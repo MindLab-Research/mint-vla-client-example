@@ -110,7 +110,7 @@ def main():
         print(f"  Last 20 token IDs: {seq.tokens[-20:]}")
         print(f"\n  Text:\n{response_text}")
         if seq.logprobs:
-            print(f"\n  Logprobs (first 5): {[f'{lp:.3f}' for lp in seq.logprobs[:5]]}")
+            print(f"\n  Logprobs (first 5): {[f'{lp:.6g}' for lp in seq.logprobs[:5]]}")
 
     print(f"\n{'='*60}")
     print("Test passed!")
