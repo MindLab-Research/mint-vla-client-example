@@ -16,6 +16,44 @@ Environment variables:
 - `HF_HOME` - Path to local HuggingFace cache directory
 - `TINKER_MODEL_PATH` - Full path to model snapshot directory
 
+## Running with Ray Cluster
+
+To use an existing Ray cluster instead of starting a local instance:
+
+### 1. Join the cluster from client node
+
+```bash
+ray start --address='<HEAD_IP>:6379'
+```
+
+Example:
+```bash
+ray start --address='192.168.47.143:6379'
+```
+
+### 2. Run the server
+
+The server auto-connects to the cluster via `ray.init(address='auto')`:
+
+```bash
+HF_HUB_OFFLINE=1 \
+HF_HOME=/vePFS-Mindverse/share/huggingface \
+TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+python scripts/run_server.py
+```
+
+### Cluster info
+
+The vLLMHttpServer actor is scheduled on cluster nodes with available GPUs. Check cluster resources:
+
+```python
+import ray
+ray.init(address='auto')
+print(ray.cluster_resources())  # Shows CPUs, GPUs, nodes
+```
+
+Dashboard: `http://<HEAD_IP>:8265`
+
 ## Known Limitations
 
 ### 1. max_tokens ignored
@@ -133,3 +171,15 @@ curl -i -X POST http://localhost:8000/api/v1/retrieve_future \
 Note:
 - Steps 1-2 don't validate - any string works for `sampling_session_id` in step 3
 - Polling returns HTTP 408 while pending (tinker client protocol)
+
+## Architecture Notes
+
+### Server Spawning Strategy
+
+For scalable multi-session support:
+
+- **Inference**: shared servers with vLLM multi-LoRA dynamic loading (no spawning per adapter)
+- **Training**: exclusive server per session (spawn from pre-warmed pool)
+- **Different models/TP configs**: spawn new server
+
+Use Ray actors for server lifecycle management.

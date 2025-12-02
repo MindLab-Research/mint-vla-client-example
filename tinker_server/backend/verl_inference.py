@@ -58,7 +58,9 @@ class VerlInferenceEngine:
         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
         if not ray.is_initialized():
-            ray.init()
+            # Use 'auto' to connect to existing cluster if available
+            # If no cluster, this falls back to starting a local Ray instance
+            ray.init(address='auto', ignore_reinit_error=True)
 
         # Create rollout config using dataclass
         rollout_config = RolloutConfig(
