@@ -56,6 +56,8 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         # Generate for each sample
         sequences = []
         for i in range(request.num_samples):
+            # NOTE: max_tokens parameter is passed here but currently ignored by verl.
+            # verl computes max_tokens as (max_model_len - prompt_len) internally.
             result = await verl_engine.generate(
                 prompt_ids=token_ids,
                 request_id=f"{request_id}_{i}",
