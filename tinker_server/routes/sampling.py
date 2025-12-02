@@ -65,11 +65,21 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
                 top_p=request.sampling_params.top_p,
                 logprobs=True,
             )
+
+            # Infer stop reason: check if EOS tokens are present
+            # verl's TokenOutput doesn't include finish_reason, so we infer it
+            # Common EOS tokens: 151645 (<|im_end|>), 151643 (<|endoftext|>)
+            eos_tokens = {151645, 151643}
+            if result.token_ids and result.token_ids[-1] in eos_tokens:
+                stop_reason = "stop"
+            else:
+                stop_reason = "length"
+
             sequences.append(
                 SampledSequence(
                     tokens=result.token_ids,
                     logprobs=result.log_probs,
-                    stop_reason="length",  # TODO: detect actual stop reason from vLLM
+                    stop_reason=stop_reason,
                 )
             )
 

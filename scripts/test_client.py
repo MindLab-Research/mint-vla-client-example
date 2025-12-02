@@ -43,15 +43,25 @@ def main():
     )
     print(f"SamplingClient created, sampling_session_id: {sampling_client._sampling_session_id}")
 
-    # Prepare prompt
+    # Prepare prompt using chat template
     prompt_text = "What is the capital of France?"
-    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+    messages = [
+        {"role": "user", "content": prompt_text}
+    ]
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    prompt_tokens = tokenizer.encode(formatted_prompt, add_special_tokens=False)
     prompt = types.ModelInput.from_ints(prompt_tokens)
 
     print(f"\n{'='*60}")
     print(f"PROMPT ({len(prompt_tokens)} tokens):")
     print(f"{'='*60}")
-    print(prompt_text)
+    print(f"User message: {prompt_text}")
+    print(f"\nFormatted with chat template:")
+    print(formatted_prompt)
     print(f"\nToken IDs: {prompt_tokens[:20]}{'...' if len(prompt_tokens) > 20 else ''}")
 
     # Sampling parameters
@@ -78,11 +88,26 @@ def main():
     print(f"\n{'='*60}")
     print(f"RESPONSE ({len(result.sequences)} sequence(s)):")
     print(f"{'='*60}")
+
+    # EOS token diagnostic
+    eos_token_id = tokenizer.eos_token_id
+    print(f"\nEOS token ID: {eos_token_id}")
+
     for i, seq in enumerate(result.sequences):
         response_text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
         print(f"\nSequence {i}:")
         print(f"  Length: {len(seq.tokens)} tokens")
         print(f"  Stop reason: {seq.stop_reason}")
+
+        # Check if EOS is in the sequence
+        if eos_token_id in seq.tokens:
+            eos_position = seq.tokens.index(eos_token_id)
+            print(f"  EOS found at position: {eos_position}")
+        else:
+            print(f"  EOS NOT found in {len(seq.tokens)} generated tokens")
+
+        print(f"\n  First 20 token IDs: {seq.tokens[:20]}")
+        print(f"  Last 20 token IDs: {seq.tokens[-20:]}")
         print(f"\n  Text:\n{response_text}")
         if seq.logprobs:
             print(f"\n  Logprobs (first 5): {[f'{lp:.3f}' for lp in seq.logprobs[:5]]}")

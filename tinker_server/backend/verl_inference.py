@@ -148,6 +148,7 @@ class VerlInferenceEngine:
             "top_k": top_k,
             "top_p": top_p,
             "logprobs": logprobs,
+            "stop_token_ids": [151645, 151643],  # <|im_end|>, <|endoftext|> for Qwen2.5
         }
 
         # Call the Ray actor's generate method

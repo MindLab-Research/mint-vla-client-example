@@ -27,19 +27,10 @@ User's `max_tokens` parameter in sampling requests is currently ignored. verl co
 
 **Location:** `/root/verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py:400`
 
-### 2. EOS token detection broken
-Model doesn't stop at EOS (end-of-sequence) tokens. Generation continues until hitting max length, producing repetitive/degraded output.
+### 2. EOS token detection (FIXED)
+EOS token detection is now working correctly. The fix adds `stop_token_ids=[151645, 151643]` to the sampling parameters in verl_inference.py, and the sampling route correctly detects the stop reason based on presence of EOS tokens in the generated sequence.
 
-**Impact:** Responses contain correct answer followed by repetitive hashtags/filler until length limit.
-
-**Root cause:** verl's `TokenOutput` at `vllm_async_server.py:433` only returns `token_ids` and `log_probs`, discarding vLLM's `finish_reason`. Server hardcodes `stop_reason="length"`.
-
-**To fix:**
-1. Extend verl's `TokenOutput` to include `finish_reason` from vLLM's `RequestOutput`
-2. Update `tinker_server/routes/sampling.py:82` to use actual finish reason instead of hardcoded "length"
-3. Alternative: Detect EOS token ID in response and truncate
-
-**Location:** `tinker_server/routes/sampling.py:82`
+**Location:** `tinker_server/backend/verl_inference.py:151` and `tinker_server/routes/sampling.py:72-76`
 
 ## Testing
 
@@ -57,15 +48,44 @@ Connecting to: http://localhost:8000
 ServiceClient created, session_id: ...
 Creating SamplingClient...
 SamplingClient created, sampling_session_id: ...
-Generating with 2 prompt tokens...
-Waiting for result...
-Generated 1 sequence(s):
-  Sequence 0:
-    Tokens: 809 tokens
-    First 10: [678, 0, 358, 2776, 1588, 311, 3061, 911, 279, 7897]
-    Stop reason: length
-    Logprobs (first 5): [-0.338, -2.100, -0.937, -1.950, -3.605]
+
+============================================================
+PROMPT (29 tokens):
+============================================================
+User message: What is the capital of France?
+
+Formatted with chat template:
+<|im_start|>user
+What is the capital of France?<|im_end|>
+<|im_start|>assistant
+<|im_end|>
+
+Token IDs: [151644, 8198, 271, 1017, 271, 951, 271, 151645, 151644, 9062, ...]
+
+============================================================
+GENERATING...
+============================================================
+
+============================================================
+RESPONSE (1 sequence(s)):
+============================================================
+
+EOS token ID: 151645
+
+Sequence 0:
+  Length: 8 tokens
+  Stop reason: stop
+  EOS found at position: 7
+
+  First 20 token IDs: [95806, 41519, 234, 6, 248, 24163, 151643, 151645]
+  Last 20 token IDs: [95806, 41519, 234, 6, 248, 24163, 151643, 151645]
+
+  Text:
+Paris
+
+============================================================
 Test passed!
+============================================================
 ```
 
 ### Using curl (raw API)
