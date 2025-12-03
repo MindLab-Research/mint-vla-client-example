@@ -1,190 +1,155 @@
-# tinker-server: Multi-Session LoRA + Training Support
+# Integration Plan: Training + Per-Session Inference
 
-## Current Task: One Server Per Session
+## Goal
 
-Implement per-session verl server with dedicated LoRA adapter.
+Integrate training from `lx_feature` branch while keeping per-session inference from `main`.
 
-### Architecture
+Architecture:
+- Per-session inference: `SessionManager` → `VerlInferenceEngine` per sampling session
+- Per-session training: `TrainingSessionManager` → `VerlTrainingEngine` per model
+- Both active simultaneously (no mutually exclusive modes)
+
+## Architecture
 
 ```
-Current:
-  app.py → single VerlInferenceEngine → all sessions
-
-New:
-  app.py → SessionManager
-             ├── session_1 → VerlInferenceEngine (lora_1)
-             ├── session_2 → VerlInferenceEngine (lora_2)
-             └── session_N → VerlInferenceEngine (lora_N)
+app.py lifespan
+├── SessionManager (inference)
+│   ├── session_1 → VerlInferenceEngine (lora_rank=32)
+│   ├── session_2 → VerlInferenceEngine (lora_rank=64)
+│   └── session_N → VerlInferenceEngine
+│
+└── TrainingSessionManager (training)
+    ├── model_1 → TrainingSession → VerlTrainingEngine state
+    ├── model_2 → TrainingSession → VerlTrainingEngine state
+    └── model_N → TrainingSession
 ```
 
-### Implementation
+## Implementation Steps
 
-**1. SessionManager (`tinker_server/backend/session_manager.py`)**
+### 1. Add training types to `types.py`
+
+From lx_feature, add (without duplicates):
+- `LoRAConfig`
+- `CreateModelRequest`, `CreateModelResponse`
+- `Datum`, `TensorData`
+- `ForwardBackwardInput`, `ForwardBackwardRequest`
+- `AdamParams`, `OptimStepRequest`, `OptimStepResponse`
+- `TelemetryRequest`, `TelemetryResponse`
+
+### 2. Create `training_session_manager.py`
+
+New file for training session management (separate from inference SessionManager):
 
 ```python
-class SessionManager:
-    _sessions: dict[str, VerlInferenceEngine]
-
-    async def create_session(self, session_id: str, lora_rank: int) -> VerlInferenceEngine
-    def get_engine(self, session_id: str) -> VerlInferenceEngine | None
-    async def end_session(self, session_id: str) -> bool
-    async def shutdown_all(self) -> None
-```
-
-**2. Modify VerlInferenceEngine**
-
-Add `lora_rank` parameter:
-```python
-def __init__(self, ..., lora_rank: int = 0):
-    self.lora_rank = lora_rank
-
-# In initialize():
-model_config = HFModelConfig(
-    path=self.model_path,
-    lora_rank=self.lora_rank,  # Was hardcoded 0
-)
-```
-
-**3. Modify Routes**
-
-`service.py`:
-- `create_sampling_session`: spawn engine via SessionManager
-
-`sampling.py`:
-- Replace global `verl_engine` with `session_manager.get_engine(session_id)`
-
-**4. Modify app.py**
-
-- Initialize SessionManager instead of single engine
-- Shutdown all sessions on app exit
-
-### New Types
-
-```python
-class CreateSamplingSessionRequest:
+class TrainingSession:
+    model_id: str
     session_id: str
-    base_model: str | None = None
-    lora_rank: int = 32  # NEW
+    model_seq_id: int
+    base_model: str
+    lora_config: LoRAConfig
+    current_step: int
+    # ... training state
+
+class TrainingSessionManager:
+    _sessions: dict[str, TrainingSession]
+
+    def create_session(model_id, ...) -> TrainingSession
+    def get_session(model_id) -> TrainingSession | None
+    def delete_session(model_id) -> bool
+    def list_sessions() -> list[TrainingSession]
 ```
 
-### Files
+### 3. Create `verl_training.py`
+
+From lx_feature, adapt the training engine:
+- Uses PyTorch + PEFT for LoRA
+- Per-session model/optimizer state
+- Methods: `create_training_session`, `forward_backward`, `optim_step`, `shutdown_session`
+
+Key fix: Remove Chinese comments, use English throughout.
+
+### 4. Create `routes/training.py`
+
+Training endpoints:
+- `POST /create_model` → create training session
+- `POST /forward_backward` → forward + backward pass
+- `POST /optim_step` → optimizer update
+- `GET /models` → list training sessions
+- `DELETE /models/{model_id}` → delete session
+
+### 5. Update `app.py`
+
+Initialize both managers:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inference manager (existing)
+    inference_manager = SessionManager(...)
+    service.session_manager = inference_manager
+    sampling.session_manager = inference_manager
+    await inference_manager.start_cleanup_task()
+
+    # Training manager (new)
+    training_manager = TrainingSessionManager()
+    training_engine = VerlTrainingEngine()
+    await training_engine.initialize()
+    training.training_manager = training_manager
+    training.training_engine = training_engine
+
+    yield
+
+    # Shutdown both
+    await inference_manager.shutdown_all()
+    await training_manager.shutdown_all(training_engine)
+```
+
+### 6. Register training routes
+
+In `app.py`:
+```python
+from .routes import training
+app.include_router(training.router, prefix="/api/v1", tags=["training"])
+```
+
+### 7. Add telemetry endpoint
+
+In `service.py`:
+```python
+@router.post("/telemetry/send")
+async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
+    return TelemetryResponse(status="accepted")
+```
+
+## Files Changed
 
 New:
-- `tinker_server/backend/session_manager.py`
-- `scripts/test_multi_lora_sessions.py`
-
-Modified:
-- `tinker_server/backend/verl_inference.py`
-- `tinker_server/routes/service.py`
-- `tinker_server/routes/sampling.py`
-- `tinker_server/app.py`
-- `tinker_server/models/types.py`
-
-### Testing
-
-```python
-# Create two sessions with different LoRA
-session_1 = create_sampling_session(lora_rank=32)
-session_2 = create_sampling_session(lora_rank=32)
-
-# Same prompt, different outputs (different random LoRA weights)
-result_1 = sample(session_1, prompt)
-result_2 = sample(session_2, prompt)
-assert result_1 != result_2
-```
-
----
-
-## Future: vLLM Multi-LoRA (Not Implemented)
-
-Current approach spawns one server per session. For high-load multi-tenant:
-
-- Bypass verl, use vLLM directly
-- Single vLLM server with `enable_lora=True`, `max_loras=N`
-- Dynamic adapter loading via `/v1/load_lora_adapter`
-- Per-request `lora_request` parameter
-
-This requires direct vLLM integration, not through verl wrapper.
-
----
-
-## Planned: Training Support
-
-Implement TrainingClient API with LoRA fine-tuning.
-
-**Endpoints:**
-- `POST /api/v1/create_model` - spawn training session with LoRA config
-- `POST /api/v1/forward_backward` - compute loss and gradients
-- `POST /api/v1/optim_step` - update weights, sync to rollout
-
-**Architecture change:**
-```
-Current: VerlInferenceEngine (STANDALONE mode, inference only)
-
-New: VerlTrainingEngine (HYBRID mode)
-  ├── ActorWorker (FSDP + LoRA rank 32)
-  └── RolloutReplica (vLLM with LoRA weights)
-      └── Weight sync after optim_step
-```
-
-**LoRA config:**
-- Rank: 32
-- Target: all-linear layers (attn, mlp, unembed)
-- Base model: Qwen2.5-7B-Instruct
-
-**Implementation:**
-- `tinker_server/backend/verl_training.py` - VerlTrainingEngine wrapper
-- `tinker_server/backend/session_manager.py` - model_id → TrainingSession mapping
-- `tinker_server/routes/training.py` - forward_backward, optim_step endpoints
-- `tinker_server/models/types.py` - add ForwardBackwardRequest, OptimStepRequest, CreateModelRequest
-
-**Weight sync flow:**
-1. optim_step completes on ActorWorker
-2. collect_lora_params() extracts LoRA weights
-3. RolloutReplica.update_weights() loads into vLLM
-
-**verl configuration:**
-- RolloutMode.HYBRID (actor + rollout share GPUs)
-- Ray placement group with max_colocate_count=2
-- Context switching: actor training → rollout sleep, rollout sampling → actor sleep
-
-**Testing:**
-```python
-# Create training session
-client = ServiceClient()
-training = client.create_lora_training_client(
-    base_model="Qwen/Qwen2.5-7B-Instruct",
-    rank=32
-)
-
-# Prepare batch
-data = [Datum(
-    model_input=ModelInput.from_ints([...]),
-    loss_fn_inputs={"target_tokens": TensorData.from_ints([...])}
-)]
-
-# Train 10 steps
-for i in range(10):
-    fwd_result = training.forward_backward(data, "cross_entropy").result()
-    opt_result = training.optim_step(AdamParams(learning_rate=1e-4)).result()
-    print(f"Step {i}: loss={fwd_result.metrics['loss']}")
-```
-
-**Verify:**
-- Loss decreases (initial ~2.5 → after 10 steps ~1.8)
-- RolloutReplica weights updated (sample from trained model shows changed output)
-- Multiple sessions don't interfere (create 2 training sessions, verify independent losses)
-
-**New files:**
+- `tinker_server/backend/training_session_manager.py`
 - `tinker_server/backend/verl_training.py`
 - `tinker_server/routes/training.py`
-- `scripts/test_training.py`
 
----
+Modified:
+- `tinker_server/models/types.py` (add training types)
+- `tinker_server/app.py` (initialize both managers)
+- `tinker_server/routes/service.py` (add telemetry endpoint)
 
-## Dependencies
+Unchanged:
+- `tinker_server/backend/session_manager.py` (inference sessions)
+- `tinker_server/backend/verl_inference.py`
+- `tinker_server/routes/sampling.py`
 
-Add to pyproject.toml:
-```toml
-"peft>=0.7.0"  # LoRA implementation
+## Bug Fixes from lx_feature
+
+1. ~~config.py boolean parsing~~ - Not needed (no ENABLE_TRAINING flag)
+2. Duplicate `LossFnOutput` class - Only include once in types.py
+
+## Testing
+
+After implementation:
+```bash
+# Test inference (existing)
+python scripts/test_client.py
+
+# Test training (new)
+python scripts/test_training_client.py
 ```

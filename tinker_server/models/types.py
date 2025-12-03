@@ -3,9 +3,9 @@
 These types match the tinker client API for compatibility.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class EncodedTextChunk(BaseModel):
@@ -118,3 +118,135 @@ class FutureRetrieveRequest(BaseModel):
 
     request_id: str
     model_id: str | None = None
+
+
+# =============================================================================
+# Training Types
+# =============================================================================
+
+
+class LoRAConfig(BaseModel):
+    """Configuration for LoRA fine-tuning."""
+
+    rank: int
+    seed: int | None = None
+    train_unembed: bool = True
+    train_mlp: bool = True
+    train_attn: bool = True
+
+
+class CreateModelRequest(BaseModel):
+    """Request to create a new training model."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    session_id: str
+    model_seq_id: int
+    base_model: str
+    user_metadata: dict[str, Any] | None = None
+    lora_config: LoRAConfig | None = None
+    type: Literal["create_model"] = "create_model"
+
+
+class CreateModelResponse(BaseModel):
+    """Response from model creation."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    request_id: str
+    model_id: str
+    type: Literal["create_model"] = "create_model"
+
+
+class Datum(BaseModel):
+    """A single data item for training."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class TensorData(BaseModel):
+    """Tensor data for tinker compatibility."""
+
+    data: list[float] | float
+    shape: list[int]
+    dtype: str = "float32"
+
+
+class LossFnOutput(BaseModel):
+    """Output from a loss function."""
+
+    model_config = ConfigDict(extra="allow")
+
+    loss: TensorData | None = None
+
+
+class ForwardBackwardInput(BaseModel):
+    """Input for forward/backward pass."""
+
+    data: list[Datum]
+    loss_fn: str
+    loss_fn_config: dict[str, float] | None = None
+
+
+class ForwardBackwardOutput(BaseModel):
+    """Output from forward/backward pass."""
+
+    loss_fn_output_type: str
+    loss_fn_outputs: list[LossFnOutput]
+    metrics: dict[str, float]
+
+
+class ForwardBackwardRequest(BaseModel):
+    """Request to perform a forward-backward pass."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    forward_backward_input: ForwardBackwardInput
+    model_id: str
+    seq_id: int | None = None
+
+
+class ForwardBackwardResponse(BaseModel):
+    """Response from a forward-backward pass."""
+
+    output: ForwardBackwardOutput
+    type: Literal["forward_backward"] = "forward_backward"
+
+
+class AdamParams(BaseModel):
+    """Parameters for Adam optimizer."""
+
+    learning_rate: float = 0.0001
+    beta1: float = 0.9
+    beta2: float = 0.95
+    eps: float = 1e-12
+
+
+class OptimStepRequest(BaseModel):
+    """Request to perform an optimizer step."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    adam_params: AdamParams
+    model_id: str
+    seq_id: int | None = None
+    type: Literal["optim_step"] = "optim_step"
+
+
+class OptimStepResponse(BaseModel):
+    """Response from an optimizer step."""
+
+    metrics: dict[str, float] | None = None
+    type: Literal["optim_step"] = "optim_step"
+
+
+class TelemetryRequest(BaseModel):
+    """Telemetry data from tinker client."""
+
+    events: list[dict[str, Any]] = []
+
+
+class TelemetryResponse(BaseModel):
+    """Response for telemetry submission."""
+
+    status: Literal["accepted"] = "accepted"

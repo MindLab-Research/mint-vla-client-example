@@ -4,6 +4,7 @@ Endpoints:
 - GET /healthz: Health check
 - POST /create_session: Create a new session
 - POST /create_sampling_session: Create a sampling session with dedicated engine
+- POST /telemetry/send: Accept telemetry data
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from ..models.types import (
     CreateSamplingSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
+    TelemetryRequest,
+    TelemetryResponse,
 )
 
 if TYPE_CHECKING:
@@ -79,3 +82,12 @@ async def create_sampling_session(
     )
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+
+
+@router.post("/telemetry/send")
+async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
+    """Accept telemetry data from tinker client.
+
+    Silently accepts and discards telemetry data.
+    """
+    return TelemetryResponse(status="accepted")
