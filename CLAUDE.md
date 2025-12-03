@@ -174,12 +174,21 @@ Note:
 
 ## Architecture Notes
 
-### Server Spawning Strategy
+### Current: One Server Per Session
 
-For scalable multi-session support:
+Each sampling session spawns a dedicated verl server with its own LoRA adapter.
 
-- **Inference**: shared servers with vLLM multi-LoRA dynamic loading (no spawning per adapter)
-- **Training**: exclusive server per session (spawn from pre-warmed pool)
-- **Different models/TP configs**: spawn new server
+- SessionManager maps session_id → VerlInferenceEngine
+- LoRA weights randomly initialized at session creation
+- Engine shutdown on session end via `/end_session`
 
-Use Ray actors for server lifecycle management.
+### Future: vLLM Multi-LoRA (Planned)
+
+For efficient multi-tenant inference under high load, bypass verl and use vLLM directly:
+
+- Single vLLM server with `enable_lora=True`, `max_loras=N`
+- Dynamic adapter loading via `/v1/load_lora_adapter`
+- Per-request `lora_request` routing
+- No per-session server spawning overhead
+
+Requires direct vLLM integration (verl's generate() doesn't expose lora_request parameter).

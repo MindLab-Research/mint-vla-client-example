@@ -98,6 +98,7 @@ class CreateSamplingSessionRequest(BaseModel):
     session_id: str
     base_model: str | None = None
     model_path: str | None = None
+    lora_rank: int = 32  # LoRA rank for per-session adapter
 
 
 class CreateSamplingSessionResponse(BaseModel):

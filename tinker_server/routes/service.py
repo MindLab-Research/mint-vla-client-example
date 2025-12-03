@@ -3,12 +3,15 @@
 Endpoints:
 - GET /healthz: Health check
 - POST /create_session: Create a new session
-- POST /create_sampling_session: Create a sampling session
+- POST /create_sampling_session: Create a sampling session with dedicated engine
 """
 
-import uuid
+from __future__ import annotations
 
-from fastapi import APIRouter
+import uuid
+from typing import TYPE_CHECKING
+
+from fastapi import APIRouter, HTTPException
 
 from ..models.types import (
     CreateSamplingSessionRequest,
@@ -17,11 +20,17 @@ from ..models.types import (
     CreateSessionResponse,
 )
 
+if TYPE_CHECKING:
+    from ..backend.session_manager import SessionManager
+
 router = APIRouter()
 
 # In-memory session storage
 sessions: dict[str, dict] = {}
 sampling_sessions: dict[str, str] = {}  # sampling_session_id -> base_model
+
+# Global session manager reference (set by app lifespan)
+session_manager: SessionManager | None = None
 
 
 @router.get("/healthz")
@@ -48,14 +57,25 @@ async def create_session(request: CreateSessionRequest) -> CreateSessionResponse
 async def create_sampling_session(
     request: CreateSamplingSessionRequest,
 ) -> CreateSamplingSessionResponse:
-    """Create a sampling session for text generation.
+    """Create a sampling session with dedicated inference engine.
 
-    For MVP, we use a pre-loaded model; the requested model is stored
-    for future multi-model support.
+    Each sampling session spawns a new VerlInferenceEngine with its own
+    LoRA adapter, enabling session isolation.
     """
+    if session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+
     sampling_session_id = str(uuid.uuid4())
-    # Store the requested model for future use
+
+    # Spawn dedicated engine for this session
+    await session_manager.create_session(
+        session_id=sampling_session_id,
+        lora_rank=request.lora_rank,
+    )
+
+    # Store metadata
     sampling_sessions[sampling_session_id] = (
         request.base_model or "Qwen/Qwen2.5-7B-Instruct"
     )
+
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)

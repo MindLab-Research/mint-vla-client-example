@@ -20,14 +20,14 @@ from ..models.types import (
 )
 
 if TYPE_CHECKING:
-    from ..backend.verl_inference import VerlInferenceEngine
+    from ..backend.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Global engine reference (set by app lifespan)
-verl_engine: VerlInferenceEngine | None = None
+# Global session manager reference (set by app lifespan)
+session_manager: SessionManager | None = None
 
 
 @router.post("/asample")
@@ -48,8 +48,15 @@ async def asample(
 async def _do_sample(request_id: str, request: SampleRequest) -> None:
     """Background task to perform sampling."""
     try:
-        if verl_engine is None:
-            raise RuntimeError("Inference engine not initialized")
+        if session_manager is None:
+            raise RuntimeError("Session manager not initialized")
+
+        # Get engine for this session
+        engine = session_manager.get_engine(request.sampling_session_id)
+        if engine is None:
+            raise RuntimeError(
+                f"No engine found for session {request.sampling_session_id}"
+            )
 
         token_ids = request.prompt.to_token_ids()
 
@@ -58,7 +65,7 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         for i in range(request.num_samples):
             # NOTE: max_tokens parameter is passed here but currently ignored by verl.
             # verl computes max_tokens as (max_model_len - prompt_len) internally.
-            result = await verl_engine.generate(
+            result = await engine.generate(
                 prompt_ids=token_ids,
                 request_id=f"{request_id}_{i}",
                 max_tokens=request.sampling_params.max_tokens,

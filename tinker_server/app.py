@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from .backend import verl_inference
+from .backend.session_manager import SessionManager
 from .config import config
 from .routes import futures, sampling, service
 
@@ -20,32 +20,33 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan manager.
 
-    Initializes the verl inference engine on startup and
-    shuts it down on application exit.
+    Initializes the SessionManager on startup and
+    shuts down all sessions on application exit.
     """
-    # Startup: initialize verl engine
-    logger.info(f"Initializing inference engine with model: {config.model_path}")
+    # Startup: initialize session manager
+    logger.info(f"Initializing session manager with model: {config.model_path}")
 
-    engine = verl_inference.VerlInferenceEngine(
+    manager = SessionManager(
         model_path=config.model_path,
         tensor_parallel_size=config.tensor_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
     )
-    await engine.initialize()
 
-    # Make engine available to routes
-    verl_inference.verl_engine = engine
-    sampling.verl_engine = engine
+    # Make session manager available to routes
+    service.session_manager = manager
+    sampling.session_manager = manager
 
-    logger.info("Inference engine initialized")
+    # Start background cleanup task
+    await manager.start_cleanup_task()
+
+    logger.info("Session manager initialized")
 
     yield
 
     # Shutdown
-    logger.info("Shutting down inference engine")
-    if verl_inference.verl_engine:
-        await verl_inference.verl_engine.shutdown()
+    logger.info("Shutting down all sessions")
+    await manager.shutdown_all()
 
 
 app = FastAPI(

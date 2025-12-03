@@ -1,8 +1,114 @@
-# tinker-server: Training + Multi-Session Support
+# tinker-server: Multi-Session LoRA + Training Support
 
-## Tasks
+## Current Task: One Server Per Session
 
-### 1. Training Support
+Implement per-session verl server with dedicated LoRA adapter.
+
+### Architecture
+
+```
+Current:
+  app.py → single VerlInferenceEngine → all sessions
+
+New:
+  app.py → SessionManager
+             ├── session_1 → VerlInferenceEngine (lora_1)
+             ├── session_2 → VerlInferenceEngine (lora_2)
+             └── session_N → VerlInferenceEngine (lora_N)
+```
+
+### Implementation
+
+**1. SessionManager (`tinker_server/backend/session_manager.py`)**
+
+```python
+class SessionManager:
+    _sessions: dict[str, VerlInferenceEngine]
+
+    async def create_session(self, session_id: str, lora_rank: int) -> VerlInferenceEngine
+    def get_engine(self, session_id: str) -> VerlInferenceEngine | None
+    async def end_session(self, session_id: str) -> bool
+    async def shutdown_all(self) -> None
+```
+
+**2. Modify VerlInferenceEngine**
+
+Add `lora_rank` parameter:
+```python
+def __init__(self, ..., lora_rank: int = 0):
+    self.lora_rank = lora_rank
+
+# In initialize():
+model_config = HFModelConfig(
+    path=self.model_path,
+    lora_rank=self.lora_rank,  # Was hardcoded 0
+)
+```
+
+**3. Modify Routes**
+
+`service.py`:
+- `create_sampling_session`: spawn engine via SessionManager
+
+`sampling.py`:
+- Replace global `verl_engine` with `session_manager.get_engine(session_id)`
+
+**4. Modify app.py**
+
+- Initialize SessionManager instead of single engine
+- Shutdown all sessions on app exit
+
+### New Types
+
+```python
+class CreateSamplingSessionRequest:
+    session_id: str
+    base_model: str | None = None
+    lora_rank: int = 32  # NEW
+```
+
+### Files
+
+New:
+- `tinker_server/backend/session_manager.py`
+- `scripts/test_multi_lora_sessions.py`
+
+Modified:
+- `tinker_server/backend/verl_inference.py`
+- `tinker_server/routes/service.py`
+- `tinker_server/routes/sampling.py`
+- `tinker_server/app.py`
+- `tinker_server/models/types.py`
+
+### Testing
+
+```python
+# Create two sessions with different LoRA
+session_1 = create_sampling_session(lora_rank=32)
+session_2 = create_sampling_session(lora_rank=32)
+
+# Same prompt, different outputs (different random LoRA weights)
+result_1 = sample(session_1, prompt)
+result_2 = sample(session_2, prompt)
+assert result_1 != result_2
+```
+
+---
+
+## Future: vLLM Multi-LoRA (Not Implemented)
+
+Current approach spawns one server per session. For high-load multi-tenant:
+
+- Bypass verl, use vLLM directly
+- Single vLLM server with `enable_lora=True`, `max_loras=N`
+- Dynamic adapter loading via `/v1/load_lora_adapter`
+- Per-request `lora_request` parameter
+
+This requires direct vLLM integration, not through verl wrapper.
+
+---
+
+## Planned: Training Support
 
 Implement TrainingClient API with LoRA fine-tuning.
 
@@ -42,31 +148,7 @@ New: VerlTrainingEngine (HYBRID mode)
 - Ray placement group with max_colocate_count=2
 - Context switching: actor training → rollout sleep, rollout sampling → actor sleep
 
-### 2. Concurrent Sessions
-
-Support multiple training/sampling sessions simultaneously.
-
-**SessionManager:**
-```python
-class SessionManager:
-    training_sessions: dict[str, TrainingSession]  # model_id -> session
-    sampling_sessions: dict[str, SamplingSession]  # session_id -> session
-```
-
-**Isolation:**
-- Each TrainingSession spawns independent Ray placement group
-- LoRA adapters isolated per model_id
-- Existing VerlInferenceEngine (STANDALONE) handles sampling-only sessions
-- No shared state between sessions
-
-**Request ordering:**
-- Use seq_id field to order requests per model_id
-- Background task queue per TrainingSession
-- forward_backward must complete before optim_step
-
-## Testing
-
-**Basic training loop:**
+**Testing:**
 ```python
 # Create training session
 client = ServiceClient()
@@ -93,7 +175,12 @@ for i in range(10):
 - RolloutReplica weights updated (sample from trained model shows changed output)
 - Multiple sessions don't interfere (create 2 training sessions, verify independent losses)
 
-**Test script:** `scripts/test_training.py`
+**New files:**
+- `tinker_server/backend/verl_training.py`
+- `tinker_server/routes/training.py`
+- `scripts/test_training.py`
+
+---
 
 ## Dependencies
 
@@ -101,16 +188,3 @@ Add to pyproject.toml:
 ```toml
 "peft>=0.7.0"  # LoRA implementation
 ```
-
-## Files
-
-New:
-- `tinker_server/backend/verl_training.py`
-- `tinker_server/backend/session_manager.py`
-- `tinker_server/routes/training.py`
-- `scripts/test_training.py`
-
-Modified:
-- `tinker_server/models/types.py`
-- `tinker_server/routes/service.py` (add /create_model)
-- `tinker_server/app.py` (initialize SessionManager)

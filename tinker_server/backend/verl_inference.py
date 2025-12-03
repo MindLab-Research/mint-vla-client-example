@@ -39,11 +39,13 @@ class VerlInferenceEngine:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int | None = None,
+        lora_rank: int = 0,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.lora_rank = lora_rank
         self.server: vLLMHttpServer | None = None
         self._initialized = False
 
@@ -89,10 +91,10 @@ class VerlInferenceEngine:
         model_config = HFModelConfig(
             path=self.model_path,
             trust_remote_code=True,
-            lora_rank=0,  # No LoRA for MVP
+            lora_rank=self.lora_rank,
         )
 
-        logger.info(f"Launching vLLMHttpServer for {self.model_path}")
+        logger.info(f"Launching vLLMHttpServer for {self.model_path} (lora_rank={self.lora_rank})")
 
         # Create vLLMHttpServer as Ray actor
         # For MVP: single node, standalone mode
@@ -172,7 +174,3 @@ class VerlInferenceEngine:
             self.server = None
         self._initialized = False
         logger.info("VerlInferenceEngine shutdown")
-
-
-# Global engine instance (initialized in app lifespan)
-verl_engine: VerlInferenceEngine | None = None
