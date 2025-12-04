@@ -83,10 +83,13 @@ class TrainingWorker:
         logger.info("[TrainingWorker] Ready")
 
     def forward_backward(self, data_items: list[dict]) -> dict:
-        """Forward + backward pass.
+        """Forward + backward pass using tinker Datum format.
 
         Args:
-            data_items: List of training data dicts.
+            data_items: List of serialized Datum dicts with:
+                - model_input.chunks[0].tokens: input token IDs
+                - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
+                - loss_fn_inputs.loss_mask: mask for loss computation
 
         Returns:
             Dict with loss_fn_outputs and metrics.
@@ -94,38 +97,75 @@ class TrainingWorker:
         self.model.train()
 
         total_loss = 0.0
+        total_tokens = 0
         loss_fn_outputs = []
 
         for item in data_items:
-            # Extract text from various possible fields
-            text = (
-                item.get("text")
-                or item.get("content")
-                or item.get("prompt")
-                or str(item)
-            )
+            # Parse tinker Datum format
+            model_input = item.get("model_input", {})
+            loss_fn_inputs = item.get("loss_fn_inputs", {})
 
-            inputs = self.tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=2048,
-            ).to(self.device)
+            # Extract input token IDs from model_input.chunks[0].tokens
+            chunks = model_input.get("chunks", [])
+            if chunks and "tokens" in chunks[0]:
+                input_ids = chunks[0]["tokens"]
+            else:
+                logger.warning(f"[TrainingWorker] No tokens in model_input, skipping item")
+                continue
 
-            outputs = self.model(**inputs, labels=inputs["input_ids"])
-            loss = outputs.loss
+            # Extract target tokens and loss mask
+            target_data = loss_fn_inputs.get("target_tokens", {})
+            mask_data = loss_fn_inputs.get("loss_mask", {})
+
+            target_tokens = target_data.get("data", [])
+            loss_mask = mask_data.get("data", [])
+
+            if not target_tokens or not loss_mask:
+                logger.warning(f"[TrainingWorker] Missing target_tokens or loss_mask, skipping item")
+                continue
+
+            # Convert to tensors
+            input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+            target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
+            loss_mask_t = torch.tensor([loss_mask], dtype=torch.float32, device=self.device)
+
+            # Forward pass - get logits
+            outputs = self.model(input_ids=input_ids_t)
+            logits = outputs.logits  # [1, seq_len, vocab_size]
+
+            # Compute cross-entropy loss with masking
+            # logits: [1, seq_len, vocab] -> [seq_len, vocab]
+            # targets: [1, seq_len] -> [seq_len]
+            logits_flat = logits.squeeze(0)  # [seq_len, vocab]
+            targets_flat = target_ids_t.squeeze(0)  # [seq_len]
+            mask_flat = loss_mask_t.squeeze(0)  # [seq_len]
+
+            # Per-token cross entropy
+            ce_loss = torch.nn.functional.cross_entropy(
+                logits_flat, targets_flat, reduction="none"
+            )  # [seq_len]
+
+            # Apply mask and compute mean over masked tokens
+            masked_loss = ce_loss * mask_flat
+            num_masked = mask_flat.sum()
+            if num_masked > 0:
+                loss = masked_loss.sum() / num_masked
+            else:
+                loss = masked_loss.sum()  # Fallback if no mask
+
             loss.backward()
 
             item_loss = loss.item()
-            total_loss += item_loss
+            total_loss += item_loss * num_masked.item()
+            total_tokens += num_masked.item()
 
             loss_fn_outputs.append(
                 {"loss": {"data": [item_loss], "shape": [1], "dtype": "float32"}}
             )
 
-        avg_loss = total_loss / max(len(data_items), 1)
+        avg_loss = total_loss / max(total_tokens, 1)
 
-        logger.info(f"[TrainingWorker] forward_backward: loss={avg_loss:.4f}")
+        logger.info(f"[TrainingWorker] forward_backward: loss={avg_loss:.4f}, tokens={total_tokens:.0f}")
 
         return {
             "loss_fn_output_type": "sft_loss",
@@ -133,6 +173,7 @@ class TrainingWorker:
             "metrics": {
                 "loss:mean": avg_loss,
                 "num_samples:sum": float(len(data_items)),
+                "num_tokens:sum": float(total_tokens),
             },
         }
 
