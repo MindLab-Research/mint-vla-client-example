@@ -135,6 +135,83 @@ def _create_extended_server_class():
             """List loaded LoRA adapter IDs."""
             return await self.engine.list_loras()
 
+        async def generate(
+            self,
+            prompt_ids: list[int],
+            sampling_params: dict,
+            request_id: str,
+            image_data: list | None = None,
+        ):
+            """Generate with user's max_tokens respected.
+
+            Override of verl's generate() which ignores user's max_tokens.
+            Uses min(user_max_tokens, max_model_len - prompt_len).
+            """
+            from typing import Optional
+
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            from verl.workers.rollout.vllm_rollout.utils import (
+                VLLM_LORA_INT_ID,
+                VLLM_LORA_NAME,
+                VLLM_LORA_PATH,
+            )
+            from verl.workers.rollout.replica import TokenOutput
+
+            # Extract user's max_tokens before verl overwrites it
+            user_max_tokens = sampling_params.pop("max_tokens", None)
+            verl_max_tokens = self.config.max_model_len - len(prompt_ids)
+
+            if user_max_tokens is not None:
+                max_tokens = min(user_max_tokens, verl_max_tokens)
+            else:
+                max_tokens = verl_max_tokens
+
+            # Rest of verl's generate() logic
+            sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+            sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+            sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+
+            prompt = TokensPrompt(
+                prompt_token_ids=prompt_ids,
+                multi_modal_data={"image": image_data} if image_data else None,
+            )
+
+            # Add lora request
+            lora_request = None
+            if self.model_config.lora_rank > 0:
+                lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+                if lora_loaded:
+                    lora_request = LoRARequest(
+                        lora_name=VLLM_LORA_NAME,
+                        lora_int_id=VLLM_LORA_INT_ID,
+                        lora_path=VLLM_LORA_PATH,
+                    )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            # Get final response
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            token_ids = final_res.outputs[0].token_ids
+            log_probs = None
+            if sampling_params.logprobs is not None:
+                log_probs = [
+                    logprobs[token_ids[i]].logprob
+                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                ]
+            return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+
     return ExtendedVLLMHttpServer
 
 
@@ -272,10 +349,10 @@ class VerlInferenceEngine:
         if not self._initialized:
             await self.initialize()
 
-        # Note: verl computes max_tokens internally as (max_model_len - prompt_len)
-        # so we don't pass it here. For MVP, user's max_tokens is ignored.
-        # TODO: Upstream fix to verl to support user-specified max_tokens
+        # Pass max_tokens to our overridden generate() in ExtendedVLLMHttpServer
+        # which uses min(user_max_tokens, max_model_len - prompt_len)
         sampling_params = {
+            "max_tokens": max_tokens,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,

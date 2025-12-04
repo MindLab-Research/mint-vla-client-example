@@ -57,14 +57,12 @@ Dashboard: `http://<HEAD_IP>:8265`
 
 ## Known Limitations
 
-### 1. max_tokens ignored
-User's `max_tokens` parameter in sampling requests is currently ignored. verl computes max_tokens internally as `max_model_len - prompt_len`, generating up to that limit.
+### 1. max_tokens support (FIXED)
+User's `max_tokens` parameter is now respected via monkey-patch in `ExtendedVLLMHttpServer.generate()`.
 
-**Impact:** Model generates thousands of tokens instead of requested amount (e.g., request 64 tokens, get 4089).
+**Fix:** Override `generate()` method to use `min(user_max_tokens, max_model_len - prompt_len)`.
 
-**To fix:** Requires upstream change to verl's `vLLMHttpServer.generate()` method to accept user-specified max_tokens.
-
-**Location:** `/root/verl/verl/workers/rollout/vllm_rollout/vllm_async_server.py:400`
+**Location:** `tinker_server/backend/verl_inference.py:138-213`
 
 ### 2. EOS token detection (FIXED)
 EOS token detection is now working correctly. The fix adds `stop_token_ids=[151645, 151643]` to the sampling parameters in verl_inference.py, and the sampling route correctly detects the stop reason based on presence of EOS tokens in the generated sequence.

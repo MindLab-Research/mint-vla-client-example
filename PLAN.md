@@ -24,24 +24,43 @@ All features from original plan implemented and working.
 
 ---
 
-## Next: Phase 2 - Production Readiness
+## Next: Phase 2 - Stability Fixes (HIGH PRIORITY)
 
-Candidates for next development phase:
+Two critical issues identified that cause poor performance and crashes:
 
-### 1. Multi-Session Isolation (Medium Priority)
+### 1. max_tokens Ignored (FIXED)
 
-**Problem:** Current shared engine only supports one active LoRA. Multiple concurrent training sessions overwrite each other's weights.
+**Problem:** User's `max_tokens` parameter was ignored by verl. Model generated up to `max_model_len - prompt_len` tokens (e.g., 4000+) instead of requested amount.
+
+**Root cause:** `verl/workers/rollout/vllm_rollout/vllm_async_server.py:400`
+```python
+max_tokens = self.config.max_model_len - len(prompt_ids)  # Ignores user's max_tokens
+```
+
+**Fix:** Monkey-patched via `ExtendedVLLMHttpServer.generate()` override in `verl_inference.py`.
+Uses `min(user_max_tokens, max_model_len - prompt_len)` to respect user's limit while staying within engine bounds.
+
+### 2. Concurrent Session Crash (HIGH PRIORITY)
+
+**Problem:** Running two training sessions in parallel causes `EngineDeadError` crash.
+
+**Root cause:** Shared inference engine has no locking around hot-reload + inference operations.
+- `_shared_engine_lock` only protects engine creation
+- When session B hot-reloads LoRA while session A is inferring, vLLM engine crashes
+
+**Reproduction:** Run two SFT training clients in parallel:
+```bash
+python /tmp/test_concurrent_sft.py  # Crashes with EngineDeadError
+```
 
 **Solution options:**
-- vLLM multi-LoRA with `max_loras=N` and per-request adapter routing
-- Session queuing (serialize ephemeral requests)
-- Multiple shared engines (one per LoRA rank)
+1. **Session serialization:** Add lock around `create_ephemeral_session()` + inference operations
+2. **Per-session engines:** Each training session gets dedicated inference engine (slower but isolated)
+3. **vLLM multi-LoRA:** Use `max_loras=N` with per-request adapter routing (requires vLLM config)
 
-### 2. max_tokens Support (Low Priority - Upstream)
+---
 
-**Problem:** User's `max_tokens` parameter ignored. Requires verl upstream change.
-
-**Workaround:** Use `stop_token_ids` for EOS detection (already implemented).
+## Phase 3 - Production Readiness
 
 ### 3. Observability (Medium Priority)
 
