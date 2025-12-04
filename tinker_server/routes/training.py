@@ -4,6 +4,7 @@ Endpoints:
 - POST /create_model: Create a training model
 - POST /forward_backward: Forward + backward pass
 - POST /optim_step: Optimizer update
+- POST /save_weights_for_sampler: Save weights for inference
 - GET /models: List training models
 - DELETE /models/{model_id}: Delete a model
 """
@@ -11,6 +12,8 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -21,10 +24,13 @@ from ..models.types import (
     CreateModelResponse,
     ForwardBackwardRequest,
     OptimStepRequest,
+    SaveWeightsForSamplerRequest,
+    SaveWeightsForSamplerResponse,
     UntypedAPIFuture,
 )
 
 if TYPE_CHECKING:
+    from ..backend.session_manager import SessionManager
     from ..backend.training_session_manager import TrainingSessionManager
     from ..backend.verl_training import VerlTrainingEngine
 
@@ -34,6 +40,7 @@ router = APIRouter()
 # Global references (set by app lifespan)
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
+inference_manager: SessionManager | None = None  # For ephemeral flow
 
 
 def _generate_model_id(session_id: str, model_seq_id: int) -> str:
@@ -182,6 +189,105 @@ async def _do_optim_step(request_id: str, session, request: OptimStepRequest) ->
 
     except Exception as e:
         logger.exception(f"[optim_step] Failed: {e}")
+        future_store.fail(request_id, str(e))
+
+
+# =============================================================================
+# save_weights_for_sampler - async
+# =============================================================================
+
+
+@router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)
+async def save_weights_for_sampler(
+    request: SaveWeightsForSamplerRequest,
+    background_tasks: BackgroundTasks,
+) -> UntypedAPIFuture:
+    """Save model weights for inference use."""
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
+
+    request_id = future_store.create()
+    background_tasks.add_task(
+        _do_save_weights_for_sampler, request_id, session, request
+    )
+    return UntypedAPIFuture(request_id=request_id)
+
+
+async def _do_save_weights_for_sampler(
+    request_id: str, session, request: SaveWeightsForSamplerRequest
+) -> None:
+    """Background task for save_weights_for_sampler.
+
+    Two flows:
+    - Named (path is not None): Save to persistent location, return path
+    - Ephemeral (path is None): Save to temp, create sampling session, return session_id
+    """
+    try:
+        if training_engine is None:
+            raise RuntimeError("Training engine not initialized")
+
+        # Get checkpoint directory from environment or default
+        checkpoint_dir = os.environ.get(
+            "TINKER_CHECKPOINT_DIR",
+            os.path.join(os.getcwd(), "checkpoints")
+        )
+
+        # Determine checkpoint name
+        if request.path is not None:
+            # Named save - use provided path
+            checkpoint_name = request.path
+        else:
+            # Ephemeral save - generate unique temp name
+            checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
+
+        # Save weights
+        save_path = await training_engine.save_weights_for_sampler(
+            session=session,
+            checkpoint_name=checkpoint_name,
+            checkpoint_base_dir=checkpoint_dir,
+        )
+
+        # Use tinker:// URI format for SDK compatibility
+        # Format: tinker://localhost/<absolute_path>
+        path_uri = f"tinker://localhost{save_path}"
+
+        if request.path is not None:
+            # Named flow: Return path, caller creates session separately
+            response = SaveWeightsForSamplerResponse(
+                path=path_uri,
+                sampling_session_id=None,
+            )
+        else:
+            # Ephemeral flow: Create sampling session with hot-loaded weights
+            if inference_manager is None:
+                raise RuntimeError("Inference manager not initialized")
+
+            sampling_session_id = str(uuid.uuid4())
+            await inference_manager.create_session(
+                session_id=sampling_session_id,
+                lora_rank=session.lora_config.rank if session.lora_config else 32,
+                model_path=save_path,  # Use file path directly (internal)
+            )
+
+            response = SaveWeightsForSamplerResponse(
+                path=None,  # Ephemeral - no path returned
+                sampling_session_id=sampling_session_id,
+            )
+            logger.info(
+                f"[save_weights_for_sampler] Ephemeral: created sampling session "
+                f"{sampling_session_id} with weights from {save_path}"
+            )
+
+        future_store.resolve(request_id, response.model_dump())
+
+    except Exception as e:
+        logger.exception(f"[save_weights_for_sampler] Failed: {e}")
         future_store.fail(request_id, str(e))
 
 

@@ -58,6 +58,7 @@ async def lifespan(app: FastAPI):
     # Make training components available to routes
     training.training_manager = train_manager
     training.training_engine = train_engine
+    training.inference_manager = inference_manager  # For ephemeral save flow
 
     logger.info("Training components initialized")
 

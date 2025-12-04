@@ -81,13 +81,21 @@ class SessionManager:
             await self.end_session(sid)
 
     async def create_session(
-        self, session_id: str, lora_rank: int = 32
+        self,
+        session_id: str,
+        lora_rank: int = 32,
+        model_path: str | None = None,
     ) -> VerlInferenceEngine:
         """Create a new session with dedicated engine.
+
+        Loads LoRA adapter at engine initialization time using vLLM's native
+        file-based LoRA loading. The adapter must be on a shared filesystem
+        accessible to both training and inference nodes.
 
         Args:
             session_id: Unique identifier for the session.
             lora_rank: LoRA rank for the adapter (0 = no LoRA).
+            model_path: Optional file:// URI or path to pre-trained LoRA adapter.
 
         Returns:
             The initialized VerlInferenceEngine for this session.
@@ -100,12 +108,19 @@ class SessionManager:
 
         from .verl_inference import VerlInferenceEngine
 
+        # Resolve adapter path if provided
+        adapter_path = None
+        if model_path:
+            adapter_path = self._resolve_model_path(model_path)
+
+        # Initialize engine WITH adapter path - vLLM loads LoRA at init
         engine = VerlInferenceEngine(
             model_path=self.model_path,
             tensor_parallel_size=self.tensor_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             max_model_len=self.max_model_len,
             lora_rank=lora_rank,
+            lora_adapter_path=adapter_path,  # Load at init time
         )
         await engine.initialize()
 
@@ -114,8 +129,33 @@ class SessionManager:
             last_activity=time.time(),
             lora_rank=lora_rank,
         )
-        logger.info(f"Created session {session_id} with lora_rank={lora_rank}")
+        logger.info(
+            f"Created session {session_id} with lora_rank={lora_rank}, "
+            f"adapter_path={adapter_path}"
+        )
         return engine
+
+    def _resolve_model_path(self, model_path: str) -> str:
+        """Resolve model_path URI to filesystem path.
+
+        Args:
+            model_path: URI like file:///path, tinker://localhost/path, or absolute path.
+
+        Returns:
+            Absolute filesystem path to adapter directory.
+        """
+        if model_path.startswith("file://"):
+            return model_path[7:]  # Strip file:// prefix
+        elif model_path.startswith("tinker://localhost"):
+            # Local server tinker:// format: tinker://localhost/<absolute_path>
+            # Extract path after 'tinker://localhost'
+            return model_path[len("tinker://localhost"):]
+        elif model_path.startswith("tinker://"):
+            # Cloud tinker:// paths not supported locally
+            raise ValueError(f"Cloud tinker:// paths not supported locally: {model_path}")
+        else:
+            # Assume absolute path
+            return model_path
 
     def get_engine(self, session_id: str) -> VerlInferenceEngine | None:
         """Get the engine for a session and update activity timestamp.

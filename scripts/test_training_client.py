@@ -162,75 +162,106 @@ def main():
         print(f"    ✓ Forward-backward completed")
         print(f"    ✓ Optimizer step completed")
 
-    print("\n✓ Training loop completed")
-
-    # # ========================================
-    # # Step 4: Save weights for inference
-    # # ========================================
-    # print("\n" + "=" * 60)
-    # print("STEP 4: Saving weights for inference")
-    # print("=" * 60)
-
-    # print("\nSaving trained weights...")
-    # save_future = training_client.save_weights_for_sampler(name="test_checkpoint")
-    # save_result = save_future.result()
-
-    # print(f"✓ Weights saved to: {save_result.path}")
-
-    # # ========================================
-    # # Step 5: Test inference with trained model
-    # # ========================================
-    # print("\n" + "=" * 60)
-    # print("STEP 5: Testing inference with trained model")
-    # print("=" * 60)
-
-    # print("\nCreating sampling client with trained weights...")
-    # sampling_client = service_client.create_sampling_client(
-    #     model_path=save_result.path
-    # )
-    # print("✓ Sampling client created")
-
-    # # Test prompt
-    # test_prompt = "What is 2 + 2?"
-    # messages = [{"role": "user", "content": test_prompt}]
-    # formatted_prompt = tokenizer.apply_chat_template(
-    #     messages,
-    #     tokenize=False,
-    #     add_generation_prompt=True,
-    # )
-    # prompt_tokens = tokenizer.encode(formatted_prompt, add_special_tokens=False)
-    # model_input = types.ModelInput.from_ints(prompt_tokens)
-
-    # print(f"\nTest prompt: {test_prompt}")
-    # print("Generating response...")
-
-    # sampling_params = types.SamplingParams(
-    #     max_tokens=64,
-    #     temperature=0.7,
-    # )
-
-    # sample_future = sampling_client.sample(
-    #     prompt=model_input,
-    #     num_samples=1,
-    #     sampling_params=sampling_params,
-    # )
-
-    # sample_result = sample_future.result()
-    # response_tokens = sample_result.sequences[0].tokens
-    # response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
-
-    # print(f"\nGenerated response:\n{response_text}")
+    print("\n Training loop completed")
 
     # ========================================
-    # Step 6: Cleanup
+    # Step 4: Save weights for inference
     # ========================================
     print("\n" + "=" * 60)
-    print("STEP 6: Cleanup")
+    print("STEP 4: Saving weights for inference")
+    print("=" * 60)
+
+    print("\nSaving trained weights...")
+    save_future = training_client.save_weights_for_sampler(name="test_checkpoint")
+    save_result = save_future.result()
+
+    print(f" Weights saved to: {save_result.path}")
+
+    # ========================================
+    # Step 5: Test inference with trained model
+    # ========================================
+    print("\n" + "=" * 60)
+    print("STEP 5: Testing inference with trained model")
+    print("=" * 60)
+
+    print("\nCreating sampling client with trained weights...")
+    sampling_client = service_client.create_sampling_client(
+        model_path=save_result.path
+    )
+    print(" Sampling client created")
+
+    # Test prompt
+    test_prompt = "What is 2 + 2?"
+    messages = [{"role": "user", "content": test_prompt}]
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    prompt_tokens = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+    model_input = types.ModelInput.from_ints(prompt_tokens)
+
+    print(f"\nTest prompt: {test_prompt}")
+    print("Generating response...")
+
+    sampling_params = types.SamplingParams(
+        max_tokens=64,
+        temperature=0.7,
+    )
+
+    sample_future = sampling_client.sample(
+        prompt=model_input,
+        num_samples=1,
+        sampling_params=sampling_params,
+    )
+
+    sample_result = sample_future.result()
+    response_tokens = sample_result.sequences[0].tokens
+    response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+    print(f"\nGenerated response:\n{response_text}")
+
+    print("\n Named flow test passed!")
+
+    # ========================================
+    # Step 6: Test ephemeral flow
+    # ========================================
+    print("\n" + "=" * 60)
+    print("STEP 6: Testing ephemeral flow (save_weights_and_get_sampling_client)")
+    print("=" * 60)
+
+    print("\nSaving weights and getting sampling client directly...")
+    ephemeral_sampling_client = training_client.save_weights_and_get_sampling_client()
+    print(" Ephemeral sampling client created")
+
+    # Test with same prompt
+    print(f"\nTest prompt: {test_prompt}")
+    print("Generating response with ephemeral weights...")
+
+    ephemeral_sample_future = ephemeral_sampling_client.sample(
+        prompt=model_input,
+        num_samples=1,
+        sampling_params=sampling_params,
+    )
+
+    ephemeral_sample_result = ephemeral_sample_future.result()
+    ephemeral_response_tokens = ephemeral_sample_result.sequences[0].tokens
+    ephemeral_response_text = tokenizer.decode(ephemeral_response_tokens, skip_special_tokens=True)
+
+    print(f"\nGenerated response (ephemeral):\n{ephemeral_response_text}")
+
+    print("\n Ephemeral flow test passed!")
+
+    # ========================================
+    # Step 7: Cleanup
+    # ========================================
+    print("\n" + "=" * 60)
+    print("STEP 7: Cleanup")
     print("=" * 60)
 
     # Note: Depending on tinker's API, you might need to delete the training client
     # training_client.delete() might not exist
-    print("\n✓ Test completed (cleanup not implemented)")
+    print("\n Test completed (cleanup not implemented)")
 
     print("\n" + "=" * 60)
     print("Training test completed successfully!")

@@ -5,6 +5,7 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -157,6 +158,64 @@ class TrainingWorker:
             "type": "optim_step",
         }
 
+    def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
+        """Extract LoRA adapter weights as state dict.
+
+        Returns:
+            Dict mapping parameter names to tensors (on CPU).
+        """
+        from peft.utils.save_and_load import get_peft_model_state_dict
+
+        state_dict = get_peft_model_state_dict(self.model)
+        # Move to CPU for serialization
+        return {k: v.cpu() for k, v in state_dict.items()}
+
+    def get_lora_config(self) -> dict:
+        """Get LoRA configuration as dictionary.
+
+        Returns:
+            PEFT config dict compatible with vLLM's PEFTHelper.
+        """
+        peft_config = self.model.peft_config.get("default")
+        return {
+            "r": peft_config.r,
+            "lora_alpha": peft_config.lora_alpha,
+            "lora_dropout": peft_config.lora_dropout,
+            "target_modules": list(peft_config.target_modules),
+            "bias": peft_config.bias,
+            "task_type": peft_config.task_type.value if peft_config.task_type else None,
+            "peft_type": "LORA",
+        }
+
+    def save_lora_weights(self, save_path: str) -> str:
+        """Save LoRA adapter to directory.
+
+        Args:
+            save_path: Directory path to save adapter files.
+
+        Returns:
+            Absolute path where weights were saved.
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        os.makedirs(save_path, exist_ok=True)
+
+        # Save adapter weights
+        state_dict = self.get_lora_state_dict()
+        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+
+        # Save adapter config
+        config = self.get_lora_config()
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
+        return abs_path
+
     def shutdown(self) -> None:
         """Release GPU resources."""
         logger.info("[TrainingWorker] Shutting down")
@@ -288,6 +347,52 @@ class VerlTrainingEngine:
 
         logger.info(f"[{model_id}] optim_step: step={session.current_step}")
         return result
+
+    async def save_weights_for_sampler(
+        self,
+        session: TrainingSession,
+        checkpoint_name: str,
+        checkpoint_base_dir: str,
+    ) -> str:
+        """Save LoRA weights for inference use.
+
+        Fetches weights from remote Ray worker via object store, then saves
+        locally on API server. This handles distributed deployments where
+        training worker and API server are on different machines.
+
+        Args:
+            session: Training session with model.
+            checkpoint_name: Name for this checkpoint.
+            checkpoint_base_dir: Base directory for checkpoints.
+
+        Returns:
+            Absolute path to saved checkpoint directory.
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+
+        # Fetch weights and config from remote worker via Ray object store
+        state_dict, config = await asyncio.gather(
+            worker.get_lora_state_dict.remote(),
+            worker.get_lora_config.remote(),
+        )
+
+        # Save locally on API server
+        save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)
+        os.makedirs(save_path, exist_ok=True)
+
+        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[{model_id}] Saved weights for sampler to {abs_path}")
+        return abs_path
 
     async def shutdown_session(self, session: TrainingSession) -> None:
         """Kill Ray actor to release GPU.

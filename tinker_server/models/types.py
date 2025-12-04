@@ -96,8 +96,9 @@ class CreateSamplingSessionRequest(BaseModel):
     """Request to create a sampling session."""
 
     session_id: str
+    sampling_session_seq_id: int | None = None  # Sequence within session
     base_model: str | None = None
-    model_path: str | None = None
+    model_path: str | None = None  # tinker:// or file:// path to weights
     lora_rank: int = 32  # LoRA rank for per-session adapter
 
 
@@ -241,12 +242,53 @@ class OptimStepResponse(BaseModel):
 
 
 class TelemetryRequest(BaseModel):
-    """Telemetry data from tinker client."""
+    """Telemetry data from tinker client (discarded)."""
 
     events: list[dict[str, Any]] = []
+    platform: str = ""
+    sdk_version: str = ""
+    session_id: str = ""
 
 
 class TelemetryResponse(BaseModel):
     """Response for telemetry submission."""
 
     status: Literal["accepted"] = "accepted"
+
+
+class SessionHeartbeatRequest(BaseModel):
+    """Heartbeat request to keep session alive."""
+
+    session_id: str
+    type: Literal["session_heartbeat"] = "session_heartbeat"
+
+
+class SessionHeartbeatResponse(BaseModel):
+    """Heartbeat response."""
+
+    type: Literal["session_heartbeat"] = "session_heartbeat"
+
+
+# =============================================================================
+# Weight Sync Types
+# =============================================================================
+
+
+class SaveWeightsForSamplerRequest(BaseModel):
+    """Request to save model weights for sampler use."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    path: str | None = None  # checkpoint name for named save (None for ephemeral)
+    seq_id: int | None = None
+    sampling_session_seq_id: int | None = None  # For ephemeral flow
+    type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
+
+
+class SaveWeightsForSamplerResponse(BaseModel):
+    """Response from save weights for sampler."""
+
+    path: str | None = None  # file:// or tinker:// URI (None for ephemeral)
+    sampling_session_id: str | None = None  # For ephemeral flow
+    type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"

@@ -15,6 +15,7 @@ Environment variables:
 - `HF_HUB_OFFLINE=1` - Force offline mode (no network access to HuggingFace)
 - `HF_HOME` - Path to local HuggingFace cache directory
 - `TINKER_MODEL_PATH` - Full path to model snapshot directory
+- `TINKER_CHECKPOINT_DIR` - Directory for saving LoRA checkpoints (must be shared filesystem in distributed deployments)
 
 ## Running with Ray Cluster
 
@@ -70,6 +71,22 @@ EOS token detection is now working correctly. The fix adds `stop_token_ids=[1516
 
 **Location:** `tinker_server/backend/verl_inference.py:151` and `tinker_server/routes/sampling.py:72-76`
 
+### 3. Slow training-to-inference weight sync (BLOCKING)
+When syncing LoRA weights from training to inference via `save_weights_for_sampler`, each new sampling session spawns a fresh vLLM engine. This causes significant latency (tens of seconds) per weight sync.
+
+**Root cause:** Current architecture creates one vLLM engine per sampling session. Loading LoRA at init requires full engine startup.
+
+**Impact:** RL training loops that frequently sync weights between training and inference are bottlenecked by engine initialization time.
+
+**To fix:** Implement hot LoRA reload into running vLLM engine. Requires:
+1. Apply verl's `VLLMHijack` to patch vLLM for `TensorLoRARequest` support
+2. Use `engine.add_lora()` to hot-swap adapters without restart
+3. Alternatively, use vLLM's native multi-LoRA with dynamic adapter loading
+
+**Workaround:** For now, minimize weight sync frequency or batch multiple training steps before sync.
+
+**Related:** See "Future: vLLM Multi-LoRA" in Architecture Notes.
+
 ## Testing
 
 ### Using tinker SamplingClient (recommended)
@@ -77,8 +94,6 @@ EOS token detection is now working correctly. The fix adds `stop_token_ids=[1516
 ```bash
 TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy python scripts/test_client.py
 ```
-
-Note: Telemetry errors (404 for `/api/v1/telemetry/send`) are expected - telemetry endpoint not implemented in MVP.
 
 Expected output:
 ```

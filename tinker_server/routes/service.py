@@ -4,7 +4,8 @@ Endpoints:
 - GET /healthz: Health check
 - POST /create_session: Create a new session
 - POST /create_sampling_session: Create a sampling session with dedicated engine
-- POST /telemetry/send: Accept telemetry data
+- POST /session_heartbeat: Keep session alive
+- POST /telemetry: Accept telemetry data (discarded)
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from ..models.types import (
     CreateSamplingSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
+    SessionHeartbeatRequest,
+    SessionHeartbeatResponse,
     TelemetryRequest,
     TelemetryResponse,
 )
@@ -64,6 +67,9 @@ async def create_sampling_session(
 
     Each sampling session spawns a new VerlInferenceEngine with its own
     LoRA adapter, enabling session isolation.
+
+    If model_path is provided (e.g., from save_weights_for_sampler), the
+    engine will load pre-trained LoRA weights from that path.
     """
     if session_manager is None:
         raise HTTPException(status_code=503, detail="Session manager not initialized")
@@ -74,6 +80,7 @@ async def create_sampling_session(
     await session_manager.create_session(
         session_id=sampling_session_id,
         lora_rank=request.lora_rank,
+        model_path=request.model_path,  # Pass LoRA adapter path for weight loading
     )
 
     # Store metadata
@@ -84,7 +91,18 @@ async def create_sampling_session(
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
 
-@router.post("/telemetry/send")
+@router.post("/session_heartbeat")
+async def session_heartbeat(
+    request: SessionHeartbeatRequest,
+) -> SessionHeartbeatResponse:
+    """Keep session alive.
+
+    Accepts heartbeat and returns acknowledgment. Session validation not implemented.
+    """
+    return SessionHeartbeatResponse()
+
+
+@router.post("/telemetry")
 async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
     """Accept telemetry data from tinker client.
 
