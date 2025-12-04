@@ -260,6 +260,39 @@ class SessionManager:
             # Assume absolute path
             return model_path
 
+    def create_session_with_engine(
+        self,
+        session_id: str,
+        engine: "VerlInferenceEngine",
+        lora_rank: int = 32,
+    ) -> None:
+        """Register a session with an already-initialized engine.
+
+        Used for per-session inference engines created by training sessions.
+        The engine is already initialized and owns its own lifecycle.
+
+        Args:
+            session_id: Unique identifier for the session.
+            engine: An already-initialized VerlInferenceEngine.
+            lora_rank: LoRA rank for the adapter.
+
+        Raises:
+            ValueError: If session_id already exists.
+        """
+        if session_id in self._sessions:
+            raise ValueError(f"Session {session_id} already exists")
+
+        self._sessions[session_id] = SessionInfo(
+            engine=engine,
+            last_activity=time.time(),
+            lora_rank=lora_rank,
+            is_shared=True,  # Mark as shared to prevent SessionManager from shutting it down
+        )
+        logger.info(
+            f"Registered session {session_id} with external engine "
+            f"(lora_rank={lora_rank})"
+        )
+
     def get_engine(self, session_id: str) -> VerlInferenceEngine | None:
         """Get the engine for a session and update activity timestamp.
 

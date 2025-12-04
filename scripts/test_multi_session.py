@@ -1,156 +1,128 @@
 #!/usr/bin/env python
-"""Test multi-session concurrent requests to tinker-server.
+"""Test concurrent training sessions.
 
-Creates multiple sampling sessions and sends requests simultaneously
-to verify the server handles concurrent sessions correctly.
+Each session gets its own training worker and inference engine,
+enabling parallel training without interference.
 
 Usage:
-    export TINKER_BASE_URL=http://localhost:8000
-    python scripts/test_multi_session.py
+    TINKER_BASE_URL=http://localhost:8000 python scripts/test_multi_session.py
 """
 
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import traceback
 
-# Add tinker to path if not installed
 tinker_path = os.path.join(os.path.dirname(__file__), "../../tinker/src")
 if os.path.exists(tinker_path):
     sys.path.insert(0, tinker_path)
 
 os.environ.setdefault("TINKER_BASE_URL", "http://localhost:8000")
 
+import torch
 from tinker import types
 from tinker.lib.public_interfaces.service_client import ServiceClient
+from tinker.types.tensor_data import TensorData
+from transformers import AutoTokenizer
 
 
-# Different prompts for each session
-PROMPTS = [
-    "What is the capital of France?",
-    "What is 2 + 2?",
-    "Name a color.",
-    "What is the largest planet?",
-    "Say hello.",
-]
+def run_training_session(session_name: str, results: dict):
+    """Run a training session and record result."""
+    try:
+        print(f"[{session_name}] Starting...")
 
+        model_name = "Qwen/Qwen2.5-7B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        service_client = ServiceClient(base_url=os.environ.get("TINKER_BASE_URL"))
 
-def create_session_and_sample(session_idx: int, tokenizer, prompt_text: str) -> dict:
-    """Create a sampling session and send a request."""
-    start = time.time()
+        print(f"[{session_name}] Creating training client...")
+        training_client = service_client.create_lora_training_client(
+            base_model=model_name,
+            rank=32,
+        )
+        print(f"[{session_name}] Training client created")
 
-    # Create independent ServiceClient and SamplingClient
-    client = ServiceClient()
-    sampling_client = client.create_sampling_client(
-        base_model="Qwen/Qwen2.5-7B-Instruct"
-    )
-    session_id = sampling_client._sampling_session_id
-    setup_time = time.time() - start
+        # Simple training data
+        prompt = f"Test prompt for {session_name}"
+        response = f"Test response for {session_name}"
 
-    # Prepare prompt with chat template
-    messages = [{"role": "user", "content": prompt_text}]
-    formatted_prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    prompt_tokens = tokenizer.encode(formatted_prompt, add_special_tokens=False)
-    prompt = types.ModelInput.from_ints(prompt_tokens)
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
+        resp_tokens = tokenizer.encode(response, add_special_tokens=False)
+        eos_token_id = tokenizer.eos_token_id
 
-    params = types.SamplingParams(max_tokens=32, temperature=0.7, top_p=0.9)
+        full = prompt_tokens + resp_tokens + [eos_token_id]
+        plen = len(prompt_tokens)
+        mask = [0.0] * (plen - 1) + [1.0] * (len(resp_tokens) + 1)
 
-    # Send request
-    sample_start = time.time()
-    future = sampling_client.sample(prompt=prompt, num_samples=1, sampling_params=params)
-    result = future.result(timeout=120)
-    sample_time = time.time() - sample_start
+        datum = types.Datum(
+            model_input=types.ModelInput.from_ints(full[:-1]),
+            loss_fn_inputs={
+                "target_tokens": TensorData.from_torch(
+                    torch.tensor(full[1:], dtype=torch.long)
+                ),
+                "loss_mask": TensorData.from_torch(
+                    torch.tensor(mask, dtype=torch.float32)
+                ),
+            },
+        )
 
-    # Decode response
-    response_text = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
+        adam = types.AdamParams(learning_rate=1e-3, beta1=0.9, beta2=0.95, eps=1e-8)
 
-    return {
-        "session_idx": session_idx,
-        "session_id": session_id[:8],
-        "prompt": prompt_text,
-        "response": response_text[:50],
-        "tokens": len(result.sequences[0].tokens),
-        "stop_reason": result.sequences[0].stop_reason,
-        "setup_time": setup_time,
-        "sample_time": sample_time,
-    }
+        # Run 3 training steps
+        for step in range(3):
+            print(f"[{session_name}] Step {step+1}/3...")
+            training_client.forward_backward([datum], loss_fn="cross_entropy").result()
+            training_client.optim_step(adam).result()
+
+        print(f"[{session_name}] Getting sampler...")
+        sampler = training_client.save_weights_and_get_sampling_client()
+
+        print(f"[{session_name}] Testing inference...")
+        tokens = tokenizer.encode("Hello", add_special_tokens=True)
+        model_input = types.ModelInput.from_ints(tokens)
+        sample_params = types.SamplingParams(max_tokens=10, temperature=0.1)
+        result = sampler.sample(
+            prompt=model_input, num_samples=1, sampling_params=sample_params
+        ).result()
+
+        results[session_name] = "SUCCESS"
+        print(f"[{session_name}] Done!")
+
+    except Exception as e:
+        results[session_name] = f"FAILED: {e}"
+        print(f"[{session_name}] FAILED: {e}")
+        traceback.print_exc()
 
 
 def main():
-    num_sessions = int(os.environ.get("NUM_SESSIONS", "5"))
-    print(f"Testing {num_sessions} concurrent sessions")
-    print(f"Server: {os.environ.get('TINKER_BASE_URL')}")
-    print("=" * 70)
+    results = {}
 
-    # Load tokenizer once
-    print("Loading tokenizer...")
-    from transformers import AutoTokenizer
-    model_path = os.environ.get("TINKER_MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # Run two training sessions in parallel
+    t1 = threading.Thread(target=run_training_session, args=("Session-A", results))
+    t2 = threading.Thread(target=run_training_session, args=("Session-B", results))
 
-    # Use prompts cyclically if num_sessions > len(PROMPTS)
-    prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_sessions)]
+    print("Starting concurrent training sessions...")
+    start = time.time()
 
-    # Run all sessions concurrently
-    print(f"\nStarting {num_sessions} concurrent requests...")
-    start_time = time.time()
+    t1.start()
+    time.sleep(0.5)  # Small delay to stagger
+    t2.start()
 
-    results = []
-    errors = []
+    t1.join()
+    t2.join()
 
-    with ThreadPoolExecutor(max_workers=num_sessions) as executor:
-        futures = {
-            executor.submit(create_session_and_sample, i, tokenizer, prompts[i]): i
-            for i in range(num_sessions)
-        }
+    elapsed = time.time() - start
 
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                result = future.result()
-                results.append(result)
-                print(f"  Session {idx}: completed ({result['tokens']} tokens)")
-            except Exception as e:
-                errors.append((idx, str(e)))
-                print(f"  Session {idx}: FAILED - {e}")
+    print(f"\n{'='*60}")
+    print(f"RESULTS (elapsed: {elapsed:.1f}s)")
+    print(f"{'='*60}")
+    for name, result in results.items():
+        print(f"  {name}: {result}")
 
-    total_time = time.time() - start_time
-
-    # Print results
-    print("\n" + "=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-
-    for r in sorted(results, key=lambda x: x["session_idx"]):
-        print(f"\nSession {r['session_idx']} (id: {r['session_id']}...):")
-        print(f"  Prompt: {r['prompt']}")
-        print(f"  Response: {r['response']}...")
-        print(f"  Tokens: {r['tokens']}, Stop: {r['stop_reason']}")
-        print(f"  Setup: {r['setup_time']:.2f}s, Sample: {r['sample_time']:.2f}s")
-
-    # Summary
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print(f"Total sessions: {num_sessions}")
-    print(f"Successful: {len(results)}")
-    print(f"Failed: {len(errors)}")
-    print(f"Total time: {total_time:.2f}s")
-
-    if results:
-        avg_sample = sum(r["sample_time"] for r in results) / len(results)
-        print(f"Avg sample time: {avg_sample:.2f}s")
-        print(f"Throughput: {len(results) / total_time:.2f} requests/s")
-
-    if errors:
-        print("\nErrors:")
-        for idx, err in errors:
-            print(f"  Session {idx}: {err}")
+    # Exit with error if any session failed
+    if any("FAILED" in r for r in results.values()):
         sys.exit(1)
-    else:
-        print("\nAll sessions completed successfully!")
 
 
 if __name__ == "__main__":

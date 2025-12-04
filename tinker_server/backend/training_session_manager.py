@@ -8,10 +8,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..models.types import LoRAConfig
+    from .verl_inference import VerlInferenceEngine
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ class TrainingSession:
     accumulated_gradients: int = 0
     is_active: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    # Per-session inference engine for isolated concurrent access
+    # Lazily initialized on first save_weights_for_sampler call
+    inference_engine: Any = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for API response."""
@@ -148,11 +153,20 @@ class TrainingSessionManager:
         session_ids = list(self._sessions.keys())
         for model_id in session_ids:
             session = self._sessions.get(model_id)
-            if session and session.is_active:
-                try:
-                    await engine.shutdown_session(session)
-                    logger.info(f"Shutdown training session: {model_id}")
-                except Exception as e:
-                    logger.error(f"Failed to shutdown session {model_id}: {e}")
+            if session:
+                # Shutdown training worker
+                if session.is_active:
+                    try:
+                        await engine.shutdown_session(session)
+                        logger.info(f"Shutdown training session: {model_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to shutdown session {model_id}: {e}")
+                # Shutdown per-session inference engine if present
+                if session.inference_engine is not None:
+                    try:
+                        await session.inference_engine.shutdown()
+                        logger.info(f"Shutdown inference engine for session: {model_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to shutdown inference engine {model_id}: {e}")
             self._sessions.pop(model_id, None)
         logger.info(f"Shutdown {len(session_ids)} training sessions")

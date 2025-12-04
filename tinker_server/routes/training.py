@@ -226,7 +226,7 @@ async def _do_save_weights_for_sampler(
 
     Two flows:
     - Named (path is not None): Save to persistent location, return path
-    - Ephemeral (path is None): Save to temp, create sampling session, return session_id
+    - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
     try:
         if training_engine is None:
@@ -264,18 +264,57 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=None,
             )
         else:
-            # Ephemeral flow: Use shared engine with hot LoRA reload (100x faster)
+            # Ephemeral flow: Use per-session inference engine for isolation
+            # Each training session gets its own inference engine, enabling
+            # concurrent training sessions without interference.
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
+
+            import time
+            from ..backend.verl_inference import VerlInferenceEngine
 
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
 
-            # Use create_ephemeral_session for fast hot-reload (100-300ms)
-            # instead of create_session (30-60s engine startup)
-            await inference_manager.create_ephemeral_session(
+            if session.inference_engine is None:
+                # First call: Create dedicated inference engine for this training session
+                logger.info(
+                    f"[save_weights_for_sampler] Creating per-session inference engine "
+                    f"for {session.model_id}"
+                )
+                start_time = time.time()
+
+                # Get config from inference_manager
+                engine = VerlInferenceEngine(
+                    model_path=inference_manager.model_path,
+                    tensor_parallel_size=inference_manager.tensor_parallel_size,
+                    gpu_memory_utilization=inference_manager.gpu_memory_utilization,
+                    max_model_len=inference_manager.max_model_len,
+                    lora_rank=lora_rank,
+                    lora_adapter_path=save_path,  # Load adapter at init
+                )
+                await engine.initialize()
+                session.inference_engine = engine
+
+                init_time = time.time() - start_time
+                logger.info(
+                    f"[save_weights_for_sampler] Per-session engine initialized "
+                    f"in {init_time:.2f}s for {session.model_id}"
+                )
+            else:
+                # Subsequent calls: Hot-reload LoRA on existing engine
+                start_time = time.time()
+                await session.inference_engine.load_lora_from_path(save_path)
+                reload_time = time.time() - start_time
+                logger.info(
+                    f"[save_weights_for_sampler] Hot-reloaded LoRA "
+                    f"in {reload_time:.3f}s for {session.model_id}"
+                )
+
+            # Register sampling session pointing to per-session engine
+            inference_manager.create_session_with_engine(
                 session_id=sampling_session_id,
-                adapter_path=save_path,
+                engine=session.inference_engine,
                 lora_rank=lora_rank,
             )
 
@@ -284,8 +323,8 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             )
             logger.info(
-                f"[save_weights_for_sampler] Ephemeral: hot-reload session "
-                f"{sampling_session_id} from {save_path}"
+                f"[save_weights_for_sampler] Ephemeral: session "
+                f"{sampling_session_id} using per-session engine for {session.model_id}"
             )
 
         future_store.resolve(request_id, response.model_dump())

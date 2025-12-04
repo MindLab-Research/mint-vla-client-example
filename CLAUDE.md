@@ -223,23 +223,22 @@ Two session creation modes with different performance tradeoffs:
 - Full engine initialization (~60s) but complete isolation
 - Use for: Long-running sessions, production deployments with stable weights
 
-**2. Ephemeral Sessions (shared engine + hot reload)**
-- `save_weights_and_get_sampling_client()` uses shared VerlInferenceEngine
-- First call initializes shared engine (~60s), subsequent calls hot-reload LoRA (~0.68s)
-- All ephemeral sessions share one engine (no isolation)
+**2. Ephemeral Sessions (per-training-session engine)**
+- `save_weights_and_get_sampling_client()` uses per-training-session VerlInferenceEngine
+- First call initializes dedicated engine (~60s), subsequent calls hot-reload LoRA (~0.7s)
+- Each training session gets its own isolated engine
+- Concurrent training sessions don't interfere with each other
 - Use for: RL training loops with frequent weight updates
 
 **Implementation:**
-- `SessionManager._shared_engine` - Single shared engine for all ephemeral sessions
-- `create_ephemeral_session()` - Hot-reloads LoRA via `add_lora_from_tensors()`
-- Sessions with `is_shared=True` don't shutdown engine on end
+- `TrainingSession.inference_engine` - Per-training-session inference engine
+- `SessionManager.create_session_with_engine()` - Registers external engines
+- `TrainingSessionManager.shutdown_all()` - Cleans up inference engines on exit
 
-### Future: vLLM Multi-LoRA
+### Concurrent Training Sessions
 
-For true multi-tenant inference with isolation under high load:
+Multiple training sessions can run in parallel. Each session has:
+- Its own `TrainingWorker` Ray actor for training
+- Its own `VerlInferenceEngine` for inference (lazily initialized)
 
-- Single vLLM server with `enable_lora=True`, `max_loras=N`
-- Multiple LoRA adapters loaded simultaneously
-- Per-request `lora_request` routing (different users, different adapters)
-
-Current shared engine only supports one active LoRA at a time. Multi-LoRA would allow concurrent users with different adapters.
+This ensures complete isolation - one session's LoRA reload doesn't affect another session's inference.

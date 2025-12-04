@@ -40,23 +40,30 @@ max_tokens = self.config.max_model_len - len(prompt_ids)  # Ignores user's max_t
 **Fix:** Monkey-patched via `ExtendedVLLMHttpServer.generate()` override in `verl_inference.py`.
 Uses `min(user_max_tokens, max_model_len - prompt_len)` to respect user's limit while staying within engine bounds.
 
-### 2. Concurrent Session Crash (HIGH PRIORITY)
+### 2. Concurrent Session Crash (FIXED)
 
-**Problem:** Running two training sessions in parallel causes `EngineDeadError` crash.
+**Problem:** Running two training sessions in parallel caused `EngineDeadError` crash.
 
-**Root cause:** Shared inference engine has no locking around hot-reload + inference operations.
-- `_shared_engine_lock` only protects engine creation
-- When session B hot-reloads LoRA while session A is inferring, vLLM engine crashes
+**Root cause:** Shared inference engine had no locking around hot-reload + inference operations.
+- `_shared_engine_lock` only protected engine creation
+- When session B hot-reloaded LoRA while session A was inferring, vLLM engine crashed
 
-**Reproduction:** Run two SFT training clients in parallel:
-```bash
-python /tmp/test_concurrent_sft.py  # Crashes with EngineDeadError
-```
+**Fix:** Implemented per-session inference engines.
 
-**Solution options:**
-1. **Session serialization:** Add lock around `create_ephemeral_session()` + inference operations
-2. **Per-session engines:** Each training session gets dedicated inference engine (slower but isolated)
-3. **vLLM multi-LoRA:** Use `max_loras=N` with per-request adapter routing (requires vLLM config)
+Each training session now gets its own dedicated `VerlInferenceEngine`:
+- On first `save_weights_and_get_sampling_client()` call: Creates new engine (~60s)
+- On subsequent calls: Hot-reloads LoRA on session's own engine (~0.7s)
+- Engines are isolated - no interference between concurrent sessions
+
+**Implementation:**
+- `TrainingSession.inference_engine` field holds per-session engine
+- `SessionManager.create_session_with_engine()` registers external engines
+- `TrainingSessionManager.shutdown_all()` cleans up inference engines
+
+**Location:**
+- `tinker_server/backend/training_session_manager.py:39-41` (new field)
+- `tinker_server/backend/session_manager.py:263-294` (new method)
+- `tinker_server/routes/training.py:266-328` (modified flow)
 
 ---
 
@@ -90,14 +97,15 @@ Client (HTTP)
     ▼
 API Server (FastAPI)
     ├── SessionManager (inference)
-    │   ├── Per-session VerlInferenceEngine (named flow)
-    │   └── Shared VerlInferenceEngine (ephemeral flow, 88x faster)
+    │   └── Per-session VerlInferenceEngine (named flow)
     │
     └── TrainingSessionManager
-        └── VerlTrainingEngine → TrainingWorker Ray actors
+        └── TrainingSession
+            ├── VerlTrainingEngine → TrainingWorker Ray actors
+            └── VerlInferenceEngine (per-session, for ephemeral flow)
 
 GPU Workers (Ray cluster)
-    ├── ExtendedVLLMHttpServer (inference)
+    ├── ExtendedVLLMHttpServer (inference - one per training session)
     └── TrainingWorker (LoRA training)
 ```
 
