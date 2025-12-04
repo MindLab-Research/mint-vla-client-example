@@ -1,155 +1,90 @@
-# Integration Plan: Training + Per-Session Inference
+# tinker-server Development Plan
 
-## Goal
+## Completed: Phase 1 - Training + Inference Integration
 
-Integrate training from `lx_feature` branch while keeping per-session inference from `main`.
+All features from original plan implemented and working.
 
-Architecture:
-- Per-session inference: `SessionManager` → `VerlInferenceEngine` per sampling session
-- Per-session training: `TrainingSessionManager` → `VerlTrainingEngine` per model
-- Both active simultaneously (no mutually exclusive modes)
+### Implemented Features
 
-## Architecture
+| Component | Status | Commit |
+|-----------|--------|--------|
+| Training types in types.py | Done | - |
+| TrainingSessionManager | Done | - |
+| VerlTrainingEngine | Done | - |
+| Training routes (/create_model, /forward_backward, /optim_step) | Done | - |
+| Save weights for sampler | Done | - |
+| Telemetry endpoint | Done | - |
+| Per-session inference engines | Done | - |
+| Hot LoRA reload (88x speedup) | Done | da69d06 |
+
+### Test Scripts
+
+- `scripts/test_client.py` - Inference flow
+- `scripts/test_training_client.py` - Training + inference integration
+
+---
+
+## Next: Phase 2 - Production Readiness
+
+Candidates for next development phase:
+
+### 1. Multi-Session Isolation (Medium Priority)
+
+**Problem:** Current shared engine only supports one active LoRA. Multiple concurrent training sessions overwrite each other's weights.
+
+**Solution options:**
+- vLLM multi-LoRA with `max_loras=N` and per-request adapter routing
+- Session queuing (serialize ephemeral requests)
+- Multiple shared engines (one per LoRA rank)
+
+### 2. max_tokens Support (Low Priority - Upstream)
+
+**Problem:** User's `max_tokens` parameter ignored. Requires verl upstream change.
+
+**Workaround:** Use `stop_token_ids` for EOS detection (already implemented).
+
+### 3. Observability (Medium Priority)
+
+- Prometheus metrics (request latency, throughput, GPU utilization)
+- Structured logging with request tracing
+- Health check endpoints
+
+### 4. Error Resilience (Medium Priority)
+
+- Graceful handling of Ray actor failures
+- Automatic session recovery after GPU OOM
+- Circuit breaker for inference requests
+
+### 5. Testing (Low Priority)
+
+- Unit tests for session managers
+- Integration tests with mock Ray actors
+- Load testing scripts
+
+---
+
+## Architecture Reference
 
 ```
-app.py lifespan
-├── SessionManager (inference)
-│   ├── session_1 → VerlInferenceEngine (lora_rank=32)
-│   ├── session_2 → VerlInferenceEngine (lora_rank=64)
-│   └── session_N → VerlInferenceEngine
-│
-└── TrainingSessionManager (training)
-    ├── model_1 → TrainingSession → VerlTrainingEngine state
-    ├── model_2 → TrainingSession → VerlTrainingEngine state
-    └── model_N → TrainingSession
+Client (HTTP)
+    │
+    ▼
+API Server (FastAPI)
+    ├── SessionManager (inference)
+    │   ├── Per-session VerlInferenceEngine (named flow)
+    │   └── Shared VerlInferenceEngine (ephemeral flow, 88x faster)
+    │
+    └── TrainingSessionManager
+        └── VerlTrainingEngine → TrainingWorker Ray actors
+
+GPU Workers (Ray cluster)
+    ├── ExtendedVLLMHttpServer (inference)
+    └── TrainingWorker (LoRA training)
 ```
 
-## Implementation Steps
-
-### 1. Add training types to `types.py`
-
-From lx_feature, add (without duplicates):
-- `LoRAConfig`
-- `CreateModelRequest`, `CreateModelResponse`
-- `Datum`, `TensorData`
-- `ForwardBackwardInput`, `ForwardBackwardRequest`
-- `AdamParams`, `OptimStepRequest`, `OptimStepResponse`
-- `TelemetryRequest`, `TelemetryResponse`
-
-### 2. Create `training_session_manager.py`
-
-New file for training session management (separate from inference SessionManager):
-
-```python
-class TrainingSession:
-    model_id: str
-    session_id: str
-    model_seq_id: int
-    base_model: str
-    lora_config: LoRAConfig
-    current_step: int
-    # ... training state
-
-class TrainingSessionManager:
-    _sessions: dict[str, TrainingSession]
-
-    def create_session(model_id, ...) -> TrainingSession
-    def get_session(model_id) -> TrainingSession | None
-    def delete_session(model_id) -> bool
-    def list_sessions() -> list[TrainingSession]
-```
-
-### 3. Create `verl_training.py`
-
-From lx_feature, adapt the training engine:
-- Uses PyTorch + PEFT for LoRA
-- Per-session model/optimizer state
-- Methods: `create_training_session`, `forward_backward`, `optim_step`, `shutdown_session`
-
-Key fix: Remove Chinese comments, use English throughout.
-
-### 4. Create `routes/training.py`
-
-Training endpoints:
-- `POST /create_model` → create training session
-- `POST /forward_backward` → forward + backward pass
-- `POST /optim_step` → optimizer update
-- `GET /models` → list training sessions
-- `DELETE /models/{model_id}` → delete session
-
-### 5. Update `app.py`
-
-Initialize both managers:
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Inference manager (existing)
-    inference_manager = SessionManager(...)
-    service.session_manager = inference_manager
-    sampling.session_manager = inference_manager
-    await inference_manager.start_cleanup_task()
-
-    # Training manager (new)
-    training_manager = TrainingSessionManager()
-    training_engine = VerlTrainingEngine()
-    await training_engine.initialize()
-    training.training_manager = training_manager
-    training.training_engine = training_engine
-
-    yield
-
-    # Shutdown both
-    await inference_manager.shutdown_all()
-    await training_manager.shutdown_all(training_engine)
-```
-
-### 6. Register training routes
-
-In `app.py`:
-```python
-from .routes import training
-app.include_router(training.router, prefix="/api/v1", tags=["training"])
-```
-
-### 7. Add telemetry endpoint
-
-In `service.py`:
-```python
-@router.post("/telemetry/send")
-async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
-    return TelemetryResponse(status="accepted")
-```
-
-## Files Changed
-
-New:
-- `tinker_server/backend/training_session_manager.py`
-- `tinker_server/backend/verl_training.py`
-- `tinker_server/routes/training.py`
-
-Modified:
-- `tinker_server/models/types.py` (add training types)
-- `tinker_server/app.py` (initialize both managers)
-- `tinker_server/routes/service.py` (add telemetry endpoint)
-
-Unchanged:
-- `tinker_server/backend/session_manager.py` (inference sessions)
-- `tinker_server/backend/verl_inference.py`
-- `tinker_server/routes/sampling.py`
-
-## Bug Fixes from lx_feature
-
-1. ~~config.py boolean parsing~~ - Not needed (no ENABLE_TRAINING flag)
-2. Duplicate `LossFnOutput` class - Only include once in types.py
-
-## Testing
-
-After implementation:
-```bash
-# Test inference (existing)
-python scripts/test_client.py
-
-# Test training (new)
-python scripts/test_training_client.py
-```
+Data flow for ephemeral weight sync:
+1. TrainingWorker.get_lora_state_dict() → tensors via Ray
+2. API server saves to checkpoint directory
+3. API server loads tensors from checkpoint
+4. server.add_lora_from_tensors.remote() → tensors via Ray
+5. GPU worker saves to temp, loads via LoRARequest

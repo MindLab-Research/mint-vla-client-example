@@ -69,23 +69,22 @@ User's `max_tokens` parameter in sampling requests is currently ignored. verl co
 ### 2. EOS token detection (FIXED)
 EOS token detection is now working correctly. The fix adds `stop_token_ids=[151645, 151643]` to the sampling parameters in verl_inference.py, and the sampling route correctly detects the stop reason based on presence of EOS tokens in the generated sequence.
 
-**Location:** `tinker_server/backend/verl_inference.py:151` and `tinker_server/routes/sampling.py:72-76`
+**Location:** `tinker_server/backend/verl_inference.py:283` and `tinker_server/routes/sampling.py:72-76`
 
-### 3. Slow training-to-inference weight sync (BLOCKING)
-When syncing LoRA weights from training to inference via `save_weights_for_sampler`, each new sampling session spawns a fresh vLLM engine. This causes significant latency (tens of seconds) per weight sync.
+### 3. Slow training-to-inference weight sync (FIXED)
+Hot LoRA reload implemented via shared engine pattern. Achieved 88x speedup.
 
-**Root cause:** Current architecture creates one vLLM engine per sampling session. Loading LoRA at init requires full engine startup.
+**Implementation:**
+- `SessionManager._shared_engine` - Lazily initialized shared vLLM engine
+- `create_ephemeral_session()` - Uses shared engine with hot LoRA reload (0.68s)
+- `add_lora_from_tensors()` - Transfers tensors via Ray to GPU worker, saves locally, loads via file-based LoRARequest
 
-**Impact:** RL training loops that frequently sync weights between training and inference are bottlenecked by engine initialization time.
+**Performance:**
+- Named flow (new engine per session): ~60s
+- Ephemeral flow first call (init shared engine): ~60s
+- Ephemeral flow subsequent calls (hot reload only): ~0.68s (88x faster)
 
-**To fix:** Implement hot LoRA reload into running vLLM engine. Requires:
-1. Apply verl's `VLLMHijack` to patch vLLM for `TensorLoRARequest` support
-2. Use `engine.add_lora()` to hot-swap adapters without restart
-3. Alternatively, use vLLM's native multi-LoRA with dynamic adapter loading
-
-**Workaround:** For now, minimize weight sync frequency or batch multiple training steps before sync.
-
-**Related:** See "Future: vLLM Multi-LoRA" in Architecture Notes.
+**Location:** `tinker_server/backend/session_manager.py:103-184` and `tinker_server/backend/verl_inference.py:77-132`
 
 ## Testing
 
@@ -217,21 +216,32 @@ Note:
 
 ## Architecture Notes
 
-### Current: One Server Per Session
+### Inference Modes
 
-Each sampling session spawns a dedicated verl server with its own LoRA adapter.
+Two session creation modes with different performance tradeoffs:
 
-- SessionManager maps session_id → VerlInferenceEngine
-- LoRA weights randomly initialized at session creation
-- Engine shutdown on session end via `/end_session`
+**1. Named Sessions (per-session engine)**
+- `create_sampling_session(model_path=...)` spawns dedicated VerlInferenceEngine
+- Full engine initialization (~60s) but complete isolation
+- Use for: Long-running sessions, production deployments with stable weights
 
-### Future: vLLM Multi-LoRA (Planned)
+**2. Ephemeral Sessions (shared engine + hot reload)**
+- `save_weights_and_get_sampling_client()` uses shared VerlInferenceEngine
+- First call initializes shared engine (~60s), subsequent calls hot-reload LoRA (~0.68s)
+- All ephemeral sessions share one engine (no isolation)
+- Use for: RL training loops with frequent weight updates
 
-For efficient multi-tenant inference under high load, bypass verl and use vLLM directly:
+**Implementation:**
+- `SessionManager._shared_engine` - Single shared engine for all ephemeral sessions
+- `create_ephemeral_session()` - Hot-reloads LoRA via `add_lora_from_tensors()`
+- Sessions with `is_shared=True` don't shutdown engine on end
+
+### Future: vLLM Multi-LoRA
+
+For true multi-tenant inference with isolation under high load:
 
 - Single vLLM server with `enable_lora=True`, `max_loras=N`
-- Dynamic adapter loading via `/v1/load_lora_adapter`
-- Per-request `lora_request` routing
-- No per-session server spawning overhead
+- Multiple LoRA adapters loaded simultaneously
+- Per-request `lora_request` routing (different users, different adapters)
 
-Requires direct vLLM integration (verl's generate() doesn't expose lora_request parameter).
+Current shared engine only supports one active LoRA at a time. Multi-LoRA would allow concurrent users with different adapters.
