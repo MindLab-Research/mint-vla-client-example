@@ -9,7 +9,7 @@ from .backend.session_manager import SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
-from .routes import futures, sampling, service, training
+from .routes import futures, sampling, service, training, weights
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +60,10 @@ async def lifespan(app: FastAPI):
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
 
+    # Weights router also needs training components
+    weights.training_manager = train_manager
+    weights.training_engine = train_engine
+
     logger.info("Training components initialized")
 
     yield
@@ -88,6 +92,7 @@ app.include_router(service.router, prefix="/api/v1", tags=["service"])
 app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
+app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
 
 
 # Root redirect to docs

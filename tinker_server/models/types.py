@@ -292,3 +292,61 @@ class SaveWeightsForSamplerResponse(BaseModel):
     path: str | None = None  # file:// or tinker:// URI (None for ephemeral)
     sampling_session_id: str | None = None  # For ephemeral flow
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
+
+
+# =============================================================================
+# Checkpoint Types (save_weights, load_weights, list, delete)
+# =============================================================================
+
+
+class SaveWeightsRequest(BaseModel):
+    """Request to save model weights to checkpoint."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    path: str  # checkpoint name, e.g. "checkpoint-100"
+    seq_id: int | None = None
+    type: Literal["save_weights"] = "save_weights"
+
+
+class SaveWeightsResponse(BaseModel):
+    """Response from saving weights."""
+
+    path: str  # tinker:// URI
+    type: Literal["save_weights"] = "save_weights"
+
+
+class LoadWeightsRequest(BaseModel):
+    """Request to load model weights from checkpoint."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    path: str  # tinker:// or file:// path
+    optimizer: bool = True  # whether to restore optimizer state
+    seq_id: int | None = None
+    type: Literal["load_weights"] = "load_weights"
+
+
+class LoadWeightsResponse(BaseModel):
+    """Response from loading weights."""
+
+    path: str
+    type: Literal["load_weights"] = "load_weights"
+
+
+class CheckpointInfo(BaseModel):
+    """Information about a checkpoint."""
+
+    checkpoint_id: str  # directory name, e.g. "checkpoint-100"
+    path: str  # tinker://local/{model_id}/{checkpoint_id}
+    step: int | None = None  # parsed from checkpoint name if available
+    created_at: str  # ISO timestamp
+
+
+class CheckpointsListResponse(BaseModel):
+    """Response listing checkpoints for a model."""
+
+    model_id: str | None = None  # None for list-all endpoint
+    checkpoints: list[CheckpointInfo]

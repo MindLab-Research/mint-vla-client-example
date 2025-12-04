@@ -77,6 +77,9 @@ class TrainingWorker:
             lr=learning_rate,
         )
 
+        # Track training step count
+        self._step_count = 0
+
         logger.info("[TrainingWorker] Ready")
 
     def forward_backward(self, data_items: list[dict]) -> dict:
@@ -151,7 +154,9 @@ class TrainingWorker:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}")
+        self._step_count += 1
+
+        logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
         return {
             "metrics": {"grad_norm": float(grad_norm)},
@@ -215,6 +220,92 @@ class TrainingWorker:
         abs_path = os.path.abspath(save_path)
         logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
         return abs_path
+
+    def save_checkpoint(self, save_path: str) -> dict:
+        """Save full checkpoint: LoRA weights + optimizer state + training metadata.
+
+        Args:
+            save_path: Directory path to save checkpoint files.
+
+        Returns:
+            Dict with training metadata.
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        os.makedirs(save_path, exist_ok=True)
+
+        # 1. LoRA weights
+        state_dict = self.get_lora_state_dict()
+        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+
+        # 2. LoRA config
+        config = self.get_lora_config()
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        # 3. Optimizer state
+        torch.save(self.optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
+
+        # 4. Training metadata
+        meta = {
+            "current_step": self._step_count,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+        }
+        with open(os.path.join(save_path, "training_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[TrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
+        return meta
+
+    def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
+        """Load checkpoint, optionally restoring optimizer state.
+
+        Args:
+            load_path: Directory path to load checkpoint from.
+            load_optimizer: Whether to restore optimizer state.
+
+        Returns:
+            Dict with training metadata.
+        """
+        import json
+        import os
+
+        from safetensors.torch import load_file
+
+        # 1. Load LoRA weights
+        adapter_path = os.path.join(load_path, "adapter_model.safetensors")
+        if os.path.exists(adapter_path):
+            state_dict = load_file(adapter_path, device=str(self.device))
+            # Load into PEFT model
+            from peft.utils.save_and_load import set_peft_model_state_dict
+            set_peft_model_state_dict(self.model, state_dict)
+            logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
+        else:
+            raise FileNotFoundError(f"Adapter not found: {adapter_path}")
+
+        # 2. Optionally load optimizer state
+        if load_optimizer:
+            optimizer_path = os.path.join(load_path, "optimizer.pt")
+            if os.path.exists(optimizer_path):
+                self.optimizer.load_state_dict(
+                    torch.load(optimizer_path, map_location=self.device)
+                )
+                logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
+
+        # 3. Load and return metadata
+        meta = {}
+        meta_path = os.path.join(load_path, "training_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            self._step_count = meta.get("current_step", 0)
+            logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+
+        return meta
 
     def shutdown(self) -> None:
         """Release GPU resources."""
@@ -393,6 +484,61 @@ class VerlTrainingEngine:
         abs_path = os.path.abspath(save_path)
         logger.info(f"[{model_id}] Saved weights for sampler to {abs_path}")
         return abs_path
+
+    async def save_weights(
+        self,
+        session: TrainingSession,
+        save_path: str,
+    ) -> str:
+        """Save full checkpoint via Ray actor.
+
+        Saves LoRA weights, optimizer state, and training metadata.
+
+        Args:
+            session: Training session.
+            save_path: Directory path for checkpoint.
+
+        Returns:
+            Absolute path to saved checkpoint.
+        """
+        import os
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+
+        # Remote call to save checkpoint
+        meta = await worker.save_checkpoint.remote(save_path)
+
+        # Update session state from worker metadata
+        session.current_step = meta.get("current_step", session.current_step)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[{model_id}] save_weights: {abs_path}")
+        return abs_path
+
+    async def load_weights(
+        self,
+        session: TrainingSession,
+        load_path: str,
+        load_optimizer: bool = True,
+    ) -> None:
+        """Load checkpoint via Ray actor.
+
+        Args:
+            session: Training session.
+            load_path: Directory path to load from.
+            load_optimizer: Whether to restore optimizer state.
+        """
+        model_id = session.model_id
+        worker = self._workers[model_id]
+
+        # Remote call to load checkpoint
+        meta = await worker.load_checkpoint.remote(load_path, load_optimizer)
+
+        # Update session state from loaded metadata
+        session.current_step = meta.get("current_step", 0)
+
+        logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
     async def shutdown_session(self, session: TrainingSession) -> None:
         """Kill Ray actor to release GPU.
