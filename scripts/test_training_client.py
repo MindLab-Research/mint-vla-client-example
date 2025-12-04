@@ -10,6 +10,7 @@ Usage:
 
 import os
 import sys
+import time
 
 # Add tinker to path if not installed
 tinker_path = os.path.join(os.path.dirname(__file__), "../../tinker/src")
@@ -24,6 +25,21 @@ from tinker import types
 from tinker.lib.public_interfaces.service_client import ServiceClient
 from tinker.types.tensor_data import TensorData
 from transformers import AutoTokenizer
+
+
+def timed(name):
+    """Context manager to time operations."""
+    class Timer:
+        def __init__(self, name):
+            self.name = name
+            self.elapsed = 0
+        def __enter__(self):
+            self.start = time.time()
+            return self
+        def __exit__(self, *args):
+            self.elapsed = time.time() - self.start
+            print(f"    [{self.name}] took {self.elapsed:.2f}s")
+    return Timer(name)
 
 
 def main():
@@ -178,17 +194,18 @@ def main():
     print(f" Weights saved to: {save_result.path}")
 
     # ========================================
-    # Step 5: Test inference with trained model
+    # Step 5: Test inference with trained model (Named flow)
     # ========================================
     print("\n" + "=" * 60)
-    print("STEP 5: Testing inference with trained model")
+    print("STEP 5: Testing inference with trained model (NAMED FLOW)")
     print("=" * 60)
 
     print("\nCreating sampling client with trained weights...")
-    sampling_client = service_client.create_sampling_client(
-        model_path=save_result.path
-    )
-    print(" Sampling client created")
+    with timed("create_sampling_client (named)") as t_named:
+        sampling_client = service_client.create_sampling_client(
+            model_path=save_result.path
+        )
+    print(f" Sampling client created")
 
     # Test prompt
     test_prompt = "What is 2 + 2?"
@@ -224,15 +241,16 @@ def main():
     print("\n Named flow test passed!")
 
     # ========================================
-    # Step 6: Test ephemeral flow
+    # Step 6: Test ephemeral flow (should be FAST after first call)
     # ========================================
     print("\n" + "=" * 60)
-    print("STEP 6: Testing ephemeral flow (save_weights_and_get_sampling_client)")
+    print("STEP 6: Testing EPHEMERAL FLOW (should be fast after first call)")
     print("=" * 60)
 
-    print("\nSaving weights and getting sampling client directly...")
-    ephemeral_sampling_client = training_client.save_weights_and_get_sampling_client()
-    print(" Ephemeral sampling client created")
+    print("\nFirst ephemeral call (initializes shared engine - may be slow)...")
+    with timed("save_weights_and_get_sampling_client #1 (init shared engine)") as t_eph1:
+        ephemeral_sampling_client = training_client.save_weights_and_get_sampling_client()
+    print(f" Ephemeral sampling client created")
 
     # Test with same prompt
     print(f"\nTest prompt: {test_prompt}")
@@ -251,6 +269,29 @@ def main():
     print(f"\nGenerated response (ephemeral):\n{ephemeral_response_text}")
 
     print("\n Ephemeral flow test passed!")
+
+    # ========================================
+    # Step 6b: Second ephemeral call (should be FAST - hot reload only)
+    # ========================================
+    print("\n" + "-" * 60)
+    print("STEP 6b: Second ephemeral call (should be FAST - hot reload)")
+    print("-" * 60)
+
+    print("\nSecond ephemeral call (reuses shared engine, hot-reload only)...")
+    with timed("save_weights_and_get_sampling_client #2 (hot reload)") as t_eph2:
+        ephemeral_sampling_client2 = training_client.save_weights_and_get_sampling_client()
+    print(f" Second ephemeral sampling client created")
+
+    # Compare times
+    print(f"\n" + "=" * 60)
+    print("TIMING COMPARISON:")
+    print(f"  Named flow (create_sampling_client):    {t_named.elapsed:.2f}s")
+    print(f"  Ephemeral #1 (init shared engine):      {t_eph1.elapsed:.2f}s")
+    print(f"  Ephemeral #2 (hot reload only):         {t_eph2.elapsed:.2f}s")
+    if t_eph1.elapsed > 0:
+        speedup = t_eph1.elapsed / t_eph2.elapsed if t_eph2.elapsed > 0 else float('inf')
+        print(f"  Speedup (eph#1 / eph#2):                {speedup:.1f}x")
+    print("=" * 60)
 
     # ========================================
     # Step 7: Cleanup

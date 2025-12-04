@@ -264,15 +264,19 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=None,
             )
         else:
-            # Ephemeral flow: Create sampling session with hot-loaded weights
+            # Ephemeral flow: Use shared engine with hot LoRA reload (100x faster)
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
 
             sampling_session_id = str(uuid.uuid4())
-            await inference_manager.create_session(
+            lora_rank = session.lora_config.rank if session.lora_config else 32
+
+            # Use create_ephemeral_session for fast hot-reload (100-300ms)
+            # instead of create_session (30-60s engine startup)
+            await inference_manager.create_ephemeral_session(
                 session_id=sampling_session_id,
-                lora_rank=session.lora_config.rank if session.lora_config else 32,
-                model_path=save_path,  # Use file path directly (internal)
+                adapter_path=save_path,
+                lora_rank=lora_rank,
             )
 
             response = SaveWeightsForSamplerResponse(
@@ -280,8 +284,8 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
             )
             logger.info(
-                f"[save_weights_for_sampler] Ephemeral: created sampling session "
-                f"{sampling_session_id} with weights from {save_path}"
+                f"[save_weights_for_sampler] Ephemeral: hot-reload session "
+                f"{sampling_session_id} from {save_path}"
             )
 
         future_store.resolve(request_id, response.model_dump())

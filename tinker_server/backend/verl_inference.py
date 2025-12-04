@@ -61,7 +61,7 @@ def _create_extended_server_class():
             """Add LoRA adapter to running engine.
 
             Args:
-                lora_request: TensorLoRARequest with peft_config and lora_tensors.
+                lora_request: LoRARequest with lora_path pointing to adapter directory.
             """
             # Remove existing LoRA first if present
             try:
@@ -73,6 +73,63 @@ def _create_extended_server_class():
 
             # Add new LoRA
             await self.engine.add_lora(lora_request)
+
+        async def add_lora_from_tensors(
+            self,
+            state_dict: dict,
+            peft_config: dict,
+        ) -> str:
+            """Add LoRA from tensors by saving to temp dir on worker node.
+
+            Receives tensors via Ray object store, saves to local temp file,
+            then loads via file-based LoRARequest. This handles distributed
+            deployments where API server and inference worker are on different nodes.
+
+            Args:
+                state_dict: LoRA weight tensors (already on CPU).
+                peft_config: PEFT adapter config dict.
+
+            Returns:
+                Path where adapter was saved on worker node.
+            """
+            import json
+            import os
+            import tempfile
+
+            from safetensors.torch import save_file
+            from vllm.lora.request import LoRARequest
+
+            from verl.workers.rollout.vllm_rollout.utils import (
+                VLLM_LORA_INT_ID,
+                VLLM_LORA_NAME,
+            )
+
+            # Create temp dir on THIS worker node
+            temp_dir = tempfile.mkdtemp(prefix="tinker_lora_")
+            adapter_path = temp_dir
+
+            # Save adapter files locally on worker node
+            save_file(state_dict, os.path.join(adapter_path, "adapter_model.safetensors"))
+            with open(os.path.join(adapter_path, "adapter_config.json"), "w") as f:
+                json.dump(peft_config, f, indent=2)
+
+            # Now load from local path
+            lora_request = LoRARequest(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=adapter_path,
+            )
+
+            # Remove existing and add new
+            try:
+                loaded = await self.engine.list_loras()
+                if VLLM_LORA_INT_ID in loaded:
+                    await self.engine.remove_lora(VLLM_LORA_INT_ID)
+            except Exception:
+                pass
+
+            await self.engine.add_lora(lora_request)
+            return adapter_path
 
         async def list_loras(self) -> set[int]:
             """List loaded LoRA adapter IDs."""
@@ -242,6 +299,8 @@ class VerlInferenceEngine:
         """Hot-reload LoRA adapter from filesystem path.
 
         Loads trained LoRA weights into the running vLLM engine without restart.
+        Transfers tensors via Ray object store to handle distributed deployments
+        where API server and inference worker are on different nodes.
 
         Args:
             adapter_path: Path to adapter directory containing
@@ -252,38 +311,22 @@ class VerlInferenceEngine:
 
         from safetensors.torch import load_file
 
-        from verl.utils.vllm import TensorLoRARequest
-        from verl.workers.rollout.vllm_rollout.utils import (
-            VLLM_LORA_INT_ID,
-            VLLM_LORA_NAME,
-            VLLM_LORA_PATH,
-        )
-
         if not self._initialized:
             await self.initialize()
 
-        # Load config
+        # Load tensors and config from local files (on API server)
+        weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
         config_path = os.path.join(adapter_path, "adapter_config.json")
+
+        state_dict = load_file(weights_path)
         with open(config_path, "r") as f:
             peft_config = json.load(f)
 
-        # Load tensors
-        weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
-        lora_tensors = load_file(weights_path)
+        # Pass tensors via Ray to inference worker, which saves locally and loads
+        # This handles distributed deployments where nodes have different filesystems
+        worker_path = await self.server.add_lora_from_tensors.remote(state_dict, peft_config)
 
-        # Create TensorLoRARequest
-        lora_request = TensorLoRARequest(
-            lora_name=VLLM_LORA_NAME,
-            lora_int_id=VLLM_LORA_INT_ID,
-            lora_path=VLLM_LORA_PATH,
-            peft_config=peft_config,
-            lora_tensors=lora_tensors,
-        )
-
-        # Hot-load into running engine
-        await self.server.add_lora.remote(lora_request)
-
-        logger.info(f"Hot-loaded LoRA adapter from {adapter_path}")
+        logger.info(f"Hot-loaded LoRA adapter (API: {adapter_path} -> Worker: {worker_path})")
 
     async def shutdown(self) -> None:
         """Cleanup Ray actors."""

@@ -2,6 +2,10 @@
 
 Each sampling session gets its own engine with dedicated LoRA weights.
 Sessions are automatically cleaned up after inactivity.
+
+Supports two modes:
+1. Per-session engine: Traditional mode, spawns new engine per session (slow init)
+2. Shared engine: Single engine for ephemeral weight syncs, uses hot LoRA reload (fast)
 """
 
 from __future__ import annotations
@@ -20,6 +24,9 @@ logger = logging.getLogger(__name__)
 # Default inactivity timeout: 5 minutes
 DEFAULT_INACTIVITY_TIMEOUT = 300
 
+# Reserved session ID for shared engine
+SHARED_ENGINE_SESSION_ID = "__shared__"
+
 
 @dataclass
 class SessionInfo:
@@ -28,6 +35,7 @@ class SessionInfo:
     engine: VerlInferenceEngine
     last_activity: float  # time.time()
     lora_rank: int
+    is_shared: bool = False  # True for sessions using the shared engine
 
 
 class SessionManager:
@@ -36,6 +44,9 @@ class SessionManager:
     Each session has its own engine with dedicated LoRA adapter,
     enabling session isolation for different LoRA variants.
     Sessions are automatically cleaned up after inactivity.
+
+    For ephemeral weight syncs during training, uses a shared engine
+    with hot LoRA reload for 100x+ faster weight updates.
     """
 
     def __init__(
@@ -45,14 +56,18 @@ class SessionManager:
         gpu_memory_utilization: float = 0.9,
         max_model_len: int | None = None,
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
+        shared_engine_lora_rank: int = 32,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.inactivity_timeout = inactivity_timeout
+        self.shared_engine_lora_rank = shared_engine_lora_rank
         self._sessions: dict[str, SessionInfo] = {}
         self._cleanup_task: asyncio.Task | None = None
+        self._shared_engine: VerlInferenceEngine | None = None
+        self._shared_engine_lock = asyncio.Lock()
 
     async def start_cleanup_task(self) -> None:
         """Start the background cleanup task."""
@@ -75,10 +90,98 @@ class SessionManager:
             sid
             for sid, info in self._sessions.items()
             if now - info.last_activity > self.inactivity_timeout
+            and not info.is_shared  # Don't cleanup shared engine sessions
         ]
         for sid in inactive:
             logger.info(f"Auto-cleaning inactive session {sid}")
             await self.end_session(sid)
+
+    # =========================================================================
+    # Shared Engine Methods (for fast ephemeral weight sync)
+    # =========================================================================
+
+    async def _get_or_create_shared_engine(self) -> "VerlInferenceEngine":
+        """Lazily initialize the shared engine for ephemeral sessions.
+
+        Uses a lock to ensure only one engine is created even with concurrent calls.
+        The shared engine is initialized with LoRA enabled but no adapter loaded.
+
+        Returns:
+            The shared VerlInferenceEngine instance.
+        """
+        async with self._shared_engine_lock:
+            if self._shared_engine is None:
+                from .verl_inference import VerlInferenceEngine
+
+                logger.info(
+                    f"Initializing shared engine (lora_rank={self.shared_engine_lora_rank})"
+                )
+                self._shared_engine = VerlInferenceEngine(
+                    model_path=self.model_path,
+                    tensor_parallel_size=self.tensor_parallel_size,
+                    gpu_memory_utilization=self.gpu_memory_utilization,
+                    max_model_len=self.max_model_len,
+                    lora_rank=self.shared_engine_lora_rank,
+                    lora_adapter_path=None,  # No initial adapter
+                )
+                await self._shared_engine.initialize()
+                logger.info("Shared engine initialized")
+
+            return self._shared_engine
+
+    async def create_ephemeral_session(
+        self,
+        session_id: str,
+        adapter_path: str,
+        lora_rank: int = 32,
+    ) -> "VerlInferenceEngine":
+        """Create an ephemeral session using the shared engine with hot LoRA reload.
+
+        Instead of spawning a new vLLM engine (30-60s), hot-loads the LoRA adapter
+        into the existing shared engine (100-300ms).
+
+        Args:
+            session_id: Unique identifier for the session.
+            adapter_path: Filesystem path to LoRA adapter directory.
+            lora_rank: LoRA rank (for validation, must match shared engine).
+
+        Returns:
+            The shared VerlInferenceEngine with the adapter loaded.
+
+        Raises:
+            ValueError: If session_id already exists.
+            RuntimeError: If LoRA rank doesn't match shared engine.
+        """
+        if session_id in self._sessions:
+            raise ValueError(f"Session {session_id} already exists")
+
+        if lora_rank != self.shared_engine_lora_rank:
+            raise RuntimeError(
+                f"LoRA rank mismatch: session requests {lora_rank}, "
+                f"shared engine has {self.shared_engine_lora_rank}"
+            )
+
+        # Get or create the shared engine
+        engine = await self._get_or_create_shared_engine()
+
+        # Hot-reload LoRA adapter (100-300ms vs 30-60s for new engine)
+        start_time = time.time()
+        await engine.load_lora_from_path(adapter_path)
+        reload_time = time.time() - start_time
+        logger.info(f"Hot-reloaded LoRA adapter in {reload_time:.3f}s")
+
+        # Register session pointing to shared engine
+        self._sessions[session_id] = SessionInfo(
+            engine=engine,
+            last_activity=time.time(),
+            lora_rank=lora_rank,
+            is_shared=True,
+        )
+        logger.info(
+            f"Created ephemeral session {session_id} using shared engine "
+            f"(reload took {reload_time:.3f}s)"
+        )
+        return engine
 
     async def create_session(
         self,
@@ -175,6 +278,9 @@ class SessionManager:
     async def end_session(self, session_id: str) -> bool:
         """End a session and shutdown its engine.
 
+        For shared engine sessions, only removes the session registration
+        without shutting down the engine (it's reused for other sessions).
+
         Args:
             session_id: The session identifier.
 
@@ -185,8 +291,13 @@ class SessionManager:
         if info is None:
             return False
 
-        await info.engine.shutdown()
-        logger.info(f"Ended session {session_id}")
+        # Only shutdown non-shared engines (shared engine is reused)
+        if not info.is_shared:
+            await info.engine.shutdown()
+            logger.info(f"Ended session {session_id} (engine shutdown)")
+        else:
+            logger.info(f"Ended ephemeral session {session_id} (shared engine kept)")
+
         return True
 
     async def shutdown_all(self) -> None:
@@ -205,6 +316,12 @@ class SessionManager:
         for session_id in session_ids:
             await self.end_session(session_id)
         logger.info(f"Shutdown {len(session_ids)} sessions")
+
+        # Shutdown shared engine
+        if self._shared_engine is not None:
+            await self._shared_engine.shutdown()
+            self._shared_engine = None
+            logger.info("Shutdown shared engine")
 
     def list_sessions(self) -> list[str]:
         """List all active session IDs."""

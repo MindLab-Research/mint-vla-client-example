@@ -187,6 +187,34 @@ Note:
 - Steps 1-2 don't validate - any string works for `sampling_session_id` in step 3
 - Polling returns HTTP 408 while pending (tinker client protocol)
 
+## Distributed Architecture (Ray Cluster)
+
+**Three distinct machines in the deployment:**
+
+1. **Client Machine** - Runs the tinker Python client (test scripts, user applications)
+   - Connects to API server via HTTP
+   - No GPU required
+
+2. **API Server Machine** - Runs FastAPI server (`scripts/run_server.py`)
+   - Hosts `/api/v1/*` endpoints
+   - Manages sessions, routes requests
+   - Checkpoints saved locally in `./checkpoints/`
+   - Connects to Ray cluster
+
+3. **GPU Worker Node(s)** - Ray actors for training and inference
+   - `TrainingWorker` Ray actors (LoRA training on GPU)
+   - `ExtendedVLLMHttpServer` Ray actors (vLLM inference on GPU)
+   - Different filesystem than API server (`/root/...` vs `/home/yiwen/...`)
+
+**Data transfer between machines uses Ray object store:**
+- Training weights: `worker.get_lora_state_dict.remote()` → API server saves to disk
+- Inference weights: API server loads from disk → `server.add_lora_from_tensors.remote()`
+
+**Path considerations:**
+- Checkpoints saved on API server are NOT accessible from GPU workers
+- Must transfer tensors via Ray, not file paths
+- Or use shared filesystem (NFS) mounted at same path on all nodes
+
 ## Architecture Notes
 
 ### Current: One Server Per Session
