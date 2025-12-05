@@ -12,14 +12,14 @@ These rename existing endpoints to match Tinker spec exactly.
 | Load full state | `POST /load_state` | `POST /load_state` | Done |
 | Response types | `SaveStateResponse`, `LoadStateResponse` | `SaveStateResponse`, `LoadStateResponse` | Done |
 
-## Priority 2: Stage 1 - Inference (Missing)
+## Priority 2: Stage 1 - Inference - DONE
 
 Core inference functionality required for all workflows.
 
 | Interface Method | Endpoint | Status | Notes |
 |-----------------|----------|--------|-------|
 | `SamplingClient.sample_async()` | `POST /asample` | Done | Working |
-| `SamplingClient.compute_logprobs_async()` | `POST /compute_logprobs` | **Missing** | vLLM supports `prompt_logprobs` natively |
+| `SamplingClient.compute_logprobs_async()` | `POST /compute_logprobs` | Done | Uses vLLM `prompt_logprobs` |
 | `ServiceClient.create_sampling_client()` | `POST /create_sampling_session` | Done | Working |
 
 ### `compute_logprobs_async` Implementation
@@ -30,10 +30,10 @@ Output: list[float] where logprobs[i] = log P(token[i+1] | token[0:i+1])
 Length: len(sequence) - 1
 ```
 
-Implementation approach:
-- Reuse existing inference engine
-- Pass sequence as prompt with `max_tokens=0`, `prompt_logprobs=1`
-- Extract logprobs from vLLM response
+Implementation:
+- `POST /compute_logprobs` endpoint added to sampling.py
+- Uses `prompt_logprobs=1` in vLLM SamplingParams
+- Supports both multi-LoRA and legacy per-session modes
 
 ## Priority 3: Stage 3 - Checkpointing (Partial)
 
@@ -159,9 +159,9 @@ Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
    - [x] `load_weights` → `load_state`
    - [x] Update types and routes
 
-2. **Add `compute_logprobs`** (Priority 2) - Enables RL data collection
-   - [ ] Add endpoint
-   - [ ] Use vLLM `prompt_logprobs` feature
+2. **Add `compute_logprobs`** (Priority 2) - Enables RL data collection - DONE
+   - [x] Add endpoint
+   - [x] Use vLLM `prompt_logprobs` feature
 
 3. **Add `create_model_from_state`** (Priority 3) - Enables training resumption
    - [ ] Add endpoint

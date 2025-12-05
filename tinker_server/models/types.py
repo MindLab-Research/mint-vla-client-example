@@ -73,6 +73,25 @@ class SampleResponse(BaseModel):
     type: Literal["sample"] = "sample"
 
 
+class ComputeLogprobsRequest(BaseModel):
+    """Request to compute logprobs for a sequence.
+
+    Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
+    Output length is len(sequence) - 1.
+    """
+
+    sampling_session_id: str
+    seq_id: int
+    sequence: ModelInput
+
+
+class ComputeLogprobsResponse(BaseModel):
+    """Response containing computed logprobs."""
+
+    logprobs: list[float]
+    type: Literal["compute_logprobs"] = "compute_logprobs"
+
+
 class CreateSessionRequest(BaseModel):
     """Request to create a new session."""
 

@@ -437,6 +437,169 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 ]
             return TokenOutput(token_ids=token_ids, log_probs=log_probs)
 
+        async def compute_prompt_logprobs(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+        ) -> list[float]:
+            """Compute logprobs for each token in the prompt.
+
+            Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
+            Output length is len(prompt_ids) - 1.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+
+            Returns:
+                List of logprobs, length = len(prompt_ids) - 1.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            from verl.workers.rollout.vllm_rollout.utils import (
+                VLLM_LORA_INT_ID,
+                VLLM_LORA_NAME,
+                VLLM_LORA_PATH,
+            )
+
+            if len(prompt_ids) < 2:
+                return []
+
+            # Use max_tokens=1 with prompt_logprobs to get logprobs for prompt tokens
+            # prompt_logprobs=1 returns top-1 logprob for each position
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=1,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Add lora request if enabled
+            lora_request = None
+            if self.model_config.lora_rank > 0:
+                lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+                if lora_loaded:
+                    lora_request = LoRARequest(
+                        lora_name=VLLM_LORA_NAME,
+                        lora_int_id=VLLM_LORA_INT_ID,
+                        lora_path=VLLM_LORA_PATH,
+                    )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            # Get final response
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            # Extract prompt logprobs
+            # prompt_logprobs is a list where element i contains logprob info for token i
+            # Skip first element (no conditioning) - want logprobs[i] = P(token[i+1] | token[0:i+1])
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            logprobs = []
+            # prompt_logprobs[i] contains logprob of token[i] given tokens[0:i]
+            # So prompt_logprobs[1] is P(token[1] | token[0])
+            # We want logprobs[i] = P(token[i+1] | token[0:i+1])
+            # So logprobs[0] = prompt_logprobs[1], etc.
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    continue
+                # Get logprob for the actual token at position i
+                token_id = prompt_ids[i]
+                if token_id in prompt_logprobs[i]:
+                    logprobs.append(prompt_logprobs[i][token_id].logprob)
+                else:
+                    # Token wasn't in top-k, use a default small value
+                    logprobs.append(-100.0)
+
+            return logprobs
+
+        async def compute_prompt_logprobs_with_lora(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            lora_int_id: int,
+        ) -> list[float]:
+            """Compute logprobs with specific LoRA adapter.
+
+            For multi-LoRA: routes request to session-specific adapter.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                lora_int_id: The LoRA adapter ID to use.
+
+            Returns:
+                List of logprobs, length = len(prompt_ids) - 1.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=1,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Look up local path for this LoRA
+            lora_path = self._lora_paths.get(lora_int_id)
+            if lora_path is None:
+                raise ValueError(f"No path found for lora_int_id={lora_int_id}")
+
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            # Get final response
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            # Extract prompt logprobs
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            logprobs = []
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    continue
+                token_id = prompt_ids[i]
+                if token_id in prompt_logprobs[i]:
+                    logprobs.append(prompt_logprobs[i][token_id].logprob)
+                else:
+                    logprobs.append(-100.0)
+
+            return logprobs
+
     return ExtendedVLLMHttpServer
 
 
@@ -596,6 +759,32 @@ class VerlInferenceEngine:
             token_ids=list(result.token_ids),
             log_probs=list(result.log_probs) if result.log_probs else None,
         )
+
+    async def compute_logprobs(
+        self,
+        prompt_ids: list[int],
+        request_id: str,
+    ) -> list[float]:
+        """Compute logprobs for each token in the sequence.
+
+        Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
+        Output length is len(prompt_ids) - 1.
+
+        Args:
+            prompt_ids: Input token IDs.
+            request_id: Unique request identifier.
+
+        Returns:
+            List of logprobs, length = len(prompt_ids) - 1.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        result = await self.server.compute_prompt_logprobs.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+        )
+        return list(result)
 
     async def load_lora_from_path(self, adapter_path: str) -> None:
         """Hot-reload LoRA adapter from filesystem path.

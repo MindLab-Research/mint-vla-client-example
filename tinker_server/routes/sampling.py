@@ -2,6 +2,7 @@
 
 Endpoints:
 - POST /asample: Async sample request (returns future)
+- POST /compute_logprobs: Compute logprobs for a sequence (returns future)
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ from fastapi import APIRouter, BackgroundTasks
 
 from ..backend.future_store import future_store
 from ..models.types import (
+    ComputeLogprobsRequest,
+    ComputeLogprobsResponse,
     SampledSequence,
     SampleRequest,
     SampleResponse,
@@ -125,6 +128,68 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
 
         future_store.resolve(request_id, response.model_dump())
         logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
+
+    except Exception as e:
+        logger.exception(f"Request {request_id} failed: {e}")
+        future_store.fail(request_id, str(e))
+
+
+@router.post("/compute_logprobs")
+async def compute_logprobs(
+    request: ComputeLogprobsRequest,
+    background_tasks: BackgroundTasks,
+) -> UntypedAPIFuture:
+    """Compute logprobs for a sequence.
+
+    Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
+    Output length is len(sequence) - 1.
+    """
+    request_id = future_store.create()
+    background_tasks.add_task(_do_compute_logprobs, request_id, request)
+    return UntypedAPIFuture(request_id=request_id)
+
+
+async def _do_compute_logprobs(
+    request_id: str, request: ComputeLogprobsRequest
+) -> None:
+    """Background task to compute logprobs."""
+    try:
+        if session_manager is None:
+            raise RuntimeError("Session manager not initialized")
+
+        token_ids = request.sequence.to_token_ids()
+        session_id = request.sampling_session_id
+
+        # Check if this session uses multi-LoRA mode
+        is_multi_lora = session_manager.is_multi_lora_session(session_id)
+
+        if is_multi_lora:
+            # Multi-LoRA mode: use shared engine with session-specific LoRA
+            multi_lora_engine = session_manager.get_multi_lora_engine()
+            if multi_lora_engine is None:
+                raise RuntimeError("Multi-LoRA engine not initialized")
+
+            logprobs = await multi_lora_engine.compute_logprobs(
+                sampling_session_id=session_id,
+                prompt_ids=token_ids,
+                request_id=request_id,
+            )
+        else:
+            # Legacy mode: per-session engine
+            engine = session_manager.get_engine(session_id)
+            if engine is None:
+                raise RuntimeError(f"No engine found for session {session_id}")
+
+            logprobs = await engine.compute_logprobs(
+                prompt_ids=token_ids,
+                request_id=request_id,
+            )
+
+        response = ComputeLogprobsResponse(logprobs=logprobs)
+        future_store.resolve(request_id, response.model_dump())
+        logger.debug(
+            f"Request {request_id} computed {len(logprobs)} logprobs"
+        )
 
     except Exception as e:
         logger.exception(f"Request {request_id} failed: {e}")

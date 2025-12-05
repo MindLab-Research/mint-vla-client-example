@@ -384,6 +384,46 @@ class MultiLoRAInferenceEngine:
             stop_reason=result.get("stop_reason"),
         )
 
+    async def compute_logprobs(
+        self,
+        sampling_session_id: str,
+        prompt_ids: list[int],
+        request_id: str,
+    ) -> list[float]:
+        """Compute logprobs for a sequence using session-specific LoRA weights.
+
+        Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
+        Output length is len(prompt_ids) - 1.
+
+        Args:
+            sampling_session_id: The sampling session to use.
+            prompt_ids: Input token IDs.
+            request_id: Unique request identifier.
+
+        Returns:
+            List of logprobs, length = len(prompt_ids) - 1.
+
+        Raises:
+            ValueError: If sampling_session_id has no loaded LoRA.
+        """
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        lora_id = await self.registry.get_lora_id(sampling_session_id)
+        if lora_id is None:
+            raise ValueError(
+                f"No LoRA loaded for sampling session {sampling_session_id}"
+            )
+
+        # Compute logprobs with session-specific LoRA
+        result = await self.server.compute_prompt_logprobs_with_lora.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+        )
+
+        return list(result)
+
     async def remove_session(self, sampling_session_id: str) -> bool:
         """Remove a sampling session and its LoRA.
 
