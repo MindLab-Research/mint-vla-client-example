@@ -1,8 +1,8 @@
-"""Weights routes for saving/loading model weights (checkpointing).
+"""State routes for saving/loading model state (checkpointing).
 
 Endpoints:
-- POST /save_weights: Save full checkpoint (LoRA + optimizer + metadata)
-- POST /load_weights: Load checkpoint
+- POST /save_state: Save full checkpoint (LoRA + optimizer + metadata)
+- POST /load_state: Load checkpoint
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
 - GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download (501)
@@ -22,8 +22,8 @@ from ..backend.future_store import future_store
 from ..models.types import (
     CheckpointInfo,
     CheckpointsListResponse,
-    LoadWeightsRequest,
-    SaveWeightsRequest,
+    LoadStateRequest,
+    SaveStateRequest,
     UntypedAPIFuture,
 )
 
@@ -69,16 +69,16 @@ def _to_tinker_path(model_id: str, checkpoint_name: str) -> str:
 
 
 # =============================================================================
-# POST /save_weights - async
+# POST /save_state - async
 # =============================================================================
 
 
-@router.post("/save_weights", response_model=UntypedAPIFuture)
-async def save_weights(
-    request: SaveWeightsRequest,
+@router.post("/save_state", response_model=UntypedAPIFuture)
+async def save_state(
+    request: SaveStateRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
-    """Save model weights to checkpoint (LoRA + optimizer + metadata)."""
+    """Save model state to checkpoint (LoRA + optimizer + metadata)."""
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
@@ -87,12 +87,12 @@ async def save_weights(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_save_weights, request_id, session, request)
+    background_tasks.add_task(_do_save_state, request_id, session, request)
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_save_weights(request_id: str, session, request: SaveWeightsRequest) -> None:
-    """Background task to save weights."""
+async def _do_save_state(request_id: str, session, request: SaveStateRequest) -> None:
+    """Background task to save state."""
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
@@ -100,7 +100,7 @@ async def _do_save_weights(request_id: str, session, request: SaveWeightsRequest
         # Build save path
         save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, request.path)
 
-        logger.info(f"[{session.model_id}] Saving weights to: {save_path}")
+        logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Call training engine to save full checkpoint
         await training_engine.save_weights(session, save_path)
@@ -110,25 +110,25 @@ async def _do_save_weights(request_id: str, session, request: SaveWeightsRequest
 
         future_store.resolve(request_id, {
             "path": tinker_path,
-            "type": "save_weights",
+            "type": "save_state",
         })
 
     except Exception as e:
-        logger.error(f"[save_weights] Failed: {e}", exc_info=True)
+        logger.error(f"[save_state] Failed: {e}", exc_info=True)
         future_store.fail(request_id, str(e))
 
 
 # =============================================================================
-# POST /load_weights - async
+# POST /load_state - async
 # =============================================================================
 
 
-@router.post("/load_weights", response_model=UntypedAPIFuture)
-async def load_weights(
-    request: LoadWeightsRequest,
+@router.post("/load_state", response_model=UntypedAPIFuture)
+async def load_state(
+    request: LoadStateRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
-    """Load model weights from checkpoint."""
+    """Load model state from checkpoint."""
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
@@ -137,12 +137,12 @@ async def load_weights(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_load_weights, request_id, session, request)
+    background_tasks.add_task(_do_load_state, request_id, session, request)
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_load_weights(request_id: str, session, request: LoadWeightsRequest) -> None:
-    """Background task to load weights."""
+async def _do_load_state(request_id: str, session, request: LoadStateRequest) -> None:
+    """Background task to load state."""
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
@@ -150,18 +150,18 @@ async def _do_load_weights(request_id: str, session, request: LoadWeightsRequest
         # Resolve path
         load_path = _resolve_tinker_path(request.path)
 
-        logger.info(f"[{session.model_id}] Loading weights from: {load_path}")
+        logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
         # Call training engine to load checkpoint
         await training_engine.load_weights(session, load_path, load_optimizer=request.optimizer)
 
         future_store.resolve(request_id, {
             "path": request.path,
-            "type": "load_weights",
+            "type": "load_state",
         })
 
     except Exception as e:
-        logger.error(f"[load_weights] Failed: {e}", exc_info=True)
+        logger.error(f"[load_state] Failed: {e}", exc_info=True)
         future_store.fail(request_id, str(e))
 
 
