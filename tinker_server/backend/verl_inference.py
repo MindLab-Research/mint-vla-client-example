@@ -70,13 +70,36 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
-            # Set multi-LoRA config as instance attributes (verl checks these)
-            self._tinker_max_loras = self.MULTI_LORA_MAX_LORAS
-            self._tinker_max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
-
             super().__init__(*args, **kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
+
+        def _patch_lora_args(self, args):
+            """Patch args Namespace with multi-LoRA config.
+
+            verl hardcodes max_loras=1. This modifies the parsed args to use
+            our configured values before AsyncEngineArgs.from_cli_args().
+            """
+            import logging
+            _logger = logging.getLogger(__name__)
+
+            if self.MULTI_LORA_MAX_LORAS > 1:
+                args.max_loras = self.MULTI_LORA_MAX_LORAS
+                _logger.info(f"Multi-LoRA: overriding max_loras={args.max_loras}")
+
+            if self.MULTI_LORA_MAX_CPU_LORAS > 0:
+                args.max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
+                _logger.info(f"Multi-LoRA: overriding max_cpu_loras={args.max_cpu_loras}")
+
+        async def run_server(self, args):
+            """Override to inject multi-LoRA config (rank-0 node)."""
+            self._patch_lora_args(args)
+            return await super().run_server(args)
+
+        async def run_headless(self, args):
+            """Override to inject multi-LoRA config (non-rank-0 nodes)."""
+            self._patch_lora_args(args)
+            return await super().run_headless(args)
 
         async def add_lora(self, lora_request) -> None:
             """Add LoRA adapter to running engine.
