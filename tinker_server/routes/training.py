@@ -2,6 +2,7 @@
 
 Endpoints:
 - POST /create_model: Create a training model
+- POST /create_model_from_state: Create model and load checkpoint (resume training)
 - POST /forward_backward: Forward + backward pass
 - POST /optim_step: Optimizer update
 - POST /save_weights_for_sampler: Save weights for inference
@@ -20,6 +21,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from ..backend.future_store import future_store
 from ..models.types import (
+    CreateModelFromStateRequest,
+    CreateModelFromStateResponse,
     CreateModelRequest,
     CreateModelResponse,
     ForwardBackwardRequest,
@@ -108,6 +111,121 @@ async def _do_create_model(request_id: str, request: CreateModelRequest) -> None
         # Clean up session if it was created
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
         if training_manager and training_manager.get_session(model_id):
+            training_manager.delete_session(model_id)
+        future_store.fail(request_id, str(e))
+
+
+# =============================================================================
+# create_model_from_state - async (composes create_model + load_state)
+# =============================================================================
+
+# Checkpoint directory (shared filesystem required for distributed deployments)
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+
+
+def _resolve_state_path(state_uri: str) -> str:
+    """Convert tinker://local/model_id/name or file:// to filesystem path.
+
+    Args:
+        state_uri: URI like tinker://local/..., tinker://localhost/...,
+                   file://..., or absolute path.
+
+    Returns:
+        Filesystem path.
+    """
+    if state_uri.startswith("tinker://local/"):
+        # tinker://local/model_id/checkpoint-100 -> ./checkpoints/model_id/checkpoint-100
+        path_part = state_uri[len("tinker://local/"):]
+        return os.path.join(CHECKPOINTS_DIR, path_part)
+    elif state_uri.startswith("tinker://localhost"):
+        # tinker://localhost/abs/path -> /abs/path
+        return state_uri[len("tinker://localhost"):]
+    elif state_uri.startswith("file://"):
+        return state_uri[7:]
+    return state_uri
+
+
+@router.post("/create_model_from_state", response_model=UntypedAPIFuture)
+async def create_model_from_state(
+    request: CreateModelFromStateRequest,
+    background_tasks: BackgroundTasks,
+) -> UntypedAPIFuture:
+    """Create a training model and load existing checkpoint.
+
+    Composes create_model + load_state into single operation.
+    Useful for resuming training from a saved checkpoint.
+    """
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    request_id = future_store.create()
+    background_tasks.add_task(_do_create_model_from_state, request_id, request)
+    return UntypedAPIFuture(request_id=request_id)
+
+
+async def _do_create_model_from_state(
+    request_id: str, request: CreateModelFromStateRequest
+) -> None:
+    """Background task to create model and load checkpoint."""
+    try:
+        if training_engine is None or training_manager is None:
+            raise RuntimeError("Training engine not initialized")
+
+        model_id = _generate_model_id(request.session_id, request.model_seq_id)
+
+        # Check if model already exists (from failed previous attempt)
+        existing = training_manager.get_session(model_id)
+        if existing is not None:
+            logger.warning(f"[{model_id}] Cleaning up stale session from previous attempt")
+            await training_engine.shutdown_session(existing)
+            training_manager.delete_session(model_id)
+
+        # Create session metadata
+        session = training_manager.create_session(
+            model_id=model_id,
+            session_id=request.session_id,
+            model_seq_id=request.model_seq_id,
+            base_model=request.base_model,
+            lora_config=request.lora_config,
+            user_metadata=request.user_metadata,
+        )
+
+        # Create Ray actor
+        await training_engine.create_training_session(session)
+
+        # Resolve state path
+        load_path = _resolve_state_path(request.state_path)
+
+        # Load checkpoint into the newly created model
+        await training_engine.load_weights(
+            session=session,
+            load_path=load_path,
+            load_optimizer=request.load_optimizer,
+        )
+
+        logger.info(
+            f"[{model_id}] Created model from state: {request.state_path} "
+            f"(step={session.current_step})"
+        )
+
+        response = CreateModelFromStateResponse(
+            request_id=request_id,
+            model_id=model_id,
+            type="create_model_from_state",
+        )
+        future_store.resolve(request_id, response.model_dump())
+
+    except Exception as e:
+        logger.exception(f"[create_model_from_state] Failed: {e}")
+        # Clean up session if it was created
+        model_id = _generate_model_id(request.session_id, request.model_seq_id)
+        if training_manager and training_manager.get_session(model_id):
+            try:
+                session = training_manager.get_session(model_id)
+                if session:
+                    await training_engine.shutdown_session(session)
+            except Exception:
+                pass  # Ignore cleanup errors
             training_manager.delete_session(model_id)
         future_store.fail(request_id, str(e))
 

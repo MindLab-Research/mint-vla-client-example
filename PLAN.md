@@ -35,7 +35,7 @@ Implementation:
 - Uses `prompt_logprobs=1` in vLLM SamplingParams
 - Supports both multi-LoRA and legacy per-session modes
 
-## Priority 3: Stage 3 - Checkpointing (Partial)
+## Priority 3: Stage 3 - Checkpointing - DONE
 
 Required for training resumption and state management.
 
@@ -45,20 +45,22 @@ Required for training resumption and state management.
 | `TrainingClient.load_state_async()` | `POST /load_state` | Done | Working |
 | `TrainingClient.save_weights_for_sampler_async()` | `POST /save_weights_for_sampler` | Done | Working |
 | `TrainingClient.save_weights_and_get_sampling_client()` | `POST /save_weights_for_sampler` (path=None) | Done | Ephemeral flow |
-| `ServiceClient.create_training_client_from_state()` | `POST /create_model_from_state` | **Missing** | New endpoint |
+| `ServiceClient.create_training_client_from_state()` | `POST /create_model_from_state` | Done | Composes create + load |
 
 ### `create_training_client_from_state` Implementation
 
 ```
-Input: state_path (str), base_model (str), lora_config (LoRAConfig)
+Input: session_id, model_seq_id, base_model, state_path, lora_config, load_optimizer
 Output: model_id (str)
 ```
 
-Implementation approach:
+Implementation:
 - Compose: `create_model` + `load_state`
 - Create new Ray actor with LoRA config
 - Load checkpoint into actor
 - Return model_id
+
+Location: `tinker_server/routes/training.py:147-229`
 
 ## Priority 4: Stage 2 - SFT Training (Mostly Done)
 
@@ -163,9 +165,9 @@ Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
    - [x] Add endpoint
    - [x] Use vLLM `prompt_logprobs` feature
 
-3. **Add `create_model_from_state`** (Priority 3) - Enables training resumption
-   - [ ] Add endpoint
-   - [ ] Compose create + load
+3. **Add `create_model_from_state`** (Priority 3) - Enables training resumption - DONE
+   - [x] Add endpoint
+   - [x] Compose create + load
 
 4. **Add `forward` (forward-only)** (Priority 4) - Enables inference-time logprob computation
    - [ ] Add endpoint

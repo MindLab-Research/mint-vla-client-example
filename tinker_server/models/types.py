@@ -369,3 +369,31 @@ class CheckpointsListResponse(BaseModel):
 
     model_id: str | None = None  # None for list-all endpoint
     checkpoints: list[CheckpointInfo]
+
+
+class CreateModelFromStateRequest(BaseModel):
+    """Request to create a training model from existing checkpoint.
+
+    Composes create_model + load_state into single operation.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    session_id: str
+    model_seq_id: int
+    base_model: str
+    state_path: str  # tinker:// or file:// path to checkpoint
+    lora_config: LoRAConfig | None = None
+    load_optimizer: bool = True  # whether to restore optimizer state
+    user_metadata: dict[str, Any] | None = None
+    type: Literal["create_model_from_state"] = "create_model_from_state"
+
+
+class CreateModelFromStateResponse(BaseModel):
+    """Response from create model from state."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    request_id: str
+    model_id: str
+    type: Literal["create_model_from_state"] = "create_model_from_state"
