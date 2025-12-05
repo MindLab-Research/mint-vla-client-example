@@ -63,25 +63,41 @@ async def create_session(request: CreateSessionRequest) -> CreateSessionResponse
 async def create_sampling_session(
     request: CreateSamplingSessionRequest,
 ) -> CreateSamplingSessionResponse:
-    """Create a sampling session with dedicated inference engine.
+    """Create a sampling session using the shared multi-LoRA engine.
 
-    Each sampling session spawns a new VerlInferenceEngine with its own
-    LoRA adapter, enabling session isolation.
+    Uses the shared multi-LoRA engine for efficient session management:
+    - Without model_path: Uses base model (no LoRA)
+    - With model_path: Loads LoRA adapter into shared engine
 
-    If model_path is provided (e.g., from save_weights_for_sampler), the
-    engine will load pre-trained LoRA weights from that path.
+    First call lazily initializes the multi-LoRA engine (~60s).
+    Subsequent calls register sessions instantly (<1s).
     """
     if session_manager is None:
         raise HTTPException(status_code=503, detail="Session manager not initialized")
 
     sampling_session_id = str(uuid.uuid4())
 
-    # Spawn dedicated engine for this session
-    await session_manager.create_session(
-        session_id=sampling_session_id,
-        lora_rank=request.lora_rank,
-        model_path=request.model_path,  # Pass LoRA adapter path for weight loading
-    )
+    # Ensure multi-LoRA engine is initialized (lazy init on first call)
+    multi_lora_engine = await session_manager.ensure_multi_lora_engine()
+
+    if request.model_path:
+        # Load LoRA weights from path into multi-LoRA engine
+        # Resolve path (file://, tinker://localhost, or absolute path)
+        adapter_path = _resolve_model_path(request.model_path)
+
+        # Add LoRA to engine and register session
+        await multi_lora_engine.add_lora_for_session(
+            sampling_session_id=sampling_session_id,
+            lora_path=adapter_path,
+            lora_rank=request.lora_rank,
+        )
+        session_manager.register_multi_lora_session(
+            session_id=sampling_session_id,
+            lora_rank=request.lora_rank,
+        )
+    else:
+        # Base model (no LoRA): register session directly
+        session_manager.register_base_model_session(sampling_session_id)
 
     # Store metadata
     sampling_sessions[sampling_session_id] = (
@@ -89,6 +105,31 @@ async def create_sampling_session(
     )
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+
+
+def _resolve_model_path(model_path: str) -> str:
+    """Resolve model_path URI to filesystem path.
+
+    Args:
+        model_path: URI like file:///path, tinker://localhost/path, or absolute path.
+
+    Returns:
+        Absolute filesystem path to adapter directory.
+    """
+    if model_path.startswith("file://"):
+        return model_path[7:]  # Strip file:// prefix
+    elif model_path.startswith("tinker://localhost"):
+        # Local server tinker:// format: tinker://localhost/<absolute_path>
+        return model_path[len("tinker://localhost"):]
+    elif model_path.startswith("tinker://"):
+        # Cloud tinker:// paths not supported locally
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cloud tinker:// paths not supported locally: {model_path}",
+        )
+    else:
+        # Assume absolute path
+        return model_path
 
 
 @router.post("/session_heartbeat")

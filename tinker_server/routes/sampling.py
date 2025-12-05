@@ -57,14 +57,15 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         token_ids = request.prompt.to_token_ids()
         session_id = request.sampling_session_id
 
-        # Check if this session uses multi-LoRA mode
+        # Check if session uses multi-LoRA mode (includes base model sessions)
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
 
         # Generate for each sample
         sequences = []
         for i in range(request.num_samples):
             if is_multi_lora:
-                # Multi-LoRA mode: use shared engine with session-specific LoRA
+                # Multi-LoRA mode: handles both LoRA and base model sessions
+                # generate() internally checks if session has LoRA registered
                 multi_lora_engine = session_manager.get_multi_lora_engine()
                 if multi_lora_engine is None:
                     raise RuntimeError("Multi-LoRA engine not initialized")
@@ -160,11 +161,12 @@ async def _do_compute_logprobs(
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
 
-        # Check if this session uses multi-LoRA mode
+        # Check if session uses multi-LoRA mode (includes base model sessions)
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
 
         if is_multi_lora:
-            # Multi-LoRA mode: use shared engine with session-specific LoRA
+            # Multi-LoRA mode: handles both LoRA and base model sessions
+            # compute_logprobs() internally checks if session has LoRA registered
             multi_lora_engine = session_manager.get_multi_lora_engine()
             if multi_lora_engine is None:
                 raise RuntimeError("Multi-LoRA engine not initialized")

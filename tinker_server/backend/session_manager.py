@@ -38,6 +38,7 @@ class SessionInfo:
     lora_rank: int
     is_shared: bool = False  # True for sessions using the shared engine
     uses_multi_lora: bool = False  # True if using MultiLoRAInferenceEngine
+    uses_base_model: bool = False  # True if multi-LoRA without any LoRA adapter
 
 
 class SessionManager:
@@ -424,6 +425,70 @@ class SessionManager:
         """
         info = self._sessions.get(session_id)
         return info is not None and info.uses_multi_lora
+
+    def is_base_model_session(self, session_id: str) -> bool:
+        """Check if a session uses base model (no LoRA) on multi-LoRA engine.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            True if session uses base model, False otherwise.
+        """
+        info = self._sessions.get(session_id)
+        return info is not None and info.uses_base_model
+
+    def register_base_model_session(self, session_id: str) -> None:
+        """Register a sampling session that uses base model on multi-LoRA engine.
+
+        The session will use the shared multi-LoRA engine without any LoRA adapter.
+
+        Args:
+            session_id: Unique identifier for the sampling session.
+
+        Raises:
+            ValueError: If session_id already exists.
+            RuntimeError: If multi-LoRA engine not set.
+        """
+        if session_id in self._sessions:
+            raise ValueError(f"Session {session_id} already exists")
+
+        if not hasattr(self, "_multi_lora_engine") or self._multi_lora_engine is None:
+            raise RuntimeError("Multi-LoRA engine not set")
+
+        self._sessions[session_id] = SessionInfo(
+            engine=None,  # No per-session engine
+            last_activity=time.time(),
+            lora_rank=0,  # No LoRA
+            is_shared=True,
+            uses_multi_lora=True,
+            uses_base_model=True,
+        )
+        logger.info(f"Registered base model session {session_id}")
+
+    async def ensure_multi_lora_engine(self) -> "MultiLoRAInferenceEngine":
+        """Initialize multi-LoRA engine if not already done.
+
+        Lazily creates and initializes the shared multi-LoRA engine.
+        This is called by create_sampling_session when using multi-LoRA mode.
+
+        Returns:
+            The initialized MultiLoRAInferenceEngine instance.
+        """
+        if not hasattr(self, "_multi_lora_engine") or self._multi_lora_engine is None:
+            from .multi_lora_engine import MultiLoRAInferenceEngine
+
+            logger.info("Initializing multi-LoRA engine lazily...")
+            self._multi_lora_engine = MultiLoRAInferenceEngine(
+                model_path=self.model_path,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                max_model_len=self.max_model_len,
+            )
+            await self._multi_lora_engine.initialize()
+            logger.info("Multi-LoRA engine initialized")
+
+        return self._multi_lora_engine
 
 
 # Global session manager (initialized in app lifespan)

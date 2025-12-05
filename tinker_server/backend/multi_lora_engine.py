@@ -330,7 +330,7 @@ class MultiLoRAInferenceEngine:
 
     async def generate(
         self,
-        sampling_session_id: str,
+        sampling_session_id: str | None,
         prompt_ids: list[int],
         request_id: str,
         max_tokens: int,
@@ -339,10 +339,12 @@ class MultiLoRAInferenceEngine:
         top_p: float = 1.0,
         logprobs: bool = True,
     ) -> GenerateResult:
-        """Generate tokens using session-specific LoRA weights.
+        """Generate tokens using session-specific LoRA or base model.
+
+        If sampling_session_id is None or has no registered LoRA, uses base model.
 
         Args:
-            sampling_session_id: The sampling session to use.
+            sampling_session_id: The sampling session to use, or None for base model.
             prompt_ids: Input token IDs.
             request_id: Unique request identifier.
             max_tokens: Maximum tokens to generate.
@@ -353,30 +355,38 @@ class MultiLoRAInferenceEngine:
 
         Returns:
             GenerateResult with generated tokens and metadata.
-
-        Raises:
-            ValueError: If sampling_session_id has no loaded LoRA.
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
-        lora_id = await self.registry.get_lora_id(sampling_session_id)
-        if lora_id is None:
-            raise ValueError(
-                f"No LoRA loaded for sampling session {sampling_session_id}"
-            )
+        # Look up LoRA ID for this session (None = base model)
+        lora_id = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
 
-        # Generate with session-specific LoRA
-        result = await self.server.generate_with_lora.remote(
-            prompt_ids=prompt_ids,
-            request_id=request_id,
-            lora_int_id=lora_id,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            logprobs=logprobs,
-        )
+        if lora_id is not None:
+            # Generate with session-specific LoRA
+            result = await self.server.generate_with_lora.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+            )
+        else:
+            # Generate with base model (no LoRA)
+            result = await self.server.generate_base.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+            )
 
         return GenerateResult(
             token_ids=result["token_ids"],
@@ -386,41 +396,46 @@ class MultiLoRAInferenceEngine:
 
     async def compute_logprobs(
         self,
-        sampling_session_id: str,
+        sampling_session_id: str | None,
         prompt_ids: list[int],
         request_id: str,
     ) -> list[float]:
-        """Compute logprobs for a sequence using session-specific LoRA weights.
+        """Compute logprobs using session-specific LoRA or base model.
+
+        If sampling_session_id is None or has no registered LoRA, uses base model.
 
         Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
         Output length is len(prompt_ids) - 1.
 
         Args:
-            sampling_session_id: The sampling session to use.
+            sampling_session_id: The sampling session to use, or None for base model.
             prompt_ids: Input token IDs.
             request_id: Unique request identifier.
 
         Returns:
             List of logprobs, length = len(prompt_ids) - 1.
-
-        Raises:
-            ValueError: If sampling_session_id has no loaded LoRA.
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
-        lora_id = await self.registry.get_lora_id(sampling_session_id)
-        if lora_id is None:
-            raise ValueError(
-                f"No LoRA loaded for sampling session {sampling_session_id}"
-            )
+        # Look up LoRA ID for this session (None = base model)
+        lora_id = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
 
-        # Compute logprobs with session-specific LoRA
-        result = await self.server.compute_prompt_logprobs_with_lora.remote(
-            prompt_ids=prompt_ids,
-            request_id=request_id,
-            lora_int_id=lora_id,
-        )
+        if lora_id is not None:
+            # Compute logprobs with session-specific LoRA
+            result = await self.server.compute_prompt_logprobs_with_lora.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+            )
+        else:
+            # Compute logprobs with base model (no LoRA)
+            result = await self.server.compute_prompt_logprobs_base.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+            )
 
         return list(result)
 

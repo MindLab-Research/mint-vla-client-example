@@ -360,6 +360,87 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "stop_reason": stop_reason,
             }
 
+        async def generate_base(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            max_tokens: int,
+            temperature: float = 1.0,
+            top_k: int = -1,
+            top_p: float = 1.0,
+            logprobs: bool = True,
+        ) -> dict:
+            """Generate using base model without any LoRA adapter.
+
+            For multi-LoRA engine: generates with base model weights only.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                max_tokens: Maximum tokens to generate.
+                temperature: Sampling temperature.
+                top_k: Top-k sampling parameter.
+                top_p: Top-p sampling parameter.
+                logprobs: Whether to return log probabilities.
+
+            Returns:
+                Dict with token_ids, logprobs, stop_reason.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+
+            # Compute effective max_tokens
+            verl_max_tokens = self.config.max_model_len - len(prompt_ids)
+            effective_max_tokens = min(max_tokens, verl_max_tokens)
+
+            # Build sampling params
+            sampling_params = SamplingParams(
+                max_tokens=effective_max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=0 if logprobs else None,
+                # EOS token handling for Qwen
+                stop_token_ids=[151645, 151643],
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Generate WITHOUT LoRA request (base model)
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=None,  # No LoRA = base model
+            )
+
+            # Get final response
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            token_ids = list(final_res.outputs[0].token_ids)
+            log_probs = None
+            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                log_probs = [
+                    logprobs[token_ids[i]].logprob
+                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                ]
+
+            # Determine stop reason
+            stop_reason = "length"
+            if final_res.outputs[0].finish_reason == "stop":
+                stop_reason = "stop"
+            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                stop_reason = "stop"
+
+            return {
+                "token_ids": token_ids,
+                "logprobs": log_probs,
+                "stop_reason": stop_reason,
+            }
+
         async def generate(
             self,
             prompt_ids: list[int],
@@ -575,6 +656,67 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 lora_request=lora_request,
+            )
+
+            # Get final response
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            # Extract prompt logprobs
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            logprobs = []
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    continue
+                token_id = prompt_ids[i]
+                if token_id in prompt_logprobs[i]:
+                    logprobs.append(prompt_logprobs[i][token_id].logprob)
+                else:
+                    logprobs.append(-100.0)
+
+            return logprobs
+
+        async def compute_prompt_logprobs_base(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+        ) -> list[float]:
+            """Compute logprobs using base model without any LoRA adapter.
+
+            For multi-LoRA engine: computes logprobs with base model weights only.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+
+            Returns:
+                List of logprobs, length = len(prompt_ids) - 1.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=1,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Generate WITHOUT LoRA request (base model)
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=None,  # No LoRA = base model
             )
 
             # Get final response
