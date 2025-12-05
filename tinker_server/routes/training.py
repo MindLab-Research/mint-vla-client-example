@@ -4,9 +4,12 @@ Endpoints:
 - POST /create_model: Create a training model
 - POST /create_model_from_state: Create model and load checkpoint (resume training)
 - POST /forward_backward: Forward + backward pass
+- POST /forward: Forward pass only (no backward), returns logprobs
 - POST /optim_step: Optimizer update
 - POST /save_weights_for_sampler: Save weights for inference
 - GET /models: List training models
+- GET /models/{model_id}: Get model info
+- GET /models/{model_id}/tokenizer: Get tokenizer config
 - DELETE /models/{model_id}: Delete a model
 """
 
@@ -268,6 +271,51 @@ async def _do_forward_backward(
 
     except Exception as e:
         logger.exception(f"[forward_backward] Failed: {e}")
+        future_store.fail(request_id, str(e))
+
+
+# =============================================================================
+# forward - async (forward only, no backward)
+# =============================================================================
+
+
+@router.post("/forward", response_model=UntypedAPIFuture)
+async def forward(
+    request: ForwardBackwardRequest,
+    background_tasks: BackgroundTasks,
+) -> UntypedAPIFuture:
+    """Perform forward pass only (no backward). Returns logprobs.
+
+    Same input as forward_backward but skips gradient computation.
+    Useful for inference-time logprob computation with training model.
+    """
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
+
+    request_id = future_store.create()
+    background_tasks.add_task(_do_forward, request_id, session, request)
+    return UntypedAPIFuture(request_id=request_id)
+
+
+async def _do_forward(
+    request_id: str, session, request: ForwardBackwardRequest
+) -> None:
+    """Background task for forward."""
+    try:
+        if training_engine is None:
+            raise RuntimeError("Training engine not initialized")
+
+        result = await training_engine.forward(session, request)
+        future_store.resolve(request_id, result)
+
+    except Exception as e:
+        logger.exception(f"[forward] Failed: {e}")
         future_store.fail(request_id, str(e))
 
 
@@ -564,3 +612,26 @@ async def delete_model(model_id: str):
     training_manager.delete_session(model_id)
 
     return {"model_id": model_id, "status": "deleted"}
+
+
+@router.get("/models/{model_id}/tokenizer")
+async def get_tokenizer(model_id: str):
+    """Get tokenizer configuration for a training model.
+
+    Returns tokenizer info (vocab_size, special tokens, etc.)
+    for client-side tokenization.
+    """
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{model_id}' not found"
+        )
+
+    tokenizer_info = await training_engine.get_tokenizer_info(session)
+    return {
+        "model_id": model_id,
+        "tokenizer": tokenizer_info,
+    }

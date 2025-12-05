@@ -62,26 +62,30 @@ Implementation:
 
 Location: `tinker_server/routes/training.py:147-229`
 
-## Priority 4: Stage 2 - SFT Training (Mostly Done)
+## Priority 4: Stage 2 - SFT Training - DONE
 
 | Interface Method | Endpoint | Status | Notes |
 |-----------------|----------|--------|-------|
 | `ServiceClient.create_lora_training_client()` | `POST /create_model` | Done | Working |
-| `TrainingClient.forward_backward_async()` | `POST /forward_backward` | Partial | Only `cross_entropy` implemented |
-| `TrainingClient.forward_async()` | `POST /forward` | **Missing** | Forward only, no backward |
+| `TrainingClient.forward_backward_async()` | `POST /forward_backward` | Done | Only `cross_entropy` implemented |
+| `TrainingClient.forward_async()` | `POST /forward` | Done | Forward only, no backward |
 | `TrainingClient.optim_step_async()` | `POST /optim_step` | Done | Working |
-| `TrainingClient.get_tokenizer()` | `GET /tokenizer` | **Missing** | Return tokenizer config |
+| `TrainingClient.get_tokenizer()` | `GET /models/{model_id}/tokenizer` | Done | Return tokenizer config |
 
 ### `forward_async` Implementation
 
 ```
 Input: data (list[Datum]), loss_fn (str)
-Output: ForwardBackwardOutput (logprobs only, no gradient computation)
+Output: ForwardBackwardOutput (logprobs in loss_fn_outputs, no gradient computation)
 ```
 
-Implementation approach:
-- Same as `forward_backward` but skip `loss.backward()`
-- Return logprobs in `loss_fn_outputs`
+Implementation:
+- `POST /forward` endpoint added to training.py
+- Uses `torch.no_grad()` context, model in eval mode
+- Returns logprobs for target tokens in `loss_fn_outputs`
+- Same input format as `forward_backward`
+
+Location: `tinker_server/routes/training.py:279-316`
 
 ## Priority 5: Stage 4 - RL Training (Not Implemented)
 
@@ -169,9 +173,10 @@ Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
    - [x] Add endpoint
    - [x] Compose create + load
 
-4. **Add `forward` (forward-only)** (Priority 4) - Enables inference-time logprob computation
-   - [ ] Add endpoint
-   - [ ] Skip backward pass
+4. **Add `forward` (forward-only)** (Priority 4) - Enables inference-time logprob computation - DONE
+   - [x] Add endpoint
+   - [x] Skip backward pass
+   - [x] Add `GET /models/{model_id}/tokenizer` endpoint
 
 5. **Add RL losses** (Priority 5) - Enables RLHF
    - [ ] `importance_sampling` loss
