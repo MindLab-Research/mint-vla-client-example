@@ -36,14 +36,28 @@ _apply_vllm_hijack()
 
 # Extended vLLMHttpServer with add_lora support
 # Must be defined after hijack is applied
-def _create_extended_server_class():
-    """Create extended vLLMHttpServer class with add_lora method."""
+def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
+    """Create extended vLLMHttpServer class with add_lora method.
+
+    Args:
+        max_loras: Maximum LoRAs in a single batch (default: 1).
+                   Set > 1 for multi-LoRA concurrent inference.
+        max_cpu_loras: Maximum LoRAs in CPU cache for swap (default: 0).
+    """
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServerBase
     from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
+
+    # Capture in closure
+    _max_loras = max_loras
+    _max_cpu_loras = max_cpu_loras
 
     @ray.remote(num_cpus=1)
     class ExtendedVLLMHttpServer(vLLMHttpServerBase):
         """Extended vLLMHttpServer with hot LoRA loading support."""
+
+        # Class-level config for multi-LoRA (captured from factory)
+        MULTI_LORA_MAX_LORAS = _max_loras
+        MULTI_LORA_MAX_CPU_LORAS = _max_cpu_loras
 
         def __init__(self, *args, **kwargs):
             """Initialize with VLLMHijack applied first."""
@@ -55,7 +69,14 @@ def _create_extended_server_class():
                     VLLMHijack.hijack()
             except Exception:
                 pass
+
+            # Set multi-LoRA config as instance attributes (verl checks these)
+            self._tinker_max_loras = self.MULTI_LORA_MAX_LORAS
+            self._tinker_max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
+
             super().__init__(*args, **kwargs)
+            # Track local paths for multi-LoRA (needed for GPU/CPU swap)
+            self._lora_paths: dict[int, str] = {}
 
         async def add_lora(self, lora_request) -> None:
             """Add LoRA adapter to running engine.
@@ -134,6 +155,187 @@ def _create_extended_server_class():
         async def list_loras(self) -> set[int]:
             """List loaded LoRA adapter IDs."""
             return await self.engine.list_loras()
+
+        async def remove_lora(self, lora_int_id: int) -> None:
+            """Remove a LoRA adapter by ID.
+
+            Args:
+                lora_int_id: The LoRA adapter ID to remove.
+            """
+            await self.engine.remove_lora(lora_int_id)
+            # Clean up path tracking
+            self._lora_paths.pop(lora_int_id, None)
+
+        async def add_lora_with_id(
+            self,
+            lora_int_id: int,
+            state_dict: dict,
+            peft_config: dict,
+        ) -> str:
+            """Add LoRA from tensors with specific lora_int_id.
+
+            For multi-LoRA: each sampling session gets unique lora_int_id
+            with frozen weights.
+
+            Args:
+                lora_int_id: Unique identifier for this LoRA adapter.
+                state_dict: LoRA weight tensors (already on CPU).
+                peft_config: PEFT adapter config dict.
+
+            Returns:
+                Path where adapter was saved on worker node.
+            """
+            import json
+            import os
+            import tempfile
+
+            from safetensors.torch import save_file
+            from vllm.lora.request import LoRARequest
+
+            # Create temp dir on THIS worker node
+            temp_dir = tempfile.mkdtemp(prefix=f"tinker_lora_{lora_int_id}_")
+            adapter_path = temp_dir
+
+            # Save adapter files locally on worker node
+            save_file(state_dict, os.path.join(adapter_path, "adapter_model.safetensors"))
+            with open(os.path.join(adapter_path, "adapter_config.json"), "w") as f:
+                json.dump(peft_config, f, indent=2)
+
+            # Track path for this lora_int_id (needed for GPU/CPU swap in generate)
+            self._lora_paths[lora_int_id] = adapter_path
+
+            # Create LoRARequest with the specific ID
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=adapter_path,
+            )
+
+            # Add to engine (no need to remove - this is a new unique ID)
+            await self.engine.add_lora(lora_request)
+            return adapter_path
+
+        async def add_lora_from_path(
+            self,
+            lora_int_id: int,
+            lora_path: str,
+            lora_name: str,
+        ) -> None:
+            """Add LoRA from filesystem path with specific lora_int_id.
+
+            For multi-LoRA: loads directly from shared filesystem.
+            File-based loading supports vLLM's GPU/CPU swapping
+            (unlike TensorLoRARequest which fails with "stub" path).
+
+            Args:
+                lora_int_id: Unique identifier for this LoRA adapter.
+                lora_path: Path to PEFT adapter directory.
+                lora_name: Human-readable name for the adapter.
+            """
+            from vllm.lora.request import LoRARequest
+
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+            await self.engine.add_lora(lora_request)
+
+        async def generate_with_lora(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            lora_int_id: int,
+            max_tokens: int,
+            temperature: float = 1.0,
+            top_k: int = -1,
+            top_p: float = 1.0,
+            logprobs: bool = True,
+        ) -> dict:
+            """Generate with a specific LoRA adapter.
+
+            For multi-LoRA: routes request to session-specific adapter.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                lora_int_id: The LoRA adapter ID to use.
+                max_tokens: Maximum tokens to generate.
+                temperature: Sampling temperature.
+                top_k: Top-k sampling parameter.
+                top_p: Top-p sampling parameter.
+                logprobs: Whether to return log probabilities.
+
+            Returns:
+                Dict with token_ids, logprobs, stop_reason.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            # Compute effective max_tokens
+            verl_max_tokens = self.config.max_model_len - len(prompt_ids)
+            effective_max_tokens = min(max_tokens, verl_max_tokens)
+
+            # Build sampling params
+            sampling_params = SamplingParams(
+                max_tokens=effective_max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=0 if logprobs else None,
+                # EOS token handling for Qwen
+                stop_token_ids=[151645, 151643],
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Look up local path for this LoRA (needed for GPU/CPU swap)
+            lora_path = self._lora_paths.get(lora_int_id)
+            if lora_path is None:
+                raise ValueError(f"No path found for lora_int_id={lora_int_id}")
+
+            # Create LoRA request with real path for swap support
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            # Get final response
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            token_ids = list(final_res.outputs[0].token_ids)
+            log_probs = None
+            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                log_probs = [
+                    logprobs[token_ids[i]].logprob
+                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                ]
+
+            # Determine stop reason
+            stop_reason = "length"
+            if final_res.outputs[0].finish_reason == "stop":
+                stop_reason = "stop"
+            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                stop_reason = "stop"
+
+            return {
+                "token_ids": token_ids,
+                "logprobs": log_probs,
+                "stop_reason": stop_reason,
+            }
 
         async def generate(
             self,

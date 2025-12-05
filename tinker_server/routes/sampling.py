@@ -51,29 +51,51 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         if session_manager is None:
             raise RuntimeError("Session manager not initialized")
 
-        # Get engine for this session
-        engine = session_manager.get_engine(request.sampling_session_id)
-        if engine is None:
-            raise RuntimeError(
-                f"No engine found for session {request.sampling_session_id}"
-            )
-
         token_ids = request.prompt.to_token_ids()
+        session_id = request.sampling_session_id
+
+        # Check if this session uses multi-LoRA mode
+        is_multi_lora = session_manager.is_multi_lora_session(session_id)
 
         # Generate for each sample
         sequences = []
         for i in range(request.num_samples):
-            # NOTE: max_tokens parameter is passed here but currently ignored by verl.
-            # verl computes max_tokens as (max_model_len - prompt_len) internally.
-            result = await engine.generate(
-                prompt_ids=token_ids,
-                request_id=f"{request_id}_{i}",
-                max_tokens=request.sampling_params.max_tokens,
-                temperature=request.sampling_params.temperature,
-                top_k=request.sampling_params.top_k,
-                top_p=request.sampling_params.top_p,
-                logprobs=True,
-            )
+            if is_multi_lora:
+                # Multi-LoRA mode: use shared engine with session-specific LoRA
+                multi_lora_engine = session_manager.get_multi_lora_engine()
+                if multi_lora_engine is None:
+                    raise RuntimeError("Multi-LoRA engine not initialized")
+
+                result = await multi_lora_engine.generate(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=f"{request_id}_{i}",
+                    max_tokens=request.sampling_params.max_tokens,
+                    temperature=request.sampling_params.temperature,
+                    top_k=request.sampling_params.top_k,
+                    top_p=request.sampling_params.top_p,
+                    logprobs=True,
+                )
+            else:
+                # Legacy mode: per-session engine
+                engine = session_manager.get_engine(session_id)
+                if engine is None:
+                    raise RuntimeError(
+                        f"No engine found for session {session_id}"
+                    )
+
+                result = await engine.generate(
+                    prompt_ids=token_ids,
+                    request_id=f"{request_id}_{i}",
+                    max_tokens=request.sampling_params.max_tokens,
+                    temperature=request.sampling_params.temperature,
+                    top_k=request.sampling_params.top_k,
+                    top_p=request.sampling_params.top_p,
+                    logprobs=True,
+                )
+
+            # Normalize logprobs attribute name (multi-LoRA uses 'logprobs', legacy uses 'log_probs')
+            logprobs = getattr(result, 'logprobs', None) or getattr(result, 'log_probs', None)
 
             # Infer stop reason: check if EOS tokens are present
             # verl's TokenOutput doesn't include finish_reason, so we infer it
@@ -87,7 +109,7 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
             sequences.append(
                 SampledSequence(
                     tokens=result.token_ids,
-                    logprobs=result.log_probs,
+                    logprobs=logprobs,
                     stop_reason=stop_reason,
                 )
             )
