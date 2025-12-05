@@ -18,6 +18,12 @@ class ServerConfig:
     gpu_memory_utilization: float = 0.9
     max_model_len: int | None = None
 
+    # Multi-LoRA settings
+    enable_multi_lora: bool = True  # Enable shared multi-LoRA engine
+    max_loras: int = 64  # GPU slots for concurrent LoRA adapters (~2.5GB for 64 rank-32 Qwen-7B)
+    max_cpu_loras: int = 1024  # CPU cache for evicted adapters
+    max_lora_rank: int = 64  # Maximum supported LoRA rank
+
     @classmethod
     def from_env(cls) -> "ServerConfig":
         """Load configuration from environment variables."""
@@ -30,6 +36,12 @@ class ServerConfig:
             max_model_len=int(os.environ["TINKER_MAX_MODEL_LEN"])
             if os.environ.get("TINKER_MAX_MODEL_LEN")
             else None,
+            # Multi-LoRA settings
+            enable_multi_lora=os.environ.get("TINKER_ENABLE_MULTI_LORA", "true").lower()
+            in ("true", "1", "yes"),
+            max_loras=int(os.environ.get("TINKER_MAX_LORAS", "64")),
+            max_cpu_loras=int(os.environ.get("TINKER_MAX_CPU_LORAS", "1024")),
+            max_lora_rank=int(os.environ.get("TINKER_MAX_LORA_RANK", "64")),
         )
 
 

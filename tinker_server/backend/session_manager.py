@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .multi_lora_engine import MultiLoRAInferenceEngine
     from .verl_inference import VerlInferenceEngine
 
 logger = logging.getLogger(__name__)
@@ -32,10 +33,11 @@ SHARED_ENGINE_SESSION_ID = "__shared__"
 class SessionInfo:
     """Tracks session state."""
 
-    engine: VerlInferenceEngine
+    engine: VerlInferenceEngine | None  # None if using multi-LoRA mode
     last_activity: float  # time.time()
     lora_rank: int
     is_shared: bool = False  # True for sessions using the shared engine
+    uses_multi_lora: bool = False  # True if using MultiLoRAInferenceEngine
 
 
 class SessionManager:
@@ -359,6 +361,69 @@ class SessionManager:
     def list_sessions(self) -> list[str]:
         """List all active session IDs."""
         return list(self._sessions.keys())
+
+    # =========================================================================
+    # Multi-LoRA Mode Methods
+    # =========================================================================
+
+    def set_multi_lora_engine(self, engine: "MultiLoRAInferenceEngine") -> None:
+        """Set the shared multi-LoRA inference engine.
+
+        Args:
+            engine: The MultiLoRAInferenceEngine instance.
+        """
+        self._multi_lora_engine = engine
+        logger.info("Multi-LoRA engine set")
+
+    def get_multi_lora_engine(self) -> "MultiLoRAInferenceEngine | None":
+        """Get the shared multi-LoRA inference engine."""
+        return getattr(self, "_multi_lora_engine", None)
+
+    def register_multi_lora_session(
+        self,
+        session_id: str,
+        lora_rank: int = 32,
+    ) -> None:
+        """Register a sampling session that uses the shared multi-LoRA engine.
+
+        The session's LoRA weights are already loaded in the multi-LoRA engine.
+
+        Args:
+            session_id: Unique identifier for the sampling session.
+            lora_rank: LoRA rank for the adapter.
+
+        Raises:
+            ValueError: If session_id already exists.
+            RuntimeError: If multi-LoRA engine not set.
+        """
+        if session_id in self._sessions:
+            raise ValueError(f"Session {session_id} already exists")
+
+        if not hasattr(self, "_multi_lora_engine") or self._multi_lora_engine is None:
+            raise RuntimeError("Multi-LoRA engine not set")
+
+        self._sessions[session_id] = SessionInfo(
+            engine=None,  # No per-session engine
+            last_activity=time.time(),
+            lora_rank=lora_rank,
+            is_shared=True,
+            uses_multi_lora=True,
+        )
+        logger.info(
+            f"Registered multi-LoRA session {session_id} (lora_rank={lora_rank})"
+        )
+
+    def is_multi_lora_session(self, session_id: str) -> bool:
+        """Check if a session uses multi-LoRA mode.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            True if session uses multi-LoRA, False otherwise.
+        """
+        info = self._sessions.get(session_id)
+        return info is not None and info.uses_multi_lora
 
 
 # Global session manager (initialized in app lifespan)

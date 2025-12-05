@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from .backend.multi_lora_engine import MultiLoRAInferenceEngine
 from .backend.session_manager import SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
@@ -47,6 +48,34 @@ async def lifespan(app: FastAPI):
     logger.info("Inference session manager initialized")
 
     # ==========================================================================
+    # Multi-LoRA: Initialize shared inference engine (optional)
+    # ==========================================================================
+    multi_lora_engine: MultiLoRAInferenceEngine | None = None
+
+    if config.enable_multi_lora:
+        logger.info(
+            f"Initializing Multi-LoRA engine: max_loras={config.max_loras}, "
+            f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
+        )
+
+        multi_lora_engine = MultiLoRAInferenceEngine(
+            model_path=config.model_path,
+            tensor_parallel_size=config.tensor_parallel_size,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            max_model_len=config.max_model_len,
+            max_loras=config.max_loras,
+            max_cpu_loras=config.max_cpu_loras,
+            max_lora_rank=config.max_lora_rank,
+        )
+        await multi_lora_engine.initialize()
+
+        # Register with session manager
+        inference_manager.set_multi_lora_engine(multi_lora_engine)
+        logger.info("Multi-LoRA engine initialized and registered")
+    else:
+        logger.info("Multi-LoRA disabled, using per-session engines")
+
+    # ==========================================================================
     # Training: Initialize TrainingSessionManager and VerlTrainingEngine
     # ==========================================================================
     logger.info("Initializing training components")
@@ -78,6 +107,11 @@ async def lifespan(app: FastAPI):
 
     # Shutdown inference sessions
     await inference_manager.shutdown_all()
+
+    # Shutdown multi-LoRA engine
+    if multi_lora_engine is not None:
+        await multi_lora_engine.shutdown()
+        logger.info("Multi-LoRA engine shutdown")
 
 
 app = FastAPI(
