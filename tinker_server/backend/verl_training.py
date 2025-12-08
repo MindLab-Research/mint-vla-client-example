@@ -675,11 +675,14 @@ class VerlTrainingEngine:
     async def create_training_session(self, session: TrainingSession) -> None:
         """Create Ray actor for session.
 
+        Routes MoE models to MegatronTrainingWorker, dense models to TrainingWorker.
         Blocks until GPU is available (Ray queuing).
 
         Args:
             session: TrainingSession with configuration.
         """
+        from .megatron_training import MegatronTrainingWorker, is_moe_model
+
         model_id = session.model_id
 
         # Determine base model path
@@ -697,14 +700,31 @@ class VerlTrainingEngine:
             session.lora_config.rank if session.lora_config else self.default_lora_rank
         )
 
-        logger.info(f"[{model_id}] Creating TrainingWorker (base={base_model}, lora_rank={lora_rank})")
+        # Check if this is an MoE model requiring Megatron backend
+        # Use requested_model for pattern matching (has HuggingFace model name)
+        model_name_for_check = requested_model or base_model or ""
+        use_megatron = is_moe_model(model_name_for_check)
 
-        # Create Ray actor - queues if no GPU available
-        worker = TrainingWorker.remote(
-            base_model=base_model,
-            lora_rank=lora_rank,
-            learning_rate=session.learning_rate,
-        )
+        if use_megatron:
+            logger.info(f"[{model_id}] Creating MegatronTrainingWorker for MoE model (base={base_model}, lora_rank={lora_rank})")
+
+            # Create Megatron worker - uses all 8 GPUs
+            worker = MegatronTrainingWorker.remote(
+                base_model=base_model,
+                lora_rank=lora_rank,
+                learning_rate=session.learning_rate,
+            )
+            session.backend = "megatron"
+        else:
+            logger.info(f"[{model_id}] Creating TrainingWorker for dense model (base={base_model}, lora_rank={lora_rank})")
+
+            # Create single-GPU worker
+            worker = TrainingWorker.remote(
+                base_model=base_model,
+                lora_rank=lora_rank,
+                learning_rate=session.learning_rate,
+            )
+            session.backend = "peft"
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
@@ -712,7 +732,7 @@ class VerlTrainingEngine:
 
         self._workers[model_id] = worker
         session.is_active = True
-        logger.info(f"[{model_id}] TrainingWorker ready")
+        logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
 
     async def forward_backward(
         self,

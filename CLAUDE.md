@@ -1,5 +1,9 @@
 # tinker-server
 
+## Code Synchronization
+
+**IMPORTANT:** Code sync between local and server is handled by a background `unison` process. **NEVER** manually synchronize code (no rsync, scp, or git operations for syncing).
+
 ## Running the Server
 
 ```bash
