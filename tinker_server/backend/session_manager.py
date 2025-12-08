@@ -56,6 +56,7 @@ class SessionManager:
         self,
         model_path: str,
         tensor_parallel_size: int = 1,
+        data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int | None = None,
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
@@ -63,6 +64,7 @@ class SessionManager:
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.inactivity_timeout = inactivity_timeout
@@ -122,6 +124,7 @@ class SessionManager:
                 self._shared_engine = VerlInferenceEngine(
                     model_path=self.model_path,
                     tensor_parallel_size=self.tensor_parallel_size,
+                    data_parallel_size=self.data_parallel_size,
                     gpu_memory_utilization=self.gpu_memory_utilization,
                     max_model_len=self.max_model_len,
                     lora_rank=self.shared_engine_lora_rank,
@@ -223,6 +226,7 @@ class SessionManager:
         engine = VerlInferenceEngine(
             model_path=self.model_path,
             tensor_parallel_size=self.tensor_parallel_size,
+            data_parallel_size=self.data_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             max_model_len=self.max_model_len,
             lora_rank=lora_rank,

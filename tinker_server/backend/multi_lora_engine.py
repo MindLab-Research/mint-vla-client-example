@@ -183,6 +183,7 @@ class MultiLoRAInferenceEngine:
         self,
         model_path: str,
         tensor_parallel_size: int = 1,
+        data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.85,
         max_model_len: int | None = None,
         max_loras: int = DEFAULT_MAX_LORAS,
@@ -191,6 +192,7 @@ class MultiLoRAInferenceEngine:
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
@@ -241,7 +243,25 @@ class MultiLoRAInferenceEngine:
                 max_cpu_loras=self.max_cpu_loras,
             )
 
+            # Compute total GPUs needed for MoE models
+            # For EP (expert parallelism), total_gpus = TP * DP
+            total_gpus = self.tensor_parallel_size * self.data_parallel_size
+
+            # Build engine_kwargs for expert parallelism
+            # Pass enable_expert_parallel directly to vLLM, bypassing verl's worker-based EP
+            # This allows vLLM to handle EP internally via multiprocessing
+            engine_kwargs = {}
+            if self.data_parallel_size > 1:
+                engine_kwargs = {
+                    "vllm": {
+                        "enable_expert_parallel": True,
+                    }
+                }
+                logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
+
             # Configure rollout with multi-LoRA support
+            # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
+            # Expert parallelism is enabled via engine_kwargs instead
             rollout_config = RolloutConfig(
                 name="vllm",
                 tensor_model_parallel_size=self.tensor_parallel_size,
@@ -259,7 +279,9 @@ class MultiLoRAInferenceEngine:
                 temperature=1.0,
                 top_k=-1,
                 top_p=1.0,
-                data_parallel_size=1,
+                data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+                expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+                engine_kwargs=engine_kwargs,
             )
             if self.max_model_len is not None:
                 rollout_config.max_model_len = self.max_model_len
@@ -274,14 +296,16 @@ class MultiLoRAInferenceEngine:
 
             logger.info(
                 f"Initializing MultiLoRAInferenceEngine: "
+                f"TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
                 f"max_loras={self.max_loras}, max_cpu_loras={self.max_cpu_loras}, "
                 f"max_lora_rank={self.max_lora_rank}"
             )
 
             # Create detached Ray actor with well-known name
             # lifetime="detached" ensures actor survives owner process termination
+            # Request total_gpus for MoE expert parallelism
             self.server = ExtendedVLLMHttpServer.options(
-                num_gpus=self.tensor_parallel_size,
+                num_gpus=total_gpus,
                 name=PERSISTENT_VLLM_ACTOR_NAME,
                 lifetime="detached",
             ).remote(
@@ -291,7 +315,7 @@ class MultiLoRAInferenceEngine:
                 workers=[],
                 replica_rank=0,
                 node_rank=0,
-                gpus_per_node=self.tensor_parallel_size,
+                gpus_per_node=total_gpus,
                 nnodes=1,
             )
 

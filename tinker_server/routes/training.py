@@ -501,6 +501,7 @@ async def _do_save_weights_for_sampler(
                     engine = VerlInferenceEngine(
                         model_path=inference_manager.model_path,
                         tensor_parallel_size=inference_manager.tensor_parallel_size,
+                        data_parallel_size=inference_manager.data_parallel_size,
                         gpu_memory_utilization=inference_manager.gpu_memory_utilization,
                         max_model_len=inference_manager.max_model_len,
                         lora_rank=lora_rank,

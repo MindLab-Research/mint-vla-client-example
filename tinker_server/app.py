@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI):
     inference_manager = SessionManager(
         model_path=config.model_path,
         tensor_parallel_size=config.tensor_parallel_size,
+        data_parallel_size=config.data_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
     )
@@ -61,6 +62,7 @@ async def lifespan(app: FastAPI):
         multi_lora_engine = MultiLoRAInferenceEngine(
             model_path=config.model_path,
             tensor_parallel_size=config.tensor_parallel_size,
+            data_parallel_size=config.data_parallel_size,
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_model_len=config.max_model_len,
             max_loras=config.max_loras,

@@ -5,6 +5,12 @@ Uses verl's Ray-based vLLM infrastructure for scalable inference.
 
 from __future__ import annotations
 
+import os
+
+# Required for vLLM multiprocessing in Ray actors (prevents fork-related hangs)
+# Must be set before vLLM is imported anywhere in the process
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import logging
 import time
 from dataclasses import dataclass
@@ -764,6 +770,7 @@ class VerlInferenceEngine:
         self,
         model_path: str = "Qwen/Qwen2.5-7B-Instruct",
         tensor_parallel_size: int = 1,
+        data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int | None = None,
         lora_rank: int = 0,
@@ -771,6 +778,7 @@ class VerlInferenceEngine:
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.lora_rank = lora_rank
@@ -796,7 +804,25 @@ class VerlInferenceEngine:
             # Use fixed namespace for persistent vLLM actor support
             ray.init(address='auto', namespace="tinker", ignore_reinit_error=True)
 
+        # Compute total GPUs needed for MoE models
+        # For EP (expert parallelism), total_gpus = TP * DP
+        total_gpus = self.tensor_parallel_size * self.data_parallel_size
+
+        # Build engine_kwargs for expert parallelism
+        # Pass enable_expert_parallel directly to vLLM, bypassing verl's worker-based EP
+        # This allows vLLM to handle EP internally via multiprocessing
+        engine_kwargs = {}
+        if self.data_parallel_size > 1:
+            engine_kwargs = {
+                "vllm": {
+                    "enable_expert_parallel": True,
+                }
+            }
+            logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
+
         # Create rollout config using dataclass
+        # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
+        # Expert parallelism is enabled via engine_kwargs instead
         rollout_config = RolloutConfig(
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
@@ -814,7 +840,9 @@ class VerlInferenceEngine:
             temperature=1.0,
             top_k=-1,
             top_p=1.0,
-            data_parallel_size=1,
+            data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+            expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+            engine_kwargs=engine_kwargs,
         )
         if self.max_model_len is not None:
             rollout_config.max_model_len = self.max_model_len
@@ -829,14 +857,14 @@ class VerlInferenceEngine:
 
         logger.info(
             f"Launching vLLMHttpServer for {self.model_path} "
-            f"(lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
+            f"(TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
+            f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
         )
 
         # Create ExtendedVLLMHttpServer as Ray actor
-        # For MVP: single node, standalone mode
-        # Request GPUs via .options() since vLLMHttpServer doesn't request them by default
+        # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         self.server = ExtendedVLLMHttpServer.options(
-            num_gpus=self.tensor_parallel_size
+            num_gpus=total_gpus
         ).remote(
             config=rollout_config,
             model_config=model_config,
@@ -844,7 +872,7 @@ class VerlInferenceEngine:
             workers=[],  # No external workers for standalone
             replica_rank=0,
             node_rank=0,
-            gpus_per_node=self.tensor_parallel_size,
+            gpus_per_node=total_gpus,
             nnodes=1,
         )
 
