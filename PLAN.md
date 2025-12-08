@@ -249,7 +249,7 @@ export TINKER_API_KEY=dummy
 
 | Recipe | Type | Loss Function | Status |
 |--------|------|---------------|--------|
-| Arithmetic RL | RL | importance_sampling/ppo | [ ] |
+| Arithmetic RL | RL | importance_sampling/ppo | [x] Done |
 
 ```bash
 python -m tinker_cookbook.recipes.math_rl.train \
@@ -265,7 +265,7 @@ Expected: Reward 0.66 → 1.0 in first few steps.
 
 | Recipe | Type | Loss Function | Status |
 |--------|------|---------------|--------|
-| Chat SL (NoRobots) | SFT | cross_entropy | [ ] |
+| Chat SL (NoRobots) | SFT | cross_entropy | [x] Done |
 
 ```bash
 python -m tinker_cookbook.recipes.chat_sl.train \
@@ -301,7 +301,7 @@ Expected: test/env/all/correct = 0.767 after 180 steps.
 
 | Recipe | Type | Loss Function | Status |
 |--------|------|---------------|--------|
-| DPO (HHH) | Preference | custom (via weights) | [ ] |
+| DPO (HHH) | Preference | custom (via weights) | [x] Done |
 
 ```bash
 python -m tinker_cookbook.recipes.preference.dpo.train \
@@ -325,11 +325,11 @@ python -m tinker_cookbook.recipes.preference.rlhf.rlhf_pipeline
 
 ### Test Checklist
 
-- [ ] Phase 1: Arithmetic RL completes without errors
-- [ ] Phase 2: Chat SL trains and loss decreases
+- [x] Phase 1: Arithmetic RL completes without errors (reward 0.66 → 1.0)
+- [x] Phase 2: Chat SL trains and loss decreases (test/nll dropped to ~1.78)
 - [ ] Phase 3: MATH RL trains and accuracy improves
-- [ ] Phase 4: DPO trains with custom loss via weights
-- [ ] Phase 5: Full RLHF pipeline completes
+- [x] Phase 4: DPO trains with custom loss via weights (accuracy 0.41 → 0.61, dpo_loss 0.71 → 0.69)
+- [~] Phase 5: Full RLHF pipeline - SKIPPED (cookbook model_info.py lacks Qwen2.5 support, not a server issue)
 
 ### Known Requirements
 
