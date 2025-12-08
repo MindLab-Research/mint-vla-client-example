@@ -123,9 +123,22 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
 
         # Handle prompt logprobs if requested
         if request.prompt_logprobs:
-            # For MVP, prompt logprobs require a separate forward pass
-            # TODO: implement prompt logprobs using vLLM's prompt_logprobs feature
-            response.prompt_logprobs = None
+            # Use compute_logprobs to get prompt log probabilities
+            # compute_logprobs returns len(sequence)-1 values: logprobs[i] = log P(token[i+1] | token[0:i+1])
+            # The API expects len(sequence) values with prompt_logprobs[0] as placeholder (no conditioning)
+            if is_multi_lora:
+                computed_logprobs = await multi_lora_engine.compute_logprobs(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=f"{request_id}_prompt_logprobs",
+                )
+            else:
+                computed_logprobs = await engine.compute_logprobs(
+                    prompt_ids=token_ids,
+                    request_id=f"{request_id}_prompt_logprobs",
+                )
+            # Prepend 0.0 for first token (no log probability for unconditional token)
+            response.prompt_logprobs = [0.0] + computed_logprobs
 
         future_store.resolve(request_id, response.model_dump())
         logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
