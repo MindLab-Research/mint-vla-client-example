@@ -1,8 +1,8 @@
 """State routes for saving/loading model state (checkpointing).
 
 Endpoints:
-- POST /save_state: Save full checkpoint (LoRA + optimizer + metadata)
-- POST /load_state: Load checkpoint
+- POST /save_weights: Save full checkpoint (LoRA + optimizer + metadata)
+- POST /load_weights: Load checkpoint
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
 - GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download (501)
@@ -69,12 +69,12 @@ def _to_tinker_path(model_id: str, checkpoint_name: str) -> str:
 
 
 # =============================================================================
-# POST /save_state - async
+# POST /save_weights - async
 # =============================================================================
 
 
-@router.post("/save_state", response_model=UntypedAPIFuture)
-async def save_state(
+@router.post("/save_weights", response_model=UntypedAPIFuture)
+async def save_weights(
     request: SaveStateRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
@@ -98,7 +98,8 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
             raise RuntimeError("Training engine not initialized")
 
         # Build save path
-        save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, request.path)
+        checkpoint_name = request.path or f"checkpoint-{session.step}"
+        save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
@@ -106,11 +107,11 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
         await training_engine.save_weights(session, save_path)
 
         # Build tinker:// path for response
-        tinker_path = _to_tinker_path(session.model_id, request.path)
+        tinker_path = _to_tinker_path(session.model_id, checkpoint_name)
 
         future_store.resolve(request_id, {
             "path": tinker_path,
-            "type": "save_state",
+            "type": "save_weights",
         })
 
     except Exception as e:
@@ -119,12 +120,12 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
 
 
 # =============================================================================
-# POST /load_state - async
+# POST /load_weights - async
 # =============================================================================
 
 
-@router.post("/load_state", response_model=UntypedAPIFuture)
-async def load_state(
+@router.post("/load_weights", response_model=UntypedAPIFuture)
+async def load_weights(
     request: LoadStateRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
@@ -157,7 +158,7 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
 
         future_store.resolve(request_id, {
             "path": request.path,
-            "type": "load_state",
+            "type": "load_weights",
         })
 
     except Exception as e:

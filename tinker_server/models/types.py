@@ -314,30 +314,30 @@ class SaveWeightsForSamplerResponse(BaseModel):
 
 
 # =============================================================================
-# Checkpoint Types (save_state, load_state, list, delete)
+# Checkpoint Types (save_weights, load_weights, list, delete)
 # =============================================================================
 
 
 class SaveStateRequest(BaseModel):
-    """Request to save model state to checkpoint."""
+    """Request to save model state to checkpoint (save_weights endpoint)."""
 
     model_config = ConfigDict(protected_namespaces=())
 
     model_id: str
-    path: str  # checkpoint name, e.g. "checkpoint-100"
+    path: str | None = None  # checkpoint name, e.g. "checkpoint-100"
     seq_id: int | None = None
-    type: Literal["save_state"] = "save_state"
+    type: Literal["save_weights"] = "save_weights"
 
 
 class SaveStateResponse(BaseModel):
     """Response from saving state."""
 
     path: str  # tinker:// URI
-    type: Literal["save_state"] = "save_state"
+    type: Literal["save_weights"] = "save_weights"
 
 
 class LoadStateRequest(BaseModel):
-    """Request to load model state from checkpoint."""
+    """Request to load model state from checkpoint (load_weights endpoint)."""
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -345,14 +345,14 @@ class LoadStateRequest(BaseModel):
     path: str  # tinker:// or file:// path
     optimizer: bool = True  # whether to restore optimizer state
     seq_id: int | None = None
-    type: Literal["load_state"] = "load_state"
+    type: Literal["load_weights"] = "load_weights"
 
 
 class LoadStateResponse(BaseModel):
     """Response from loading state."""
 
     path: str
-    type: Literal["load_state"] = "load_state"
+    type: Literal["load_weights"] = "load_weights"
 
 
 class CheckpointInfo(BaseModel):

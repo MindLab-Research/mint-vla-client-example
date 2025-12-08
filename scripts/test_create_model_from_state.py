@@ -98,7 +98,7 @@ def test_create_model_from_state():
     # 5. Save state
     print("\n5. Saving state...")
     checkpoint_name = "test-checkpoint-1"
-    resp = requests.post(f"{BASE_URL}/save_state", json={
+    resp = requests.post(f"{BASE_URL}/save_weights", json={
         "model_id": model_id,
         "path": checkpoint_name,
     })

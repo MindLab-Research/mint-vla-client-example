@@ -8,8 +8,8 @@ These rename existing endpoints to match Tinker spec exactly.
 
 | Endpoint | Current Name | Tinker Name | Status |
 |----------|-------------|-------------|--------|
-| Save full state (LoRA + optimizer) | `POST /save_state` | `POST /save_state` | Done |
-| Load full state | `POST /load_state` | `POST /load_state` | Done |
+| Save full state (LoRA + optimizer) | `POST /save_weights` | `POST /save_weights` | Done |
+| Load full state | `POST /load_weights` | `POST /load_weights` | Done |
 | Response types | `SaveStateResponse`, `LoadStateResponse` | `SaveStateResponse`, `LoadStateResponse` | Done |
 
 ## Priority 2: Stage 1 - Inference - DONE
@@ -41,8 +41,8 @@ Required for training resumption and state management.
 
 | Interface Method | Endpoint | Status | Notes |
 |-----------------|----------|--------|-------|
-| `TrainingClient.save_state_async()` | `POST /save_state` | Done | Working |
-| `TrainingClient.load_state_async()` | `POST /load_state` | Done | Working |
+| `TrainingClient.save_state_async()` | `POST /save_weights` | Done | Working |
+| `TrainingClient.load_state_async()` | `POST /load_weights` | Done | Working |
 | `TrainingClient.save_weights_for_sampler_async()` | `POST /save_weights_for_sampler` | Done | Working |
 | `TrainingClient.save_weights_and_get_sampling_client()` | `POST /save_weights_for_sampler` (path=None) | Done | Ephemeral flow |
 | `ServiceClient.create_training_client_from_state()` | `POST /create_model_from_state` | Done | Composes create + load |
@@ -55,7 +55,7 @@ Output: model_id (str)
 ```
 
 Implementation:
-- Compose: `create_model` + `load_state`
+- Compose: `create_model` + `load_weights`
 - Create new Ray actor with LoRA config
 - Load checkpoint into actor
 - Return model_id
@@ -195,9 +195,9 @@ Location: `tinker_server/backend/verl_training.py:85-283`
 
 ## Implementation Order
 
-1. **Rename endpoints** (Priority 1) - Breaking change, do first - DONE
-   - [x] `save_weights` → `save_state`
-   - [x] `load_weights` → `load_state`
+1. **Endpoint alignment** (Priority 1) - Match tinker client exactly - DONE
+   - [x] `POST /save_weights` - Save full checkpoint
+   - [x] `POST /load_weights` - Load checkpoint
    - [x] Update types and routes
 
 2. **Add `compute_logprobs`** (Priority 2) - Enables RL data collection - DONE
@@ -222,7 +222,120 @@ Location: `tinker_server/backend/verl_training.py:85-283`
    - [x] Detect negative weights for custom loss backward (sum without averaging)
    - [x] Client-side `forward_backward_custom` composes `/forward` + `/forward_backward`
 
-## Test Coverage Needed
+## Integration Testing with Tinker Cookbook
+
+Run unmodified Tinker Cookbook recipes against our local server by setting environment variables:
+
+```bash
+TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy
+```
+
+### Test Environment
+
+```bash
+# Terminal 1: Start tinker-server
+HF_HUB_OFFLINE=1 \
+HF_HOME=/vePFS-Mindverse/share/huggingface \
+TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+python scripts/run_server.py
+
+# Terminal 2: Run cookbook recipes
+cd ../tinker-cookbook
+export TINKER_BASE_URL=http://localhost:8000
+export TINKER_API_KEY=dummy
+```
+
+### Phase 1: Quick Validation (5 min)
+
+| Recipe | Type | Loss Function | Status |
+|--------|------|---------------|--------|
+| Arithmetic RL | RL | importance_sampling/ppo | [ ] |
+
+```bash
+python -m tinker_cookbook.recipes.math_rl.train \
+    model_name="Qwen/Qwen2.5-7B-Instruct" \
+    group_size=4 \
+    groups_per_batch=100 \
+    learning_rate=1e-4
+```
+
+Expected: Reward 0.66 → 1.0 in first few steps.
+
+### Phase 2: SFT Baseline (30-60 min)
+
+| Recipe | Type | Loss Function | Status |
+|--------|------|---------------|--------|
+| Chat SL (NoRobots) | SFT | cross_entropy | [ ] |
+
+```bash
+python -m tinker_cookbook.recipes.chat_sl.train \
+    model_name=Qwen/Qwen2.5-7B-Instruct \
+    dataset=no_robots \
+    learning_rate=5e-4 \
+    batch_size=64 \
+    lora_rank=64 \
+    eval_every=20
+```
+
+Expected: test/nll drops to ~1.78 after 140 steps.
+
+### Phase 3: RL on Math (2-4 hours)
+
+| Recipe | Type | Loss Function | Status |
+|--------|------|---------------|--------|
+| MATH RL | RL | importance_sampling/ppo | [ ] |
+
+```bash
+python -m tinker_cookbook.recipes.math_rl.train \
+    env=math \
+    model_name="Qwen/Qwen2.5-7B-Instruct" \
+    group_size=16 \
+    groups_per_batch=64 \
+    learning_rate=2e-5 \
+    max_tokens=512
+```
+
+Expected: test/env/all/correct = 0.767 after 180 steps.
+
+### Phase 4: Custom Loss - DPO (1-2 hours)
+
+| Recipe | Type | Loss Function | Status |
+|--------|------|---------------|--------|
+| DPO (HHH) | Preference | custom (via weights) | [ ] |
+
+```bash
+python -m tinker_cookbook.recipes.preference.dpo.train \
+    model_name=Qwen/Qwen2.5-7B-Instruct \
+    dataset=hhh \
+    learning_rate=1e-5 \
+    dpo_beta=0.1
+```
+
+Expected: accuracy ~0.57 after 50 steps.
+
+### Phase 5: Full Pipeline (8+ hours, optional)
+
+| Recipe | Type | Coverage | Status |
+|--------|------|----------|--------|
+| RLHF 3-stage | SFT→RM→RL | All loss types | [ ] |
+
+```bash
+python -m tinker_cookbook.recipes.preference.rlhf.rlhf_pipeline
+```
+
+### Test Checklist
+
+- [ ] Phase 1: Arithmetic RL completes without errors
+- [ ] Phase 2: Chat SL trains and loss decreases
+- [ ] Phase 3: MATH RL trains and accuracy improves
+- [ ] Phase 4: DPO trains with custom loss via weights
+- [ ] Phase 5: Full RLHF pipeline completes
+
+### Known Requirements
+
+All recipes auto-download data from HuggingFace. No external services required for Phases 1-4.
+
+## Unit Test Coverage
 
 - [ ] `compute_logprobs` returns correct format (length = seq_len - 1)
 - [x] `create_model_from_state` restores LoRA + optimizer correctly

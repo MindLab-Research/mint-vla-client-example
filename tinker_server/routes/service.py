@@ -45,6 +45,19 @@ async def healthz() -> dict:
     return {"status": "ready"}
 
 
+@router.get("/get_server_capabilities")
+async def get_server_capabilities() -> dict:
+    """Return server capabilities for tinker client."""
+    import os
+
+    model_path = os.environ.get("TINKER_MODEL_PATH", "")
+    model_name = model_path.split("/")[-1] if model_path else "unknown"
+
+    return {
+        "supported_models": [{"model_name": model_name}],
+    }
+
+
 @router.post("/create_session")
 async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
     """Create a new session.
