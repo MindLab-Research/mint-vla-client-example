@@ -209,9 +209,19 @@ class TrainingWorker:
                 loss.backward()
                 item_loss = loss.item()
 
-                loss_fn_outputs.append(
-                    {"loss": {"data": [item_loss], "shape": [1], "dtype": "float32"}}
-                )
+                # Compute logprobs for training metrics (cookbook expects this)
+                # logprobs = log_softmax(logits)[targets]
+                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)
+                target_logprobs = log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+
+                loss_fn_outputs.append({
+                    "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
+                    "logprobs": {
+                        "data": target_logprobs.detach().tolist(),
+                        "shape": list(target_logprobs.shape),
+                        "dtype": "float32",
+                    },
+                })
 
             elif loss_fn in ("importance_sampling", "ppo"):
                 # RL losses require old logprobs and advantages
@@ -750,7 +760,7 @@ class VerlTrainingEngine:
 
         Args:
             session: TrainingSession.
-            request: ForwardBackwardRequest with data.
+            request: ForwardRequest with forward_input field.
 
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
@@ -759,7 +769,8 @@ class VerlTrainingEngine:
         worker = self._workers[model_id]
 
         # Serialize data for Ray
-        data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        # ForwardRequest uses forward_input (not forward_backward_input)
+        data_items = [item.model_dump() for item in request.forward_input.data]
 
         # Remote call
         result = await worker.forward.remote(data_items)

@@ -229,6 +229,19 @@ class ForwardBackwardRequest(BaseModel):
     seq_id: int | None = None
 
 
+class ForwardRequest(BaseModel):
+    """Request to perform a forward-only pass (no backward).
+
+    Uses forward_input field (not forward_backward_input) to match tinker client API.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    forward_input: ForwardBackwardInput
+    model_id: str
+    seq_id: int | None = None
+
+
 class ForwardBackwardResponse(BaseModel):
     """Response from a forward-backward pass."""
 

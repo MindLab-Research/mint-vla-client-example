@@ -30,6 +30,7 @@ from ..models.types import (
     CreateModelRequest,
     CreateModelResponse,
     ForwardBackwardRequest,
+    ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
     ModelData,
@@ -285,13 +286,13 @@ async def _do_forward_backward(
 
 @router.post("/forward", response_model=UntypedAPIFuture)
 async def forward(
-    request: ForwardBackwardRequest,
+    request: ForwardRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
     """Perform forward pass only (no backward). Returns logprobs.
 
-    Same input as forward_backward but skips gradient computation.
-    Useful for inference-time logprob computation with training model.
+    Uses ForwardRequest with forward_input field (not forward_backward_input)
+    to match tinker client API.
     """
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
@@ -308,7 +309,7 @@ async def forward(
 
 
 async def _do_forward(
-    request_id: str, session, request: ForwardBackwardRequest
+    request_id: str, session, request: ForwardRequest
 ) -> None:
     """Background task for forward."""
     try:
