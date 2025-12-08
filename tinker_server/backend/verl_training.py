@@ -139,11 +139,27 @@ class TrainingWorker:
             target_tokens = target_data.get("data", [])
             weights = weights_data.get("data", []) if weights_data else []
 
-            if not target_tokens or not weights:
+            # For RL losses, derive weights from advantages if not provided
+            # (tinker-cookbook removes mask before sending, but advantages implicitly encode it)
+            if not weights and loss_fn in ("importance_sampling", "ppo"):
+                advantages_data = loss_fn_inputs.get("advantages", {})
+                advantages = advantages_data.get("data", [])
+                if advantages:
+                    # Binary mask: 1 where advantage != 0 (action tokens), 0 elsewhere
+                    weights = [1.0 if a != 0 else 0.0 for a in advantages]
+
+            if not target_tokens:
                 logger.warning(
-                    f"[TrainingWorker] Missing target_tokens or weights/mask, skipping item. "
+                    f"[TrainingWorker] Missing target_tokens, skipping item. "
+                    f"loss_fn_inputs keys: {list(loss_fn_inputs.keys())}"
+                )
+                continue
+
+            if not weights:
+                logger.warning(
+                    f"[TrainingWorker] Missing weights/mask and cannot derive from advantages, skipping item. "
                     f"loss_fn_inputs keys: {list(loss_fn_inputs.keys())}, "
-                    f"target_tokens len: {len(target_tokens)}, weights len: {len(weights)}"
+                    f"target_tokens len: {len(target_tokens)}"
                 )
                 continue
 
@@ -270,9 +286,14 @@ class TrainingWorker:
                 total_ratio += masked_ratio.item()
                 num_rl_samples += 1
 
-                loss_fn_outputs.append(
-                    {"loss": {"data": [item_loss], "shape": [1], "dtype": "float32"}}
-                )
+                loss_fn_outputs.append({
+                    "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
+                    "logprobs": {
+                        "data": new_logprobs.detach().tolist(),
+                        "shape": list(new_logprobs.shape),
+                        "dtype": "float32",
+                    },
+                })
 
             else:
                 raise ValueError(f"Unknown loss_fn: {loss_fn}")
@@ -349,9 +370,13 @@ class TrainingWorker:
                 target_tokens = target_data.get("data", [])
                 weights = weights_data.get("data", []) if weights_data else []
 
-                if not target_tokens or not weights:
-                    logger.warning("[TrainingWorker] Missing target_tokens or weights/mask, skipping item")
+                if not target_tokens:
+                    logger.warning("[TrainingWorker] Missing target_tokens, skipping item")
                     continue
+
+                # For forward-only, weights are optional - default to all 1s
+                if not weights:
+                    weights = [1.0] * len(target_tokens)
 
                 # Convert to tensors
                 input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
