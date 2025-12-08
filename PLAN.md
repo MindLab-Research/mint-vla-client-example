@@ -100,9 +100,9 @@ Required for RLHF workflows.
 
 | Loss | Required `loss_fn_inputs` |
 |------|--------------------------|
-| `cross_entropy` | `target_tokens`, `loss_mask` |
-| `importance_sampling` | `target_tokens`, `loss_mask`, `logprobs`, `advantages` |
-| `ppo` | `target_tokens`, `loss_mask`, `logprobs`, `advantages` |
+| `cross_entropy` | `target_tokens`, `weights` |
+| `importance_sampling` | `target_tokens`, `weights`, `logprobs`, `advantages` |
+| `ppo` | `target_tokens`, `weights`, `logprobs`, `advantages` |
 
 ### `importance_sampling` Loss
 
@@ -131,24 +131,49 @@ Location: `tinker_server/backend/verl_training.py:84-210`
 - Asymmetric clipping via `loss_fn_config.clip_low` / `clip_high`
 - Returns RL metrics: `ratio:mean`, `clipfrac:mean` (PPO only)
 
-## Priority 6: Stage 5 - Custom Losses (Not Implemented)
+## Priority 6: Stage 5 - Custom Losses - DONE
 
 Required for DPO and custom training objectives.
 
 | Interface Method | Endpoint | Status | Notes |
 |-----------------|----------|--------|-------|
-| `TrainingClient.forward_backward_custom()` | `POST /forward_backward_custom` | **Missing** | Callback execution |
+| `TrainingClient.forward_backward_custom()` | Client-side | Done | Server supports via `weights` |
 
 ### `forward_backward_custom` Implementation
 
-Challenge: Callback functions cannot be serialized over HTTP.
+The tinker client implements `forward_backward_custom` **client-side** using existing server endpoints:
 
-Options:
-1. **Named callbacks** - Server defines callback registry, client passes callback name
-2. **Code execution** - Client sends Python code (security risk)
-3. **DSL** - Define a loss function DSL that server interprets
+1. Client calls `POST /forward` with `cross_entropy` → gets logprobs with `requires_grad=True`
+2. Client runs user's callback: `loss, metrics = loss_fn(data, logprobs_list)`
+3. Client calls `loss.backward()` → extracts gradients from logprob tensors
+4. Client calls `POST /forward_backward` with `weights: -grad` (negative gradients)
+5. Server computes `loss = sum(cross_entropy * weights)` → backpropagates custom loss gradients
 
-Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
+### Server-side Support
+
+No new endpoint needed. Server supports custom losses via `weights` in `loss_fn_inputs`:
+
+- When `weights` has negative values → custom loss backward → sum without averaging
+- When `weights` is non-negative → standard SFT/RL → average by sum of weights
+
+### Data Flow
+
+```
+Client                              Server
+------                              ------
+forward(data, "cross_entropy")  --> /forward --> logprobs
+
+loss_fn(data, logprobs)         [client-side]
+loss.backward()                 [client-side]
+grads = logprobs.grad           [client-side]
+
+forward_backward(               --> /forward_backward
+  data with weights=-grads,         (detects negative weights)
+  "cross_entropy"                   loss = sum(ce * weights)
+)                                   loss.backward()
+```
+
+Location: `tinker_server/backend/verl_training.py:85-283`
 
 ## Data Types Status
 
@@ -192,9 +217,10 @@ Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
    - [x] `importance_sampling` loss
    - [x] `ppo` loss
 
-6. **Add custom loss support** (Priority 6) - Enables DPO
-   - [ ] Design callback mechanism
-   - [ ] Implement `forward_backward_custom`
+6. **Add custom loss support** (Priority 6) - Enables DPO - DONE
+   - [x] Use `weights` in `loss_fn_inputs` (tinker standard)
+   - [x] Detect negative weights for custom loss backward (sum without averaging)
+   - [x] Client-side `forward_backward_custom` composes `/forward` + `/forward_backward`
 
 ## Test Coverage Needed
 

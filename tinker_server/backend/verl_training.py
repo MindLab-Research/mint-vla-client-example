@@ -94,7 +94,9 @@ class TrainingWorker:
             data_items: List of serialized Datum dicts with:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
-                - loss_fn_inputs.loss_mask: mask for loss computation
+                - loss_fn_inputs.weights: per-token weights (float)
+                  For SFT: binary mask (0.0 or 1.0)
+                  For custom loss backward: negative gradients from client
                 For RL losses (importance_sampling, ppo), also needs:
                 - loss_fn_inputs.logprobs: old policy logprobs
                 - loss_fn_inputs.advantages: advantage estimates
@@ -129,21 +131,21 @@ class TrainingWorker:
                 logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
                 continue
 
-            # Extract target tokens and loss mask
+            # Extract target tokens and weights
             target_data = loss_fn_inputs.get("target_tokens", {})
-            mask_data = loss_fn_inputs.get("loss_mask", {})
+            weights_data = loss_fn_inputs.get("weights", {})
 
             target_tokens = target_data.get("data", [])
-            loss_mask = mask_data.get("data", [])
+            weights = weights_data.get("data", []) if weights_data else []
 
-            if not target_tokens or not loss_mask:
-                logger.warning("[TrainingWorker] Missing target_tokens or loss_mask, skipping item")
+            if not target_tokens or not weights:
+                logger.warning("[TrainingWorker] Missing target_tokens or weights, skipping item")
                 continue
 
             # Convert to tensors
             input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
             target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
-            loss_mask_t = torch.tensor([loss_mask], dtype=torch.float32, device=self.device)
+            weights_t = torch.tensor([weights], dtype=torch.float32, device=self.device)
 
             # Forward pass - get logits
             outputs = self.model(input_ids=input_ids_t)
@@ -152,19 +154,36 @@ class TrainingWorker:
             # Flatten for loss computation
             logits_flat = logits.squeeze(0)  # [seq_len, vocab]
             targets_flat = target_ids_t.squeeze(0)  # [seq_len]
-            mask_flat = loss_mask_t.squeeze(0)  # [seq_len]
-            num_masked = mask_flat.sum()
+            weights_flat = weights_t.squeeze(0)  # [seq_len]
+
+            # Determine if this is custom loss backward (weights has negative values)
+            # or standard SFT/RL (weights are non-negative mask)
+            has_negative_weights = (weights_flat < 0).any().item()
+
+            # For standard loss: average over non-zero weights
+            # For custom loss backward: sum without averaging (weights encode gradients)
+            if has_negative_weights:
+                # Custom loss backward: sum(ce * weights) without averaging
+                num_weighted = 1.0  # No averaging
+            else:
+                # Standard SFT/RL: average over weighted tokens
+                num_weighted = weights_flat.sum()
 
             if loss_fn == "cross_entropy":
-                # Standard cross-entropy loss
+                # Cross-entropy loss
                 ce_loss = torch.nn.functional.cross_entropy(
                     logits_flat, targets_flat, reduction="none"
                 )  # [seq_len]
-                masked_loss = ce_loss * mask_flat
-                if num_masked > 0:
-                    loss = masked_loss.sum() / num_masked
+                weighted_loss = ce_loss * weights_flat
+
+                if has_negative_weights:
+                    # Custom loss backward: sum without averaging
+                    loss = weighted_loss.sum()
+                elif num_weighted > 0:
+                    # Standard: average over weighted tokens
+                    loss = weighted_loss.sum() / num_weighted
                 else:
-                    loss = masked_loss.sum()
+                    loss = weighted_loss.sum()
 
                 loss.backward()
                 item_loss = loss.item()
@@ -204,10 +223,10 @@ class TrainingWorker:
 
                 if loss_fn == "importance_sampling":
                     # Policy gradient with importance sampling
-                    # loss = -ratio * advantages * mask
-                    pg_loss = -ratio * advantages_t * mask_flat
-                    if num_masked > 0:
-                        loss = pg_loss.sum() / num_masked
+                    # loss = -ratio * advantages * weights
+                    pg_loss = -ratio * advantages_t * weights_flat
+                    if num_weighted > 0:
+                        loss = pg_loss.sum() / num_weighted
                     else:
                         loss = pg_loss.sum()
 
@@ -226,23 +245,23 @@ class TrainingWorker:
 
                     # PPO objective: max(unclipped, clipped) for positive advantages
                     # This prevents too large policy updates
-                    pg_loss = torch.maximum(pg_loss1, pg_loss2) * mask_flat
+                    pg_loss = torch.maximum(pg_loss1, pg_loss2) * weights_flat
 
-                    if num_masked > 0:
-                        loss = pg_loss.sum() / num_masked
+                    if num_weighted > 0:
+                        loss = pg_loss.sum() / num_weighted
                     else:
                         loss = pg_loss.sum()
 
                     # Track clip fraction
-                    clipped = ((ratio < clip_low) | (ratio > clip_high)).float() * mask_flat
-                    clipfrac = clipped.sum() / max(num_masked, 1)
+                    clipped = ((ratio < clip_low) | (ratio > clip_high)).float() * weights_flat
+                    clipfrac = clipped.sum() / max(num_weighted, 1)
                     total_clipfrac += clipfrac.item()
 
                 loss.backward()
                 item_loss = loss.item()
 
                 # Track RL metrics
-                masked_ratio = (ratio * mask_flat).sum() / max(num_masked, 1)
+                masked_ratio = (ratio * weights_flat).sum() / max(num_weighted, 1)
                 total_ratio += masked_ratio.item()
                 num_rl_samples += 1
 
@@ -253,8 +272,10 @@ class TrainingWorker:
             else:
                 raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-            total_loss += item_loss * num_masked.item()
-            total_tokens += num_masked.item()
+            # For metrics tracking: use absolute sum of weights for token count
+            effective_tokens = weights_flat.abs().sum().item() if has_negative_weights else num_weighted.item()
+            total_loss += item_loss * effective_tokens
+            total_tokens += effective_tokens
 
         avg_loss = total_loss / max(total_tokens, 1)
 
@@ -290,7 +311,7 @@ class TrainingWorker:
             data_items: List of serialized Datum dicts with:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
-                - loss_fn_inputs.loss_mask: mask for loss computation
+                - loss_fn_inputs.weights: per-token weights (float)
 
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
@@ -315,21 +336,21 @@ class TrainingWorker:
                     logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
                     continue
 
-                # Extract target tokens and loss mask
+                # Extract target tokens and weights
                 target_data = loss_fn_inputs.get("target_tokens", {})
-                mask_data = loss_fn_inputs.get("loss_mask", {})
+                weights_data = loss_fn_inputs.get("weights", {})
 
                 target_tokens = target_data.get("data", [])
-                loss_mask = mask_data.get("data", [])
+                weights = weights_data.get("data", []) if weights_data else []
 
-                if not target_tokens or not loss_mask:
-                    logger.warning("[TrainingWorker] Missing target_tokens or loss_mask, skipping item")
+                if not target_tokens or not weights:
+                    logger.warning("[TrainingWorker] Missing target_tokens or weights, skipping item")
                     continue
 
                 # Convert to tensors
                 input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
                 target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
-                loss_mask_t = torch.tensor([loss_mask], dtype=torch.float32, device=self.device)
+                weights_t = torch.tensor([weights], dtype=torch.float32, device=self.device)
 
                 # Forward pass - get logits
                 outputs = self.model(input_ids=input_ids_t)
@@ -347,8 +368,8 @@ class TrainingWorker:
                     index=target_ids_t.squeeze(0).unsqueeze(-1),  # [seq_len, 1]
                 ).squeeze(-1)  # [seq_len]
 
-                # Apply mask
-                mask_flat = loss_mask_t.squeeze(0)  # [seq_len]
+                # Apply weights
+                weights_flat = weights_t.squeeze(0)  # [seq_len]
 
                 # Compute cross-entropy loss (for metrics)
                 logits_flat = logits.squeeze(0)
@@ -356,16 +377,16 @@ class TrainingWorker:
                 ce_loss = torch.nn.functional.cross_entropy(
                     logits_flat, targets_flat, reduction="none"
                 )
-                masked_loss = ce_loss * mask_flat
-                num_masked = mask_flat.sum()
-                if num_masked > 0:
-                    loss = masked_loss.sum() / num_masked
+                weighted_loss = ce_loss * weights_flat
+                num_weighted = weights_flat.sum()
+                if num_weighted > 0:
+                    loss = weighted_loss.sum() / num_weighted
                 else:
-                    loss = masked_loss.sum()
+                    loss = weighted_loss.sum()
 
                 item_loss = loss.item()
-                total_loss += item_loss * num_masked.item()
-                total_tokens += num_masked.item()
+                total_loss += item_loss * num_weighted.item()
+                total_tokens += num_weighted.item()
 
                 # Return logprobs in loss_fn_outputs
                 loss_fn_outputs.append({
