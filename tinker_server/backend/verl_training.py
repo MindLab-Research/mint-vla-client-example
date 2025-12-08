@@ -82,7 +82,12 @@ class TrainingWorker:
 
         logger.info("[TrainingWorker] Ready")
 
-    def forward_backward(self, data_items: list[dict]) -> dict:
+    def forward_backward(
+        self,
+        data_items: list[dict],
+        loss_fn: str = "cross_entropy",
+        loss_fn_config: dict | None = None,
+    ) -> dict:
         """Forward + backward pass using tinker Datum format.
 
         Args:
@@ -90,15 +95,26 @@ class TrainingWorker:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
                 - loss_fn_inputs.loss_mask: mask for loss computation
+                For RL losses (importance_sampling, ppo), also needs:
+                - loss_fn_inputs.logprobs: old policy logprobs
+                - loss_fn_inputs.advantages: advantage estimates
+            loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo")
+            loss_fn_config: Optional config (e.g., {"epsilon": 0.2} for PPO)
 
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
         self.model.train()
+        loss_fn_config = loss_fn_config or {}
 
         total_loss = 0.0
         total_tokens = 0
         loss_fn_outputs = []
+
+        # RL-specific metrics
+        total_ratio = 0.0
+        total_clipfrac = 0.0
+        num_rl_samples = 0
 
         for item in data_items:
             # Parse tinker Datum format
@@ -110,7 +126,7 @@ class TrainingWorker:
             if chunks and "tokens" in chunks[0]:
                 input_ids = chunks[0]["tokens"]
             else:
-                logger.warning(f"[TrainingWorker] No tokens in model_input, skipping item")
+                logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
                 continue
 
             # Extract target tokens and loss mask
@@ -121,7 +137,7 @@ class TrainingWorker:
             loss_mask = mask_data.get("data", [])
 
             if not target_tokens or not loss_mask:
-                logger.warning(f"[TrainingWorker] Missing target_tokens or loss_mask, skipping item")
+                logger.warning("[TrainingWorker] Missing target_tokens or loss_mask, skipping item")
                 continue
 
             # Convert to tensors
@@ -133,48 +149,135 @@ class TrainingWorker:
             outputs = self.model(input_ids=input_ids_t)
             logits = outputs.logits  # [1, seq_len, vocab_size]
 
-            # Compute cross-entropy loss with masking
-            # logits: [1, seq_len, vocab] -> [seq_len, vocab]
-            # targets: [1, seq_len] -> [seq_len]
+            # Flatten for loss computation
             logits_flat = logits.squeeze(0)  # [seq_len, vocab]
             targets_flat = target_ids_t.squeeze(0)  # [seq_len]
             mask_flat = loss_mask_t.squeeze(0)  # [seq_len]
-
-            # Per-token cross entropy
-            ce_loss = torch.nn.functional.cross_entropy(
-                logits_flat, targets_flat, reduction="none"
-            )  # [seq_len]
-
-            # Apply mask and compute mean over masked tokens
-            masked_loss = ce_loss * mask_flat
             num_masked = mask_flat.sum()
-            if num_masked > 0:
-                loss = masked_loss.sum() / num_masked
+
+            if loss_fn == "cross_entropy":
+                # Standard cross-entropy loss
+                ce_loss = torch.nn.functional.cross_entropy(
+                    logits_flat, targets_flat, reduction="none"
+                )  # [seq_len]
+                masked_loss = ce_loss * mask_flat
+                if num_masked > 0:
+                    loss = masked_loss.sum() / num_masked
+                else:
+                    loss = masked_loss.sum()
+
+                loss.backward()
+                item_loss = loss.item()
+
+                loss_fn_outputs.append(
+                    {"loss": {"data": [item_loss], "shape": [1], "dtype": "float32"}}
+                )
+
+            elif loss_fn in ("importance_sampling", "ppo"):
+                # RL losses require old logprobs and advantages
+                old_logprobs_data = loss_fn_inputs.get("logprobs", {})
+                advantages_data = loss_fn_inputs.get("advantages", {})
+
+                old_logprobs = old_logprobs_data.get("data", [])
+                advantages = advantages_data.get("data", [])
+
+                if not old_logprobs or not advantages:
+                    logger.warning(
+                        f"[TrainingWorker] Missing logprobs or advantages for {loss_fn}, skipping item"
+                    )
+                    continue
+
+                old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=self.device)
+                advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+
+                # Compute new logprobs from current policy
+                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)  # [seq_len, vocab]
+                new_logprobs = torch.gather(
+                    log_probs, dim=-1, index=targets_flat.unsqueeze(-1)
+                ).squeeze(-1)  # [seq_len]
+
+                # Compute importance ratio: exp(new_logprobs - old_logprobs)
+                # Clamp for numerical stability
+                log_ratio = new_logprobs - old_logprobs_t
+                log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+                ratio = torch.exp(log_ratio)
+
+                if loss_fn == "importance_sampling":
+                    # Policy gradient with importance sampling
+                    # loss = -ratio * advantages * mask
+                    pg_loss = -ratio * advantages_t * mask_flat
+                    if num_masked > 0:
+                        loss = pg_loss.sum() / num_masked
+                    else:
+                        loss = pg_loss.sum()
+
+                else:  # ppo
+                    # PPO with clipping
+                    epsilon = loss_fn_config.get("epsilon", 0.2)
+                    clip_low = loss_fn_config.get("clip_low", 1.0 - epsilon)
+                    clip_high = loss_fn_config.get("clip_high", 1.0 + epsilon)
+
+                    # Unclipped objective
+                    pg_loss1 = -advantages_t * ratio
+
+                    # Clipped objective
+                    clipped_ratio = torch.clamp(ratio, clip_low, clip_high)
+                    pg_loss2 = -advantages_t * clipped_ratio
+
+                    # PPO objective: max(unclipped, clipped) for positive advantages
+                    # This prevents too large policy updates
+                    pg_loss = torch.maximum(pg_loss1, pg_loss2) * mask_flat
+
+                    if num_masked > 0:
+                        loss = pg_loss.sum() / num_masked
+                    else:
+                        loss = pg_loss.sum()
+
+                    # Track clip fraction
+                    clipped = ((ratio < clip_low) | (ratio > clip_high)).float() * mask_flat
+                    clipfrac = clipped.sum() / max(num_masked, 1)
+                    total_clipfrac += clipfrac.item()
+
+                loss.backward()
+                item_loss = loss.item()
+
+                # Track RL metrics
+                masked_ratio = (ratio * mask_flat).sum() / max(num_masked, 1)
+                total_ratio += masked_ratio.item()
+                num_rl_samples += 1
+
+                loss_fn_outputs.append(
+                    {"loss": {"data": [item_loss], "shape": [1], "dtype": "float32"}}
+                )
+
             else:
-                loss = masked_loss.sum()  # Fallback if no mask
+                raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-            loss.backward()
-
-            item_loss = loss.item()
             total_loss += item_loss * num_masked.item()
             total_tokens += num_masked.item()
 
-            loss_fn_outputs.append(
-                {"loss": {"data": [item_loss], "shape": [1], "dtype": "float32"}}
-            )
-
         avg_loss = total_loss / max(total_tokens, 1)
 
-        logger.info(f"[TrainingWorker] forward_backward: loss={avg_loss:.4f}, tokens={total_tokens:.0f}")
+        metrics = {
+            "loss:mean": avg_loss,
+            "num_samples:sum": float(len(data_items)),
+            "num_tokens:sum": float(total_tokens),
+        }
+
+        # Add RL-specific metrics
+        if num_rl_samples > 0:
+            metrics["ratio:mean"] = total_ratio / num_rl_samples
+            if loss_fn == "ppo":
+                metrics["clipfrac:mean"] = total_clipfrac / num_rl_samples
+
+        logger.info(
+            f"[TrainingWorker] forward_backward ({loss_fn}): loss={avg_loss:.4f}, tokens={total_tokens:.0f}"
+        )
 
         return {
-            "loss_fn_output_type": "sft_loss",
+            "loss_fn_output_type": f"{loss_fn}_loss",
             "loss_fn_outputs": loss_fn_outputs,
-            "metrics": {
-                "loss:mean": avg_loss,
-                "num_samples:sum": float(len(data_items)),
-                "num_tokens:sum": float(total_tokens),
-            },
+            "metrics": metrics,
         }
 
     def forward(self, data_items: list[dict]) -> dict:
@@ -567,14 +670,16 @@ class VerlTrainingEngine:
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        loss_fn = request.forward_backward_input.loss_fn
+        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
 
         # Remote call
-        result = await worker.forward_backward.remote(data_items)
+        result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
 
         # Update session state
         session.accumulated_gradients += 1
 
-        logger.info(f"[{model_id}] forward_backward completed")
+        logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
         return result
 
     async def forward(

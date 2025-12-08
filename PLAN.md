@@ -87,22 +87,22 @@ Implementation:
 
 Location: `tinker_server/routes/training.py:279-316`
 
-## Priority 5: Stage 4 - RL Training (Not Implemented)
+## Priority 5: Stage 4 - RL Training - DONE
 
 Required for RLHF workflows.
 
 | Interface Method | Endpoint | Status | Notes |
 |-----------------|----------|--------|-------|
-| `forward_backward_async(loss_fn="importance_sampling")` | `POST /forward_backward` | **Missing** | Need loss implementation |
-| `forward_backward_async(loss_fn="ppo")` | `POST /forward_backward` | **Missing** | Need loss implementation |
+| `forward_backward_async(loss_fn="importance_sampling")` | `POST /forward_backward` | Done | Policy gradient with IS |
+| `forward_backward_async(loss_fn="ppo")` | `POST /forward_backward` | Done | PPO with clipping |
 
 ### Loss Function Inputs (from spec)
 
 | Loss | Required `loss_fn_inputs` |
 |------|--------------------------|
-| `cross_entropy` | `weights`, `target_tokens` |
-| `importance_sampling` | `weights`, `target_tokens`, `logprobs`, `advantages`, `mask` |
-| `ppo` | `weights`, `target_tokens`, `logprobs`, `advantages`, `mask` |
+| `cross_entropy` | `target_tokens`, `loss_mask` |
+| `importance_sampling` | `target_tokens`, `loss_mask`, `logprobs`, `advantages` |
+| `ppo` | `target_tokens`, `loss_mask`, `logprobs`, `advantages` |
 
 ### `importance_sampling` Loss
 
@@ -115,11 +115,21 @@ loss = -ratio * advantages * mask
 ### `ppo` Loss
 
 ```python
-# PPO with clipping
+# PPO with clipping (epsilon from loss_fn_config, default 0.2)
 ratio = exp(new_logprobs - old_logprobs)
 clipped_ratio = clip(ratio, 1 - epsilon, 1 + epsilon)
-loss = -min(ratio * advantages, clipped_ratio * advantages) * mask
+loss = -max(ratio * advantages, clipped_ratio * advantages) * mask
+# Note: max() because we negate, equivalent to min() on positive objective
 ```
+
+### Implementation
+
+Location: `tinker_server/backend/verl_training.py:84-210`
+
+- `loss_fn` and `loss_fn_config` passed from request to worker
+- PPO epsilon configurable via `loss_fn_config.epsilon` (default: 0.2)
+- Asymmetric clipping via `loss_fn_config.clip_low` / `clip_high`
+- Returns RL metrics: `ratio:mean`, `clipfrac:mean` (PPO only)
 
 ## Priority 6: Stage 5 - Custom Losses (Not Implemented)
 
@@ -178,9 +188,9 @@ Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
    - [x] Skip backward pass
    - [x] Add `GET /models/{model_id}/tokenizer` endpoint
 
-5. **Add RL losses** (Priority 5) - Enables RLHF
-   - [ ] `importance_sampling` loss
-   - [ ] `ppo` loss
+5. **Add RL losses** (Priority 5) - Enables RLHF - DONE
+   - [x] `importance_sampling` loss
+   - [x] `ppo` loss
 
 6. **Add custom loss support** (Priority 6) - Enables DPO
    - [ ] Design callback mechanism
@@ -189,7 +199,7 @@ Recommended: Option 1 (named callbacks) for MVP, with built-in DPO loss.
 ## Test Coverage Needed
 
 - [ ] `compute_logprobs` returns correct format (length = seq_len - 1)
-- [ ] `create_model_from_state` restores LoRA + optimizer correctly
-- [ ] `forward` returns logprobs without updating gradients
+- [x] `create_model_from_state` restores LoRA + optimizer correctly
+- [x] `forward` returns logprobs without updating gradients
 - [ ] `importance_sampling` loss computes correct gradients
 - [ ] `ppo` loss clips ratios correctly
