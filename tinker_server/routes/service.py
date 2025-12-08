@@ -163,3 +163,43 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
     Silently accepts and discards telemetry data.
     """
     return TelemetryResponse(status="accepted")
+
+
+# =============================================================================
+# Admin endpoints for vLLM management
+# =============================================================================
+
+
+@router.post("/kill_vllm")
+async def kill_vllm() -> dict:
+    """Kill the persistent vLLM actor.
+
+    Use this to force a full restart of the vLLM engine.
+    The next request that needs vLLM will create a new actor (~80s init).
+
+    This is useful when:
+    - You need to reload the base model
+    - vLLM is in a bad state
+    - You want to free GPU memory
+    """
+    from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+
+    killed = kill_persistent_vllm_actor()
+    return {"killed": killed, "message": "vLLM actor killed" if killed else "No vLLM actor found"}
+
+
+@router.get("/vllm_status")
+async def vllm_status() -> dict:
+    """Check if persistent vLLM actor exists.
+
+    Returns:
+        alive: True if actor exists and is alive
+        actor_name: The well-known actor name
+    """
+    from ..backend.multi_lora_engine import (
+        PERSISTENT_VLLM_ACTOR_NAME,
+        check_persistent_vllm_actor,
+    )
+
+    alive = check_persistent_vllm_actor()
+    return {"alive": alive, "actor_name": PERSISTENT_VLLM_ACTOR_NAME}

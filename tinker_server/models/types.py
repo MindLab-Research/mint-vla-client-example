@@ -41,7 +41,7 @@ class SamplingParams(BaseModel):
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
-    stop: list[str] = []
+    stop: list[str] | list[int] | str | None = None
     seed: int | None = None
 
 
@@ -182,6 +182,9 @@ class Datum(BaseModel):
     """A single data item for training."""
 
     model_config = ConfigDict(extra="allow")
+
+    model_input: ModelInput
+    loss_fn_inputs: dict[str, Any]  # Dict mapping field names to TensorData
 
 
 class TensorData(BaseModel):
@@ -397,3 +400,40 @@ class CreateModelFromStateResponse(BaseModel):
     request_id: str
     model_id: str
     type: Literal["create_model_from_state"] = "create_model_from_state"
+
+
+# =============================================================================
+# Model Info Types (get_info endpoint)
+# =============================================================================
+
+
+class GetInfoRequest(BaseModel):
+    """Request to get model info."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    type: Literal["get_info"] = "get_info"
+
+
+class ModelData(BaseModel):
+    """Model architecture and tokenizer data."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    arch: str | None = None
+    model_name: str | None = None
+    tokenizer_id: str | None = None
+
+
+class GetInfoResponse(BaseModel):
+    """Response from get_info endpoint."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    model_data: ModelData
+    model_name: str | None = None
+    is_lora: bool | None = None
+    lora_rank: int | None = None
+    type: Literal["get_info"] = "get_info"

@@ -26,6 +26,11 @@ DEFAULT_MAX_LORAS = 64  # GPU slots (~2.5GB for rank-32 Qwen-7B)
 DEFAULT_MAX_CPU_LORAS = 1024  # CPU cache for evicted adapters
 DEFAULT_MAX_LORA_RANK = 64  # Maximum supported rank
 
+# Well-known name for persistent vLLM actor
+PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
+# Fixed namespace for persistent actors (without this, each process gets random namespace)
+PERSISTENT_NAMESPACE = "tinker"
+
 
 @dataclass
 class LoRASlotInfo:
@@ -198,10 +203,32 @@ class MultiLoRAInferenceEngine:
         self._init_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
-        """Initialize the shared vLLM engine with multi-LoRA support."""
+        """Initialize the shared vLLM engine with multi-LoRA support.
+
+        Uses a detached Ray actor that survives server restarts.
+        First tries to connect to existing actor, creates new one if not found.
+        """
         async with self._init_lock:
             if self._initialized:
                 return
+
+            if not ray.is_initialized():
+                # Use fixed namespace so detached actors can be found across process restarts
+                ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+            # Try to get existing persistent actor
+            try:
+                self.server = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+                logger.info(
+                    f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
+                )
+                self._initialized = True
+                return
+            except ValueError:
+                # Actor doesn't exist, create new one
+                logger.info(
+                    f"No existing vLLM actor found, creating new detached actor: {PERSISTENT_VLLM_ACTOR_NAME}"
+                )
 
             from verl.workers.config import HFModelConfig, RolloutConfig
             from verl.workers.rollout.replica import RolloutMode
@@ -213,9 +240,6 @@ class MultiLoRAInferenceEngine:
                 max_loras=self.max_loras,
                 max_cpu_loras=self.max_cpu_loras,
             )
-
-            if not ray.is_initialized():
-                ray.init(address="auto", ignore_reinit_error=True)
 
             # Configure rollout with multi-LoRA support
             rollout_config = RolloutConfig(
@@ -254,9 +278,12 @@ class MultiLoRAInferenceEngine:
                 f"max_lora_rank={self.max_lora_rank}"
             )
 
-            # Create Ray actor with GPU resources
+            # Create detached Ray actor with well-known name
+            # lifetime="detached" ensures actor survives owner process termination
             self.server = ExtendedVLLMHttpServer.options(
-                num_gpus=self.tensor_parallel_size
+                num_gpus=self.tensor_parallel_size,
+                name=PERSISTENT_VLLM_ACTOR_NAME,
+                lifetime="detached",
             ).remote(
                 config=rollout_config,
                 model_config=model_config,
@@ -270,7 +297,7 @@ class MultiLoRAInferenceEngine:
 
             await self.server.launch_server.remote()
             self._initialized = True
-            logger.info("MultiLoRAInferenceEngine initialized")
+            logger.info("MultiLoRAInferenceEngine initialized (detached actor)")
 
     async def add_lora_for_session(
         self,
@@ -463,16 +490,60 @@ class MultiLoRAInferenceEngine:
         logger.info(f"Removed session {sampling_session_id} (lora_int_id={lora_id})")
         return True
 
-    async def shutdown(self) -> None:
-        """Shutdown the engine and cleanup resources."""
-        if self.server is not None:
+    async def shutdown(self, kill_actor: bool = False) -> None:
+        """Disconnect from the engine (optionally kill the persistent actor).
+
+        Args:
+            kill_actor: If True, kill the persistent vLLM actor.
+                        If False (default), just disconnect - actor survives for reuse.
+        """
+        if self.server is not None and kill_actor:
             try:
                 ray.kill(self.server)
+                logger.info("Killed persistent vLLM actor")
             except Exception as e:
                 logger.warning(f"Error killing server actor: {e}")
-            self.server = None
+        self.server = None
         self._initialized = False
-        logger.info("MultiLoRAInferenceEngine shutdown")
+        logger.info("MultiLoRAInferenceEngine disconnected")
+
+
+def kill_persistent_vllm_actor() -> bool:
+    """Kill the persistent vLLM actor if it exists.
+
+    Use this to force a full restart of the vLLM engine (e.g., after model changes).
+    After calling this, the next server startup will create a new actor (~80s init).
+
+    Returns:
+        True if actor was killed, False if not found.
+    """
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    try:
+        actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        ray.kill(actor)
+        logger.info(f"Killed persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}")
+        return True
+    except ValueError:
+        logger.info(f"No persistent vLLM actor found: {PERSISTENT_VLLM_ACTOR_NAME}")
+        return False
+
+
+def check_persistent_vllm_actor() -> bool:
+    """Check if persistent vLLM actor exists.
+
+    Returns:
+        True if actor exists and is alive, False otherwise.
+    """
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    try:
+        ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        return True
+    except ValueError:
+        return False
 
 
 # Global instance (initialized in app lifespan)

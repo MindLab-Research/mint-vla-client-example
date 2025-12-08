@@ -131,15 +131,20 @@ class TrainingWorker:
                 logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
                 continue
 
-            # Extract target tokens and weights
+            # Extract target tokens and weights/mask
+            # Accept both "weights" and "mask" field names (tinker spec uses "mask")
             target_data = loss_fn_inputs.get("target_tokens", {})
-            weights_data = loss_fn_inputs.get("weights", {})
+            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
 
             target_tokens = target_data.get("data", [])
             weights = weights_data.get("data", []) if weights_data else []
 
             if not target_tokens or not weights:
-                logger.warning("[TrainingWorker] Missing target_tokens or weights, skipping item")
+                logger.warning(
+                    f"[TrainingWorker] Missing target_tokens or weights/mask, skipping item. "
+                    f"loss_fn_inputs keys: {list(loss_fn_inputs.keys())}, "
+                    f"target_tokens len: {len(target_tokens)}, weights len: {len(weights)}"
+                )
                 continue
 
             # Convert to tensors
@@ -336,15 +341,16 @@ class TrainingWorker:
                     logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
                     continue
 
-                # Extract target tokens and weights
+                # Extract target tokens and weights/mask
+                # Accept both "weights" and "mask" field names (tinker spec uses "mask")
                 target_data = loss_fn_inputs.get("target_tokens", {})
-                weights_data = loss_fn_inputs.get("weights", {})
+                weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
 
                 target_tokens = target_data.get("data", [])
                 weights = weights_data.get("data", []) if weights_data else []
 
                 if not target_tokens or not weights:
-                    logger.warning("[TrainingWorker] Missing target_tokens or weights, skipping item")
+                    logger.warning("[TrainingWorker] Missing target_tokens or weights/mask, skipping item")
                     continue
 
                 # Convert to tensors
@@ -627,7 +633,8 @@ class VerlTrainingEngine:
     async def initialize(self) -> None:
         """Initialize Ray connection."""
         if not ray.is_initialized():
-            ray.init(address="auto", ignore_reinit_error=True)
+            # Use fixed namespace for persistent vLLM actor support
+            ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
     async def create_training_session(self, session: TrainingSession) -> None:
@@ -693,6 +700,12 @@ class VerlTrainingEngine:
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+
+        # Debug: log first item's loss_fn_inputs keys
+        if data_items:
+            first_item = data_items[0]
+            lfi = first_item.get("loss_fn_inputs", {})
+            print(f"[DEBUG] First datum loss_fn_inputs keys: {list(lfi.keys())}", flush=True)
 
         # Remote call
         result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)

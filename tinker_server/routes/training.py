@@ -7,6 +7,7 @@ Endpoints:
 - POST /forward: Forward pass only (no backward), returns logprobs
 - POST /optim_step: Optimizer update
 - POST /save_weights_for_sampler: Save weights for inference
+- POST /get_info: Get model info (tinker client compatible)
 - GET /models: List training models
 - GET /models/{model_id}: Get model info
 - GET /models/{model_id}/tokenizer: Get tokenizer config
@@ -29,6 +30,9 @@ from ..models.types import (
     CreateModelRequest,
     CreateModelResponse,
     ForwardBackwardRequest,
+    GetInfoRequest,
+    GetInfoResponse,
+    ModelData,
     OptimStepRequest,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
@@ -570,6 +574,38 @@ async def get_model_info(model_id: str):
         "current_step": session.current_step,
         "is_active": session.is_active,
     }
+
+
+@router.post("/get_info", response_model=GetInfoResponse)
+async def get_info(request: GetInfoRequest) -> GetInfoResponse:
+    """Get model info (tinker client compatible endpoint).
+
+    Returns model architecture, tokenizer, and LoRA configuration.
+    """
+    if training_manager is None:
+        raise HTTPException(status_code=503, detail="Training manager not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
+
+    # Build response matching tinker client expectations
+    lora_rank = session.lora_config.rank if session.lora_config else None
+    is_lora = session.lora_config is not None
+
+    return GetInfoResponse(
+        model_id=session.model_id,
+        model_data=ModelData(
+            arch="transformer",  # Generic architecture identifier
+            model_name=session.base_model,
+            tokenizer_id=session.base_model,  # Use base model as tokenizer ID
+        ),
+        model_name=session.base_model,
+        is_lora=is_lora,
+        lora_rank=lora_rank,
+    )
 
 
 @router.get("/models")

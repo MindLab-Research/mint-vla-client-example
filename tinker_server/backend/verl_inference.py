@@ -793,7 +793,8 @@ class VerlInferenceEngine:
         if not ray.is_initialized():
             # Use 'auto' to connect to existing cluster if available
             # If no cluster, this falls back to starting a local Ray instance
-            ray.init(address='auto', ignore_reinit_error=True)
+            # Use fixed namespace for persistent vLLM actor support
+            ray.init(address='auto', namespace="tinker", ignore_reinit_error=True)
 
         # Create rollout config using dataclass
         rollout_config = RolloutConfig(

@@ -242,3 +242,171 @@ Multiple training sessions can run in parallel. Each session has:
 - Its own `VerlInferenceEngine` for inference (lazily initialized)
 
 This ensures complete isolation - one session's LoRA reload doesn't affect another session's inference.
+
+### Persistent vLLM Actor (Dev Mode)
+
+The vLLM engine runs as a **detached Ray actor** that survives server restarts. This enables fast debug cycles:
+
+- First server start: Creates new vLLM actor (~80s initialization)
+- Subsequent restarts: Reuses existing actor (~2s startup)
+- Explicit kill: Use `/api/v1/kill_vllm` or `scripts/kill_vllm.py`
+
+**How it works:**
+```
+Server Process 1    →    vLLM Actor (detached)    ←    Server Process 2
+   creates                  persists                    reconnects
+```
+
+**Actor management:**
+```bash
+# Check if vLLM actor exists
+curl http://localhost:8000/api/v1/vllm_status
+# Returns: {"alive": true, "actor_name": "tinker_vllm_server"}
+
+# Kill vLLM actor (forces ~80s reinit on next request)
+curl -X POST http://localhost:8000/api/v1/kill_vllm
+# Returns: {"killed": true, "message": "vLLM actor killed"}
+
+# Or from command line (on volcano):
+ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.py'
+```
+
+**When to kill the vLLM actor:**
+- Base model changed (different checkpoint)
+- vLLM is in a bad state (OOM, stuck)
+- Need to free GPU memory
+- Want to test cold-start behavior
+
+**Note:** LoRA registry is stored in the Python process, not the Ray actor. After server restart, sessions need to re-register their LoRAs, but the base model stays warm.
+
+## Remote Testing Pipeline (volcano)
+
+For integration testing with Tinker Cookbook, deploy the server on `volcano` (Ray cluster head node) and test locally.
+
+### Architecture
+
+```
+Local Machine                     volcano (Ray Head)              GPU Workers
+─────────────                     ──────────────────              ───────────
+tinker-cookbook  ──HTTP──>  tinker-server (FastAPI)  ──Ray──>  TrainingWorker
+     |                            port 8000                    vLLM Engine
+     |                               |
+     └── SSH tunnel (port 8000) ─────┘
+```
+
+- Code synced via Unison (background, automatic)
+- Server restart required after code changes (vLLM actor persists, so restart is fast ~2s)
+- First start or after `/kill_vllm`: ~80s (model loading + CUDA graph capture)
+
+### Setup SSH Tunnel
+
+```bash
+# Start SSH tunnel with local port forwarding (run once)
+ssh -f -N -L 8000:localhost:8000 volcano
+
+# Verify tunnel is running
+ps aux | grep "ssh.*-L 8000" | grep -v grep
+```
+
+### Server Management Commands
+
+```bash
+# Kill existing server
+ssh volcano 'pkill -f "python scripts/run_server.py"'
+
+# Start server in background
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+
+# Check server status
+ssh volcano "ps aux | grep run_server | grep -v grep"
+
+# View server logs
+ssh volcano "tail -50 /tmp/tinker_server.log"
+
+# Check health (after ~80s initialization)
+curl -s http://localhost:8000/api/v1/healthz
+# Expected: {"status":"ready"}
+```
+
+### Fast Restart (Code Changes Only)
+
+vLLM actor persists across server restarts. Use for most code changes:
+
+```bash
+# 1. Kill old server
+ssh volcano 'pkill -f "python scripts/run_server.py"'
+
+# 2. Start new server (vLLM actor reused, ~2s startup)
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+
+# 3. Wait for FastAPI startup (~2 seconds)
+sleep 3
+
+# 4. Verify
+curl -s http://localhost:8000/api/v1/healthz
+```
+
+### Full Restart (vLLM Changes)
+
+Kill vLLM actor when you need to reload base model or vLLM config:
+
+```bash
+# 1. Kill vLLM actor
+curl -X POST http://localhost:8000/api/v1/kill_vllm
+# Or: ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.py'
+
+# 2. Kill old server
+ssh volcano 'pkill -f "python scripts/run_server.py"'
+
+# 3. Start new server
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+
+# 4. Wait for vLLM initialization (~80 seconds)
+sleep 80
+
+# 5. Verify
+curl -s http://localhost:8000/api/v1/healthz
+```
+
+### Running Tinker Cookbook Tests
+
+Once server is ready, run cookbook recipes locally:
+
+```bash
+cd /home/yiwen/tinker_project/tinker-cookbook
+
+# Phase 1: Quick Validation - Arithmetic RL (~5 min)
+TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
+python -m tinker_cookbook.recipes.math_rl.train \
+    model_name="Qwen/Qwen2.5-7B-Instruct" \
+    renderer_name="qwen3_instruct" \
+    group_size=4 \
+    groups_per_batch=100 \
+    learning_rate=1e-4
+
+# Phase 2: SFT Baseline - Chat SL (~30-60 min)
+TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
+python -m tinker_cookbook.recipes.chat_sl.train \
+    model_name=Qwen/Qwen2.5-7B-Instruct \
+    renderer_name="qwen3_instruct" \
+    dataset=no_robots \
+    learning_rate=5e-4 \
+    batch_size=64 \
+    lora_rank=64 \
+    eval_every=20
+```
+
+Note: Use `renderer_name="qwen3_instruct"` to bypass model lookup (cookbook only has Qwen3 in model_info).
+
+### Debugging
+
+```bash
+# Check server logs for errors
+ssh volcano "grep -i 'error\|exception\|traceback' /tmp/tinker_server.log | tail -20"
+
+# Check training worker logs
+ssh volcano "grep 'TrainingWorker' /tmp/tinker_server.log | tail -20"
+
+# Debug forward_backward issues
+ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
+```
