@@ -317,7 +317,7 @@ Expected: accuracy ~0.57 after 50 steps.
 
 | Recipe | Type | Coverage | Status |
 |--------|------|----------|--------|
-| RLHF 3-stage | SFT→RM→RL | All loss types | [ ] |
+| RLHF 3-stage | SFT→RM→RL | All loss types | Running (SFT stage) |
 
 ```bash
 python -m tinker_cookbook.recipes.preference.rlhf.rlhf_pipeline
@@ -327,9 +327,9 @@ python -m tinker_cookbook.recipes.preference.rlhf.rlhf_pipeline
 
 - [x] Phase 1: Arithmetic RL completes without errors (reward 0.66 → 1.0)
 - [x] Phase 2: Chat SL trains and loss decreases (test/nll dropped to ~1.78)
-- [ ] Phase 3: MATH RL trains and accuracy improves
+- [ ] Phase 3: MATH RL - Running (188 batches, initial evals completed)
 - [x] Phase 4: DPO trains with custom loss via weights (accuracy 0.41 → 0.61, dpo_loss 0.71 → 0.69)
-- [~] Phase 5: Full RLHF pipeline - SKIPPED (cookbook model_info.py lacks Qwen2.5 support, not a server issue)
+- [ ] Phase 5: Full RLHF pipeline - Running SFT stage (train_mean_nll 2.31 → 1.84)
 
 ### Known Requirements
 
