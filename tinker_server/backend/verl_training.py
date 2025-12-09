@@ -673,6 +673,40 @@ class VerlTrainingEngine:
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
+    def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
+        """Resolve HuggingFace model ID to local cache path.
+
+        HF cache structure: HF_HOME/hub/models--{org}--{name}/snapshots/{hash}/
+
+        Args:
+            hf_model_id: Model ID like "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+        Returns:
+            Local path to model snapshot, or None if not found.
+        """
+        import os
+        from pathlib import Path
+
+        hf_home = os.environ.get("HF_HOME", "/vePFS-Mindverse/share/huggingface")
+        # Convert "org/model" to "models--org--model"
+        cache_name = "models--" + hf_model_id.replace("/", "--")
+        model_dir = Path(hf_home) / "hub" / cache_name / "snapshots"
+
+        if not model_dir.exists():
+            logger.warning(f"Model cache not found: {model_dir}")
+            return None
+
+        # Get the latest snapshot (usually only one)
+        snapshots = list(model_dir.iterdir())
+        if not snapshots:
+            logger.warning(f"No snapshots in: {model_dir}")
+            return None
+
+        # Return the first snapshot path
+        snapshot_path = str(snapshots[0])
+        logger.info(f"Resolved {hf_model_id} -> {snapshot_path}")
+        return snapshot_path
+
     async def create_training_session(self, session: TrainingSession) -> None:
         """Create Ray actor for session.
 
@@ -688,35 +722,38 @@ class VerlTrainingEngine:
         model_id = session.model_id
 
         # Determine base model path
-        # If request specifies a HuggingFace ID but we have a local path configured,
-        # prefer the local path (worker nodes may not have network access)
         requested_model = session.base_model or self.default_base_model
-        if requested_model and not requested_model.startswith("/"):
-            # Not a local path - use configured default which should be local
-            base_model = self.default_base_model
-            logger.info(f"[{model_id}] Using local model path: {base_model} (requested: {requested_model})")
-        else:
-            base_model = requested_model
 
         lora_rank = (
             session.lora_config.rank if session.lora_config else self.default_lora_rank
         )
 
         # Check if this is an MoE model requiring Megatron backend
-        # Use requested_model for pattern matching (has HuggingFace model name)
-        model_name_for_check = requested_model or base_model or ""
-        use_megatron = is_moe_model(model_name_for_check)
+        use_megatron = is_moe_model(requested_model or "")
+
+        # Resolve model path based on backend
+        if requested_model and not requested_model.startswith("/"):
+            # HuggingFace model ID - resolve to local cache path
+            base_model = self._resolve_hf_model_path(requested_model)
+            if base_model:
+                logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+            else:
+                # Fall back to default (works for dense models on same architecture)
+                base_model = self.default_base_model
+                logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
+        else:
+            base_model = requested_model
 
         if use_megatron:
             logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank})")
 
             # Create distributed Megatron worker group
-            # Start with TP=1, PP=1 (single worker) for initial testing
-            # TODO: Increase to TP=2, PP=2 after validating single-worker flow
+            # TP=2, PP=2 = 4 GPUs total for model parallelism
+            # EP=2 for expert parallelism (orthogonal to TP/PP)
             distributed_config = DistributedConfig(
-                tensor_parallel_size=1,
-                pipeline_parallel_size=1,
-                expert_parallel_size=1,
+                tensor_parallel_size=2,
+                pipeline_parallel_size=2,
+                expert_parallel_size=2,
                 context_parallel_size=1,
             )
             worker = MegatronWorkerGroup.remote(

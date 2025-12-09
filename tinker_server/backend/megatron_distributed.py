@@ -32,10 +32,12 @@ class DistributedConfig:
     @property
     def world_size(self) -> int:
         """Total number of processes needed."""
-        # EP is orthogonal to TP/PP/CP
+        # For MoE models: world_size = TP * PP * EP * CP
+        # Each rank handles one shard of tensor/pipeline/expert parallelism
         return (
             self.tensor_parallel_size
             * self.pipeline_parallel_size
+            * self.expert_parallel_size
             * self.context_parallel_size
         )
 
@@ -148,6 +150,20 @@ class MegatronRankWorker:
             trust_remote_code=True,
         )
 
+        # Build override_transformer_config for MoE models
+        override_tf_config = {}
+        num_experts = getattr(hf_config, "num_experts", None)
+        if num_experts is not None:
+            # MoE model - pass expert parameters to TransformerConfig
+            override_tf_config["num_moe_experts"] = num_experts
+            # moe_router_topk = num_experts_per_tok (active experts per token)
+            num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 2)
+            override_tf_config["moe_router_topk"] = num_experts_per_tok
+            logger.info(
+                f"[Rank {self.rank}] MoE config: {num_experts} experts, "
+                f"top-{num_experts_per_tok} routing"
+            )
+
         engine_config = McoreEngineConfig(
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
@@ -159,6 +175,7 @@ class MegatronRankWorker:
             dtype="bfloat16",
             use_mbridge=True,
             use_distributed_optimizer=True,
+            override_transformer_config=override_tf_config,
         )
 
         optimizer_config = McoreOptimizerConfig(
