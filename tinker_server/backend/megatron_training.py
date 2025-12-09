@@ -37,17 +37,18 @@ class MegatronTrainingConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     learning_rate: float = 1e-4
-    # Parallelism config for Qwen3-30B-A3B on 8 GPUs
-    tensor_parallel_size: int = 2
-    pipeline_parallel_size: int = 2
-    expert_parallel_size: int = 4
-    context_parallel_size: int = 2
-    # Offloading
+    # Parallelism config - single process for now (TP=1 to avoid distributed)
+    # TODO: Implement proper multi-process parallelism for 8 GPUs
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    context_parallel_size: int = 1
+    # Offloading - enable to fit large models
     param_offload: bool = True
     optimizer_offload: bool = True
     grad_offload: bool = True
     # Training
-    dtype: str = "bf16"
+    dtype: str = "bfloat16"
     seed: int = 42
 
 
@@ -245,7 +246,7 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
     return ppo_loss_fn
 
 
-@ray.remote(num_gpus=8)  # MoE training uses all 8 GPUs
+@ray.remote(num_gpus=1)  # TODO: Implement multi-GPU parallelism
 class MegatronTrainingWorker:
     """Ray actor for MoE training via verl's Megatron backend.
 
@@ -264,11 +265,9 @@ class MegatronTrainingWorker:
     ):
         """Initialize Megatron training worker.
 
-        This spawns a multi-GPU training setup with:
-        - Tensor Parallelism (TP=2)
-        - Pipeline Parallelism (PP=2)
-        - Expert Parallelism (EP=4)
-        - Context Parallelism (CP=2)
+        Currently runs single-GPU without parallelism. Multi-GPU parallelism
+        requires launching distributed processes (torchrun) which is not yet
+        implemented for Ray actors.
 
         Args:
             base_model: HuggingFace model path or local path.
@@ -315,7 +314,20 @@ class MegatronTrainingWorker:
         from verl.utils.torch_dtypes import PrecisionType
 
         # Initialize distributed if not already done
+        # For Ray actor running single-process multi-GPU, we set up minimal distributed env
         if not torch.distributed.is_initialized():
+            # Set required env vars for torch.distributed if not present
+            if "RANK" not in os.environ:
+                os.environ["RANK"] = "0"
+            if "WORLD_SIZE" not in os.environ:
+                os.environ["WORLD_SIZE"] = "1"
+            if "LOCAL_RANK" not in os.environ:
+                os.environ["LOCAL_RANK"] = "0"
+            if "MASTER_ADDR" not in os.environ:
+                os.environ["MASTER_ADDR"] = "localhost"
+            if "MASTER_PORT" not in os.environ:
+                os.environ["MASTER_PORT"] = "29500"
+
             rank = int(os.environ.get("LOCAL_RANK", 0))
             torch.distributed.init_process_group(backend="nccl")
             torch.cuda.set_device(rank)
@@ -325,18 +337,16 @@ class MegatronTrainingWorker:
 
         # Build HFModelConfig
         from transformers import AutoConfig
-        hf_config = AutoConfig.from_pretrained(local_path, trust_remote_code=True)
+        hf_config = AutoConfig.from_pretrained(local_path, trust_remote_code=True, local_files_only=True)
 
         model_config = HFModelConfig(
+            path=self.base_model,  # HuggingFace model name for tokenizer
             local_path=local_path,
             hf_config=hf_config,
             architectures=hf_config.architectures,
-            share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
-            lora={
-                "rank": self.config.lora_rank,
-                "alpha": self.config.lora_alpha,
-                "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
-            },
+            lora_rank=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            target_modules="all-linear",
             trust_remote_code=True,
         )
 
@@ -356,13 +366,15 @@ class MegatronTrainingWorker:
         )
 
         # Build McoreOptimizerConfig
+        # Use constant LR decay style for online learning (no fixed schedule)
         optimizer_config = McoreOptimizerConfig(
             lr=self.learning_rate,
             weight_decay=0.01,
-            adam_beta1=0.9,
-            adam_beta2=0.999,
-            adam_eps=1e-8,
+            betas=(0.9, 0.999),
             clip_grad=1.0,
+            lr_decay_steps=100000,  # Large value for online learning
+            lr_decay_style="constant",  # Don't decay learning rate
+            lr_warmup_steps=0,
         )
 
         # Build CheckpointConfig (minimal)
@@ -572,7 +584,7 @@ class MegatronTrainingWorker:
             Dict with tokenizer info.
         """
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True, local_files_only=True)
 
         return {
             "vocab_size": tokenizer.vocab_size,

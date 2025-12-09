@@ -111,6 +111,7 @@ async def _do_create_model(request_id: str, request: CreateModelRequest) -> None
             request_id=request_id,
             model_id=model_id,
             type="create_model",
+            backend=session.backend,  # "megatron" or "peft"
         )
         future_store.resolve(request_id, response.model_dump())
 

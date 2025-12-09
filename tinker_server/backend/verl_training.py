@@ -46,7 +46,7 @@ class TrainingWorker:
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            base_model, trust_remote_code=True
+            base_model, trust_remote_code=True, local_files_only=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -56,6 +56,7 @@ class TrainingWorker:
             base_model,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            local_files_only=True,
             device_map="cuda",  # Use this worker's GPU
         )
 
@@ -681,7 +682,8 @@ class VerlTrainingEngine:
         Args:
             session: TrainingSession with configuration.
         """
-        from .megatron_training import MegatronTrainingWorker, is_moe_model
+        from .megatron_training import is_moe_model
+        from .megatron_distributed import MegatronWorkerGroup, DistributedConfig
 
         model_id = session.model_id
 
@@ -706,20 +708,41 @@ class VerlTrainingEngine:
         use_megatron = is_moe_model(model_name_for_check)
 
         if use_megatron:
-            logger.info(f"[{model_id}] Creating MegatronTrainingWorker for MoE model (base={base_model}, lora_rank={lora_rank})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank})")
 
-            # Create Megatron worker - uses all 8 GPUs
-            worker = MegatronTrainingWorker.remote(
+            # Create distributed Megatron worker group
+            # Uses TP=2, PP=2, EP=2 for 4 GPUs total (TP*PP)
+            # Runtime env is set inside MegatronWorkerGroup for child workers
+            distributed_config = DistributedConfig(
+                tensor_parallel_size=2,
+                pipeline_parallel_size=2,
+                expert_parallel_size=2,
+                context_parallel_size=1,
+            )
+            worker = MegatronWorkerGroup.remote(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,
+                distributed_config=distributed_config,
             )
             session.backend = "megatron"
         else:
             logger.info(f"[{model_id}] Creating TrainingWorker for dense model (base={base_model}, lora_rank={lora_rank})")
 
             # Create single-GPU worker
-            worker = TrainingWorker.remote(
+            # Set PYTHONPATH and HF_HOME so workers can find code and cached models
+            # HF_HUB_OFFLINE prevents network calls for model metadata
+            dense_runtime_env = {
+                "env_vars": {
+                    "PYTHONPATH": "/vePFS-Mindverse/share/code/tinker-server",
+                    "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                    "HF_HUB_OFFLINE": "1",
+                    "TRANSFORMERS_OFFLINE": "1",
+                }
+            }
+            worker = TrainingWorker.options(
+                runtime_env=dense_runtime_env
+            ).remote(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,

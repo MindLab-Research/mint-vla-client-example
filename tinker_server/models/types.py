@@ -176,6 +176,7 @@ class CreateModelResponse(BaseModel):
     request_id: str
     model_id: str
     type: Literal["create_model"] = "create_model"
+    backend: str | None = None  # "megatron" for MoE, "peft" for dense
 
 
 class Datum(BaseModel):
