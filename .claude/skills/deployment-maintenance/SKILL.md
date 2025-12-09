@@ -129,7 +129,7 @@ Dashboard: http://192.168.47.158:8265
 
 **Prerequisites:** Run `scripts/setup_volc_cli.sh` to install CLI, then `volc configure`.
 
-#### Option 1: Simple (Single Node 8 GPU)
+#### Option 1: Simple (Single Node)
 
 ```bash
 scripts/deploy_cluster.sh simple
@@ -143,6 +143,24 @@ scripts/deploy_cluster.sh scalable
 ```
 
 Then follow printed instructions to get HEAD_IP and submit worker.
+
+### Adjusting GPU Count
+
+**GPU allocation is flexible.** Modify configs as needed:
+
+1. Change `Flavor` to match GPU count (see [volcano-reference.md](volcano-reference.md)):
+   - `ml.pni2l.7xlarge` = 1 GPU
+   - `ml.pni2l.14xlarge` = 2 GPUs
+   - `ml.pni2l.28xlarge` = 8 GPUs
+
+2. Update `--num-gpus=N` in entrypoint to match
+
+Example for 2 GPUs:
+```yaml
+Flavor: "ml.pni2l.14xlarge"
+Entrypoint: |
+  ray start --head --port=6379 --dashboard-host=0.0.0.0 --num-gpus=2 && sleep infinity
+```
 
 ### Check Cluster Status
 

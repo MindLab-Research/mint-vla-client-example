@@ -4,8 +4,12 @@
 
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
-| `ml.g2a.xlarge` | 0 | 8GB | Head node |
-| `ml.pni2l.28xlarge` | 8x A100 80GB | 640GB | Training/Inference |
+| `ml.g2a.xlarge` | 0 | 8GB | Head node (CPU only) |
+| `ml.pni2l.7xlarge` | 1x A100 80GB | 80GB | Small inference |
+| `ml.pni2l.14xlarge` | 2x A100 80GB | 160GB | Medium inference |
+| `ml.pni2l.28xlarge` | 8x A100 80GB | 640GB | Training/Large inference |
+
+**GPU allocation is flexible.** Adjust `Flavor` and `--num-gpus` in configs as needed.
 
 ## Storage Mounts
 
