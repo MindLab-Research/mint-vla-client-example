@@ -1,18 +1,19 @@
 ---
 name: deployment-maintenance
-description: Guides server deployment to Volcano GPU cluster, code synchronization via Unison, and cluster maintenance including vLLM actor management, Ray cluster coordination, and health monitoring for the Tinker inference server.
+description: "Triggers: deploy, integration test, test on server, run remotely, restart server, sync code, unison, vLLM status, kill vLLM, Ray cluster, Volcano. Use for deploying code to Volcano GPU server, running integration tests against remote server, managing Tinker inference server lifecycle, and troubleshooting distributed inference."
 ---
 
 # Server Deployment and Cluster Maintenance
 
 ## When to Use This Skill
 
-- Deploy/restart Tinker server on Volcano cluster
-- Manage code sync via Unison
-- Manage Ray cluster (submit tasks, check status, cancel)
-- Handle vLLM actor lifecycle
-- Troubleshoot distributed inference issues
-- Set up SSH tunnels for remote testing
+**Trigger this skill when:**
+- Running integration tests that require the remote server
+- Deploying code changes to Volcano for testing
+- User asks to "test on server", "deploy", "run remotely", or "integration test"
+- Restarting or debugging the Tinker server
+- Managing vLLM actor (kill, check status, OOM recovery)
+- Setting up or troubleshooting code sync
 
 ## Skill Resources
 
