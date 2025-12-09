@@ -438,7 +438,7 @@ class MegatronWorkerGroup:
         ray.get(futures)
 
         self._step_count += 1
-        return {"step": self._step_count}
+        return {"metrics": {"step": self._step_count}}
 
     def get_lora_state_dict(self) -> dict:
         """Get LoRA state dict from rank 0."""
