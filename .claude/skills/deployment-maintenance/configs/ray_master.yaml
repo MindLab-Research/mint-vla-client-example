@@ -1,10 +1,13 @@
 # Ray Master (Head Node) - CPU only, persistent
 # Submit with: volc ml_task submit -c configs/ray_master.yaml
+# NOTE: No internet access - HF_HUB_OFFLINE required
 
 TaskName: "ray-master"
 Description: "Ray head node - CPU only, long-running"
 
 Entrypoint: |
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
   ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-cpus=4 --num-gpus=0 && sleep infinity
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"

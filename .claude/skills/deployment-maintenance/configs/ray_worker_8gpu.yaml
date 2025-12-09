@@ -1,6 +1,7 @@
 # Ray GPU Worker - 8x GPU, ephemeral
 # Joins existing Ray master cluster
 # Submit with: volc ml_task submit -c configs/ray_worker_8gpu.yaml
+# NOTE: No internet access - HF_HUB_OFFLINE required
 
 TaskName: "ray-worker-8gpu"
 Description: "Ray GPU worker - 8x A100, joins master cluster"
@@ -8,6 +9,8 @@ Description: "Ray GPU worker - 8x A100, joins master cluster"
 # NOTE: Update HEAD_IP to match your Ray master's IP address
 # Get it from: volc ml_task list -> select ray-master -> view instance IP
 Entrypoint: |
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
   ray start --address='HEAD_IP:6379' --num-gpus=8 && sleep infinity
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"

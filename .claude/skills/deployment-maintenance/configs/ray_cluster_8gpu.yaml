@@ -1,11 +1,14 @@
 # Ray Cluster - Single 8-GPU node (combined head + worker)
 # Use this for simpler deployments where head and workers are on same node
 # Submit with: volc ml_task submit -c configs/ray_cluster_8gpu.yaml
+# NOTE: No internet access - HF_HUB_OFFLINE required
 
 TaskName: "ray-cluster-8gpu"
 Description: "Ray cluster with 8 GPUs for dynamic workload allocation"
 
 Entrypoint: |
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
   ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-gpus=8 && sleep infinity
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"

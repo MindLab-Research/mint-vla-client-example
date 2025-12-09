@@ -63,13 +63,24 @@ Profile syncs `/home/yiwen/tinker_project` <-> `volcano:/root/tinker_project`.
 
 Ignores: `*.pyc`, `__pycache__`, `.git`, `.venv`, `node_modules`.
 
+## Offline Environment
+
+**The server and Ray workers have NO internet access.** Always set:
+
+```bash
+export HF_HUB_OFFLINE=1
+export HF_HOME=/vePFS-Mindverse/share/huggingface
+```
+
+These must be set on both the API server and all Ray workers. Models must be pre-downloaded to `HF_HOME`.
+
 ## Server Management
 
 ### Environment Variables
 
 ```bash
-HF_HUB_OFFLINE=1                    # Force offline mode
-HF_HOME=/vePFS-Mindverse/share/huggingface
+HF_HUB_OFFLINE=1                    # Required: no internet access
+HF_HOME=/vePFS-Mindverse/share/huggingface  # Required: shared model cache
 TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
 TINKER_CHECKPOINT_DIR=<path>        # LoRA checkpoints (shared filesystem required)
 ```
