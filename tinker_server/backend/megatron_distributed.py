@@ -40,20 +40,19 @@ class DistributedConfig:
         )
 
 
-def get_free_port() -> int:
-    """Get a free port on the current node."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 @ray.remote(num_gpus=0)
 def get_node_ip_and_free_port() -> tuple[str, int]:
-    """Get node IP and free port for master address."""
+    """Get node IP and free port for master address.
+
+    Self-contained to avoid module import issues on Ray workers.
+    """
     import socket
     hostname = socket.gethostname()
     ip = socket.gethostbyname(hostname)
-    port = get_free_port()
+    # Get free port inline
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
     return ip, port
 
 
@@ -90,7 +89,8 @@ class MegatronRankWorker:
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["RANK"] = str(rank)
-        os.environ["LOCAL_RANK"] = str(rank % 8)  # Assumes <= 8 GPUs per node
+        # LOCAL_RANK is always 0 because Ray sets CUDA_VISIBLE_DEVICES to a single GPU
+        os.environ["LOCAL_RANK"] = "0"
 
         # HuggingFace offline mode
         os.environ["HF_HOME"] = "/vePFS-Mindverse/share/huggingface"
@@ -122,21 +122,13 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
-        from megatron.core import parallel_state as mpu
         from verl.workers.engine.megatron.transformer_impl import MegatronEngine
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
 
-        # Initialize Megatron model parallelism
-        mpu.initialize_model_parallel(
-            tensor_model_parallel_size=self.config.tensor_parallel_size,
-            pipeline_model_parallel_size=self.config.pipeline_parallel_size,
-            expert_model_parallel_size=self.config.expert_parallel_size,
-            context_parallel_size=self.config.context_parallel_size,
-        )
-
+        # Note: mpu.initialize_model_parallel() is called by MegatronEngine
         # Copy model to local (returns path unchanged if not HDFS)
         local_path = copy_to_local(self.base_model)
 
@@ -317,19 +309,7 @@ class MegatronWorkerGroup:
 
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
 
-        # Get master address from first bundle's node
-        master_addr, master_port = ray.get(
-            get_node_ip_and_free_port.options(
-                scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                    placement_group=self.placement_group,
-                    placement_group_bundle_index=0,
-                )
-            ).remote()
-        )
-
-        logger.info(f"[MegatronWorkerGroup] Master: {master_addr}:{master_port}")
-
-        # Spawn workers
+        # Runtime env for all Ray tasks - ensures workers can import tinker_server
         runtime_env = {
             "env_vars": {
                 "PYTHONPATH": "/vePFS-Mindverse/share/code/tinker-server",
@@ -339,6 +319,20 @@ class MegatronWorkerGroup:
             }
         }
 
+        # Get master address from first bundle's node
+        master_addr, master_port = ray.get(
+            get_node_ip_and_free_port.options(
+                scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                    placement_group=self.placement_group,
+                    placement_group_bundle_index=0,
+                ),
+                runtime_env=runtime_env,
+            ).remote()
+        )
+
+        logger.info(f"[MegatronWorkerGroup] Master: {master_addr}:{master_port}")
+
+        # Spawn workers (reuse same runtime_env)
         for rank in range(world_size):
             worker = MegatronRankWorker.options(
                 scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(

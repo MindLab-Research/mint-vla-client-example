@@ -711,12 +711,12 @@ class VerlTrainingEngine:
             logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank})")
 
             # Create distributed Megatron worker group
-            # Uses TP=2, PP=2, EP=2 for 4 GPUs total (TP*PP)
-            # Runtime env is set inside MegatronWorkerGroup for child workers
+            # Start with TP=1, PP=1 (single worker) for initial testing
+            # TODO: Increase to TP=2, PP=2 after validating single-worker flow
             distributed_config = DistributedConfig(
-                tensor_parallel_size=2,
-                pipeline_parallel_size=2,
-                expert_parallel_size=2,
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                expert_parallel_size=1,
                 context_parallel_size=1,
             )
             worker = MegatronWorkerGroup.remote(
