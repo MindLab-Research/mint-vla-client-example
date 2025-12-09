@@ -1,5 +1,5 @@
 # Ray Master (Head Node) - CPU only, persistent
-# Submit with: volc ml_task submit -c ray_master.yaml
+# Submit with: volc ml_task submit -c configs/ray_master.yaml
 
 TaskName: "ray-master"
 Description: "Ray head node - CPU only, long-running"

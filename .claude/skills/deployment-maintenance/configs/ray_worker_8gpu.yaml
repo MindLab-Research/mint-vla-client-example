@@ -1,6 +1,6 @@
 # Ray GPU Worker - 8x GPU, ephemeral
 # Joins existing Ray master cluster
-# Submit with: volc ml_task submit -c ray_worker_8gpu.yaml
+# Submit with: volc ml_task submit -c configs/ray_worker_8gpu.yaml
 
 TaskName: "ray-worker-8gpu"
 Description: "Ray GPU worker - 8x A100, joins master cluster"

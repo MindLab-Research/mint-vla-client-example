@@ -1,6 +1,6 @@
 # Ray Cluster - Single 8-GPU node (combined head + worker)
 # Use this for simpler deployments where head and workers are on same node
-# Submit with: volc ml_task submit -c ray_cluster_8gpu.yaml
+# Submit with: volc ml_task submit -c configs/ray_cluster_8gpu.yaml
 
 TaskName: "ray-cluster-8gpu"
 Description: "Ray cluster with 8 GPUs for dynamic workload allocation"
