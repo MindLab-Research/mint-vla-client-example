@@ -559,12 +559,16 @@ class MegatronTrainingWorker:
         }
 
     def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
-        """Extract LoRA adapter weights.
+        """Extract LoRA adapter weights in PEFT format.
 
         Uses bridge.export_weights() and filters for LoRA parameters.
+        Converts mbridge HuggingFace names to PEFT format for vLLM compatibility.
+
+        mbridge format: layers.0.self_attn.q_proj.lora_A.weight
+        PEFT format:    base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
 
         Returns:
-            Dict mapping LoRA parameter names to CPU tensors.
+            Dict mapping LoRA parameter names (PEFT format) to CPU tensors.
         """
         if self.bridge is None:
             raise RuntimeError("Bridge not initialized - cannot export weights")
@@ -572,14 +576,19 @@ class MegatronTrainingWorker:
         # Export all weights via bridge
         full_state_dict = dict(self.bridge.export_weights(self.engine.module))
 
-        # Filter for LoRA parameters
+        # Filter for LoRA parameters and convert to PEFT format
         lora_state_dict = {}
         for name, tensor in full_state_dict.items():
             if "lora" in name.lower():
+                # Convert mbridge HuggingFace format to PEFT format
+                peft_name = f"base_model.model.model.{name}"
                 # Move to CPU for Ray serialization
-                lora_state_dict[name] = tensor.cpu() if tensor.is_cuda else tensor
+                lora_state_dict[peft_name] = tensor.cpu() if tensor.is_cuda else tensor
 
-        logger.info(f"[MegatronTrainingWorker] Extracted {len(lora_state_dict)} LoRA parameters")
+        logger.info(f"[MegatronTrainingWorker] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
+        if lora_state_dict:
+            sample_keys = list(lora_state_dict.keys())[:3]
+            logger.debug(f"[MegatronTrainingWorker] Sample LoRA keys: {sample_keys}")
 
         return lora_state_dict
 

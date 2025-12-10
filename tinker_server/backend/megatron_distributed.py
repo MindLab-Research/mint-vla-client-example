@@ -373,15 +373,68 @@ class MegatronRankWorker:
         return {}
 
     def get_lora_state_dict(self) -> dict:
-        """Get LoRA state dict (rank 0 gathers from all ranks)."""
-        # Get local shard
-        local_state = self.engine.get_lora_state_dict()
+        """Get LoRA state dict in PEFT format (rank 0 gathers from all ranks).
 
-        # Gather to rank 0
+        Converts mbridge HuggingFace names to PEFT format for vLLM compatibility:
+        mbridge: layers.0.self_attn.q_proj.lora_A.weight
+        PEFT:    base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+        """
+        import torch.nn as nn
+        logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
+        logger.info(f"[Rank {self.rank}] engine.module type: {type(self.engine.module)}")
+        
+        if isinstance(self.engine.module, (list, tuple)):
+            logger.info(f"[Rank {self.rank}] engine.module is list/tuple with {len(self.engine.module)} items")
+            for i, item in enumerate(self.engine.module):
+                logger.info(f"[Rank {self.rank}] engine.module[{i}] type: {type(item)}")
+                if isinstance(item, (list, tuple)):
+                    logger.info(f"[Rank {self.rank}] engine.module[{i}] is list/tuple with {len(item)} items")
+                    for j, subitem in enumerate(item):
+                        logger.info(f"[Rank {self.rank}] engine.module[{i}][{j}] type: {type(subitem)}")
+
+        # self.engine.module is a list (possibly nested for pipeline parallelism)
+        # Flatten to get all modules, then iterate parameters
+        def flatten_modules(modules):
+            """Recursively flatten nested list of modules."""
+            result = []
+            for item in modules:
+                if isinstance(item, (list, tuple)):
+                    result.extend(flatten_modules(item))
+                elif isinstance(item, nn.Module):
+                    result.append(item)
+                else:
+                    logger.warning(f"[Rank {self.rank}] Unexpected item type in modules: {type(item)}")
+            return result
+
+        modules = self.engine.module
+        if not isinstance(modules, (list, tuple)):
+            modules = [modules]
+        flat_modules = flatten_modules(modules)
+        
+        logger.info(f"[Rank {self.rank}] Found {len(flat_modules)} module(s) to scan for LoRA params")
+
+        lora_state_dict = {}
+        for idx, module in enumerate(flat_modules):
+            logger.info(f"[Rank {self.rank}] Scanning module {idx}: {type(module)}")
+            for name, param in module.named_parameters():
+                if "lora" in name.lower():
+                    # Convert mbridge HuggingFace format to PEFT format
+                    if not name.startswith("base_model."):
+                        peft_name = f"base_model.model.model.{name}"
+                    else:
+                        peft_name = name
+                    # Move to CPU for Ray serialization
+                    lora_state_dict[peft_name] = param.data.cpu()
+
+        logger.info(f"[Rank {self.rank}] get_lora_state_dict: Found {len(lora_state_dict)} LoRA params")
+
+        # Only rank 0 should return the full state dict
         if self.rank == 0:
-            # For TP/PP, need to gather shards
-            # Simplified: assume LoRA weights are replicated or handle in engine
-            return local_state
+            logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
+            if lora_state_dict:
+                sample_keys = list(lora_state_dict.keys())[:3]
+                logger.info(f"[Rank 0] Sample LoRA keys: {sample_keys}")
+            return lora_state_dict
         return {}
 
     def shutdown(self):
@@ -556,7 +609,27 @@ class MegatronWorkerGroup:
 
     def get_lora_state_dict(self) -> dict:
         """Get LoRA state dict from rank 0."""
-        return ray.get(self.workers[0].get_lora_state_dict.remote())
+        logger.info("[MegatronWorkerGroup] get_lora_state_dict: ENTRY")
+        logger.info(f"[MegatronWorkerGroup] Calling workers[0].get_lora_state_dict.remote()...")
+        result = ray.get(self.workers[0].get_lora_state_dict.remote())
+        logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: returning {len(result)} params")
+        return result
+
+    def get_lora_config(self) -> dict:
+        """Get LoRA configuration as dictionary.
+        
+        Returns:
+            PEFT config dict compatible with vLLM's PEFTHelper.
+        """
+        return {
+            "r": self.lora_rank,
+            "lora_alpha": self.lora_rank * 2,
+            "lora_dropout": 0.0,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
+        }
 
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about the worker group."""

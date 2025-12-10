@@ -933,11 +933,16 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
+        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY")
+        logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
+
         # Fetch weights and config from remote worker via Ray object store
+        logger.info(f"[{model_id}] save_weights_for_sampler: calling get_lora_state_dict.remote()...")
         state_dict, config = await asyncio.gather(
             worker.get_lora_state_dict.remote(),
             worker.get_lora_config.remote(),
         )
+        logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
 
         # Save locally on API server
         save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)

@@ -101,7 +101,7 @@ ssh volcano "rm -rf /root/tinker_project/tinker-server && \
 
 ### Environment
 
-**Offline environment** - no internet access. Always set:
+**Offline environment** - workers have no internet. SSH server has proxy access.
 
 ```bash
 export HF_HUB_OFFLINE=1
@@ -109,6 +109,21 @@ export HF_HOME=/vePFS-Mindverse/share/huggingface
 export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache - avoids bytecode/source mismatch on PFS
 export TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
 ```
+
+### Proxy (SSH Server Only)
+
+SSH server has internet via proxy. Workers do NOT have internet.
+
+```bash
+# HTTP proxy
+export http_proxy=http://localhost:1081
+export https_proxy=http://localhost:1081
+
+# SOCKS5 proxy
+export ALL_PROXY=socks5://localhost:1080
+```
+
+Use for downloading packages, models, or accessing external APIs from SSH server.
 
 ### Start Server
 
@@ -198,25 +213,70 @@ volc ml_task logs -t <task_id> -i worker_0           # View logs (find IP here)
 
 | Operation | Time | Method |
 |-----------|------|--------|
-| First start | ~80s | Automatic on server start |
-| Restart (reuse) | ~2s | Restart server |
+| First start | ~80s | Automatic on first request |
+| Reconnect (existing) | ~2s | Server restart reconnects to detached actor |
 | Kill actor | - | `curl -X POST .../kill_vllm` |
 
-**Kill actor when:** Base model changed, OOM, need to free GPU memory, **or vLLM code changed**.
+**Kill actor + restart server when:** Base model changed, OOM, need to free GPU memory, or vLLM code changed. See Section 6 for SOP.
 
 ---
 
-## 5. Code Updates and Persistent Actors
+## 5. Package Upgrades via PFS
 
-Persistent Ray actors retain imported modules in memory. After changing implementation code, you **must kill the corresponding actor** to load fresh code.
+Workers cannot install packages (no internet, no pip). To upgrade packages without rebuilding images:
 
-| Changed Code | Actor to Kill | Command |
-|--------------|---------------|---------|
-| `megatron_*.py` | Megatron worker group | See below |
-| `verl_inference.py`, `vllm_*.py` | vLLM actor | `curl -X POST .../kill_vllm` |
+1. **Download on SSH server** (has proxy):
+   ```bash
+   ssh volcano 'export http_proxy=http://localhost:1081 https_proxy=http://localhost:1081 && \
+     pip download <package>==<version> --no-deps -d /tmp/wheels'
+   ```
 
-**Kill Megatron actor:**
+2. **Install to PFS target directory:**
+   ```bash
+   ssh volcano 'pip install --target=/vePFS-Mindverse/share/code/<package>-<version> \
+     /tmp/wheels/<package>-*.whl --no-deps'
+   ```
+
+3. **Set PYTHONPATH in Ray runtime_env:**
+   ```python
+   runtime_env = {
+       "env_vars": {
+           "PYTHONPATH": "/vePFS-Mindverse/share/code/<package>-<version>:$PYTHONPATH",
+       }
+   }
+   actor = SomeActor.options(runtime_env=runtime_env).remote()
+   ```
+
+### Current PFS Packages
+
+| Package | Version | Path | Used By |
+|---------|---------|------|---------|
+| vLLM | 0.12.0 | `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM inference actors |
+
+### Verification
+
+Test that workers load the correct version:
 ```bash
+ssh volcano 'cd /vePFS-Mindverse/share/code/tinker-server && python3 scripts/test_vllm_version.py'
+```
+
+---
+
+## 6. Code Updates (SOP)
+
+**Both actor kill AND server restart are required** after code changes. Ray actors and the API server can retain stale bytecode cache even after code syncs to PFS.
+
+| Changed Code | Required Actions |
+|--------------|------------------|
+| `megatron_*.py`, `megatron_distributed.py` | Kill Megatron actor + restart server |
+| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | Kill vLLM actor + restart server |
+| Route handlers, middleware, other server code | Restart server only |
+
+### Standard Procedure
+
+**After Megatron code changes:**
+```bash
+# 1. Kill Megatron actor
 ssh volcano 'HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface python3 -c "
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -227,11 +287,36 @@ try:
 except ValueError:
     print(\"Megatron actor not found\")
 "'
+
+# 2. Restart API server
+ssh volcano 'pkill -f "run_server" 2>/dev/null; pkill -f "uvicorn" 2>/dev/null'
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
+  "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 ```
 
-**Full cleanup script** (kills both actors and server):
+**After vLLM code changes:**
 ```bash
+# 1. Kill vLLM actor
+curl -X POST http://localhost:8000/api/v1/kill_vllm
+
+# 2. Restart API server
 ssh volcano 'pkill -f "run_server" 2>/dev/null; pkill -f "uvicorn" 2>/dev/null'
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
+  "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+```
+
+**Full cleanup** (kills both actors and restarts server):
+```bash
+# Kill server
+ssh volcano 'pkill -f "run_server" 2>/dev/null; pkill -f "uvicorn" 2>/dev/null'
+
+# Kill both actors
 ssh volcano 'HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface python3 -c "
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -243,13 +328,14 @@ for name in [\"persistent_megatron_worker_group\", \"persistent_vllm_actor\"]:
     except ValueError:
         print(f\"{name} not found\")
 "'
-```
 
-**Workflow after code change:**
-1. Sync code (Unison handles automatically)
-2. Kill relevant persistent actor(s)
-3. Restart API server
-4. Actor will be recreated with fresh code on next request
+# Restart server
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
+  "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+```
 
 ---
 

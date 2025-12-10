@@ -1,5 +1,14 @@
 # Volcano ML Platform Reference
 
+## Network Access
+
+| Component | Internet | Proxy |
+|-----------|----------|-------|
+| SSH server | Via proxy | `localhost:1081` (HTTP), `localhost:1080` (SOCKS5) |
+| Ray workers | None | N/A |
+
+Workers must use packages pre-installed in image or via PFS PYTHONPATH.
+
 ## Instance Flavors
 
 | Flavor | GPUs | Memory | Use Case |
@@ -19,6 +28,16 @@ Storages:
       SubPath: "share"
       ReadOnly: false
 ```
+
+## PFS Directory Structure
+
+| Path | Purpose |
+|------|---------|
+| `/vePFS-Mindverse/share/code/tinker-server/` | Application code (synced via Unison) |
+| `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM package (for PYTHONPATH override) |
+| `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
+| `/vePFS-Mindverse/share/models/` | Model checkpoints |
+| `/vePFS-Mindverse/share/dataset/` | Training datasets |
 
 ## Common YAML Parameters
 

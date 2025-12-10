@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# vLLM 0.12.0 on PFS - supports MoE expert LoRA via FusedMoEWithLoRA
+VLLM_PFS_PATH = "/vePFS-Mindverse/share/code/vllm-0.12.0"
+
 # Apply verl's hijack for TensorLoRARequest support
 # Must be done before engine initialization
 def _apply_vllm_hijack():
@@ -863,8 +866,16 @@ class VerlInferenceEngine:
 
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
+        # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
         self.server = ExtendedVLLMHttpServer.options(
-            num_gpus=total_gpus
+            num_gpus=total_gpus,
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": VLLM_PFS_PATH,
+                    "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                    "HF_HUB_OFFLINE": "1",
+                }
+            },
         ).remote(
             config=rollout_config,
             model_config=model_config,

@@ -31,6 +31,9 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = "tinker"
 
+# vLLM 0.12.0 on PFS - supports MoE expert LoRA via FusedMoEWithLoRA
+VLLM_PFS_PATH = "/vePFS-Mindverse/share/code/vllm-0.12.0"
+
 
 @dataclass
 class LoRASlotInfo:
@@ -304,10 +307,17 @@ class MultiLoRAInferenceEngine:
             # Create detached Ray actor with well-known name
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
+            # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=PERSISTENT_VLLM_ACTOR_NAME,
                 lifetime="detached",
+                runtime_env={
+                    "env_vars": {
+                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                        "HF_HUB_OFFLINE": "1",
+                    }
+                },
             ).remote(
                 config=rollout_config,
                 model_config=model_config,
