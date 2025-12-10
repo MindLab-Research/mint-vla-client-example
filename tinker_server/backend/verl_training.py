@@ -717,7 +717,7 @@ class VerlTrainingEngine:
             session: TrainingSession with configuration.
         """
         from .megatron_training import is_moe_model
-        from .megatron_distributed import MegatronWorkerGroup, DistributedConfig
+        from .megatron_distributed import get_or_create_megatron_worker_group, DistributedConfig
 
         model_id = session.model_id
 
@@ -745,18 +745,15 @@ class VerlTrainingEngine:
             base_model = requested_model
 
         if use_megatron:
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank})")
+            # MoE models (30B+) need tensor parallelism to fit in GPU memory
+            # 30B model with DDP: ~30 GiB weights + ~57 GiB gradient buffer per rank
+            # A800 GPU: 80 GiB -> need TP=4 (not TP=2) due to DDP overhead
+            distributed_config = DistributedConfig(tensor_parallel_size=4)
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size})")
 
-            # Create distributed Megatron worker group
-            # TP=2, PP=2 = 4 GPUs total for model parallelism
-            # EP=2 for expert parallelism (orthogonal to TP/PP)
-            distributed_config = DistributedConfig(
-                tensor_parallel_size=2,
-                pipeline_parallel_size=2,
-                expert_parallel_size=2,
-                context_parallel_size=1,
-            )
-            worker = MegatronWorkerGroup.remote(
+            # Get or create persistent Megatron worker group
+            # Uses detached Ray actor pattern like vLLM for crash resilience
+            worker = get_or_create_megatron_worker_group(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,
@@ -815,12 +812,6 @@ class VerlTrainingEngine:
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
-
-        # Debug: log first item's loss_fn_inputs keys
-        if data_items:
-            first_item = data_items[0]
-            lfi = first_item.get("loss_fn_inputs", {})
-            print(f"[DEBUG] First datum loss_fn_inputs keys: {list(lfi.keys())}", flush=True)
 
         # Remote call
         result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)

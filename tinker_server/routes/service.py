@@ -203,3 +203,38 @@ async def vllm_status() -> dict:
 
     alive = check_persistent_vllm_actor()
     return {"alive": alive, "actor_name": PERSISTENT_VLLM_ACTOR_NAME}
+
+
+@router.post("/kill_megatron")
+async def kill_megatron() -> dict:
+    """Kill the persistent Megatron training actor.
+
+    Use this to force a full restart of the Megatron worker group.
+    The next training request will create a new actor.
+
+    This is useful when:
+    - Workers are in a bad state after a crash
+    - You want to free GPU memory
+    - You need to reload code changes
+    """
+    from ..backend.megatron_distributed import kill_megatron_actor
+
+    killed = kill_megatron_actor()
+    return {"killed": killed, "message": "Megatron actor killed" if killed else "No Megatron actor found"}
+
+
+@router.get("/megatron_status")
+async def megatron_status() -> dict:
+    """Check if persistent Megatron actor exists.
+
+    Returns:
+        alive: True if actor exists and is alive
+        actor_name: The well-known actor name
+    """
+    from ..backend.megatron_distributed import (
+        PERSISTENT_MEGATRON_ACTOR_NAME,
+        is_megatron_actor_running,
+    )
+
+    alive = is_megatron_actor_running()
+    return {"alive": alive, "actor_name": PERSISTENT_MEGATRON_ACTOR_NAME}

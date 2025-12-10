@@ -50,12 +50,18 @@ def create_training_session(base_model: str, rank: int = 16) -> tuple[str, str]:
         "base_model": base_model,
         "lora_config": {"rank": rank},
     }
-    resp = requests.post(url, json=payload, timeout=60)
+    resp = requests.post(url, json=payload, timeout=900)
     resp.raise_for_status()
     future = resp.json()
     request_id = future.get("request_id")
 
     result = poll_future(request_id, timeout=600)
+
+    # Check for error response
+    if "error" in result:
+        print(f"[ERROR] Session creation failed: {result['error']}")
+        raise RuntimeError(f"Session creation failed: {result['error']}")
+
     model_id = result.get("model_id")
     backend = result.get("backend")
 

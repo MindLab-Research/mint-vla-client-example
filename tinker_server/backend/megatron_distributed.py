@@ -7,26 +7,40 @@ Based on patterns from verl/single_controller/ray/base.py and
 verl/workers/megatron_workers.py.
 """
 
+from __future__ import annotations  # Allow forward references in type hints
+
 import os
 import socket
 import logging
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tensordict import TensorDict
 
 import ray
-import torch
-from tensordict import TensorDict
+# NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
+# to ensure CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
+# (tensordict imports torch internally)
 
 logger = logging.getLogger(__name__)
+
+# Persistent actor configuration - matches vLLM pattern
+PERSISTENT_MEGATRON_ACTOR_NAME = "persistent_megatron_worker_group_v2"
+PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
 
 
 @dataclass
 class DistributedConfig:
-    """Configuration for distributed Megatron training."""
+    """Configuration for distributed Megatron training.
 
-    tensor_parallel_size: int = 2
-    pipeline_parallel_size: int = 2
-    expert_parallel_size: int = 2
+    Defaults configured for 1-GPU setup (GPU 0 has leaked memory).
+    For multi-GPU: tensor_parallel_size=2 (2-GPU) or TP=2,PP=2,EP=2 (8-GPU)
+    """
+
+    tensor_parallel_size: int = 1  # Single GPU - GPU 0 has corrupted memory
+    pipeline_parallel_size: int = 1
+    expert_parallel_size: int = 1
     context_parallel_size: int = 1
 
     @property
@@ -79,19 +93,56 @@ class MegatronRankWorker:
         learning_rate: float,
         distributed_config: DistributedConfig,
     ):
+        """Create worker but don't initialize distributed yet.
+        
+        Distributed init is deferred to initialize() to avoid deadlock.
+        All workers must be created first, then initialize() called on all
+        simultaneously so they can reach init_process_group barrier together.
+        """
         self.rank = rank
         self.world_size = world_size
+        self.master_addr = master_addr
+        self.master_port = master_port
         self.base_model = base_model
         self.lora_rank = lora_rank
         self.learning_rate = learning_rate
         self.config = distributed_config
+        self.engine = None  # Set in initialize()
+        
+        logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
+
+    def initialize(self):
+        """Initialize distributed backend and Megatron engine.
+        
+        Must be called on all workers simultaneously after all workers are created.
+        This ensures all workers reach init_process_group barrier together.
+        """
+        # Ray sets CUDA_VISIBLE_DEVICES before process starts when using num_gpus=1
+        # Import torch HERE (lazy) - CUDA_VISIBLE_DEVICES must be set before torch initializes CUDA
+        import torch
+
+        cuda_device = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        ray_gpu_ids = ray.get_gpu_ids()
+        device_count = torch.cuda.device_count()
+
+        logger.info(
+            f"[Rank {self.rank}] initialize() starting: CUDA_VISIBLE_DEVICES={cuda_device!r}, "
+            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}"
+        )
+
+        if device_count != 1:
+            raise RuntimeError(
+                f"MegatronRankWorker rank {self.rank} expected 1 GPU, but torch sees {device_count}. "
+                f"CUDA_VISIBLE_DEVICES={cuda_device}, ray_gpu_ids={ray_gpu_ids}. "
+                f"Check that Ray actor was created with num_gpus=1."
+            )
 
         # Set environment for torch.distributed
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = str(master_port)
-        os.environ["WORLD_SIZE"] = str(world_size)
-        os.environ["RANK"] = str(rank)
-        # LOCAL_RANK is always 0 because Ray sets CUDA_VISIBLE_DEVICES to a single GPU
+        os.environ["MASTER_ADDR"] = self.master_addr
+        os.environ["MASTER_PORT"] = str(self.master_port)
+        os.environ["WORLD_SIZE"] = str(self.world_size)
+        os.environ["RANK"] = str(self.rank)
+        # LOCAL_RANK is always 0 because CUDA_VISIBLE_DEVICES limits to single GPU
         os.environ["LOCAL_RANK"] = "0"
 
         # HuggingFace offline mode
@@ -102,20 +153,32 @@ class MegatronRankWorker:
         self._initialize_distributed()
         self._initialize_megatron()
 
-        logger.info(f"[MegatronRankWorker] Rank {rank}/{world_size} ready")
+        logger.info(f"[Rank {self.rank}] initialize() complete")
 
     def _initialize_distributed(self):
         """Initialize torch.distributed with NCCL backend."""
+        import torch
+
+        logger.info(f"[Rank {self.rank}] _initialize_distributed starting...")
+
         if torch.distributed.is_initialized():
+            logger.info(f"[Rank {self.rank}] torch.distributed already initialized")
             return
 
         # Set CUDA device before init
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
 
+        master_addr = os.environ["MASTER_ADDR"]
+        master_port = os.environ["MASTER_PORT"]
+        logger.info(
+            f"[Rank {self.rank}] Calling init_process_group: "
+            f"master={master_addr}:{master_port}, world_size={self.world_size}"
+        )
+
         torch.distributed.init_process_group(
             backend="nccl",
-            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+            init_method=f"tcp://{master_addr}:{master_port}",
             world_size=self.world_size,
             rank=self.rank,
         )
@@ -124,7 +187,7 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
-        from verl.workers.engine.megatron.transformer_impl import MegatronEngine
+        from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
@@ -191,7 +254,8 @@ class MegatronRankWorker:
         checkpoint_config = CheckpointConfig()
 
         # Create and initialize engine
-        self.engine = MegatronEngine(
+        # Use MegatronEngineWithLMHead which implements forward_step for LM training
+        self.engine = MegatronEngineWithLMHead(
             model_config=model_config,
             engine_config=engine_config,
             optimizer_config=optimizer_config,
@@ -199,7 +263,7 @@ class MegatronRankWorker:
         )
         self.engine.initialize()
 
-        logger.info(f"[Rank {self.rank}] MegatronEngine initialized")
+        logger.info(f"[Rank {self.rank}] MegatronEngineWithLMHead initialized")
 
     def forward_backward(
         self,
@@ -212,6 +276,7 @@ class MegatronRankWorker:
         Gradients are synchronized via NCCL allreduce.
         Returns metrics from rank 0 only.
         """
+        import torch
         from tinker_server.backend.megatron_training import (
             create_sft_loss_fn, create_ppo_loss_fn
         )
@@ -245,16 +310,45 @@ class MegatronRankWorker:
         if self.rank == 0:
             loss_value = 0.0
             num_tokens = 0
+            clip_frac_sum = 0.0
+            ratio_mean_sum = 0.0
+            n_ppo_results = 0
+
             if result and len(result) > 0:
                 for micro_result in result:
                     if isinstance(micro_result, dict):
-                        loss_value += micro_result.get("loss", 0.0)
-                        num_tokens += micro_result.get("num_tokens", 0)
+                        # Extract loss - may be tensor, convert to Python float
+                        loss = micro_result.get("loss", 0.0)
+                        if hasattr(loss, "item"):
+                            loss = loss.item()
+                        loss_value += float(loss)
 
+                        # Extract num_tokens - may be tensor
+                        tokens = micro_result.get("num_tokens", 0)
+                        if hasattr(tokens, "item"):
+                            tokens = tokens.item()
+                        num_tokens += int(tokens)
+
+                        # Extract PPO metrics if present
+                        if "clip_frac" in micro_result:
+                            cf = micro_result["clip_frac"]
+                            if hasattr(cf, "item"):
+                                cf = cf.item()
+                            clip_frac_sum += float(cf)
+                            n_ppo_results += 1
+                        if "ratio_mean" in micro_result:
+                            rm = micro_result["ratio_mean"]
+                            if hasattr(rm, "item"):
+                                rm = rm.item()
+                            ratio_mean_sum += float(rm)
+
+            # Return CPU-safe scalars only (no CUDA tensors)
             return {
-                "loss_value": loss_value,
-                "num_tokens": num_tokens,
-                "result": result,
+                "loss_value": float(loss_value),
+                "num_tokens": int(num_tokens),
+                "clip_frac_sum": float(clip_frac_sum),
+                "ratio_mean_sum": float(ratio_mean_sum),
+                "n_ppo_results": int(n_ppo_results),
             }
         return {}
 
@@ -313,7 +407,7 @@ class MegatronWorkerGroup:
         self._initialize()
 
     def _initialize(self):
-        """Create placement group and spawn workers."""
+        """Create placement group, spawn workers, then initialize them all together."""
         world_size = self.config.world_size
 
         # Create placement group with N GPU bundles
@@ -326,14 +420,14 @@ class MegatronWorkerGroup:
 
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
 
-        # Runtime env for all Ray tasks - ensures workers can import tinker_server
+        # Runtime env for workers
         runtime_env = {
             "env_vars": {
-                "PYTHONPATH": "/vePFS-Mindverse/share/code/tinker-server",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
-            }
+                "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
+            },
         }
 
         # Get master address from first bundle's node
@@ -349,9 +443,12 @@ class MegatronWorkerGroup:
 
         logger.info(f"[MegatronWorkerGroup] Master: {master_addr}:{master_port}")
 
-        # Spawn workers (reuse same runtime_env)
+        # Spawn workers - __init__ is lightweight, no distributed init yet
         for rank in range(world_size):
+            logger.info(f"[MegatronWorkerGroup] Spawning rank {rank}")
             worker = MegatronRankWorker.options(
+                num_gpus=1,  # Ray sets CUDA_VISIBLE_DEVICES before process starts
+                num_cpus=1,
                 scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
                     placement_group=self.placement_group,
                     placement_group_bundle_index=rank,
@@ -369,10 +466,16 @@ class MegatronWorkerGroup:
             )
             self.workers.append(worker)
 
-        # Wait for all workers to initialize
+        # Wait for all worker actors to be created (lightweight __init__ only)
         ray.get([w.__ray_ready__.remote() for w in self.workers])
+        logger.info(f"[MegatronWorkerGroup] All {world_size} worker actors created")
 
-        logger.info(f"[MegatronWorkerGroup] All {world_size} workers ready")
+        # Now initialize all workers simultaneously - they will reach
+        # init_process_group barrier together, avoiding deadlock
+        logger.info(f"[MegatronWorkerGroup] Calling initialize() on all workers...")
+        ray.get([w.initialize.remote() for w in self.workers])
+
+        logger.info(f"[MegatronWorkerGroup] All {world_size} workers initialized and ready")
 
     def forward_backward(
         self,
@@ -415,14 +518,13 @@ class MegatronWorkerGroup:
             "num_tokens:sum": float(num_tokens),
         }
 
-        # Add PPO metrics if present
-        result_list = rank0_result.get("result", [])
-        if loss_fn == "ppo" and result_list:
-            clip_frac = sum(r.get("clip_frac", 0) for r in result_list if isinstance(r, dict))
-            ratio_mean = sum(r.get("ratio_mean", 1) for r in result_list if isinstance(r, dict))
-            n = len([r for r in result_list if isinstance(r, dict)]) or 1
-            metrics["clipfrac:mean"] = float(clip_frac / n)
-            metrics["ratio:mean"] = float(ratio_mean / n)
+        # Add PPO metrics if present (now pre-extracted as scalars)
+        n_ppo = rank0_result.get("n_ppo_results", 0)
+        if loss_fn == "ppo" and n_ppo > 0:
+            clip_frac_sum = rank0_result.get("clip_frac_sum", 0.0)
+            ratio_mean_sum = rank0_result.get("ratio_mean_sum", 0.0)
+            metrics["clipfrac:mean"] = float(clip_frac_sum / n_ppo)
+            metrics["ratio:mean"] = float(ratio_mean_sum / n_ppo)
 
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
@@ -444,6 +546,18 @@ class MegatronWorkerGroup:
         """Get LoRA state dict from rank 0."""
         return ray.get(self.workers[0].get_lora_state_dict.remote())
 
+    def get_diagnostics(self) -> dict:
+        """Return diagnostic info about the worker group."""
+        return {
+            "world_size": self.config.world_size,
+            "tensor_parallel_size": self.config.tensor_parallel_size,
+            "pipeline_parallel_size": self.config.pipeline_parallel_size,
+            "expert_parallel_size": self.config.expert_parallel_size,
+            "num_workers": len(self.workers),
+            "base_model": self.base_model,
+            "lora_rank": self.lora_rank,
+        }
+
     def shutdown(self):
         """Shutdown all workers and release placement group."""
         for w in self.workers:
@@ -457,3 +571,113 @@ class MegatronWorkerGroup:
 
         self.workers = []
         self.placement_group = None
+
+
+def get_or_create_megatron_worker_group(
+    base_model: str,
+    lora_rank: int,
+    learning_rate: float,
+    distributed_config: DistributedConfig | None = None,
+) -> ray.actor.ActorHandle:
+    """Get existing or create new persistent MegatronWorkerGroup.
+
+    Uses detached Ray actor pattern like vLLM for crash resilience.
+    First tries to connect to existing actor, creates new one if not found.
+
+    Args:
+        base_model: HuggingFace model path.
+        lora_rank: LoRA rank.
+        learning_rate: Initial learning rate.
+        distributed_config: Parallelism config. Defaults to single-GPU.
+
+    Returns:
+        Ray actor handle to MegatronWorkerGroup.
+    """
+    config = distributed_config or DistributedConfig()
+
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    # Try to get existing persistent actor
+    try:
+        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        logger.info(
+            f"Connected to existing Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
+        )
+        return actor
+    except ValueError:
+        # Actor doesn't exist, create new one
+        logger.info(
+            f"Creating new detached Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
+        )
+
+    # Runtime env for PFS code access
+    runtime_env = {
+        "env_vars": {
+            "PYTHONPATH": "/vePFS-Mindverse/share/code/tinker-server",
+            "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
+        }
+    }
+
+    # Create detached Ray actor with well-known name
+    # lifetime="detached" ensures actor survives owner process termination
+    actor = MegatronWorkerGroup.options(
+        name=PERSISTENT_MEGATRON_ACTOR_NAME,
+        namespace=PERSISTENT_NAMESPACE,
+        lifetime="detached",
+        runtime_env=runtime_env,
+    ).remote(
+        base_model=base_model,
+        lora_rank=lora_rank,
+        learning_rate=learning_rate,
+        distributed_config=config,
+    )
+
+    # Wait for initialization
+    ray.get(actor.__ray_ready__.remote())
+    logger.info("Megatron worker group initialized (detached actor)")
+
+    return actor
+
+
+def kill_megatron_actor() -> bool:
+    """Kill persistent Megatron actor and release resources.
+
+    Returns:
+        True if actor was killed, False if not found.
+    """
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    try:
+        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        # Graceful shutdown first
+        try:
+            ray.get(actor.shutdown.remote(), timeout=10)
+        except Exception:
+            pass
+        ray.kill(actor, no_restart=True)
+        logger.info(f"Killed Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}")
+        return True
+    except ValueError:
+        logger.info("No Megatron actor to kill")
+        return False
+
+
+def is_megatron_actor_running() -> bool:
+    """Check if persistent Megatron actor is running.
+
+    Returns:
+        True if actor exists and is accessible.
+    """
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    try:
+        ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        return True
+    except ValueError:
+        return False

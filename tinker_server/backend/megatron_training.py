@@ -20,6 +20,7 @@ import torch
 import torch.distributed
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData
 
 if TYPE_CHECKING:
     pass
@@ -52,7 +53,10 @@ class MegatronTrainingConfig:
     seed: int = 42
 
 
-def tinker_to_tensordict(data_items: list[dict]) -> TensorDict:
+def tinker_to_tensordict(
+    data_items: list[dict],
+    max_token_len_per_gpu: int = 8192,
+) -> TensorDict:
     """Convert Tinker Datum format to verl TensorDict.
 
     Tinker format:
@@ -71,9 +75,19 @@ def tinker_to_tensordict(data_items: list[dict]) -> TensorDict:
             "input_ids": tensor [batch, seq_len],
             "attention_mask": tensor [batch, seq_len],
             "loss_mask": tensor [batch, seq_len],
+            "position_ids": tensor [batch, seq_len],  # 0 to seq_len-1
+            "temperature": tensor [batch, 1],         # logits scaling (1.0 = no scaling)
             "old_log_probs": tensor [batch, seq_len],  # for RL
             "advantages": tensor [batch, seq_len],     # for RL
+            # Non-tensor metadata for verl's prepare_micro_batches:
+            "use_dynamic_bsz": NonTensorData(True),
+            "max_token_len_per_gpu": NonTensorData(int),
         })
+
+    Args:
+        data_items: List of Tinker Datum dicts.
+        max_token_len_per_gpu: Max tokens per GPU for dynamic batch sizing.
+            Used by verl's prepare_micro_batches when use_dynamic_bsz=True.
     """
     input_ids_list = []
     attention_mask_list = []
@@ -119,93 +133,98 @@ def tinker_to_tensordict(data_items: list[dict]) -> TensorDict:
 
     batch_size = len(input_ids_list)
 
-    # Pad sequences to max_len
-    def pad_sequence(seq_list: list[list], pad_value: float = 0.0) -> torch.Tensor:
-        padded = []
-        for seq in seq_list:
-            if len(seq) < max_len:
-                seq = seq + [pad_value] * (max_len - len(seq))
-            padded.append(seq[:max_len])
-        return torch.tensor(padded)
+    # verl expects nested/jagged tensors for variable-length sequences
+    # Convert each sample to a tensor, then create nested tensors
+    input_ids_tensors = [torch.tensor(seq, dtype=torch.long) for seq in input_ids_list]
+    loss_mask_tensors = [torch.tensor(seq, dtype=torch.bool) for seq in loss_mask_list]
+    position_ids_tensors = [torch.arange(len(seq), dtype=torch.long) for seq in input_ids_list]
 
-    input_ids = pad_sequence(input_ids_list, pad_value=0).long()
-    attention_mask = (input_ids != 0).long()  # Simple attention mask
-    loss_mask = pad_sequence(loss_mask_list, pad_value=0.0).float()
+    # Create nested tensors with jagged layout
+    input_ids = torch.nested.as_nested_tensor(input_ids_tensors, layout=torch.jagged)
+    loss_mask = torch.nested.as_nested_tensor(loss_mask_tensors, layout=torch.jagged)
+    position_ids = torch.nested.as_nested_tensor(position_ids_tensors, layout=torch.jagged)
 
     td = TensorDict({
         "input_ids": input_ids,
-        "attention_mask": attention_mask,
         "loss_mask": loss_mask,
+        "position_ids": position_ids,
     }, batch_size=[batch_size])
 
-    # Add RL inputs if present
+    # Temperature for logits scaling (1.0 = no scaling during training)
+    # verl's forward_step does logits.div_(batch["temperature"])
+    # Must be a scalar float to broadcast correctly with logits shape [?, ?, vocab_size]
+    # Using set_non_tensor with float prevents batching/slicing by prepare_micro_batches
+    td.set_non_tensor("temperature", 1.0)
+
+    # Add RL inputs if present (also as nested tensors)
     if has_rl_inputs and old_log_probs_list:
-        td["old_log_probs"] = pad_sequence(old_log_probs_list, pad_value=0.0).float()
+        old_log_probs_tensors = [torch.tensor(seq, dtype=torch.float) for seq in old_log_probs_list]
+        td["old_log_probs"] = torch.nested.as_nested_tensor(old_log_probs_tensors, layout=torch.jagged)
     if advantages_list:
-        td["advantages"] = pad_sequence(advantages_list, pad_value=0.0).float()
+        advantages_tensors = [torch.tensor(seq, dtype=torch.float) for seq in advantages_list]
+        td["advantages"] = torch.nested.as_nested_tensor(advantages_tensors, layout=torch.jagged)
+
+    # Add non-tensor metadata for verl's prepare_micro_batches
+    # These control how verl splits the batch into micro-batches
+    td["use_dynamic_bsz"] = NonTensorData(True)
+    td["max_token_len_per_gpu"] = NonTensorData(max_token_len_per_gpu)
+
+    # Add fields required by verl's sft_loss
+    # Compute total tokens in batch for loss normalization
+    # Use set_non_tensor to avoid batch dimension validation (these are scalar values)
+    total_tokens = sum(len(seq) for seq in input_ids_list)
+    td.set_non_tensor("dp_size", 1)  # Single data parallel group
+    td.set_non_tensor("batch_num_tokens", total_tokens)
 
     return td
 
 
 def create_sft_loss_fn() -> Callable:
-    """Create cross-entropy loss function for SFT.
+    """Create SFT loss function using verl's built-in implementation.
 
-    verl expects loss functions that take (logits, data) and return loss dict.
+    verl's postprocess_micro_batch_func calls:
+        loss, metrics = loss_function(model_output=..., data=..., dp_group=...)
+
+    verl's sft_loss expects:
+        - model_output["log_probs"]: log probabilities from model forward
+        - data["loss_mask"]: NestedTensor with mask for loss computation
+        - data["dp_size"]: data parallel size
+        - data["batch_num_tokens"]: total tokens for normalization
+
+    Returns partial of verl.workers.roles.utils.losses.sft_loss with config=None.
     """
-    def sft_loss_fn(logits: torch.Tensor, data: TensorDict) -> dict:
-        """Cross-entropy loss with loss_mask weighting.
+    from functools import partial
+    from verl.workers.roles.utils.losses import sft_loss
 
-        Args:
-            logits: [batch, seq_len, vocab_size]
-            data: TensorDict with input_ids, loss_mask
-        """
-        # Shift for language modeling: predict next token
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = data["input_ids"][..., 1:].contiguous()
-        shift_mask = data["loss_mask"][..., 1:].contiguous()
-
-        # Flatten
-        vocab_size = shift_logits.size(-1)
-        shift_logits = shift_logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-        shift_mask = shift_mask.view(-1)
-
-        # Cross-entropy per token
-        ce_loss = torch.nn.functional.cross_entropy(
-            shift_logits, shift_labels, reduction="none"
-        )
-
-        # Weighted average
-        masked_loss = ce_loss * shift_mask
-        num_tokens = shift_mask.sum()
-
-        if num_tokens > 0:
-            loss = masked_loss.sum() / num_tokens
-        else:
-            loss = masked_loss.sum()
-
-        return {"loss": loss, "num_tokens": num_tokens}
-
-    return sft_loss_fn
+    return partial(sft_loss, config=None)
 
 
 def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
     """Create PPO loss function.
 
+    verl's postprocess_micro_batch_func calls:
+        loss, metrics = loss_function(model_output=..., data=..., dp_group=...)
+
     Args:
         epsilon: Clipping parameter for PPO.
     """
-    def ppo_loss_fn(logits: torch.Tensor, data: TensorDict) -> dict:
+    def ppo_loss_fn(model_output: torch.Tensor, data: TensorDict, dp_group=None) -> tuple:
         """PPO clipped objective loss.
 
         Args:
-            logits: [batch, seq_len, vocab_size]
+            model_output: logits tensor from model forward pass
             data: TensorDict with input_ids, loss_mask, old_log_probs, advantages
+            dp_group: data parallel group (may be used for normalization)
+
+        Returns:
+            Tuple of (loss_tensor, metrics_dict)
         """
+        logits = model_output
+
         # Shift for language modeling
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = data["input_ids"][..., 1:].contiguous()
-        shift_mask = data["loss_mask"][..., 1:].contiguous()
+        shift_mask = data["loss_mask"][..., 1:].contiguous().float()
         old_log_probs = data["old_log_probs"][..., 1:].contiguous()
         advantages = data["advantages"][..., 1:].contiguous()
 
@@ -235,13 +254,15 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         # Clip fraction metric
         clipped = ((ratio < 1 - epsilon) | (ratio > 1 + epsilon)).float()
         clip_frac = (clipped * shift_mask).sum() / max(num_tokens, 1)
+        ratio_mean = (ratio * shift_mask).sum() / max(num_tokens, 1)
 
-        return {
-            "loss": loss,
-            "num_tokens": num_tokens,
-            "clip_frac": clip_frac,
-            "ratio_mean": (ratio * shift_mask).sum() / max(num_tokens, 1),
+        metrics = {
+            "loss": loss.item(),
+            "num_tokens": int(num_tokens.item()),
+            "clip_frac": clip_frac.item(),
+            "ratio_mean": ratio_mean.item(),
         }
+        return loss, metrics
 
     return ppo_loss_fn
 
@@ -308,7 +329,7 @@ class MegatronTrainingWorker:
         """
         # Import verl components
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
-        from verl.workers.engine.megatron.transformer_impl import MegatronEngine
+        from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from verl.utils.torch_dtypes import PrecisionType
@@ -381,7 +402,8 @@ class MegatronTrainingWorker:
         checkpoint_config = CheckpointConfig()
 
         # Create and initialize the engine
-        self.engine = MegatronEngine(
+        # Use MegatronEngineWithLMHead which implements forward_step for LM training
+        self.engine = MegatronEngineWithLMHead(
             model_config=model_config,
             engine_config=engine_config,
             optimizer_config=optimizer_config,
@@ -392,7 +414,7 @@ class MegatronTrainingWorker:
         # Store bridge reference for weight export
         self.bridge = self.engine.bridge
 
-        logger.info("[MegatronTrainingWorker] MegatronEngine initialized")
+        logger.info("[MegatronTrainingWorker] MegatronEngineWithLMHead initialized")
 
     def forward_backward(
         self,
