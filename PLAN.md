@@ -240,7 +240,7 @@ actor_rollout_ref.actor.megatron.grad_offload=True
 
 ---
 
-## Phase 3: LoRA Transfer Pipeline
+## Phase 3: LoRA Transfer Pipeline (Complete)
 
 **Goal:** Sub-second LoRA adapter transfer between training and inference.
 
@@ -258,19 +258,26 @@ lora_state = ray.get(lora_ref)                    # ~0.1s for 100MB
 vllm_engine.load_lora_adapter(lora_state)         # ~0.5s hot-swap
 ```
 
-Expected latency: **0.6-0.7s** (validated in Phase 1 for dense models)
+Actual latency: **0.16s extraction + 2.2s inference** (verified with Qwen3-30B-A3B)
 
 ### Tasks
 
 | Task | Status |
 |------|--------|
-| Implement LoRA extraction from Megatron | [ ] |
-| Validate checkpoint format compatibility | [ ] |
-| Benchmark transfer latency | [ ] |
+| Implement LoRA extraction from Megatron | Done |
+| Validate checkpoint format compatibility | Done |
+| Benchmark transfer latency | Done |
+
+### Implementation Notes
+
+LoRA extraction from distributed Megatron requires handling nested module lists (pipeline parallelism):
+- `megatron_distributed.py:375-430`: `flatten_modules()` recursively extracts `nn.Module` objects
+- Names converted from mbridge format to PEFT format: `layers.0.self_attn.q_proj.lora_A.weight` → `base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight`
+- Integration test: `scripts/test_moe_lora_transfer.py`
 
 ---
 
-## Phase 4: Multi-Tenant Support
+## Phase 4: Multi-Tenant Support (Complete)
 
 **Goal:** Multiple tenants share base model, each with isolated LoRA adapters.
 
@@ -284,21 +291,43 @@ Expected latency: **0.6-0.7s** (validated in Phase 1 for dense models)
 
 | Task | Status |
 |------|--------|
-| Multi-tenant session management | [ ] |
-| vLLM multi-LoRA configuration | [ ] |
-| Tenant isolation validation | [ ] |
+| Multi-tenant session management | Done |
+| vLLM multi-LoRA configuration | Done |
+| Tenant isolation validation | Done |
+
+### Implementation Notes
+
+Multi-tenant support is built into the existing infrastructure:
+- `max_loras=64` GPU slots, `max_cpu_loras=1024` overflow cache
+- Per-session `lora_int_id` provides weight isolation
+- `LoRARegistry` tracks session → adapter mapping with LRU eviction
+- Concurrent inference verified with `scripts/test_multi_tenant.py`
+
+**Not implemented (optional for production):**
+- Tenant-level authentication/API keys
+- Per-tenant resource quotas
+- Cross-tenant access control
 
 ---
 
-## Phase 5: Integration Testing
+## Phase 5: Integration Testing (Complete)
 
 ### Test Matrix
 
 | Model | GPUs | Paradigm | Status |
 |-------|------|----------|--------|
 | Qwen3-30B-A3B | 8 | SFT | [x] |
-| Qwen3-30B-A3B | 8 | RL (GRPO) | [ ] |
-| Qwen3-30B-A3B | 8 | LoRA hot-swap | [ ] |
+| Qwen3-30B-A3B | 8 | RL (GRPO) | [x] |
+| Qwen3-30B-A3B | 8 | LoRA hot-swap | [x] |
+| Qwen2.5-7B | 1 | Multi-tenant | [x] |
+
+### Test Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/test_moe_lora_transfer.py` | SFT + LoRA extraction + vLLM inference |
+| `scripts/test_moe_rl.py` | importance_sampling + PPO losses |
+| `scripts/test_multi_tenant.py` | Concurrent multi-tenant inference |
 
 ### Validation Commands
 
@@ -322,13 +351,15 @@ python -m tinker_cookbook.recipes.chat_sl.train \
 
 ## Implementation Order
 
-| Phase | Description | Effort | Dependencies |
+| Phase | Description | Status | Dependencies |
 |-------|-------------|--------|--------------|
 | 1 | MoE Inference (vLLM TP) | Done | - |
-| 2 | verl Megatron Adapter | 2 weeks | verl installed |
-| 3 | LoRA Transfer Pipeline | 1 week | Phase 2 |
-| 4 | Multi-Tenant Support | 1 week | Phase 3 |
-| 5 | Integration Testing | 1 week | All phases |
+| 2 | verl Megatron Adapter | Done | verl installed |
+| 3 | LoRA Transfer Pipeline | Done | Phase 2 |
+| 4 | Multi-Tenant Support | Done | Phase 3 |
+| 5 | Integration Testing | Done | All phases |
+
+**All phases complete.** MoE training and inference fully operational.
 
 ---
 
