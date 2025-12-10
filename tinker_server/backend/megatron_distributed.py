@@ -354,10 +354,22 @@ class MegatronRankWorker:
 
     def optim_step(self, learning_rate: float) -> dict:
         """Run optimizer step (synchronized across ranks)."""
-        self.engine.optim_step(learning_rate)
+        # Note: learning_rate not used directly - verl engine handles LR scheduling
+        grad_norm = self.engine.optimizer_step()
+        current_lr = self.engine.lr_scheduler_step()
 
         if self.rank == 0:
-            return {"step": "completed"}
+            # Handle current_lr being either a float or a list
+            if current_lr is not None:
+                lr_value = current_lr[0] if isinstance(current_lr, (list, tuple)) else current_lr
+            else:
+                lr_value = learning_rate
+            # Return CPU-safe scalars only
+            return {
+                "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
+                "lr": float(lr_value),
+                "step": "completed",
+            }
         return {}
 
     def get_lora_state_dict(self) -> dict:
@@ -549,6 +561,7 @@ class MegatronWorkerGroup:
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about the worker group."""
         return {
+            "code_version": "test-reload-v1",  # Trivial change to test code reload
             "world_size": self.config.world_size,
             "tensor_parallel_size": self.config.tensor_parallel_size,
             "pipeline_parallel_size": self.config.pipeline_parallel_size,
@@ -641,6 +654,37 @@ def get_or_create_megatron_worker_group(
     logger.info("Megatron worker group initialized (detached actor)")
 
     return actor
+
+
+async def async_get_or_create_megatron_worker_group(
+    base_model: str,
+    lora_rank: int,
+    learning_rate: float,
+    distributed_config: DistributedConfig | None = None,
+) -> ray.actor.ActorHandle:
+    """Async version of get_or_create_megatron_worker_group.
+
+    Wraps blocking Ray operations in asyncio.to_thread() to avoid blocking
+    the uvicorn event loop during FastAPI request handling.
+
+    Args:
+        base_model: HuggingFace model path.
+        lora_rank: LoRA rank.
+        learning_rate: Initial learning rate.
+        distributed_config: Parallelism config. Defaults to single-GPU.
+
+    Returns:
+        Ray actor handle to MegatronWorkerGroup.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(
+        get_or_create_megatron_worker_group,
+        base_model,
+        lora_rank,
+        learning_rate,
+        distributed_config,
+    )
 
 
 def kill_megatron_actor() -> bool:

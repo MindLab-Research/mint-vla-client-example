@@ -95,9 +95,9 @@ Architecture: Single-GPU Ray actors with PEFT LoRA.
 | Implement SFT + PPO loss functions | `megatron_training.py` | Done |
 | Implement LoRA extraction via bridge | `megatron_training.py` | Done |
 | Route MoE models to Megatron worker | `verl_training.py` | Done |
-| Test with Qwen3-30B-A3B | - | Routing validated* |
+| Test with Qwen3-30B-A3B | - | Done |
 
-*Routing validated: MoE model correctly routes to MegatronTrainingWorker (8 GPUs). Full training requires code deployment to worker nodes.
+*Full MoE training flow verified: create_model (213s) → forward_backward (8.5s) → optim_step (4.3s) with 8 GPUs (TP=4, EP=2).
 
 ### Implementation: VerlMegatronAdapter
 
@@ -296,7 +296,7 @@ Expected latency: **0.6-0.7s** (validated in Phase 1 for dense models)
 
 | Model | GPUs | Paradigm | Status |
 |-------|------|----------|--------|
-| Qwen3-30B-A3B | 8 | SFT | [ ] |
+| Qwen3-30B-A3B | 8 | SFT | [x] |
 | Qwen3-30B-A3B | 8 | RL (GRPO) | [ ] |
 | Qwen3-30B-A3B | 8 | LoRA hot-swap | [ ] |
 

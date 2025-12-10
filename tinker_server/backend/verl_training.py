@@ -717,7 +717,7 @@ class VerlTrainingEngine:
             session: TrainingSession with configuration.
         """
         from .megatron_training import is_moe_model
-        from .megatron_distributed import get_or_create_megatron_worker_group, DistributedConfig
+        from .megatron_distributed import async_get_or_create_megatron_worker_group, DistributedConfig
 
         model_id = session.model_id
 
@@ -745,15 +745,19 @@ class VerlTrainingEngine:
             base_model = requested_model
 
         if use_megatron:
-            # MoE models (30B+) need tensor parallelism to fit in GPU memory
-            # 30B model with DDP: ~30 GiB weights + ~57 GiB gradient buffer per rank
-            # A800 GPU: 80 GiB -> need TP=4 (not TP=2) due to DDP overhead
-            distributed_config = DistributedConfig(tensor_parallel_size=4)
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size})")
+            # MoE models (30B+) need tensor + expert parallelism to fit model+optimizer
+            # 30B MoE with TP=4: ~76 GiB/GPU for model+gradients, no room for optimizer
+            # TP=4, EP=2 = 8 GPUs: distributes optimizer state, ~38 GiB/GPU
+            distributed_config = DistributedConfig(
+                tensor_parallel_size=4,
+                expert_parallel_size=2,
+            )
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size}, EP={distributed_config.expert_parallel_size})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
-            worker = get_or_create_megatron_worker_group(
+            # Use async version to avoid blocking uvicorn event loop
+            worker = await async_get_or_create_megatron_worker_group(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,

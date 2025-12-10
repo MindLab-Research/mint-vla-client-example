@@ -73,10 +73,12 @@ volc ml_task logs -t <task_id> -i worker_0 | grep "Local node IP"
 
 ## 1. Code Synchronization
 
+**IMPORTANT:** Start the Unison daemon **before** any other deployment operations. Manual one-time syncs are error-prone and should be avoided.
+
 Unison provides **bidirectional sync** between local machine and PFS. Edit on either side - newer changes win. Both SSH server and Ray workers read from PFS.
 
 ```bash
-unison volcano-tinker -repeat watch   # Start daemon (runs continuously)
+unison volcano-tinker -repeat watch   # Start daemon (runs continuously) - DO THIS FIRST
 pgrep -af "unison.*volcano-tinker"    # Check if running
 pkill -f "unison.*volcano-tinker"     # Stop daemon
 ```
@@ -84,6 +86,8 @@ pkill -f "unison.*volcano-tinker"     # Stop daemon
 First-time setup: `cp configs/volcano-tinker.prf ~/.unison/`
 
 Syncs everything including `.git` - full repo state on both sides.
+
+**Why daemon mode?** The daemon watches for file changes and syncs automatically. Without it, code edits won't reach PFS until manually synced, causing stale code issues on Ray workers.
 
 **SSH server symlink setup** (one-time):
 ```bash
@@ -198,7 +202,54 @@ volc ml_task logs -t <task_id> -i worker_0           # View logs (find IP here)
 | Restart (reuse) | ~2s | Restart server |
 | Kill actor | - | `curl -X POST .../kill_vllm` |
 
-**Kill actor when:** Base model changed, OOM, need to free GPU memory.
+**Kill actor when:** Base model changed, OOM, need to free GPU memory, **or vLLM code changed**.
+
+---
+
+## 5. Code Updates and Persistent Actors
+
+Persistent Ray actors retain imported modules in memory. After changing implementation code, you **must kill the corresponding actor** to load fresh code.
+
+| Changed Code | Actor to Kill | Command |
+|--------------|---------------|---------|
+| `megatron_*.py` | Megatron worker group | See below |
+| `verl_inference.py`, `vllm_*.py` | vLLM actor | `curl -X POST .../kill_vllm` |
+
+**Kill Megatron actor:**
+```bash
+ssh volcano 'HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+try:
+    actor = ray.get_actor(\"persistent_megatron_worker_group\", namespace=\"tinker\")
+    ray.kill(actor)
+    print(\"Killed megatron actor\")
+except ValueError:
+    print(\"Megatron actor not found\")
+"'
+```
+
+**Full cleanup script** (kills both actors and server):
+```bash
+ssh volcano 'pkill -f "run_server" 2>/dev/null; pkill -f "uvicorn" 2>/dev/null'
+ssh volcano 'HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+for name in [\"persistent_megatron_worker_group\", \"persistent_vllm_actor\"]:
+    try:
+        actor = ray.get_actor(name, namespace=\"tinker\")
+        ray.kill(actor)
+        print(f\"Killed {name}\")
+    except ValueError:
+        print(f\"{name} not found\")
+"'
+```
+
+**Workflow after code change:**
+1. Sync code (Unison handles automatically)
+2. Kill relevant persistent actor(s)
+3. Restart API server
+4. Actor will be recreated with fresh code on next request
 
 ---
 

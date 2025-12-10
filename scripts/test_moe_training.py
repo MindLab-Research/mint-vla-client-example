@@ -38,7 +38,7 @@ def poll_future(request_id: str, timeout: int = 600) -> dict:
     raise TimeoutError(f"Operation did not complete within {timeout}s")
 
 
-def create_training_session(base_model: str, rank: int = 16) -> tuple[str, str]:
+def create_training_session(base_model: str, rank: int = 16, timeout: int = 900) -> tuple[str, str]:
     """Create training session, return (session_id, model_id)."""
     session_id = str(uuid.uuid4())
     model_seq_id = 1
@@ -55,7 +55,7 @@ def create_training_session(base_model: str, rank: int = 16) -> tuple[str, str]:
     future = resp.json()
     request_id = future.get("request_id")
 
-    result = poll_future(request_id, timeout=600)
+    result = poll_future(request_id, timeout=timeout)
 
     # Check for error response
     if "error" in result:
@@ -92,7 +92,9 @@ def optim_step(model_id: str, learning_rate: float = 1e-4) -> dict:
     url = f"{BASE_URL}/api/v1/optim_step"
     payload = {
         "model_id": model_id,
-        "learning_rate": learning_rate,
+        "adam_params": {
+            "learning_rate": learning_rate,
+        },
     }
     resp = requests.post(url, json=payload, timeout=60)
     resp.raise_for_status()
