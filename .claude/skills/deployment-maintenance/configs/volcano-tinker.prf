@@ -1,9 +1,12 @@
-# Unison profile for syncing tinker_project with volcano
-# Install to: ~/.unison/volcano-tinker.prf
-# Run with: unison volcano-tinker -repeat watch
+# Unison profile: bidirectional sync between local and PFS
+# Install: cp volcano-tinker.prf ~/.unison/
+# Usage: unison volcano-tinker -repeat watch
+#
+# PFS is single source of truth. Edit on either local machine or server.
+# Unison keeps both in sync, preferring newer changes.
 
-root = /home/yiwen/tinker_project
-root = ssh://volcano//root/tinker_project
+root = /home/yiwen/tinker_project/tinker-server
+root = ssh://volcano//vePFS-Mindverse/share/code/tinker-server
 
 # Sync options
 auto = true
@@ -11,16 +14,18 @@ batch = true
 prefer = newer
 times = true
 
-# Ignore common patterns
+# Ignore patterns (only temp/build artifacts)
 ignore = Name {*.pyc}
 ignore = Name {__pycache__}
-ignore = Name {.git}
 ignore = Name {*.swp}
 ignore = Name {*.swo}
 ignore = Name {.DS_Store}
 ignore = Name {node_modules}
 ignore = Name {.venv}
 ignore = Name {venv}
+ignore = Name {.mypy_cache}
+ignore = Name {.pytest_cache}
+ignore = Name {*.egg-info}
 
 # SSH options - use the compiled unison on remote
 servercmd = /usr/local/bin/unison

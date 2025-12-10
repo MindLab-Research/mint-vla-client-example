@@ -1,212 +1,240 @@
 ---
 name: deployment-maintenance
-description: "Triggers: deploy, integration test, test on server, run remotely, restart server, sync code, unison, vLLM status, kill vLLM, Ray cluster, Volcano. Use for deploying code to Volcano GPU server, running integration tests against remote server, managing Tinker inference server lifecycle, and troubleshooting distributed inference."
+description: |
+  Load this skill when deploying code to test server features on the Volcano GPU cluster.
+
+  The Tinker server runs on a remote Volcano ML platform with Ray-based distributed GPU workers.
+  Code syncs via Unison directly to PFS - single source of truth for both SSH server and Ray workers.
+
+  Triggers:
+  - Deploy/test: "deploy", "test on server", "run remotely", "integration test"
+  - Code sync: "sync code", "unison"
+  - API server: "start server", "stop server", "restart server", "server logs"
+  - vLLM: "vLLM status", "kill vLLM", "vLLM OOM"
+  - Ray cluster: "create cluster", "tear down cluster", "Ray dashboard"
+  - Volcano: "Volcano task", "GPU allocation", "list tasks", "cancel task"
 ---
 
-# Server Deployment and Cluster Maintenance
+# Deployment & Cluster Maintenance
 
-## When to Use This Skill
+## Architecture
 
-**Trigger this skill when:**
-- Running integration tests that require the remote server
-- Deploying code changes to Volcano for testing
-- User asks to "test on server", "deploy", "run remotely", or "integration test"
-- Restarting or debugging the Tinker server
-- Managing vLLM actor (kill, check status, OOM recovery)
-- Setting up or troubleshooting code sync
-
-## Skill Resources
-
-- [configs/](configs/) - Ray cluster YAML configs + Unison profile
-- [scripts/](scripts/) - Deployment and status scripts
-- [volcano-reference.md](volcano-reference.md) - Instance flavors, storage, CLI commands
-
-## Code Synchronization (Unison)
-
-**NEVER** manually sync code (no rsync, scp, git for syncing). Use Unison.
-
-### Start Sync (Background)
-
-```bash
-unison volcano-tinker -repeat watch
+```
+Local Machine                      Volcano ML Platform
+─────────────                      ───────────────────
+                 ┌──Unison───>  PFS: /vePFS-Mindverse/share/code/tinker-server
+Code edits <─────┤<──────────                  │
+                 │             ┌───────────────┴───────────────┐
+                 │             ▼                               ▼
+                 │      SSH Server (volcano)             Ray Workers
+                 │      symlink to PFS                   direct read
+                 │      API server (no GPU)              2-8 GPUs each
+                 └──────joins cluster: --num-gpus=0
 ```
 
-Runs continuously, syncing on file changes.
+**Key constraints:**
+- SSH server has NO GPUs. All GPU workloads run on Ray workers (Volcano tasks).
+- **PFS is single source of truth.** Edit on local machine OR server - Unison syncs bidirectionally (prefer newer).
 
-### One-Time Sync
+| Component | Location | GPUs | Code Source |
+|-----------|----------|------|-------------|
+| API server | SSH server | 0 | PFS (via symlink) |
+| Ray head | Volcano task | 0 | - |
+| Ray workers | Volcano tasks | 2-8 each | PFS (direct) |
 
-```bash
-unison volcano-tinker
-```
+---
 
-### Check Sync Status
+## Quick Reference
 
-```bash
-pgrep -af "unison.*volcano-tinker"
-```
-
-### Stop Sync
-
-```bash
-pkill -f "unison.*volcano-tinker"
-```
-
-### Setup (First Time)
-
-Copy profile to `~/.unison/`:
-
-```bash
-cp configs/volcano-tinker.prf ~/.unison/
-```
-
-Profile syncs `/home/yiwen/tinker_project` <-> `volcano:/root/tinker_project`.
-
-Ignores: `*.pyc`, `__pycache__`, `.git`, `.venv`, `node_modules`.
-
-## Offline Environment
-
-**The server and Ray workers have NO internet access.** Always set:
-
-```bash
-export HF_HUB_OFFLINE=1
-export HF_HOME=/vePFS-Mindverse/share/huggingface
-```
-
-These must be set on both the API server and all Ray workers. Models must be pre-downloaded to `HF_HOME`.
-
-## Server Management
-
-### Environment Variables
-
-```bash
-HF_HUB_OFFLINE=1                    # Required: no internet access
-HF_HOME=/vePFS-Mindverse/share/huggingface  # Required: shared model cache
-TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
-TINKER_CHECKPOINT_DIR=<path>        # LoRA checkpoints (shared filesystem required)
-```
-
-### SSH Tunnel Setup
+**Before running client tests:** Establish SSH tunnel first.
 
 ```bash
 ssh -f -N -L 8000:localhost:8000 volcano
 ```
 
+| Task | Command |
+|------|---------|
+| Start sync daemon | `unison volcano-tinker -repeat watch` |
+| Health check | `curl http://localhost:8000/api/v1/healthz` |
+| Server logs | `ssh volcano "tail -50 /tmp/tinker_server.log"` |
+| Stop server | `ssh volcano 'pkill -f "python scripts/run_server.py"'` |
+| vLLM status | `curl http://localhost:8000/api/v1/vllm_status` |
+| Kill vLLM | `curl -X POST http://localhost:8000/api/v1/kill_vllm` |
+| List tasks | `volc ml_task list --output json` |
+| Cancel task | `volc ml_task cancel --id <task_id> --output json` |
+| Ray dashboard | `http://<RAY_HEAD_IP>:8265` |
+
+**Finding RAY_HEAD_IP:** Check task logs for "Local node IP: 192.x.x.x":
+```bash
+volc ml_task logs -t <task_id> -i worker_0 | grep "Local node IP"
+```
+
+---
+
+## 1. Code Synchronization
+
+Unison provides **bidirectional sync** between local machine and PFS. Edit on either side - newer changes win. Both SSH server and Ray workers read from PFS.
+
+```bash
+unison volcano-tinker -repeat watch   # Start daemon (runs continuously)
+pgrep -af "unison.*volcano-tinker"    # Check if running
+pkill -f "unison.*volcano-tinker"     # Stop daemon
+```
+
+First-time setup: `cp configs/volcano-tinker.prf ~/.unison/`
+
+Syncs everything including `.git` - full repo state on both sides.
+
+**SSH server symlink setup** (one-time):
+```bash
+ssh volcano "rm -rf /root/tinker_project/tinker-server && \
+  ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server"
+```
+
+---
+
+## 2. API Server
+
+### Environment
+
+**Offline environment** - no internet access. Always set:
+
+```bash
+export HF_HUB_OFFLINE=1
+export HF_HOME=/vePFS-Mindverse/share/huggingface
+export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache - avoids bytecode/source mismatch on PFS
+export TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+```
+
 ### Start Server
 
 ```bash
-ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
+  "HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 ```
 
-### Stop Server
-
-```bash
-ssh volcano 'pkill -f "python scripts/run_server.py"'
-```
-
-### Health Check
-
-```bash
-curl -s http://localhost:8000/api/v1/healthz  # {"status":"ready"}
-```
-
-### View Logs
-
-```bash
-ssh volcano "tail -50 /tmp/tinker_server.log"
-```
-
-## vLLM Actor Management
-
-| Operation | Time | Command |
-|-----------|------|---------|
-| First start | ~80s | Automatic on server start |
-| Restart (actor reused) | ~2s | Kill server, restart |
-| Kill actor | - | `curl -X POST http://localhost:8000/api/v1/kill_vllm` |
-| Check status | - | `curl http://localhost:8000/api/v1/vllm_status` |
-
-**When to kill actor:** Base model changed, OOM, need GPU memory.
-
-## Ray Cluster
-
-### Connect to Existing Cluster
-
-```bash
-ray start --address='192.168.47.158:6379'
-```
-
-Dashboard: http://192.168.47.158:8265
-
-### Deploy New Cluster via Volcano
-
-**Prerequisites:** Run `scripts/setup_volc_cli.sh` to install CLI, then `volc configure`.
-
-#### Option 1: Simple (Single Node)
-
-```bash
-scripts/deploy_cluster.sh simple
-# Or directly: volc ml_task submit -c configs/ray_cluster_8gpu.yaml
-```
-
-#### Option 2: Scalable (Separate Head + Workers)
-
-```bash
-scripts/deploy_cluster.sh scalable
-```
-
-Then follow printed instructions to get HEAD_IP and submit worker.
-
-### Adjusting GPU Count
-
-**GPU allocation is flexible.** Modify configs as needed:
-
-1. Change `Flavor` to match GPU count (see [volcano-reference.md](volcano-reference.md)):
-   - `ml.pni2l.7xlarge` = 1 GPU
-   - `ml.pni2l.14xlarge` = 2 GPUs
-   - `ml.pni2l.28xlarge` = 8 GPUs
-
-2. Update `--num-gpus=N` in entrypoint to match
-
-Example for 2 GPUs:
-```yaml
-Flavor: "ml.pni2l.14xlarge"
-Entrypoint: |
-  ray start --head --port=6379 --dashboard-host=0.0.0.0 --num-gpus=2 && sleep infinity
-```
-
-### Check Cluster Status
-
-```bash
-scripts/cluster_status.sh
-```
-
-## API Endpoints
+### API Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/healthz` | GET | Health check |
 | `/api/v1/vllm_status` | GET | vLLM actor status |
 | `/api/v1/kill_vllm` | POST | Kill vLLM actor |
-| `/api/v1/create_session` | POST | Create session |
+| `/api/v1/create_session` | POST | Create training session |
 | `/api/v1/create_sampling_session` | POST | Create sampling session |
-| `/api/v1/asample` | POST | Submit async sample |
-| `/api/v1/retrieve_future` | POST | Poll result (408=pending, 200=ready) |
+| `/api/v1/asample` | POST | Async sample request |
+| `/api/v1/retrieve_future` | POST | Poll result (408=pending) |
+
+---
+
+## 3. Ray Cluster
+
+### Connect SSH Server to Existing Cluster
+
+```bash
+ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0
+```
+
+### Deploy New Cluster
+
+Prerequisites: Install Volcano CLI with `scripts/setup_volc_cli.sh`, then `volc configure`
+
+1. **Start head node:**
+   ```bash
+   volc ml_task submit -c configs/ray_head.yaml --output json
+   ```
+
+2. **Get head IP from logs:**
+   ```bash
+   volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
+   ```
+
+3. **Create worker config:** Copy `configs/ray_worker.yaml`, replace `<RAY_HEAD_IP>` with actual IP, adjust GPU count if needed.
+
+4. **Submit worker:**
+   ```bash
+   volc ml_task submit -c ray_worker_configured.yaml --output json
+   ```
+
+### GPU Flavors
+
+| Flavor | GPUs | Memory |
+|--------|------|--------|
+| `ml.pni2l.7xlarge` | 2 | 490 GiB |
+| `ml.pni2l.14xlarge` | 4 | 980 GiB |
+| `ml.pni2l.28xlarge` | 8 | 1960 GiB |
+
+Update both `Flavor` and `--num-gpus=N` in YAML config.
+
+### Manage Cluster
+
+The cluster is fully dynamic. Use `volc` CLI to add, remove, or recreate workers as needed.
+
+**Important:** Always use `--output json` to avoid interactive TUI mode.
+
+```bash
+volc ml_task list --output json                      # List all tasks
+volc ml_task submit -c <config.yaml> --output json   # Add new worker
+volc ml_task cancel --id <task_id> --output json     # Remove worker or head
+volc ml_task logs -t <task_id> -i worker_0           # View logs (find IP here)
+```
+
+**Common operations:**
+- **Scale up:** Submit additional worker tasks pointing to existing head
+- **Scale down:** Cancel worker tasks to free GPUs
+- **Recreate worker:** Cancel stale worker, submit new one
+- **Tear down cluster:** Cancel both head and all worker tasks
+
+---
+
+## 4. vLLM Actor
+
+| Operation | Time | Method |
+|-----------|------|--------|
+| First start | ~80s | Automatic on server start |
+| Restart (reuse) | ~2s | Restart server |
+| Kill actor | - | `curl -X POST .../kill_vllm` |
+
+**Kill actor when:** Base model changed, OOM, need to free GPU memory.
+
+---
 
 ## Troubleshooting
 
-### Unison not syncing
-- Check process running: `pgrep -af "unison.*volcano-tinker"`
-- Check SSH connectivity: `ssh volcano echo ok`
-- View logs: `tail -100 ~/.unison/unison.log`
-- Restart: `pkill -f "unison.*volcano-tinker" && unison volcano-tinker -repeat watch`
+### Code Sync
+| Symptom | Fix |
+|---------|-----|
+| Unison not running | `pgrep -af "unison.*volcano-tinker"` → restart |
+| Symlink broken | Re-run symlink setup command |
 
-### Server won't start
-- Check logs: `ssh volcano "tail -100 /tmp/tinker_server.log"`
-- Verify model path exists
-- Check Ray cluster connectivity
+### Server
+| Symptom | Fix |
+|---------|-----|
+| Won't start | `ssh volcano "tail -100 /tmp/tinker_server.log"` |
+| Can't connect | Check SSH tunnel, Ray cluster |
 
-### vLLM OOM
-- Kill actor: `curl -X POST http://localhost:8000/api/v1/kill_vllm`
-- Restart server
-- Monitor GPU on dashboard
+### GPU/Memory
+| Symptom | Fix |
+|---------|-----|
+| vLLM OOM | Kill actor, restart server |
+| Worker OOM | Check dashboard, kill stale actors |
+| MoE models | Need ~57 GiB - ensure workers have free memory |
 
-See [volcano-reference.md](volcano-reference.md) for Volcano-specific troubleshooting.
+### Common Mistakes
+
+1. **Running GPU workloads on SSH server** - it has no GPUs. Use `CUDA_VISIBLE_DEVICES=`.
+2. **Starting Ray head on SSH server** - Ray head is a Volcano task. Connect to existing cluster.
+3. **Forgetting `--num-gpus=0`** - SSH server must join cluster with zero GPUs.
+
+---
+
+## Resources
+
+- [volcano-reference.md](volcano-reference.md) - Instance flavors, Volcano CLI
+- [configs/volcano-tinker.prf](configs/volcano-tinker.prf) - Unison profile (bidirectional sync to PFS)
+- [configs/ray_head.yaml](configs/ray_head.yaml) - Ray head node config (ready to use)
+- [configs/ray_worker.yaml](configs/ray_worker.yaml) - Ray worker template (requires head IP)
+- [scripts/setup_volc_cli.sh](scripts/setup_volc_cli.sh) - Install Volcano CLI

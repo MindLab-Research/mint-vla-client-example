@@ -4,10 +4,9 @@
 
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
-| `ml.g2a.xlarge` | 0 | 8GB | Head node (CPU only) |
-| `ml.pni2l.7xlarge` | 1x A100 80GB | 80GB | Small inference |
-| `ml.pni2l.14xlarge` | 2x A100 80GB | 160GB | Medium inference |
-| `ml.pni2l.28xlarge` | 8x A100 80GB | 640GB | Training/Large inference |
+| `ml.pni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training |
+| `ml.pni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training |
+| `ml.pni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE |
 
 **GPU allocation is flexible.** Adjust `Flavor` and `--num-gpus` in configs as needed.
 
@@ -31,13 +30,16 @@ Storages:
 
 ## CLI Commands
 
+**Important:** Use `--output json` to avoid interactive TUI mode.
+
 ```bash
-volc ml_task list                          # List tasks
-volc ml_task logs -t TASK_ID -i worker_0   # View logs
-volc ml_task cancel --id TASK_ID           # Cancel task
-volc ml_task export --id TASK_ID           # Export config
-volc ml_task get --id TASK_ID              # Task details
+volc ml_task list --output json                 # List tasks
+volc ml_task submit -c config.yaml --output json  # Submit new task
+volc ml_task cancel --id TASK_ID --output json  # Cancel task
+volc ml_task logs -t TASK_ID -i worker_0        # View logs (find Ray IP here)
 ```
+
+**Finding Ray head IP:** Check logs for "Local node IP: 192.x.x.x"
 
 ## Troubleshooting
 
