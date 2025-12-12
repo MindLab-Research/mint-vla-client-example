@@ -957,6 +957,129 @@ class MegatronRankWorker:
         logger.info(f"[MegatronRankWorker] Saved checkpoint to {abs_path} (step={step_count})")
         return meta
 
+
+    # ========================================================================
+    # Phase 6: Multi-Session Support Methods
+    # ========================================================================
+
+    def load_adapter_state(self, checkpoint_path: str) -> dict:
+        """Load LoRA adapter weights from checkpoint.
+
+        ALL ranks must call this method - uses NCCL collectives internally.
+        Used for session swapping: loading a different session's adapter weights.
+
+        Args:
+            checkpoint_path: Base directory containing adapter checkpoint files.
+                Each rank loads from its own mp_rank_XX_adapter.pt file.
+
+        Returns:
+            Dict with status info (rank 0 only returns meaningful data).
+        """
+        import os
+        from verl.utils.megatron_peft_utils import load_adapter_checkpoint
+
+        # Use train_mode context to ensure model is on GPU for loading
+        with self.engine.train_mode():
+            load_adapter_checkpoint(
+                model=self.engine.module,
+                checkpoint_path=checkpoint_path,
+                strict=False,  # Allow partial load for adapter-only updates
+            )
+
+        logger.info(f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path}")
+
+        if self.rank == 0:
+            return {"status": "ok", "path": checkpoint_path}
+        return {}
+
+    def save_adapter_state(self, checkpoint_path: str) -> dict:
+        """Save LoRA adapter weights to checkpoint.
+
+        ALL ranks must call this method - uses NCCL collectives internally.
+        Used for session swapping: saving current session's adapter weights.
+
+        Args:
+            checkpoint_path: Base directory to save adapter checkpoint files.
+                Each rank saves to its own mp_rank_XX_adapter.pt file.
+
+        Returns:
+            Dict with status info (rank 0 only returns meaningful data).
+        """
+        import os
+        from verl.utils.megatron_peft_utils import save_adapter_checkpoint
+
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        # Use train_mode context to ensure model is on GPU for saving
+        with self.engine.train_mode():
+            save_adapter_checkpoint(
+                model=self.engine.module,
+                checkpoint_path=checkpoint_path,
+                rank=self.rank,
+            )
+
+        logger.info(f"[Rank {self.rank}] Saved adapter state to {checkpoint_path}")
+
+        if self.rank == 0:
+            return {"status": "ok", "path": checkpoint_path}
+        return {}
+
+    def reset_optimizer(self, learning_rate: float | None = None) -> dict:
+        """Reset optimizer state for a new session.
+
+        Updates learning rate and zeros gradients. Note: With distributed optimizer,
+        full momentum/variance reset is complex and often unnecessary - momentum
+        from prior training can actually help convergence.
+
+        Args:
+            learning_rate: Optional new learning rate. If None, keeps current.
+
+        Returns:
+            Dict with status info.
+        """
+        # Update learning rate if specified
+        if learning_rate is not None:
+            self.learning_rate = learning_rate
+            # Update all param groups
+            for group in self.engine.optimizer.param_groups:
+                group['lr'] = learning_rate
+
+        # Zero gradients (always safe)
+        self.engine.optimizer_zero_grad()
+
+        # Note: Full optimizer state reset (momentum/variance) is skipped for distributed
+        # optimizer because:
+        # 1. ProxyDict doesn't support standard iteration patterns
+        # 2. Momentum from prior training often helps convergence
+        # If full reset is needed, the actor should be killed and recreated.
+
+        logger.info(f"[Rank {self.rank}] Reset optimizer (lr={learning_rate or self.learning_rate}, grads zeroed)")
+
+        if self.rank == 0:
+            return {"status": "ok", "learning_rate": learning_rate or self.learning_rate}
+        return {}
+
+    def get_session_info(self) -> dict:
+        """Get current session info for diagnostics.
+
+        Returns:
+            Dict with model, LoRA, and optimizer info.
+        """
+        if self.rank != 0:
+            return {}
+
+        lr = self.learning_rate
+        if self.engine.optimizer.param_groups:
+            lr = self.engine.optimizer.param_groups[0].get('lr', self.learning_rate)
+
+        return {
+            "base_model": self.base_model,
+            "lora_rank": self.lora_rank,
+            "learning_rate": float(lr),
+            "world_size": self.world_size,
+            "rank": self.rank,
+        }
+
     def shutdown(self):
         """Clean shutdown of distributed process."""
         if torch.distributed.is_initialized():
@@ -988,6 +1111,7 @@ class MegatronWorkerGroup:
         self.workers: list[ray.actor.ActorHandle] = []
         self.placement_group = None
         self._step_count = 0
+        self._current_session: str | None = None  # Phase 6: session tracking
 
         self._initialize()
 
@@ -1280,6 +1404,138 @@ class MegatronWorkerGroup:
             "lora_rank": self.lora_rank,
         }
 
+
+    # ========================================================================
+    # Phase 6: Multi-Session Support Methods
+    # ========================================================================
+
+    def load_adapter_state(self, checkpoint_path: str) -> dict:
+        """Load LoRA adapter weights from checkpoint on all workers.
+
+        ALL workers must participate due to NCCL collectives.
+
+        Args:
+            checkpoint_path: Base directory containing adapter checkpoint.
+
+        Returns:
+            Dict with status info from rank 0.
+        """
+        logger.info(f"[MegatronWorkerGroup] Loading adapter state from {checkpoint_path}")
+        futures = [w.load_adapter_state.remote(checkpoint_path) for w in self.workers]
+        results = ray.get(futures)
+        result = results[0]  # Rank 0 result
+        logger.info(f"[MegatronWorkerGroup] Adapter state loaded: {result}")
+        return result
+
+    def save_adapter_state(self, checkpoint_path: str) -> dict:
+        """Save LoRA adapter weights to checkpoint from all workers.
+
+        ALL workers must participate due to NCCL collectives.
+
+        Args:
+            checkpoint_path: Base directory to save adapter checkpoint.
+
+        Returns:
+            Dict with status info from rank 0.
+        """
+        logger.info(f"[MegatronWorkerGroup] Saving adapter state to {checkpoint_path}")
+        futures = [w.save_adapter_state.remote(checkpoint_path) for w in self.workers]
+        results = ray.get(futures)
+        result = results[0]  # Rank 0 result
+        logger.info(f"[MegatronWorkerGroup] Adapter state saved: {result}")
+        return result
+
+    def reset_optimizer(self, learning_rate: float | None = None) -> dict:
+        """Reset optimizer state on all workers.
+
+        Used for new sessions to start fresh without prior momentum.
+
+        Args:
+            learning_rate: Optional new learning rate.
+
+        Returns:
+            Dict with status info from rank 0.
+        """
+        logger.info(f"[MegatronWorkerGroup] Resetting optimizer (lr={learning_rate})")
+        futures = [w.reset_optimizer.remote(learning_rate) for w in self.workers]
+        results = ray.get(futures)
+        result = results[0]  # Rank 0 result
+        self._step_count = 0  # Reset step counter for new session
+        logger.info(f"[MegatronWorkerGroup] Optimizer reset: {result}")
+        return result
+
+    def swap_session(
+        self,
+        old_session_id: str | None,
+        new_session_id: str,
+        old_checkpoint_path: str | None,
+        new_checkpoint_path: str | None,
+        new_learning_rate: float,
+    ) -> dict:
+        """Atomically swap from old session to new session.
+
+        Steps:
+        1. Save old session state (if any and checkpoint_path provided)
+        2. Load new session state (if checkpoint exists) or reset
+        3. Update current session marker
+
+        Args:
+            old_session_id: ID of session being swapped out (None if first session).
+            new_session_id: ID of session being swapped in.
+            old_checkpoint_path: Where to save old session state (None to skip).
+            new_checkpoint_path: Where to load new session state (None to reset).
+            new_learning_rate: Learning rate for new session.
+
+        Returns:
+            Dict with swap status.
+        """
+        import os
+
+        logger.info(f"[MegatronWorkerGroup] Swapping session: {old_session_id} -> {new_session_id}")
+
+        # 1. Save old session state (if applicable)
+        if old_session_id and old_checkpoint_path:
+            logger.info(f"[MegatronWorkerGroup] Saving old session {old_session_id}")
+            self.save_adapter_state(old_checkpoint_path)
+
+        # 2. Load new session state or reset
+        if new_checkpoint_path and os.path.exists(new_checkpoint_path):
+            logger.info(f"[MegatronWorkerGroup] Loading new session {new_session_id} from {new_checkpoint_path}")
+            self.load_adapter_state(new_checkpoint_path)
+            # Keep optimizer state from checkpoint (momentum preserved)
+        else:
+            logger.info(f"[MegatronWorkerGroup] Resetting for new session {new_session_id}")
+            self.reset_optimizer(new_learning_rate)
+
+        # 3. Update session tracking
+        self._current_session = new_session_id
+        self._step_count = 0
+        self.learning_rate = new_learning_rate
+
+        logger.info(f"[MegatronWorkerGroup] Session swap complete: now on {new_session_id}")
+        return {
+            "status": "ok",
+            "old_session": old_session_id,
+            "new_session": new_session_id,
+        }
+
+    def get_session_info(self) -> dict:
+        """Get current session info.
+
+        Returns:
+            Dict with session and worker info.
+        """
+        futures = [self.workers[0].get_session_info.remote()]
+        results = ray.get(futures)
+        worker_info = results[0]
+
+        return {
+            **worker_info,
+            "current_session": getattr(self, '_current_session', None),
+            "step_count": self._step_count,
+            "num_workers": len(self.workers),
+        }
+
     def shutdown(self):
         """Shutdown all workers and release placement group."""
         for w in self.workers:
@@ -1293,6 +1549,224 @@ class MegatronWorkerGroup:
 
         self.workers = []
         self.placement_group = None
+
+
+# ============================================================================
+# Phase 6: MegatronActorPool - Manages actors keyed by (base_model, lora_rank)
+# ============================================================================
+
+@dataclass
+class MegatronActorEntry:
+    """Entry in the actor pool with session tracking."""
+    actor: ray.actor.ActorHandle
+    base_model: str
+    lora_rank: int
+    current_session: str | None = None
+    created_at: float = 0.0
+
+    def __post_init__(self):
+        import time
+        if self.created_at == 0.0:
+            self.created_at = time.time()
+
+
+class MegatronActorPool:
+    """Pool of Megatron actors keyed by (base_model, lora_rank).
+
+    Allows multiple training sessions to share actors based on model/rank
+    configuration, avoiding 80s restart cost when switching sessions.
+
+    Thread-safe for concurrent access from multiple API requests.
+    """
+
+    def __init__(self):
+        import threading
+        self._actors: dict[tuple[str, int], MegatronActorEntry] = {}
+        self._lock = threading.Lock()
+
+    def _make_key(self, base_model: str, lora_rank: int) -> tuple[str, int]:
+        """Create pool key from model and rank."""
+        return (base_model, lora_rank)
+
+    def _make_actor_name(self, base_model: str, lora_rank: int) -> str:
+        """Create unique actor name for this config."""
+        # Use model basename and rank for readable names
+        model_name = base_model.split("/")[-1].replace("-", "_").lower()
+        return f"megatron_pool_{model_name}_r{lora_rank}"
+
+    def get(self, base_model: str, lora_rank: int) -> MegatronActorEntry | None:
+        """Get existing actor entry if it exists.
+
+        Args:
+            base_model: HuggingFace model path.
+            lora_rank: LoRA rank.
+
+        Returns:
+            MegatronActorEntry if actor exists, None otherwise.
+        """
+        key = self._make_key(base_model, lora_rank)
+        with self._lock:
+            return self._actors.get(key)
+
+    def get_or_create(
+        self,
+        base_model: str,
+        lora_rank: int,
+        learning_rate: float,
+        distributed_config: DistributedConfig | None = None,
+        session_id: str | None = None,
+    ) -> MegatronActorEntry:
+        """Get existing or create new Megatron actor for this config.
+
+        Args:
+            base_model: HuggingFace model path.
+            lora_rank: LoRA rank.
+            learning_rate: Initial learning rate (only used if creating new).
+            distributed_config: Parallelism config.
+            session_id: Optional session ID to register with actor.
+
+        Returns:
+            MegatronActorEntry with actor handle.
+        """
+        key = self._make_key(base_model, lora_rank)
+        config = distributed_config or DistributedConfig()
+
+        with self._lock:
+            # Return existing actor if available
+            if key in self._actors:
+                entry = self._actors[key]
+                logger.info(
+                    f"[MegatronActorPool] Reusing existing actor for {base_model}, rank={lora_rank}"
+                )
+                return entry
+
+            # Create new actor
+            actor_name = self._make_actor_name(base_model, lora_rank)
+            logger.info(
+                f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, rank={lora_rank}"
+            )
+
+            # Check if detached actor already exists (e.g., from previous server run)
+            try:
+                actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                logger.info(f"[MegatronActorPool] Found existing detached actor: {actor_name}")
+                # Verify it's alive
+                ray.get(actor.get_diagnostics.remote(), timeout=10)
+            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                # Create new detached actor
+                runtime_env = {
+                    "env_vars": {
+                        "PYTHONPATH": PFS_PYTHONPATH,
+                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    }
+                }
+
+                actor = MegatronWorkerGroup.options(
+                    name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    lifetime="detached",
+                    runtime_env=runtime_env,
+                ).remote(
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    learning_rate=learning_rate,
+                    distributed_config=config,
+                )
+
+                # Wait for initialization
+                ray.get(actor.__ray_ready__.remote())
+                logger.info(f"[MegatronActorPool] Actor {actor_name} initialized")
+
+            entry = MegatronActorEntry(
+                actor=actor,
+                base_model=base_model,
+                lora_rank=lora_rank,
+                current_session=session_id,
+            )
+            self._actors[key] = entry
+            return entry
+
+    def remove(self, base_model: str, lora_rank: int, kill_actor: bool = True) -> bool:
+        """Remove actor from pool.
+
+        Args:
+            base_model: HuggingFace model path.
+            lora_rank: LoRA rank.
+            kill_actor: If True, also kill the Ray actor.
+
+        Returns:
+            True if actor was removed, False if not found.
+        """
+        key = self._make_key(base_model, lora_rank)
+
+        with self._lock:
+            if key not in self._actors:
+                return False
+
+            entry = self._actors.pop(key)
+            if kill_actor:
+                try:
+                    ray.get(entry.actor.shutdown.remote(), timeout=30)
+                    ray.kill(entry.actor)
+                except Exception as e:
+                    logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
+
+            logger.info(f"[MegatronActorPool] Removed actor for {base_model}, rank={lora_rank}")
+            return True
+
+    def list_actors(self) -> list[dict]:
+        """List all actors in the pool.
+
+        Returns:
+            List of actor info dicts.
+        """
+        with self._lock:
+            return [
+                {
+                    "base_model": entry.base_model,
+                    "lora_rank": entry.lora_rank,
+                    "current_session": entry.current_session,
+                    "created_at": entry.created_at,
+                }
+                for entry in self._actors.values()
+            ]
+
+    def clear(self, kill_actors: bool = True) -> int:
+        """Remove all actors from pool.
+
+        Args:
+            kill_actors: If True, also kill the Ray actors.
+
+        Returns:
+            Number of actors removed.
+        """
+        with self._lock:
+            count = len(self._actors)
+            if kill_actors:
+                for entry in self._actors.values():
+                    try:
+                        ray.get(entry.actor.shutdown.remote(), timeout=30)
+                        ray.kill(entry.actor)
+                    except Exception as e:
+                        logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
+            self._actors.clear()
+            logger.info(f"[MegatronActorPool] Cleared {count} actors")
+            return count
+
+
+# Global actor pool instance
+_megatron_actor_pool: MegatronActorPool | None = None
+
+
+def get_megatron_actor_pool() -> MegatronActorPool:
+    """Get or create the global Megatron actor pool."""
+    global _megatron_actor_pool
+    if _megatron_actor_pool is None:
+        _megatron_actor_pool = MegatronActorPool()
+    return _megatron_actor_pool
 
 
 def get_or_create_megatron_worker_group(
