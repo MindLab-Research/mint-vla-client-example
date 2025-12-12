@@ -1256,20 +1256,47 @@ PFS_PYTHONPATH_DENSE = "/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindver
 
 @dataclass
 class DenseTrainerEntry:
-    """Entry in the dense trainer pool with session tracking."""
+    """Entry in the dense trainer pool with session tracking.
+
+    Phase 9: Adds LRU tracking for adaptive resource management.
+    """
 
     actor: ray.actor.ActorHandle
     base_model: str
     max_lora_rank: int  # Trainer's max rank
+    num_gpus: int = 1  # GPUs used by this actor
     current_session: str | None = None
     actual_rank: int | None = None  # Current session's actual rank
     created_at: float = 0.0
+    last_accessed: float = 0.0  # Phase 9: LRU tracking
 
     def __post_init__(self):
         import time
 
+        now = time.time()
         if self.created_at == 0.0:
-            self.created_at = time.time()
+            self.created_at = now
+        if self.last_accessed == 0.0:
+            self.last_accessed = now
+
+    def touch(self):
+        """Update last_accessed timestamp (call on each access)."""
+        import time
+        self.last_accessed = time.time()
+
+    def is_idle(self) -> bool:
+        """Check if actor has no active session."""
+        return self.current_session is None
+
+    def age(self) -> float:
+        """Seconds since creation."""
+        import time
+        return time.time() - self.created_at
+
+    def idle_time(self) -> float:
+        """Seconds since last access."""
+        import time
+        return time.time() - self.last_accessed
 
 
 class DenseTrainerPool:
@@ -1278,11 +1305,17 @@ class DenseTrainerPool:
     Phase 8: Unified rank support - actors are initialized with max_lora_rank
     and can train adapters with any rank <= max_lora_rank via padding/truncation.
 
+    Phase 9: LRU-based eviction for adaptive resource management.
+
     Thread-safe for concurrent access from multiple API requests.
     """
 
     # Default max rank for pooled actors
     DEFAULT_MAX_LORA_RANK = 64
+    # Default GPUs per dense trainer actor
+    DEFAULT_NUM_GPUS = 1
+    # Minimum actor age before eligible for eviction (seconds)
+    MIN_ACTOR_AGE = 300  # 5 minutes
 
     def __init__(self):
         import threading
@@ -1310,7 +1343,57 @@ class DenseTrainerPool:
         """
         key = self._make_key(base_model)
         with self._lock:
-            return self._actors.get(key)
+            entry = self._actors.get(key)
+            if entry:
+                entry.touch()  # Phase 9: Update LRU
+            return entry
+
+    def _get_idle_actors_lru(self) -> list[DenseTrainerEntry]:
+        """Get idle actors sorted by last access time (LRU first).
+
+        Must be called with lock held.
+        """
+        idle = [e for e in self._actors.values() if e.is_idle() and e.age() > self.MIN_ACTOR_AGE]
+        return sorted(idle, key=lambda e: e.last_accessed)
+
+    def _evict_for_gpus(self, needed_gpus: int, save_state: bool = True) -> int:
+        """Evict idle actors to free up GPUs.
+
+        Must be called with lock held.
+
+        Args:
+            needed_gpus: Number of GPUs needed.
+            save_state: If True, save session state before eviction.
+
+        Returns:
+            Number of GPUs freed.
+        """
+        freed_gpus = 0
+        idle_actors = self._get_idle_actors_lru()
+
+        for entry in idle_actors:
+            if freed_gpus >= needed_gpus:
+                break
+
+            logger.info(
+                f"[DenseTrainerPool] Evicting idle actor: {entry.base_model} "
+                f"(idle {entry.idle_time():.1f}s, frees {entry.num_gpus} GPUs)"
+            )
+
+            # Remove from pool
+            key = self._make_key(entry.base_model)
+            self._actors.pop(key, None)
+
+            # Kill actor (no state to save since it's idle)
+            try:
+                ray.get(entry.actor.shutdown.remote(), timeout=30)
+                ray.kill(entry.actor)
+            except Exception as e:
+                logger.warning(f"[DenseTrainerPool] Error killing evicted actor: {e}")
+
+            freed_gpus += entry.num_gpus
+
+        return freed_gpus
 
     def get_or_create(
         self,
@@ -1325,6 +1408,8 @@ class DenseTrainerPool:
         Phase 8: If actor exists, it will be reused regardless of lora_rank
         (padding/truncation happens at session swap time).
 
+        Phase 9: If resources exhausted, tries LRU eviction of idle actors.
+
         Args:
             base_model: HuggingFace model path.
             lora_rank: Requested LoRA rank for this session.
@@ -1334,6 +1419,9 @@ class DenseTrainerPool:
 
         Returns:
             DenseTrainerEntry with actor handle.
+
+        Raises:
+            ValueError: If rank exceeds max or insufficient resources.
         """
         key = self._make_key(base_model)
 
@@ -1346,6 +1434,7 @@ class DenseTrainerPool:
                         f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
                         f"Kill the actor and restart with higher max_lora_rank."
                     )
+                entry.touch()  # Phase 9: Update LRU
                 logger.info(
                     f"[DenseTrainerPool] Reusing existing actor for {base_model} "
                     f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
@@ -1402,6 +1491,7 @@ class DenseTrainerPool:
                 actor=actor,
                 base_model=base_model,
                 max_lora_rank=effective_max_rank,
+                num_gpus=self.DEFAULT_NUM_GPUS,
                 current_session=session_id,
                 actual_rank=lora_rank,
             )
@@ -1448,10 +1538,45 @@ class DenseTrainerPool:
                     "max_lora_rank": entry.max_lora_rank,
                     "actual_rank": entry.actual_rank,
                     "current_session": entry.current_session,
+                    "num_gpus": entry.num_gpus,
                     "created_at": entry.created_at,
+                    "last_accessed": entry.last_accessed,
+                    "idle_time": entry.idle_time(),
                 }
                 for entry in self._actors.values()
             ]
+
+    def total_gpus(self) -> int:
+        """Total GPUs used by all actors in pool."""
+        with self._lock:
+            return sum(e.num_gpus for e in self._actors.values())
+
+    def evict_idle(self, min_idle_seconds: float = 600) -> int:
+        """Evict all idle actors that have been idle longer than threshold.
+
+        Args:
+            min_idle_seconds: Minimum idle time before eviction.
+
+        Returns:
+            Number of actors evicted.
+        """
+        with self._lock:
+            to_evict = [
+                e for e in self._actors.values()
+                if e.is_idle() and e.idle_time() > min_idle_seconds
+            ]
+
+            for entry in to_evict:
+                key = self._make_key(entry.base_model)
+                self._actors.pop(key, None)
+                try:
+                    ray.get(entry.actor.shutdown.remote(), timeout=30)
+                    ray.kill(entry.actor)
+                except Exception as e:
+                    logger.warning(f"[DenseTrainerPool] Error killing idle actor: {e}")
+                logger.info(f"[DenseTrainerPool] Evicted idle actor: {entry.base_model}")
+
+            return len(to_evict)
 
     def clear(self, kill_actors: bool = True) -> int:
         """Remove all actors from pool.
