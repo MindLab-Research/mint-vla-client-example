@@ -381,9 +381,477 @@ python -m tinker_cookbook.recipes.chat_sl.train \
 
 ---
 
+## Phase 6: Multi-Session Megatron Actor Sharing
+
+**Goal:** Multiple training sessions share a single Megatron actor to avoid ~80s restart cost. Each session maintains isolated LoRA weights and optimizer state.
+
+### Current Limitation
+
+The Megatron actor is a singleton (`PERSISTENT_MEGATRON_ACTOR_NAME`) with parameter lock-in at creation time:
+
+```
+Session A creates actor: base_model=X, lora_rank=32, lr=1e-4
+Session A ends (actor persists)
+Session B starts: wants lora_rank=64, lr=1e-5
+  → get_or_create returns existing actor
+  → Session B's params IGNORED
+  → Session B inherits Session A's final weights and hyperparameters
+```
+
+This is incorrect for independent sessions.
+
+### Proposed Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MegatronActorPool                                    │
+│                                                                              │
+│  Key: (base_model, lora_rank) → ActorHandle                                  │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Actor "qwen3-30b-r32"                                                 │   │
+│  │   - base_model: Qwen/Qwen3-30B-A3B                                    │   │
+│  │   - lora_rank: 32                                                     │   │
+│  │   - current_session: session_A (or None if idle)                      │   │
+│  │   - lock: asyncio.Lock                                                │   │
+│  │                                                                        │   │
+│  │   State Storage (per-session, on PFS):                                │   │
+│  │   /checkpoints/{session_id}/                                          │   │
+│  │     ├── adapter_checkpoint/mp_rank_XX_adapter.pt  (LoRA weights)      │   │
+│  │     ├── optimizer/                                 (optimizer state)  │   │
+│  │     └── training_meta.json                         (step, lr, etc)    │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Actor "qwen3-30b-r64"                                                 │   │
+│  │   - base_model: Qwen/Qwen3-30B-A3B                                    │   │
+│  │   - lora_rank: 64                                                     │   │
+│  │   - ...                                                               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Session Flow:
+┌─────────────┐     acquire_actor()     ┌─────────────────────┐
+│  Session A  │ ───────────────────────►│  Lock acquired      │
+│             │                         │  load_session_state │
+│             │     forward_backward    │  (adapter + optim)  │
+│             │ ───────────────────────►│                     │
+│             │     optim_step          │                     │
+│             │ ───────────────────────►│                     │
+│             │     release_actor()     │  save_session_state │
+│             │ ◄───────────────────────│  Lock released      │
+└─────────────┘                         └─────────────────────┘
+                                                  │
+                                                  ▼
+┌─────────────┐     acquire_actor()     ┌─────────────────────┐
+│  Session B  │ ───────────────────────►│  Lock acquired      │
+│  (waiting)  │                         │  load_session_state │
+│             │                         │  (Session B's state)│
+└─────────────┘                         └─────────────────────┘
+```
+
+### Investigation Findings
+
+#### 1. State Components to Swap
+
+| Component | Size (30B MoE, rank=32) | Storage Location | Swap Method |
+|-----------|------------------------|------------------|-------------|
+| LoRA adapter weights | ~100MB | PFS | `load_adapter_checkpoint()` |
+| Optimizer state (Adam) | ~200MB | PFS | `set_optimizer_state_dict()` |
+| LR scheduler state | <1KB | PFS | JSON serialize |
+| RNG state | <1KB | PFS | `load_rng_states()` |
+| Step counter | <1KB | Memory | Session metadata |
+
+#### 2. verl API for State Loading
+
+**Adapter weights** - `verl/utils/megatron_peft_utils.py`:
+```python
+# Save (existing)
+save_adapter_checkpoint(model, checkpoint_path, rank)
+# Load (existing)
+load_adapter_checkpoint(model, checkpoint_path, strict=True)
+```
+
+**Optimizer state** - `verl/utils/checkpoint/megatron_checkpoint_manager.py`:
+```python
+# Save: generate_state_dict() includes optimizer via sharded_state_dict()
+state_dict = manager.generate_state_dict(
+    generate_model=False,
+    generate_optimizer=True,
+    generate_extra=True,
+)
+
+# Load: checkpoint_manager.load_checkpoint() handles optimizer
+# WARNING: requires coordinated loading across all ranks (NCCL collectives)
+```
+
+#### 3. Locking Mechanism
+
+Ray actors are single-threaded - one call at a time. But we need:
+- **Explicit session lock** to prevent interleaving mid-batch
+- **Async waiting** for sessions queued behind active session
+
+Options:
+1. **Actor-level asyncio.Lock** - simple, but requires all callers to acquire
+2. **Wrapper class with context manager** - cleaner API
+3. **Ray actor method ordering** - relies on Ray's FIFO guarantee
+
+Recommendation: Option 2 - wrapper class that acquires lock + swaps state atomically.
+
+#### 4. Actor Pool Keying
+
+Key: `(base_model, lora_rank)` tuple
+
+Rationale:
+- `lora_rank` determines LoRA layer dimensions - cannot change after initialization
+- `base_model` determines model architecture
+- `learning_rate` can be changed per-session via optimizer state reload
+
+Pool behavior:
+- First session with (model, rank) creates actor
+- Subsequent sessions reuse existing actor
+- Actors persist until explicit kill or resource pressure
+
+### Implementation Tasks
+
+| # | Task | File | Complexity |
+|---|------|------|------------|
+| 1 | Add `load_adapter_state()` to `MegatronRankWorker` | `megatron_distributed.py` | Medium |
+| 2 | Add `save_optimizer_state()` / `load_optimizer_state()` | `megatron_distributed.py` | High |
+| 3 | Add `reset_optimizer()` for new sessions | `megatron_distributed.py` | Medium |
+| 4 | Create `MegatronActorPool` class | `megatron_distributed.py` | Medium |
+| 5 | Add session locking to `MegatronWorkerGroup` | `megatron_distributed.py` | Medium |
+| 6 | Add `swap_session()` atomic operation | `megatron_distributed.py` | High |
+| 7 | Update `VerlTrainingEngine` to use pool | `verl_training.py` | Medium |
+| 8 | Add session state persistence paths | `training_session_manager.py` | Low |
+| 9 | Test multi-session sequential access | `tests/` | Medium |
+| 10 | Test multi-session concurrent queueing | `tests/` | Medium |
+
+### Detailed Design
+
+#### Task 1: `load_adapter_state()`
+
+```python
+# MegatronRankWorker
+def load_adapter_state(self, checkpoint_path: str) -> None:
+    """Load LoRA adapter weights from checkpoint.
+
+    ALL ranks must call - uses NCCL collectives internally.
+    """
+    from verl.utils.megatron_peft_utils import load_adapter_checkpoint
+    load_adapter_checkpoint(
+        model=self.engine.module,
+        checkpoint_path=checkpoint_path,
+        strict=True,
+    )
+    logger.info(f"[Rank {self.rank}] Loaded adapter from {checkpoint_path}")
+```
+
+#### Task 2: Optimizer State Save/Load
+
+Challenge: Megatron distributed optimizer uses `sharded_state_dict()` which requires coordinated save/load across all ranks.
+
+```python
+# MegatronRankWorker
+def save_optimizer_state(self, save_path: str) -> None:
+    """Save optimizer state to checkpoint path."""
+    # Use checkpoint manager's generate_state_dict with optimizer only
+    state_dict = self.engine.checkpoint_mananager.generate_state_dict(
+        generate_model=False,
+        generate_optimizer=True,
+        generate_extra=True,  # includes LR scheduler, RNG
+    )
+    # Save via distributed checkpointing
+    save_dist_checkpointing(state_dict, save_path, async_save=False)
+    torch.distributed.barrier()
+
+def load_optimizer_state(self, load_path: str) -> None:
+    """Load optimizer state from checkpoint path."""
+    # Load via checkpoint manager (handles NCCL coordination)
+    self.engine.checkpoint_mananager.load_checkpoint(
+        local_path=load_path,
+        hdfs_path=None,
+        del_local_after_load=False,
+    )
+```
+
+#### Task 3: Reset Optimizer for New Sessions
+
+```python
+# MegatronRankWorker
+def reset_optimizer(self, learning_rate: float) -> None:
+    """Reset optimizer state for a fresh session.
+
+    Clears momentum/variance, resets step counter.
+    Sets new learning rate.
+    """
+    # Option A: Reinitialize optimizer (simple but may have overhead)
+    self.engine.optimizer_config.lr = learning_rate
+    self.engine.optimizer = self.engine._build_optimizer()
+
+    # Option B: Zero out states (faster but more fragile)
+    for group in self.engine.optimizer.param_groups:
+        group['lr'] = learning_rate
+    for state in self.engine.optimizer.state.values():
+        if 'exp_avg' in state:
+            state['exp_avg'].zero_()
+        if 'exp_avg_sq' in state:
+            state['exp_avg_sq'].zero_()
+        if 'step' in state:
+            state['step'] = 0
+```
+
+#### Task 4: MegatronActorPool
+
+```python
+# megatron_distributed.py
+
+class MegatronActorPool:
+    """Pool of Megatron actors keyed by (base_model, lora_rank)."""
+
+    def __init__(self):
+        self._actors: dict[tuple[str, int], MegatronActorEntry] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create(
+        self,
+        base_model: str,
+        lora_rank: int,
+        learning_rate: float,  # Only used if creating new
+        distributed_config: DistributedConfig,
+    ) -> "MegatronActorEntry":
+        key = (base_model, lora_rank)
+        with self._lock:
+            if key not in self._actors:
+                actor = self._create_actor(base_model, lora_rank, learning_rate, distributed_config)
+                self._actors[key] = MegatronActorEntry(actor=actor, base_model=base_model, lora_rank=lora_rank)
+            return self._actors[key]
+
+@dataclass
+class MegatronActorEntry:
+    actor: ray.actor.ActorHandle
+    base_model: str
+    lora_rank: int
+    current_session: str | None = None
+    session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+```
+
+#### Task 6: Atomic Session Swap
+
+```python
+# MegatronWorkerGroup
+async def swap_session(
+    self,
+    old_session_id: str | None,
+    new_session_id: str,
+    new_checkpoint_path: str | None,
+    new_learning_rate: float,
+) -> None:
+    """Atomically swap from old session to new session.
+
+    1. Save old session state (if any)
+    2. Load new session state (or reset if new)
+    3. Update current_session marker
+    """
+    async with self._session_lock:
+        # Save old session state
+        if old_session_id:
+            old_path = self._get_session_checkpoint_path(old_session_id)
+            await self._save_session_state(old_path)
+
+        # Load new session state
+        if new_checkpoint_path and os.path.exists(new_checkpoint_path):
+            await self._load_session_state(new_checkpoint_path)
+        else:
+            # New session - reset to fresh state
+            await self._reset_state(new_learning_rate)
+
+        self._current_session = new_session_id
+```
+
+### Estimated Swap Latency
+
+| Operation | Time (estimated) | Notes |
+|-----------|-----------------|-------|
+| Save adapter (100MB) | ~0.5s | PFS write |
+| Save optimizer (200MB) | ~1s | Distributed checkpoint |
+| Load adapter (100MB) | ~0.5s | PFS read + param copy |
+| Load optimizer (200MB) | ~1s | Distributed checkpoint |
+| **Total swap** | **~3s** | Much better than 80s restart |
+
+### Open Questions
+
+1. **Memory pressure:** With optimizer offload enabled, loading optimizer state may trigger CPU→GPU transfer. Need to measure actual latency.
+
+2. **Concurrent session limit:** Should we cap concurrent queued sessions? If 10 sessions queue on same actor, tail latency could be high.
+
+3. **Warm vs cold start:** For new sessions, should we:
+   - (A) Reset optimizer to zeros (fast, no prior momentum)
+   - (B) Copy from a "template" checkpoint (has warmup momentum)
+
+4. **Checkpoint cleanup:** When should session checkpoints be garbage collected?
+
+### Phase 6 Milestones
+
+| Milestone | Description | Success Criteria |
+|-----------|-------------|------------------|
+| M1 | Adapter hot-swap | Load different LoRA weights without restart |
+| M2 | Optimizer state swap | Load/save optimizer state per-session |
+| M3 | Session locking | Concurrent sessions queue without corruption |
+| M4 | Full integration | cookbook tests pass with session reuse |
+
+---
+
+## Phase 7: Unified Rank Support via Max-Rank Padding
+
+Key trainers by `base_model` only (not `base_model + lora_rank`). Initialize with max supported rank, pad/truncate adapters at load/save time.
+
+**Mechanism:**
+
+Rank-64 trainer can train rank-32 adapter:
+- Load: zero-pad lora_A rows and lora_B columns from 32 to 64
+- Save: truncate back to actual rank
+- Scaling: store `actual_rank` per session, adjust `alpha/r` factor
+
+```python
+def load_adapter_padded(state_dict, trainer_rank, actual_rank):
+    for name, tensor in state_dict.items():
+        if 'lora_A' in name:  # (actual_rank, hidden) -> (trainer_rank, hidden)
+            padded = torch.zeros(trainer_rank, tensor.shape[1])
+            padded[:actual_rank] = tensor
+            state_dict[name] = padded
+        elif 'lora_B' in name:  # (hidden, actual_rank) -> (hidden, trainer_rank)
+            padded = torch.zeros(tensor.shape[0], trainer_rank)
+            padded[:, :actual_rank] = tensor
+            state_dict[name] = padded
+    return state_dict
+```
+
+**Scaling correction:**
+
+LoRA output: `lora_B @ lora_A @ x * (alpha / rank)`
+
+If trainer uses fixed `alpha = 2 * trainer_rank`, scale output by `trainer_rank / actual_rank` for sessions with smaller rank.
+
+**Trade-off:**
+- Pro: One trainer per base_model instead of per (base_model, rank)
+- Con: Wasted FLOPs on zero dimensions, optimizer state for unused params
+
+**Changes:**
+- Pool key: `base_model` only
+- Session metadata: `actual_rank`, `alpha`
+- Load/save: pad/truncate helpers
+- Forward: scaling adjustment based on actual_rank
+
+---
+
+## Phase 8: Backport Multi-Session Sharing to Dense Models
+
+Same paradigm as Phase 6 for 7B dense models. Currently each session spawns new `TrainingWorker` (~30s init).
+
+Changes:
+- Add `save/load_session_state()` to `TrainingWorker`
+- Create `DenseTrainerPool` with `base_model` keying (using Phase 7 max-rank approach)
+- Unified interface with `MegatronActorPool`
+
+Swap latency: ~1s (50MB LoRA + 100MB optimizer) vs 30s restart.
+
+---
+
+## Phase 9: Adaptive Resource Management
+
+LRU-based actor pool with dynamic creation/eviction.
+
+```
+request_actor(model, type):
+  1. Actor exists -> reuse
+  2. Resources available -> create
+  3. Resources exhausted -> LRU evict idle actors until enough GPUs freed
+  4. Cannot free enough -> error
+```
+
+Safeguards:
+- Never evict actors with active sessions
+- Save session state before eviction
+- Minimum actor lifetime before eligible for eviction
+
+---
+
+## Phase 10: Model Lineup
+
+### Tinker Official Support (from tinker-cookbook/model_info.py)
+
+**Qwen:**
+| Model | Architecture | Active Params |
+|-------|--------------|---------------|
+| Qwen/Qwen2.5-{0.5,1.5,3,7,14,32,72}B[-Instruct] | Dense | Full |
+| Qwen/Qwen3-{0.6,1.7,4,8,14,32}B[-Base] | Dense | Full |
+| Qwen/Qwen3-30B-A3B[-Instruct-2507] | MoE 64E | 3B |
+| Qwen/Qwen3-235B-A22B-Instruct-2507 | MoE 128E | 22B |
+
+**DeepSeek:**
+| Model | Architecture | Active Params |
+|-------|--------------|---------------|
+| deepseek-ai/DeepSeek-V3.1[-Base] | MoE | 37B (671B total) |
+
+**Kimi (Moonshot AI):**
+| Model | Architecture | Active Params | Notes |
+|-------|--------------|---------------|-------|
+| moonshotai/Kimi-K2-Instruct | MoE | 32B (1T total) | Block-FP8 format |
+| moonshotai/Kimi-K2-Thinking | MoE | 32B (1T total) | Reasoning model |
+| moonshotai/Kimi-Dev-72B | Dense | 72B | Based on Qwen2.5-72B |
+
+### Our Support Plan
+
+**Supported:**
+| Model | Backend | Train GPUs | Infer GPUs | Status |
+|-------|---------|------------|------------|--------|
+| Qwen/Qwen2.5-7B-Instruct | PEFT | 1 | 1 | Verified |
+| Qwen/Qwen3-30B-A3B | Megatron | 8 (TP4,EP2) | 4 (TP4) | Verified |
+
+**To Test:**
+| Model | Backend | Train GPUs | Infer GPUs | Blockers |
+|-------|---------|------------|------------|----------|
+| Qwen/Qwen2.5-14B-Instruct | PEFT | 2 (TP2) | 2 | None |
+| Qwen/Qwen3-32B | PEFT/Megatron | 4 (TP4) | 4 | Dense, may fit single-node |
+| Qwen/Qwen3-235B-A22B | Megatron | 32 (TP8,EP4) | 16 | Multi-node |
+| deepseek-ai/DeepSeek-V3.1 | Megatron | 64+ | 32+ | Needs architecture support |
+| moonshotai/Kimi-K2-Instruct | Megatron | 64+ | 32+ | Block-FP8 format, 1T params |
+
+**Not Planned:**
+- Llama models (lower priority per user request)
+- Vision-language models
+
+### Architecture Requirements
+
+Dense models: PEFT LoRA, TP for >14B.
+MoE models: Megatron with TP + EP. Formula: `total_gpus = TP * EP`.
+
+---
+
+## Phase 11: Comprehensive Testing
+
+Compare our implementation against Tinker official on identical model/data/hyperparameters.
+
+**Correctness:**
+- Loss curve correlation r > 0.99
+- Final loss difference < 1%
+- Checkpoint round-trip produces identical weights
+
+**Performance:**
+- Throughput >= 90% of Tinker
+- Memory <= 110% of Tinker
+- Session swap p99 < 5s
+
+**Stress:**
+- 10K iterations without OOM/NaN
+- 100 sequential session swaps
+- 10 concurrent sessions on 1 actor
+
+---
+
 ## References
 
-- [verl Megatron Workers](https://github.com/volcengine/verl/blob/main/verl/workers/megatron_workers.py)
-- [verl Qwen3-30B LoRA Script](https://github.com/volcengine/verl/blob/main/examples/grpo_trainer/run_qwen3moe-30b_megatron_lora.sh)
-- [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)
-- [vLLM Multi-LoRA](https://docs.vllm.ai/en/latest/models/lora.html)
+- [verl megatron_peft_utils](https://github.com/volcengine/verl/blob/main/verl/utils/megatron_peft_utils.py)
+- [verl MegatronCheckpointManager](https://github.com/volcengine/verl/blob/main/verl/utils/checkpoint/megatron_checkpoint_manager.py)
+- [Kimi-K2-Instruct on HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct)

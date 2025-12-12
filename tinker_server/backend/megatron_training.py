@@ -56,6 +56,7 @@ class MegatronTrainingConfig:
 def tinker_to_tensordict(
     data_items: list[dict],
     max_token_len_per_gpu: int = 8192,
+    device: str | torch.device | None = None,
 ) -> TensorDict:
     """Convert Tinker Datum format to verl TensorDict.
 
@@ -88,6 +89,8 @@ def tinker_to_tensordict(
         data_items: List of Tinker Datum dicts.
         max_token_len_per_gpu: Max tokens per GPU for dynamic batch sizing.
             Used by verl's prepare_micro_batches when use_dynamic_bsz=True.
+        device: Target device for tensors. If None, uses CPU.
+            Creating tensors directly on GPU avoids CPU-to-GPU copy issues with nested tensors.
     """
     input_ids_list = []
     attention_mask_list = []
@@ -139,16 +142,18 @@ def tinker_to_tensordict(
     batch_size = len(input_ids_list)
 
     # verl expects nested/jagged tensors for variable-length sequences
-    # Convert each sample to a tensor, then create nested tensors
-    input_ids_tensors = [torch.tensor(seq, dtype=torch.long) for seq in input_ids_list]
-    loss_mask_tensors = [torch.tensor(seq, dtype=torch.bool) for seq in loss_mask_list]
-    position_ids_tensors = [torch.arange(len(seq), dtype=torch.long) for seq in input_ids_list]
+    # Create tensors directly on target device (GPU) to avoid .to() issues
+    # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
+    input_ids_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in input_ids_list]
+    loss_mask_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in loss_mask_list]
+    position_ids_tensors = [torch.arange(len(seq), dtype=torch.long, device=device) for seq in input_ids_list]
 
     # Create nested tensors with jagged layout
     input_ids = torch.nested.as_nested_tensor(input_ids_tensors, layout=torch.jagged)
     loss_mask = torch.nested.as_nested_tensor(loss_mask_tensors, layout=torch.jagged)
     position_ids = torch.nested.as_nested_tensor(position_ids_tensors, layout=torch.jagged)
 
+    # TensorDict (don't pass device= as it triggers .to() on nested tensors)
     td = TensorDict({
         "input_ids": input_ids,
         "loss_mask": loss_mask,
@@ -161,12 +166,12 @@ def tinker_to_tensordict(
     # Using set_non_tensor with float prevents batching/slicing by prepare_micro_batches
     td.set_non_tensor("temperature", 1.0)
 
-    # Add RL inputs if present (also as nested tensors)
+    # Add RL inputs if present (also as nested tensors on target device)
     if has_rl_inputs and old_log_probs_list:
-        old_log_probs_tensors = [torch.tensor(seq, dtype=torch.float) for seq in old_log_probs_list]
+        old_log_probs_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in old_log_probs_list]
         td["old_log_probs"] = torch.nested.as_nested_tensor(old_log_probs_tensors, layout=torch.jagged)
     if advantages_list:
-        advantages_tensors = [torch.tensor(seq, dtype=torch.float) for seq in advantages_list]
+        advantages_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in advantages_list]
         td["advantages"] = torch.nested.as_nested_tensor(advantages_tensors, layout=torch.jagged)
 
     # Add non-tensor metadata for verl's prepare_micro_batches
@@ -256,6 +261,14 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         return nll, metrics
 
     return sft_loss_with_logprobs
+
+
+def create_loss_fn() -> Callable:
+    """Create default loss function for warmup/initialization.
+
+    Returns SFT loss function as the default for forward-backward warmup.
+    """
+    return create_sft_loss_fn(return_logprobs=False)
 
 
 def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:

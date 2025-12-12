@@ -1,0 +1,66 @@
+# MINT Production Ray GPU Worker - DO NOT MODIFY FOR DEV
+# This cluster is for production deployment only.
+#
+# Before submitting:
+#   1. Get Ray head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
+#   2. Replace <RAY_HEAD_IP> with the actual IP address
+#
+# Submit with: volc ml_task submit -c mint-prod-worker.yaml --output json
+
+TaskName: "mint-prod-worker"
+Description: "MINT PRODUCTION - Ray GPU worker - DO NOT USE FOR DEV"
+
+Entrypoint: |
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
+  export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache
+
+  # Use PFS verl (has abort_all_requests method, needed for multi-lora)
+  export PYTHONPATH=/vePFS-Mindverse/share/code/verl:$PYTHONPATH
+
+  # Symlink to PFS code (tinker-server-auth for production)
+  rm -rf /root/tinker_project/tinker-server-auth
+  mkdir -p /root/tinker_project
+  ln -s /vePFS-Mindverse/share/code/tinker-server-auth /root/tinker_project/tinker-server-auth
+
+  echo "=== MINT PRODUCTION WORKER ==="
+  echo "Started at $(date)"
+  echo "Using PFS code via symlink:"
+  ls -la /root/tinker_project/tinker-server-auth/
+
+  # Read Ray head IP from PFS
+  RAY_HEAD_IP=$(cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt 2>/dev/null || echo "")
+  if [ -z "${RAY_HEAD_IP}" ]; then
+    echo "ERROR: Ray head IP not found. Ensure mint-prod-head is running."
+    echo "Expected file: /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"
+    sleep 300
+    exit 1
+  fi
+  echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
+
+  # Start Ray worker
+  ray start --address="${RAY_HEAD_IP}:6379" --num-gpus=2 && sleep infinity
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ResourceQueueID: "q-20251126180002-26lwz"
+Framework: "Custom"
+
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.pni2l.7xlarge"  # 2x A800 80GB
+
+# No time limit - runs indefinitely
+ActiveDeadlineSeconds: 0
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+
+Storages:
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse"
+      SubPath: ""
+      ReadOnly: true
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse/share"
+      SubPath: "share"
+      ReadOnly: false

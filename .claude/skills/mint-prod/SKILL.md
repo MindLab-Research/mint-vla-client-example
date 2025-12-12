@@ -1,0 +1,266 @@
+---
+name: mint-prod
+description: |
+  Production environment operations for the Mint server on Volcano cluster.
+
+  Use for: code sync, server start/stop, vLLM management, logs - all in PROD environment.
+
+  Triggers: "prod server", "start prod", "restart prod", "prod logs", "sync to prod", "prod vLLM", "production"
+
+  **Do NOT invoke this skill for development work. Use mint-dev instead.**
+
+  For cluster lifecycle (create/teardown tasks), invoke the volcano-cluster skill.
+---
+
+# Mint Production Environment
+
+## NEVER Do These (Development Belongs to mint-dev)
+
+- **NEVER** `ssh volcano` - that's development
+- **NEVER** use port `8000` - that's development
+- **NEVER** use `volcano-tinker` unison profile (without `-auth`) - that's development
+- **NEVER** use `mint-dev-*.yaml` Ray configs - that's development
+- **NEVER** use `tinker-server` directory (without `-auth`) - that's development
+- **NEVER** use `pkill -f "run_server"` - may kill dev server; use `fuser -k 18000/tcp`
+- **NEVER** omit `X-API-Key` header on API calls (except healthz)
+- **NEVER** omit `PYTHONPATH` override - causes auth bypass
+
+If user asks for development operations, **stop and invoke mint-dev skill instead**.
+
+---
+
+## Environment Config
+
+| Property | Value |
+|----------|-------|
+| SSH Host | `mint-prod` |
+| Port | 18000 |
+| Code Directory | `tinker-server-auth` |
+| PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
+| Unison Profile | `volcano-tinker-auth` |
+| Ray Configs | `mint-prod-head.yaml`, `mint-prod-worker.yaml` |
+| API Key | **Required** (`X-API-Key` header) |
+| Log File | `/tmp/tinker_server_auth.log` |
+
+**IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
+
+---
+
+## Quick Reference
+
+```bash
+# SSH tunnel
+ssh -f -N -L 18000:localhost:18000 mint-prod
+
+# Health check (no auth needed)
+curl http://localhost:18000/api/v1/healthz
+
+# Server logs
+ssh mint-prod "tail -50 /tmp/tinker_server_auth.log"
+
+# vLLM status (auth required)
+curl -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status
+
+# Kill vLLM (auth required)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+```
+
+---
+
+## 1. Code Synchronization
+
+> **CRITICAL: ALWAYS USE DAEMON MODE (`-repeat watch`)**
+>
+> **NEVER** run one-off `unison volcano-tinker-auth -batch` commands. This causes stale code on workers.
+
+```bash
+# Start daemon (run first, keep running)
+unison volcano-tinker-auth -repeat watch
+
+# Check if running
+pgrep -af "unison.*volcano-tinker-auth"
+
+# Stop daemon
+pkill -f "unison.*volcano-tinker-auth"
+```
+
+**First-time setup:**
+```bash
+cp .claude/skills/mint-prod/configs/volcano-tinker-auth.prf ~/.unison/
+```
+
+**SSH server symlink setup** (one-time):
+```bash
+ssh mint-prod "rm -rf /root/tinker_project/tinker-server-auth && \
+  ln -s /vePFS-Mindverse/share/code/tinker-server-auth /root/tinker_project/tinker-server-auth"
+```
+
+---
+
+## 2. Server Management
+
+### Environment Variables
+
+```bash
+export HF_HUB_OFFLINE=1
+export HF_HOME=/vePFS-Mindverse/share/huggingface
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH
+export TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+export TINKER_API_KEY=<API_KEY>
+export TINKER_PORT=18000
+```
+
+**IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
+
+### Start Server
+
+```bash
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
+  PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH \
+  HF_HUB_OFFLINE=1 \
+  HF_HOME=/vePFS-Mindverse/share/huggingface \
+  PYTHONDONTWRITEBYTECODE=1 \
+  TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  TINKER_API_KEY=<API_KEY> \
+  TINKER_PORT=18000 \
+  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
+```
+
+### Stop Server
+
+**Use `fuser` to kill only port 18000. Do NOT use `pkill` - it may kill dev server too.**
+
+```bash
+ssh mint-prod 'fuser -k 18000/tcp'
+```
+
+### Check Status
+
+```bash
+ssh mint-prod "ps aux | grep run_server | grep -v grep"
+```
+
+---
+
+## 3. vLLM Actor
+
+| Operation | Time | When to use |
+|-----------|------|-------------|
+| Reconnect (existing) | ~2s | Server restart, vLLM actor still alive |
+| Kill + restart | ~80s | Base model changed, OOM, vLLM code changed |
+
+### Kill vLLM Actor
+
+```bash
+# Via API (requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+
+# Via script (if server down)
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_vllm.py'
+```
+
+---
+
+## 4. Code Update SOP
+
+| Changed Code | Required Actions |
+|--------------|------------------|
+| `megatron_*.py`, `megatron_distributed.py` | Kill Megatron actor + restart server |
+| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | Kill vLLM actor + restart server |
+| Route handlers, middleware, other server code | Restart server only |
+
+### Fast Restart (no vLLM changes)
+
+```bash
+ssh mint-prod 'fuser -k 18000/tcp 2>/dev/null; sleep 2'
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
+  PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH \
+  HF_HUB_OFFLINE=1 \
+  HF_HOME=/vePFS-Mindverse/share/huggingface \
+  PYTHONDONTWRITEBYTECODE=1 \
+  TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  TINKER_API_KEY=<API_KEY> \
+  TINKER_PORT=18000 \
+  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
+```
+
+### Full Restart (vLLM changes)
+
+```bash
+# Kill vLLM (requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+
+# Restart server
+ssh mint-prod 'fuser -k 18000/tcp 2>/dev/null; sleep 2'
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
+  PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH \
+  HF_HUB_OFFLINE=1 \
+  HF_HOME=/vePFS-Mindverse/share/huggingface \
+  PYTHONDONTWRITEBYTECODE=1 \
+  TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  TINKER_API_KEY=<API_KEY> \
+  TINKER_PORT=18000 \
+  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
+
+# Wait for vLLM init (~80s)
+sleep 80 && curl -s http://localhost:18000/api/v1/healthz
+```
+
+---
+
+## 5. Ray Cluster
+
+**Connect SSH server to cluster:**
+```bash
+ssh mint-prod "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+```
+
+**Get Ray head IP from PFS:**
+```bash
+cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt
+```
+
+**For cluster create/teardown, invoke the `volcano-cluster` skill.**
+
+Prod-specific values:
+- Ray head config: `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`
+- Ray worker config: `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml`
+- Task names: include "prod" prefix
+
+---
+
+## 6. Debugging
+
+```bash
+# Error search
+ssh mint-prod "grep -i 'error\|exception\|traceback' /tmp/tinker_server_auth.log | tail -20"
+
+# Training worker logs
+ssh mint-prod "grep 'TrainingWorker' /tmp/tinker_server_auth.log | tail -20"
+
+# Forward/backward issues
+ssh mint-prod "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.log | tail -10"
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Unison not running | `pgrep -af "unison.*volcano-tinker-auth"` then restart daemon |
+| Symlink broken | Re-run symlink setup command |
+| Server won't start | Check logs: `tail -100 /tmp/tinker_server_auth.log` |
+| Auth bypass | Verify `PYTHONPATH` prioritizes `tinker-server-auth` |
+| Can't connect | Check SSH tunnel (port 18000), Ray cluster connection |
+| vLLM OOM | Kill vLLM actor, restart server |
+
+---
+
+## Common Mistakes
+
+1. **Using `pkill` instead of `fuser -k 18000/tcp`** - may kill dev server running on same host
+2. **Missing `PYTHONPATH` override** - causes auth bypass (loads pip-installed `tinker-server` without auth)
+3. **Forgetting `X-API-Key` header** - all endpoints except healthz require auth
+4. **Wrong port** - prod uses 18000, not 8000

@@ -249,10 +249,20 @@ class MegatronRankWorker:
             # moe_router_topk = num_experts_per_tok (active experts per token)
             num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 2)
             override_tf_config["moe_router_topk"] = num_experts_per_tok
+            # Disable permute fusion due to Triton version incompatibility
+            # (triton 3.5.0 + transformer_engine 2.9.0 causes get_int_dtype error)
+            override_tf_config["moe_permute_fusion"] = False
             logger.info(
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
                 f"top-{num_experts_per_tok} routing"
             )
+
+        # For LoRA training, disable grad_offload to keep gradient buffers allocated.
+        # The distributed optimizer needs gradient storage, but offloading resizes it to 0.
+        # LoRA adapter grads are small so grad_offload isn't needed for memory.
+        use_grad_offload = False if self.lora_rank > 0 else True
+        if self.lora_rank > 0:
+            logger.info(f"[Rank {self.rank}] LoRA enabled (rank={self.lora_rank}), disabling grad_offload")
 
         engine_config = McoreEngineConfig(
             tensor_model_parallel_size=self.config.tensor_parallel_size,
@@ -261,11 +271,11 @@ class MegatronRankWorker:
             context_parallel_size=self.config.context_parallel_size,
             param_offload=True,
             optimizer_offload=True,
-            grad_offload=True,
+            grad_offload=use_grad_offload,
             dtype="bfloat16",
             use_mbridge=True,
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
-            use_distributed_optimizer=True,
+            use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
             override_transformer_config=override_tf_config,
         )
 
@@ -290,12 +300,95 @@ class MegatronRankWorker:
             checkpoint_config=checkpoint_config,
         )
         self.engine.initialize()
-
         logger.info(f"[Rank {self.rank}] MegatronEngineWithLMHead initialized")
+
+        # CUDA sync and test to detect corruption early
+        import torch
+        torch.cuda.synchronize()
+        try:
+            test_tensor = torch.ones(1, device="cuda:0")
+            torch.cuda.synchronize()  # Force error detection
+            logger.info(f"[Rank {self.rank}] Post-init CUDA test passed: {test_tensor.item()}")
+            del test_tensor
+        except Exception as e:
+            logger.error(f"[Rank {self.rank}] Post-init CUDA test FAILED: {e}")
+            raise RuntimeError(f"CUDA corrupted after engine init: {e}")
+
+        # Warmup disabled: nested tensors with CUDA cause issues
+        # If warmup is needed in the future, ensure CUDA operations work correctly first
+        # if self.lora_rank > 0:
+        #     self._warmup_lora_weights()
+        logger.info(f"[Rank {self.rank}] Skipping warmup (nested tensor CUDA issues)")
+
+    def _warmup_lora_weights(self):
+        """Run warmup forward_backward to initialize LoRA weight storage.
+
+        When param_offload=True, LoRA adapter weights may not be allocated until
+        the first forward_backward pass. If forward_only=True is called first
+        (e.g., NLL evaluation in SL recipes), the weights remain unallocated,
+        causing "storage size of 0" errors.
+
+        This warmup runs a dummy forward_backward to force weight allocation.
+        verl's forward_backward_batch expects loss_mask for token counting.
+        """
+        import torch
+        from tensordict import TensorDict
+        from tensordict.tensorclass import NonTensorData
+
+        logger.info(f"[Rank {self.rank}] Running LoRA warmup forward_backward...")
+
+        # Create minimal dummy batch (4 tokens) with fields verl expects
+        device = torch.cuda.current_device()
+        seq_len = 4
+
+        # Use nested tensors to match actual training data format
+        dummy_input_ids_t = torch.tensor([1, 2, 3, 4], dtype=torch.long, device=device)
+        dummy_position_ids_t = torch.arange(seq_len, dtype=torch.long, device=device)
+        dummy_loss_mask_t = torch.ones(seq_len, dtype=torch.bool, device=device)
+
+        # Create nested tensors with jagged layout (batch size 1)
+        input_ids = torch.nested.as_nested_tensor([dummy_input_ids_t], layout=torch.jagged)
+        position_ids = torch.nested.as_nested_tensor([dummy_position_ids_t], layout=torch.jagged)
+        loss_mask = torch.nested.as_nested_tensor([dummy_loss_mask_t], layout=torch.jagged)
+
+        dummy_data = TensorDict(
+            {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "loss_mask": loss_mask,
+            },
+            batch_size=[1],
+            device=device,
+        )
+
+        # Add non-tensor metadata for verl's prepare_micro_batches
+        dummy_data["use_dynamic_bsz"] = NonTensorData(True)
+        dummy_data["max_token_len_per_gpu"] = NonTensorData(8192)
+        dummy_data.set_non_tensor("dp_size", 1)
+        dummy_data.set_non_tensor("batch_num_tokens", seq_len)
+        dummy_data.set_non_tensor("temperature", 1.0)
+
+        # Run forward_backward (not forward_only) to allocate LoRA weights
+        from tinker_server.backend.megatron_training import create_loss_fn
+
+        loss_function = create_loss_fn()
+        try:
+            self.engine.forward_backward_batch(
+                data=dummy_data,
+                loss_function=loss_function,
+                forward_only=False,
+            )
+            # Zero gradients after warmup
+            self.engine.optimizer.zero_grad()
+            logger.info(f"[Rank {self.rank}] LoRA warmup complete")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] LoRA warmup failed (non-fatal): {e}")
+            import traceback
+            logger.warning(f"[Rank {self.rank}] Warmup traceback: {traceback.format_exc()}")
 
     def forward_backward(
         self,
-        data: TensorDict,
+        data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
     ) -> dict:
@@ -303,28 +396,37 @@ class MegatronRankWorker:
 
         Gradients are synchronized via NCCL allreduce.
         Returns metrics from rank 0 only, including per-sample loss_fn_outputs.
+
+        Note: TensorDict with nested tensors is created locally to avoid Ray
+        serialization issues that cause CUDA memory corruption.
         """
         import torch
         from tinker_server.backend.megatron_training import (
-            create_sft_loss_fn, create_ppo_loss_fn
+            create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
         )
 
-        # Extract per-sample sequence lengths BEFORE moving to device
-        # Needed to split concatenated log_probs back into per-sample tensors
+        # Get sequence lengths from raw data (before tensor creation)
         seq_lengths = []
-        input_ids = data.get("input_ids")
-        if input_ids is not None:
-            if hasattr(input_ids, 'unbind'):
-                for seq in input_ids.unbind():
-                    seq_lengths.append(len(seq))
-            elif hasattr(input_ids, '_offsets'):
-                offsets = input_ids._offsets.tolist()
-                for i in range(len(offsets) - 1):
-                    seq_lengths.append(offsets[i + 1] - offsets[i])
+        for item in data_items:
+            model_input = item.get("model_input", {})
+            chunks = model_input.get("chunks", [])
+            if chunks and "tokens" in chunks[0]:
+                seq_lengths.append(len(chunks[0]["tokens"]))
 
-        # Move data to this rank's device
+        # Test CUDA context before creating TensorDict
         device = torch.cuda.current_device()
-        data = data.to(device)
+        try:
+            test_tensor = torch.ones(1, device=f"cuda:{device}")
+            torch.cuda.synchronize()  # Force error detection here
+            logger.info(f"[Rank {self.rank}] CUDA context valid, test tensor on cuda:{device}")
+            del test_tensor
+        except Exception as e:
+            logger.error(f"[Rank {self.rank}] CUDA context INVALID at forward_backward start: {e}")
+            raise RuntimeError(f"CUDA context corrupted before forward_backward: {e}")
+
+        # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
+        # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
+        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
 
         # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
@@ -337,15 +439,18 @@ class MegatronRankWorker:
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-        # Zero gradients
-        self.engine.optimizer_zero_grad()
+        # Use train_mode context to load model from CPU to GPU (required for param_offload)
+        # The context manager handles: load to GPU on __enter__, offload to CPU on __exit__
+        with self.engine.train_mode():
+            # Zero gradients (must be after model is on GPU)
+            self.engine.optimizer_zero_grad()
 
-        # Run forward-backward (engine handles gradient sync)
-        result = self.engine.forward_backward_batch(
-            data=data,
-            loss_function=loss_function,
-            forward_only=False,
-        )
+            # Run forward-backward (engine handles gradient sync)
+            result = self.engine.forward_backward_batch(
+                data=data,
+                loss_function=loss_function,
+                forward_only=False,
+            )
 
         # Only rank 0 returns metrics
         if self.rank == 0:
@@ -436,7 +541,7 @@ class MegatronRankWorker:
 
     def forward(
         self,
-        data: TensorDict,
+        data_items: list[dict],
     ) -> dict:
         """Run forward pass only (no backward). Returns per-token logprobs.
 
@@ -446,44 +551,39 @@ class MegatronRankWorker:
 
         Important: Creates one loss_fn_outputs entry per sample (not per micro-batch)
         to match cookbook's NLL evaluator expectations.
+
+        Note: TensorDict with nested tensors is created locally to avoid Ray
+        serialization issues that cause CUDA memory corruption.
         """
         import torch
+        from tinker_server.backend.megatron_training import tinker_to_tensordict
 
-        # Extract per-sample sequence lengths from input data BEFORE moving to device
-        # This is needed to split the concatenated log_probs back into per-sample tensors
+        # Get sequence lengths from raw data (before tensor creation)
         seq_lengths = []
-        input_ids = data.get("input_ids")
-        if input_ids is not None:
-            if hasattr(input_ids, 'unbind'):
-                # NestedTensor: unbind to get individual tensors
-                for seq in input_ids.unbind():
-                    seq_lengths.append(len(seq))
-            elif hasattr(input_ids, '_offsets'):
-                # Alternative: use offsets from jagged tensor
-                offsets = input_ids._offsets.tolist()
-                for i in range(len(offsets) - 1):
-                    seq_lengths.append(offsets[i + 1] - offsets[i])
-            else:
-                # Padded tensor: use attention_mask to find actual lengths
-                attention_mask = data.get("attention_mask")
-                if attention_mask is not None:
-                    seq_lengths = attention_mask.sum(dim=1).tolist()
+        for item in data_items:
+            model_input = item.get("model_input", {})
+            chunks = model_input.get("chunks", [])
+            if chunks and "tokens" in chunks[0]:
+                seq_lengths.append(len(chunks[0]["tokens"]))
 
-        # Move data to this rank's device
+        # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
-        data = data.to(device)
+        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn
         loss_function = create_logprob_extractor_fn()
 
-        # Run forward only (no gradient sync)
-        with torch.no_grad():
-            result = self.engine.forward_backward_batch(
-                data=data,
-                loss_function=loss_function,
-                forward_only=True,
-            )
+        # Use eval_mode context to load model from CPU to GPU (required for param_offload)
+        # eval_mode is used for forward-only operations
+        with self.engine.eval_mode():
+            # Run forward only (no gradient sync)
+            with torch.no_grad():
+                result = self.engine.forward_backward_batch(
+                    data=data,
+                    loss_function=loss_function,
+                    forward_only=True,
+                )
 
         # Only rank 0 returns metrics
         if self.rank == 0:
@@ -572,8 +672,11 @@ class MegatronRankWorker:
     def optim_step(self, learning_rate: float) -> dict:
         """Run optimizer step (synchronized across ranks)."""
         # Note: learning_rate not used directly - verl engine handles LR scheduling
-        grad_norm = self.engine.optimizer_step()
-        current_lr = self.engine.lr_scheduler_step()
+        # Use train_mode context to ensure model/gradients are on GPU (required for param_offload)
+        # Without this, optimizer would access offloaded tensors with invalid CUDA pointers
+        with self.engine.train_mode():
+            grad_norm = self.engine.optimizer_step()
+            current_lr = self.engine.lr_scheduler_step()
 
         if self.rank == 0:
             # Handle current_lr being either a float or a list
@@ -976,16 +1079,12 @@ class MegatronWorkerGroup:
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
-        from tinker_server.backend.megatron_training import tinker_to_tensordict
-
         loss_fn_config = loss_fn_config or {}
 
-        # Convert to TensorDict
-        data = tinker_to_tensordict(data_items)
-
-        # Broadcast to all workers
+        # Send raw data_items to workers (TensorDict created locally on each worker
+        # to avoid Ray serialization issues with nested tensors)
         futures = [
-            w.forward_backward.remote(data, loss_fn, loss_fn_config)
+            w.forward_backward.remote(data_items, loss_fn, loss_fn_config)
             for w in self.workers
         ]
         results = ray.get(futures)
@@ -1032,13 +1131,9 @@ class MegatronWorkerGroup:
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
-        from tinker_server.backend.megatron_training import tinker_to_tensordict
-
-        # Convert to TensorDict
-        data = tinker_to_tensordict(data_items)
-
-        # Broadcast to all workers
-        futures = [w.forward.remote(data) for w in self.workers]
+        # Send raw data_items to workers (TensorDict created locally on each worker
+        # to avoid Ray serialization issues with nested tensors)
+        futures = [w.forward.remote(data_items) for w in self.workers]
         results = ray.get(futures)
 
         # Rank 0 result has metrics, loss_fn_outputs, and log_probs
