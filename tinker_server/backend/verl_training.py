@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -19,12 +21,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Default idle timeout for TrainingWorker (seconds)
+# Worker self-terminates if no activity for this duration
+DEFAULT_IDLE_TIMEOUT = 300  # 5 minutes
+
 
 @ray.remote(num_gpus=1)
 class TrainingWorker:
     """Ray actor holding model + optimizer on dedicated GPU.
 
     Each instance runs in its own process with exclusive GPU access.
+    Auto-terminates after idle_timeout seconds of inactivity.
     """
 
     def __init__(
@@ -32,6 +39,7 @@ class TrainingWorker:
         base_model: str,
         lora_rank: int,
         learning_rate: float,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     ):
         """Initialize model and optimizer on this worker's GPU.
 
@@ -39,8 +47,25 @@ class TrainingWorker:
             base_model: HuggingFace model path.
             lora_rank: LoRA adapter rank.
             learning_rate: Initial learning rate for optimizer.
+            idle_timeout: Seconds of inactivity before self-termination.
+                          Set to 0 to disable auto-termination.
         """
         self.device = torch.device("cuda")
+
+        # Idle timeout tracking
+        self._last_activity = time.time()
+        self._idle_timeout = idle_timeout
+        self._shutdown_requested = False
+
+        # Start watchdog thread if timeout enabled
+        if idle_timeout > 0:
+            self._watchdog_thread = threading.Thread(
+                target=self._idle_watchdog,
+                daemon=True,
+                name="TrainingWorker-IdleWatchdog",
+            )
+            self._watchdog_thread.start()
+            logger.info(f"[TrainingWorker] Idle watchdog started (timeout={idle_timeout}s)")
 
         logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
 
@@ -82,6 +107,49 @@ class TrainingWorker:
 
         logger.info("[TrainingWorker] Ready")
 
+    def _touch(self) -> None:
+        """Update last activity timestamp. Call at start of every method."""
+        self._last_activity = time.time()
+
+    def _idle_watchdog(self) -> None:
+        """Background thread that monitors for idle timeout.
+
+        Checks every 30 seconds if the worker has been idle too long.
+        If so, terminates the actor to release GPU resources.
+        """
+        check_interval = 30  # seconds between checks
+        while not self._shutdown_requested:
+            time.sleep(check_interval)
+            if self._shutdown_requested:
+                break
+
+            idle_time = time.time() - self._last_activity
+            if idle_time >= self._idle_timeout:
+                logger.warning(
+                    f"[TrainingWorker] Idle for {idle_time:.0f}s (timeout={self._idle_timeout}s), "
+                    "self-terminating to release GPU"
+                )
+                # Clean shutdown
+                try:
+                    self.shutdown()
+                except Exception as e:
+                    logger.error(f"[TrainingWorker] Shutdown error: {e}")
+                # Exit the Ray actor
+                ray.actor.exit_actor()
+                return
+
+    def heartbeat(self) -> dict:
+        """Keep worker alive and return status. Call periodically to prevent idle timeout.
+
+        Returns:
+            Dict with idle_time and timeout info.
+        """
+        self._touch()
+        return {
+            "idle_timeout": self._idle_timeout,
+            "time_until_timeout": max(0, self._idle_timeout - (time.time() - self._last_activity)),
+        }
+
     def forward_backward(
         self,
         data_items: list[dict],
@@ -106,6 +174,7 @@ class TrainingWorker:
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        self._touch()
         self.model.train()
         loss_fn_config = loss_fn_config or {}
 
@@ -352,6 +421,7 @@ class TrainingWorker:
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
         """
+        self._touch()
         self.model.eval()
 
         total_loss = 0.0
@@ -481,6 +551,7 @@ class TrainingWorker:
         Returns:
             Dict with metrics.
         """
+        self._touch()
         # Update learning rate if provided
         if learning_rate is not None:
             for pg in self.optimizer.param_groups:
@@ -505,6 +576,7 @@ class TrainingWorker:
         Returns:
             Dict mapping parameter names to tensors (on CPU).
         """
+        self._touch()
         from peft.utils.save_and_load import get_peft_model_state_dict
 
         state_dict = get_peft_model_state_dict(self.model)
@@ -537,6 +609,7 @@ class TrainingWorker:
         Returns:
             Absolute path where weights were saved.
         """
+        self._touch()
         import json
         import os
 
@@ -566,6 +639,7 @@ class TrainingWorker:
         Returns:
             Dict with training metadata.
         """
+        self._touch()
         import json
         import os
 
@@ -607,6 +681,7 @@ class TrainingWorker:
         Returns:
             Dict with training metadata.
         """
+        self._touch()
         import json
         import os
 
@@ -644,10 +719,15 @@ class TrainingWorker:
         return meta
 
     def shutdown(self) -> None:
-        """Release GPU resources."""
+        """Release GPU resources and stop watchdog thread."""
         logger.info("[TrainingWorker] Shutting down")
-        del self.model
-        del self.optimizer
+        # Stop watchdog thread
+        self._shutdown_requested = True
+        # Release GPU resources
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "optimizer"):
+            del self.optimizer
         torch.cuda.empty_cache()
 
 
