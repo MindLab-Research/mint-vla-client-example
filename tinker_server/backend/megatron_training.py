@@ -114,8 +114,13 @@ def tinker_to_tensordict(
         input_ids_list.append(tokens)
 
         # Extract weights (loss mask)
-        weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
-        weights = weights_data.get("data", []) if weights_data else [1.0] * len(tokens)
+        # Try "weights" first, then "mask"; if neither has data, default to all 1s
+        weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask")
+        if weights_data and weights_data.get("data"):
+            weights = weights_data["data"]
+        else:
+            # Default: all tokens contribute to loss
+            weights = [1.0] * len(tokens)
         loss_mask_list.append(weights)
 
         # RL inputs (optional)
@@ -179,58 +184,129 @@ def tinker_to_tensordict(
     return td
 
 
-def create_sft_loss_fn() -> Callable:
-    """Create SFT loss function using verl's built-in implementation.
-
-    verl's postprocess_micro_batch_func calls:
-        loss, metrics = loss_function(model_output=..., data=..., dp_group=...)
-
-    verl's sft_loss expects:
-        - model_output["log_probs"]: log probabilities from model forward
-        - data["loss_mask"]: NestedTensor with mask for loss computation
-        - data["dp_size"]: data parallel size
-        - data["batch_num_tokens"]: total tokens for normalization
-
-    Returns partial of verl.workers.roles.utils.losses.sft_loss with config=None.
-    """
-    from functools import partial
-    from verl.workers.roles.utils.losses import sft_loss
-
-    return partial(sft_loss, config=None)
-
-
-def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
-    """Create PPO loss function.
+def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
+    """Create SFT loss function that also extracts per-token log_probs.
 
     verl's postprocess_micro_batch_func calls:
         loss, metrics = loss_function(model_output=..., data=..., dp_group=...)
 
     Args:
+        return_logprobs: If True, include log_probs in metrics (for cookbook train_nll)
+
+    Returns:
+        Loss function compatible with verl's forward_backward_batch.
+    """
+    def sft_loss_with_logprobs(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
+        """SFT cross-entropy loss that also returns log_probs for metrics.
+
+        Args:
+            model_output: dict with "log_probs" key containing log probabilities
+            data: TensorDict with loss_mask, dp_size, batch_num_tokens
+            dp_group: data parallel group (unused)
+
+        Returns:
+            Tuple of (loss_tensor, metrics_dict_with_logprobs)
+        """
+        log_probs = model_output.get("log_probs")
+
+        if log_probs is None:
+            loss = torch.tensor(0.0)
+            return loss, {"error": "no_log_probs", "num_tokens": 0}
+
+        # Handle NestedTensor format from verl (NO_PADDING mode)
+        if hasattr(log_probs, 'values'):
+            log_probs_flat = log_probs.values()
+        else:
+            log_probs_flat = log_probs
+
+        # Get loss_mask to identify which tokens contribute to loss
+        loss_mask = data.get("loss_mask")
+        if loss_mask is not None and hasattr(loss_mask, 'values'):
+            loss_mask_flat = loss_mask.values()
+        elif loss_mask is not None:
+            loss_mask_flat = loss_mask
+        else:
+            # Default: all tokens contribute
+            loss_mask_flat = torch.ones_like(log_probs_flat, dtype=torch.bool)
+
+        # Ensure types are compatible
+        loss_mask_float = loss_mask_flat.float()
+
+        # Compute SFT loss: -sum(log_probs * mask) / sum(mask)
+        # log_probs are already the target token log probs from verl's forward
+        weighted_log_probs = log_probs_flat * loss_mask_float
+        num_tokens = loss_mask_float.sum()
+
+        if num_tokens > 0:
+            nll = -weighted_log_probs.sum() / num_tokens
+        else:
+            nll = -weighted_log_probs.sum()
+
+        # Clone log_probs for metrics (detach to avoid affecting gradients)
+        log_probs_cpu = log_probs_flat.detach().cpu()
+
+        metrics = {
+            "loss": nll.detach(),
+            "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
+        }
+
+        if return_logprobs:
+            metrics["log_probs"] = log_probs_cpu
+
+        return nll, metrics
+
+    return sft_loss_with_logprobs
+
+
+def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
+    """Create PPO loss function compatible with verl's model_output format.
+
+    verl's postprocess_micro_batch_func calls:
+        loss, metrics = loss_function(model_output=..., data=..., dp_group=...)
+
+    verl's model_output is a dict with:
+        - "log_probs": log probabilities from model forward (already computed)
+        - "entropy": (optional) entropy values
+
+    Args:
         epsilon: Clipping parameter for PPO.
     """
-    def ppo_loss_fn(model_output: torch.Tensor, data: TensorDict, dp_group=None) -> tuple:
+    def ppo_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """PPO clipped objective loss.
 
         Args:
-            model_output: logits tensor from model forward pass
+            model_output: dict with "log_probs" key containing log probabilities
             data: TensorDict with input_ids, loss_mask, old_log_probs, advantages
             dp_group: data parallel group (may be used for normalization)
 
         Returns:
             Tuple of (loss_tensor, metrics_dict)
         """
-        logits = model_output
+        # Extract log_probs from model output (verl provides this, not raw logits)
+        new_log_probs = model_output["log_probs"]
 
-        # Shift for language modeling
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = data["input_ids"][..., 1:].contiguous()
-        shift_mask = data["loss_mask"][..., 1:].contiguous().float()
-        old_log_probs = data["old_log_probs"][..., 1:].contiguous()
-        advantages = data["advantages"][..., 1:].contiguous()
+        # Handle nested tensor format from verl (NO_PADDING mode)
+        if hasattr(new_log_probs, 'values'):
+            new_log_probs = new_log_probs.values()
 
-        # Compute new log probs
-        log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-        new_log_probs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+        # Get old log probs and advantages from data
+        old_log_probs = data["old_log_probs"]
+        advantages = data["advantages"]
+        loss_mask = data["loss_mask"]
+
+        # Handle nested tensors (verl NO_PADDING mode)
+        if hasattr(old_log_probs, 'values'):
+            old_log_probs = old_log_probs.values()
+        if hasattr(advantages, 'values'):
+            advantages = advantages.values()
+        if hasattr(loss_mask, 'values'):
+            loss_mask = loss_mask.values()
+
+        loss_mask = loss_mask.float()
+
+        # Note: No shift needed for RL training
+        # Client sends aligned old_log_probs and loss_mask for response tokens
+        # verl's new_log_probs are already aligned with old_log_probs
 
         # Importance ratio
         log_ratio = new_log_probs - old_log_probs
@@ -243,28 +319,106 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         pg_loss = torch.maximum(pg_loss1, pg_loss2)
 
         # Weighted average
-        masked_loss = pg_loss * shift_mask
-        num_tokens = shift_mask.sum()
+        masked_loss = pg_loss * loss_mask
+        num_tokens = loss_mask.sum()
 
-        if num_tokens > 0:
-            loss = masked_loss.sum() / num_tokens
+        # Get dp_size and batch_num_tokens for proper normalization
+        # TensorDict.get() may return NonTensorData wrappers, extract .data attribute
+        dp_size = data.get("dp_size", 1)
+        if hasattr(dp_size, 'data'):
+            dp_size = dp_size.data
+        batch_num_tokens = data.get("batch_num_tokens", num_tokens)
+        if hasattr(batch_num_tokens, 'data'):
+            batch_num_tokens = batch_num_tokens.data
+
+        # Convert to Python scalar for comparison
+        if hasattr(batch_num_tokens, 'item'):
+            batch_num_tokens_scalar = batch_num_tokens.item()
+        else:
+            batch_num_tokens_scalar = float(batch_num_tokens)
+
+        if batch_num_tokens_scalar > 0:
+            loss = masked_loss.sum() / batch_num_tokens * dp_size
         else:
             loss = masked_loss.sum()
 
         # Clip fraction metric
         clipped = ((ratio < 1 - epsilon) | (ratio > 1 + epsilon)).float()
-        clip_frac = (clipped * shift_mask).sum() / max(num_tokens, 1)
-        ratio_mean = (ratio * shift_mask).sum() / max(num_tokens, 1)
+        clip_frac = (clipped * loss_mask).sum() / max(num_tokens, 1)
+        ratio_mean = (ratio * loss_mask).sum() / max(num_tokens, 1)
 
         metrics = {
-            "loss": loss.item(),
-            "num_tokens": int(num_tokens.item()),
-            "clip_frac": clip_frac.item(),
-            "ratio_mean": ratio_mean.item(),
+            "loss": loss.detach().item(),
+            "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
+            "clip_frac": clip_frac.detach().item() if hasattr(clip_frac, 'item') else float(clip_frac),
+            "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, 'item') else float(ratio_mean),
         }
         return loss, metrics
 
     return ppo_loss_fn
+
+
+def create_logprob_extractor_fn() -> Callable:
+    """Create a function that extracts per-token log_probs from model forward.
+
+    Used for Chat SL and DPO which need per-token log probabilities
+    rather than aggregate loss. verl computes log_probs during forward
+    and passes them to the loss function.
+
+    Returns a function that returns:
+        - Zero loss (no training signal)
+        - Metrics dict containing per-token log_probs
+    """
+    def logprob_extractor(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
+        """Extract per-token log_probs from model_output.
+
+        Args:
+            model_output: dict with "log_probs" containing per-token log probabilities
+            data: TensorDict with input_ids, loss_mask, etc.
+            dp_group: data parallel group (unused)
+
+        Returns:
+            Tuple of (zero_loss, metrics_with_logprobs)
+        """
+        log_probs = model_output.get("log_probs")
+
+        if log_probs is None:
+            # Fallback: model didn't compute log_probs
+            loss = torch.tensor(0.0)
+            return loss, {"error": "no_log_probs", "num_tokens": 0}
+
+        # Handle NestedTensor format from verl (NO_PADDING mode)
+        if hasattr(log_probs, 'values'):
+            log_probs = log_probs.values()
+
+        # Get loss_mask to identify response tokens
+        loss_mask = data.get("loss_mask")
+        if loss_mask is not None and hasattr(loss_mask, 'values'):
+            loss_mask = loss_mask.values()
+
+        # Clone and detach log_probs
+        log_probs_cpu = log_probs.detach().cpu()
+
+        # Compute aggregate loss for compatibility (NLL)
+        if loss_mask is not None:
+            loss_mask_float = loss_mask.float() if loss_mask is not None else torch.ones_like(log_probs)
+            nll = -(log_probs * loss_mask_float).sum()
+            num_tokens = loss_mask_float.sum().item()
+            if num_tokens > 0:
+                nll = nll / num_tokens
+        else:
+            nll = -log_probs.mean()
+            num_tokens = log_probs.numel()
+
+        # Return log_probs in metrics
+        metrics = {
+            "loss": nll.detach().item() if hasattr(nll, 'item') else float(nll),
+            "num_tokens": int(num_tokens),
+            "log_probs": log_probs_cpu,  # Per-token log probabilities tensor
+        }
+        return nll, metrics
+
+    return logprob_extractor
 
 
 @ray.remote(num_gpus=1)  # TODO: Implement multi-GPU parallelism
@@ -495,35 +649,84 @@ class MegatronTrainingWorker:
         }
 
     def forward(self, data_items: list[dict]) -> dict:
-        """Forward pass only (no backward). Returns logprobs.
+        """Forward pass only (no backward). Returns per-token logprobs.
 
         Args:
             data_items: List of Tinker Datum dicts.
 
         Returns:
-            Dict with loss_fn_outputs (including logprobs) and metrics.
+            Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
         data = tinker_to_tensordict(data_items)
         device = f"cuda:{torch.distributed.get_rank() % 8}"
         data = data.to(device)
 
-        loss_function = create_sft_loss_fn()
+        # Use logprob extractor to get per-token log probabilities
+        loss_function = create_logprob_extractor_fn()
 
         # Forward only via engine
-        result = self.engine.forward_backward_batch(
-            data=data,
-            loss_function=loss_function,
-            forward_only=True,
-        )
+        with torch.no_grad():
+            result = self.engine.forward_backward_batch(
+                data=data,
+                loss_function=loss_function,
+                forward_only=True,
+            )
 
-        logger.info("[MegatronTrainingWorker] forward completed")
+        # Extract per-token log_probs from result
+        loss_value = 0.0
+        num_tokens = 0
+        all_log_probs = []
+        loss_fn_outputs = []
+
+        if result and len(result) > 0:
+            for micro_result in result:
+                if isinstance(micro_result, dict):
+                    loss = micro_result.get("loss", 0.0)
+                    if hasattr(loss, "item"):
+                        loss = loss.item()
+                    loss_value += float(loss)
+
+                    tokens = micro_result.get("num_tokens", 0)
+                    if hasattr(tokens, "item"):
+                        tokens = tokens.item()
+                    num_tokens += int(tokens)
+
+                    log_probs = micro_result.get("log_probs")
+                    if log_probs is not None:
+                        if hasattr(log_probs, "cpu"):
+                            log_probs = log_probs.cpu()
+                        all_log_probs.append(log_probs)
+                        # Note: use "logprobs" (no underscore) for cookbook NLL evaluator compatibility
+                        loss_fn_outputs.append({
+                            "loss": {"data": [float(loss)], "shape": [1], "dtype": "float32"},
+                            "logprobs": {
+                                "data": log_probs.tolist() if hasattr(log_probs, "tolist") else list(log_probs),
+                                "shape": list(log_probs.shape) if hasattr(log_probs, "shape") else [],
+                                "dtype": "float32",
+                            },
+                        })
+
+        # Combine log_probs if multiple micro-batches
+        log_probs_data = None
+        if all_log_probs:
+            combined = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+            log_probs_data = {
+                "data": combined.tolist(),
+                "shape": list(combined.shape),
+                "dtype": str(combined.dtype),
+            }
+
+        logger.info(f"[MegatronTrainingWorker] forward: loss={loss_value:.4f}, log_probs={'present' if log_probs_data else 'none'}")
 
         return {
-            "loss_fn_output_type": "sft_loss",
-            "loss_fn_outputs": [],
+            "loss_fn_output_type": "logprob_extractor",
+            "loss_fn_outputs": loss_fn_outputs,
             "metrics": {
+                "loss:mean": float(loss_value),
                 "num_samples:sum": float(len(data_items)),
+                "num_tokens:sum": float(num_tokens),
             },
+            "log_probs": log_probs_data,
         }
 
     def optim_step(self, learning_rate: float | None = None) -> dict:
@@ -624,6 +827,47 @@ class MegatronTrainingWorker:
             "eos_token_id": tokenizer.eos_token_id,
             "bos_token_id": tokenizer.bos_token_id,
         }
+
+
+    def save_checkpoint(self, save_path: str) -> dict:
+        """Save checkpoint: LoRA weights + config + training metadata.
+
+        For distributed Megatron training, optimizer state is sharded across ranks
+        and not saved here. Only rank 0 saves the checkpoint.
+
+        Args:
+            save_path: Directory path to save checkpoint files.
+
+        Returns:
+            Dict with training metadata.
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        os.makedirs(save_path, exist_ok=True)
+
+        # 1. LoRA weights
+        state_dict = self.get_lora_state_dict()
+        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+
+        # 2. LoRA config
+        config = self.get_lora_config()
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        # 3. Training metadata
+        meta = {
+            "current_step": self._step_count,
+            "learning_rate": self.learning_rate,
+        }
+        with open(os.path.join(save_path, "training_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[MegatronTrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
+        return meta
 
     def shutdown(self) -> None:
         """Release resources."""

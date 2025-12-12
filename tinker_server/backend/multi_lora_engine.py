@@ -31,8 +31,8 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = "tinker"
 
-# vLLM 0.12.0 on PFS - supports MoE expert LoRA via FusedMoEWithLoRA
-VLLM_PFS_PATH = "/vePFS-Mindverse/share/code/vllm-0.12.0"
+# Import centralized PFS paths from config
+from tinker_server.config import PFS_PYTHONPATH
 
 
 @dataclass
@@ -222,13 +222,27 @@ class MultiLoRAInferenceEngine:
                 ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
             # Try to get existing persistent actor
+            # Note: ray.get_actor succeeds even for dead actors (name still registered)
+            # We must verify the actor is alive by calling a method on it
             try:
                 self.server = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-                logger.info(
-                    f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
-                )
-                self._initialized = True
-                return
+                # Health check: try calling a method to verify actor is alive
+                # This will raise RayActorError if actor is dead
+                try:
+                    ray.get(self.server.__ray_ready__.remote(), timeout=5)
+                    logger.info(
+                        f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
+                    )
+                    self._initialized = True
+                    return
+                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    # Actor is dead or unresponsive, need to create new one
+                    logger.warning(
+                        f"vLLM actor {PERSISTENT_VLLM_ACTOR_NAME} is dead/unresponsive, creating new one"
+                    )
+                    self.server = None
+                    # Reset initialized flag so we'll create new actor below
+                    self._initialized = False
             except ValueError:
                 # Actor doesn't exist, create new one
                 logger.info(
@@ -314,6 +328,7 @@ class MultiLoRAInferenceEngine:
                 lifetime="detached",
                 runtime_env={
                     "env_vars": {
+                        "PYTHONPATH": PFS_PYTHONPATH,
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
                     }
@@ -329,7 +344,9 @@ class MultiLoRAInferenceEngine:
                 nnodes=1,
             )
 
-            await self.server.launch_server.remote()
+            # ray.get() blocks until launch_server completes (sets self.engine)
+            # Note: await on ObjectRef doesn't work - must use ray.get()
+            ray.get(self.server.launch_server.remote())
             self._initialized = True
             logger.info("MultiLoRAInferenceEngine initialized (detached actor)")
 
@@ -348,6 +365,8 @@ class MultiLoRAInferenceEngine:
         where API server and inference worker have different filesystems.
         Worker saves tensors locally then creates file-based LoRARequest.
         File-based loading supports vLLM's GPU/CPU swapping.
+
+        Auto-restarts vLLM actor if dead.
 
         Args:
             sampling_session_id: Unique identifier for the sampling session.
@@ -375,12 +394,25 @@ class MultiLoRAInferenceEngine:
 
         # Transfer tensors via Ray and save locally on worker node.
         # Worker creates file-based LoRARequest for GPU/CPU swap support.
+        # Auto-restart vLLM if actor died (e.g. killed for GPU allocation).
         start_time = time.time()
-        await self.server.add_lora_with_id.remote(
-            lora_int_id=lora_id,
-            state_dict=state_dict,
-            peft_config=peft_config,
-        )
+        try:
+            await self.server.add_lora_with_id.remote(
+                lora_int_id=lora_id,
+                state_dict=state_dict,
+                peft_config=peft_config,
+            )
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            self._initialized = False
+            self.server = None
+            await self.initialize()
+            # Retry after restart
+            await self.server.add_lora_with_id.remote(
+                lora_int_id=lora_id,
+                state_dict=state_dict,
+                peft_config=peft_config,
+            )
         load_time = time.time() - start_time
 
         logger.info(
@@ -565,7 +597,7 @@ def kill_persistent_vllm_actor() -> bool:
 
 
 def check_persistent_vllm_actor() -> bool:
-    """Check if persistent vLLM actor exists.
+    """Check if persistent vLLM actor exists and is alive.
 
     Returns:
         True if actor exists and is alive, False otherwise.
@@ -574,9 +606,12 @@ def check_persistent_vllm_actor() -> bool:
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     try:
-        ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        # ray.get_actor succeeds even for dead actors (name still registered)
+        # Verify actor is alive by calling a method on it
+        ray.get(actor.__ray_ready__.remote(), timeout=5)
         return True
-    except ValueError:
+    except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
         return False
 
 

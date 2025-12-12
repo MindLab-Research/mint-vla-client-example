@@ -25,6 +25,9 @@ import ray
 
 logger = logging.getLogger(__name__)
 
+# Import centralized PFS paths from config
+from tinker_server.config import PFS_PYTHONPATH
+
 # Persistent actor configuration - matches vLLM pattern
 PERSISTENT_MEGATRON_ACTOR_NAME = "persistent_megatron_worker_group_v2"
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
@@ -202,6 +205,29 @@ class MegatronRankWorker:
             local_path, trust_remote_code=True, local_files_only=True
         )
 
+        # Build lora sub-config for get_peft_config() compatibility
+        # verl's get_peft_config expects model_config.lora with both .get() and .rank access
+        # Must be passed at construction time since HFModelConfig.lora is not in _mutable_fields
+        lora_config = {}
+        if self.lora_rank > 0:
+            # Create a config object that supports both dict and attribute access
+            class LoraConfigDict(dict):
+                """Dict subclass with attribute access for verl compatibility."""
+                def __getattr__(self, key):
+                    try:
+                        return self[key]
+                    except KeyError:
+                        raise AttributeError(key)
+
+            lora_config = LoraConfigDict(
+                rank=self.lora_rank,
+                alpha=self.lora_rank * 2,
+                type="lora",
+                target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+                dropout=0.0,
+            )
+            logger.info(f"[Rank {self.rank}] LoRA config: rank={self.lora_rank}, alpha={self.lora_rank * 2}")
+
         model_config = HFModelConfig(
             path=self.base_model,
             local_path=local_path,
@@ -209,6 +235,7 @@ class MegatronRankWorker:
             architectures=hf_config.architectures,
             lora_rank=self.lora_rank,
             lora_alpha=self.lora_rank * 2,
+            lora=lora_config,
             target_modules="all-linear",
             trust_remote_code=True,
         )
@@ -237,6 +264,7 @@ class MegatronRankWorker:
             grad_offload=True,
             dtype="bfloat16",
             use_mbridge=True,
+            vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,
             override_transformer_config=override_tf_config,
         )
@@ -274,20 +302,33 @@ class MegatronRankWorker:
         """Run forward and backward pass on this rank's shard.
 
         Gradients are synchronized via NCCL allreduce.
-        Returns metrics from rank 0 only.
+        Returns metrics from rank 0 only, including per-sample loss_fn_outputs.
         """
         import torch
         from tinker_server.backend.megatron_training import (
             create_sft_loss_fn, create_ppo_loss_fn
         )
 
+        # Extract per-sample sequence lengths BEFORE moving to device
+        # Needed to split concatenated log_probs back into per-sample tensors
+        seq_lengths = []
+        input_ids = data.get("input_ids")
+        if input_ids is not None:
+            if hasattr(input_ids, 'unbind'):
+                for seq in input_ids.unbind():
+                    seq_lengths.append(len(seq))
+            elif hasattr(input_ids, '_offsets'):
+                offsets = input_ids._offsets.tolist()
+                for i in range(len(offsets) - 1):
+                    seq_lengths.append(offsets[i + 1] - offsets[i])
+
         # Move data to this rank's device
         device = torch.cuda.current_device()
         data = data.to(device)
 
-        # Select loss function
+        # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
-            loss_function = create_sft_loss_fn()
+            loss_function = create_sft_loss_fn(return_logprobs=True)
         elif loss_fn == "ppo":
             epsilon = loss_fn_config.get("epsilon", 0.2)
             loss_function = create_ppo_loss_fn(epsilon)
@@ -313,42 +354,218 @@ class MegatronRankWorker:
             clip_frac_sum = 0.0
             ratio_mean_sum = 0.0
             n_ppo_results = 0
+            all_log_probs = []
+            loss_fn_outputs = []
 
-            if result and len(result) > 0:
-                for micro_result in result:
-                    if isinstance(micro_result, dict):
-                        # Extract loss - may be tensor, convert to Python float
-                        loss = micro_result.get("loss", 0.0)
-                        if hasattr(loss, "item"):
-                            loss = loss.item()
-                        loss_value += float(loss)
+            # verl's forward_backward_batch returns a single dict:
+            # {
+            #     "model_output": {"log_probs": nested_tensor, ...},
+            #     "loss": [loss1, loss2, ...],  # list from each micro-batch
+            #     "metrics": {
+            #         "log_probs": [tensor1, tensor2, ...],
+            #         "num_tokens": [n1, n2, ...],
+            #         "loss": [l1, l2, ...],
+            #     }
+            # }
+            if result and isinstance(result, dict):
+                metrics = result.get("metrics", {})
+                losses = result.get("loss", [])
 
-                        # Extract num_tokens - may be tensor
-                        tokens = micro_result.get("num_tokens", 0)
-                        if hasattr(tokens, "item"):
-                            tokens = tokens.item()
-                        num_tokens += int(tokens)
+                # Sum losses from all micro-batches
+                for loss in losses:
+                    if hasattr(loss, "item"):
+                        loss = loss.item()
+                    loss_value += float(loss)
 
-                        # Extract PPO metrics if present
-                        if "clip_frac" in micro_result:
-                            cf = micro_result["clip_frac"]
-                            if hasattr(cf, "item"):
-                                cf = cf.item()
-                            clip_frac_sum += float(cf)
-                            n_ppo_results += 1
-                        if "ratio_mean" in micro_result:
-                            rm = micro_result["ratio_mean"]
-                            if hasattr(rm, "item"):
-                                rm = rm.item()
-                            ratio_mean_sum += float(rm)
+                # Sum num_tokens from metrics (list of values from micro-batches)
+                num_tokens_list = metrics.get("num_tokens", [])
+                for tokens in num_tokens_list:
+                    if hasattr(tokens, "item"):
+                        tokens = tokens.item()
+                    num_tokens += int(tokens)
 
-            # Return CPU-safe scalars only (no CUDA tensors)
+                # Extract per-token log_probs from metrics (list of tensors)
+                log_probs_list = metrics.get("log_probs", [])
+                for log_probs in log_probs_list:
+                    if log_probs is not None:
+                        if hasattr(log_probs, "cpu"):
+                            log_probs = log_probs.cpu()
+                        all_log_probs.append(log_probs)
+
+                # Extract PPO metrics if present (list of values)
+                clip_frac_list = metrics.get("clip_frac", [])
+                for cf in clip_frac_list:
+                    if hasattr(cf, "item"):
+                        cf = cf.item()
+                    clip_frac_sum += float(cf)
+                    n_ppo_results += 1
+
+                ratio_mean_list = metrics.get("ratio_mean", [])
+                for rm in ratio_mean_list:
+                    if hasattr(rm, "item"):
+                        rm = rm.item()
+                    ratio_mean_sum += float(rm)
+
+            # Concatenate and split log_probs into per-sample tensors for loss_fn_outputs
+            if all_log_probs and seq_lengths:
+                combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+                offset = 0
+                avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
+                for seq_len in seq_lengths:
+                    sample_log_probs = combined_log_probs[offset:offset + seq_len]
+                    offset += seq_len
+                    loss_fn_outputs.append({
+                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                        "logprobs": {
+                            "data": sample_log_probs.tolist(),
+                            "shape": list(sample_log_probs.shape),
+                            "dtype": "float32",
+                        },
+                    })
+
+            # Return CPU-safe scalars and loss_fn_outputs
             return {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
                 "clip_frac_sum": float(clip_frac_sum),
                 "ratio_mean_sum": float(ratio_mean_sum),
                 "n_ppo_results": int(n_ppo_results),
+                "loss_fn_outputs": loss_fn_outputs,
+            }
+        return {}
+
+    def forward(
+        self,
+        data: TensorDict,
+    ) -> dict:
+        """Run forward pass only (no backward). Returns per-token logprobs.
+
+        Similar to forward_backward but skips gradient computation.
+        Used for computing reference model logprobs in DPO/SL.
+        Returns per-token log probabilities from rank 0 only.
+
+        Important: Creates one loss_fn_outputs entry per sample (not per micro-batch)
+        to match cookbook's NLL evaluator expectations.
+        """
+        import torch
+
+        # Extract per-sample sequence lengths from input data BEFORE moving to device
+        # This is needed to split the concatenated log_probs back into per-sample tensors
+        seq_lengths = []
+        input_ids = data.get("input_ids")
+        if input_ids is not None:
+            if hasattr(input_ids, 'unbind'):
+                # NestedTensor: unbind to get individual tensors
+                for seq in input_ids.unbind():
+                    seq_lengths.append(len(seq))
+            elif hasattr(input_ids, '_offsets'):
+                # Alternative: use offsets from jagged tensor
+                offsets = input_ids._offsets.tolist()
+                for i in range(len(offsets) - 1):
+                    seq_lengths.append(offsets[i + 1] - offsets[i])
+            else:
+                # Padded tensor: use attention_mask to find actual lengths
+                attention_mask = data.get("attention_mask")
+                if attention_mask is not None:
+                    seq_lengths = attention_mask.sum(dim=1).tolist()
+
+        # Move data to this rank's device
+        device = torch.cuda.current_device()
+        data = data.to(device)
+
+        # Use logprob extractor to get per-token log probabilities
+        from tinker_server.backend.megatron_training import create_logprob_extractor_fn
+        loss_function = create_logprob_extractor_fn()
+
+        # Run forward only (no gradient sync)
+        with torch.no_grad():
+            result = self.engine.forward_backward_batch(
+                data=data,
+                loss_function=loss_function,
+                forward_only=True,
+            )
+
+        # Only rank 0 returns metrics
+        if self.rank == 0:
+            loss_value = 0.0
+            num_tokens = 0
+            all_log_probs = []
+            loss_fn_outputs = []
+
+            # verl's forward_backward_batch returns a single dict (not a list):
+            # {
+            #     "model_output": {"log_probs": nested_tensor, ...},
+            #     "loss": [loss1, loss2, ...],  # list from each micro-batch
+            #     "metrics": {
+            #         "log_probs": [tensor1, tensor2, ...],  # our extracted log_probs (concatenated per micro-batch)
+            #         "num_tokens": [n1, n2, ...],
+            #         "loss": [l1, l2, ...],
+            #     }
+            # }
+            if result and isinstance(result, dict):
+                metrics = result.get("metrics", {})
+                losses = result.get("loss", [])
+
+                # Sum losses from all micro-batches
+                for loss in losses:
+                    if hasattr(loss, "item"):
+                        loss = loss.item()
+                    loss_value += float(loss)
+
+                # Sum num_tokens from all micro-batches (list of values)
+                num_tokens_list = metrics.get("num_tokens", [])
+                for tokens in num_tokens_list:
+                    if hasattr(tokens, "item"):
+                        tokens = tokens.item()
+                    num_tokens += int(tokens)
+
+                # Extract per-token log_probs from metrics (list of tensors, one per micro-batch)
+                log_probs_list = metrics.get("log_probs", [])
+                for log_probs in log_probs_list:
+                    if log_probs is not None:
+                        # log_probs is already CPU tensor from extractor
+                        if hasattr(log_probs, "cpu"):
+                            log_probs = log_probs.cpu()
+                        all_log_probs.append(log_probs)
+
+                # Concatenate all micro-batch log_probs into a single tensor
+                if all_log_probs:
+                    combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+                else:
+                    combined_log_probs = None
+
+                # Split combined log_probs back into per-sample tensors using seq_lengths
+                # This is critical for cookbook compatibility - it expects one loss_fn_outputs per sample
+                if combined_log_probs is not None and seq_lengths:
+                    offset = 0
+                    avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
+                    for seq_len in seq_lengths:
+                        sample_log_probs = combined_log_probs[offset:offset + seq_len]
+                        offset += seq_len
+                        loss_fn_outputs.append({
+                            "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                            "logprobs": {
+                                "data": sample_log_probs.tolist(),
+                                "shape": list(sample_log_probs.shape),
+                                "dtype": "float32",
+                            },
+                        })
+                elif combined_log_probs is not None:
+                    # Fallback: single entry with all log_probs (legacy behavior)
+                    loss_fn_outputs.append({
+                        "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
+                        "logprobs": {
+                            "data": combined_log_probs.tolist(),
+                            "shape": list(combined_log_probs.shape),
+                            "dtype": "float32",
+                        },
+                    })
+
+            return {
+                "loss_value": float(loss_value),
+                "num_tokens": int(num_tokens),
+                "loss_fn_outputs": loss_fn_outputs,
+                "log_probs": combined_log_probs,  # Combined per-token log_probs tensor (for backward compat)
             }
         return {}
 
@@ -375,67 +592,267 @@ class MegatronRankWorker:
     def get_lora_state_dict(self) -> dict:
         """Get LoRA state dict in PEFT format (rank 0 gathers from all ranks).
 
-        Converts mbridge HuggingFace names to PEFT format for vLLM compatibility:
-        mbridge: layers.0.self_attn.q_proj.lora_A.weight
-        PEFT:    base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+        With use_mbridge=True, weights must be accessed via bridge.export_weights()
+        instead of model.named_parameters().
+
+        IMPORTANT: ALL ranks must call bridge.export_weights() because it uses NCCL
+        collectives internally. Only rank 0 processes and returns the actual data;
+        other ranks return empty dict AFTER the collective completes.
+
+        The bridge returns HuggingFace-style names like:
+            model.layers.0.self_attn.q_proj.lora_A.weight
+            model.layers.0.self_attn.q_proj.lora_B.weight
+
+        PEFT expects names like:
+            base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+            base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight
         """
-        import torch.nn as nn
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
-        logger.info(f"[Rank {self.rank}] engine.module type: {type(self.engine.module)}")
         
-        if isinstance(self.engine.module, (list, tuple)):
-            logger.info(f"[Rank {self.rank}] engine.module is list/tuple with {len(self.engine.module)} items")
-            for i, item in enumerate(self.engine.module):
-                logger.info(f"[Rank {self.rank}] engine.module[{i}] type: {type(item)}")
-                if isinstance(item, (list, tuple)):
-                    logger.info(f"[Rank {self.rank}] engine.module[{i}] is list/tuple with {len(item)} items")
-                    for j, subitem in enumerate(item):
-                        logger.info(f"[Rank {self.rank}] engine.module[{i}][{j}] type: {type(subitem)}")
+        # Write diagnostic output to shared PFS for debugging
+        debug_file = "/vePFS-Mindverse/share/code/tinker-server/debug_lora_export.log"
 
-        # self.engine.module is a list (possibly nested for pipeline parallelism)
-        # Flatten to get all modules, then iterate parameters
-        def flatten_modules(modules):
-            """Recursively flatten nested list of modules."""
-            result = []
-            for item in modules:
-                if isinstance(item, (list, tuple)):
-                    result.extend(flatten_modules(item))
-                elif isinstance(item, nn.Module):
-                    result.append(item)
-                else:
-                    logger.warning(f"[Rank {self.rank}] Unexpected item type in modules: {type(item)}")
-            return result
+        adapter_state = {}
 
-        modules = self.engine.module
-        if not isinstance(modules, (list, tuple)):
-            modules = [modules]
-        flat_modules = flatten_modules(modules)
-        
-        logger.info(f"[Rank {self.rank}] Found {len(flat_modules)} module(s) to scan for LoRA params")
+        # Patterns for identifying adapter/LoRA parameters
+        # MBridge uses HF-style names with "lora" suffix
+        # Megatron may use different naming conventions
+        adapter_patterns = ['lora', 'adapter', 'peft']
 
-        lora_state_dict = {}
-        for idx, module in enumerate(flat_modules):
-            logger.info(f"[Rank {self.rank}] Scanning module {idx}: {type(module)}")
-            for name, param in module.named_parameters():
-                if "lora" in name.lower():
-                    # Convert mbridge HuggingFace format to PEFT format
-                    if not name.startswith("base_model."):
-                        peft_name = f"base_model.model.model.{name}"
+        # Check if we have mbridge with export_weights (vanilla_mbridge=True only)
+        # Non-vanilla bridge uses different API - skip to fallback
+        bridge = getattr(self.engine, 'bridge', None)
+        has_export_weights = bridge is not None and hasattr(bridge, 'export_weights')
+
+        if has_export_weights:
+            logger.info(f"[Rank {self.rank}] Using bridge.export_weights() for vanilla mbridge mode")
+            try:
+                # export_weights returns a generator of (name, tensor) tuples
+                # with HuggingFace-style parameter names
+                # ALL ranks must iterate through this generator for NCCL sync
+                all_param_names = []
+                adapter_param_names = []
+                for name, tensor in bridge.export_weights(self.engine.module):
+                    all_param_names.append(name)
+                    # Only rank 0 collects the actual data
+                    if self.rank == 0:
+                        # Check multiple patterns for adapter parameters
+                        name_lower = name.lower()
+                        if any(pattern in name_lower for pattern in adapter_patterns):
+                            adapter_param_names.append(name)
+                            # Clone and move to CPU
+                            adapter_state[name] = tensor.data.clone().cpu() if tensor.is_cuda else tensor.data.clone()
+
+                # Log diagnostic info
+                logger.info(f"[Rank {self.rank}] bridge.export_weights() returned {len(all_param_names)} total params")
+                
+                # Only rank 0 logs detailed info and writes debug file
+                if self.rank == 0:
+                    logger.info(f"[Rank 0] Found {len(adapter_param_names)} adapter params (patterns: {adapter_patterns})")
+
+                    # Write to PFS for debugging (append mode)
+                    try:
+                        import datetime
+                        with open(debug_file, "a") as f:
+                            f.write(f"\n=== {datetime.datetime.now()} ===\n")
+                            f.write(f"Total params from bridge.export_weights(): {len(all_param_names)}\n")
+                            f.write(f"Adapter params found: {len(adapter_param_names)}\n")
+                            f.write(f"First 30 param names:\n")
+                            for n in all_param_names[:30]:
+                                f.write(f"  {n}\n")
+                            if len(all_param_names) > 100:
+                                f.write(f"Middle 10 param names (around index {len(all_param_names)//2}):\n")
+                                mid = len(all_param_names) // 2
+                                for n in all_param_names[mid:mid+10]:
+                                    f.write(f"  {n}\n")
+                            if adapter_param_names:
+                                f.write(f"Adapter param names:\n")
+                                for n in adapter_param_names[:30]:
+                                    f.write(f"  {n}\n")
+                            f.write(f"===\n")
+                    except Exception as e:
+                        logger.warning(f"Failed to write debug file: {e}")
+
+                    # Show sample of ALL param names to debug naming convention
+                    if all_param_names:
+                        sample_all = all_param_names[:10]
+                        logger.info(f"[Rank 0] Sample ALL param names (first 10): {sample_all}")
+                        # Also show some from the middle
+                        if len(all_param_names) > 50:
+                            mid_idx = len(all_param_names) // 2
+                            sample_mid = all_param_names[mid_idx:mid_idx+5]
+                            logger.info(f"[Rank 0] Sample ALL param names (middle 5): {sample_mid}")
+
+                    if adapter_param_names:
+                        sample_adapter = adapter_param_names[:5]
+                        logger.info(f"[Rank 0] Sample adapter param names: {sample_adapter}")
                     else:
-                        peft_name = name
-                    # Move to CPU for Ray serialization
-                    lora_state_dict[peft_name] = param.data.cpu()
+                        logger.warning("[Rank 0] NO adapter params found via bridge.export_weights()!")
 
-        logger.info(f"[Rank {self.rank}] get_lora_state_dict: Found {len(lora_state_dict)} LoRA params")
+            except Exception as e:
+                logger.error(f"[Rank {self.rank}] bridge.export_weights() failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
-        # Only rank 0 should return the full state dict
-        if self.rank == 0:
-            logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
-            if lora_state_dict:
-                sample_keys = list(lora_state_dict.keys())[:3]
-                logger.info(f"[Rank 0] Sample LoRA keys: {sample_keys}")
-            return lora_state_dict
-        return {}
+        # Non-rank-0 workers return empty dict AFTER participating in NCCL collective
+        if self.rank != 0:
+            logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
+            return {}
+
+        # Fallback: use get_adapter_state_dict if bridge method returned empty or doesn't exist
+        if not adapter_state:
+            logger.info("[Rank 0] Trying get_adapter_state_dict() fallback...")
+            try:
+                from verl.utils.megatron_peft_utils import get_adapter_state_dict
+                raw_state = get_adapter_state_dict(self.engine.module)
+                logger.info(f"[Rank 0] get_adapter_state_dict returned {len(raw_state)} params")
+                # Move all tensors to CPU for serialization to CPU-only WorkerGroup
+                for name, tensor in raw_state.items():
+                    adapter_state[name] = tensor.cpu() if tensor.is_cuda else tensor.clone()
+                if adapter_state:
+                    sample_keys = list(adapter_state.keys())[:5]
+                    logger.info(f"[Rank 0] Sample Megatron keys: {sample_keys}")
+            except ImportError:
+                logger.warning("[Rank 0] verl.utils.megatron_peft_utils not available")
+            except Exception as e:
+                logger.error(f"[Rank 0] get_adapter_state_dict failed: {e}")
+
+        if not adapter_state:
+            logger.warning("[Rank 0] No adapter/LoRA parameters found!")
+            return {}
+
+        # Convert to PEFT format
+        # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
+        # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
+        lora_state_dict = {}
+        for name, tensor in adapter_state.items():
+            # Add PEFT prefix if not already present
+            if name.startswith("model."):
+                peft_name = f"base_model.model.{name}"
+            elif name.startswith("base_model."):
+                peft_name = name  # Already in PEFT format
+            else:
+                # Megatron format - need more complex conversion
+                peft_name = self._convert_megatron_to_peft(name)
+                if peft_name is None:
+                    logger.warning(f"Could not convert to PEFT: {name}")
+                    continue
+            lora_state_dict[peft_name] = tensor
+
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
+        if lora_state_dict:
+            sample_peft_keys = list(lora_state_dict.keys())[:3]
+            logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
+
+        return lora_state_dict
+
+    def _convert_megatron_to_peft(self, name: str) -> str | None:
+        """Convert Megatron LoRA param name to PEFT format.
+
+        Megatron-Bridge names (with vanilla_mbridge=False):
+            decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight
+            decoder.layers.0.self_attention.linear_qkv.adapter.linear_out.weight
+            decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight
+            decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight
+            decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_out.weight
+
+        PEFT names (HuggingFace style):
+            base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+            base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight
+            base_model.model.model.layers.0.mlp.gate_proj.lora_A.weight
+        """
+        import re
+
+        # Extract layer number
+        match = re.search(r'layers\.(\d+)\.', name)
+        if not match:
+            logger.warning(f"Could not extract layer number from: {name}")
+            return None
+        layer_num = match.group(1)
+
+        # Map adapter naming to LoRA naming
+        # adapter.linear_in -> lora_A, adapter.linear_out -> lora_B
+        if 'adapter.linear_in' in name:
+            lora_type = 'lora_A'
+        elif 'adapter.linear_out' in name:
+            lora_type = 'lora_B'
+        elif 'lora_A' in name.lower():
+            lora_type = 'lora_A'
+        elif 'lora_B' in name.lower():
+            lora_type = 'lora_B'
+        else:
+            logger.warning(f"Could not determine LoRA type from: {name}")
+            return None
+
+        # Determine the target module
+        # Handle both dense and MoE (experts) variants
+        if 'linear_qkv.adapter' in name or 'linear_qkv.lora_' in name.lower():
+            # Fused QKV - map to q_proj (vLLM will handle the fused format)
+            target = 'self_attn.q_proj'
+        elif 'self_attention.linear_proj' in name:
+            target = 'self_attn.o_proj'
+        elif 'mlp.experts.linear_fc1' in name or 'mlp.linear_fc1' in name:
+            # gate_proj for Qwen-style models (gate is part of gate_up_proj)
+            target = 'mlp.gate_proj'
+        elif 'mlp.experts.linear_fc2' in name or 'mlp.linear_fc2' in name:
+            target = 'mlp.down_proj'
+        else:
+            logger.warning(f"Unknown module pattern: {name}")
+            return None
+
+        peft_name = f"base_model.model.model.layers.{layer_num}.{target}.{lora_type}.weight"
+        return peft_name
+
+
+    def save_checkpoint(self, save_path: str, step_count: int = 0) -> dict:
+        """Save checkpoint: LoRA weights + config + training metadata.
+
+        Only rank 0 saves the checkpoint.
+
+        Args:
+            save_path: Directory path to save checkpoint files.
+            step_count: Current training step (passed from MegatronWorkerGroup).
+
+        Returns:
+            Dict with training metadata.
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        if self.rank != 0:
+            return {}
+
+        os.makedirs(save_path, exist_ok=True)
+
+        # 1. LoRA weights (PEFT format)
+        state_dict = self.get_lora_state_dict()
+        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+
+        # 2. LoRA config
+        config = {
+            "r": self.lora_rank,
+            "lora_alpha": self.lora_rank,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": self.base_model,
+        }
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        # 3. Training metadata
+        meta = {
+            "current_step": step_count,
+            "learning_rate": self.learning_rate,
+        }
+        with open(os.path.join(save_path, "training_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[MegatronRankWorker] Saved checkpoint to {abs_path} (step={step_count})")
+        return meta
 
     def shutdown(self):
         """Clean shutdown of distributed process."""
@@ -488,6 +905,7 @@ class MegatronWorkerGroup:
         # Runtime env for workers
         runtime_env = {
             "env_vars": {
+                "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -595,8 +1013,65 @@ class MegatronWorkerGroup:
 
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
-            "loss_fn_outputs": [],
+            "loss_fn_outputs": rank0_result.get("loss_fn_outputs", []),
             "metrics": metrics,
+        }
+
+    def forward(
+        self,
+        data_items: list[dict],
+    ) -> dict:
+        """Run forward pass only on all workers. Returns per-token logprobs.
+
+        Similar to forward_backward but skips gradient computation.
+        Used for computing reference model logprobs in DPO/SL.
+
+        Args:
+            data_items: List of Tinker Datum dicts.
+
+        Returns:
+            Dict with loss_fn_outputs (including per-token logprobs) and metrics.
+        """
+        from tinker_server.backend.megatron_training import tinker_to_tensordict
+
+        # Convert to TensorDict
+        data = tinker_to_tensordict(data_items)
+
+        # Broadcast to all workers
+        futures = [w.forward.remote(data) for w in self.workers]
+        results = ray.get(futures)
+
+        # Rank 0 result has metrics, loss_fn_outputs, and log_probs
+        rank0_result = results[0]
+        loss_value = rank0_result.get("loss_value", 0.0)
+        num_tokens = rank0_result.get("num_tokens", 0)
+        loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
+        log_probs = rank0_result.get("log_probs")  # Per-token log_probs tensor
+
+        metrics = {
+            "loss:mean": float(loss_value),
+            "num_samples:sum": float(len(data_items)),
+            "num_tokens:sum": float(num_tokens),
+        }
+
+        # Convert log_probs tensor to serializable format if present
+        log_probs_data = None
+        if log_probs is not None:
+            import torch
+            if isinstance(log_probs, torch.Tensor):
+                log_probs_data = {
+                    "data": log_probs.tolist(),
+                    "shape": list(log_probs.shape),
+                    "dtype": str(log_probs.dtype),
+                }
+
+        logger.info(f"[MegatronWorkerGroup] forward: loss={loss_value:.4f}, log_probs={'present' if log_probs_data else 'none'}")
+
+        return {
+            "loss_fn_output_type": "logprob_extractor",
+            "loss_fn_outputs": loss_fn_outputs,
+            "metrics": metrics,
+            "log_probs": log_probs_data,  # Per-token log probabilities
         }
 
     def optim_step(self, learning_rate: float) -> dict:
@@ -608,12 +1083,30 @@ class MegatronWorkerGroup:
         return {"metrics": {"step": self._step_count}}
 
     def get_lora_state_dict(self) -> dict:
-        """Get LoRA state dict from rank 0."""
+        """Get LoRA state dict from all workers (rank 0 returns data, others empty).
+
+        IMPORTANT: Must call ALL workers in parallel because bridge.export_weights()
+        may use NCCL collectives internally. Calling only rank 0 would deadlock.
+        """
         logger.info("[MegatronWorkerGroup] get_lora_state_dict: ENTRY")
-        logger.info(f"[MegatronWorkerGroup] Calling workers[0].get_lora_state_dict.remote()...")
-        result = ray.get(self.workers[0].get_lora_state_dict.remote())
-        logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: returning {len(result)} params")
-        return result
+        logger.info(f"[MegatronWorkerGroup] Calling get_lora_state_dict.remote() on all {len(self.workers)} workers...")
+
+        try:
+            # Call ALL workers - bridge.export_weights() may use NCCL allgather
+            # Rank 0 returns actual data, other ranks return empty dict
+            futures = [w.get_lora_state_dict.remote() for w in self.workers]
+            results = ray.get(futures, timeout=120)
+
+            # Rank 0's result has the actual data
+            result = results[0]
+            logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: returning {len(result)} params from rank 0")
+            return result
+        except ray.exceptions.GetTimeoutError:
+            logger.error("[MegatronWorkerGroup] get_lora_state_dict timed out after 120s")
+            raise RuntimeError("get_lora_state_dict timed out - workers not responding (possible NCCL deadlock)")
+        except ray.exceptions.RayActorError as e:
+            logger.error(f"[MegatronWorkerGroup] get_lora_state_dict failed - worker died: {e}")
+            raise RuntimeError(f"get_lora_state_dict failed - worker died: {e}")
 
     def get_lora_config(self) -> dict:
         """Get LoRA configuration as dictionary.
@@ -630,6 +1123,54 @@ class MegatronWorkerGroup:
             "task_type": "CAUSAL_LM",
             "peft_type": "LORA",
         }
+
+    def get_tokenizer_info(self) -> dict:
+        """Get tokenizer info for the model.
+
+        Returns:
+            Dict with tokenizer configuration.
+        """
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True)
+        return {
+            "vocab_size": len(tokenizer),
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+        }
+
+    def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
+        """Load checkpoint from path.
+
+        Note: Megatron distributed checkpoints use verl's checkpoint format.
+        This is a placeholder - actual implementation needs verl engine integration.
+
+        Args:
+            load_path: Path to checkpoint directory.
+            load_optimizer: Whether to restore optimizer state.
+
+        Returns:
+            Dict with load metadata.
+        """
+        logger.warning(f"[MegatronWorkerGroup] load_checkpoint not fully implemented: {load_path}")
+        # For now, return empty metadata - full implementation requires
+        # coordinated loading across all workers
+        return {"status": "not_implemented", "path": load_path}
+
+
+    def save_checkpoint(self, save_path: str) -> dict:
+        """Save checkpoint using rank 0 worker.
+
+        Args:
+            save_path: Directory path to save checkpoint files.
+
+        Returns:
+            Dict with training metadata.
+        """
+        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path}")
+        result = ray.get(self.workers[0].save_checkpoint.remote(save_path, self._step_count))
+        logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
+        return result
 
     def get_diagnostics(self) -> dict:
         """Return diagnostic info about the worker group."""
@@ -700,7 +1241,7 @@ def get_or_create_megatron_worker_group(
     # Runtime env for PFS code access
     runtime_env = {
         "env_vars": {
-            "PYTHONPATH": "/vePFS-Mindverse/share/code/tinker-server",
+            "PYTHONPATH": PFS_PYTHONPATH,
             "HF_HOME": "/vePFS-Mindverse/share/huggingface",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
@@ -788,13 +1329,27 @@ def is_megatron_actor_running() -> bool:
     """Check if persistent Megatron actor is running.
 
     Returns:
-        True if actor exists and is accessible.
+        True if actor exists and is actually alive (not dead).
     """
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     try:
-        ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        # ray.get_actor() returns handle even for DEAD actors
+        # Need to actually verify actor is alive by calling a method
+        # Use short timeout to avoid hanging on dead actors
+        ray.get(actor.get_diagnostics.remote(), timeout=5)
         return True
     except ValueError:
+        # Actor doesn't exist
+        return False
+    except ray.exceptions.RayActorError:
+        # Actor is dead
+        return False
+    except ray.exceptions.GetTimeoutError:
+        # Actor not responding
+        return False
+    except Exception:
+        # Any other error - assume not running
         return False

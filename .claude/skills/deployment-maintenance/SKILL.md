@@ -251,7 +251,10 @@ Workers cannot install packages (no internet, no pip). To upgrade packages witho
 
 | Package | Version | Path | Used By |
 |---------|---------|------|---------|
-| vLLM | 0.12.0 | `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM inference actors |
+| PyTorch | 2.9.0 | `/vePFS-Mindverse/share/code/torch-2.9.0/` | All Ray actors (vLLM 0.12.0 requires torch 2.9.0) |
+| vLLM | 0.12.0 | `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM inference actors (MoE LoRA support) |
+
+**PYTHONPATH order matters:** torch must come before vllm. Defined in `tinker_server/config.py:PFS_PYTHONPATH`.
 
 ### Verification
 

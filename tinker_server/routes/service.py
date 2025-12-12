@@ -98,11 +98,14 @@ async def create_sampling_session(
         # Resolve path (file://, tinker://localhost, or absolute path)
         adapter_path = _resolve_model_path(request.model_path)
 
+        # Load adapter weights and config from disk
+        state_dict, peft_config = _load_adapter_from_path(adapter_path, request.lora_rank)
+
         # Add LoRA to engine and register session
         await multi_lora_engine.add_lora_for_session(
             sampling_session_id=sampling_session_id,
-            lora_path=adapter_path,
-            lora_rank=request.lora_rank,
+            state_dict=state_dict,
+            peft_config=peft_config,
         )
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,
@@ -143,6 +146,46 @@ def _resolve_model_path(model_path: str) -> str:
     else:
         # Assume absolute path
         return model_path
+
+
+def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, dict]:
+    """Load LoRA adapter weights and config from disk.
+
+    Args:
+        adapter_path: Filesystem path to adapter directory.
+        lora_rank: LoRA rank for config.
+
+    Returns:
+        (state_dict, peft_config) tuple.
+    """
+    import json
+    import os
+
+    from safetensors.torch import load_file
+
+    # Load weights
+    weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+    if not os.path.exists(weights_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Adapter weights not found: {weights_path}",
+        )
+    state_dict = load_file(weights_path)
+
+    # Load config
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            peft_config = json.load(f)
+    else:
+        # Construct minimal config if missing
+        peft_config = {
+            "r": lora_rank,
+            "lora_alpha": lora_rank,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        }
+
+    return state_dict, peft_config
 
 
 @router.post("/session_heartbeat")

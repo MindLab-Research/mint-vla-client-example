@@ -25,8 +25,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# vLLM 0.12.0 on PFS - supports MoE expert LoRA via FusedMoEWithLoRA
-VLLM_PFS_PATH = "/vePFS-Mindverse/share/code/vllm-0.12.0"
+# Import centralized PFS paths from config
+from tinker_server.config import PFS_PYTHONPATH
 
 # Apply verl's hijack for TensorLoRARequest support
 # Must be done before engine initialization
@@ -871,7 +871,7 @@ class VerlInferenceEngine:
             num_gpus=total_gpus,
             runtime_env={
                 "env_vars": {
-                    "PYTHONPATH": VLLM_PFS_PATH,
+                    "PYTHONPATH": PFS_PYTHONPATH,
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                 }

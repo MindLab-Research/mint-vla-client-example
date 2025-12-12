@@ -4,6 +4,10 @@
 
 Code sync handled by background `unison` process. **NEVER** manually sync.
 
+## Remote Commands
+
+**NEVER** run `ray` or `volc` commands locally. Use the `deployment-maintenance` skill for remote server operations.
+
 ## Quick Start
 
 ```bash
@@ -23,14 +27,19 @@ For server deployment and cluster management, use the `deployment-maintenance` s
 ## Architecture
 
 ```
-Client Machine              API Server (volcano)           GPU Workers
-──────────────              ────────────────────           ───────────
-tinker-cookbook  ──HTTP──>  tinker-server:8000  ──Ray──>  TrainingWorker
-                                   |                       vLLM Engine
-                            SSH tunnel (8000)
+Local Machine               API Server (volcano)           GPU Workers (Ray)
+─────────────               ────────────────────           ─────────────────
+tinker-cookbook  ──HTTP──>  tinker-server:8000  ──Ray──>  MegatronWorker
+(Python 3.11+)         ↑                                   vLLM Engine
+                       │
+                 SSH tunnel (localhost:8000 → volcano:8000)
 ```
 
-**Data transfer:** Weights via Ray object store, not file paths.
+**Key points:**
+- **tinker-cookbook**: Runs LOCALLY on your workstation. Requires Python 3.11+ (for `chz` package).
+- **tinker-server**: Runs on volcano API server. Receives HTTP requests, dispatches to Ray workers.
+- **GPU Workers**: Run on Ray cluster nodes. Execute training (Megatron) and inference (vLLM).
+- **Data transfer**: Weights via Ray object store, not file paths.
 
 ### Inference Modes
 
@@ -53,9 +62,12 @@ Detached Ray actor surviving server restarts. First start ~80s, subsequent ~2s.
 | `/api/v1/asample` | POST | Submit async sample |
 | `/api/v1/retrieve_future` | POST | Poll result (408=pending, 200=ready) |
 
-## Cookbook Tests
+## Cookbook Tests (Run Locally)
+
+tinker-cookbook runs on your LOCAL machine, not on the server. Ensure SSH tunnel is active.
 
 ```bash
+# Run from LOCAL machine (requires Python 3.11+, chz package)
 cd /home/yiwen/tinker_project/tinker-cookbook
 
 # Arithmetic RL (~5 min)

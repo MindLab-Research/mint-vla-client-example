@@ -19,15 +19,19 @@ Entrypoint: |
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache to avoid bytecode/source mismatch
 
-  # Symlink to PFS code
+  # Symlink to PFS code (use PFS versions instead of container packages)
   rm -rf /root/tinker_project/tinker-server
   mkdir -p /root/tinker_project
   ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
 
+  # Use PFS verl with patched _mutable_fields (allows lora config assignment)
+  rm -rf /root/verl
+  ln -s /vePFS-Mindverse/share/code/verl /root/verl
+
   # Connect to Ray head
   ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=8 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:2"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 

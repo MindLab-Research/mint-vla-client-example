@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Import centralized PFS paths from config
+from tinker_server.config import PFS_PYTHONPATH
+
 
 @ray.remote(num_gpus=1)
 class TrainingWorker:
@@ -772,7 +775,7 @@ class VerlTrainingEngine:
             # HF_HUB_OFFLINE prevents network calls for model metadata
             dense_runtime_env = {
                 "env_vars": {
-                    "PYTHONPATH": "/vePFS-Mindverse/share/code/tinker-server",
+                    "PYTHONPATH": PFS_PYTHONPATH,
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
@@ -937,11 +940,21 @@ class VerlTrainingEngine:
         logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
 
         # Fetch weights and config from remote worker via Ray object store
+        # Use ray.get() with timeout in thread executor for reliable async handling
         logger.info(f"[{model_id}] save_weights_for_sampler: calling get_lora_state_dict.remote()...")
-        state_dict, config = await asyncio.gather(
-            worker.get_lora_state_dict.remote(),
-            worker.get_lora_config.remote(),
-        )
+        import ray
+        loop = asyncio.get_running_loop()
+
+        # Schedule remote calls
+        state_dict_ref = worker.get_lora_state_dict.remote()
+        config_ref = worker.get_lora_config.remote()
+        logger.info(f"[{model_id}] save_weights_for_sampler: remote calls scheduled, waiting for results...")
+
+        # Use ray.get() with timeout in executor to avoid blocking event loop
+        def get_with_timeout():
+            return ray.get([state_dict_ref, config_ref], timeout=120)
+
+        state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
 
         # Save locally on API server
