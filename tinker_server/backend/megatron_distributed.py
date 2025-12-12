@@ -962,8 +962,12 @@ class MegatronRankWorker:
     # Phase 6: Multi-Session Support Methods
     # ========================================================================
 
-    def load_adapter_state(self, checkpoint_path: str) -> dict:
+    def load_adapter_state(
+        self, checkpoint_path: str, actual_rank: int | None = None, trainer_rank: int | None = None
+    ) -> dict:
         """Load LoRA adapter weights from checkpoint.
+
+        Phase 7: Supports padding for unified rank training.
 
         ALL ranks must call this method - uses NCCL collectives internally.
         Used for session swapping: loading a different session's adapter weights.
@@ -971,29 +975,64 @@ class MegatronRankWorker:
         Args:
             checkpoint_path: Base directory containing adapter checkpoint files.
                 Each rank loads from its own mp_rank_XX_adapter.pt file.
+            actual_rank: The rank of the checkpoint being loaded. If less than
+                trainer_rank, padding will be applied.
+            trainer_rank: The trainer's max rank. Required if actual_rank is specified.
 
         Returns:
             Dict with status info (rank 0 only returns meaningful data).
         """
         import os
-        from verl.utils.megatron_peft_utils import load_adapter_checkpoint
+
+        import torch
+
+        from tinker_server.backend.lora_utils import pad_lora_state_dict
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+        from verl.utils.megatron_utils import unwrap_model
 
         # Use train_mode context to ensure model is on GPU for loading
         with self.engine.train_mode():
-            load_adapter_checkpoint(
-                model=self.engine.module,
-                checkpoint_path=checkpoint_path,
-                strict=False,  # Allow partial load for adapter-only updates
-            )
+            # Get rank-specific checkpoint path
+            rank_path = _get_rank_checkpoint_path(checkpoint_path)
+            adapter_file = rank_path + "_adapter.pt"
+
+            if not os.path.isfile(adapter_file):
+                raise FileNotFoundError(f"Adapter checkpoint not found: {adapter_file}")
+
+            checkpoint = torch.load(adapter_file, map_location="cpu")
+            adapter_state = checkpoint.get("adapter_state_dict", {})
+
+            # Phase 7: Apply padding if actual_rank < trainer_rank
+            if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+                logger.info(
+                    f"[Rank {self.rank}] Padding adapter from rank {actual_rank} to {trainer_rank}"
+                )
+                adapter_state = pad_lora_state_dict(adapter_state, actual_rank, trainer_rank)
+
+            # Load into model
+            model = self.engine.module
+            if isinstance(model, list):
+                model = model[0]
+            unwrapped = unwrap_model(model)
+            if isinstance(unwrapped, list):
+                unwrapped = unwrapped[0]
+
+            _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
+            if unexpected:
+                logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
 
         logger.info(f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path}")
 
         if self.rank == 0:
-            return {"status": "ok", "path": checkpoint_path}
+            return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
         return {}
 
-    def save_adapter_state(self, checkpoint_path: str) -> dict:
+    def save_adapter_state(
+        self, checkpoint_path: str, actual_rank: int | None = None, trainer_rank: int | None = None
+    ) -> dict:
         """Save LoRA adapter weights to checkpoint.
+
+        Phase 7: Supports truncation for unified rank training.
 
         ALL ranks must call this method - uses NCCL collectives internally.
         Used for session swapping: saving current session's adapter weights.
@@ -1001,27 +1040,46 @@ class MegatronRankWorker:
         Args:
             checkpoint_path: Base directory to save adapter checkpoint files.
                 Each rank saves to its own mp_rank_XX_adapter.pt file.
+            actual_rank: The rank to save as. If less than trainer_rank,
+                truncation will be applied to strip zero-padded dimensions.
+            trainer_rank: The trainer's max rank. Required if actual_rank is specified.
 
         Returns:
             Dict with status info (rank 0 only returns meaningful data).
         """
         import os
-        from verl.utils.megatron_peft_utils import save_adapter_checkpoint
+        from pathlib import Path
+
+        import torch
+
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path, get_adapter_state_dict
 
         os.makedirs(checkpoint_path, exist_ok=True)
 
         # Use train_mode context to ensure model is on GPU for saving
         with self.engine.train_mode():
-            save_adapter_checkpoint(
-                model=self.engine.module,
-                checkpoint_path=checkpoint_path,
-                rank=self.rank,
-            )
+            # Get adapter state dict
+            adapter_state = get_adapter_state_dict(self.engine.module)
+
+            # Phase 7: Apply truncation if actual_rank < trainer_rank
+            if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+                logger.info(
+                    f"[Rank {self.rank}] Truncating adapter from rank {trainer_rank} to {actual_rank}"
+                )
+                adapter_state = truncate_lora_state_dict(adapter_state, trainer_rank, actual_rank)
+
+            # Get rank-specific path
+            Path(checkpoint_path).mkdir(parents=True, exist_ok=True)
+            rank_path = _get_rank_checkpoint_path(checkpoint_path)
+            adapter_file = rank_path + "_adapter.pt"
+
+            torch.save({"adapter_state_dict": adapter_state}, adapter_file)
 
         logger.info(f"[Rank {self.rank}] Saved adapter state to {checkpoint_path}")
 
         if self.rank == 0:
-            return {"status": "ok", "path": checkpoint_path}
+            return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
         return {}
 
     def reset_optimizer(self, learning_rate: float | None = None) -> dict:
@@ -1104,7 +1162,7 @@ class MegatronWorkerGroup:
         distributed_config: DistributedConfig | None = None,
     ):
         self.base_model = base_model
-        self.lora_rank = lora_rank
+        self.lora_rank = lora_rank  # This is max_lora_rank for Phase 7
         self.learning_rate = learning_rate
         self.config = distributed_config or DistributedConfig()
 
@@ -1112,6 +1170,7 @@ class MegatronWorkerGroup:
         self.placement_group = None
         self._step_count = 0
         self._current_session: str | None = None  # Phase 6: session tracking
+        self._actual_rank: int | None = None  # Phase 7: actual LoRA rank for current session
 
         self._initialize()
 
@@ -1409,37 +1468,69 @@ class MegatronWorkerGroup:
     # Phase 6: Multi-Session Support Methods
     # ========================================================================
 
-    def load_adapter_state(self, checkpoint_path: str) -> dict:
+    def load_adapter_state(
+        self, checkpoint_path: str, actual_rank: int | None = None
+    ) -> dict:
         """Load LoRA adapter weights from checkpoint on all workers.
+
+        Phase 7: Supports loading adapters with rank < trainer's max_rank.
+        Padding is applied automatically.
 
         ALL workers must participate due to NCCL collectives.
 
         Args:
             checkpoint_path: Base directory containing adapter checkpoint.
+            actual_rank: The actual rank of the adapter being loaded.
+                If None, assumes adapter rank matches trainer rank (no padding).
 
         Returns:
             Dict with status info from rank 0.
         """
-        logger.info(f"[MegatronWorkerGroup] Loading adapter state from {checkpoint_path}")
-        futures = [w.load_adapter_state.remote(checkpoint_path) for w in self.workers]
+        logger.info(
+            f"[MegatronWorkerGroup] Loading adapter state from {checkpoint_path} "
+            f"(actual_rank={actual_rank}, trainer_rank={self.lora_rank})"
+        )
+        futures = [
+            w.load_adapter_state.remote(
+                checkpoint_path, actual_rank=actual_rank, trainer_rank=self.lora_rank
+            )
+            for w in self.workers
+        ]
         results = ray.get(futures)
         result = results[0]  # Rank 0 result
+        self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
         logger.info(f"[MegatronWorkerGroup] Adapter state loaded: {result}")
         return result
 
-    def save_adapter_state(self, checkpoint_path: str) -> dict:
+    def save_adapter_state(
+        self, checkpoint_path: str, actual_rank: int | None = None
+    ) -> dict:
         """Save LoRA adapter weights to checkpoint from all workers.
+
+        Phase 7: Supports saving adapters with rank < trainer's max_rank.
+        Truncation is applied automatically to strip zero-padded dimensions.
 
         ALL workers must participate due to NCCL collectives.
 
         Args:
             checkpoint_path: Base directory to save adapter checkpoint.
+            actual_rank: The actual rank to save (truncate to). If None, uses
+                self._actual_rank or trainer rank.
 
         Returns:
             Dict with status info from rank 0.
         """
-        logger.info(f"[MegatronWorkerGroup] Saving adapter state to {checkpoint_path}")
-        futures = [w.save_adapter_state.remote(checkpoint_path) for w in self.workers]
+        effective_rank = actual_rank or self._actual_rank or self.lora_rank
+        logger.info(
+            f"[MegatronWorkerGroup] Saving adapter state to {checkpoint_path} "
+            f"(actual_rank={effective_rank}, trainer_rank={self.lora_rank})"
+        )
+        futures = [
+            w.save_adapter_state.remote(
+                checkpoint_path, actual_rank=effective_rank, trainer_rank=self.lora_rank
+            )
+            for w in self.workers
+        ]
         results = ray.get(futures)
         result = results[0]  # Rank 0 result
         logger.info(f"[MegatronWorkerGroup] Adapter state saved: {result}")
@@ -1471,13 +1562,16 @@ class MegatronWorkerGroup:
         old_checkpoint_path: str | None,
         new_checkpoint_path: str | None,
         new_learning_rate: float,
+        new_actual_rank: int | None = None,
     ) -> dict:
         """Atomically swap from old session to new session.
+
+        Phase 7: Supports actual_rank tracking for unified rank training.
 
         Steps:
         1. Save old session state (if any and checkpoint_path provided)
         2. Load new session state (if checkpoint exists) or reset
-        3. Update current session marker
+        3. Update current session marker and actual_rank
 
         Args:
             old_session_id: ID of session being swapped out (None if first session).
@@ -1485,6 +1579,7 @@ class MegatronWorkerGroup:
             old_checkpoint_path: Where to save old session state (None to skip).
             new_checkpoint_path: Where to load new session state (None to reset).
             new_learning_rate: Learning rate for new session.
+            new_actual_rank: Actual LoRA rank for new session (default: trainer's rank).
 
         Returns:
             Dict with swap status.
@@ -1501,26 +1596,33 @@ class MegatronWorkerGroup:
         # 2. Load new session state or reset
         if new_checkpoint_path and os.path.exists(new_checkpoint_path):
             logger.info(f"[MegatronWorkerGroup] Loading new session {new_session_id} from {new_checkpoint_path}")
-            self.load_adapter_state(new_checkpoint_path)
+            self.load_adapter_state(new_checkpoint_path, actual_rank=new_actual_rank)
             # Keep optimizer state from checkpoint (momentum preserved)
         else:
             logger.info(f"[MegatronWorkerGroup] Resetting for new session {new_session_id}")
             self.reset_optimizer(new_learning_rate)
 
-        # 3. Update session tracking
+        # 3. Update session tracking (Phase 7: include actual_rank)
         self._current_session = new_session_id
         self._step_count = 0
         self.learning_rate = new_learning_rate
+        self._actual_rank = new_actual_rank if new_actual_rank is not None else self.lora_rank
 
-        logger.info(f"[MegatronWorkerGroup] Session swap complete: now on {new_session_id}")
+        logger.info(
+            f"[MegatronWorkerGroup] Session swap complete: now on {new_session_id} "
+            f"(actual_rank={self._actual_rank})"
+        )
         return {
             "status": "ok",
             "old_session": old_session_id,
             "new_session": new_session_id,
+            "actual_rank": self._actual_rank,
         }
 
     def get_session_info(self) -> dict:
         """Get current session info.
+
+        Phase 7: Includes actual_rank and max_lora_rank for unified rank training.
 
         Returns:
             Dict with session and worker info.
@@ -1534,6 +1636,8 @@ class MegatronWorkerGroup:
             "current_session": getattr(self, '_current_session', None),
             "step_count": self._step_count,
             "num_workers": len(self.workers),
+            "max_lora_rank": self.lora_rank,  # Phase 7: trainer's max rank
+            "actual_rank": getattr(self, '_actual_rank', None),  # Phase 7: session's actual rank
         }
 
     def shutdown(self):
@@ -1557,11 +1661,15 @@ class MegatronWorkerGroup:
 
 @dataclass
 class MegatronActorEntry:
-    """Entry in the actor pool with session tracking."""
+    """Entry in the actor pool with session tracking.
+
+    Phase 7: Supports unified rank training where max_lora_rank >= actual session ranks.
+    """
     actor: ray.actor.ActorHandle
     base_model: str
-    lora_rank: int
+    max_lora_rank: int  # Trainer's max rank (used for pooling)
     current_session: str | None = None
+    actual_rank: int | None = None  # Current session's actual rank
     created_at: float = 0.0
 
     def __post_init__(self):
@@ -1571,40 +1679,41 @@ class MegatronActorEntry:
 
 
 class MegatronActorPool:
-    """Pool of Megatron actors keyed by (base_model, lora_rank).
+    """Pool of Megatron actors keyed by base_model.
 
-    Allows multiple training sessions to share actors based on model/rank
-    configuration, avoiding 80s restart cost when switching sessions.
+    Phase 7: Unified rank support - actors are initialized with max_lora_rank
+    and can train adapters with any rank <= max_lora_rank via padding/truncation.
 
     Thread-safe for concurrent access from multiple API requests.
     """
 
+    # Default max rank for pooled actors
+    DEFAULT_MAX_LORA_RANK = 64
+
     def __init__(self):
         import threading
-        self._actors: dict[tuple[str, int], MegatronActorEntry] = {}
+        self._actors: dict[str, MegatronActorEntry] = {}  # key: base_model
         self._lock = threading.Lock()
 
-    def _make_key(self, base_model: str, lora_rank: int) -> tuple[str, int]:
-        """Create pool key from model and rank."""
-        return (base_model, lora_rank)
+    def _make_key(self, base_model: str) -> str:
+        """Create pool key from model path."""
+        return base_model
 
-    def _make_actor_name(self, base_model: str, lora_rank: int) -> str:
+    def _make_actor_name(self, base_model: str, max_rank: int) -> str:
         """Create unique actor name for this config."""
-        # Use model basename and rank for readable names
         model_name = base_model.split("/")[-1].replace("-", "_").lower()
-        return f"megatron_pool_{model_name}_r{lora_rank}"
+        return f"megatron_pool_{model_name}_maxr{max_rank}"
 
-    def get(self, base_model: str, lora_rank: int) -> MegatronActorEntry | None:
+    def get(self, base_model: str) -> MegatronActorEntry | None:
         """Get existing actor entry if it exists.
 
         Args:
             base_model: HuggingFace model path.
-            lora_rank: LoRA rank.
 
         Returns:
             MegatronActorEntry if actor exists, None otherwise.
         """
-        key = self._make_key(base_model, lora_rank)
+        key = self._make_key(base_model)
         with self._lock:
             return self._actors.get(key)
 
@@ -1615,35 +1724,53 @@ class MegatronActorPool:
         learning_rate: float,
         distributed_config: DistributedConfig | None = None,
         session_id: str | None = None,
+        max_lora_rank: int | None = None,
     ) -> MegatronActorEntry:
-        """Get existing or create new Megatron actor for this config.
+        """Get existing or create new Megatron actor for this base model.
+
+        Phase 7: If actor exists, it will be reused regardless of lora_rank
+        (padding/truncation happens at session swap time). If creating new,
+        uses max(lora_rank, max_lora_rank, DEFAULT_MAX_LORA_RANK).
 
         Args:
             base_model: HuggingFace model path.
-            lora_rank: LoRA rank.
+            lora_rank: Requested LoRA rank for this session.
             learning_rate: Initial learning rate (only used if creating new).
             distributed_config: Parallelism config.
             session_id: Optional session ID to register with actor.
+            max_lora_rank: Override max rank for new actor creation.
 
         Returns:
             MegatronActorEntry with actor handle.
         """
-        key = self._make_key(base_model, lora_rank)
+        key = self._make_key(base_model)
         config = distributed_config or DistributedConfig()
 
         with self._lock:
             # Return existing actor if available
             if key in self._actors:
                 entry = self._actors[key]
+                if lora_rank > entry.max_lora_rank:
+                    raise ValueError(
+                        f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
+                        f"Kill the actor and restart with higher max_lora_rank."
+                    )
                 logger.info(
-                    f"[MegatronActorPool] Reusing existing actor for {base_model}, rank={lora_rank}"
+                    f"[MegatronActorPool] Reusing existing actor for {base_model} "
+                    f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
                 )
                 return entry
 
-            # Create new actor
-            actor_name = self._make_actor_name(base_model, lora_rank)
+            # Create new actor with max rank
+            effective_max_rank = max(
+                lora_rank,
+                max_lora_rank or 0,
+                self.DEFAULT_MAX_LORA_RANK,
+            )
+            actor_name = self._make_actor_name(base_model, effective_max_rank)
             logger.info(
-                f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, rank={lora_rank}"
+                f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, "
+                f"max_rank={effective_max_rank}"
             )
 
             # Check if detached actor already exists (e.g., from previous server run)
@@ -1671,7 +1798,7 @@ class MegatronActorPool:
                     runtime_env=runtime_env,
                 ).remote(
                     base_model=base_model,
-                    lora_rank=lora_rank,
+                    lora_rank=effective_max_rank,  # Initialize with max rank
                     learning_rate=learning_rate,
                     distributed_config=config,
                 )
@@ -1683,24 +1810,24 @@ class MegatronActorPool:
             entry = MegatronActorEntry(
                 actor=actor,
                 base_model=base_model,
-                lora_rank=lora_rank,
+                max_lora_rank=effective_max_rank,
                 current_session=session_id,
+                actual_rank=lora_rank,
             )
             self._actors[key] = entry
             return entry
 
-    def remove(self, base_model: str, lora_rank: int, kill_actor: bool = True) -> bool:
+    def remove(self, base_model: str, kill_actor: bool = True) -> bool:
         """Remove actor from pool.
 
         Args:
             base_model: HuggingFace model path.
-            lora_rank: LoRA rank.
             kill_actor: If True, also kill the Ray actor.
 
         Returns:
             True if actor was removed, False if not found.
         """
-        key = self._make_key(base_model, lora_rank)
+        key = self._make_key(base_model)
 
         with self._lock:
             if key not in self._actors:
@@ -1714,7 +1841,7 @@ class MegatronActorPool:
                 except Exception as e:
                     logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
 
-            logger.info(f"[MegatronActorPool] Removed actor for {base_model}, rank={lora_rank}")
+            logger.info(f"[MegatronActorPool] Removed actor for {base_model}")
             return True
 
     def list_actors(self) -> list[dict]:
@@ -1727,7 +1854,8 @@ class MegatronActorPool:
             return [
                 {
                     "base_model": entry.base_model,
-                    "lora_rank": entry.lora_rank,
+                    "max_lora_rank": entry.max_lora_rank,
+                    "actual_rank": entry.actual_rank,
                     "current_session": entry.current_session,
                     "created_at": entry.created_at,
                 }
