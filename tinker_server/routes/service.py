@@ -10,10 +10,13 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
+import os
 import uuid
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException
+from safetensors.torch import load_file
 
 from ..models.types import (
     CreateSamplingSessionRequest,
@@ -98,11 +101,18 @@ async def create_sampling_session(
         # Resolve path (file://, tinker://localhost, or absolute path)
         adapter_path = _resolve_model_path(request.model_path)
 
+        # Load tensors from saved checkpoint
+        weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+        config_path = os.path.join(adapter_path, "adapter_config.json")
+        state_dict = load_file(weights_path)
+        with open(config_path, "r") as f:
+            peft_config = json.load(f)
+
         # Add LoRA to engine and register session
         await multi_lora_engine.add_lora_for_session(
             sampling_session_id=sampling_session_id,
-            lora_path=adapter_path,
-            lora_rank=request.lora_rank,
+            state_dict=state_dict,
+            peft_config=peft_config,
         )
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,

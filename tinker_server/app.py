@@ -125,16 +125,21 @@ app = FastAPI(
 # Paths that don't require authentication
 UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
 
+print("=== REGISTERING AUTH MIDDLEWARE ===", flush=True)
+
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
     """Validate X-API-Key header for all protected endpoints."""
+    print(f"AUTH MIDDLEWARE: path={request.url.path}, has_key={bool(request.headers.get('X-API-Key'))}", flush=True)
+
     if request.url.path in UNAUTHENTICATED_PATHS:
         return await call_next(request)
 
     api_key = request.headers.get("X-API-Key", "")
+    print(f"AUTH CHECK: api_key_len={len(api_key)}, valid={config.validate_api_key(api_key)}", flush=True)
     if not config.validate_api_key(api_key):
-        logger.warning(f"Invalid API key from {request.client.host if request.client else 'unknown'}")
+        print(f"AUTH FAILED: from {request.client.host if request.client else 'unknown'}", flush=True)
         return JSONResponse(
             status_code=401,
             content={"error": "Invalid or missing API key"},
