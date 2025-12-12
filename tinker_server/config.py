@@ -1,6 +1,7 @@
 """Server configuration."""
 
 import os
+import secrets
 from dataclasses import dataclass
 
 
@@ -11,6 +12,9 @@ class ServerConfig:
     # Server settings
     host: str = "0.0.0.0"
     port: int = 8000
+
+    # Authentication
+    api_key: str = ""  # Required - server refuses to start without it
 
     # Model settings
     model_path: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -27,9 +31,17 @@ class ServerConfig:
     @classmethod
     def from_env(cls) -> "ServerConfig":
         """Load configuration from environment variables."""
+        api_key = os.environ.get("TINKER_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "TINKER_API_KEY environment variable is required. "
+                "Set it to a secure random string (e.g., 32+ bytes, base64 encoded)."
+            )
+
         return cls(
             host=os.environ.get("TINKER_HOST", "0.0.0.0"),
             port=int(os.environ.get("TINKER_PORT", "8000")),
+            api_key=api_key,
             model_path=os.environ.get("TINKER_MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct"),
             tensor_parallel_size=int(os.environ.get("TINKER_TP_SIZE", "1")),
             gpu_memory_utilization=float(os.environ.get("TINKER_GPU_MEM_UTIL", "0.9")),
@@ -43,6 +55,10 @@ class ServerConfig:
             max_cpu_loras=int(os.environ.get("TINKER_MAX_CPU_LORAS", "1024")),
             max_lora_rank=int(os.environ.get("TINKER_MAX_LORA_RANK", "64")),
         )
+
+    def validate_api_key(self, provided_key: str) -> bool:
+        """Validate API key using constant-time comparison."""
+        return secrets.compare_digest(self.api_key, provided_key)
 
 
 # Global config instance

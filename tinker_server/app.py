@@ -3,7 +3,8 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from .backend.multi_lora_engine import MultiLoRAInferenceEngine
 from .backend.session_manager import SessionManager
@@ -120,6 +121,27 @@ app = FastAPI(
     description="Tinker-compatible inference server wrapping verl",
     version="0.1.0",
 )
+
+# Paths that don't require authentication
+UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
+
+
+@app.middleware("http")
+async def api_key_auth_middleware(request: Request, call_next):
+    """Validate X-API-Key header for all protected endpoints."""
+    if request.url.path in UNAUTHENTICATED_PATHS:
+        return await call_next(request)
+
+    api_key = request.headers.get("X-API-Key", "")
+    if not config.validate_api_key(api_key):
+        logger.warning(f"Invalid API key from {request.client.host if request.client else 'unknown'}")
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Invalid or missing API key"},
+        )
+
+    return await call_next(request)
+
 
 # Register routes with API prefix
 app.include_router(service.router, prefix="/api/v1", tags=["service"])
