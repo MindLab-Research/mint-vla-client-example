@@ -6,7 +6,7 @@
 # Unison keeps both in sync, preferring newer changes.
 
 root = /home/yiwen/tinker_project/tinker-server-auth
-root = ssh://volcano//vePFS-Mindverse/share/code/tinker-server-auth
+root = ssh://mint-prod//vePFS-Mindverse/share/code/tinker-server-auth
 
 # Sync options
 auto = true
