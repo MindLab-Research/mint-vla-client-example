@@ -966,27 +966,24 @@ class VerlTrainingEngine:
             )
             session.backend = "megatron"
         else:
-            logger.info(f"[{model_id}] Creating TrainingWorker for dense model (base={base_model}, lora_rank={lora_rank})")
+            # Phase 8: Use DenseTrainerPool for actor reuse
+            logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
 
-            # Create single-GPU worker
-            # Set PYTHONPATH and HF_HOME so workers can find code and cached models
-            # HF_HUB_OFFLINE prevents network calls for model metadata
-            dense_runtime_env = {
-                "env_vars": {
-                    "PYTHONPATH": PFS_PYTHONPATH,
-                    "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                    "HF_HUB_OFFLINE": "1",
-                    "TRANSFORMERS_OFFLINE": "1",
-                }
-            }
-            worker = TrainingWorker.options(
-                runtime_env=dense_runtime_env
-            ).remote(
+            pool = get_dense_trainer_pool()
+            entry = pool.get_or_create(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,
+                session_id=session.session_id,
             )
+            worker = entry.actor
+
+            # Update pool entry with current session
+            entry.current_session = session.session_id
+            entry.actual_rank = lora_rank
+
             session.backend = "peft"
+            logger.info(f"[{model_id}] DenseTrainerPool: reusing actor for {base_model} (max_rank={entry.max_lora_rank})")
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
