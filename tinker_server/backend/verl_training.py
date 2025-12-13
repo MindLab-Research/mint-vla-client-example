@@ -1103,6 +1103,64 @@ class VerlTrainingEngine:
         logger.info(f"[{model_id}] optim_step: step={session.current_step}")
         return result
 
+    async def train_step(
+        self,
+        session: TrainingSession,
+        request: Any,
+    ) -> dict:
+        """Combined forward_backward + optim_step in a single call.
+
+        This is the correct way to train MoE models with param_offload=True.
+        Keeping both operations in a single remote call ensures they run in
+        the same train_mode context, so gradients survive for the optimizer step.
+
+        Args:
+            session: TrainingSession.
+            request: ForwardBackwardRequest with training data.
+
+        Returns:
+            Dict with loss_fn_outputs, metrics, and optimizer results.
+        """
+        from .megatron_training import is_moe_model
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+
+        # Serialize data for Ray
+        data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        loss_fn = request.forward_backward_input.loss_fn
+        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+        lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
+
+        # Check if this is an MoE model (uses MegatronWorkerGroup with train_step)
+        use_train_step = session.backend == "megatron" and is_moe_model(session.base_model or "")
+
+        if use_train_step:
+            # MoE: Use combined train_step to keep gradients in same context
+            result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
+        else:
+            # Dense models: Use separate calls (they don't have param_offload issues)
+            fb_result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
+            opt_result = await worker.optim_step.remote(lr)
+
+            # Merge results
+            result = fb_result.copy()
+            if "metrics" not in result:
+                result["metrics"] = {}
+            result["metrics"].update(opt_result.get("metrics", {}))
+
+        # Update session state
+        session.current_step += 1
+        session.accumulated_gradients = 0
+
+        # Ensure step is in metrics
+        if "metrics" not in result:
+            result["metrics"] = {}
+        result["metrics"]["step"] = session.current_step
+
+        logger.info(f"[{model_id}] train_step: step={session.current_step}")
+        return result
+
     async def save_weights_for_sampler(
         self,
         session: TrainingSession,

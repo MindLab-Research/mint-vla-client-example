@@ -670,7 +670,11 @@ class MegatronRankWorker:
         return {}
 
     def optim_step(self, learning_rate: float) -> dict:
-        """Run optimizer step (synchronized across ranks)."""
+        """Run optimizer step (synchronized across ranks).
+
+        WARNING: With param_offload=True, gradients are zeroed when entering train_mode.
+        Use train_step() instead for combined forward_backward + optim_step.
+        """
         # Note: learning_rate not used directly - verl engine handles LR scheduling
         # Use train_mode context to ensure model/gradients are on GPU (required for param_offload)
         # Without this, optimizer would access offloaded tensors with invalid CUDA pointers
@@ -689,6 +693,155 @@ class MegatronRankWorker:
                 "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
                 "lr": float(lr_value),
                 "step": "completed",
+            }
+        return {}
+
+    def train_step(
+        self,
+        data_items: list[dict],
+        loss_fn: str,
+        loss_fn_config: dict,
+        learning_rate: float,
+    ) -> dict:
+        """Run forward, backward, and optimizer step in a single train_mode context.
+
+        This is the correct way to train with param_offload=True. When train_mode exits,
+        gradients are offloaded to CPU. A subsequent train_mode entry zeros the gradients.
+        By keeping everything in one context, gradients persist for the optimizer step.
+
+        Args:
+            data_items: List of Tinker Datum dicts.
+            loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
+            loss_fn_config: Loss function config (e.g., {"epsilon": 0.2} for PPO).
+            learning_rate: Learning rate (passed for compatibility, verl handles scheduling).
+
+        Returns:
+            Dict with loss metrics and optimizer results (from rank 0 only).
+        """
+        import torch
+        from tinker_server.backend.megatron_training import (
+            create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
+        )
+
+        # Get sequence lengths from raw data (before tensor creation)
+        seq_lengths = []
+        for item in data_items:
+            model_input = item.get("model_input", {})
+            chunks = model_input.get("chunks", [])
+            if chunks and "tokens" in chunks[0]:
+                seq_lengths.append(len(chunks[0]["tokens"]))
+
+        # Create TensorDict directly on GPU
+        device = torch.cuda.current_device()
+        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
+
+        # Select loss function
+        if loss_fn == "cross_entropy":
+            loss_function = create_sft_loss_fn(return_logprobs=True)
+        elif loss_fn == "ppo":
+            epsilon = loss_fn_config.get("epsilon", 0.2)
+            loss_function = create_ppo_loss_fn(epsilon)
+        elif loss_fn == "importance_sampling":
+            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
+        else:
+            raise ValueError(f"Unknown loss_fn: {loss_fn}")
+
+        # CRITICAL: All operations in single train_mode context
+        # This ensures gradients survive for optimizer step
+        with self.engine.train_mode():
+            # Zero gradients
+            self.engine.optimizer_zero_grad()
+
+            # Forward-backward (computes gradients)
+            result = self.engine.forward_backward_batch(
+                data=data,
+                loss_function=loss_function,
+                forward_only=False,
+            )
+
+            # Optimizer step (uses gradients computed above)
+            grad_norm = self.engine.optimizer_step()
+            current_lr = self.engine.lr_scheduler_step()
+
+        # Only rank 0 returns metrics
+        if self.rank == 0:
+            loss_value = 0.0
+            num_tokens = 0
+            clip_frac_sum = 0.0
+            ratio_mean_sum = 0.0
+            n_ppo_results = 0
+            all_log_probs = []
+            loss_fn_outputs = []
+
+            if result and isinstance(result, dict):
+                metrics = result.get("metrics", {})
+                losses = result.get("loss", [])
+
+                for loss in losses:
+                    if hasattr(loss, "item"):
+                        loss = loss.item()
+                    loss_value += float(loss)
+
+                num_tokens_list = metrics.get("num_tokens", [])
+                for tokens in num_tokens_list:
+                    if hasattr(tokens, "item"):
+                        tokens = tokens.item()
+                    num_tokens += int(tokens)
+
+                log_probs_list = metrics.get("log_probs", [])
+                for log_probs in log_probs_list:
+                    if log_probs is not None:
+                        if hasattr(log_probs, "cpu"):
+                            log_probs = log_probs.cpu()
+                        all_log_probs.append(log_probs)
+
+                clip_frac_list = metrics.get("clip_frac", [])
+                for cf in clip_frac_list:
+                    if hasattr(cf, "item"):
+                        cf = cf.item()
+                    clip_frac_sum += float(cf)
+                    n_ppo_results += 1
+
+                ratio_mean_list = metrics.get("ratio_mean", [])
+                for rm in ratio_mean_list:
+                    if hasattr(rm, "item"):
+                        rm = rm.item()
+                    ratio_mean_sum += float(rm)
+
+            # Build loss_fn_outputs
+            if all_log_probs and seq_lengths:
+                combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+                offset = 0
+                avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
+                for seq_len in seq_lengths:
+                    sample_log_probs = combined_log_probs[offset:offset + seq_len]
+                    offset += seq_len
+                    loss_fn_outputs.append({
+                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                        "logprobs": {
+                            "data": sample_log_probs.tolist(),
+                            "shape": list(sample_log_probs.shape),
+                            "dtype": "float32",
+                        },
+                    })
+
+            # Handle learning rate
+            if current_lr is not None:
+                lr_value = current_lr[0] if isinstance(current_lr, (list, tuple)) else current_lr
+            else:
+                lr_value = learning_rate
+
+            logger.info(f"[Rank {self.rank}] train_step: loss={loss_value:.4f}, grad_norm={grad_norm:.4f}")
+
+            return {
+                "loss_value": float(loss_value),
+                "num_tokens": int(num_tokens),
+                "clip_frac_sum": float(clip_frac_sum),
+                "ratio_mean_sum": float(ratio_mean_sum),
+                "n_ppo_results": int(n_ppo_results),
+                "loss_fn_outputs": loss_fn_outputs,
+                "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
+                "lr": float(lr_value),
             }
         return {}
 
@@ -1353,12 +1506,83 @@ class MegatronWorkerGroup:
         }
 
     def optim_step(self, learning_rate: float) -> dict:
-        """Run optimizer step on all workers."""
+        """Run optimizer step on all workers.
+
+        WARNING: With param_offload=True, gradients are zeroed when entering train_mode.
+        Use train_step() instead for combined forward_backward + optim_step.
+        """
         futures = [w.optim_step.remote(learning_rate) for w in self.workers]
         ray.get(futures)
 
         self._step_count += 1
         return {"metrics": {"step": self._step_count}}
+
+    def train_step(
+        self,
+        data_items: list[dict],
+        loss_fn: str,
+        loss_fn_config: dict,
+        learning_rate: float,
+    ) -> dict:
+        """Run forward, backward, and optimizer step in a single train_mode context.
+
+        This is the correct way to train with param_offload=True. Keeps all operations
+        in one train_mode context so gradients survive for optimizer step.
+
+        Args:
+            data_items: List of Tinker Datum dicts.
+            loss_fn: Loss function type.
+            loss_fn_config: Loss function config.
+            learning_rate: Learning rate.
+
+        Returns:
+            Dict with loss metrics and optimizer results.
+        """
+        # Call all workers in parallel
+        futures = [
+            w.train_step.remote(data_items, loss_fn, loss_fn_config, learning_rate)
+            for w in self.workers
+        ]
+        results = ray.get(futures)
+
+        # Rank 0 returns the actual result
+        rank0_result = results[0]
+
+        self._step_count += 1
+
+        # Extract metrics from rank 0 result
+        loss_value = rank0_result.get("loss_value", 0.0)
+        num_tokens = rank0_result.get("num_tokens", 0)
+        clip_frac_sum = rank0_result.get("clip_frac_sum", 0.0)
+        ratio_mean_sum = rank0_result.get("ratio_mean_sum", 0.0)
+        n_ppo_results = rank0_result.get("n_ppo_results", 0)
+        grad_norm = rank0_result.get("grad_norm", 0.0)
+        lr = rank0_result.get("lr", learning_rate)
+
+        n_samples = len(data_items) or 1
+
+        metrics = {
+            "loss:mean": loss_value / n_samples if n_samples > 0 else loss_value,
+            "num_samples:sum": float(n_samples),
+            "num_tokens:sum": float(num_tokens),
+            "grad_norm": grad_norm,
+            "lr": lr,
+            "step": self._step_count,
+        }
+        if n_ppo_results > 0:
+            metrics["clipfrac:mean"] = clip_frac_sum / n_ppo_results
+            metrics["ratio:mean"] = ratio_mean_sum / n_ppo_results
+
+        logger.info(
+            f"[MegatronWorkerGroup] train_step: loss={loss_value:.4f}, "
+            f"grad_norm={grad_norm:.4f}, step={self._step_count}"
+        )
+
+        return {
+            "loss_fn_output_type": f"{loss_fn}_loss",
+            "loss_fn_outputs": rank0_result.get("loss_fn_outputs", []),
+            "metrics": metrics,
+        }
 
     def get_lora_state_dict(self) -> dict:
         """Get LoRA state dict from all workers (rank 0 returns data, others empty).

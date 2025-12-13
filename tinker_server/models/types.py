@@ -277,6 +277,22 @@ class OptimStepResponse(BaseModel):
     type: Literal["optim_step"] = "optim_step"
 
 
+class TrainStepRequest(BaseModel):
+    """Request to perform combined forward-backward + optimizer step.
+
+    This is the recommended way to train MoE models with param_offload=True.
+    Keeping both operations in a single request ensures gradients survive
+    for the optimizer step.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    forward_backward_input: ForwardBackwardInput
+    adam_params: AdamParams
+    model_id: str
+    seq_id: int | None = None
+
+
 class TelemetryRequest(BaseModel):
     """Telemetry data from tinker client (discarded)."""
 
