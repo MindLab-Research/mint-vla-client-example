@@ -712,11 +712,7 @@ class MegatronTrainingWorker:
                         # Note: use "logprobs" (no underscore) for cookbook NLL evaluator compatibility
                         loss_fn_outputs.append({
                             "loss": {"data": [float(loss)], "shape": [1], "dtype": "float32"},
-                            "logprobs": {
-                                "data": log_probs.tolist() if hasattr(log_probs, "tolist") else list(log_probs),
-                                "shape": list(log_probs.shape) if hasattr(log_probs, "shape") else [],
-                                "dtype": "float32",
-                            },
+                            "logprobs": log_probs.tolist() if hasattr(log_probs, "tolist") else list(log_probs),
                         })
 
         # Combine log_probs if multiple micro-batches

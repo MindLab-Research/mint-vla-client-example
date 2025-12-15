@@ -221,11 +221,7 @@ class TrainingWorker:
 
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {
-                        "data": target_logprobs.detach().tolist(),
-                        "shape": list(target_logprobs.shape),
-                        "dtype": "float32",
-                    },
+                    "logprobs": target_logprobs.detach().tolist(),
                 })
 
             elif loss_fn in ("importance_sampling", "ppo"):
@@ -303,11 +299,7 @@ class TrainingWorker:
 
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {
-                        "data": new_logprobs.detach().tolist(),
-                        "shape": list(new_logprobs.shape),
-                        "dtype": "float32",
-                    },
+                    "logprobs": new_logprobs.detach().tolist(),
                 })
 
             else:
@@ -437,11 +429,7 @@ class TrainingWorker:
                 # Return logprobs in loss_fn_outputs
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {
-                        "data": target_logprobs.tolist(),
-                        "shape": list(target_logprobs.shape),
-                        "dtype": "float32",
-                    },
+                    "logprobs": target_logprobs.tolist(),
                 })
 
         avg_loss = total_loss / max(total_tokens, 1)
@@ -1243,13 +1231,19 @@ class VerlTrainingEngine:
         Returns:
             Dict with path, state_dict, and peft_config for multi-LoRA registration.
         """
+        import asyncio
         import os
+
+        import ray
 
         model_id = session.model_id
         worker = self._workers[model_id]
 
         # Remote call to save checkpoint - returns meta with state_dict and peft_config
-        meta = await worker.save_checkpoint.remote(save_path)
+        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
+        loop = asyncio.get_running_loop()
+        meta_ref = worker.save_checkpoint.remote(save_path)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
 
         # Update session state from worker metadata
         session.current_step = meta.get("current_step", session.current_step)
@@ -1277,11 +1271,18 @@ class VerlTrainingEngine:
             load_path: Directory path to load from.
             load_optimizer: Whether to restore optimizer state.
         """
+        import asyncio
+
+        import ray
+
         model_id = session.model_id
         worker = self._workers[model_id]
 
         # Remote call to load checkpoint
-        meta = await worker.load_checkpoint.remote(load_path, load_optimizer)
+        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
+        loop = asyncio.get_running_loop()
+        meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
 
         # Update session state from loaded metadata
         session.current_step = meta.get("current_step", 0)

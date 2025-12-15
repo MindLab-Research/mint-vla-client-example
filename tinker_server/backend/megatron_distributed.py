@@ -521,11 +521,7 @@ class MegatronRankWorker:
                     offset += seq_len
                     loss_fn_outputs.append({
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": {
-                            "data": sample_log_probs.tolist(),
-                            "shape": list(sample_log_probs.shape),
-                            "dtype": "float32",
-                        },
+                        "logprobs": sample_log_probs.tolist(),
                     })
 
             # Return CPU-safe scalars and loss_fn_outputs
@@ -644,21 +640,13 @@ class MegatronRankWorker:
                         offset += seq_len
                         loss_fn_outputs.append({
                             "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                            "logprobs": {
-                                "data": sample_log_probs.tolist(),
-                                "shape": list(sample_log_probs.shape),
-                                "dtype": "float32",
-                            },
+                            "logprobs": sample_log_probs.tolist(),
                         })
                 elif combined_log_probs is not None:
                     # Fallback: single entry with all log_probs (legacy behavior)
                     loss_fn_outputs.append({
                         "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
-                        "logprobs": {
-                            "data": combined_log_probs.tolist(),
-                            "shape": list(combined_log_probs.shape),
-                            "dtype": "float32",
-                        },
+                        "logprobs": combined_log_probs.tolist(),
                     })
 
             return {
@@ -818,11 +806,7 @@ class MegatronRankWorker:
                     offset += seq_len
                     loss_fn_outputs.append({
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": {
-                            "data": sample_log_probs.tolist(),
-                            "shape": list(sample_log_probs.shape),
-                            "dtype": "float32",
-                        },
+                        "logprobs": sample_log_probs.tolist(),
                     })
 
             # Handle learning rate
@@ -1302,6 +1286,10 @@ class MegatronRankWorker:
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[MegatronRankWorker] Saved checkpoint to {abs_path} (step={step_count})")
+
+        # Return state_dict and peft_config for vLLM multi-LoRA registration
+        meta["state_dict"] = state_dict
+        meta["peft_config"] = config
         return meta
 
 
