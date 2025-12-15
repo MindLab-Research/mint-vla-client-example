@@ -325,6 +325,7 @@ class MultiLoRAInferenceEngine:
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=PERSISTENT_VLLM_ACTOR_NAME,
+                namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
                 runtime_env={
                     "env_vars": {

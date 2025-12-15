@@ -55,7 +55,10 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
             raise RuntimeError("Session manager not initialized")
 
         token_ids = request.prompt.to_token_ids()
-        session_id = request.sampling_session_id
+        session_id = request.get_session_id()  # Supports both sampling_session_id and model_id
+
+        # Handle include_prompt_logprobs alias
+        want_prompt_logprobs = request.prompt_logprobs or request.include_prompt_logprobs
 
         # Check if session uses multi-LoRA mode (includes base model sessions)
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
@@ -122,7 +125,7 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         response = SampleResponse(sequences=sequences)
 
         # Handle prompt logprobs if requested
-        if request.prompt_logprobs:
+        if want_prompt_logprobs:
             # Use compute_logprobs to get prompt log probabilities
             # compute_logprobs returns len(sequence)-1 values: logprobs[i] = log P(token[i+1] | token[0:i+1])
             # The API expects len(sequence) values with prompt_logprobs[0] as placeholder (no conditioning)

@@ -137,9 +137,9 @@ class TrainingWorker:
                 continue
 
             # Extract target tokens and weights/mask
-            # Accept both "weights" and "mask" field names (tinker spec uses "mask")
+            # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
             target_data = loss_fn_inputs.get("target_tokens", {})
-            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
+            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
 
             target_tokens = target_data.get("data", [])
             weights = weights_data.get("data", []) if weights_data else []
@@ -378,9 +378,9 @@ class TrainingWorker:
                     continue
 
                 # Extract target tokens and weights/mask
-                # Accept both "weights" and "mask" field names (tinker spec uses "mask")
+                # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
                 target_data = loss_fn_inputs.get("target_tokens", {})
-                weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
+                weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
 
                 target_tokens = target_data.get("data", [])
                 weights = weights_data.get("data", []) if weights_data else []
@@ -569,7 +569,7 @@ class TrainingWorker:
             save_path: Directory path to save checkpoint files.
 
         Returns:
-            Dict with training metadata.
+            Dict with training metadata, state_dict, and peft_config for registration.
         """
         import json
         import os
@@ -583,9 +583,9 @@ class TrainingWorker:
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
-        config = self.get_lora_config()
+        peft_config = self.get_lora_config()
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(peft_config, f, indent=2)
 
         # 3. Optimizer state
         torch.save(self.optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
@@ -594,9 +594,14 @@ class TrainingWorker:
         meta = {
             "current_step": self._step_count,
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            # Include state_dict and config for multi-LoRA registration
+            # (API server can't read files from Ray worker filesystem)
+            "state_dict": state_dict,
+            "peft_config": peft_config,
         }
         with open(os.path.join(save_path, "training_meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
+            # Don't write state_dict/peft_config to file (already saved separately)
+            json.dump({k: v for k, v in meta.items() if k not in ("state_dict", "peft_config")}, f, indent=2)
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[TrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
@@ -1226,7 +1231,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
-    ) -> str:
+    ) -> dict:
         """Save full checkpoint via Ray actor.
 
         Saves LoRA weights, optimizer state, and training metadata.
@@ -1236,14 +1241,14 @@ class VerlTrainingEngine:
             save_path: Directory path for checkpoint.
 
         Returns:
-            Absolute path to saved checkpoint.
+            Dict with path, state_dict, and peft_config for multi-LoRA registration.
         """
         import os
 
         model_id = session.model_id
         worker = self._workers[model_id]
 
-        # Remote call to save checkpoint
+        # Remote call to save checkpoint - returns meta with state_dict and peft_config
         meta = await worker.save_checkpoint.remote(save_path)
 
         # Update session state from worker metadata
@@ -1251,7 +1256,13 @@ class VerlTrainingEngine:
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[{model_id}] save_weights: {abs_path}")
-        return abs_path
+
+        # Return dict with path and weights for registration
+        return {
+            "path": abs_path,
+            "state_dict": meta.get("state_dict"),
+            "peft_config": meta.get("peft_config"),
+        }
 
     async def load_weights(
         self,

@@ -91,9 +91,10 @@ async def lifespan(app: FastAPI):
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
 
-    # Weights router also needs training components
+    # Weights router also needs training components and inference manager
     weights.training_manager = train_manager
     weights.training_engine = train_engine
+    weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
 
     logger.info("Training components initialized")
 
