@@ -1059,6 +1059,200 @@ class MegatronRankWorker:
         peft_name = f"base_model.model.model.layers.{layer_num}.{target}.{lora_type}.weight"
         return peft_name
 
+    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+        """Reinitialize LoRA weights AND optimizer state for fresh session.
+
+        Uses verl's default initialization:
+        - lora_A: xavier_uniform
+        - lora_B: zeros
+
+        Also resets Adam optimizer state (exp_avg, exp_avg_sq) to prevent
+        momentum from previous sessions affecting new training.
+
+        Args:
+            learning_rate: New learning rate for the session. If provided,
+                updates all optimizer param_groups. Critical for session reuse.
+
+        This allows reusing the actor for a new session with fresh weights.
+        ALL ranks must call this method for distributed sync.
+
+        Returns:
+            dict with status and count of reinitialized parameters.
+        """
+        import torch
+        import torch.nn.init as init
+        from megatron.core.optimizer import ChainedOptimizer
+
+        logger.info(f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate})")
+        print(f"[REINIT DEBUG Rank {self.rank}] reinit_lora_weights ENTRY lr={learning_rate}", flush=True)
+
+        # Must use train_mode context for param_offload
+        reinit_count = 0
+        opt_state_reset_count = 0
+        lr_updated = False
+
+        with self.engine.train_mode():
+            # Access model parameters (unwrap from list/DDP like verl does)
+            from verl.utils.megatron_utils import unwrap_model
+            model = unwrap_model(self.engine.module)
+            # Unwrap nested lists until we get a module
+            while isinstance(model, list):
+                model = model[0]
+
+            # Find and reinitialize all LoRA parameters
+            for name, param in model.named_parameters():
+                name_lower = name.lower()
+                if 'lora' not in name_lower and 'adapter' not in name_lower:
+                    continue
+
+                if not param.requires_grad:
+                    continue
+
+                # Determine if this is lora_A or lora_B type
+                is_lora_a = ('lora_a' in name_lower or 'linear_in' in name_lower)
+                is_lora_b = ('lora_b' in name_lower or 'linear_out' in name_lower)
+
+                if is_lora_a:
+                    # xavier_uniform for lora_A
+                    init.xavier_uniform_(param.data)
+                    reinit_count += 1
+                elif is_lora_b:
+                    # zeros for lora_B
+                    init.zeros_(param.data)
+                    reinit_count += 1
+
+            # Zero gradients
+            if hasattr(self.engine, 'optimizer') and self.engine.optimizer is not None:
+                self.engine.optimizer.zero_grad(set_to_none=True)
+
+            # Reset optimizer state (Adam momentum and variance)
+            # This is critical: without resetting, accumulated momentum from
+            # previous session causes unexpected convergence behavior
+            optimizer = self.engine.optimizer
+            logger.info(f"[Rank {self.rank}] Optimizer type: {type(optimizer)}")
+            if optimizer is not None:
+                # Handle ChainedOptimizer (multiple optimizers)
+                def iter_optimizers(opt):
+                    if isinstance(opt, ChainedOptimizer):
+                        return opt.chained_optimizers
+                    return [opt]
+
+                opt_list = list(iter_optimizers(optimizer))
+                logger.info(f"[Rank {self.rank}] Number of optimizers in chain: {len(opt_list)}")
+
+                for i, _opt in enumerate(opt_list):
+                    logger.info(f"[Rank {self.rank}] Optimizer {i}: type={type(_opt)}, has .optimizer={hasattr(_opt, 'optimizer')}")
+
+                    # Update learning rate in param_groups (critical for session reuse!)
+                    if learning_rate is not None and hasattr(_opt, 'param_groups'):
+                        old_lr = _opt.param_groups[0].get('lr', 'N/A') if _opt.param_groups else 'N/A'
+                        for pg in _opt.param_groups:
+                            pg['lr'] = learning_rate
+                        lr_updated = True
+                        logger.info(f"[Rank {self.rank}] Updated optimizer {i} LR: {old_lr} -> {learning_rate}")
+
+                    # Access the underlying PyTorch optimizer
+                    if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
+                        inner_opt = _opt.optimizer
+                        logger.info(f"[Rank {self.rank}] Inner optimizer type: {type(inner_opt)}")
+                        state = inner_opt.state
+                        state_count = len(state)
+                        logger.info(f"[Rank {self.rank}] Optimizer state has {state_count} entries BEFORE clear, state type: {type(state)}")
+
+                        # Update learning rate in inner optimizer's param_groups too
+                        if learning_rate is not None and hasattr(inner_opt, 'param_groups'):
+                            for pg in inner_opt.param_groups:
+                                pg['lr'] = learning_rate
+
+                        # CRITICAL FIX: Clear entire optimizer state dict instead of zeroing
+                        # individual entries. With distributed optimizer + param_offload, the
+                        # param objects used as keys may change identity when offloaded/reloaded.
+                        # Clearing forces fresh state initialization on next training step.
+                        #
+                        # Handle ProxyDict from ChainedOptimizer - it wraps multiple optimizer
+                        # states and doesn't have .clear(). Access underlying dicts directly.
+                        print(f"[REINIT DEBUG Rank {self.rank}] state type={type(state).__name__}, has _inner_dicts={hasattr(state, '_inner_dicts')}, has clear={hasattr(state, 'clear')}, count={state_count}", flush=True)
+                        if hasattr(state, '_inner_dicts'):
+                            # ProxyDict from ChainedOptimizer
+                            for inner_dict in state._inner_dicts:
+                                inner_dict.clear()
+                            logger.info(f"[Rank {self.rank}] Cleared ProxyDict optimizer state ({state_count} entries from {len(state._inner_dicts)} inner dicts)")
+                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared ProxyDict, now len={len(state)}", flush=True)
+                        elif hasattr(state, 'clear'):
+                            # Regular dict
+                            state.clear()
+                            logger.info(f"[Rank {self.rank}] Cleared optimizer state dict ({state_count} entries)")
+                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared dict via .clear(), now len={len(state)}", flush=True)
+                        else:
+                            # Unknown type - try to clear via iteration
+                            keys = list(state.keys()) if hasattr(state, 'keys') else []
+                            for key in keys:
+                                del state[key]
+                            logger.info(f"[Rank {self.rank}] Cleared optimizer state via key deletion ({len(keys)} entries)")
+                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared via key deletion, now len={len(state)}", flush=True)
+                        opt_state_reset_count = state_count
+                    else:
+                        logger.warning(f"[Rank {self.rank}] Optimizer {i} has no inner optimizer or it's None")
+
+        # Update instance learning_rate for future reference
+        if learning_rate is not None:
+            self.learning_rate = learning_rate
+
+        logger.info(f"[Rank {self.rank}] Reinitialized {reinit_count} LoRA params, reset {opt_state_reset_count} optimizer states, lr_updated={lr_updated}")
+        return {"status": "ok", "reinit_count": reinit_count, "opt_state_reset": opt_state_reset_count, "lr_updated": lr_updated, "learning_rate": learning_rate}
+
+    def get_optimizer_info(self) -> dict:
+        """Return detailed info about optimizer structure for debugging."""
+        from megatron.core.optimizer import ChainedOptimizer
+
+        info = {
+            "rank": self.rank,
+            "optimizer_type": str(type(self.engine.optimizer)),
+            "has_optimizer": self.engine.optimizer is not None,
+        }
+
+        if self.engine.optimizer is None:
+            return info
+
+        optimizer = self.engine.optimizer
+
+        def iter_optimizers(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        opt_list = list(iter_optimizers(optimizer))
+        info["num_optimizers"] = len(opt_list)
+        info["optimizer_details"] = []
+
+        for i, _opt in enumerate(opt_list):
+            opt_info = {
+                "index": i,
+                "type": str(type(_opt)),
+                "has_inner_optimizer": hasattr(_opt, 'optimizer') and _opt.optimizer is not None,
+            }
+            if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
+                inner_opt = _opt.optimizer
+                opt_info["inner_type"] = str(type(inner_opt))
+                opt_info["state_count"] = len(inner_opt.state)
+                # Sample first few state entries
+                state_samples = []
+                for j, (param_id, param_state) in enumerate(inner_opt.state.items()):
+                    if j >= 3:
+                        break
+                    sample = {
+                        "param_type": str(type(param_id)),
+                        "state_keys": list(param_state.keys()),
+                    }
+                    if 'exp_avg' in param_state:
+                        sample["exp_avg_norm"] = param_state['exp_avg'].norm().item()
+                    if 'exp_avg_sq' in param_state:
+                        sample["exp_avg_sq_norm"] = param_state['exp_avg_sq'].norm().item()
+                    state_samples.append(sample)
+                opt_info["state_samples"] = state_samples
+            info["optimizer_details"].append(opt_info)
+
+        return info
 
     def save_checkpoint(self, save_path: str, step_count: int = 0) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
@@ -1641,6 +1835,40 @@ class MegatronWorkerGroup:
             "pad_token_id": tokenizer.pad_token_id,
         }
 
+    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+        """Reinitialize LoRA weights to fresh random state on all workers.
+
+        This must be called when reusing an actor for a new session to ensure
+        fresh weights instead of inheriting trained weights from previous session.
+
+        Args:
+            learning_rate: New learning rate for the session. If provided,
+                updates all optimizer param_groups on all workers.
+
+        Returns:
+            dict with status and total count of reinitialized parameters.
+        """
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate})")
+
+        # Call reinit on all workers (required for distributed sync)
+        futures = [w.reinit_lora_weights.remote(learning_rate) for w in self.workers]
+        results = ray.get(futures)
+
+        # Aggregate results
+        total_reinit = sum(r.get("reinit_count", 0) for r in results)
+        total_opt_state_reset = sum(r.get("opt_state_reset", 0) for r in results)
+        lr_updated = any(r.get("lr_updated", False) for r in results)
+
+        # Reset step count for fresh training
+        self._step_count = 0
+
+        # Update instance learning_rate
+        if learning_rate is not None:
+            self.learning_rate = learning_rate
+
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}")
+        return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate}
+
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
         """Load checkpoint from path.
 
@@ -1863,6 +2091,12 @@ class MegatronWorkerGroup:
             "max_lora_rank": self.lora_rank,  # Phase 7: trainer's max rank
             "actual_rank": getattr(self, '_actual_rank', None),  # Phase 7: session's actual rank
         }
+
+    def get_optimizer_info(self) -> dict:
+        """Get detailed optimizer info for debugging."""
+        futures = [self.workers[0].get_optimizer_info.remote()]
+        results = ray.get(futures)
+        return results[0]
 
     def shutdown(self):
         """Shutdown all workers and release placement group."""
@@ -2276,6 +2510,15 @@ def get_or_create_megatron_worker_group(
         logger.info(
             f"Connected to existing Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
         )
+        # Reinitialize LoRA weights for fresh session
+        # This ensures each new session starts with fresh random weights
+        # instead of inheriting trained weights from previous session
+        # CRITICAL: Pass learning_rate to update optimizer param_groups
+        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate})...")
+        print(f"[API SERVER] Calling reinit_lora_weights with lr={learning_rate}", flush=True)
+        result = ray.get(actor.reinit_lora_weights.remote(learning_rate))
+        print(f"[API SERVER] reinit_lora_weights returned: reinit_count={result.get('reinit_count', 0)}, opt_state_reset={result.get('opt_state_reset', 0)}, lr_updated={result.get('lr_updated', False)}", flush=True)
+        logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
         return actor
     except ValueError:
         # Actor doesn't exist, create new one
