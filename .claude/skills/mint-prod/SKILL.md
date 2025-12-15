@@ -164,6 +164,29 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill
 
 ## 4. Code Update SOP
 
+### Decision Matrix
+
+| Code Changed | Actors Running | Action |
+|--------------|----------------|--------|
+| `megatron_*.py`, `megatron_distributed.py` | Megatron alive | Kill Megatron + restart server |
+| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | vLLM alive | Kill vLLM + restart server |
+| Routes, middleware only | Any | Restart server only |
+| Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
+
+### Kill Scripts
+
+```bash
+# Kill Megatron (frees 8 GPUs for MoE)
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_megatron.py'
+
+# Kill vLLM (frees 1-4 GPUs depending on model) - requires auth
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+# OR if server down:
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_vllm.py'
+```
+
+### Legacy Reference
+
 | Changed Code | Required Actions |
 |--------------|------------------|
 | `megatron_*.py`, `megatron_distributed.py` | Kill Megatron actor + restart server |
@@ -230,7 +253,42 @@ Prod-specific values:
 
 ---
 
-## 6. Debugging
+## 6. GPU Requirements for MoE Models
+
+> **CRITICAL: ALWAYS verify cluster has enough GPUs before starting MoE actors.**
+
+### GPU Requirements by Model
+
+| Model | vLLM (Inference) | Megatron (Training) | Total (Simultaneous) |
+|-------|------------------|---------------------|----------------------|
+| **Qwen3-30B-A3B** | TP=1, DP=4 → **4 GPUs** | TP=4, EP=2 → **8 GPUs** | **12 GPUs** |
+| **Qwen3-235B-A22B** | TP=2, DP=4 → **8 GPUs** | Not tested | **8+ GPUs** |
+| Dense models (7B-14B) | **1 GPU** | **1 GPU** | **2 GPUs** |
+
+### Pre-flight Check (MANDATORY)
+
+```bash
+# Quick status command (MANDATORY before any work)
+ssh mint-prod 'python3 << "PYEOF"
+import ray
+ray.init(address="auto", ignore_reinit_error=True)
+r = ray.available_resources()
+t = ray.cluster_resources()
+gpu_avail = r.get("GPU", 0)
+gpu_total = t.get("GPU", 0)
+print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
+for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
+    try:
+        ray.get_actor(name, namespace="tinker")
+        print(f"{name}: ALIVE")
+    except ValueError:
+        print(f"{name}: not running")
+PYEOF'
+```
+
+---
+
+## 7. Debugging
 
 ```bash
 # Error search

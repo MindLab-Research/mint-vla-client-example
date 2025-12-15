@@ -157,6 +157,29 @@ ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.p
 
 ## 4. Code Update SOP
 
+### Decision Matrix
+
+| Code Changed | Actors Running | Action |
+|--------------|----------------|--------|
+| `megatron_*.py`, `megatron_distributed.py` | Megatron alive | Kill Megatron + restart server |
+| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | vLLM alive | Kill vLLM + restart server |
+| Routes, middleware only | Any | Restart server only |
+| Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
+
+### Kill Scripts
+
+```bash
+# Kill Megatron (frees 8 GPUs for MoE)
+ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+
+# Kill vLLM (frees 1-4 GPUs depending on model)
+curl -X POST http://localhost:8000/api/v1/kill_vllm
+# OR if server is down:
+ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.py'
+```
+
+### Legacy Reference (do not use these names directly)
+
 | Changed Code | Required Actions |
 |--------------|------------------|
 | `megatron_*.py`, `megatron_distributed.py` | Kill Megatron actor + restart server |
@@ -231,8 +254,22 @@ Dev-specific values:
 Before starting any MoE test, run:
 
 ```bash
-# Check available GPUs
-ssh volcano "python -c \"import ray; ray.init(); r=ray.available_resources(); print(f'Available GPUs: {r.get(\\\"GPU\\\", 0)}')\""
+# Quick status command (MANDATORY before any work)
+ssh volcano 'python3 << "PYEOF"
+import ray
+ray.init(address="auto", ignore_reinit_error=True)
+r = ray.available_resources()
+t = ray.cluster_resources()
+gpu_avail = r.get("GPU", 0)
+gpu_total = t.get("GPU", 0)
+print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
+for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
+    try:
+        ray.get_actor(name, namespace="tinker")
+        print(f"{name}: ALIVE")
+    except ValueError:
+        print(f"{name}: not running")
+PYEOF'
 
 # Check pending placement groups (should be empty)
 ssh volcano "ray status 2>/dev/null | grep -A5 'Pending Demands'"

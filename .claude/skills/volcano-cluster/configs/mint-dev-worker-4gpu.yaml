@@ -1,44 +1,39 @@
-# Ray GPU Worker - Template
+# Ray GPU Worker - 4 GPU variant for LRU eviction testing
 #
 # WARNING: This YAML is NOT directly usable.
 # Before submitting, the agent must:
 #   1. Look up the Ray head IP from task logs: volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 #   2. Replace <RAY_HEAD_IP> with the actual IP address
-#   3. Adjust Flavor and --num-gpus as needed:
-#      - ml.pni2l.7xlarge  = 2 GPUs
-#      - ml.pni2l.14xlarge = 4 GPUs
-#      - ml.pni2l.28xlarge = 8 GPUs
 #
-# Submit with: volc ml_task submit -c ray_worker.yaml --output json
+# This config creates a 4-GPU worker, used together with an 8-GPU worker (12 total)
+# to test LRU eviction behavior when Dense and MoE models cannot colocate.
+#
+# Submit with: volc ml_task submit -c mint-dev-worker-4gpu.yaml --output json
 
-TaskName: "ray-worker"
-Description: "Ray GPU worker - A800, joins head cluster"
+TaskName: "ray-worker-4gpu"
+Description: "Ray 4-GPU worker - A800, for LRU eviction testing"
 
 Entrypoint: |
   export HF_HUB_OFFLINE=1
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1  # Disable .pyc cache to avoid bytecode/source mismatch
 
-  # Symlink to PFS code (use PFS versions instead of container packages)
+  # Symlink to PFS code
   rm -rf /root/tinker_project/tinker-server
   mkdir -p /root/tinker_project
   ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
 
-  # Use PFS verl with patched _mutable_fields (allows lora config assignment)
-  rm -rf /root/verl
-  ln -s /vePFS-Mindverse/share/code/verl /root/verl
-
   # Connect to Ray head
-  ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=8 && sleep infinity
+  ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=4 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:2"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.pni2l.28xlarge"  # 8x A800 80GB
+      Flavor: "ml.pni2l.14xlarge"  # 4x A800 80GB
 
 # Ephemeral: 12 hours default
 ActiveDeadlineSeconds: 43200

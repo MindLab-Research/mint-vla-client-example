@@ -160,24 +160,59 @@ ssh mint-prod "ray stop"
 
 When actors become unresponsive (OOM, stuck, orphaned):
 
-1. **Check Ray dashboard** for actor status:
-   ```
-   http://<RAY_HEAD_IP>:8265
-   ```
+### Check GPU and Actor Status
 
-2. **Kill specific actor via API** (if server running):
-   ```bash
-   # Dev
-   curl -X POST http://localhost:8000/api/v1/kill_vllm
+```bash
+# Dev cluster
+ssh volcano 'python3 << "PYEOF"
+import ray
+ray.init(address="auto", ignore_reinit_error=True)
+r = ray.available_resources()
+t = ray.cluster_resources()
+gpu_avail = r.get("GPU", 0)
+gpu_total = t.get("GPU", 0)
+print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
+for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
+    try:
+        ray.get_actor(name, namespace="tinker")
+        print(f"{name}: ALIVE")
+    except ValueError:
+        print(f"{name}: not running")
+PYEOF'
 
-   # Prod
-   curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
-   ```
+# Prod cluster - use mint-prod instead of volcano
+```
 
-3. **Nuclear option - tear down entire cluster:**
-   - Cancel all worker tasks
-   - Cancel head task
-   - Redeploy cluster
+### Kill Actors
+
+```bash
+# Kill Megatron (dev)
+ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+
+# Kill Megatron (prod)
+ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_megatron.py'
+
+# Kill vLLM (dev)
+curl -X POST http://localhost:8000/api/v1/kill_vllm
+
+# Kill vLLM (prod - requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+```
+
+### Actor Names Reference
+
+| Actor | Name | Namespace |
+|-------|------|-----------|
+| Megatron | `persistent_megatron_worker_group_v2` | `tinker` |
+| vLLM | `tinker_vllm_server` | `tinker` |
+
+### Nuclear Option
+
+If actors cannot be killed via API:
+
+1. Cancel all worker tasks
+2. Cancel head task
+3. Redeploy cluster
 
 ---
 
@@ -237,7 +272,10 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 
 | Package | Version | Path |
 |---------|---------|------|
+| PyTorch | 2.9.0 | `/vePFS-Mindverse/share/code/torch-2.9.0/` |
 | vLLM | 0.12.0 | `/vePFS-Mindverse/share/code/vllm-0.12.0/` |
+
+**PYTHONPATH order matters:** torch must come before vllm.
 
 ---
 
