@@ -37,6 +37,7 @@ from ..models.types import (
     OptimStepRequest,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
+    TrainStepRequest,
     UntypedAPIFuture,
 )
 
@@ -111,6 +112,7 @@ async def _do_create_model(request_id: str, request: CreateModelRequest) -> None
             request_id=request_id,
             model_id=model_id,
             type="create_model",
+            backend=session.backend,  # "megatron" or "peft"
         )
         future_store.resolve(request_id, response.model_dump())
 
@@ -364,6 +366,51 @@ async def _do_optim_step(request_id: str, session, request: OptimStepRequest) ->
 
 
 # =============================================================================
+# train_step - combined forward_backward + optim_step (async)
+# =============================================================================
+
+
+@router.post("/train_step", response_model=UntypedAPIFuture)
+async def train_step(
+    request: TrainStepRequest,
+    background_tasks: BackgroundTasks,
+) -> UntypedAPIFuture:
+    """Combined forward-backward and optimizer step.
+
+    This is the recommended way to train MoE models with param_offload=True.
+    Keeping both operations in a single request ensures gradients survive
+    for the optimizer step.
+    """
+
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
+
+    request_id = future_store.create()
+    background_tasks.add_task(_do_train_step, request_id, session, request)
+    return UntypedAPIFuture(request_id=request_id)
+
+
+async def _do_train_step(request_id: str, session, request) -> None:
+    """Background task for train_step."""
+    try:
+        if training_engine is None:
+            raise RuntimeError("Training engine not initialized")
+
+        result = await training_engine.train_step(session, request)
+        future_store.resolve(request_id, result)
+
+    except Exception as e:
+        logger.exception(f"[train_step] Failed: {e}")
+        future_store.fail(request_id, str(e))
+
+
+# =============================================================================
 # save_weights_for_sampler - async
 # =============================================================================
 
@@ -501,6 +548,7 @@ async def _do_save_weights_for_sampler(
                     engine = VerlInferenceEngine(
                         model_path=inference_manager.model_path,
                         tensor_parallel_size=inference_manager.tensor_parallel_size,
+                        data_parallel_size=inference_manager.data_parallel_size,
                         gpu_memory_utilization=inference_manager.gpu_memory_utilization,
                         max_model_len=inference_manager.max_model_len,
                         lora_rank=lora_rank,

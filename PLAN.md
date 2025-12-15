@@ -1,589 +1,447 @@
-# Tinker-Server: Qwen3 MoE Support Plan
+# Mint Server Roadmap
 
-## Current Status: Dense Models (Complete)
+## Overview
 
-All Tinker API endpoints implemented and verified with Qwen2.5-7B-Instruct:
+**Mint** is a multi-tenant training/inference server compatible with Tinker APIs.
 
-| Paradigm | Loss Function | Status |
-|----------|---------------|--------|
-| SFT | `cross_entropy` | Verified |
-| Policy Gradient RL | `importance_sampling` | Verified |
-| PPO | `ppo` | Verified |
-| Custom Losses (DPO) | via `weights` | Verified |
-
-Architecture: Single-GPU Ray actors with PEFT LoRA.
+- Separated inference and training on different GPU pools
+- LoRA-based training with sub-second adapter transfer
+- Dense models via PEFT, MoE models via verl Megatron backend
+- Multi-session actor sharing with LRU eviction
 
 ---
 
-## Milestone: Qwen3 MoE Support
+## Current State (Completed)
 
-### Target Models
-
-| Model | Total Params | Active Params | Min GPUs | Status |
-|-------|--------------|---------------|----------|--------|
-| Qwen3-30B-A3B | 30B | 3B | 4x A100-80GB | Target |
-| Qwen3-235B-A22B | 235B | 22B | 8x A100-80GB | Stretch |
-
-### Architecture Requirements
-
-MoE models require multi-GPU training with FSDP. Current single-GPU actor pattern insufficient.
-
-**Current (Dense):**
-```
-1 Training Session = 1 Ray Actor = 1 Process = 1 GPU
-```
-
-**Required (MoE):**
-```
-1 Training Session = N Ray Actors = N Processes = N GPUs (FSDP)
-```
+| Feature | Status |
+|---------|--------|
+| Dense model training (Qwen2.5-7B) | Verified |
+| MoE model training (Qwen3-30B-A3B) | Verified |
+| Multi-session actor sharing | Verified |
+| Unified rank support (max-rank padding) | Verified |
+| LRU-based actor eviction | Implemented |
+| LoRA hot-swap to vLLM | Verified (0.16s extraction + 2.2s inference) |
 
 ---
 
-## Phase 1: Inference Support
+## Roadmap
 
-**Goal:** Serve Qwen3 MoE models for sampling and logprob computation.
+### 1. Model Lineup
 
-**Dependencies:** vLLM >= 0.9.0
+#### T0 (Week 1-2) - Foundation
 
-### Tasks
+| Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
+|-------|------|--------------|------------|------------|-------|
+| Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | |
+| moonshotai/Kimi-K2-Thinking | Reasoning | MoE | 64+ | 32+ | Block-FP8, infra team has working impl |
 
-| Task | File | Status |
-|------|------|--------|
-| Add `tensor_parallel_size` config | `config.py` | [ ] |
-| Add `expert_parallel_size` config | `config.py` | [ ] |
-| Update vLLM server args | `verl_inference.py` | [ ] |
-| Test Qwen3-30B-A3B inference | - | [ ] |
+#### T1 (Week 2-3) - Scale Up
 
-### Implementation
+| Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
+|-------|------|--------------|------------|------------|-------|
+| Qwen/Qwen3-4B-Instruct-2507 | Instruction | Dense | 1 | 1 | |
+| Qwen/Qwen3-8B | Hybrid | Dense | 2 | 1 | |
+| Qwen/Qwen3-235B-A22B-Instruct-2507 | Instruction | MoE | 32 (TP8,EP4) | 16 | Multi-node |
+| deepseek-ai/DeepSeek-V3.1 | Hybrid | MoE | 64+ | 32+ | Different MoE architecture |
 
-```python
-# config.py
-@dataclass
-class ServerConfig:
-    # Existing
-    tensor_parallel_size: int = 1
+#### T2 (Week 4+) - Multimodal & Embodied
 
-    # New for MoE
-    expert_parallel_size: int = 1  # vLLM expert parallelism
-    enable_expert_parallel: bool = False
+| Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
+|-------|------|--------------|------------|------------|-------|
+| Qwen/Qwen3-VL-30B-A3B-Instruct | Vision | MoE | TBD | TBD | Vision encoder integration |
+| Qwen/Qwen3-VL-235B-A22B-Instruct | Vision | MoE | TBD | TBD | |
+| physical-intelligence/pi0 | VLA | PaliGemma+Expert | TBD | TBD | Flow matching, 50Hz actions |
+| physical-intelligence/pi0.5 | VLA | PaliGemma+Expert | TBD | TBD | Open-world generalization |
+| physical-intelligence/pi0-fast | VLA | PaliGemma+Expert | TBD | TBD | FAST action tokenizer |
+
+#### Testing Strategy
+
+Each tier involves:
+1. Functional testing with supported models (SFT, RL, DPO)
+2. Scientific experiments (base models, LoRA ranks, learning rates)
+3. Testing with unsupported but compatible models (e.g., Llama dense if Qwen dense works)
+
+#### Technical Challenges
+
+| Model | Challenge | Mitigation |
+|-------|-----------|------------|
+| Kimi-K2 | Block-FP8 quantization, 1T params | Infra team has working impl, migrate to Mint |
+| DeepSeek-V3.1 | Different MoE routing | Architecture analysis needed |
+| VL models | Vision encoder, multimodal inputs | New modality support |
+| pi0/pi0.5 (VLA) | See VLA investigation below | Tentative - may require new backend |
+
+#### VLA Models Investigation (Tentative)
+
+**What are VLA models?** Vision-Language-Action models for robot control. Output continuous action trajectories instead of text tokens.
+
+**Architecture (pi0):**
+- Base: PaliGemma 3B VLM backbone
+- Action expert: +300M params (initialized from scratch)
+- Total: ~3.3B parameters
+- Output: Continuous action vectors at 50Hz via flow matching
+
+**Key differences from standard VLM fine-tuning:**
+
+| Aspect | Standard VLM | VLA (pi0) |
+|--------|--------------|-----------|
+| Output | Discrete text tokens | Continuous action vectors |
+| Training objective | Cross-entropy | Flow matching |
+| Inference rate | Variable | Fixed 50Hz real-time |
+| Additional inputs | Image + text | Image + text + robot state |
+| Expert module | None | 300M action expert |
+
+**Implementation requirements:**
+
+1. **Flow matching support** - Different from cross-entropy loss, generates smooth trajectories
+2. **Action expert module** - Additional trainable module beyond VLM backbone
+3. **Robot state inputs** - Proprioceptive data (joint positions, velocities)
+4. **Continuous output** - Not discrete token prediction
+5. **Real-time inference** - 50Hz control loop requirements
+
+**Framework status:**
+- Native: JAX with FSDP
+- PyTorch: Recently added (DDP, multi-node via torchrun)
+- LoRA fine-tuning: Supported (>22.5 GB VRAM)
+- Full fine-tuning: >70 GB VRAM (A100/H100)
+
+**Open questions:**
+1. Can verl/Megatron support PaliGemma architecture?
+2. How to integrate flow matching into existing training pipeline?
+3. Is there demand for VLA fine-tuning via Tinker-style API?
+4. Alternative: Direct integration with openpi repo?
+
+**References:**
+- [openpi GitHub](https://github.com/Physical-Intelligence/openpi)
+- [pi0 Paper](https://www.physicalintelligence.company/download/pi0.pdf)
+- [pi0.5 Paper](https://arxiv.org/abs/2504.16054)
+- [HuggingFace Blog](https://huggingface.co/blog/pi0)
+
+---
+
+### 2. Resource Orchestration
+
+#### Current State
+
+- Per-backend pools: `MegatronActorPool`, `DenseTrainerPool`
+- LRU eviction within each pool
+- No cross-pool awareness
+
+#### Target State
+
+Unified `ResourceManager` with global GPU tracking and cross-pool eviction.
+
+```
+ResourceManager
+├── total_gpus: int (cluster capacity)
+├── allocated: dict[actor_id, num_gpus]
+├── pools: [MegatronActorPool, DenseTrainerPool, InferencePool]
+└── allocate(model, num_gpus) → evicts across ALL pools if needed
 ```
 
-```python
-# verl_inference.py - ExtendedVLLMHttpServer.__init__
-if self.config.enable_expert_parallel:
-    args.enable_expert_parallel = True
-    args.expert_parallel_size = self.config.expert_parallel_size
-```
+#### GPU Requirements Reference
 
-### Validation
+| Model | Inference | Training | Total |
+|-------|-----------|----------|-------|
+| Qwen3-0.6B | 1 | 1 | 2 |
+| Qwen2.5-7B | 1 | 1 | 2 |
+| Qwen3-8B | 1 | 2 | 3 |
+| Qwen3-30B-A3B | 4 (TP4) | 8 (TP4,EP2) | 12 |
+| Qwen3-235B-A22B | 16 (TP8) | 32 (TP8,EP4) | 48 |
+| Kimi-K2 | 32+ | 64+ | 96+ |
+| DeepSeek-V3.1 | 32+ | 64+ | 96+ |
+
+#### Tasks
+
+| Task | Priority | Complexity |
+|------|----------|------------|
+| Create unified `ResourceManager` | High | Medium |
+| Implement cross-pool eviction | High | Medium |
+| Add GPU requirement registry per model | Medium | Low |
+| Future: multi-worker scaling for high load | Low | High |
+
+---
+
+### 3. Procedure Standardization
+
+#### Branch Strategy
+
+- `develop`: All development work
+- `main`: Production-ready code, requires gate pass
+
+#### Merge Gate (Claude Skill)
+
+A skill that guides the agent through manual testing before merge:
+
+| Step | Test | Pass Criteria |
+|------|------|---------------|
+| 1 | Bring up clean dev cluster | Cluster healthy, GPUs available |
+| 2 | Functional test (dense) | SFT/RL/DPO with Qwen3-0.6B, loss decreases |
+| 3 | Functional test (MoE) | SFT/RL/DPO with Qwen3-30B-A3B, loss decreases |
+| 4 | API alignment test | tinker_test.ipynb passes |
+| 5 | Stress test | 10 concurrent sessions, no crashes/deadlocks |
+
+#### Tinker Comparison Skill
+
+Compare Mint against official Tinker API:
+
+- **Caching**: Store Tinker results in `results/tinker_baseline/` to avoid repeated API calls
+- **Metrics**: Loss correlation (r > 0.99), final loss diff (< 1%), wall time ratio
+- **API key**: `TINKER_API_KEY` in `.env` (gitignored)
+
+#### Environment Separation
+
+| Property | Dev | Prod |
+|----------|-----|------|
+| Port | 8000 | 18000 |
+| API key required | No | Yes |
+| SSH host | `volcano` | `mint-prod` |
+| Unison profile | `volcano-tinker` | `volcano-tinker-auth` |
+
+#### Deployment
+
+After merge to main: automated deployment to prod cluster (nightly).
+
+---
+
+### 4. Cleanup
+
+#### Project Rename: tinker-server → mint
+
+| Category | Count | Action |
+|----------|-------|--------|
+| Directory | 1 | `tinker_server/` → `mint/` |
+| Imports | ~50 files | `from tinker_server` → `from mint` |
+| Config vars | ~10 | `TINKER_MODEL_PATH` → `MINT_MODEL_PATH` |
+| Skills | 4 | Update paths |
+
+Keep `TINKER_BASE_URL`, `TINKER_API_KEY` for client-side Tinker API compatibility.
+
+#### Test Script Consolidation
+
+Current: 39 scripts with significant overlap.
+
+| Keep | Merge | Purpose |
+|------|-------|---------|
+| `test_sft_loop.py` | - | Dense SFT baseline |
+| `test_moe_training.py` | 8 `test_moe_*.py` | MoE training |
+| `test_concurrent_sessions.py` | stress scripts | Load testing |
+| `test_phase6_isolation.py` | - | Session isolation |
+| `test_time_sliced_isolation.py` | New | Correctness verification |
+| `test_tinker_api_alignment.py` | New | API compatibility gate |
+
+#### Common Test Utilities
+
+Extract duplicated code into `tests/utils.py`:
+- `poll_future()`
+- `create_session()`
+- `TinkerTestClient` class
+
+#### Code Smell Watch List
+
+- Duplicated `poll_future()` across scripts
+- Hardcoded model names
+- Similar helper functions
+
+---
+
+### 5. Agent Awareness Improvements
+
+#### Problem
+
+Common debugging loop wastes time:
+1. Restart server (actors keep old code)
+2. Test fails with stale behavior
+3. Realize actors need killing
+4. Kill actors, wait for GPU release
+5. Retry
+
+#### Solution
+
+Add pre-flight checks to skills:
 
 ```bash
-# Start server with Qwen3-30B-A3B
-TINKER_MODEL_PATH=/path/to/Qwen3-30B-A3B \
-TENSOR_PARALLEL_SIZE=4 \
-python scripts/run_server.py
-
-# Test sampling
-curl -X POST http://localhost:8000/api/v1/asample ...
-```
-
----
-
-## Phase 2: FSDP Training Infrastructure
-
-**Goal:** Replace single-GPU `TrainingWorker` with multi-GPU FSDP training via Ray placement groups.
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    FSDPTrainingSession                       │
-│  (Manages placement group + coordinates N workers)           │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│   │ FSDPWorker   │  │ FSDPWorker   │  │ FSDPWorker   │ ...  │
-│   │ rank=0       │  │ rank=1       │  │ rank=2       │      │
-│   │ GPU 0        │  │ GPU 1        │  │ GPU 2        │      │
-│   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
-│          │                 │                 │               │
-│          └─────────────────┼─────────────────┘               │
-│                            │                                 │
-│                    NCCL Collectives                          │
-│                 (torch.distributed)                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Tasks
-
-| Task | File | Status |
-|------|------|--------|
-| Create `ModelConfig` registry | `model_registry.py` | [ ] |
-| Create `FSDPWorker` Ray actor | `fsdp_training.py` | [ ] |
-| Create `FSDPTrainingSession` coordinator | `fsdp_training.py` | [ ] |
-| Integrate with `TrainingSessionManager` | `training_session_manager.py` | [ ] |
-| Update `POST /create_model` to auto-detect FSDP | `routes/training.py` | [ ] |
-| Update `POST /forward_backward` for FSDP | `routes/training.py` | [ ] |
-| FSDP checkpoint save/load | `fsdp_training.py` | [ ] |
-
-### New File: `tinker_server/backend/fsdp_training.py`
-
-```python
-"""FSDP Training with Ray Placement Groups.
-
-Multi-GPU training via coordinated Ray actors with torch.distributed.
-"""
-
+# Quick status command
+ssh volcano 'python3 -c "
 import ray
-import torch
-import torch.distributed as dist
-from ray.util.placement_group import PlacementGroup, placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from peft import LoraConfig, get_peft_model
-
-
-@ray.remote
-def get_master_addr_port() -> tuple[str, str]:
-    """Get master address and port for torch.distributed."""
-    import socket
-    addr = ray.util.get_node_ip_address()
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        port = sock.getsockname()[1]
-    return addr, str(port)
-
-
-@ray.remote(num_gpus=1)
-class FSDPWorker:
-    """Single worker in an FSDP training group.
-
-    Each worker holds a shard of the model and participates in
-    collective operations via torch.distributed.
-    """
-
-    def __init__(
-        self,
-        rank: int,
-        world_size: int,
-        master_addr: str,
-        master_port: str,
-        base_model: str,
-        lora_rank: int,
-    ):
-        self.rank = rank
-        self.world_size = world_size
-        self.base_model = base_model
-        self.lora_rank = lora_rank
-
-        # Set environment for torch.distributed
-        import os
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = master_port
-        os.environ["RANK"] = str(rank)
-        os.environ["WORLD_SIZE"] = str(world_size)
-
-        self.initialized = False
-
-    def init_distributed(self):
-        """Initialize torch.distributed and FSDP model."""
-        if self.initialized:
-            return
-
-        # Initialize process group
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(0)  # Each worker sees only its GPU
-
-        # Load model
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.base_model, trust_remote_code=True
-        )
-
-        # Load with meta device for efficient FSDP init
-        from accelerate import init_empty_weights
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_pretrained(
-                self.base_model,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-            )
-
-        # Apply LoRA before FSDP wrapping
-        peft_config = LoraConfig(
-            r=self.lora_rank,
-            lora_alpha=self.lora_rank,
-            target_modules="all-linear",  # Includes MoE expert layers
-            lora_dropout=0.0,
-            bias="none",
-        )
-        model = get_peft_model(model, peft_config)
-
-        # Wrap with FSDP
-        from torch.distributed.fsdp import ShardingStrategy
-        from verl.utils.fsdp_utils import get_fsdp_wrap_policy
-
-        self.model = FSDP(
-            model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            auto_wrap_policy=get_fsdp_wrap_policy(model),
-            device_id=torch.cuda.current_device(),
-        )
-
-        # Optimizer for LoRA params only
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=1e-4,
-        )
-
-        self.initialized = True
-        return {"rank": self.rank, "status": "ready"}
-
-    def forward_backward(self, data_items: list[dict], loss_fn: str) -> dict:
-        """Forward + backward pass with gradient sync via FSDP."""
-        self.model.train()
-
-        # Process batch (same logic as current TrainingWorker)
-        # ... loss computation ...
-
-        loss.backward()  # FSDP handles gradient sync
-
-        # Only rank 0 returns metrics
-        if self.rank == 0:
-            return {"loss": loss.item(), "metrics": {...}}
-        return {}
-
-    def optim_step(self, adam_params: dict) -> dict:
-        """Optimizer step (synchronized across workers)."""
-        # Update learning rate
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = adam_params.get("learning_rate", pg["lr"])
-
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-
-        return {"status": "ok"}
-
-    def get_state_dict(self) -> dict:
-        """Get full state dict (gathered from all shards)."""
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-        with FSDP.state_dict_type(
-            self.model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            if self.rank == 0:
-                return self.model.state_dict()
-        return {}
-
-
-class FSDPTrainingSession:
-    """Coordinator for multi-GPU FSDP training session.
-
-    Manages a placement group of FSDPWorkers that form one training session.
-    """
-
-    def __init__(
-        self,
-        session_id: str,
-        base_model: str,
-        lora_rank: int,
-        num_gpus: int = 4,
-    ):
-        self.session_id = session_id
-        self.num_gpus = num_gpus
-        self.workers: list[ray.actor.ActorHandle] = []
-
-        # Create placement group
-        self.pg = placement_group(
-            bundles=[{"GPU": 1, "CPU": 4} for _ in range(num_gpus)],
-            strategy="STRICT_PACK",  # Same node for NVLink
-            name=f"fsdp_training_{session_id}",
-        )
-        ray.get(self.pg.ready())
-
-        # Get master addr/port
-        master_addr, master_port = ray.get(get_master_addr_port.remote())
-
-        # Spawn workers
-        for rank in range(num_gpus):
-            worker = FSDPWorker.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=self.pg,
-                    placement_group_bundle_index=rank,
-                )
-            ).remote(
-                rank=rank,
-                world_size=num_gpus,
-                master_addr=master_addr,
-                master_port=master_port,
-                base_model=base_model,
-                lora_rank=lora_rank,
-            )
-            self.workers.append(worker)
-
-        # Initialize all workers
-        ray.get([w.init_distributed.remote() for w in self.workers])
-
-    async def forward_backward(self, data_items: list[dict], loss_fn: str) -> dict:
-        """Broadcast data to all workers, return metrics from rank 0."""
-        results = await asyncio.gather(*[
-            w.forward_backward.remote(data_items, loss_fn)
-            for w in self.workers
-        ])
-        # Rank 0 has the metrics
-        return results[0]
-
-    async def optim_step(self, adam_params: dict) -> dict:
-        """Synchronized optimizer step across all workers."""
-        results = await asyncio.gather(*[
-            w.optim_step.remote(adam_params)
-            for w in self.workers
-        ])
-        return results[0]
-
-    async def save_checkpoint(self, path: str) -> str:
-        """Save FSDP checkpoint (rank 0 gathers full state)."""
-        state_dict = await self.workers[0].get_state_dict.remote()
-        torch.save(state_dict, path)
-        return path
-
-    def shutdown(self):
-        """Clean up placement group and workers."""
-        for worker in self.workers:
-            ray.kill(worker)
-        ray.util.remove_placement_group(self.pg)
+ray.init(address=\"auto\", ignore_reinit_error=True)
+r = ray.available_resources()
+t = ray.cluster_resources()
+print(f\"GPUs: {r.get('GPU', 0):.0f} / {t.get('GPU', 0):.0f}\")
+for name in ['persistent_megatron_worker_group', 'persistent_vllm_actor']:
+    try:
+        ray.get_actor(name, namespace='tinker')
+        print(f'{name}: ALIVE')
+    except ValueError:
+        print(f'{name}: not running')
+"'
 ```
 
-### API Changes
+#### Decision Matrix
 
-**No API changes.** User specifies model name, server auto-detects GPU requirements.
-
-```python
-# routes/training.py
-from ..backend.model_registry import get_model_config
-
-def create_model(request: CreateModelRequest):
-    model_config = get_model_config(request.base_model)
-
-    if model_config.requires_fsdp:
-        # MoE or large model -> FSDP path
-        session = FSDPTrainingSession(
-            session_id=model_id,
-            base_model=request.base_model,
-            lora_rank=request.lora_config.rank,
-            num_gpus=model_config.min_gpus,
-        )
-    else:
-        # Dense model that fits on single GPU -> legacy path
-        worker = TrainingWorker.remote(...)
-```
-
-### New File: `tinker_server/backend/model_registry.py`
-
-```python
-"""Model configuration registry.
-
-Maps model names to hardware requirements.
-"""
-
-from dataclasses import dataclass
-
-@dataclass
-class ModelConfig:
-    """Hardware requirements for a model."""
-    requires_fsdp: bool  # True for MoE or models > single GPU memory
-    min_gpus: int        # Minimum GPUs needed
-    is_moe: bool         # Whether model uses MoE architecture
-    total_params: str    # e.g., "30B", "235B"
-    active_params: str   # For MoE: activated params per token
-
-# Model registry
-MODEL_CONFIGS = {
-    # Dense models (single GPU)
-    "Qwen/Qwen2.5-0.5B-Instruct": ModelConfig(False, 1, False, "0.5B", "0.5B"),
-    "Qwen/Qwen2.5-1.5B-Instruct": ModelConfig(False, 1, False, "1.5B", "1.5B"),
-    "Qwen/Qwen2.5-3B-Instruct": ModelConfig(False, 1, False, "3B", "3B"),
-    "Qwen/Qwen2.5-7B-Instruct": ModelConfig(False, 1, False, "7B", "7B"),
-    "Qwen/Qwen2.5-14B-Instruct": ModelConfig(False, 2, False, "14B", "14B"),
-    "Qwen/Qwen2.5-32B-Instruct": ModelConfig(True, 2, False, "32B", "32B"),
-    "Qwen/Qwen2.5-72B-Instruct": ModelConfig(True, 4, False, "72B", "72B"),
-
-    # Qwen3 MoE models
-    "Qwen/Qwen3-30B-A3B": ModelConfig(True, 4, True, "30B", "3B"),
-    "Qwen/Qwen3-235B-A22B": ModelConfig(True, 8, True, "235B", "22B"),
-}
-
-def get_model_config(model_name: str) -> ModelConfig:
-    """Get hardware config for model, with fallback heuristics."""
-    if model_name in MODEL_CONFIGS:
-        return MODEL_CONFIGS[model_name]
-
-    # Fallback: estimate from model name
-    # e.g., "Qwen/Qwen3-30B-A3B" -> MoE, "Llama-3-70B" -> large dense
-    if "-A" in model_name.split("/")[-1]:
-        # MoE pattern: "30B-A3B" means 30B total, 3B active
-        return ModelConfig(True, 4, True, "unknown", "unknown")
-
-    # Default: single GPU dense
-    return ModelConfig(False, 1, False, "unknown", "unknown")
-```
+| Code Changed | Actors Running | Action |
+|--------------|----------------|--------|
+| `megatron_*.py` | Megatron alive | Kill Megatron → restart server |
+| `vllm_*.py` | vLLM alive | Kill vLLM → restart server |
+| Routes only | Any | Restart server only |
+| Any | 0 GPUs available | Kill idle actors → free GPUs → proceed |
 
 ---
 
-## Phase 3: LoRA on MoE
+### 6. Tinker API Alignment
 
-**Goal:** Correct LoRA target modules for Qwen3 MoE architecture.
+Detailed verification that Mint matches official Tinker SDK behavior.
 
-### Qwen3 MoE Module Structure
+#### Reference Test Cases (from tinker_test.ipynb)
 
-```
-Qwen3MoeDecoderLayer
-├── self_attn
-│   ├── q_proj, k_proj, v_proj, o_proj  # Standard attention
-├── mlp (Qwen3MoeSparseMoeBlock)
-│   ├── gate                             # Router (don't LoRA)
-│   ├── experts                          # nn.ModuleList
-│       ├── [i].gate_proj                # Expert FFN
-│       ├── [i].up_proj
-│       └── [i].down_proj
-```
+| Test | Description | Expected Behavior |
+|------|-------------|-------------------|
+| 1. Service Client | `ServiceClient.get_server_capabilities()` | List supported models |
+| 2. Training Client | `create_lora_training_client(base_model)` | Returns client with tokenizer |
+| 3. Data Preparation | `types.Datum`, `types.ModelInput.from_ints()` | Token/weight format |
+| 4. Forward-Backward | `forward_backward(data, "cross_entropy")` | Returns logprobs per token |
+| 5. Optim Step | `optim_step(AdamParams(learning_rate=1e-4))` | Updates weights |
+| 6. Loss Computation | Client-side: `-dot(logprobs, weights) / sum(weights)` | Matches server loss |
+| 7. Sampling | `save_weights_and_get_sampling_client()` | Hot-reload LoRA |
+| 8. Sample Generation | `sample(prompt, params, num_samples)` | Returns sequences |
+| 9. Prompt Logprobs | `include_prompt_logprobs=True` | Returns per-token logprobs |
+| 10. Top-k Logprobs | `topk_prompt_logprobs=5` | Returns top-k per position |
+| 11. Save for Sampler | `save_weights_for_sampler(name)` | Returns path |
+| 12. Save State | `save_state(name)` | Resume checkpoint path |
+| 13. Load State | `load_state(path)` | Restores training state |
 
-### LoRA Configuration
+#### API Mapping: Tinker SDK → Mint
 
-```python
-# For Qwen3 MoE models
-peft_config = LoraConfig(
-    r=32,
-    lora_alpha=32,
-    target_modules=[
-        # Attention (standard)
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        # Expert FFN (MoE-specific)
-        "gate_proj", "up_proj", "down_proj",
-    ],
-    # Alternative: "all-linear" if PEFT handles MoE correctly
-    modules_to_save=[],  # Don't save router weights
-    lora_dropout=0.0,
-    bias="none",
-)
-```
+| Tinker SDK | Mint Endpoint | Notes |
+|------------|---------------|-------|
+| `get_server_capabilities()` | `/api/v1/healthz` | Extend for model list |
+| `create_lora_training_client()` | `/api/v1/create_model` | Same |
+| `forward_backward()` | `/api/v1/forward_backward` | Returns logprobs |
+| `optim_step()` | `/api/v1/optim_step` | Same |
+| `save_weights_and_get_sampling_client()` | `/api/v1/save_weights` | Hot-reload |
+| `sample()` | `/api/v1/asample` | Same |
+| `save_weights_for_sampler()` | `/api/v1/save_weights` | With name |
+| `save_state()` | `/api/v1/save_state` | **NEW** |
+| `load_state()` | `/api/v1/load_state` | **NEW** |
 
-### Tasks
+#### Test Cases
 
-| Task | Status |
-|------|--------|
-| Verify `target_modules="all-linear"` works with Qwen3 MoE | [ ] |
-| Test explicit module list if needed | [ ] |
-| Validate LoRA checkpoint format for MoE | [ ] |
+**Test 6.1: Pig Latin SFT (Dense)**
 
----
+Replicate notebook's Pig Latin translation with Qwen2.5-7B.
 
-## Phase 4: Inference-Training Weight Sync
+| Metric | Target |
+|--------|--------|
+| Update 1 loss | ~2.45 |
+| Update 6 loss | ~0.58 |
+| Loss reduction | >75% |
+| Iteration time | <2s |
 
-**Goal:** Transfer LoRA weights from FSDP training to vLLM inference.
+**Test 6.2: Pig Latin SFT (MoE)**
 
-### Challenge
+Same task with Qwen3-30B-A3B.
 
-FSDP shards weights across workers. Need to gather full state before syncing to inference.
+| Metric | Target |
+|--------|--------|
+| Update 1 loss | ~2.5-3.0 |
+| Update 10 loss | <1.0 |
+| Loss reduction | >60% |
+| Iteration time | <8s |
 
-### Implementation
+**Test 6.3: Forward-Backward Logprobs**
 
-```python
-# FSDPTrainingSession.save_weights_for_sampler()
-async def save_weights_for_sampler(self) -> tuple[dict, dict]:
-    """Gather LoRA weights from FSDP shards for inference."""
-    # Rank 0 gathers full state dict
-    full_state = await self.workers[0].get_state_dict.remote()
+Verify client-computed loss matches server `metrics['loss:mean']`. Pass: diff < 0.01.
 
-    # Extract LoRA-only weights
-    lora_state = {
-        k: v for k, v in full_state.items()
-        if "lora_" in k
-    }
+**Test 6.4: Prompt Logprobs**
 
-    # Get PEFT config
-    peft_config = await self.workers[0].get_lora_config.remote()
+Verify `include_prompt_logprobs=True` returns per-token logprobs. First token = 0.0.
 
-    return lora_state, peft_config
-```
+**Test 6.5: Checkpoint Round-Trip**
 
----
+Train 5 iter → save → train 5 more → load → verify loss matches step 6 from first run. Pass: diff < 0.05.
 
-## Phase 5: Integration Testing
+**Test 6.6: Hot-Reload Sampling**
 
-### Test Matrix
+Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → output differs from base model.
 
-| Model | GPUs | Paradigm | Status |
-|-------|------|----------|--------|
-| Qwen3-30B-A3B | 4 | SFT | [ ] |
-| Qwen3-30B-A3B | 4 | RL (PPO) | [ ] |
-| Qwen3-30B-A3B | 4 | DPO | [ ] |
-| Qwen3-235B-A22B | 8 | SFT | [ ] |
+#### Data Format Comparison
 
-### Validation Commands
+| Aspect | Tinker SDK | Mint | Compatible? |
+|--------|------------|------|-------------|
+| Per-token weights | `weights` | `loss_mask` | **NO** - field name mismatch |
+| Model input | `chunks` with `EncodedTextChunk` | `chunks` format | Yes |
+| Tensor format | `TensorData{data, shape, dtype}` | `{data, shape, dtype}` | Yes |
+| Loss functions | `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | ? | Verify |
 
-```bash
-# Start server with MoE model
-TINKER_MODEL_PATH=/path/to/Qwen3-30B-A3B \
-TENSOR_PARALLEL_SIZE=4 \
-python scripts/run_server.py
+**Action required**: Rename `loss_mask` → `weights` for Tinker API compatibility.
 
-# Create training session (server auto-detects FSDP requirement from model name)
-curl -X POST http://localhost:8000/api/v1/create_model \
-  -d '{"base_model": "Qwen/Qwen3-30B-A3B", "lora_config": {"rank": 32}}'
+#### Implementation Tasks
 
-# Run training (same API as dense models)
-python -m tinker_cookbook.recipes.chat_sl.train \
-    model_name="Qwen/Qwen3-30B-A3B" \
-    lora_rank=32
-```
+| Task | Priority | Status |
+|------|----------|--------|
+| Rename `loss_mask` → `weights` in forward_backward | **Critical** | Pending |
+| Verify all loss functions: `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | High | Pending |
+| Add `/api/v1/save_state` | High | Pending |
+| Add `/api/v1/load_state` | High | Pending |
+| Add `forward_backward_custom` for arbitrary loss functions | Medium | Pending |
+| Verify LoRA config options: `train_unembed`, `train_mlp`, `train_attn` | Medium | Pending |
+| Verify logprobs format matches `TensorData` spec | High | Pending |
+| Create `test_tinker_api_alignment.py` | High | Pending |
+| Verify `include_prompt_logprobs` and `topk_prompt_logprobs` | Medium | Pending |
 
 ---
 
-## Implementation Order
+## Known Issues
 
-| Phase | Description | Dependencies |
-|-------|-------------|--------------|
-| 1 | Inference (vLLM config) | vLLM >= 0.9.0 |
-| 2 | FSDP Training Infrastructure | Phase 1 |
-| 3 | LoRA on MoE | Phase 2 |
-| 4 | Weight Sync | Phase 2, 3 |
-| 5 | Integration Testing | All phases |
+### train_step API Breaks Tinker Compatibility
 
----
+**Problem**: With MoE + `param_offload=True`, gradients are zeroed between `forward_backward` and `optim_step` calls.
 
-## Backward Compatibility
+**Current workaround**: `/api/v1/train_step` combines both in single context.
 
-Existing single-GPU training continues to work:
+**Mitigation**: For LoRA, `grad_offload=False` keeps gradients in GPU memory.
 
-- Dense models (Qwen2.5-7B, etc.): Uses current `TrainingWorker` path
-- MoE/large models (Qwen3-30B-A3B, etc.): Uses new `FSDPTrainingSession` path
+**TODO**: Verify that LoRA + `grad_offload=False` allows standard Tinker API.
 
-**No API changes.** Server auto-detects based on model name via `model_registry.py`.
+### Time-Sliced Isolation Not Yet Verified
+
+Previous tests prove sessions have different weights (A ≠ B), but don't prove training is correct (A_interleaved == A_exclusive).
+
+**TODO**: Implement `test_time_sliced_isolation.py` to verify stronger correctness condition.
 
 ---
 
-## Open Questions
+## Architecture Reference
 
-1. **Expert Parallelism in Training:** Should we support EP in addition to FSDP for very large MoE models?
-
-2. **Checkpoint Format:** Use verl's `FSDPCheckpointManager` or custom format?
-
-3. **Mixed Precision:** bf16 vs fp16 for MoE expert computations?
-
-4. **Router Training:** Should LoRA apply to router weights or freeze them?
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Mint API Server                               │
+│                     (Tinker-Compatible REST API)                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ResourceManager                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ Global GPU tracking, cross-pool LRU eviction                    │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+├──────────────────────────────┬──────────────────────────────────────────┤
+│      Inference Pool          │           Training Pool                  │
+│  ┌────────────────────────┐  │  ┌────────────────────────────────────┐  │
+│  │  vLLM Engine           │  │  │  DenseTrainerPool                  │  │
+│  │  - Multi-LoRA serving  │  │  │    (PEFT, <14B models)             │  │
+│  │  - Hot-swap adapters   │  │  │                                    │  │
+│  └────────────────────────┘  │  │  MegatronActorPool                 │  │
+│             ▲                │  │    (verl Megatron, MoE models)     │  │
+│             │                │  └────────────────────────────────────┘  │
+│             │    LoRA Transfer (Ray ObjectRef, ~0.7s)                   │
+│             └───────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## References
 
-- [verl FSDP Workers](https://github.com/volcengine/verl/blob/main/verl/workers/fsdp_workers.py)
-- [verl FSDPEngine](https://github.com/volcengine/verl/blob/main/verl/workers/engine/fsdp/transformer_impl.py)
-- [HuggingFace Qwen3MoE](https://huggingface.co/docs/transformers/en/model_doc/qwen3_moe)
-- [PEFT LoRA for MoE](https://huggingface.co/docs/peft/main/en/conceptual_guides/lora)
-- [vLLM Expert Parallel](https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment.html)
-- [Ray Placement Groups](https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html)
+- [verl Megatron Backend](https://verl.readthedocs.io/en/latest/workers/megatron_workers.html)
+- [verl Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html)
+- [Kimi-K2-Instruct on HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct)
+- [Tinker SDK test notebook](~/Downloads/tinker_test.ipynb)
+- [Tinker Official Agent Reference](./tinker_official_reference.txt) - Full API docs and type definitions

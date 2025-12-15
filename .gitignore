@@ -209,3 +209,8 @@ __marimo__/
 # Serena
 .serena/
 checkpoints/
+
+# Current prompt
+PROMPT.md
+LOG.md
+results/

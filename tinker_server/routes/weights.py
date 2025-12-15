@@ -28,6 +28,7 @@ from ..models.types import (
 )
 
 if TYPE_CHECKING:
+    from ..backend.session_manager import SessionManager
     from ..backend.training_session_manager import TrainingSessionManager
     from ..backend.verl_training import VerlTrainingEngine
 
@@ -37,6 +38,7 @@ router = APIRouter()
 # Global references (set by app lifespan)
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
+inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
 CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
@@ -92,19 +94,53 @@ async def save_weights(
 
 
 async def _do_save_state(request_id: str, session, request: SaveStateRequest) -> None:
-    """Background task to save state."""
+    """Background task to save state.
+
+    Also registers the model for sampling via multi-LoRA engine, enabling
+    subsequent asample calls with the same model_id.
+    """
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
         # Build save path
-        checkpoint_name = request.path or f"checkpoint-{session.step}"
+        checkpoint_name = request.path or f"checkpoint-{session.current_step}"
         save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Call training engine to save full checkpoint
-        await training_engine.save_weights(session, save_path)
+        # Returns dict with path, state_dict, and peft_config
+        result = await training_engine.save_weights(session, save_path)
+
+        # Register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
+        # This allows asample to work with model_id after save_weights
+        state_dict = result.get("state_dict")
+        peft_config = result.get("peft_config")
+
+        if inference_manager is not None and state_dict is not None and peft_config is not None:
+            multi_lora_engine = inference_manager.get_multi_lora_engine()
+            if multi_lora_engine is not None:
+                # Check if already registered (update existing)
+                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
+                if existing_lora_id is not None:
+                    # Remove old registration and add new one
+                    await multi_lora_engine.remove_session(session.model_id)
+
+                # Register with model_id as session_id for SDK compatibility
+                await multi_lora_engine.add_lora_for_session(
+                    sampling_session_id=session.model_id,
+                    state_dict=state_dict,
+                    peft_config=peft_config,
+                )
+                # Also mark as multi-LoRA session in inference manager
+                inference_manager.register_multi_lora_session(session.model_id)
+                logger.info(f"[{session.model_id}] Registered for multi-LoRA sampling")
+        else:
+            logger.warning(f"[{session.model_id}] Cannot register for sampling: "
+                          f"inference_manager={inference_manager is not None}, "
+                          f"state_dict={state_dict is not None}, "
+                          f"peft_config={peft_config is not None}")
 
         # Build tinker:// path for response
         tinker_path = _to_tinker_path(session.model_id, checkpoint_name)

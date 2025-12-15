@@ -31,6 +31,9 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = "tinker"
 
+# Import centralized PFS paths from config
+from tinker_server.config import PFS_PYTHONPATH
+
 
 @dataclass
 class LoRASlotInfo:
@@ -183,6 +186,7 @@ class MultiLoRAInferenceEngine:
         self,
         model_path: str,
         tensor_parallel_size: int = 1,
+        data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.85,
         max_model_len: int | None = None,
         max_loras: int = DEFAULT_MAX_LORAS,
@@ -191,6 +195,7 @@ class MultiLoRAInferenceEngine:
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
@@ -217,13 +222,27 @@ class MultiLoRAInferenceEngine:
                 ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
             # Try to get existing persistent actor
+            # Note: ray.get_actor succeeds even for dead actors (name still registered)
+            # We must verify the actor is alive by calling a method on it
             try:
                 self.server = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-                logger.info(
-                    f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
-                )
-                self._initialized = True
-                return
+                # Health check: try calling a method to verify actor is alive
+                # This will raise RayActorError if actor is dead
+                try:
+                    ray.get(self.server.__ray_ready__.remote(), timeout=5)
+                    logger.info(
+                        f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
+                    )
+                    self._initialized = True
+                    return
+                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    # Actor is dead or unresponsive, need to create new one
+                    logger.warning(
+                        f"vLLM actor {PERSISTENT_VLLM_ACTOR_NAME} is dead/unresponsive, creating new one"
+                    )
+                    self.server = None
+                    # Reset initialized flag so we'll create new actor below
+                    self._initialized = False
             except ValueError:
                 # Actor doesn't exist, create new one
                 logger.info(
@@ -241,7 +260,25 @@ class MultiLoRAInferenceEngine:
                 max_cpu_loras=self.max_cpu_loras,
             )
 
+            # Compute total GPUs needed for MoE models
+            # For EP (expert parallelism), total_gpus = TP * DP
+            total_gpus = self.tensor_parallel_size * self.data_parallel_size
+
+            # Build engine_kwargs for expert parallelism
+            # Pass enable_expert_parallel directly to vLLM, bypassing verl's worker-based EP
+            # This allows vLLM to handle EP internally via multiprocessing
+            engine_kwargs = {}
+            if self.data_parallel_size > 1:
+                engine_kwargs = {
+                    "vllm": {
+                        "enable_expert_parallel": True,
+                    }
+                }
+                logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
+
             # Configure rollout with multi-LoRA support
+            # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
+            # Expert parallelism is enabled via engine_kwargs instead
             rollout_config = RolloutConfig(
                 name="vllm",
                 tensor_model_parallel_size=self.tensor_parallel_size,
@@ -259,7 +296,9 @@ class MultiLoRAInferenceEngine:
                 temperature=1.0,
                 top_k=-1,
                 top_p=1.0,
-                data_parallel_size=1,
+                data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+                expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+                engine_kwargs=engine_kwargs,
             )
             if self.max_model_len is not None:
                 rollout_config.max_model_len = self.max_model_len
@@ -274,16 +313,27 @@ class MultiLoRAInferenceEngine:
 
             logger.info(
                 f"Initializing MultiLoRAInferenceEngine: "
+                f"TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
                 f"max_loras={self.max_loras}, max_cpu_loras={self.max_cpu_loras}, "
                 f"max_lora_rank={self.max_lora_rank}"
             )
 
             # Create detached Ray actor with well-known name
             # lifetime="detached" ensures actor survives owner process termination
+            # Request total_gpus for MoE expert parallelism
+            # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
             self.server = ExtendedVLLMHttpServer.options(
-                num_gpus=self.tensor_parallel_size,
+                num_gpus=total_gpus,
                 name=PERSISTENT_VLLM_ACTOR_NAME,
+                namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                runtime_env={
+                    "env_vars": {
+                        "PYTHONPATH": PFS_PYTHONPATH,
+                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                        "HF_HUB_OFFLINE": "1",
+                    }
+                },
             ).remote(
                 config=rollout_config,
                 model_config=model_config,
@@ -291,11 +341,13 @@ class MultiLoRAInferenceEngine:
                 workers=[],
                 replica_rank=0,
                 node_rank=0,
-                gpus_per_node=self.tensor_parallel_size,
+                gpus_per_node=total_gpus,
                 nnodes=1,
             )
 
-            await self.server.launch_server.remote()
+            # ray.get() blocks until launch_server completes (sets self.engine)
+            # Note: await on ObjectRef doesn't work - must use ray.get()
+            ray.get(self.server.launch_server.remote())
             self._initialized = True
             logger.info("MultiLoRAInferenceEngine initialized (detached actor)")
 
@@ -314,6 +366,8 @@ class MultiLoRAInferenceEngine:
         where API server and inference worker have different filesystems.
         Worker saves tensors locally then creates file-based LoRARequest.
         File-based loading supports vLLM's GPU/CPU swapping.
+
+        Auto-restarts vLLM actor if dead.
 
         Args:
             sampling_session_id: Unique identifier for the sampling session.
@@ -341,12 +395,25 @@ class MultiLoRAInferenceEngine:
 
         # Transfer tensors via Ray and save locally on worker node.
         # Worker creates file-based LoRARequest for GPU/CPU swap support.
+        # Auto-restart vLLM if actor died (e.g. killed for GPU allocation).
         start_time = time.time()
-        await self.server.add_lora_with_id.remote(
-            lora_int_id=lora_id,
-            state_dict=state_dict,
-            peft_config=peft_config,
-        )
+        try:
+            await self.server.add_lora_with_id.remote(
+                lora_int_id=lora_id,
+                state_dict=state_dict,
+                peft_config=peft_config,
+            )
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            self._initialized = False
+            self.server = None
+            await self.initialize()
+            # Retry after restart
+            await self.server.add_lora_with_id.remote(
+                lora_int_id=lora_id,
+                state_dict=state_dict,
+                peft_config=peft_config,
+            )
         load_time = time.time() - start_time
 
         logger.info(
@@ -531,7 +598,7 @@ def kill_persistent_vllm_actor() -> bool:
 
 
 def check_persistent_vllm_actor() -> bool:
-    """Check if persistent vLLM actor exists.
+    """Check if persistent vLLM actor exists and is alive.
 
     Returns:
         True if actor exists and is alive, False otherwise.
@@ -540,9 +607,12 @@ def check_persistent_vllm_actor() -> bool:
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     try:
-        ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+        # ray.get_actor succeeds even for dead actors (name still registered)
+        # Verify actor is alive by calling a method on it
+        ray.get(actor.__ray_ready__.remote(), timeout=5)
         return True
-    except ValueError:
+    except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
         return False
 
 

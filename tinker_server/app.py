@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
     inference_manager = SessionManager(
         model_path=config.model_path,
         tensor_parallel_size=config.tensor_parallel_size,
+        data_parallel_size=config.data_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
     )
@@ -62,6 +63,7 @@ async def lifespan(app: FastAPI):
         multi_lora_engine = MultiLoRAInferenceEngine(
             model_path=config.model_path,
             tensor_parallel_size=config.tensor_parallel_size,
+            data_parallel_size=config.data_parallel_size,
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_model_len=config.max_model_len,
             max_loras=config.max_loras,
@@ -90,9 +92,10 @@ async def lifespan(app: FastAPI):
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
 
-    # Weights router also needs training components
+    # Weights router also needs training components and inference manager
     weights.training_manager = train_manager
     weights.training_engine = train_engine
+    weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
 
     logger.info("Training components initialized")
 

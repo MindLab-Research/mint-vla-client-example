@@ -9,6 +9,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 # Default idle timeout for TrainingWorker (seconds)
 # Worker self-terminates if no activity for this duration
 DEFAULT_IDLE_TIMEOUT = 300  # 5 minutes
+
+# Import centralized PFS paths from config
+from tinker_server.config import PFS_PYTHONPATH
 
 
 @ray.remote(num_gpus=1)
@@ -71,7 +75,7 @@ class TrainingWorker:
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            base_model, trust_remote_code=True
+            base_model, trust_remote_code=True, local_files_only=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -81,6 +85,7 @@ class TrainingWorker:
             base_model,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            local_files_only=True,
             device_map="cuda",  # Use this worker's GPU
         )
 
@@ -201,9 +206,9 @@ class TrainingWorker:
                 continue
 
             # Extract target tokens and weights/mask
-            # Accept both "weights" and "mask" field names (tinker spec uses "mask")
+            # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
             target_data = loss_fn_inputs.get("target_tokens", {})
-            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
+            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
 
             target_tokens = target_data.get("data", [])
             weights = weights_data.get("data", []) if weights_data else []
@@ -285,11 +290,7 @@ class TrainingWorker:
 
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {
-                        "data": target_logprobs.detach().tolist(),
-                        "shape": list(target_logprobs.shape),
-                        "dtype": "float32",
-                    },
+                    "logprobs": target_logprobs.detach().tolist(),
                 })
 
             elif loss_fn in ("importance_sampling", "ppo"):
@@ -367,11 +368,7 @@ class TrainingWorker:
 
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {
-                        "data": new_logprobs.detach().tolist(),
-                        "shape": list(new_logprobs.shape),
-                        "dtype": "float32",
-                    },
+                    "logprobs": new_logprobs.detach().tolist(),
                 })
 
             else:
@@ -443,9 +440,9 @@ class TrainingWorker:
                     continue
 
                 # Extract target tokens and weights/mask
-                # Accept both "weights" and "mask" field names (tinker spec uses "mask")
+                # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
                 target_data = loss_fn_inputs.get("target_tokens", {})
-                weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask", {})
+                weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
 
                 target_tokens = target_data.get("data", [])
                 weights = weights_data.get("data", []) if weights_data else []
@@ -502,11 +499,7 @@ class TrainingWorker:
                 # Return logprobs in loss_fn_outputs
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {
-                        "data": target_logprobs.tolist(),
-                        "shape": list(target_logprobs.shape),
-                        "dtype": "float32",
-                    },
+                    "logprobs": target_logprobs.tolist(),
                 })
 
         avg_loss = total_loss / max(total_tokens, 1)
@@ -637,7 +630,7 @@ class TrainingWorker:
             save_path: Directory path to save checkpoint files.
 
         Returns:
-            Dict with training metadata.
+            Dict with training metadata, state_dict, and peft_config for registration.
         """
         self._touch()
         import json
@@ -652,9 +645,9 @@ class TrainingWorker:
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
-        config = self.get_lora_config()
+        peft_config = self.get_lora_config()
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(peft_config, f, indent=2)
 
         # 3. Optimizer state
         torch.save(self.optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
@@ -663,9 +656,14 @@ class TrainingWorker:
         meta = {
             "current_step": self._step_count,
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            # Include state_dict and config for multi-LoRA registration
+            # (API server can't read files from Ray worker filesystem)
+            "state_dict": state_dict,
+            "peft_config": peft_config,
         }
         with open(os.path.join(save_path, "training_meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
+            # Don't write state_dict/peft_config to file (already saved separately)
+            json.dump({k: v for k, v in meta.items() if k not in ("state_dict", "peft_config")}, f, indent=2)
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[TrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
@@ -718,6 +716,203 @@ class TrainingWorker:
 
         return meta
 
+
+    # =====================================================================
+    # Phase 8: Session Management Methods (backported from MegatronRankWorker)
+    # =====================================================================
+
+    def load_adapter_state(
+        self,
+        checkpoint_path: str,
+        actual_rank: int | None = None,
+        trainer_rank: int | None = None,
+    ) -> dict:
+        """Load LoRA adapter weights from checkpoint.
+
+        Phase 8: Supports padding for unified rank training.
+
+        Args:
+            checkpoint_path: Directory containing adapter checkpoint.
+            actual_rank: The rank of the checkpoint being loaded.
+            trainer_rank: The trainer's max rank.
+
+        Returns:
+            Dict with status info.
+        """
+        import os
+
+        from safetensors.torch import load_file
+
+        from tinker_server.backend.lora_utils import pad_lora_state_dict
+
+        adapter_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"Adapter not found: {adapter_path}")
+
+        state_dict = load_file(adapter_path, device=str(self.device))
+
+        # Phase 7: Apply padding if actual_rank < trainer_rank
+        if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+            logger.info(f"[TrainingWorker] Padding adapter from rank {actual_rank} to {trainer_rank}")
+            state_dict = pad_lora_state_dict(state_dict, actual_rank, trainer_rank)
+
+        # Load into PEFT model
+        from peft.utils.save_and_load import set_peft_model_state_dict
+
+        set_peft_model_state_dict(self.model, state_dict)
+        logger.info(f"[TrainingWorker] Loaded adapter state from {checkpoint_path}")
+
+        return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
+
+    def save_adapter_state(
+        self,
+        checkpoint_path: str,
+        actual_rank: int | None = None,
+        trainer_rank: int | None = None,
+    ) -> dict:
+        """Save LoRA adapter weights to checkpoint.
+
+        Phase 8: Supports truncation for unified rank training.
+
+        Args:
+            checkpoint_path: Directory to save adapter checkpoint.
+            actual_rank: The rank to save as (truncate to).
+            trainer_rank: The trainer's max rank.
+
+        Returns:
+            Dict with status info.
+        """
+        import os
+
+        from peft import get_peft_model_state_dict
+        from safetensors.torch import save_file
+
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
+
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        # Get LoRA state dict
+        state_dict = get_peft_model_state_dict(self.model)
+
+        # Phase 7: Apply truncation if actual_rank < trainer_rank
+        if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+            logger.info(f"[TrainingWorker] Truncating adapter from rank {trainer_rank} to {actual_rank}")
+            state_dict = truncate_lora_state_dict(state_dict, trainer_rank, actual_rank)
+
+        # Save to safetensors format
+        adapter_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
+        save_file(state_dict, adapter_path)
+        logger.info(f"[TrainingWorker] Saved adapter state to {checkpoint_path}")
+
+        return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
+
+    def reset_optimizer(self, learning_rate: float | None = None) -> dict:
+        """Reset optimizer state for a new session.
+
+        Phase 8: Resets learning rate and zeros gradients for session swap.
+
+        Args:
+            learning_rate: New learning rate. If None, keeps current rate.
+
+        Returns:
+            Dict with status info.
+        """
+        # Update learning rate if provided
+        if learning_rate is not None:
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
+            logger.info(f"[TrainingWorker] Set learning rate to {learning_rate}")
+
+        # Zero gradients
+        self.optimizer.zero_grad()
+
+        # Reset optimizer state (momentum/variance)
+        # For AdamW, this resets exp_avg and exp_avg_sq
+        self.optimizer.state.clear()
+        logger.info("[TrainingWorker] Reset optimizer state (momentum cleared)")
+
+        return {"status": "ok", "learning_rate": learning_rate}
+
+    def get_session_info(self) -> dict:
+        """Get current session info for diagnostics.
+
+        Returns:
+            Dict with session and worker info.
+        """
+        # Get current learning rate
+        lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else None
+
+        # Get model info
+        peft_config = self.model.peft_config.get("default")
+        lora_rank = peft_config.r if peft_config else None
+
+        return {
+            "learning_rate": lr,
+            "lora_rank": lora_rank,
+            "step_count": self._step_count,
+            "device": str(self.device),
+        }
+
+    def swap_session(
+        self,
+        old_session_id: str | None,
+        new_session_id: str,
+        old_checkpoint_path: str | None,
+        new_checkpoint_path: str | None,
+        new_learning_rate: float,
+        new_actual_rank: int | None = None,
+    ) -> dict:
+        """Atomically swap from old session to new session.
+
+        Phase 8: Session swap for dense models.
+
+        Args:
+            old_session_id: ID of session being swapped out (None if first).
+            new_session_id: ID of session being swapped in.
+            old_checkpoint_path: Where to save old session state (None to skip).
+            new_checkpoint_path: Where to load new session state (None to reset).
+            new_learning_rate: Learning rate for new session.
+            new_actual_rank: Actual LoRA rank for new session.
+
+        Returns:
+            Dict with swap status.
+        """
+        import os
+
+        logger.info(f"[TrainingWorker] Swapping session: {old_session_id} -> {new_session_id}")
+
+        # Get trainer rank from current model
+        peft_config = self.model.peft_config.get("default")
+        trainer_rank = peft_config.r if peft_config else None
+
+        # 1. Save old session state (if applicable)
+        if old_session_id and old_checkpoint_path:
+            logger.info(f"[TrainingWorker] Saving old session {old_session_id}")
+            self.save_adapter_state(old_checkpoint_path)
+
+        # 2. Load new session state or reset
+        if new_checkpoint_path and os.path.exists(new_checkpoint_path):
+            logger.info(f"[TrainingWorker] Loading new session {new_session_id}")
+            self.load_adapter_state(
+                new_checkpoint_path,
+                actual_rank=new_actual_rank,
+                trainer_rank=trainer_rank,
+            )
+        else:
+            logger.info(f"[TrainingWorker] Resetting for new session {new_session_id}")
+            self.reset_optimizer(new_learning_rate)
+
+        # 3. Update step count
+        self._step_count = 0
+
+        logger.info(f"[TrainingWorker] Session swap complete: now on {new_session_id}")
+        return {
+            "status": "ok",
+            "old_session": old_session_id,
+            "new_session": new_session_id,
+            "actual_rank": new_actual_rank,
+        }
+
     def shutdown(self) -> None:
         """Release GPU resources and stop watchdog thread."""
         logger.info("[TrainingWorker] Shutting down")
@@ -752,39 +947,116 @@ class VerlTrainingEngine:
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
+    def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
+        """Resolve HuggingFace model ID to local cache path.
+
+        HF cache structure: HF_HOME/hub/models--{org}--{name}/snapshots/{hash}/
+
+        Args:
+            hf_model_id: Model ID like "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+        Returns:
+            Local path to model snapshot, or None if not found.
+        """
+        import os
+        from pathlib import Path
+
+        hf_home = os.environ.get("HF_HOME", "/vePFS-Mindverse/share/huggingface")
+        # Convert "org/model" to "models--org--model"
+        cache_name = "models--" + hf_model_id.replace("/", "--")
+        model_dir = Path(hf_home) / "hub" / cache_name / "snapshots"
+
+        if not model_dir.exists():
+            logger.warning(f"Model cache not found: {model_dir}")
+            return None
+
+        # Get the latest snapshot (usually only one)
+        snapshots = list(model_dir.iterdir())
+        if not snapshots:
+            logger.warning(f"No snapshots in: {model_dir}")
+            return None
+
+        # Return the first snapshot path
+        snapshot_path = str(snapshots[0])
+        logger.info(f"Resolved {hf_model_id} -> {snapshot_path}")
+        return snapshot_path
+
     async def create_training_session(self, session: TrainingSession) -> None:
         """Create Ray actor for session.
 
+        Routes MoE models to MegatronTrainingWorker, dense models to TrainingWorker.
         Blocks until GPU is available (Ray queuing).
 
         Args:
             session: TrainingSession with configuration.
         """
+        from .megatron_training import is_moe_model
+        from .megatron_distributed import async_get_or_create_megatron_worker_group, DistributedConfig
+
         model_id = session.model_id
 
         # Determine base model path
-        # If request specifies a HuggingFace ID but we have a local path configured,
-        # prefer the local path (worker nodes may not have network access)
         requested_model = session.base_model or self.default_base_model
-        if requested_model and not requested_model.startswith("/"):
-            # Not a local path - use configured default which should be local
-            base_model = self.default_base_model
-            logger.info(f"[{model_id}] Using local model path: {base_model} (requested: {requested_model})")
-        else:
-            base_model = requested_model
 
         lora_rank = (
             session.lora_config.rank if session.lora_config else self.default_lora_rank
         )
 
-        logger.info(f"[{model_id}] Creating TrainingWorker (base={base_model}, lora_rank={lora_rank})")
+        # Check if this is an MoE model requiring Megatron backend
+        use_megatron = is_moe_model(requested_model or "")
 
-        # Create Ray actor - queues if no GPU available
-        worker = TrainingWorker.remote(
-            base_model=base_model,
-            lora_rank=lora_rank,
-            learning_rate=session.learning_rate,
-        )
+        # Resolve model path based on backend
+        if requested_model and not requested_model.startswith("/"):
+            # HuggingFace model ID - resolve to local cache path
+            base_model = self._resolve_hf_model_path(requested_model)
+            if base_model:
+                logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+            else:
+                # Fall back to default (works for dense models on same architecture)
+                base_model = self.default_base_model
+                logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
+        else:
+            base_model = requested_model
+
+        if use_megatron:
+            # MoE models (30B+) need tensor + expert parallelism to fit model+optimizer
+            # 30B MoE with TP=4: ~76 GiB/GPU for model+gradients, no room for optimizer
+            # TP=4, EP=2 = 8 GPUs: distributes optimizer state, ~38 GiB/GPU
+            distributed_config = DistributedConfig(
+                tensor_parallel_size=4,
+                expert_parallel_size=2,
+            )
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size}, EP={distributed_config.expert_parallel_size})")
+
+            # Get or create persistent Megatron worker group
+            # Uses detached Ray actor pattern like vLLM for crash resilience
+            # Use async version to avoid blocking uvicorn event loop
+            worker = await async_get_or_create_megatron_worker_group(
+                base_model=base_model,
+                lora_rank=lora_rank,
+                learning_rate=session.learning_rate,
+                distributed_config=distributed_config,
+            )
+            session.backend = "megatron"
+        else:
+            # Phase 8: Use DenseTrainerPool for actor reuse
+            logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
+
+            pool = get_dense_trainer_pool()
+            entry = pool.get_or_create(
+                base_model=base_model,
+                lora_rank=lora_rank,
+                learning_rate=session.learning_rate,
+                session_id=session.session_id,
+            )
+            worker = entry.actor
+
+            # Update pool entry with current session
+            entry.current_session = session.session_id
+            entry.actual_rank = lora_rank
+
+            session.backend = "peft"
+            logger.info(f"[{model_id}] DenseTrainerPool: reusing actor for {base_model} (max_rank={entry.max_lora_rank})")
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
@@ -792,7 +1064,7 @@ class VerlTrainingEngine:
 
         self._workers[model_id] = worker
         session.is_active = True
-        logger.info(f"[{model_id}] TrainingWorker ready")
+        logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
 
     async def forward_backward(
         self,
@@ -815,12 +1087,6 @@ class VerlTrainingEngine:
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
-
-        # Debug: log first item's loss_fn_inputs keys
-        if data_items:
-            first_item = data_items[0]
-            lfi = first_item.get("loss_fn_inputs", {})
-            print(f"[DEBUG] First datum loss_fn_inputs keys: {list(lfi.keys())}", flush=True)
 
         # Remote call
         result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
@@ -910,6 +1176,64 @@ class VerlTrainingEngine:
         logger.info(f"[{model_id}] optim_step: step={session.current_step}")
         return result
 
+    async def train_step(
+        self,
+        session: TrainingSession,
+        request: Any,
+    ) -> dict:
+        """Combined forward_backward + optim_step in a single call.
+
+        This is the correct way to train MoE models with param_offload=True.
+        Keeping both operations in a single remote call ensures they run in
+        the same train_mode context, so gradients survive for the optimizer step.
+
+        Args:
+            session: TrainingSession.
+            request: ForwardBackwardRequest with training data.
+
+        Returns:
+            Dict with loss_fn_outputs, metrics, and optimizer results.
+        """
+        from .megatron_training import is_moe_model
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+
+        # Serialize data for Ray
+        data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        loss_fn = request.forward_backward_input.loss_fn
+        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+        lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
+
+        # Check if this is an MoE model (uses MegatronWorkerGroup with train_step)
+        use_train_step = session.backend == "megatron" and is_moe_model(session.base_model or "")
+
+        if use_train_step:
+            # MoE: Use combined train_step to keep gradients in same context
+            result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
+        else:
+            # Dense models: Use separate calls (they don't have param_offload issues)
+            fb_result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
+            opt_result = await worker.optim_step.remote(lr)
+
+            # Merge results
+            result = fb_result.copy()
+            if "metrics" not in result:
+                result["metrics"] = {}
+            result["metrics"].update(opt_result.get("metrics", {}))
+
+        # Update session state
+        session.current_step += 1
+        session.accumulated_gradients = 0
+
+        # Ensure step is in metrics
+        if "metrics" not in result:
+            result["metrics"] = {}
+        result["metrics"]["step"] = session.current_step
+
+        logger.info(f"[{model_id}] train_step: step={session.current_step}")
+        return result
+
     async def save_weights_for_sampler(
         self,
         session: TrainingSession,
@@ -938,11 +1262,26 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
+        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY")
+        logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
+
         # Fetch weights and config from remote worker via Ray object store
-        state_dict, config = await asyncio.gather(
-            worker.get_lora_state_dict.remote(),
-            worker.get_lora_config.remote(),
-        )
+        # Use ray.get() with timeout in thread executor for reliable async handling
+        logger.info(f"[{model_id}] save_weights_for_sampler: calling get_lora_state_dict.remote()...")
+        import ray
+        loop = asyncio.get_running_loop()
+
+        # Schedule remote calls
+        state_dict_ref = worker.get_lora_state_dict.remote()
+        config_ref = worker.get_lora_config.remote()
+        logger.info(f"[{model_id}] save_weights_for_sampler: remote calls scheduled, waiting for results...")
+
+        # Use ray.get() with timeout in executor to avoid blocking event loop
+        def get_with_timeout():
+            return ray.get([state_dict_ref, config_ref], timeout=120)
+
+        state_dict, config = await loop.run_in_executor(None, get_with_timeout)
+        logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
 
         # Save locally on API server
         save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)
@@ -960,7 +1299,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
-    ) -> str:
+    ) -> dict:
         """Save full checkpoint via Ray actor.
 
         Saves LoRA weights, optimizer state, and training metadata.
@@ -970,22 +1309,34 @@ class VerlTrainingEngine:
             save_path: Directory path for checkpoint.
 
         Returns:
-            Absolute path to saved checkpoint.
+            Dict with path, state_dict, and peft_config for multi-LoRA registration.
         """
+        import asyncio
         import os
+
+        import ray
 
         model_id = session.model_id
         worker = self._workers[model_id]
 
-        # Remote call to save checkpoint
-        meta = await worker.save_checkpoint.remote(save_path)
+        # Remote call to save checkpoint - returns meta with state_dict and peft_config
+        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
+        loop = asyncio.get_running_loop()
+        meta_ref = worker.save_checkpoint.remote(save_path)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
 
         # Update session state from worker metadata
         session.current_step = meta.get("current_step", session.current_step)
 
         abs_path = os.path.abspath(save_path)
         logger.info(f"[{model_id}] save_weights: {abs_path}")
-        return abs_path
+
+        # Return dict with path and weights for registration
+        return {
+            "path": abs_path,
+            "state_dict": meta.get("state_dict"),
+            "peft_config": meta.get("peft_config"),
+        }
 
     async def load_weights(
         self,
@@ -1000,11 +1351,18 @@ class VerlTrainingEngine:
             load_path: Directory path to load from.
             load_optimizer: Whether to restore optimizer state.
         """
+        import asyncio
+
+        import ray
+
         model_id = session.model_id
         worker = self._workers[model_id]
 
         # Remote call to load checkpoint
-        meta = await worker.load_checkpoint.remote(load_path, load_optimizer)
+        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
+        loop = asyncio.get_running_loop()
+        meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
 
         # Update session state from loaded metadata
         session.current_step = meta.get("current_step", 0)
@@ -1029,6 +1387,377 @@ class VerlTrainingEngine:
             ray.kill(worker)
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker shutdown")
+
+
+# =====================================================================
+# Phase 8: Dense Trainer Pool (mirrors MegatronActorPool)
+# =====================================================================
+
+# Persistent actor naming
+PERSISTENT_DENSE_NAMESPACE = "tinker"
+PERSISTENT_DENSE_ACTOR_PREFIX = "dense_trainer_pool_"
+
+# PFS PYTHONPATH for worker processes
+PFS_PYTHONPATH_DENSE = "/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/vllm"
+
+
+@dataclass
+class DenseTrainerEntry:
+    """Entry in the dense trainer pool with session tracking.
+
+    Phase 9: Adds LRU tracking for adaptive resource management.
+    """
+
+    actor: ray.actor.ActorHandle
+    base_model: str
+    max_lora_rank: int  # Trainer's max rank
+    num_gpus: int = 1  # GPUs used by this actor
+    current_session: str | None = None
+    actual_rank: int | None = None  # Current session's actual rank
+    created_at: float = 0.0
+    last_accessed: float = 0.0  # Phase 9: LRU tracking
+
+    def __post_init__(self):
+        import time
+
+        now = time.time()
+        if self.created_at == 0.0:
+            self.created_at = now
+        if self.last_accessed == 0.0:
+            self.last_accessed = now
+
+    def touch(self):
+        """Update last_accessed timestamp (call on each access)."""
+        import time
+        self.last_accessed = time.time()
+
+    def is_idle(self) -> bool:
+        """Check if actor has no active session."""
+        return self.current_session is None
+
+    def age(self) -> float:
+        """Seconds since creation."""
+        import time
+        return time.time() - self.created_at
+
+    def idle_time(self) -> float:
+        """Seconds since last access."""
+        import time
+        return time.time() - self.last_accessed
+
+
+class DenseTrainerPool:
+    """Pool of dense TrainingWorker actors keyed by base_model.
+
+    Phase 8: Unified rank support - actors are initialized with max_lora_rank
+    and can train adapters with any rank <= max_lora_rank via padding/truncation.
+
+    Phase 9: LRU-based eviction for adaptive resource management.
+
+    Thread-safe for concurrent access from multiple API requests.
+    """
+
+    # Default max rank for pooled actors
+    DEFAULT_MAX_LORA_RANK = 64
+    # Default GPUs per dense trainer actor
+    DEFAULT_NUM_GPUS = 1
+    # Minimum actor age before eligible for eviction (seconds)
+    MIN_ACTOR_AGE = 300  # 5 minutes
+
+    def __init__(self):
+        import threading
+
+        self._actors: dict[str, DenseTrainerEntry] = {}  # key: base_model
+        self._lock = threading.Lock()
+
+    def _make_key(self, base_model: str) -> str:
+        """Create pool key from model path."""
+        return base_model
+
+    def _make_actor_name(self, base_model: str, max_rank: int) -> str:
+        """Create unique actor name for this config."""
+        model_name = base_model.split("/")[-1].replace("-", "_").lower()
+        return f"{PERSISTENT_DENSE_ACTOR_PREFIX}{model_name}_maxr{max_rank}"
+
+    def get(self, base_model: str) -> DenseTrainerEntry | None:
+        """Get existing actor entry if it exists.
+
+        Args:
+            base_model: HuggingFace model path.
+
+        Returns:
+            DenseTrainerEntry if actor exists, None otherwise.
+        """
+        key = self._make_key(base_model)
+        with self._lock:
+            entry = self._actors.get(key)
+            if entry:
+                entry.touch()  # Phase 9: Update LRU
+            return entry
+
+    def _get_idle_actors_lru(self) -> list[DenseTrainerEntry]:
+        """Get idle actors sorted by last access time (LRU first).
+
+        Must be called with lock held.
+        """
+        idle = [e for e in self._actors.values() if e.is_idle() and e.age() > self.MIN_ACTOR_AGE]
+        return sorted(idle, key=lambda e: e.last_accessed)
+
+    def _evict_for_gpus(self, needed_gpus: int, save_state: bool = True) -> int:
+        """Evict idle actors to free up GPUs.
+
+        Must be called with lock held.
+
+        Args:
+            needed_gpus: Number of GPUs needed.
+            save_state: If True, save session state before eviction.
+
+        Returns:
+            Number of GPUs freed.
+        """
+        freed_gpus = 0
+        idle_actors = self._get_idle_actors_lru()
+
+        for entry in idle_actors:
+            if freed_gpus >= needed_gpus:
+                break
+
+            logger.info(
+                f"[DenseTrainerPool] Evicting idle actor: {entry.base_model} "
+                f"(idle {entry.idle_time():.1f}s, frees {entry.num_gpus} GPUs)"
+            )
+
+            # Remove from pool
+            key = self._make_key(entry.base_model)
+            self._actors.pop(key, None)
+
+            # Kill actor (no state to save since it's idle)
+            try:
+                ray.get(entry.actor.shutdown.remote(), timeout=30)
+                ray.kill(entry.actor)
+            except Exception as e:
+                logger.warning(f"[DenseTrainerPool] Error killing evicted actor: {e}")
+
+            freed_gpus += entry.num_gpus
+
+        return freed_gpus
+
+    def get_or_create(
+        self,
+        base_model: str,
+        lora_rank: int,
+        learning_rate: float,
+        session_id: str | None = None,
+        max_lora_rank: int | None = None,
+    ) -> DenseTrainerEntry:
+        """Get existing or create new dense trainer for this base model.
+
+        Phase 8: If actor exists, it will be reused regardless of lora_rank
+        (padding/truncation happens at session swap time).
+
+        Phase 9: If resources exhausted, tries LRU eviction of idle actors.
+
+        Args:
+            base_model: HuggingFace model path.
+            lora_rank: Requested LoRA rank for this session.
+            learning_rate: Initial learning rate (only used if creating new).
+            session_id: Optional session ID to register with actor.
+            max_lora_rank: Override max rank for new actor creation.
+
+        Returns:
+            DenseTrainerEntry with actor handle.
+
+        Raises:
+            ValueError: If rank exceeds max or insufficient resources.
+        """
+        key = self._make_key(base_model)
+
+        with self._lock:
+            # Return existing actor if available
+            if key in self._actors:
+                entry = self._actors[key]
+                if lora_rank > entry.max_lora_rank:
+                    raise ValueError(
+                        f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
+                        f"Kill the actor and restart with higher max_lora_rank."
+                    )
+                entry.touch()  # Phase 9: Update LRU
+                logger.info(
+                    f"[DenseTrainerPool] Reusing existing actor for {base_model} "
+                    f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
+                )
+                return entry
+
+            # Create new actor with max rank
+            effective_max_rank = max(
+                lora_rank,
+                max_lora_rank or 0,
+                self.DEFAULT_MAX_LORA_RANK,
+            )
+            actor_name = self._make_actor_name(base_model, effective_max_rank)
+            logger.info(
+                f"[DenseTrainerPool] Creating new actor: {actor_name} for {base_model}, "
+                f"max_rank={effective_max_rank}"
+            )
+
+            # Check if detached actor already exists
+            try:
+                actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
+                logger.info(f"[DenseTrainerPool] Found existing detached actor: {actor_name}")
+                # Verify it's alive
+                ray.get(actor.get_session_info.remote(), timeout=10)
+            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                # Create new detached actor
+                runtime_env = {
+                    "env_vars": {
+                        "PYTHONPATH": PFS_PYTHONPATH_DENSE,
+                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    }
+                }
+
+                actor = TrainingWorker.options(
+                    name=actor_name,
+                    namespace=PERSISTENT_DENSE_NAMESPACE,
+                    lifetime="detached",
+                    num_gpus=1,
+                    runtime_env=runtime_env,
+                ).remote(
+                    base_model=base_model,
+                    lora_rank=effective_max_rank,  # Initialize with max rank
+                    learning_rate=learning_rate,
+                )
+
+                # Wait for initialization
+                ray.get(actor.__ray_ready__.remote())
+                logger.info(f"[DenseTrainerPool] Actor {actor_name} initialized")
+
+            entry = DenseTrainerEntry(
+                actor=actor,
+                base_model=base_model,
+                max_lora_rank=effective_max_rank,
+                num_gpus=self.DEFAULT_NUM_GPUS,
+                current_session=session_id,
+                actual_rank=lora_rank,
+            )
+            self._actors[key] = entry
+            return entry
+
+    def remove(self, base_model: str, kill_actor: bool = True) -> bool:
+        """Remove actor from pool.
+
+        Args:
+            base_model: HuggingFace model path.
+            kill_actor: If True, also kill the Ray actor.
+
+        Returns:
+            True if actor was removed, False if not found.
+        """
+        key = self._make_key(base_model)
+
+        with self._lock:
+            if key not in self._actors:
+                return False
+
+            entry = self._actors.pop(key)
+            if kill_actor:
+                try:
+                    ray.get(entry.actor.shutdown.remote(), timeout=30)
+                    ray.kill(entry.actor)
+                except Exception as e:
+                    logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
+
+            logger.info(f"[DenseTrainerPool] Removed actor for {base_model}")
+            return True
+
+    def list_actors(self) -> list[dict]:
+        """List all actors in the pool.
+
+        Returns:
+            List of actor info dicts.
+        """
+        with self._lock:
+            return [
+                {
+                    "base_model": entry.base_model,
+                    "max_lora_rank": entry.max_lora_rank,
+                    "actual_rank": entry.actual_rank,
+                    "current_session": entry.current_session,
+                    "num_gpus": entry.num_gpus,
+                    "created_at": entry.created_at,
+                    "last_accessed": entry.last_accessed,
+                    "idle_time": entry.idle_time(),
+                }
+                for entry in self._actors.values()
+            ]
+
+    def total_gpus(self) -> int:
+        """Total GPUs used by all actors in pool."""
+        with self._lock:
+            return sum(e.num_gpus for e in self._actors.values())
+
+    def evict_idle(self, min_idle_seconds: float = 600) -> int:
+        """Evict all idle actors that have been idle longer than threshold.
+
+        Args:
+            min_idle_seconds: Minimum idle time before eviction.
+
+        Returns:
+            Number of actors evicted.
+        """
+        with self._lock:
+            to_evict = [
+                e for e in self._actors.values()
+                if e.is_idle() and e.idle_time() > min_idle_seconds
+            ]
+
+            for entry in to_evict:
+                key = self._make_key(entry.base_model)
+                self._actors.pop(key, None)
+                try:
+                    ray.get(entry.actor.shutdown.remote(), timeout=30)
+                    ray.kill(entry.actor)
+                except Exception as e:
+                    logger.warning(f"[DenseTrainerPool] Error killing idle actor: {e}")
+                logger.info(f"[DenseTrainerPool] Evicted idle actor: {entry.base_model}")
+
+            return len(to_evict)
+
+    def clear(self, kill_actors: bool = True) -> int:
+        """Remove all actors from pool.
+
+        Args:
+            kill_actors: If True, also kill the Ray actors.
+
+        Returns:
+            Number of actors removed.
+        """
+        with self._lock:
+            count = len(self._actors)
+            if kill_actors:
+                for entry in self._actors.values():
+                    try:
+                        ray.get(entry.actor.shutdown.remote(), timeout=30)
+                        ray.kill(entry.actor)
+                    except Exception as e:
+                        logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
+            self._actors.clear()
+            logger.info(f"[DenseTrainerPool] Cleared {count} actors")
+            return count
+
+
+# Global pool instance
+_dense_trainer_pool: DenseTrainerPool | None = None
+
+
+def get_dense_trainer_pool() -> DenseTrainerPool:
+    """Get or create the global DenseTrainerPool instance."""
+    global _dense_trainer_pool
+    if _dense_trainer_pool is None:
+        _dense_trainer_pool = DenseTrainerPool()
+    return _dense_trainer_pool
 
 
 # Global engine instance (initialized in app lifespan)

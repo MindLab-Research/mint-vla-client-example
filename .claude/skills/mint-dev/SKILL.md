@@ -69,6 +69,12 @@ curl -X POST http://localhost:8000/api/v1/kill_vllm
 >
 > **NEVER** run one-off `unison volcano-tinker -batch` commands. This causes stale code on workers.
 
+> **PRE-FLIGHT CHECK:** Before ANY dev work, verify unison daemon is running:
+> ```bash
+> pgrep -af "unison.*volcano-tinker" || echo "WARNING: unison not running - server has outdated code!"
+> ```
+> If not running, start it first: `unison volcano-tinker -repeat watch`
+
 ```bash
 # Start daemon (run first, keep running)
 unison volcano-tinker -repeat watch
@@ -206,7 +212,64 @@ Dev-specific values:
 
 ---
 
-## 6. Debugging
+## 6. GPU Requirements for MoE Models
+
+> **CRITICAL: ALWAYS verify cluster has enough GPUs before starting MoE actors.**
+>
+> Insufficient GPUs cause pending placement groups that block the cluster.
+
+### GPU Requirements by Model
+
+| Model | vLLM (Inference) | Megatron (Training) | Total (Simultaneous) |
+|-------|------------------|---------------------|----------------------|
+| **Qwen3-30B-A3B** | TP=1, DP=4 → **4 GPUs** | TP=4, EP=2 → **8 GPUs** | **12 GPUs** |
+| **Qwen3-235B-A22B** | TP=2, DP=4 → **8 GPUs** | Not tested | **8+ GPUs** |
+| Dense models (7B-14B) | **1 GPU** | **1 GPU** | **2 GPUs** |
+
+### Pre-flight Check (MANDATORY)
+
+Before starting any MoE test, run:
+
+```bash
+# Check available GPUs
+ssh volcano "python -c \"import ray; ray.init(); r=ray.available_resources(); print(f'Available GPUs: {r.get(\\\"GPU\\\", 0)}')\""
+
+# Check pending placement groups (should be empty)
+ssh volcano "ray status 2>/dev/null | grep -A5 'Pending Demands'"
+```
+
+**Required for Qwen3-30B-A3B tests:** At least 12 available GPUs and no pending placement groups.
+
+### Parallelism Configuration
+
+**vLLM (Inference)** - configured in `model_registry.py`:
+- TP (tensor_parallel): Shards model weights across GPUs
+- DP (data_parallel): Runs multiple model replicas
+- MoE uses expert parallelism: EP = TP × DP
+
+**Megatron (Training)** - configured in `verl_training.py`:
+- TP=4: Tensor parallelism (shards attention/FFN)
+- EP=2: Expert parallelism (distributes MoE experts)
+- world_size = TP × PP × EP × CP = 4 × 1 × 2 × 1 = 8 GPUs
+
+### Clearing Stuck Resources
+
+If placement groups are pending (blocking GPUs):
+
+```bash
+# Kill all Megatron actors
+ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+
+# Kill vLLM actor
+curl -X POST http://localhost:8000/api/v1/kill_vllm
+
+# Verify resources freed
+ssh volcano "ray status 2>/dev/null | head -20"
+```
+
+---
+
+## 7. Debugging
 
 ```bash
 # Error search
@@ -230,3 +293,5 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 | Server won't start | Check logs: `tail -100 /tmp/tinker_server.log` |
 | Can't connect | Check SSH tunnel, Ray cluster connection |
 | vLLM OOM | Kill vLLM actor, restart server |
+| Pending placement groups | Not enough GPUs. Kill stale actors (see section 6) |
+| MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |

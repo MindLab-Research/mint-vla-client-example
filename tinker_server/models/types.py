@@ -54,15 +54,28 @@ class SampledSequence(BaseModel):
 
 
 class SampleRequest(BaseModel):
-    """Request to generate samples from the model."""
+    """Request to generate samples from the model.
 
-    sampling_session_id: str
-    seq_id: int
+    Accepts either sampling_session_id or model_id for Tinker SDK compatibility.
+    """
+
+    sampling_session_id: str | None = None
+    model_id: str | None = None  # Alias for sampling_session_id (Tinker SDK compat)
+    seq_id: int = 0  # Default to 0 if not provided
     num_samples: int
     prompt: ModelInput
     sampling_params: SamplingParams
     prompt_logprobs: bool = False
     topk_prompt_logprobs: int = 0
+    include_prompt_logprobs: bool = False  # Alias for prompt_logprobs (Tinker SDK compat)
+
+    def get_session_id(self) -> str:
+        """Get the session ID, preferring sampling_session_id over model_id."""
+        if self.sampling_session_id:
+            return self.sampling_session_id
+        if self.model_id:
+            return self.model_id
+        raise ValueError("Either sampling_session_id or model_id must be provided")
 
 
 class SampleResponse(BaseModel):
@@ -176,6 +189,7 @@ class CreateModelResponse(BaseModel):
     request_id: str
     model_id: str
     type: Literal["create_model"] = "create_model"
+    backend: str | None = None  # "megatron" for MoE, "peft" for dense
 
 
 class Datum(BaseModel):
@@ -274,6 +288,22 @@ class OptimStepResponse(BaseModel):
 
     metrics: dict[str, float] | None = None
     type: Literal["optim_step"] = "optim_step"
+
+
+class TrainStepRequest(BaseModel):
+    """Request to perform combined forward-backward + optimizer step.
+
+    This is the recommended way to train MoE models with param_offload=True.
+    Keeping both operations in a single request ensures gradients survive
+    for the optimizer step.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    forward_backward_input: ForwardBackwardInput
+    adam_params: AdamParams
+    model_id: str
+    seq_id: int | None = None
 
 
 class TelemetryRequest(BaseModel):

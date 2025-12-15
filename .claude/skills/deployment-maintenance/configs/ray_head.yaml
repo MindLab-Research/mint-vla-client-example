@@ -1,0 +1,32 @@
+# Ray Head Node - CPU only, persistent
+# Submit with: volc ml_task submit -c ray_head.yaml --output json
+
+TaskName: "ray-head"
+Description: "Ray head node - CPU only, long-running"
+
+Entrypoint: |
+  ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-cpus=4 --num-gpus=0 && sleep infinity
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:2"
+ResourceQueueID: "q-20251126180002-26lwz"
+Framework: "Custom"
+
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.g2a.xlarge"
+
+# Max runtime: 5 days
+ActiveDeadlineSeconds: 432000
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+
+Storages:
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse"
+      SubPath: ""
+      ReadOnly: true
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse/share"
+      SubPath: "share"
+      ReadOnly: false

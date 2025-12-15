@@ -101,12 +101,8 @@ async def create_sampling_session(
         # Resolve path (file://, tinker://localhost, or absolute path)
         adapter_path = _resolve_model_path(request.model_path)
 
-        # Load tensors from saved checkpoint
-        weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
-        config_path = os.path.join(adapter_path, "adapter_config.json")
-        state_dict = load_file(weights_path)
-        with open(config_path, "r") as f:
-            peft_config = json.load(f)
+        # Load adapter weights and config from disk
+        state_dict, peft_config = _load_adapter_from_path(adapter_path, request.lora_rank)
 
         # Add LoRA to engine and register session
         await multi_lora_engine.add_lora_for_session(
@@ -153,6 +149,46 @@ def _resolve_model_path(model_path: str) -> str:
     else:
         # Assume absolute path
         return model_path
+
+
+def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, dict]:
+    """Load LoRA adapter weights and config from disk.
+
+    Args:
+        adapter_path: Filesystem path to adapter directory.
+        lora_rank: LoRA rank for config.
+
+    Returns:
+        (state_dict, peft_config) tuple.
+    """
+    import json
+    import os
+
+    from safetensors.torch import load_file
+
+    # Load weights
+    weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+    if not os.path.exists(weights_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Adapter weights not found: {weights_path}",
+        )
+    state_dict = load_file(weights_path)
+
+    # Load config
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            peft_config = json.load(f)
+    else:
+        # Construct minimal config if missing
+        peft_config = {
+            "r": lora_rank,
+            "lora_alpha": lora_rank,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        }
+
+    return state_dict, peft_config
 
 
 @router.post("/session_heartbeat")
@@ -213,3 +249,38 @@ async def vllm_status() -> dict:
 
     alive = check_persistent_vllm_actor()
     return {"alive": alive, "actor_name": PERSISTENT_VLLM_ACTOR_NAME}
+
+
+@router.post("/kill_megatron")
+async def kill_megatron() -> dict:
+    """Kill the persistent Megatron training actor.
+
+    Use this to force a full restart of the Megatron worker group.
+    The next training request will create a new actor.
+
+    This is useful when:
+    - Workers are in a bad state after a crash
+    - You want to free GPU memory
+    - You need to reload code changes
+    """
+    from ..backend.megatron_distributed import kill_megatron_actor
+
+    killed = kill_megatron_actor()
+    return {"killed": killed, "message": "Megatron actor killed" if killed else "No Megatron actor found"}
+
+
+@router.get("/megatron_status")
+async def megatron_status() -> dict:
+    """Check if persistent Megatron actor exists.
+
+    Returns:
+        alive: True if actor exists and is alive
+        actor_name: The well-known actor name
+    """
+    from ..backend.megatron_distributed import (
+        PERSISTENT_MEGATRON_ACTOR_NAME,
+        is_megatron_actor_running,
+    )
+
+    alive = is_megatron_actor_running()
+    return {"alive": alive, "actor_name": PERSISTENT_MEGATRON_ACTOR_NAME}

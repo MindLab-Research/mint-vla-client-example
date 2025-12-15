@@ -35,6 +35,7 @@ class TrainingSession:
     accumulated_gradients: int = 0
     is_active: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
 
     # Per-session inference engine for isolated concurrent access
     # Lazily initialized on first save_weights_for_sampler call
@@ -54,6 +55,7 @@ class TrainingSession:
             "is_active": self.is_active,
             "created_at": self.created_at,
             "learning_rate": self.learning_rate,
+            "backend": self.backend,
         }
 
 

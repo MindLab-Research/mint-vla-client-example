@@ -1,69 +1,77 @@
-# Mint Server
+# tinker-server
 
-## Quick Start (Local)
+## Tinker API Reference
 
-```bash
-HF_HUB_OFFLINE=1 \
-HF_HOME=/vePFS-Mindverse/share/huggingface \
-TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
-python scripts/run_server.py
-```
+When needing details about the official Tinker API (types, methods, loss functions, data formats), read `tinker_official_reference.txt` in the project root. This contains complete SDK documentation and type definitions.
 
-Environment variables:
-- `HF_HUB_OFFLINE=1` - Force offline mode
-- `HF_HOME` - HuggingFace cache directory
-- `TINKER_MODEL_PATH` - Model snapshot path
-- `TINKER_CHECKPOINT_DIR` - LoRA checkpoint directory (shared filesystem for distributed)
+## Code Synchronization
 
-## Remote Deployment
+Code sync handled by background `unison` process. **NEVER** manually sync.
 
-**For remote deployment and cluster management, use skills:**
-- `mint-dev` - Development environment (volcano, port 8000)
-- `mint-prod` - Production environment (mint-prod, port 18000)
-- `volcano-cluster` - Ray cluster lifecycle
+## Remote Commands
 
-## Testing
+**NEVER** run `ray` or `volc` commands locally. Use the `deployment-maintenance` skill for remote server operations.
 
-### Using tinker SamplingClient
+## Quick Start
 
 ```bash
 TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy python scripts/test_client.py
 ```
 
-### Using curl (raw API)
+For server deployment and cluster management, use the `deployment-maintenance` skill.
 
-```bash
-# 1. Create session
-curl -X POST http://localhost:8000/api/v1/create_session \
-  -H "Content-Type: application/json" \
-  -d '{"tags": [], "user_metadata": {}}'
+## Fixed Issues
 
-# 2. Create sampling session
-curl -X POST http://localhost:8000/api/v1/create_sampling_session \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "<session_id>"}'
+| Issue | Fix | Location |
+|-------|-----|----------|
+| max_tokens ignored | Override `generate()` to respect user param | `verl_inference.py:138-213` |
+| EOS not detected | Add `stop_token_ids=[151645, 151643]` | `verl_inference.py:283`, `sampling.py:72-76` |
+| Slow weight sync (60s) | Hot LoRA reload via shared engine (0.68s) | `session_manager.py:103-184`, `verl_inference.py:77-132` |
 
-# 3. Submit async sample
-curl -X POST http://localhost:8000/api/v1/asample \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sampling_session_id": "<sampling_session_id>",
-    "seq_id": 0,
-    "num_samples": 1,
-    "prompt": {"chunks": [{"tokens": [9707], "type": "encoded_text"}]},
-    "sampling_params": {"max_tokens": 32, "temperature": 0.7}
-  }'
+## Architecture
 
-# 4. Poll result
-curl -i -X POST http://localhost:8000/api/v1/retrieve_future \
-  -H "Content-Type: application/json" \
-  -d '{"request_id": "<request_id>"}'
-# Returns: HTTP 408 (pending) or HTTP 200 with result
+```
+Local Machine               API Server (volcano)           GPU Workers (Ray)
+─────────────               ────────────────────           ─────────────────
+tinker-cookbook  ──HTTP──>  tinker-server:8000  ──Ray──>  MegatronWorker
+(Python 3.11+)         ↑                                   vLLM Engine
+                       │
+                 SSH tunnel (localhost:8000 → volcano:8000)
 ```
 
-### Tinker Cookbook Integration
+**Key points:**
+- **tinker-cookbook**: Runs LOCALLY on your workstation. Requires Python 3.11+ (for `chz` package).
+- **tinker-server**: Runs on volcano API server. Receives HTTP requests, dispatches to Ray workers.
+- **GPU Workers**: Run on Ray cluster nodes. Execute training (Megatron) and inference (vLLM).
+- **Data transfer**: Weights via Ray object store, not file paths.
+
+### Inference Modes
+
+- **Named Sessions:** `create_sampling_session(model_path=...)` - dedicated engine (~60s init)
+- **Ephemeral Sessions:** `save_weights_and_get_sampling_client()` - hot-reload (~0.7s after first)
+
+### vLLM Actor
+
+Detached Ray actor surviving server restarts. First start ~80s, subsequent ~2s.
+
+## API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/v1/healthz` | GET | Health check |
+| `/api/v1/vllm_status` | GET | vLLM actor status |
+| `/api/v1/kill_vllm` | POST | Kill vLLM actor |
+| `/api/v1/create_session` | POST | Create session |
+| `/api/v1/create_sampling_session` | POST | Create sampling session |
+| `/api/v1/asample` | POST | Submit async sample |
+| `/api/v1/retrieve_future` | POST | Poll result (408=pending, 200=ready) |
+
+## Cookbook Tests (Run Locally)
+
+tinker-cookbook runs on your LOCAL machine, not on the server. Ensure SSH tunnel is active.
 
 ```bash
+# Run from LOCAL machine (requires Python 3.11+, chz package)
 cd /home/yiwen/tinker_project/tinker-cookbook
 
 # Arithmetic RL (~5 min)
@@ -71,70 +79,7 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
 python -m tinker_cookbook.recipes.math_rl.train \
     model_name="Qwen/Qwen2.5-7B-Instruct" \
     renderer_name="qwen3_instruct" \
-    group_size=4 \
-    groups_per_batch=100 \
-    learning_rate=1e-4
-
-# Chat SL (~30-60 min)
-TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
-python -m tinker_cookbook.recipes.chat_sl.train \
-    model_name=Qwen/Qwen2.5-7B-Instruct \
-    renderer_name="qwen3_instruct" \
-    dataset=no_robots \
-    learning_rate=5e-4 \
-    batch_size=64 \
-    lora_rank=64 \
-    eval_every=20
+    group_size=4 groups_per_batch=100 learning_rate=1e-4
 ```
 
-Note: Use `renderer_name="qwen3_instruct"` to bypass model lookup.
-
-## Architecture
-
-### Distributed Deployment
-
-```
-Client Machine                     API Server                    GPU Workers
---------------                     ----------                    -----------
-tinker-cookbook  ──HTTP──>  FastAPI (no GPU)  ──Ray──>  TrainingWorker
-                            sessions, routing           vLLM Engine
-```
-
-- **Client**: Python client, connects via HTTP
-- **API Server**: FastAPI, manages sessions, no GPU, connects to Ray cluster
-- **GPU Workers**: Ray actors for training (TrainingWorker) and inference (vLLM)
-
-Data transfer uses Ray object store, not filesystem paths.
-
-### Inference Modes
-
-**Named Sessions** - dedicated engine per session
-- `create_sampling_session(model_path=...)` spawns VerlInferenceEngine
-- ~60s init, complete isolation
-- Use for: long-running sessions, stable weights
-
-**Ephemeral Sessions** - per-training-session engine
-- `save_weights_and_get_sampling_client()` uses shared engine
-- First call ~60s, subsequent hot-reload ~0.7s
-- Use for: RL training loops with frequent weight updates
-
-### Persistent vLLM Actor
-
-vLLM runs as detached Ray actor surviving server restarts:
-- First start: ~80s (model loading + CUDA graphs)
-- Subsequent restarts: ~2s (reuses actor)
-- Kill with `/api/v1/kill_vllm` when: model changed, OOM, vLLM code changed
-
-## Known Limitations (Fixed)
-
-### max_tokens
-User's `max_tokens` respected via monkey-patch in `ExtendedVLLMHttpServer.generate()`.
-Location: `tinker_server/backend/verl_inference.py:138-213`
-
-### EOS token detection
-`stop_token_ids=[151645, 151643]` added to sampling parameters.
-Location: `tinker_server/backend/verl_inference.py:283`, `tinker_server/routes/sampling.py:72-76`
-
-### Training-to-inference weight sync
-Hot LoRA reload via shared engine pattern. 88x speedup (60s → 0.68s).
-Location: `tinker_server/backend/session_manager.py:103-184`, `tinker_server/backend/verl_inference.py:77-132`
+Note: `renderer_name="qwen3_instruct"` bypasses model lookup.
