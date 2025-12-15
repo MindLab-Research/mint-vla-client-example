@@ -45,12 +45,15 @@
 | Qwen/Qwen3-235B-A22B-Instruct-2507 | Instruction | MoE | 32 (TP8,EP4) | 16 | Multi-node |
 | deepseek-ai/DeepSeek-V3.1 | Hybrid | MoE | 64+ | 32+ | Different MoE architecture |
 
-#### T2 (Week 4+) - Multimodal
+#### T2 (Week 4+) - Multimodal & Embodied
 
 | Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-VL-30B-A3B-Instruct | Vision | MoE | TBD | TBD | Vision encoder integration |
 | Qwen/Qwen3-VL-235B-A22B-Instruct | Vision | MoE | TBD | TBD | |
+| physical-intelligence/pi0 | VLA | PaliGemma+Expert | TBD | TBD | Flow matching, 50Hz actions |
+| physical-intelligence/pi0.5 | VLA | PaliGemma+Expert | TBD | TBD | Open-world generalization |
+| physical-intelligence/pi0-fast | VLA | PaliGemma+Expert | TBD | TBD | FAST action tokenizer |
 
 #### Testing Strategy
 
@@ -66,6 +69,53 @@ Each tier involves:
 | Kimi-K2 | Block-FP8 quantization, 1T params | Infra team has working impl, migrate to Mint |
 | DeepSeek-V3.1 | Different MoE routing | Architecture analysis needed |
 | VL models | Vision encoder, multimodal inputs | New modality support |
+| pi0/pi0.5 (VLA) | See VLA investigation below | Tentative - may require new backend |
+
+#### VLA Models Investigation (Tentative)
+
+**What are VLA models?** Vision-Language-Action models for robot control. Output continuous action trajectories instead of text tokens.
+
+**Architecture (pi0):**
+- Base: PaliGemma 3B VLM backbone
+- Action expert: +300M params (initialized from scratch)
+- Total: ~3.3B parameters
+- Output: Continuous action vectors at 50Hz via flow matching
+
+**Key differences from standard VLM fine-tuning:**
+
+| Aspect | Standard VLM | VLA (pi0) |
+|--------|--------------|-----------|
+| Output | Discrete text tokens | Continuous action vectors |
+| Training objective | Cross-entropy | Flow matching |
+| Inference rate | Variable | Fixed 50Hz real-time |
+| Additional inputs | Image + text | Image + text + robot state |
+| Expert module | None | 300M action expert |
+
+**Implementation requirements:**
+
+1. **Flow matching support** - Different from cross-entropy loss, generates smooth trajectories
+2. **Action expert module** - Additional trainable module beyond VLM backbone
+3. **Robot state inputs** - Proprioceptive data (joint positions, velocities)
+4. **Continuous output** - Not discrete token prediction
+5. **Real-time inference** - 50Hz control loop requirements
+
+**Framework status:**
+- Native: JAX with FSDP
+- PyTorch: Recently added (DDP, multi-node via torchrun)
+- LoRA fine-tuning: Supported (>22.5 GB VRAM)
+- Full fine-tuning: >70 GB VRAM (A100/H100)
+
+**Open questions:**
+1. Can verl/Megatron support PaliGemma architecture?
+2. How to integrate flow matching into existing training pipeline?
+3. Is there demand for VLA fine-tuning via Tinker-style API?
+4. Alternative: Direct integration with openpi repo?
+
+**References:**
+- [openpi GitHub](https://github.com/Physical-Intelligence/openpi)
+- [pi0 Paper](https://www.physicalintelligence.company/download/pi0.pdf)
+- [pi0.5 Paper](https://arxiv.org/abs/2504.16054)
+- [HuggingFace Blog](https://huggingface.co/blog/pi0)
 
 ---
 
@@ -238,6 +288,109 @@ for name in ['persistent_megatron_worker_group', 'persistent_vllm_actor']:
 
 ---
 
+### 6. Tinker API Alignment
+
+Detailed verification that Mint matches official Tinker SDK behavior.
+
+#### Reference Test Cases (from tinker_test.ipynb)
+
+| Test | Description | Expected Behavior |
+|------|-------------|-------------------|
+| 1. Service Client | `ServiceClient.get_server_capabilities()` | List supported models |
+| 2. Training Client | `create_lora_training_client(base_model)` | Returns client with tokenizer |
+| 3. Data Preparation | `types.Datum`, `types.ModelInput.from_ints()` | Token/weight format |
+| 4. Forward-Backward | `forward_backward(data, "cross_entropy")` | Returns logprobs per token |
+| 5. Optim Step | `optim_step(AdamParams(learning_rate=1e-4))` | Updates weights |
+| 6. Loss Computation | Client-side: `-dot(logprobs, weights) / sum(weights)` | Matches server loss |
+| 7. Sampling | `save_weights_and_get_sampling_client()` | Hot-reload LoRA |
+| 8. Sample Generation | `sample(prompt, params, num_samples)` | Returns sequences |
+| 9. Prompt Logprobs | `include_prompt_logprobs=True` | Returns per-token logprobs |
+| 10. Top-k Logprobs | `topk_prompt_logprobs=5` | Returns top-k per position |
+| 11. Save for Sampler | `save_weights_for_sampler(name)` | Returns path |
+| 12. Save State | `save_state(name)` | Resume checkpoint path |
+| 13. Load State | `load_state(path)` | Restores training state |
+
+#### API Mapping: Tinker SDK → Mint
+
+| Tinker SDK | Mint Endpoint | Notes |
+|------------|---------------|-------|
+| `get_server_capabilities()` | `/api/v1/healthz` | Extend for model list |
+| `create_lora_training_client()` | `/api/v1/create_model` | Same |
+| `forward_backward()` | `/api/v1/forward_backward` | Returns logprobs |
+| `optim_step()` | `/api/v1/optim_step` | Same |
+| `save_weights_and_get_sampling_client()` | `/api/v1/save_weights` | Hot-reload |
+| `sample()` | `/api/v1/asample` | Same |
+| `save_weights_for_sampler()` | `/api/v1/save_weights` | With name |
+| `save_state()` | `/api/v1/save_state` | **NEW** |
+| `load_state()` | `/api/v1/load_state` | **NEW** |
+
+#### Test Cases
+
+**Test 6.1: Pig Latin SFT (Dense)**
+
+Replicate notebook's Pig Latin translation with Qwen2.5-7B.
+
+| Metric | Target |
+|--------|--------|
+| Update 1 loss | ~2.45 |
+| Update 6 loss | ~0.58 |
+| Loss reduction | >75% |
+| Iteration time | <2s |
+
+**Test 6.2: Pig Latin SFT (MoE)**
+
+Same task with Qwen3-30B-A3B.
+
+| Metric | Target |
+|--------|--------|
+| Update 1 loss | ~2.5-3.0 |
+| Update 10 loss | <1.0 |
+| Loss reduction | >60% |
+| Iteration time | <8s |
+
+**Test 6.3: Forward-Backward Logprobs**
+
+Verify client-computed loss matches server `metrics['loss:mean']`. Pass: diff < 0.01.
+
+**Test 6.4: Prompt Logprobs**
+
+Verify `include_prompt_logprobs=True` returns per-token logprobs. First token = 0.0.
+
+**Test 6.5: Checkpoint Round-Trip**
+
+Train 5 iter → save → train 5 more → load → verify loss matches step 6 from first run. Pass: diff < 0.05.
+
+**Test 6.6: Hot-Reload Sampling**
+
+Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → output differs from base model.
+
+#### Data Format Comparison
+
+| Aspect | Tinker SDK | Mint | Compatible? |
+|--------|------------|------|-------------|
+| Per-token weights | `weights` | `loss_mask` | **NO** - field name mismatch |
+| Model input | `chunks` with `EncodedTextChunk` | `chunks` format | Yes |
+| Tensor format | `TensorData{data, shape, dtype}` | `{data, shape, dtype}` | Yes |
+| Loss functions | `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | ? | Verify |
+
+**Action required**: Rename `loss_mask` → `weights` for Tinker API compatibility.
+
+#### Implementation Tasks
+
+| Task | Priority | Status |
+|------|----------|--------|
+| Rename `loss_mask` → `weights` in forward_backward | **Critical** | Pending |
+| Verify all loss functions: `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | High | Pending |
+| Add `/api/v1/save_state` | High | Pending |
+| Add `/api/v1/load_state` | High | Pending |
+| Add `forward_backward_custom` for arbitrary loss functions | Medium | Pending |
+| Verify LoRA config options: `train_unembed`, `train_mlp`, `train_attn` | Medium | Pending |
+| Verify logprobs format matches `TensorData` spec | High | Pending |
+| Create `test_tinker_api_alignment.py` | High | Pending |
+| Verify `include_prompt_logprobs` and `topk_prompt_logprobs` | Medium | Pending |
+
+---
+
 ## Known Issues
 
 ### train_step API Breaks Tinker Compatibility
@@ -290,3 +443,5 @@ Previous tests prove sessions have different weights (A ≠ B), but don't prove 
 - [verl Megatron Backend](https://verl.readthedocs.io/en/latest/workers/megatron_workers.html)
 - [verl Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html)
 - [Kimi-K2-Instruct on HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct)
+- [Tinker SDK test notebook](~/Downloads/tinker_test.ipynb)
+- [Tinker Official Agent Reference](./tinker_official_reference.txt) - Full API docs and type definitions

@@ -1,5 +1,9 @@
 # tinker-server
 
+## Tinker API Reference
+
+When needing details about the official Tinker API (types, methods, loss functions, data formats), read `tinker_official_reference.txt` in the project root. This contains complete SDK documentation and type definitions.
+
 ## Code Synchronization
 
 Code sync handled by background `unison` process. **NEVER** manually sync.
