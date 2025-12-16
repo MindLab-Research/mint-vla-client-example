@@ -438,6 +438,76 @@ Previous tests prove sessions have different weights (A ≠ B), but don't prove 
 
 ---
 
+## Future Research
+
+### Multi-LoRA Batched Training
+
+**Problem**: Current architecture time-shares a single Megatron engine between different LoRA clients. Each `forward_backward` call trains one LoRA at a time. With N concurrent users, total time = N × single-user time.
+
+**Opportunity**: Batch multiple LoRAs in a single forward-backward pass. When GPUs are undersaturated (small per-user batches), this could yield 2-3× speedup.
+
+**How it works (conceptually)**:
+
+```python
+# Current: sequential
+for lora in [A, B, C]:
+    forward_backward(batch[lora], lora)  # 3 passes
+
+# Batched: single pass with per-sequence adapter routing
+batched_forward_backward(
+    combined_batch,
+    adapters=[A, B, C],
+    adapter_indices=[0,0,1,1,2,2]  # which sequence uses which LoRA
+)
+```
+
+**Current landscape**:
+
+| System | Multi-LoRA Training | Production-ready |
+|--------|---------------------|------------------|
+| [mLoRA](https://github.com/TUDB-Labs/mLoRA) | Yes (BatchLoRA kernels) | No - research code |
+| verl / Megatron | No | Yes |
+| vLLM (inference only) | Yes (BGMV kernels) | Yes |
+
+**Two approaches**:
+
+| Approach | Description | Speedup | Complexity |
+|----------|-------------|---------|------------|
+| mLoRA-style (PyTorch) | Batch base model ops, separate LoRA ops | ~80-90% of optimal | Medium |
+| Full BGMV/SGMV | Custom CUDA kernels for batched LoRA | ~100% of optimal | Very High |
+
+mLoRA batches the expensive base model computation (`X @ W`) but runs N separate LoRA ops (`x @ A @ B`). Since LoRA params are <1% of base model, this captures most of the benefit without custom CUDA.
+
+**Kernel backward pass status**:
+
+| Kernel | Forward | Backward (training) |
+|--------|---------|---------------------|
+| Punica BGMV/SGMV | ✓ | ✗ (not implemented) |
+| vLLM BGMV | ✓ | ✗ (inference only) |
+| mLoRA BatchLoRA | ✓ (PyTorch) | ✓ (autograd) |
+
+No public BGMV/SGMV backward implementations exist. All are inference-only.
+
+**Recommended path** (mLoRA-style):
+
+1. Modify `forward_backward_batch` to accept multiple adapter contexts
+2. Stack inputs from multiple sessions before forward pass
+3. Replace single-adapter LoRA modules with multi-adapter versions
+4. Route gradients to correct adapter's optimizer
+5. Manage per-adapter optimizer states
+
+No custom CUDA kernels needed. Main challenge is integration with Megatron's tensor parallelism.
+
+**When to prioritize**: Only worthwhile with 3+ concurrent users with small batches. Single-user or large-batch scenarios see minimal benefit.
+
+**References**:
+- [mLoRA Paper (VLDB 2024)](https://arxiv.org/abs/2312.02515) - BatchLoRA operator design (PyTorch-level)
+- [Punica Paper](https://arxiv.org/abs/2310.18547) - SGMV kernels for multi-LoRA inference (no backward)
+- [S-LoRA Blog](https://lmsys.org/blog/2023-11-15-slora/) - Serving thousands of adapters
+- [Punica BGMV source](https://github.com/punica-ai/punica/blob/master/csrc/bgmv/bgmv_impl.cuh) - Forward-only CUDA kernel
+
+---
+
 ## References
 
 - [verl Megatron Backend](https://verl.readthedocs.io/en/latest/workers/megatron_workers.html)
