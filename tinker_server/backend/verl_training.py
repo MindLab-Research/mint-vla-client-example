@@ -23,8 +23,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Default idle timeout for TrainingWorker (seconds)
-# Worker self-terminates if no activity for this duration
-DEFAULT_IDLE_TIMEOUT = 300  # 5 minutes
+# Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
+DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
