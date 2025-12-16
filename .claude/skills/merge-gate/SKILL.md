@@ -347,20 +347,50 @@ Merge gate passed (2025-12-15):
 - `session_manager.py`: hot reload optimization
 ```
 
-### 3. Create Tag and PR (requires user approval)
+### 3. Generate Changelog and Create Tag (requires user approval)
 
-**Do NOT auto-create.** Present draft to user and wait for approval.
+**Do NOT auto-create.** The agent should:
+
+1. Find the previous nightly tag
+2. Analyze commits since that tag
+3. **Summarize changes into categories** (not raw git log)
+4. Present summary to user for approval
+5. Create tag with summarized changelog
 
 ```bash
-# After user approval:
+# Find the most recent nightly tag
+PREV_TAG=$(git tag -l 'nightly_*' --sort=-creatordate | head -1)
+echo "Previous tag: $PREV_TAG"
 
-# Create nightly tag (overwrite if exists)
-git tag -d nightly_$(date +%Y%m%d) 2>/dev/null || true
-git push origin :refs/tags/nightly_$(date +%Y%m%d) 2>/dev/null || true
-git tag -a nightly_$(date +%Y%m%d) -m "Merge gate passed $(date +%Y-%m-%d)"
-git push origin nightly_$(date +%Y%m%d)
+# Show raw commits for agent to summarize
+git log $PREV_TAG..HEAD --oneline --no-merges
+```
 
-# Create PR
+**Agent must summarize commits into a user-facing changelog:**
+
+- Include API changes, bug fixes, new features
+- Exclude internal housekeeping (skill updates, test changes, docs)
+
+```
+- Fix Tinker API endpoint alignment (/save_weights + /save_state)
+- Add auth bypass for dev mode (no API key required)
+```
+
+**After user approval:**
+
+```bash
+TODAY=$(date +%Y%m%d)
+
+# Create tag with summarized message (agent writes TAG_MSG)
+git tag -d nightly_$TODAY 2>/dev/null || true
+git push origin :refs/tags/nightly_$TODAY 2>/dev/null || true
+git tag -a nightly_$TODAY -m "$TAG_MSG"
+git push origin nightly_$TODAY
+```
+
+### 4. Create PR
+
+```bash
 gh pr create --base main --head develop --title "Release: <version>" --body-file /tmp/pr_body.md
 ```
 
