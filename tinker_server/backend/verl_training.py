@@ -30,6 +30,168 @@ DEFAULT_IDLE_TIMEOUT = 300  # 5 minutes
 from tinker_server.config import PFS_PYTHONPATH
 
 
+# =====================================================================
+# Session State Manager - Per-iteration state persistence for stateless trainers
+# =====================================================================
+
+class SessionStateManager:
+    """Manages session state (LoRA weights + optimizer) for stateless trainers.
+
+    Enables multiple sessions to share a single trainer by loading/saving
+    state per iteration. Each session has its own checkpoint directory.
+
+    Storage layout:
+        {base_path}/{session_id}_checkpoint/
+            adapter_model.safetensors  # LoRA weights
+            optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
+            training_meta.json         # step count, learning_rate
+    """
+
+    def __init__(self, base_path: str = "/tmp/mint_sessions"):
+        """Initialize the session state manager.
+
+        Args:
+            base_path: Root directory for all session checkpoints.
+        """
+        import os
+        self.base_path = base_path
+        os.makedirs(base_path, exist_ok=True)
+        logger.info(f"[SessionStateManager] Initialized with base_path={base_path}")
+
+    def get_session_path(self, session_id: str) -> str:
+        """Get checkpoint directory path for a session."""
+        import os
+        return os.path.join(self.base_path, f"{session_id}_checkpoint")
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session has saved state."""
+        import os
+        session_path = self.get_session_path(session_id)
+        adapter_path = os.path.join(session_path, "adapter_model.safetensors")
+        return os.path.exists(adapter_path)
+
+    def save_state(
+        self,
+        session_id: str,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        step: int,
+        lr: float,
+        device: torch.device,
+    ) -> str:
+        """Save session state (LoRA weights + optimizer + metadata).
+
+        Args:
+            session_id: Unique session identifier.
+            model: PEFT model with LoRA adapters.
+            optimizer: Optimizer with state to save.
+            step: Current training step.
+            lr: Current learning rate.
+            device: Device for tensor operations.
+
+        Returns:
+            Absolute path to saved checkpoint.
+        """
+        import json
+        import os
+
+        from peft.utils.save_and_load import get_peft_model_state_dict
+        from safetensors.torch import save_file
+
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+
+        # 1. Save LoRA weights
+        state_dict = get_peft_model_state_dict(model)
+        # Move to CPU for serialization
+        state_dict = {k: v.cpu() for k, v in state_dict.items()}
+        save_file(state_dict, os.path.join(session_path, "adapter_model.safetensors"))
+
+        # 2. Save optimizer state
+        torch.save(optimizer.state_dict(), os.path.join(session_path, "optimizer.pt"))
+
+        # 3. Save metadata
+        meta = {"current_step": step, "learning_rate": lr}
+        with open(os.path.join(session_path, "training_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        logger.debug(f"[SessionStateManager] Saved state for {session_id} (step={step})")
+        return os.path.abspath(session_path)
+
+    def load_state(
+        self,
+        session_id: str,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+    ) -> dict:
+        """Load session state into model/optimizer.
+
+        Args:
+            session_id: Unique session identifier.
+            model: PEFT model to load weights into.
+            optimizer: Optimizer to load state into.
+            device: Device for tensor operations.
+
+        Returns:
+            Dict with metadata (current_step, learning_rate).
+
+        Raises:
+            FileNotFoundError: If session checkpoint doesn't exist.
+        """
+        import json
+        import os
+
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        session_path = self.get_session_path(session_id)
+        adapter_path = os.path.join(session_path, "adapter_model.safetensors")
+
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"Session {session_id} has no saved state")
+
+        # 1. Load LoRA weights
+        state_dict = load_file(adapter_path, device=str(device))
+        set_peft_model_state_dict(model, state_dict)
+
+        # 2. Load optimizer state
+        optimizer_path = os.path.join(session_path, "optimizer.pt")
+        if os.path.exists(optimizer_path):
+            optimizer.load_state_dict(
+                torch.load(optimizer_path, map_location=device, weights_only=True)
+            )
+
+        # 3. Load metadata
+        meta = {"current_step": 0, "learning_rate": optimizer.param_groups[0]["lr"]}
+        meta_path = os.path.join(session_path, "training_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+
+        logger.debug(f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)})")
+        return meta
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete session checkpoint.
+
+        Args:
+            session_id: Unique session identifier.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        import os
+        import shutil
+
+        session_path = self.get_session_path(session_id)
+        if os.path.exists(session_path):
+            shutil.rmtree(session_path)
+            logger.info(f"[SessionStateManager] Deleted session {session_id}")
+            return True
+        return False
+
+
 @ray.remote(num_gpus=1)
 class TrainingWorker:
     """Ray actor holding model + optimizer on dedicated GPU.
@@ -110,11 +272,63 @@ class TrainingWorker:
         # Track training step count
         self._step_count = 0
 
+        # Session state management for stateless trainer pattern
+        self._state_manager = SessionStateManager()
+        self._current_session_id: str | None = None
+
         logger.info("[TrainingWorker] Ready")
 
     def _touch(self) -> None:
         """Update last activity timestamp. Call at start of every method."""
         self._last_activity = time.time()
+
+    def _ensure_session_loaded(self, session_id: str) -> None:
+        """Ensure the specified session's state is loaded.
+
+        If a different session is currently loaded, this saves its state first,
+        then loads the requested session's state.
+
+        Args:
+            session_id: Session ID to load state for.
+        """
+        if self._current_session_id == session_id:
+            # Already loaded
+            return
+
+        # If we have a current session, its state should already be saved
+        # (save happens at end of optim_step)
+
+        # Load new session's state
+        if self._state_manager.session_exists(session_id):
+            meta = self._state_manager.load_state(
+                session_id, self.model, self.optimizer, self.device
+            )
+            self._step_count = meta.get("current_step", 0)
+            # Update learning rate if saved
+            if "learning_rate" in meta:
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = meta["learning_rate"]
+            logger.info(f"[TrainingWorker] Loaded session {session_id} (step={self._step_count})")
+        else:
+            # New session: reinitialize weights
+            self.reinit_lora_weights()
+            logger.info(f"[TrainingWorker] New session {session_id}, initialized fresh weights")
+
+        self._current_session_id = session_id
+
+    def _save_session_state(self, session_id: str) -> None:
+        """Save current session state to disk.
+
+        Called at the end of optim_step to persist state.
+
+        Args:
+            session_id: Session ID to save state for.
+        """
+        lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
+        self._state_manager.save_state(
+            session_id, self.model, self.optimizer, self._step_count, lr, self.device
+        )
+        logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
     def _idle_watchdog(self) -> None:
         """Background thread that monitors for idle timeout.
@@ -160,6 +374,7 @@ class TrainingWorker:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        session_id: str | None = None,
     ) -> dict:
         """Forward + backward pass using tinker Datum format.
 
@@ -175,11 +390,18 @@ class TrainingWorker:
                 - loss_fn_inputs.advantages: advantage estimates
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo")
             loss_fn_config: Optional config (e.g., {"epsilon": 0.2} for PPO)
+            session_id: Optional session ID for stateless trainer pattern.
+                       If provided, loads session state before forward pass.
 
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
         self._touch()
+
+        # Stateless trainer: load session state if session_id provided
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
         self.model.train()
         loss_fn_config = loss_fn_config or {}
 
@@ -403,7 +625,7 @@ class TrainingWorker:
             "metrics": metrics,
         }
 
-    def forward(self, data_items: list[dict]) -> dict:
+    def forward(self, data_items: list[dict], session_id: str | None = None) -> dict:
         """Forward pass only (no backward). Returns logprobs.
 
         Same input format as forward_backward but skips gradient computation.
@@ -414,11 +636,18 @@ class TrainingWorker:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
                 - loss_fn_inputs.weights: per-token weights (float)
+            session_id: Optional session ID for stateless trainer pattern.
+                       If provided, loads session state before forward pass.
 
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
         """
         self._touch()
+
+        # Stateless trainer: load session state if session_id provided
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
         self.model.eval()
 
         total_loss = 0.0
@@ -535,16 +764,23 @@ class TrainingWorker:
             "unk_token_id": self.tokenizer.unk_token_id,
         }
 
-    def optim_step(self, learning_rate: float | None) -> dict:
+    def optim_step(self, learning_rate: float | None, session_id: str | None = None) -> dict:
         """Optimizer update step.
 
         Args:
             learning_rate: Optional new learning rate.
+            session_id: Optional session ID for stateless trainer pattern.
+                       If provided, saves session state after optimizer step.
 
         Returns:
             Dict with metrics.
         """
         self._touch()
+
+        # Stateless trainer: ensure session state is loaded
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
         # Update learning rate if provided
         if learning_rate is not None:
             for pg in self.optimizer.param_groups:
@@ -555,6 +791,10 @@ class TrainingWorker:
         self.optimizer.zero_grad()
 
         self._step_count += 1
+
+        # Stateless trainer: save session state after update
+        if session_id:
+            self._save_session_state(session_id)
 
         logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
@@ -1163,8 +1403,10 @@ class VerlTrainingEngine:
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
 
-        # Remote call
-        result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
+        # Remote call - pass session_id for stateless trainer pattern
+        result = await worker.forward_backward.remote(
+            data_items, loss_fn, loss_fn_config, session.session_id
+        )
 
         # Update session state
         session.accumulated_gradients += 1
@@ -1193,8 +1435,8 @@ class VerlTrainingEngine:
         # ForwardRequest uses forward_input (not forward_backward_input)
         data_items = [item.model_dump() for item in request.forward_input.data]
 
-        # Remote call
-        result = await worker.forward.remote(data_items)
+        # Remote call - pass session_id for stateless trainer pattern
+        result = await worker.forward.remote(data_items, session.session_id)
 
         logger.info(f"[{model_id}] forward completed")
         return result
@@ -1238,8 +1480,8 @@ class VerlTrainingEngine:
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
 
-        # Remote call
-        result = await worker.optim_step.remote(lr)
+        # Remote call - pass session_id for stateless trainer pattern
+        result = await worker.optim_step.remote(lr, session.session_id)
 
         # Update session state
         session.current_step += 1
@@ -1288,8 +1530,11 @@ class VerlTrainingEngine:
             result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
-            fb_result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
-            opt_result = await worker.optim_step.remote(lr)
+            # Pass session_id for stateless trainer pattern
+            fb_result = await worker.forward_backward.remote(
+                data_items, loss_fn, loss_fn_config, session.session_id
+            )
+            opt_result = await worker.optim_step.remote(lr, session.session_id)
 
             # Merge results
             result = fb_result.copy()
