@@ -19,7 +19,7 @@
 | MoE model training (Qwen3-30B-A3B) | Verified |
 | Multi-session actor sharing | Verified |
 | Unified rank support (max-rank padding) | Verified |
-| LRU-based actor eviction | **Broken** (method exists but never called) |
+| LRU-based actor eviction | Verified (unified ResourcePool with cross-actor LRU) |
 | LoRA hot-swap to vLLM | Verified (0.16s extraction + 2.2s inference) |
 
 ---
@@ -119,25 +119,29 @@ Each tier involves:
 
 ---
 
-### 2. Resource Orchestration
+### 2. Resource Orchestration - COMPLETE
 
-#### Current State
+#### Implementation (2025-12-16)
 
-- Per-backend pools: `MegatronActorPool`, `DenseTrainerPool`
-- LRU eviction within each pool
-- No cross-pool awareness
-
-#### Target State
-
-Unified `ResourceManager` with global GPU tracking and cross-pool eviction.
+Unified `ResourcePool` singleton with global GPU tracking and cross-actor LRU eviction.
 
 ```
-ResourceManager
-├── total_gpus: int (cluster capacity)
-├── allocated: dict[actor_id, num_gpus]
-├── pools: [MegatronActorPool, DenseTrainerPool, InferencePool]
-└── allocate(model, num_gpus) → evicts across ALL pools if needed
+ResourcePool (tinker_server/backend/resource_pool.py)
+├── _entries: dict[actor_name, ResourceEntry]
+├── register(actor_name, actor_type, num_gpus, ...)
+├── ensure_gpus_available(needed_gpus) → evicts LRU idle actors
+├── evict_for_gpus(needed_gpus) → int (GPUs freed)
+└── list_actors() → status for monitoring
 ```
+
+**Actor Types Tracked**:
+| Type | Actor Name | GPU Usage |
+|------|------------|-----------|
+| MEGATRON | `persistent_megatron_worker_group_v2` | 8 (TP4,EP2) |
+| DENSE | `dense_trainer_*` | 1 |
+| VLLM | `tinker_vllm_server` | 1-4 |
+
+**Monitoring**: `GET /api/v1/resource_pool`
 
 #### GPU Requirements Reference
 
@@ -288,7 +292,176 @@ for name in ['persistent_megatron_worker_group_v2', 'tinker_vllm_server']:
 
 ---
 
-### 6. Tinker API Alignment
+### 6. Stateless Trainer Architecture
+
+#### Problem Statement
+
+**Current behavior**: Trainers hold session state (weights + optimizer) in memory. Multiple sessions cannot safely share a trainer, and actor eviction loses unsaved state.
+
+```
+Session A: create → [weights in memory] → train → train → [END]
+Session B: create → [INHERITS A's weights - BUG!] → train → ...
+```
+
+**Desired behavior**: Trainers are stateless compute resources. Session state lives in persistent storage and is loaded/saved per operation.
+
+```
+Session A: create → load(A) → train → save(A) → load(A) → train → save(A) → [END]
+Session B: create → load(B) → train → save(B) → ...
+           (can interleave with A on same trainer)
+```
+
+#### Architecture
+
+**Session State Storage**:
+```
+/tmp/mint_sessions/
+├── session_A_checkpoint/
+│   ├── adapter_model.safetensors  # LoRA weights
+│   ├── optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
+│   └── training_meta.json         # step count, learning_rate
+├── session_B_checkpoint/
+│   └── ...
+```
+
+**Per-Iteration Flow**:
+```
+forward_backward(session_id, data):
+    1. Load session state: load_session_state(session_id)
+       - LoRA weights → model
+       - Optimizer state → optimizer
+       - Learning rate → optimizer.param_groups
+    2. Forward pass: model(data)
+    3. Backward pass: loss.backward()
+    4. Return logprobs (gradients accumulated, not applied)
+
+optim_step(session_id):
+    1. Verify session state loaded (or load if not)
+    2. Clip gradients
+    3. optimizer.step()
+    4. optimizer.zero_grad()
+    5. Save session state: save_session_state(session_id)
+       - LoRA weights → safetensors
+       - Optimizer state → optimizer.pt
+       - Increment step count
+```
+
+**Key Invariant**: After optim_step returns, session state is persisted. Trainer can be reused for any session.
+
+#### Implementation Plan
+
+**Phase 1: Session State Manager**
+
+New class `SessionStateManager` handles checkpoint I/O:
+
+```python
+class SessionStateManager:
+    def __init__(self, base_path: str = "/tmp/mint_sessions"):
+        self.base_path = base_path
+
+    def get_session_path(self, session_id: str) -> str:
+        return os.path.join(self.base_path, f"{session_id}_checkpoint")
+
+    def save_state(self, session_id: str, model, optimizer, step: int, lr: float):
+        """Save LoRA weights + optimizer state + metadata."""
+        ...
+
+    def load_state(self, session_id: str, model, optimizer) -> dict:
+        """Load state into model/optimizer. Returns metadata."""
+        ...
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check if session has saved state."""
+        ...
+
+    def delete_session(self, session_id: str):
+        """Clean up session storage."""
+        ...
+```
+
+**Phase 2: Modify TrainingWorker**
+
+```python
+class TrainingWorker:
+    def __init__(self, ...):
+        self.state_manager = SessionStateManager()
+        self._current_session_id = None  # Track which session is loaded
+
+    def _ensure_session_loaded(self, session_id: str):
+        """Load session state if not already loaded."""
+        if self._current_session_id != session_id:
+            if self.state_manager.session_exists(session_id):
+                self.state_manager.load_state(session_id, self.model, self.optimizer)
+            else:
+                # New session: reinitialize weights
+                self.reinit_lora_weights()
+            self._current_session_id = session_id
+
+    def forward_backward(self, session_id: str, data_items, ...):
+        self._ensure_session_loaded(session_id)
+        # ... existing forward/backward logic ...
+
+    def optim_step(self, session_id: str, learning_rate: float):
+        self._ensure_session_loaded(session_id)
+        # ... existing optim logic ...
+        # Save state after update
+        self.state_manager.save_state(
+            session_id, self.model, self.optimizer,
+            self._step_count, learning_rate
+        )
+```
+
+**Phase 3: API Changes**
+
+Add `session_id` parameter to all training operations (may already exist as `model_id`):
+
+| Endpoint | Current | New |
+|----------|---------|-----|
+| `/forward_backward` | `model_id` routes to session | Same, state loaded per-call |
+| `/optim_step` | `model_id` | Same, state saved after |
+| `/train_step` | `model_id` | Same, load before + save after |
+
+**Phase 4: Megatron Backend**
+
+Apply same pattern to `MegatronRankWorker`:
+- Distributed checkpoint save/load (all ranks coordinate)
+- Use existing `save_adapter_state` / `load_adapter_state` methods
+- Add per-iteration save after `optim_step`
+
+#### Performance Considerations
+
+| Operation | Estimated Time | Mitigation |
+|-----------|---------------|------------|
+| Load LoRA weights (32-rank) | 50-100ms | SSD storage, memory-mapped files |
+| Load optimizer state | 100-200ms | Lazy load (skip if same session) |
+| Save LoRA weights | 50-100ms | Async write (return before fsync) |
+| Save optimizer state | 100-200ms | Async write |
+
+**Optimization**: Track `_current_session_id` to skip load if same session as previous call. Most training loops call forward_backward → optim_step → forward_backward on same session, so load happens once at start.
+
+**Total overhead per iteration**: ~0ms (same session) to ~300ms (session switch)
+
+#### Testing Strategy
+
+1. **Unit test**: SessionStateManager save/load roundtrip
+2. **Integration test**: Two sessions interleaved on same trainer
+   - Session A: 3 iterations, final loss L_A
+   - Session B: 3 iterations, final loss L_B
+   - Session A: 3 more iterations, should continue from L_A
+3. **Stress test**: 10 sessions round-robin on single trainer
+4. **Recovery test**: Kill trainer mid-training, recreate, verify session continues correctly
+
+#### Migration Path
+
+1. Implement SessionStateManager (no behavior change yet)
+2. Add `_ensure_session_loaded` to TrainingWorker with feature flag
+3. Enable by default, monitor for regressions
+4. Apply to MegatronRankWorker
+5. Remove in-memory-only code paths
+
+---
+
+### 7. Tinker API Alignment
 
 Detailed verification that Mint matches official Tinker SDK behavior.
 
@@ -393,44 +566,26 @@ Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → o
 
 ## Known Issues
 
-### LRU Eviction Not Wired Up (Critical)
+### LRU Eviction Not Wired Up - RESOLVED (2025-12-16)
 
-**Problem**: `_evict_for_gpus()` method exists in both `MegatronActorPool` and `DenseTrainerPool` but is **never called**. When creating a new session that requires more GPUs than currently available, the system hangs indefinitely instead of evicting idle actors.
+**Problem**: `_evict_for_gpus()` method existed in `MegatronActorPool` and `DenseTrainerPool` but was never called.
 
-**Observed behavior** (prod deployment 2025-12-16):
-- Cluster: 12 GPUs (8 training + 4 inference)
-- Dense model actor using 1 GPU
-- MoE session creation (needs 8 GPUs) times out after 300s
-- `_evict_for_gpus()` never invoked to free the 1 GPU + request 8 GPUs
+**Solution**: Created unified `ResourcePool` singleton (`tinker_server/backend/resource_pool.py`) tracking ALL GPU-using actors with cross-actor LRU eviction.
 
-**Root cause**: `get_or_create()` in both pools:
-1. Checks if actor exists for base_model → returns it
-2. Creates new actor without checking available resources
-3. Ray actor creation blocks indefinitely waiting for GPUs
+**Implementation**:
+- `ResourcePool.register()` called when creating vLLM, Megatron, and Dense actors
+- `ResourcePool.ensure_gpus_available()` called before actor creation - evicts LRU idle actors if needed
+- MIN_ACTOR_AGE = 300s prevents eviction thrashing
+- `/api/v1/resource_pool` endpoint for monitoring
 
-**Expected behavior**: Before creating actor, check if `needed_gpus > available_gpus`. If so, call `_evict_for_gpus(needed_gpus - available_gpus)` to free resources.
+**Files modified**:
+- `resource_pool.py` (new)
+- `megatron_distributed.py` (added registration and ensure_gpus_available)
+- `verl_training.py` (added registration)
+- `multi_lora_engine.py` (added registration)
+- `routes/service.py` (added monitoring endpoint)
 
-**Location**:
-- `megatron_distributed.py:2247-2353` - `MegatronActorPool.get_or_create()`
-- `verl_training.py:1558-1699` - `DenseTrainerPool.get_or_create()`
-
-**Fix required**:
-```python
-# Before creating new actor (around line 2310 in megatron_distributed.py):
-available = ray.available_resources().get("GPU", 0)
-if num_gpus > available:
-    freed = self._evict_for_gpus(num_gpus - int(available))
-    if freed < num_gpus - int(available):
-        raise ValueError(f"Cannot free enough GPUs: need {num_gpus}, available {available}, freed {freed}")
-```
-
-**Priority**: Critical - blocks MoE model usage when dense actors exist
-
-**Testing**: Update merge-gate skill to include systematic eviction test:
-1. Create dense session (uses 1 GPU)
-2. Create MoE session (needs 8 GPUs) - should trigger eviction
-3. Verify dense actor was evicted and MoE session succeeds
-4. Agent tends to skip this test - make it mandatory in skill checklist
+**Limitation**: MoE requires STRICT_PACK (8 GPUs on single node). Evicting actors on different nodes doesn't help MoE creation.
 
 ---
 

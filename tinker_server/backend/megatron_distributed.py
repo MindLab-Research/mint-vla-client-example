@@ -2287,6 +2287,14 @@ class MegatronActorPool:
                         f"Kill the actor and restart with higher max_lora_rank."
                     )
                 entry.touch()  # Phase 9: Update LRU
+                # Also update unified resource pool
+                from tinker_server.backend.resource_pool import get_resource_pool
+                actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                resource_pool = get_resource_pool()
+                pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                if pool_entry:
+                    pool_entry.current_session = session_id
+
                 logger.info(
                     f"[MegatronActorPool] Reusing existing actor for {base_model} "
                     f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
@@ -2306,6 +2314,11 @@ class MegatronActorPool:
                 f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, "
                 f"max_rank={effective_max_rank}, gpus={num_gpus}"
             )
+
+            # Phase 9: Check available GPUs and evict LRU actors if necessary
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            resource_pool = get_resource_pool()
+            resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists (e.g., from previous server run)
             try:
@@ -2350,6 +2363,18 @@ class MegatronActorPool:
                 actual_rank=lora_rank,
             )
             self._actors[key] = entry
+
+            # Register with unified resource pool for LRU tracking
+            resource_pool.register(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=num_gpus,
+                actor_handle=actor,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=base_model,
+                session_id=session_id,
+            )
+
             return entry
 
     def remove(self, base_model: str, kill_actor: bool = True) -> bool:
@@ -2487,16 +2512,30 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
+    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
     config = distributed_config or DistributedConfig()
+    num_gpus = config.world_size
 
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    resource_pool = get_resource_pool()
 
     # Try to get existing persistent actor
     try:
         actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
         logger.info(
             f"Connected to existing Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
+        )
+        # Register with resource pool (reconnection case)
+        resource_pool.register(
+            actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=num_gpus,
+            actor_handle=actor,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model,
         )
         # Reinitialize LoRA weights for fresh session
         # This ensures each new session starts with fresh random weights
@@ -2513,6 +2552,9 @@ def get_or_create_megatron_worker_group(
         logger.info(
             f"Creating new detached Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
         )
+
+    # Phase 9: Check available GPUs and evict LRU actors if necessary
+    resource_pool.ensure_gpus_available(num_gpus)
 
     # Runtime env for PFS code access
     runtime_env = {
@@ -2542,6 +2584,16 @@ def get_or_create_megatron_worker_group(
     # Wait for initialization
     ray.get(actor.__ray_ready__.remote())
     logger.info("Megatron worker group initialized (detached actor)")
+
+    # Register with unified resource pool for LRU tracking
+    resource_pool.register(
+        actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+        actor_type=ActorType.MEGATRON,
+        num_gpus=num_gpus,
+        actor_handle=actor,
+        namespace=PERSISTENT_NAMESPACE,
+        base_model=base_model,
+    )
 
     return actor
 
@@ -2583,6 +2635,8 @@ def kill_megatron_actor() -> bool:
     Returns:
         True if actor was killed, False if not found.
     """
+    from tinker_server.backend.resource_pool import get_resource_pool
+
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
@@ -2595,6 +2649,11 @@ def kill_megatron_actor() -> bool:
             pass
         ray.kill(actor, no_restart=True)
         logger.info(f"Killed Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}")
+
+        # Unregister from resource pool
+        resource_pool = get_resource_pool()
+        resource_pool.unregister(PERSISTENT_MEGATRON_ACTOR_NAME)
+
         return True
     except ValueError:
         logger.info("No Megatron actor to kill")

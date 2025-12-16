@@ -234,6 +234,19 @@ class MultiLoRAInferenceEngine:
                         f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
                     )
                     self._initialized = True
+
+                    # Register existing actor with resource pool for LRU tracking
+                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                    total_gpus = self.tensor_parallel_size * self.data_parallel_size
+                    resource_pool = get_resource_pool()
+                    resource_pool.register(
+                        actor_name=PERSISTENT_VLLM_ACTOR_NAME,
+                        actor_type=ActorType.VLLM,
+                        num_gpus=total_gpus,
+                        actor_handle=self.server,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=self.model_path,
+                    )
                     return
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive, need to create new one
@@ -350,6 +363,18 @@ class MultiLoRAInferenceEngine:
             ray.get(self.server.launch_server.remote())
             self._initialized = True
             logger.info("MultiLoRAInferenceEngine initialized (detached actor)")
+
+            # Register with unified resource pool for LRU tracking
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            resource_pool = get_resource_pool()
+            resource_pool.register(
+                actor_name=PERSISTENT_VLLM_ACTOR_NAME,
+                actor_type=ActorType.VLLM,
+                num_gpus=total_gpus,
+                actor_handle=self.server,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=self.model_path,
+            )
 
     async def add_lora_for_session(
         self,
@@ -584,6 +609,8 @@ def kill_persistent_vllm_actor() -> bool:
     Returns:
         True if actor was killed, False if not found.
     """
+    from tinker_server.backend.resource_pool import get_resource_pool
+
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
@@ -591,6 +618,11 @@ def kill_persistent_vllm_actor() -> bool:
         actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
         ray.kill(actor)
         logger.info(f"Killed persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}")
+
+        # Unregister from resource pool
+        resource_pool = get_resource_pool()
+        resource_pool.unregister(PERSISTENT_VLLM_ACTOR_NAME)
+
         return True
     except ValueError:
         logger.info(f"No persistent vLLM actor found: {PERSISTENT_VLLM_ACTOR_NAME}")

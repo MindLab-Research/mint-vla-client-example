@@ -284,3 +284,22 @@ async def megatron_status() -> dict:
 
     alive = is_megatron_actor_running()
     return {"alive": alive, "actor_name": PERSISTENT_MEGATRON_ACTOR_NAME}
+
+
+@router.get("/resource_pool")
+async def resource_pool_status() -> dict:
+    """Get unified resource pool status.
+
+    Returns:
+        actors: List of all tracked actors with LRU info
+        total_gpus: Total GPUs used
+        min_actor_age: Minimum actor age before eviction eligible
+    """
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    return {
+        "actors": pool.list_actors(),
+        "total_gpus_used": pool.total_gpus_used(),
+        "min_actor_age": pool.MIN_ACTOR_AGE,
+    }

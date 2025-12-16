@@ -184,7 +184,19 @@ volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-worker-4g
 
 # 3. Wait for workers to join Ray cluster
 
-# 4. Run LRU eviction test
+# 4. Restart server with MINT_MIN_ACTOR_AGE=0 to enable immediate eviction
+# (Production uses 300s to prevent thrashing; 0 for fast testing)
+ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-server && \
+  nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+  PYTHONDONTWRITEBYTECODE=1 MINT_MIN_ACTOR_AGE=0 \
+  TINKER_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct \
+  python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+
+# 5. Wait for server to start (check healthz)
+sleep 10 && curl http://localhost:8000/api/v1/healthz
+
+# 6. Run LRU eviction test
 TINKER_BASE_URL=http://localhost:8000 \
 python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_mixed_model_lru_eviction -v -s
 ```

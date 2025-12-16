@@ -833,6 +833,73 @@ class TrainingWorker:
 
         return {"status": "ok", "learning_rate": learning_rate}
 
+    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+        """Reinitialize LoRA weights AND optimizer state for fresh session.
+
+        Uses standard initialization:
+        - lora_A: xavier_uniform
+        - lora_B: zeros
+
+        Also resets Adam optimizer state to prevent momentum from previous
+        sessions affecting new training.
+
+        Args:
+            learning_rate: New learning rate. If provided, updates param_groups.
+
+        Returns:
+            dict with reinit_count, opt_state_reset, lr_updated.
+        """
+        import torch.nn.init as init
+
+        reinit_count = 0
+        opt_state_reset = 0
+        lr_updated = False
+
+        # Find and reinitialize all LoRA parameters
+        for name, param in self.model.named_parameters():
+            name_lower = name.lower()
+            if 'lora' not in name_lower:
+                continue
+            if not param.requires_grad:
+                continue
+
+            is_lora_a = 'lora_a' in name_lower
+            is_lora_b = 'lora_b' in name_lower
+
+            if is_lora_a:
+                init.xavier_uniform_(param.data)
+                reinit_count += 1
+            elif is_lora_b:
+                init.zeros_(param.data)
+                reinit_count += 1
+
+        # Update learning rate
+        if learning_rate is not None:
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
+            lr_updated = True
+            logger.info(f"[TrainingWorker] Set learning rate to {learning_rate}")
+
+        # Zero gradients
+        self.optimizer.zero_grad()
+
+        # Reset optimizer state (momentum/variance)
+        opt_state_reset = len(self.optimizer.state)
+        self.optimizer.state.clear()
+        logger.info(f"[TrainingWorker] Reset optimizer state ({opt_state_reset} entries)")
+
+        # Reset step count
+        self._step_count = 0
+
+        logger.info(f"[TrainingWorker] Reinitialized {reinit_count} LoRA params")
+        return {
+            "status": "ok",
+            "reinit_count": reinit_count,
+            "opt_state_reset": opt_state_reset,
+            "lr_updated": lr_updated,
+            "learning_rate": learning_rate,
+        }
+
     def get_session_info(self) -> dict:
         """Get current session info for diagnostics.
 
@@ -1050,6 +1117,14 @@ class VerlTrainingEngine:
                 session_id=session.session_id,
             )
             worker = entry.actor
+
+            # Reinitialize LoRA weights for fresh session (statelessness)
+            # This ensures each new session starts with fresh random weights
+            # instead of inheriting trained weights from previous session
+            logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
+            import ray
+            result = ray.get(worker.reinit_lora_weights.remote(session.learning_rate))
+            logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
             # Update pool entry with current session
             entry.current_session = session.session_id
@@ -1499,8 +1574,15 @@ class DenseTrainerPool:
         """Get idle actors sorted by last access time (LRU first).
 
         Must be called with lock held.
+
+        An actor is evictable if:
+        1. It is idle (no active session)
+        2. It has been idle longer than MIN_ACTOR_AGE
+
+        Note: We use idle_time() (time since last access) rather than age()
+        (time since creation) to protect recently-active actors from eviction.
         """
-        idle = [e for e in self._actors.values() if e.is_idle() and e.age() > self.MIN_ACTOR_AGE]
+        idle = [e for e in self._actors.values() if e.is_idle() and e.idle_time() > self.MIN_ACTOR_AGE]
         return sorted(idle, key=lambda e: e.last_accessed)
 
     def _evict_for_gpus(self, needed_gpus: int, save_state: bool = True) -> int:
@@ -1582,6 +1664,14 @@ class DenseTrainerPool:
                         f"Kill the actor and restart with higher max_lora_rank."
                     )
                 entry.touch()  # Phase 9: Update LRU
+                # Also update unified resource pool
+                from tinker_server.backend.resource_pool import get_resource_pool
+                actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                resource_pool = get_resource_pool()
+                pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                if pool_entry:
+                    pool_entry.current_session = session_id
+
                 logger.info(
                     f"[DenseTrainerPool] Reusing existing actor for {base_model} "
                     f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
@@ -1595,10 +1685,16 @@ class DenseTrainerPool:
                 self.DEFAULT_MAX_LORA_RANK,
             )
             actor_name = self._make_actor_name(base_model, effective_max_rank)
+            num_gpus = self.DEFAULT_NUM_GPUS  # 1 GPU for dense models
             logger.info(
                 f"[DenseTrainerPool] Creating new actor: {actor_name} for {base_model}, "
-                f"max_rank={effective_max_rank}"
+                f"max_rank={effective_max_rank}, gpus={num_gpus}"
             )
+
+            # Phase 9: Check available GPUs and evict LRU actors if necessary
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            resource_pool = get_resource_pool()
+            resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists
             try:
@@ -1643,6 +1739,18 @@ class DenseTrainerPool:
                 actual_rank=lora_rank,
             )
             self._actors[key] = entry
+
+            # Register with unified resource pool for LRU tracking
+            resource_pool.register(
+                actor_name=actor_name,
+                actor_type=ActorType.DENSE,
+                num_gpus=self.DEFAULT_NUM_GPUS,
+                actor_handle=actor,
+                namespace=PERSISTENT_DENSE_NAMESPACE,
+                base_model=base_model,
+                session_id=session_id,
+            )
+
             return entry
 
     def remove(self, base_model: str, kill_actor: bool = True) -> bool:
