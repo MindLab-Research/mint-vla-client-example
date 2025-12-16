@@ -1903,25 +1903,41 @@ class DenseTrainerPool:
             # Return existing actor if available
             if key in self._actors:
                 entry = self._actors[key]
-                if lora_rank > entry.max_lora_rank:
-                    raise ValueError(
-                        f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
-                        f"Kill the actor and restart with higher max_lora_rank."
-                    )
-                entry.touch()  # Phase 9: Update LRU
-                # Also update unified resource pool
-                from tinker_server.backend.resource_pool import get_resource_pool
-                actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
-                resource_pool = get_resource_pool()
-                pool_entry = resource_pool.get(actor_name)  # This calls touch()
-                if pool_entry:
-                    pool_entry.current_session = session_id
 
-                logger.info(
-                    f"[DenseTrainerPool] Reusing existing actor for {base_model} "
-                    f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
-                )
-                return entry
+                # Check if actor is still alive (may have self-terminated due to idle timeout)
+                try:
+                    ray.get(entry.actor.heartbeat.remote(), timeout=5)
+                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor for {base_model} is dead (idle timeout?), removing from pool"
+                    )
+                    self._actors.pop(key, None)
+                    # Also remove from unified resource pool
+                    from tinker_server.backend.resource_pool import get_resource_pool
+                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                    resource_pool = get_resource_pool()
+                    resource_pool.unregister(actor_name)
+                    # Fall through to create new actor
+                else:
+                    if lora_rank > entry.max_lora_rank:
+                        raise ValueError(
+                            f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
+                            f"Kill the actor and restart with higher max_lora_rank."
+                        )
+                    entry.touch()  # Phase 9: Update LRU
+                    # Also update unified resource pool
+                    from tinker_server.backend.resource_pool import get_resource_pool
+                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                    resource_pool = get_resource_pool()
+                    pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                    if pool_entry:
+                        pool_entry.current_session = session_id
+
+                    logger.info(
+                        f"[DenseTrainerPool] Reusing existing actor for {base_model} "
+                        f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
+                    )
+                    return entry
 
             # Create new actor with max rank
             effective_max_rank = max(
