@@ -28,23 +28,25 @@ The merge gate validates that code on `develop` is ready to merge to `main`. It 
 | Model | vLLM GPUs | Megatron GPUs | Total |
 |-------|-----------|---------------|-------|
 | Qwen2.5-7B (Dense) | 1 | 1 | 2 |
-| Qwen3-30B-A3B (MoE) | 4 (TP=1, DP=4) | 8 (TP=4, EP=2) | 12 |
+| Qwen3-0.6B (Dense) | 1 | 1 | 2 |
+| Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4) | 8 |
+
+**Note**: MoE uses TP=4 for both vLLM and Megatron. Expert Parallelism (EP) is not used because vLLM 0.12.0 does not support MoE expert LoRA inference with EP enabled.
 
 ### Full Merge Gate Procedure
 
 The merge gate runs in **two phases** with different cluster configurations:
 
-**Phase 1: Functional Tests (16 GPUs - two 8-GPU workers)**
-1. Start cluster with 16 GPUs
-2. Run ALL functional tests: Dense SFT/RL/DPO/API, MoE SFT, Stress
-3. **Do NOT kill actors between tests** - Dense and MoE coexist
-4. Validates normal concurrent operation
+**Phase 1: Functional Tests (8 GPUs - one 8-GPU worker)**
+1. Start cluster with 8 GPUs
+2. Run ALL functional tests: Dense SFT/RL/DPO/API, MoE SFT/RL/API, Stress
+3. **Do NOT kill actors between tests** - Dense and MoE coexist (Dense uses 1 GPU, MoE uses 4)
+4. Validates normal concurrent operation with shared GPU resources
 
-**Phase 2: LRU Eviction Test (12 GPUs - one 8-GPU + one 4-GPU)**
-1. **Tear down** Phase 1 cluster completely
-2. Start new cluster with only 12 GPUs
-3. Run LRU eviction test (Dense -> MoE -> Dense switches)
-4. Validates graceful actor replacement when resources insufficient
+**Phase 2: LRU Eviction Test (8 GPUs - one 8-GPU worker)**
+1. Run LRU eviction test with MINT_MIN_ACTOR_AGE=0
+2. Tests Dense → MoE → Dense switches with eviction
+3. Validates graceful actor replacement when switching between models
 
 Use the **volcano-cluster** skill to manage workers.
 
@@ -81,25 +83,23 @@ for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
         print(f"{name}: not running")
 
 # Warning if insufficient
-if gpu_total < 16:
-    print(f"WARNING: Full concurrent tests need 16 GPUs, have {gpu_total:.0f}")
-    if gpu_total >= 12:
-        print("  Can run LRU eviction test (12 GPU config)")
-elif gpu_avail < 14:
+if gpu_total < 8:
+    print(f"WARNING: Full merge gate needs 8 GPUs, have {gpu_total:.0f}")
+elif gpu_avail < 4:
     print(f"WARNING: {gpu_total - gpu_avail:.0f} GPUs in use by actors")
     print("  Actors will be reused - this is expected behavior")
 PYEOF'
 ```
 
-### 3. Add Workers for Phase 1 (via volcano-cluster skill)
+### 3. Add Workers for Merge Gate (via volcano-cluster skill)
 
-Phase 1 requires 16 GPUs (two 8-GPU workers):
+Merge gate requires 8 GPUs (one 8-GPU worker):
 
 ```bash
 # Check current workers
 volc ml_task list --output json | jq '.[] | select(.Status=="Running") | {name: .Name}'
 
-# If only one worker running, add another 8-GPU worker
+# If no worker running, add an 8-GPU worker
 volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml --output json
 ```
 
@@ -159,32 +159,23 @@ Stress test configurations:
 
 ## Running the Tests
 
-### Complete Merge Gate (Two Phases)
-
-**Phase 1: Functional Tests (16 GPUs)**
+### Complete Merge Gate
 
 ```bash
-# Ensure 16 GPUs available (two 8-GPU workers)
+# Ensure 8 GPUs available (one 8-GPU worker)
 cd /home/yiwen/tinker_project/tinker-server
 
 # Run all functional tests (do NOT kill actors between)
 TINKER_BASE_URL=http://localhost:8000 \
-python -m pytest .claude/skills/merge-gate/tests/ \
-    --ignore=.claude/skills/merge-gate/tests/test_stress.py::TestStress::test_mixed_model_lru_eviction \
-    -v --tb=short
+python -m pytest .claude/skills/merge-gate/tests/ -v --tb=short
 ```
 
-**Phase 2: LRU Eviction Test (12 GPUs)**
+### Run with LRU Eviction Testing
+
+To test LRU eviction with immediate actor replacement:
 
 ```bash
-# 1. Tear down Phase 1 cluster via volcano-cluster skill
-# 2. Start new cluster with 12 GPUs (one 8-GPU + one 4-GPU worker)
-volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml --output json
-volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-worker-4gpu.yaml --output json
-
-# 3. Wait for workers to join Ray cluster
-
-# 4. Restart server with MINT_MIN_ACTOR_AGE=0 to enable immediate eviction
+# Restart server with MINT_MIN_ACTOR_AGE=0 to enable immediate eviction
 # (Production uses 300s to prevent thrashing; 0 for fast testing)
 ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-server && \
   nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
@@ -193,10 +184,10 @@ ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-
   TINKER_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct \
   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 
-# 5. Wait for server to start (check healthz)
+# Wait for server to start
 sleep 10 && curl http://localhost:8000/api/v1/healthz
 
-# 6. Run LRU eviction test
+# Run LRU eviction test
 TINKER_BASE_URL=http://localhost:8000 \
 python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_mixed_model_lru_eviction -v -s
 ```
@@ -415,7 +406,23 @@ gh pr create --base main --head develop --title "Release: <version>" --body-file
 | Pre-flight fails: 0 GPUs | Kill stale actors (see mint-dev skill section 6) |
 | Pre-flight fails: cluster disconnected | Reconnect: `ssh volcano "ray start --address='<IP>:6379'"` |
 | Dense tests timeout | Check server logs, restart server |
-| MoE tests fail to start | Need 12 GPUs, add workers via volcano-cluster |
+| MoE tests fail to start | Need 8 GPUs (TP=4), add worker via volcano-cluster |
 | MoE tests OOM | Kill vLLM, restart with fresh actor |
 | Stress test deadlock | Session isolation issue, check logs |
 | Loss not decreasing | Optimizer state bug, check Issue 6c fix |
+| MoE LoRA not loading in vLLM | MLP modules filtered out (vLLM limitation), only attention LoRA supported |
+
+---
+
+## Known Limitations
+
+### MoE LoRA Inference
+
+vLLM 0.12.0 does NOT support MoE expert (MLP) LoRA inference. The FusedMoEWithLoRA class exists but is disabled:
+
+- Module validation rejects MLP modules for MoE models
+- EP assertion blocks even with TP-only config
+
+**Current approach**: Filter out MLP modules in `get_lora_state_dict()`, export only attention LoRA (q_proj, k_proj, v_proj, o_proj). Training still uses full MLP+attention LoRA via Megatron, but inference is attention-only.
+
+**Impact**: Slightly reduced LoRA effectiveness for MoE models during inference. Training quality is unaffected.
