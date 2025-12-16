@@ -26,7 +26,7 @@ class ServerConfig:
     port: int = 8000
 
     # Authentication
-    api_key: str = ""  # Required - server refuses to start without it
+    api_key: str = ""  # If empty, auth disabled; if set, all endpoints require it
 
     # Model settings
     model_path: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -45,11 +45,7 @@ class ServerConfig:
     def from_env(cls) -> "ServerConfig":
         """Load configuration from environment variables."""
         api_key = os.environ.get("TINKER_API_KEY", "")
-        if not api_key:
-            raise ValueError(
-                "TINKER_API_KEY environment variable is required. "
-                "Set it to a secure random string (e.g., 32+ bytes, base64 encoded)."
-            )
+        # If no API key set, auth is disabled (dev mode)
 
         return cls(
             host=os.environ.get("TINKER_HOST", "0.0.0.0"),

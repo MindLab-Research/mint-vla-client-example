@@ -19,7 +19,7 @@
 | MoE model training (Qwen3-30B-A3B) | Verified |
 | Multi-session actor sharing | Verified |
 | Unified rank support (max-rank padding) | Verified |
-| LRU-based actor eviction | Implemented |
+| LRU-based actor eviction | **Broken** (method exists but never called) |
 | LoRA hot-swap to vLLM | Verified (0.16s extraction + 2.2s inference) |
 
 ---
@@ -268,7 +268,7 @@ ray.init(address=\"auto\", ignore_reinit_error=True)
 r = ray.available_resources()
 t = ray.cluster_resources()
 print(f\"GPUs: {r.get('GPU', 0):.0f} / {t.get('GPU', 0):.0f}\")
-for name in ['persistent_megatron_worker_group', 'persistent_vllm_actor']:
+for name in ['persistent_megatron_worker_group_v2', 'tinker_vllm_server']:
     try:
         ray.get_actor(name, namespace='tinker')
         print(f'{name}: ALIVE')
@@ -392,6 +392,47 @@ Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → o
 ---
 
 ## Known Issues
+
+### LRU Eviction Not Wired Up (Critical)
+
+**Problem**: `_evict_for_gpus()` method exists in both `MegatronActorPool` and `DenseTrainerPool` but is **never called**. When creating a new session that requires more GPUs than currently available, the system hangs indefinitely instead of evicting idle actors.
+
+**Observed behavior** (prod deployment 2025-12-16):
+- Cluster: 12 GPUs (8 training + 4 inference)
+- Dense model actor using 1 GPU
+- MoE session creation (needs 8 GPUs) times out after 300s
+- `_evict_for_gpus()` never invoked to free the 1 GPU + request 8 GPUs
+
+**Root cause**: `get_or_create()` in both pools:
+1. Checks if actor exists for base_model → returns it
+2. Creates new actor without checking available resources
+3. Ray actor creation blocks indefinitely waiting for GPUs
+
+**Expected behavior**: Before creating actor, check if `needed_gpus > available_gpus`. If so, call `_evict_for_gpus(needed_gpus - available_gpus)` to free resources.
+
+**Location**:
+- `megatron_distributed.py:2247-2353` - `MegatronActorPool.get_or_create()`
+- `verl_training.py:1558-1699` - `DenseTrainerPool.get_or_create()`
+
+**Fix required**:
+```python
+# Before creating new actor (around line 2310 in megatron_distributed.py):
+available = ray.available_resources().get("GPU", 0)
+if num_gpus > available:
+    freed = self._evict_for_gpus(num_gpus - int(available))
+    if freed < num_gpus - int(available):
+        raise ValueError(f"Cannot free enough GPUs: need {num_gpus}, available {available}, freed {freed}")
+```
+
+**Priority**: Critical - blocks MoE model usage when dense actors exist
+
+**Testing**: Update merge-gate skill to include systematic eviction test:
+1. Create dense session (uses 1 GPU)
+2. Create MoE session (needs 8 GPUs) - should trigger eviction
+3. Verify dense actor was evicted and MoE session succeeds
+4. Agent tends to skip this test - make it mandatory in skill checklist
+
+---
 
 ### train_step API Breaks Tinker Compatibility
 

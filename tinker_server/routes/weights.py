@@ -1,8 +1,9 @@
-"""State routes for saving/loading model state (checkpointing).
+"""Weight and state routes for saving/loading model weights and checkpoints.
 
 Endpoints:
-- POST /save_weights: Save full checkpoint (LoRA + optimizer + metadata)
-- POST /load_weights: Load checkpoint
+- POST /save_weights: Save LoRA weights for sampling (Tinker SDK: save_weights_for_sampler)
+- POST /save_state: Save full checkpoint (LoRA + optimizer + metadata) for training resume
+- POST /load_state: Load checkpoint to resume training
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
 - GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download (501)
@@ -71,7 +72,7 @@ def _to_tinker_path(model_id: str, checkpoint_name: str) -> str:
 
 
 # =============================================================================
-# POST /save_weights - async
+# POST /save_weights - async (for sampling, Tinker SDK: save_weights_for_sampler)
 # =============================================================================
 
 
@@ -80,7 +81,39 @@ async def save_weights(
     request: SaveStateRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
-    """Save model state to checkpoint (LoRA + optimizer + metadata)."""
+    """Save LoRA weights for sampling.
+
+    This endpoint saves weights and registers them for multi-LoRA sampling.
+    Maps to Tinker SDK: save_weights_for_sampler() / save_weights_and_get_sampling_client()
+    """
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+
+    request_id = future_store.create()
+    # Reuse _do_save_state - both endpoints save weights and register for sampling
+    background_tasks.add_task(_do_save_state, request_id, session, request)
+    return UntypedAPIFuture(request_id=request_id)
+
+
+# =============================================================================
+# POST /save_state - async (full checkpoint for training resume)
+# =============================================================================
+
+
+@router.post("/save_state", response_model=UntypedAPIFuture)
+async def save_state(
+    request: SaveStateRequest,
+    background_tasks: BackgroundTasks,
+) -> UntypedAPIFuture:
+    """Save full model state to checkpoint (LoRA + optimizer + metadata).
+
+    This endpoint saves weights AND optimizer state for resuming training.
+    Maps to Tinker SDK: save_state()
+    """
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
@@ -156,12 +189,12 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
 
 
 # =============================================================================
-# POST /load_weights - async
+# POST /load_state - async
 # =============================================================================
 
 
-@router.post("/load_weights", response_model=UntypedAPIFuture)
-async def load_weights(
+@router.post("/load_state", response_model=UntypedAPIFuture)
+async def load_state(
     request: LoadStateRequest,
     background_tasks: BackgroundTasks,
 ) -> UntypedAPIFuture:
