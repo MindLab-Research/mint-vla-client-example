@@ -1,0 +1,42 @@
+# Ray GPU Worker - Dev cluster (4 GPUs)
+# Head IP: 192.168.47.243
+
+TaskName: "mint-dev-worker-4gpu"
+Description: "Dev Ray GPU worker - 4x A800, joins dev cluster"
+
+Entrypoint: |
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
+  export PYTHONDONTWRITEBYTECODE=1
+
+  # Symlink to PFS code
+  rm -rf /root/tinker_project/tinker-server
+  mkdir -p /root/tinker_project
+  ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
+
+  # Connect to Ray head
+  ray start --address='192.168.47.243:6379' --num-gpus=4 && sleep infinity
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ResourceQueueID: "q-20251126180002-26lwz"
+Framework: "Custom"
+
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.pni2l.14xlarge"  # 4x A800 80GB
+
+# Ephemeral: 12 hours
+ActiveDeadlineSeconds: 43200
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+
+Storages:
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse"
+      SubPath: ""
+      ReadOnly: true
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse/share"
+      SubPath: "share"
+      ReadOnly: false

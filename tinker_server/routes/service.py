@@ -93,8 +93,11 @@ async def create_sampling_session(
 
     sampling_session_id = str(uuid.uuid4())
 
-    # Ensure multi-LoRA engine is initialized (lazy init on first call)
-    multi_lora_engine = await session_manager.ensure_multi_lora_engine()
+    # Get base model (required for multi-model support)
+    base_model = request.base_model or "Qwen/Qwen2.5-7B-Instruct"
+
+    # Get or create engine for this model (dynamically creates vLLM actor if needed)
+    multi_lora_engine = await session_manager.get_engine_for_model(base_model)
 
     if request.model_path:
         # Load LoRA weights from path into multi-LoRA engine
@@ -112,16 +115,15 @@ async def create_sampling_session(
         )
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,
+            base_model=base_model,
             lora_rank=request.lora_rank,
         )
     else:
         # Base model (no LoRA): register session directly
-        session_manager.register_base_model_session(sampling_session_id)
+        session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
 
     # Store metadata
-    sampling_sessions[sampling_session_id] = (
-        request.base_model or "Qwen/Qwen2.5-7B-Instruct"
-    )
+    sampling_sessions[sampling_session_id] = base_model
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
@@ -182,10 +184,12 @@ def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, di
             peft_config = json.load(f)
     else:
         # Construct minimal config if missing
+        # Include MLP modules for dense models (vLLM supports them).
+        # Note: MoE expert LoRA is NOT supported by vLLM's FusedMoE kernel.
         peft_config = {
             "r": lora_rank,
             "lora_alpha": lora_rank,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         }
 
     return state_dict, peft_config
@@ -303,3 +307,17 @@ async def resource_pool_status() -> dict:
         "total_gpus_used": pool.total_gpus_used(),
         "min_actor_age": pool.MIN_ACTOR_AGE,
     }
+
+
+@router.post("/clear_resource_pool")
+async def clear_resource_pool() -> dict:
+    """Clear all entries from the resource pool.
+
+    Used for debugging when pool has stale entries after actors are killed externally.
+    Does NOT kill actors - just clears the tracking entries.
+    """
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    count = pool.clear(kill_actors=False)
+    return {"cleared": count, "message": f"Cleared {count} entries from resource pool"}

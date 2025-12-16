@@ -32,8 +32,8 @@
 
 | Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
 |-------|------|--------------|------------|------------|-------|
-| Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | |
-| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | |
+| Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** |
 | moonshotai/Kimi-K2-Thinking | Reasoning | MoE | 64+ | 32+ | Block-FP8, infra team has working impl |
 
 #### T1 (Week 2-3) - Scale Up
@@ -292,172 +292,29 @@ for name in ['persistent_megatron_worker_group_v2', 'tinker_vllm_server']:
 
 ---
 
-### 6. Stateless Trainer Architecture
+### 6. Stateless Trainer Architecture - COMPLETE
 
-#### Problem Statement
+#### Implementation (2025-12-16)
 
-**Current behavior**: Trainers hold session state (weights + optimizer) in memory. Multiple sessions cannot safely share a trainer, and actor eviction loses unsaved state.
-
-```
-Session A: create → [weights in memory] → train → train → [END]
-Session B: create → [INHERITS A's weights - BUG!] → train → ...
-```
-
-**Desired behavior**: Trainers are stateless compute resources. Session state lives in persistent storage and is loaded/saved per operation.
+`SessionStateManager` persists state per-iteration for stateless trainers:
 
 ```
-Session A: create → load(A) → train → save(A) → load(A) → train → save(A) → [END]
-Session B: create → load(B) → train → save(B) → ...
-           (can interleave with A on same trainer)
+/tmp/mint_sessions/{session_id}_checkpoint/
+├── adapter_model.safetensors  # LoRA weights
+├── optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
+└── training_meta.json         # step count, learning_rate
 ```
 
-#### Architecture
+**Key Methods**:
+- `_ensure_session_loaded(session_id)`: Load if different from current
+- `_save_session_state(session_id)`: Save after optim_step
+- Overhead: ~0ms same session, ~100-200ms on switch
 
-**Session State Storage**:
-```
-/tmp/mint_sessions/
-├── session_A_checkpoint/
-│   ├── adapter_model.safetensors  # LoRA weights
-│   ├── optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
-│   └── training_meta.json         # step count, learning_rate
-├── session_B_checkpoint/
-│   └── ...
-```
+**Verification**: Interleaved sessions test passes (Session A → B → A continues from correct loss)
 
-**Per-Iteration Flow**:
-```
-forward_backward(session_id, data):
-    1. Load session state: load_session_state(session_id)
-       - LoRA weights → model
-       - Optimizer state → optimizer
-       - Learning rate → optimizer.param_groups
-    2. Forward pass: model(data)
-    3. Backward pass: loss.backward()
-    4. Return logprobs (gradients accumulated, not applied)
-
-optim_step(session_id):
-    1. Verify session state loaded (or load if not)
-    2. Clip gradients
-    3. optimizer.step()
-    4. optimizer.zero_grad()
-    5. Save session state: save_session_state(session_id)
-       - LoRA weights → safetensors
-       - Optimizer state → optimizer.pt
-       - Increment step count
-```
-
-**Key Invariant**: After optim_step returns, session state is persisted. Trainer can be reused for any session.
-
-#### Implementation Plan
-
-**Phase 1: Session State Manager**
-
-New class `SessionStateManager` handles checkpoint I/O:
-
-```python
-class SessionStateManager:
-    def __init__(self, base_path: str = "/tmp/mint_sessions"):
-        self.base_path = base_path
-
-    def get_session_path(self, session_id: str) -> str:
-        return os.path.join(self.base_path, f"{session_id}_checkpoint")
-
-    def save_state(self, session_id: str, model, optimizer, step: int, lr: float):
-        """Save LoRA weights + optimizer state + metadata."""
-        ...
-
-    def load_state(self, session_id: str, model, optimizer) -> dict:
-        """Load state into model/optimizer. Returns metadata."""
-        ...
-
-    def session_exists(self, session_id: str) -> bool:
-        """Check if session has saved state."""
-        ...
-
-    def delete_session(self, session_id: str):
-        """Clean up session storage."""
-        ...
-```
-
-**Phase 2: Modify TrainingWorker**
-
-```python
-class TrainingWorker:
-    def __init__(self, ...):
-        self.state_manager = SessionStateManager()
-        self._current_session_id = None  # Track which session is loaded
-
-    def _ensure_session_loaded(self, session_id: str):
-        """Load session state if not already loaded."""
-        if self._current_session_id != session_id:
-            if self.state_manager.session_exists(session_id):
-                self.state_manager.load_state(session_id, self.model, self.optimizer)
-            else:
-                # New session: reinitialize weights
-                self.reinit_lora_weights()
-            self._current_session_id = session_id
-
-    def forward_backward(self, session_id: str, data_items, ...):
-        self._ensure_session_loaded(session_id)
-        # ... existing forward/backward logic ...
-
-    def optim_step(self, session_id: str, learning_rate: float):
-        self._ensure_session_loaded(session_id)
-        # ... existing optim logic ...
-        # Save state after update
-        self.state_manager.save_state(
-            session_id, self.model, self.optimizer,
-            self._step_count, learning_rate
-        )
-```
-
-**Phase 3: API Changes**
-
-Add `session_id` parameter to all training operations (may already exist as `model_id`):
-
-| Endpoint | Current | New |
-|----------|---------|-----|
-| `/forward_backward` | `model_id` routes to session | Same, state loaded per-call |
-| `/optim_step` | `model_id` | Same, state saved after |
-| `/train_step` | `model_id` | Same, load before + save after |
-
-**Phase 4: Megatron Backend**
-
-Apply same pattern to `MegatronRankWorker`:
-- Distributed checkpoint save/load (all ranks coordinate)
-- Use existing `save_adapter_state` / `load_adapter_state` methods
-- Add per-iteration save after `optim_step`
-
-#### Performance Considerations
-
-| Operation | Estimated Time | Mitigation |
-|-----------|---------------|------------|
-| Load LoRA weights (32-rank) | 50-100ms | SSD storage, memory-mapped files |
-| Load optimizer state | 100-200ms | Lazy load (skip if same session) |
-| Save LoRA weights | 50-100ms | Async write (return before fsync) |
-| Save optimizer state | 100-200ms | Async write |
-
-**Optimization**: Track `_current_session_id` to skip load if same session as previous call. Most training loops call forward_backward → optim_step → forward_backward on same session, so load happens once at start.
-
-**Total overhead per iteration**: ~0ms (same session) to ~300ms (session switch)
-
-#### Testing Strategy
-
-1. **Unit test**: SessionStateManager save/load roundtrip
-2. **Integration test**: Two sessions interleaved on same trainer
-   - Session A: 3 iterations, final loss L_A
-   - Session B: 3 iterations, final loss L_B
-   - Session A: 3 more iterations, should continue from L_A
-3. **Stress test**: 10 sessions round-robin on single trainer
-4. **Recovery test**: Kill trainer mid-training, recreate, verify session continues correctly
-
-#### Migration Path
-
-1. Implement SessionStateManager (no behavior change yet)
-2. Add `_ensure_session_loaded` to TrainingWorker with feature flag
-3. Enable by default, monitor for regressions
-4. Apply to MegatronRankWorker
-5. Remove in-memory-only code paths
+**Files Modified**:
+- `verl_training.py`: Added `SessionStateManager`, modified `TrainingWorker`
+- `scripts/test_interleaved_sessions.py`: Integration test
 
 ---
 
@@ -541,26 +398,102 @@ Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → o
 
 | Aspect | Tinker SDK | Mint | Compatible? |
 |--------|------------|------|-------------|
-| Per-token weights | `weights` | `loss_mask` | **NO** - field name mismatch |
+| Per-token weights | `weights` | `weights` or `loss_mask` | **Yes** - both accepted |
 | Model input | `chunks` with `EncodedTextChunk` | `chunks` format | Yes |
 | Tensor format | `TensorData{data, shape, dtype}` | `{data, shape, dtype}` | Yes |
-| Loss functions | `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | ? | Verify |
-
-**Action required**: Rename `loss_mask` → `weights` for Tinker API compatibility.
+| Loss functions | `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | Partial | `cispo`, `dro` pending |
 
 #### Implementation Tasks
 
 | Task | Priority | Status |
 |------|----------|--------|
-| Rename `loss_mask` → `weights` in forward_backward | **Critical** | Pending |
-| Verify all loss functions: `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | High | Pending |
-| Add `/api/v1/save_state` | High | Pending |
-| Add `/api/v1/load_state` | High | Pending |
+| Accept both `loss_mask` and `weights` field names | **Critical** | **DONE** |
+| Verify `cross_entropy`, `importance_sampling`, `ppo` loss functions | High | **DONE** |
+| Add `/api/v1/save_state` endpoint | High | **DONE** |
+| Add `/api/v1/load_state` endpoint | High | **DONE** |
+| Accept both `X-API-Key` and `Authorization: Bearer` auth | High | **DONE** |
+| Accept both `sampling_session_id` and `model_id` in sample requests | High | **DONE** |
+| Create merge-gate test suite | High | **DONE** (19/20 pass) |
+| Verify logprobs format matches `TensorData` spec | High | **DONE** |
+| Verify `include_prompt_logprobs` | Medium | **DONE** |
+| Add `cispo`, `dro` loss functions | Medium | Pending |
 | Add `forward_backward_custom` for arbitrary loss functions | Medium | Pending |
 | Verify LoRA config options: `train_unembed`, `train_mlp`, `train_attn` | Medium | Pending |
-| Verify logprobs format matches `TensorData` spec | High | Pending |
-| Create `test_tinker_api_alignment.py` | High | Pending |
-| Verify `include_prompt_logprobs` and `topk_prompt_logprobs` | Medium | Pending |
+| Verify `topk_prompt_logprobs` | Low | Pending |
+
+---
+
+### 8. DPO Support
+
+#### Problem Statement
+
+DPO (Direct Preference Optimization) requires comparing chosen vs rejected responses using reference model logprobs. Current implementation lacks reference model support.
+
+#### DPO Loss Function
+
+```
+L_DPO = -log σ(β * (log π(y_w|x) - log π(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x)))
+```
+
+Where:
+- `y_w`: chosen (winning) response
+- `y_l`: rejected (losing) response
+- `π`: policy model (being trained)
+- `π_ref`: reference model (frozen)
+- `β`: temperature parameter (default: 0.1)
+
+#### Required Data Format (Tinker API)
+
+```python
+{
+    "model_input": {"chunks": [{"tokens": [...], "type": "encoded_text"}]},
+    "loss_fn_inputs": {
+        "target_tokens": {"data": [...], "shape": [...], "dtype": "int64"},
+        "loss_mask": {"data": [...], "shape": [...], "dtype": "float32"},
+        "ref_logprobs": {"data": [...], "shape": [...], "dtype": "float32"},  # NEW
+        "is_chosen": true/false,  # NEW
+    }
+}
+```
+
+#### Implementation Options
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: External ref logprobs** | Client computes ref_logprobs before training | No extra GPU, simple implementation | Requires separate inference pass |
+| **B: Dual model loading** | Load ref model alongside policy model | One-shot training | 2x GPU memory |
+| **C: Cached ref logprobs** | Pre-compute ref logprobs on session create | Good throughput | Storage overhead, staleness |
+
+**Recommended: Option A** - Client-side ref logprobs computation matches tinker-cookbook pattern.
+
+#### Implementation Tasks
+
+| Task | Priority | Status |
+|------|----------|--------|
+| Add `dpo` loss function to TrainingWorker.forward_backward | High | Pending |
+| Add `dpo` loss function to MegatronRankWorker | High | Pending |
+| Add `ref_logprobs` and `is_chosen` to datum parsing | High | Pending |
+| Create DPO merge-gate test | High | Pending |
+| Document DPO workflow in API reference | Medium | Pending |
+
+#### Example Workflow
+
+```python
+# 1. Get ref logprobs using forward-only pass (no gradients)
+ref_result = training_client.forward(data=[chosen_datum, rejected_datum])
+ref_logprobs_chosen = ref_result["loss_fn_outputs"][0]["logprobs"]
+ref_logprobs_rejected = ref_result["loss_fn_outputs"][1]["logprobs"]
+
+# 2. Add ref_logprobs to training data
+chosen_datum["loss_fn_inputs"]["ref_logprobs"] = {"data": ref_logprobs_chosen, ...}
+chosen_datum["loss_fn_inputs"]["is_chosen"] = True
+rejected_datum["loss_fn_inputs"]["ref_logprobs"] = {"data": ref_logprobs_rejected, ...}
+rejected_datum["loss_fn_inputs"]["is_chosen"] = False
+
+# 3. Train with DPO loss
+result = training_client.forward_backward(data=[chosen_datum, rejected_datum], loss_fn="dpo")
+training_client.optim_step(adam_params)
+```
 
 ---
 

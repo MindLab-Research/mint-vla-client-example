@@ -1,0 +1,805 @@
+=== REGISTERING AUTH MIDDLEWARE ===
+INFO:     Started server process [595623]
+INFO:     Waiting for application startup.
+2025-12-16 10:58:21,566	INFO worker.py:1832 -- Connecting to existing Ray cluster at address: 192.168.47.243:6379...
+2025-12-16 10:58:21,576	INFO worker.py:2003 -- Connected to Ray cluster. View the dashboard at [1m[32m192.168.47.243:8265 [39m[22m
+/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:52454 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45330 - "POST /api/v1/create_model HTTP/1.1" 200 OK
+ERROR:2025-12-16 11:03:35,439:[create_model] Failed: Insufficient GPUs: need 1, available 0 after eviction. Freed 0 GPUs but may have resource fragmentation. Check cluster status with 'ray status'.
+Traceback (most recent call last):
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/routes/training.py", line 109, in _do_create_model
+    await training_engine.create_training_session(session)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/verl_training.py", line 1356, in create_training_session
+    entry = pool.get_or_create(
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/verl_training.py", line 1961, in get_or_create
+    resource_pool.ensure_gpus_available(num_gpus)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/resource_pool.py", line 294, in ensure_gpus_available
+    raise ValueError(
+ValueError: Insufficient GPUs: need 1, available 0 after eviction. Freed 0 GPUs but may have resource fragmentation. Check cluster status with 'ray status'.
+INFO:     127.0.0.1:45338 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56022 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54738 - "POST /api/v1/kill_megatron HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45040 - "POST /api/v1/create_model HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45052 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45068 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45078 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45092 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45102 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45116 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45126 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45138 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45146 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45148 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45152 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45164 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45176 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45186 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45198 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45206 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45220 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45226 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45228 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45242 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45248 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45262 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45274 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45276 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45288 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:45294 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60196 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60206 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60210 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60222 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60224 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60236 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60252 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60262 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60274 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60282 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60292 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60308 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60318 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60332 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60334 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60342 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60346 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60354 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60366 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60370 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60378 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60390 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60398 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60400 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60414 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60424 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60434 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60446 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60454 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60462 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60470 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60486 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60498 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60510 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60512 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60514 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60524 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60534 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60536 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60550 - "POST /api/v1/forward_backward HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60556 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60570 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60576 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60582 - "POST /api/v1/optim_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60590 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60600 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60614 - "POST /api/v1/save_weights HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60624 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38470 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+WARNING:2025-12-16 11:05:34,812:fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+INFO:     127.0.0.1:38480 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38492 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38506 - "POST /api/v1/asample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38516 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38532 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38546 - "POST /api/v1/asample HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38548 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38554 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54706 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54046 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42368 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58570 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45294 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40024 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40028 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33904 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:33910 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38386 - "POST /api/v1/create_model HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38392 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38406 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38412 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38418 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38428 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38438 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38450 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38452 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38454 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38468 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38480 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38488 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38494 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38502 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38518 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38532 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38548 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38554 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38564 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53464 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53466 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53478 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53486 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53494 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53510 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53524 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53530 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53540 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53552 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53556 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53564 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53576 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53588 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53600 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53606 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m INFO 12-16 11:36:40 [__init__.py:216] Automatically detected platform cuda.
+INFO:     127.0.0.1:53620 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53622 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53626 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:53628 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54898 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54902 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54912 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54920 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54928 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54932 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54948 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54956 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54964 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m WARNING:2025-12-16 11:36:47,201:fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.
+INFO:     127.0.0.1:54974 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54982 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54988 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:54998 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55006 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m [Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m [Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m [Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[36m(MegatronRankWorker pid=215505, ip=192.168.32.10)[0m INFO 12-16 11:36:40 [__init__.py:216] Automatically detected platform cuda.[32m [repeated 7x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+INFO:     127.0.0.1:55012 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55018 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m /usr/local/lib/python3.10/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.57.1 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m   _warnings.warn(
+INFO:     127.0.0.1:55030 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55044 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m `torch_dtype` is deprecated! Use `dtype` instead!
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m /workspace/Megatron-LM/megatron/core/transformer/transformer_config.py:1539: UserWarning: Using a large number of experts (e.g. >=32) without fp32 routing. Consider enabling moe_router_dtype for better numerical stability.
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m   warnings.warn(
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m /workspace/Megatron-LM/megatron/core/models/gpt/gpt_layer_specs.py:203: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m   warnings.warn(
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m /usr/local/lib/python3.10/dist-packages/transformer_engine/pytorch/module/base.py:1125: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m   warnings.warn(
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m Enabling LORA with rank=32, alpha=64, dropout=0.0
+INFO:     127.0.0.1:55060 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m WARNING:2025-12-16 11:36:48,263:fused_indices_to_multihot has reached end of life. Please migrate to a non-experimental function.[32m [repeated 7x across cluster][0m
+INFO:     127.0.0.1:55066 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52008 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52012 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215502, ip=192.168.32.10)[0m  > number of parameters on (tensor, pipeline) model parallel rank (2, 0): 4026316800
+INFO:     127.0.0.1:52020 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52026 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m ============================================================
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m PEFT Adapter Information:
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m   Total parameters:     4,026,316,800
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m   Adapter parameters:   7,569,408
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m   Trainable percentage: 0.19%
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m ============================================================
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m module: 1
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m [Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0[32m [repeated 21x across cluster][0m
+INFO:     127.0.0.1:52038 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52046 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52048 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52054 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52062 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52066 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52070 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52086 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52090 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52092 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52108 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52114 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52124 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52128 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:52140 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40038 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40040 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40046 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40062 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40070 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40076 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40082 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40090 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40100 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40110 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40120 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40136 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40138 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40154 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40158 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40166 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40172 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40182 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40198 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:40204 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59806 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59818 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59820 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59828 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59840 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59852 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59868 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59874 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59890 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59900 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59904 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59914 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59918 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59926 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59940 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59948 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59958 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59966 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59968 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:59978 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60936 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60946 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60958 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60964 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60966 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60974 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60982 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60984 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60992 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:60998 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32768 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32782 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32798 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32814 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32826 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32840 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32850 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32860 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32862 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:32878 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56884 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56890 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56906 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56916 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56926 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56930 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56942 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56952 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56968 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56980 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56982 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56986 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56990 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:56994 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:57010 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:57018 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:57024 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:57034 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:57042 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:57054 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:37982 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:37990 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38004 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38018 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38022 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38032 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38046 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38058 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38060 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38062 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38076 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38092 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38106 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38114 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38120 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38132 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38142 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38150 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38160 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:38170 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55594 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55602 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215509, ip=192.168.32.10)[0m Enabling LORA with rank=32, alpha=64, dropout=0.0[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m  > number of parameters on (tensor, pipeline) model parallel rank (3, 0): 4026316800[32m [repeated 3x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m module: 1[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215502, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215505, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215508, ip=192.168.32.10)[0m 
+INFO:     127.0.0.1:55616 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m Loading from /vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen… (… Qwen…
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m DistributedDataParallel contains 4.03B parameters
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m optimizer config after override: {'optimizer': 'adam', 'lr': 0.0001, 'min_lr': 0.0, 'clip_grad': 1.0, 'weight_decay': 0.01, 'use_distributed_optimizer': True, 'bf16': True, 'params_dtype': torch.bfloat16}
+[36m(MegatronRankWorker pid=215509, ip=192.168.32.10)[0m 
+INFO:     127.0.0.1:55626 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55640 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215505, ip=192.168.32.10)[0m /vePFS-Mindverse/share/code/verl/verl/utils/megatron_utils.py:416: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+[36m(MegatronRankWorker pid=215505, ip=192.168.32.10)[0m   if buffer.param_data is not None and buffer.param_data.storage().size() > 0:
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m /usr/local/lib/python3.10/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.57.1 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m   _warnings.warn([32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m `torch_dtype` is deprecated! Use `dtype` instead![32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m /workspace/Megatron-LM/megatron/core/transformer/transformer_config.py:1539: UserWarning: Using a large number of experts (e.g. >=32) without fp32 routing. Consider enabling moe_router_dtype for better numerical stability.[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m   warnings.warn([32m [repeated 21x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m /workspace/Megatron-LM/megatron/core/models/gpt/gpt_layer_specs.py:203: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m /usr/local/lib/python3.10/dist-packages/transformer_engine/pytorch/module/base.py:1125: UserWarning: To guarantee overlapping TP and SP collectives with the backwardGEMMs, set environment variable CUDA_DEVICE_MAX_CONNECTIONS = 1[32m [repeated 7x across cluster][0m
+INFO:     127.0.0.1:55656 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55662 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55670 - "POST /api/v1/train_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55672 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55678 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55694 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55698 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:730: UserWarning: When using async grad allreduce it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup
+INFO:     127.0.0.1:55706 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55714 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55722 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55732 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55746 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55760 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55762 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55776 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55780 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:55796 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46430 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46434 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46438 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46444 - "POST /api/v1/train_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46460 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46466 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46482 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46488 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46500 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46506 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46518 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46524 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46536 - "POST /api/v1/train_step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46544 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46554 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46570 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46576 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46582 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46590 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46596 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+INFO:     127.0.0.1:46598 - "POST /api/v1/retrieve_future HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46606 - "POST /api/v1/save_weights HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46608 - "POST /api/v1/retrieve_future HTTP/1.1" 408 Request Timeout
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m ERROR:2025-12-16 11:38:11,348:[Rank 0] get_adapter_state_dict failed: CUDA error: invalid argument
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215503, ip=192.168.32.10)[0m WARNING:2025-12-16 11:38:11,348:[Rank 0] No adapter/LoRA parameters found!
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m /vePFS-Mindverse/share/code/verl/verl/utils/megatron_utils.py:416: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215506, ip=192.168.32.10)[0m   if buffer.param_data is not None and buffer.param_data.storage().size() > 0:[32m [repeated 7x across cluster][0m
+[36m(MegatronRankWorker pid=215508, ip=192.168.32.10)[0m   warnings.warn([32m [repeated 8x across cluster][0m
+[36m(MegatronRankWorker pid=215508, ip=192.168.32.10)[0m /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:730: UserWarning: When using async grad allreduce it is recommended to set the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for maximum speedup[32m [repeated 7x across cluster][0m
+*** SIGTERM received at time=1765886329 on cpu 108 ***
+PC: @     0x7ff2ce090117  (unknown)  (unknown)
+    @     0x7ff2ce041520  (unknown)  (unknown)
+    @ ... and at least 1 more frames
+[2025-12-16 11:58:49,594 E 595623 595623] logging.cc:474: *** SIGTERM received at time=1765886329 on cpu 108 ***
+[2025-12-16 11:58:49,595 E 595623 595623] logging.cc:474: PC: @     0x7ff2ce090117  (unknown)  (unknown)
+[2025-12-16 11:58:49,595 E 595623 595623] logging.cc:474:     @     0x7ff2ce041520  (unknown)  (unknown)
+[2025-12-16 11:58:49,595 E 595623 595623] logging.cc:474:     @ ... and at least 1 more frames
+ERROR:    Exception in ASGI application
+  + Exception Group Traceback (most recent call last):
+  |   File "/usr/local/lib/python3.10/dist-packages/starlette/_utils.py", line 79, in collapse_excgroups
+  |     yield
+  |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 192, in __call__
+  |     async with anyio.create_task_group() as task_group:
+  |   File "/usr/local/lib/python3.10/dist-packages/anyio/_backends/_asyncio.py", line 736, in __aexit__
+  |     raise BaseExceptionGroup(
+  | exceptiongroup.BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/usr/local/lib/python3.10/dist-packages/uvicorn/protocols/http/httptools_impl.py", line 409, in run_asgi
+    |     result = await app(  # type: ignore[func-returns-value]
+    |   File "/usr/local/lib/python3.10/dist-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    |     return await self.app(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/applications.py", line 1134, in __call__
+    |     await super().__call__(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/applications.py", line 113, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/errors.py", line 164, in __call__
+    |     await self.app(scope, receive, _send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 191, in __call__
+    |     with recv_stream, send_stream, collapse_excgroups():
+    |   File "/usr/lib/python3.10/contextlib.py", line 153, in __exit__
+    |     self.gen.throw(typ, value, traceback)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/_utils.py", line 85, in collapse_excgroups
+    |     raise exc
+    |   File "/usr/local/lib/python3.10/dist-packages/uvicorn/_compat.py", line 60, in asyncio_run
+    |     return loop.run_until_complete(main)
+    |   File "uvloop/loop.pyx", line 1512, in uvloop.loop.Loop.run_until_complete
+    |   File "uvloop/loop.pyx", line 1505, in uvloop.loop.Loop.run_until_complete
+    |   File "uvloop/loop.pyx", line 1379, in uvloop.loop.Loop.run_forever
+    |   File "uvloop/loop.pyx", line 557, in uvloop.loop.Loop._run
+    |   File "uvloop/loop.pyx", line 476, in uvloop.loop.Loop._on_idle
+    |   File "uvloop/cbhandles.pyx", line 83, in uvloop.loop.Handle._run
+    |   File "uvloop/cbhandles.pyx", line 63, in uvloop.loop.Handle._run
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 144, in coro
+    |     await self.app(scope, receive_or_disconnect, send_no_error)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    |     await self.app(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 716, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 736, in app
+    |     await route.handle(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 290, in handle
+    |     await self.app(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 125, in app
+    |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 112, in app
+    |     await response(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/responses.py", line 167, in __call__
+    |     await self.background()
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 42, in __call__
+    |     await task()
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 27, in __call__
+    |     await self.func(*self.args, **self.kwargs)
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/routes/weights.py", line 161, in _do_save_state
+    |     multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/session_manager.py", line 413, in get_engine_for_model
+    |     return await manager.get_engine(model_name)
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 704, in get_engine
+    |     await engine.initialize()
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 366, in initialize
+    |     ray.get(self.server.launch_server.remote())
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    |     return fn(*args, **kwargs)
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    |     return func(*args, **kwargs)
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 2961, in get
+    |     values, debugger_breakpoint = worker.get_objects(
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 998, in get_objects
+    |     ] = self.core_worker.get_objects(
+    |   File "python/ray/_raylet.pyx", line 3141, in ray._raylet.CoreWorker.get_objects
+    |   File "python/ray/includes/common.pxi", line 115, in ray._raylet.check_status
+    |   File "python/ray/_raylet.pyx", line 943, in ray._raylet.raise_sys_exit_with_custom_error_message
+    | SystemExit: 1
+    +------------------------------------
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/protocols/http/httptools_impl.py", line 409, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/applications.py", line 1134, in __call__
+    await super().__call__(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/applications.py", line 113, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 191, in __call__
+    with recv_stream, send_stream, collapse_excgroups():
+  File "/usr/lib/python3.10/contextlib.py", line 153, in __exit__
+    self.gen.throw(typ, value, traceback)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_utils.py", line 85, in collapse_excgroups
+    raise exc
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/_compat.py", line 60, in asyncio_run
+    return loop.run_until_complete(main)
+  File "uvloop/loop.pyx", line 1512, in uvloop.loop.Loop.run_until_complete
+  File "uvloop/loop.pyx", line 1505, in uvloop.loop.Loop.run_until_complete
+  File "uvloop/loop.pyx", line 1379, in uvloop.loop.Loop.run_forever
+  File "uvloop/loop.pyx", line 557, in uvloop.loop.Loop._run
+  File "uvloop/loop.pyx", line 476, in uvloop.loop.Loop._on_idle
+  File "uvloop/cbhandles.pyx", line 83, in uvloop.loop.Handle._run
+  File "uvloop/cbhandles.pyx", line 63, in uvloop.loop.Handle._run
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 144, in coro
+    await self.app(scope, receive_or_disconnect, send_no_error)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 125, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 112, in app
+    await response(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/responses.py", line 167, in __call__
+    await self.background()
+  File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 42, in __call__
+    await task()
+  File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 27, in __call__
+    await self.func(*self.args, **self.kwargs)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/routes/weights.py", line 161, in _do_save_state
+    multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/session_manager.py", line 413, in get_engine_for_model
+    return await manager.get_engine(model_name)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 704, in get_engine
+    await engine.initialize()
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 366, in initialize
+    ray.get(self.server.launch_server.remote())
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 2961, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 998, in get_objects
+    ] = self.core_worker.get_objects(
+  File "python/ray/_raylet.pyx", line 3141, in ray._raylet.CoreWorker.get_objects
+  File "python/ray/includes/common.pxi", line 115, in ray._raylet.check_status
+  File "python/ray/_raylet.pyx", line 943, in ray._raylet.raise_sys_exit_with_custom_error_message
+SystemExit: 1
+ERROR:      + Exception Group Traceback (most recent call last):
+  |   File "/usr/local/lib/python3.10/dist-packages/starlette/_utils.py", line 79, in collapse_excgroups
+  |     yield
+  |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 192, in __call__
+  |     async with anyio.create_task_group() as task_group:
+  |   File "/usr/local/lib/python3.10/dist-packages/anyio/_backends/_asyncio.py", line 736, in __aexit__
+  |     raise BaseExceptionGroup(
+  | exceptiongroup.BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/usr/local/lib/python3.10/dist-packages/uvicorn/protocols/http/httptools_impl.py", line 409, in run_asgi
+    |     result = await app(  # type: ignore[func-returns-value]
+    |   File "/usr/local/lib/python3.10/dist-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    |     return await self.app(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/applications.py", line 1134, in __call__
+    |     await super().__call__(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/applications.py", line 113, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/errors.py", line 164, in __call__
+    |     await self.app(scope, receive, _send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 191, in __call__
+    |     with recv_stream, send_stream, collapse_excgroups():
+    |   File "/usr/lib/python3.10/contextlib.py", line 153, in __exit__
+    |     self.gen.throw(typ, value, traceback)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/_utils.py", line 85, in collapse_excgroups
+    |     raise exc
+    |   File "/usr/local/lib/python3.10/dist-packages/uvicorn/_compat.py", line 60, in asyncio_run
+    |     return loop.run_until_complete(main)
+    |   File "uvloop/loop.pyx", line 1512, in uvloop.loop.Loop.run_until_complete
+    |   File "uvloop/loop.pyx", line 1505, in uvloop.loop.Loop.run_until_complete
+    |   File "uvloop/loop.pyx", line 1379, in uvloop.loop.Loop.run_forever
+    |   File "uvloop/loop.pyx", line 557, in uvloop.loop.Loop._run
+    |   File "uvloop/loop.pyx", line 476, in uvloop.loop.Loop._on_idle
+    |   File "uvloop/cbhandles.pyx", line 83, in uvloop.loop.Handle._run
+    |   File "uvloop/cbhandles.pyx", line 63, in uvloop.loop.Handle._run
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 144, in coro
+    |     await self.app(scope, receive_or_disconnect, send_no_error)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    |     await self.app(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 716, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 736, in app
+    |     await route.handle(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 290, in handle
+    |     await self.app(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 125, in app
+    |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 112, in app
+    |     await response(scope, receive, send)
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/responses.py", line 167, in __call__
+    |     await self.background()
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 42, in __call__
+    |     await task()
+    |   File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 27, in __call__
+    |     await self.func(*self.args, **self.kwargs)
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/routes/weights.py", line 161, in _do_save_state
+    |     multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/session_manager.py", line 413, in get_engine_for_model
+    |     return await manager.get_engine(model_name)
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 704, in get_engine
+    |     await engine.initialize()
+    |   File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 366, in initialize
+    |     ray.get(self.server.launch_server.remote())
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    |     return fn(*args, **kwargs)
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    |     return func(*args, **kwargs)
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 2961, in get
+    |     values, debugger_breakpoint = worker.get_objects(
+    |   File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 998, in get_objects
+    |     ] = self.core_worker.get_objects(
+    |   File "python/ray/_raylet.pyx", line 3141, in ray._raylet.CoreWorker.get_objects
+    |   File "python/ray/includes/common.pxi", line 115, in ray._raylet.check_status
+    |   File "python/ray/_raylet.pyx", line 943, in ray._raylet.raise_sys_exit_with_custom_error_message
+    | SystemExit: 1
+    +------------------------------------
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/protocols/http/httptools_impl.py", line 409, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/applications.py", line 1134, in __call__
+    await super().__call__(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/applications.py", line 113, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 191, in __call__
+    with recv_stream, send_stream, collapse_excgroups():
+  File "/usr/lib/python3.10/contextlib.py", line 153, in __exit__
+    self.gen.throw(typ, value, traceback)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_utils.py", line 85, in collapse_excgroups
+    raise exc
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/_compat.py", line 60, in asyncio_run
+    return loop.run_until_complete(main)
+  File "uvloop/loop.pyx", line 1512, in uvloop.loop.Loop.run_until_complete
+  File "uvloop/loop.pyx", line 1505, in uvloop.loop.Loop.run_until_complete
+  File "uvloop/loop.pyx", line 1379, in uvloop.loop.Loop.run_forever
+  File "uvloop/loop.pyx", line 557, in uvloop.loop.Loop._run
+  File "uvloop/loop.pyx", line 476, in uvloop.loop.Loop._on_idle
+  File "uvloop/cbhandles.pyx", line 83, in uvloop.loop.Handle._run
+  File "uvloop/cbhandles.pyx", line 63, in uvloop.loop.Handle._run
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/base.py", line 144, in coro
+    await self.app(scope, receive_or_disconnect, send_no_error)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 125, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 112, in app
+    await response(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/responses.py", line 167, in __call__
+    await self.background()
+  File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 42, in __call__
+    await task()
+  File "/usr/local/lib/python3.10/dist-packages/starlette/background.py", line 27, in __call__
+    await self.func(*self.args, **self.kwargs)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/routes/weights.py", line 161, in _do_save_state
+    multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/session_manager.py", line 413, in get_engine_for_model
+    return await manager.get_engine(model_name)
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 704, in get_engine
+    await engine.initialize()
+  File "/vePFS-Mindverse/share/code/tinker-server/tinker_server/backend/multi_lora_engine.py", line 366, in initialize
+    ray.get(self.server.launch_server.remote())
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 2961, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/usr/local/lib/python3.10/dist-packages/ray/_private/worker.py", line 998, in get_objects
+    ] = self.core_worker.get_objects(
+  File "python/ray/_raylet.pyx", line 3141, in ray._raylet.CoreWorker.get_objects
+  File "python/ray/includes/common.pxi", line 115, in ray._raylet.check_status
+  File "python/ray/_raylet.pyx", line 943, in ray._raylet.raise_sys_exit_with_custom_error_message
+SystemExit: 1
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 701, in lifespan
+    await receive()
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/lifespan/on.py", line 137, in receive
+    return await self.receive_queue.get()
+  File "/usr/lib/python3.10/asyncio/queues.py", line 159, in get
+    await getter
+asyncio.exceptions.CancelledError
+
+[36m(autoscaler +40m2s, ip=192.168.47.243)[0m Tip: use `ray status` to view detailed cluster status. To disable these messages, set RAY_SCHEDULER_EVENTS=0.
+[33m(autoscaler +40m2s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +40m37s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +41m12s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +41m48s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +42m23s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +42m58s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +43m33s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +44m8s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +44m43s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +45m18s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +45m53s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +46m28s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +47m3s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +47m38s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +48m14s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +48m49s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +49m24s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +49m59s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +50m34s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +51m9s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +51m44s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +52m19s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +52m54s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +53m29s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +54m5s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +54m40s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +55m15s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +55m50s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +56m25s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +57m0s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +57m35s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +58m10s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +58m45s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +59m21s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +59m55s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 4.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+[33m(autoscaler +1h31s, ip=192.168.47.243)[0m Warning: The following resource request cannot be scheduled right now: {'GPU': 4.0, 'CPU': 1.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+INFO:     127.0.0.1:41930 - "POST /api/v1/kill_megatron HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36166 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60054 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42926 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36554 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44598 - "GET /api/v1/resource_pool HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46748 - "GET /api/v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36248 - "POST /api/v1/kill_megatron HTTP/1.1" 200 OK
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m [rank6]:[W1216 11:58:49.290161188 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=105, addr=[::ffff:9.37.208.34]:37290, remote=[::ffff:9.37.208.34]:34653): Connection reset by peer
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:679 (most recent call first):
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7fa0c937eeb0 in /usr/local/lib/python3.10/dist-packages/torch/lib/libc10.so)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #1: <unknown function> + 0x5d694f1 (0x7f72064b14f1 in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #2: <unknown function> + 0x5d6a953 (0x7f72064b2953 in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #3: <unknown function> + 0x5d6b49a (0x7f72064b349a in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7f72064ae1be in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x398 (0x7f71c85c70c8 in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cuda.so)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #6: <unknown function> + 0xdc253 (0x7fa199ea9253 in /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #7: <unknown function> + 0x94ac3 (0x7fa19c2e7ac3 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m frame #8: <unknown function> + 0x126850 (0x7fa19c379850 in /usr/lib/x86_64-linux-gnu/libc.so.6)
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215507, ip=192.168.32.10)[0m [rank6]:[W1216 11:58:49.296189109 ProcessGroupNCCL.cpp:1783] [PG ID 0 PG GUID 0(default_pg) Rank 6] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Connection reset by peer
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m [rank1]:[W1216 11:58:50.452148696 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=108, addr=[::ffff:9.37.208.34]:37322, remote=[::ffff:9.37.208.34]:34653): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m 
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m [rank1]:[W1216 11:58:50.458187647 ProcessGroupNCCL.cpp:1783] [PG ID 0 PG GUID 0(default_pg) Rank 1] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7f01ac0d9eb0 in /usr/local/lib/python3.10/dist-packages/torch/lib/libc10.so)
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m frame #8: <unknown function> + 0x126850 (0x7f0245dab850 in /usr/lib/x86_64-linux-gnu/libc.so.6)[32m [repeated 6x across cluster][0m
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7ed2b04ae1be in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cpu.so)
+[36m(MegatronRankWorker pid=215504, ip=192.168.32.10)[0m frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x398 (0x7ed2725c70c8 in /usr/local/lib/python3.10/dist-packages/torch/lib/libtorch_cuda.so)

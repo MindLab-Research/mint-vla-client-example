@@ -151,24 +151,41 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
         state_dict = result.get("state_dict")
         peft_config = result.get("peft_config")
 
+        # Try to register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
+        # This allows asample to work with model_id after save_weights
+        # Note: Registration may fail if resources unavailable (e.g., MoE needs separate GPUs)
+        sampling_registered = False
         if inference_manager is not None and state_dict is not None and peft_config is not None:
-            multi_lora_engine = inference_manager.get_multi_lora_engine()
-            if multi_lora_engine is not None:
-                # Check if already registered (update existing)
-                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                if existing_lora_id is not None:
-                    # Remove old registration and add new one
-                    await multi_lora_engine.remove_session(session.model_id)
+            base_model = session.base_model
+            if base_model is None:
+                logger.warning(f"[{session.model_id}] Cannot register for sampling: base_model not set")
+            else:
+                try:
+                    # Get or create engine for this model (dynamically creates vLLM actor if needed)
+                    multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
 
-                # Register with model_id as session_id for SDK compatibility
-                await multi_lora_engine.add_lora_for_session(
-                    sampling_session_id=session.model_id,
-                    state_dict=state_dict,
-                    peft_config=peft_config,
-                )
-                # Also mark as multi-LoRA session in inference manager
-                inference_manager.register_multi_lora_session(session.model_id)
-                logger.info(f"[{session.model_id}] Registered for multi-LoRA sampling")
+                    # Check if already registered (update existing)
+                    existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
+                    if existing_lora_id is not None:
+                        await multi_lora_engine.remove_session(session.model_id)
+
+                    # Register with model_id as session_id for SDK compatibility
+                    await multi_lora_engine.add_lora_for_session(
+                        sampling_session_id=session.model_id,
+                        state_dict=state_dict,
+                        peft_config=peft_config,
+                    )
+                    try:
+                        inference_manager.register_multi_lora_session(
+                            session.model_id, base_model=base_model
+                        )
+                    except ValueError:
+                        pass  # Session already registered
+                    sampling_registered = True
+                    logger.info(f"[{session.model_id}] Registered for multi-LoRA sampling (model={base_model})")
+                except Exception as reg_err:
+                    # Log but don't fail save_weights - sampling registration is optional
+                    logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
         else:
             logger.warning(f"[{session.model_id}] Cannot register for sampling: "
                           f"inference_manager={inference_manager is not None}, "
@@ -178,9 +195,16 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
         # Build tinker:// path for response
         tinker_path = _to_tinker_path(session.model_id, checkpoint_name)
 
+        # Include state_dict metadata in response for verification (e.g., checking MLP modules)
+        # Keys are JSON-serializable, tensors are not
+        state_dict_keys = list(state_dict.keys()) if state_dict else []
+
         future_store.resolve(request_id, {
             "path": tinker_path,
             "type": "save_weights",
+            "state_dict_keys": state_dict_keys,  # List of parameter names for verification
+            "peft_config": peft_config,
+            "sampling_registered": sampling_registered,
         })
 
     except Exception as e:

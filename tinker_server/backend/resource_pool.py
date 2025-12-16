@@ -298,8 +298,24 @@ class ResourcePool:
         )
 
     def list_actors(self) -> list[dict]:
-        """List all tracked actors."""
+        """List all tracked actors (validates liveness)."""
         with self._pool_lock:
+            # Validate actors still exist in Ray, remove stale entries
+            # Only check if Ray is initialized
+            stale = []
+            if ray.is_initialized():
+                for name, e in self._entries.items():
+                    try:
+                        ray.get_actor(e.actor_name, namespace=e.namespace)
+                    except ValueError as ex:
+                        logger.warning(f"[ResourcePool] Actor {name} not found in Ray: {ex}")
+                        stale.append(name)
+                    except Exception as ex:
+                        logger.warning(f"[ResourcePool] Error checking actor {name}: {ex}")
+                for name in stale:
+                    logger.info(f"[ResourcePool] Removing stale actor: {name}")
+                    del self._entries[name]
+
             return [
                 {
                     "actor_name": e.actor_name,

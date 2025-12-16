@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .backend.multi_lora_engine import MultiLoRAInferenceEngine
+from .backend.multi_lora_engine import MultiModelInferenceManager
 from .backend.session_manager import SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
@@ -50,31 +50,28 @@ async def lifespan(app: FastAPI):
     logger.info("Inference session manager initialized")
 
     # ==========================================================================
-    # Multi-LoRA: Initialize shared inference engine (optional)
+    # Multi-Model Inference: Initialize manager for dynamic engine creation
     # ==========================================================================
-    multi_lora_engine: MultiLoRAInferenceEngine | None = None
+    multi_model_manager: MultiModelInferenceManager | None = None
 
     if config.enable_multi_lora:
         logger.info(
-            f"Initializing Multi-LoRA engine: max_loras={config.max_loras}, "
+            f"Initializing Multi-Model Inference Manager: max_loras={config.max_loras}, "
             f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
         )
 
-        multi_lora_engine = MultiLoRAInferenceEngine(
-            model_path=config.model_path,
-            tensor_parallel_size=config.tensor_parallel_size,
-            data_parallel_size=config.data_parallel_size,
+        # Create manager - engines are created lazily per model
+        multi_model_manager = MultiModelInferenceManager(
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_model_len=config.max_model_len,
             max_loras=config.max_loras,
             max_cpu_loras=config.max_cpu_loras,
             max_lora_rank=config.max_lora_rank,
         )
-        await multi_lora_engine.initialize()
 
         # Register with session manager
-        inference_manager.set_multi_lora_engine(multi_lora_engine)
-        logger.info("Multi-LoRA engine initialized and registered")
+        inference_manager.set_multi_model_manager(multi_model_manager)
+        logger.info("Multi-model inference manager initialized (engines created on-demand)")
     else:
         logger.info("Multi-LoRA disabled, using per-session engines")
 
@@ -112,10 +109,10 @@ async def lifespan(app: FastAPI):
     # Shutdown inference sessions
     await inference_manager.shutdown_all()
 
-    # Shutdown multi-LoRA engine
-    if multi_lora_engine is not None:
-        await multi_lora_engine.shutdown()
-        logger.info("Multi-LoRA engine shutdown")
+    # Shutdown multi-model inference manager
+    if multi_model_manager is not None:
+        await multi_model_manager.shutdown_all()
+        logger.info("Multi-model inference manager shutdown")
 
 
 app = FastAPI(

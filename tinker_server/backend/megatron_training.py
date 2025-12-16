@@ -890,24 +890,16 @@ class MegatronTrainingWorker:
 def is_moe_model(model_name: str) -> bool:
     """Check if a model is an MoE model requiring Megatron training.
 
+    Delegates to model_registry for centralized model configuration.
+
     Args:
-        model_name: Model name or path (e.g., "Qwen/Qwen3-30B-A3B").
+        model_name: Model name (e.g., "Qwen/Qwen3-30B-A3B").
 
     Returns:
         True if model is MoE and should use MegatronTrainingWorker.
+
+    Raises:
+        ValueError: If model is not in the supported list.
     """
-    import re
-
-    # Qwen3 MoE pattern: Qwen3-*-A*B (e.g., Qwen3-30B-A3B)
-    # The "A" followed by a number indicates active parameters (MoE)
-    moe_patterns = [
-        r"Qwen3-\d+B-A\d+B",  # Qwen3 MoE (e.g., Qwen3-30B-A3B)
-        r"Mixtral",           # Mixtral models
-        r"DeepSeek.*MoE",     # DeepSeek MoE
-    ]
-
-    for pattern in moe_patterns:
-        if re.search(pattern, model_name, re.IGNORECASE):
-            return True
-
-    return False
+    from .model_registry import is_moe_model as registry_is_moe
+    return registry_is_moe(model_name)

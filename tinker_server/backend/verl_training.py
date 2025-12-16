@@ -252,11 +252,15 @@ class TrainingWorker:
         )
 
         # Apply LoRA
+        # Per Tinker docs: "LoRA performs better when applied to all weight matrices,
+        # especially MLP and MoE layers. Attention-only LoRA underperforms."
+        # For dense models, vLLM supports MLP LoRA (gate_proj, up_proj, down_proj).
+        # Note: MoE models use FusedMoE kernel which doesn't support LoRA on expert layers.
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_rank,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.0,
             bias="none",
         )
@@ -510,9 +514,10 @@ class TrainingWorker:
                 log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)
                 target_logprobs = log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
 
+                logprobs_list = target_logprobs.detach().tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": target_logprobs.detach().tolist(),
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                 })
 
             elif loss_fn in ("importance_sampling", "ppo"):
@@ -588,9 +593,10 @@ class TrainingWorker:
                 total_ratio += masked_ratio.item()
                 num_rl_samples += 1
 
+                rl_logprobs_list = new_logprobs.detach().tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": new_logprobs.detach().tolist(),
+                    "logprobs": {"data": rl_logprobs_list, "shape": [len(rl_logprobs_list)], "dtype": "float32"},
                 })
 
             else:
@@ -725,10 +731,11 @@ class TrainingWorker:
                 total_loss += item_loss * num_weighted.item()
                 total_tokens += num_weighted.item()
 
-                # Return logprobs in loss_fn_outputs
+                # Return logprobs in loss_fn_outputs (TensorData format required by Tinker SDK)
+                logprobs_list = target_logprobs.tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": target_logprobs.tolist(),
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                 })
 
         avg_loss = total_loss / max(total_tokens, 1)
@@ -1326,12 +1333,12 @@ class VerlTrainingEngine:
             base_model = requested_model
 
         if use_megatron:
-            # MoE models (30B+) need tensor + expert parallelism to fit model+optimizer
-            # 30B MoE with TP=4: ~76 GiB/GPU for model+gradients, no room for optimizer
-            # TP=4, EP=2 = 8 GPUs: distributes optimizer state, ~38 GiB/GPU
+            # MoE models (30B+) need tensor parallelism to fit model
+            # TP=4, EP=1 = 4 GPUs: all experts on each GPU, model sharded across 4 GPUs
+            # With param_offload=True, this fits in 4x 80GB A100s
             distributed_config = DistributedConfig(
                 tensor_parallel_size=4,
-                expert_parallel_size=2,
+                expert_parallel_size=1,  # Changed from 2 to 1 (cluster has 4 GPUs)
             )
             logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size}, EP={distributed_config.expert_parallel_size})")
 
