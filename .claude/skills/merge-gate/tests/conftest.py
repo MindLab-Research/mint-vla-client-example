@@ -140,14 +140,14 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 def tokenizer():
     """Get tokenizer for Dense model."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True, local_files_only=True)
 
 
 @pytest.fixture(scope="module")
 def moe_tokenizer():
     """Get tokenizer for MoE model."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True, local_files_only=True)
 
 
 @pytest.fixture
