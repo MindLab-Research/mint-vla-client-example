@@ -85,8 +85,9 @@ def generate_rollouts(tokenizer, model_id: str, problems: list) -> list[dict]:
         # Advantages: use non-zero value to ensure gradients flow
         # In real RL: advantage = reward - baseline
         # For testing: use reward or small positive to ensure training happens
+        # NOTE: advantages must match target_tokens length (prompt[1:] + generated)
         advantage_value = reward if reward > 0 else 0.1  # Small positive for exploration
-        advantages = [advantage_value] * len(generated_tokens)
+        advantages = [0.0] * (len(prompt_tokens) - 1) + [advantage_value] * len(generated_tokens)
 
         # Old logprobs for importance sampling
         old_logprobs = [0.0] * (len(prompt_tokens) - 1) + logprobs
