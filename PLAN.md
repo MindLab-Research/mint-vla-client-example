@@ -540,6 +540,98 @@ Previous tests prove sessions have different weights (A ≠ B), but don't prove 
 
 ---
 
+### vLLM MoE Expert LoRA Inference - INCOMPLETE (2025-12-17)
+
+**Problem**: vLLM 0.12.0 has `FusedMoEWithLoRA` class but cannot load MoE expert LoRA weights for inference. Training with full MLP+attention LoRA works via Megatron, but inference is limited to attention-only LoRA.
+
+**Impact**: MoE models (Qwen3-30B-A3B) train with full LoRA (attention + expert MLP) but inference only uses attention LoRA. This reduces LoRA effectiveness during inference while training quality remains unaffected.
+
+#### Technical Analysis
+
+**Location**: `/root/tinker_project/vllm/vllm/lora/`
+
+**Blocker 1: Expert Parallelism Assertion** (`layers/fused_moe.py:48`)
+```python
+assert not self.base_layer.use_ep, (
+    "EP support for Fused MoE LoRA is not implemented yet."
+)
+```
+- Blocks when Expert Parallelism (EP) is enabled
+- **Workaround**: Use TP=4 only (no EP) - currently implemented
+
+**Blocker 2: Module Validation** (`models.py:188-213`)
+```python
+def check_unexpected_modules(modules: dict):
+    for lora_module in modules.keys():
+        # ...
+        if ".experts" in module_name:
+            expert_suffix = module_name[expert_idx + 1:]
+            if expert_suffix not in expected_lora_modules:
+                unexpected_modules.append(module_name)
+```
+- Rejects expert LoRA weights because suffix format doesn't match
+- Expert weights have paths like `model.layers.0.mlp.experts.0.gate_proj`
+- Suffix `experts.0.gate_proj` not in `expected_lora_modules` (which has `q_proj`, `k_proj`, etc.)
+
+**Blocker 3: LoRA Weight Loading Format**
+- `FusedMoEWithLoRA.set_lora()` expects 3 weight pairs: `(w1_lora_a, w2_lora_a, w3_lora_a), (w1_lora_b, w2_lora_b, w3_lora_b)`
+- PEFT exports per-expert weights with different naming convention
+- Need adapter to convert PEFT format to vLLM's expected tensor layout
+
+#### vLLM 0.12.0 MoE LoRA Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| FusedMoEWithLoRA class | EXISTS | Full implementation present |
+| Module validation | BLOCKS | Rejects expert weight names |
+| EP assertion | BLOCKS | Disabled for EP=0 |
+| LoRA weight format | INCOMPATIBLE | PEFT → vLLM conversion needed |
+| Attention-only LoRA | WORKS | Current workaround |
+
+#### Patching Approach
+
+**Option A: Minimal Patch (Recommended)**
+
+1. **Patch `models.py` module validation** (~20 lines)
+   - Modify `check_unexpected_modules` to recognize expert LoRA patterns
+   - Allow `experts.{N}.gate_proj`, `experts.{N}.up_proj`, `experts.{N}.down_proj`
+
+2. **Add weight format adapter** (~50 lines)
+   - Convert PEFT expert LoRA format to vLLM's `(w1, w2, w3)` tensor layout
+   - Handle per-expert indexing
+
+**Option B: Full Patch**
+
+In addition to Option A:
+3. **Remove EP assertion** for TP-only mode
+4. **Add expert weight routing** for multi-tenant scenarios
+
+#### Implementation Plan
+
+| Phase | Task | Effort | Risk |
+|-------|------|--------|------|
+| 1 | Fork vLLM 0.12.0, create `mint-vllm` branch | Low | Low |
+| 2 | Patch module validation in `models.py` | Medium | Low |
+| 3 | Add PEFT → vLLM weight format adapter | Medium | Medium |
+| 4 | Test with Qwen3-30B-A3B expert LoRA | High | Medium |
+| 5 | Upstream PR or maintain fork | - | - |
+
+#### Current Workaround
+
+Filter out MLP modules in `megatron_distributed.py:get_lora_state_dict()`:
+- Training: Full MLP + attention LoRA via Megatron
+- Inference: Attention-only LoRA via vLLM
+- Loss: ~10-20% effectiveness reduction for MoE inference (based on Tinker docs)
+
+#### References
+
+- [vLLM Forum: MoE LoRA on expert layers](https://discuss.vllm.ai/t/do-the-current-moe-models-support-setting-lora-adapters-on-expert-layers/1726)
+- [vLLM Issue #18120: Qwen 3 MoE LoRA](https://github.com/vllm-project/vllm/issues/18120)
+- [vLLM PR #20932: Adds warning but no fix](https://github.com/vllm-project/vllm/pull/20932)
+- [TRL Issue #4584: vLLM upgrade for FusedMoE LoRA](https://github.com/huggingface/trl/issues/4584)
+
+---
+
 ## Architecture Reference
 
 ```
