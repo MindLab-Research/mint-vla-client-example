@@ -21,7 +21,7 @@ description: |
 - **NEVER** use `volcano-tinker-auth` unison profile - that's production
 - **NEVER** use `mint-prod-*.yaml` Ray configs - that's production
 - **NEVER** use `tinker-server-auth` directory - that's production
-- **NEVER** set `TINKER_API_KEY` or `TINKER_PORT` - not needed for dev
+- **NEVER** set `TINKER_PORT` - not needed for dev (uses default 8000)
 
 If user asks for production operations, **stop and invoke mint-prod skill instead**.
 
@@ -37,7 +37,7 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server` |
 | Unison Profile | `volcano-tinker` |
 | Ray Configs | `mint-dev-head.yaml`, `mint-dev-worker.yaml` |
-| API Key | Not required |
+| API Key | Not required (auth disabled when `TINKER_API_KEY` unset) |
 | Log File | `/tmp/tinker_server.log` |
 
 ---

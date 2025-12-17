@@ -23,11 +23,173 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Default idle timeout for TrainingWorker (seconds)
-# Worker self-terminates if no activity for this duration
-DEFAULT_IDLE_TIMEOUT = 300  # 5 minutes
+# Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
+DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
+
+
+# =====================================================================
+# Session State Manager - Per-iteration state persistence for stateless trainers
+# =====================================================================
+
+class SessionStateManager:
+    """Manages session state (LoRA weights + optimizer) for stateless trainers.
+
+    Enables multiple sessions to share a single trainer by loading/saving
+    state per iteration. Each session has its own checkpoint directory.
+
+    Storage layout:
+        {base_path}/{session_id}_checkpoint/
+            adapter_model.safetensors  # LoRA weights
+            optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
+            training_meta.json         # step count, learning_rate
+    """
+
+    def __init__(self, base_path: str = "/tmp/mint_sessions"):
+        """Initialize the session state manager.
+
+        Args:
+            base_path: Root directory for all session checkpoints.
+        """
+        import os
+        self.base_path = base_path
+        os.makedirs(base_path, exist_ok=True)
+        logger.info(f"[SessionStateManager] Initialized with base_path={base_path}")
+
+    def get_session_path(self, session_id: str) -> str:
+        """Get checkpoint directory path for a session."""
+        import os
+        return os.path.join(self.base_path, f"{session_id}_checkpoint")
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session has saved state."""
+        import os
+        session_path = self.get_session_path(session_id)
+        adapter_path = os.path.join(session_path, "adapter_model.safetensors")
+        return os.path.exists(adapter_path)
+
+    def save_state(
+        self,
+        session_id: str,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        step: int,
+        lr: float,
+        device: torch.device,
+    ) -> str:
+        """Save session state (LoRA weights + optimizer + metadata).
+
+        Args:
+            session_id: Unique session identifier.
+            model: PEFT model with LoRA adapters.
+            optimizer: Optimizer with state to save.
+            step: Current training step.
+            lr: Current learning rate.
+            device: Device for tensor operations.
+
+        Returns:
+            Absolute path to saved checkpoint.
+        """
+        import json
+        import os
+
+        from peft.utils.save_and_load import get_peft_model_state_dict
+        from safetensors.torch import save_file
+
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+
+        # 1. Save LoRA weights
+        state_dict = get_peft_model_state_dict(model)
+        # Move to CPU for serialization
+        state_dict = {k: v.cpu() for k, v in state_dict.items()}
+        save_file(state_dict, os.path.join(session_path, "adapter_model.safetensors"))
+
+        # 2. Save optimizer state
+        torch.save(optimizer.state_dict(), os.path.join(session_path, "optimizer.pt"))
+
+        # 3. Save metadata
+        meta = {"current_step": step, "learning_rate": lr}
+        with open(os.path.join(session_path, "training_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        logger.debug(f"[SessionStateManager] Saved state for {session_id} (step={step})")
+        return os.path.abspath(session_path)
+
+    def load_state(
+        self,
+        session_id: str,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+    ) -> dict:
+        """Load session state into model/optimizer.
+
+        Args:
+            session_id: Unique session identifier.
+            model: PEFT model to load weights into.
+            optimizer: Optimizer to load state into.
+            device: Device for tensor operations.
+
+        Returns:
+            Dict with metadata (current_step, learning_rate).
+
+        Raises:
+            FileNotFoundError: If session checkpoint doesn't exist.
+        """
+        import json
+        import os
+
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        session_path = self.get_session_path(session_id)
+        adapter_path = os.path.join(session_path, "adapter_model.safetensors")
+
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"Session {session_id} has no saved state")
+
+        # 1. Load LoRA weights
+        state_dict = load_file(adapter_path, device=str(device))
+        set_peft_model_state_dict(model, state_dict)
+
+        # 2. Load optimizer state
+        optimizer_path = os.path.join(session_path, "optimizer.pt")
+        if os.path.exists(optimizer_path):
+            optimizer.load_state_dict(
+                torch.load(optimizer_path, map_location=device, weights_only=True)
+            )
+
+        # 3. Load metadata
+        meta = {"current_step": 0, "learning_rate": optimizer.param_groups[0]["lr"]}
+        meta_path = os.path.join(session_path, "training_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+
+        logger.debug(f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)})")
+        return meta
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete session checkpoint.
+
+        Args:
+            session_id: Unique session identifier.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        import os
+        import shutil
+
+        session_path = self.get_session_path(session_id)
+        if os.path.exists(session_path):
+            shutil.rmtree(session_path)
+            logger.info(f"[SessionStateManager] Deleted session {session_id}")
+            return True
+        return False
 
 
 @ray.remote(num_gpus=1)
@@ -90,11 +252,15 @@ class TrainingWorker:
         )
 
         # Apply LoRA
+        # Per Tinker docs: "LoRA performs better when applied to all weight matrices,
+        # especially MLP and MoE layers. Attention-only LoRA underperforms."
+        # For dense models, vLLM supports MLP LoRA (gate_proj, up_proj, down_proj).
+        # Note: MoE models use FusedMoE kernel which doesn't support LoRA on expert layers.
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_rank,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.0,
             bias="none",
         )
@@ -110,11 +276,63 @@ class TrainingWorker:
         # Track training step count
         self._step_count = 0
 
+        # Session state management for stateless trainer pattern
+        self._state_manager = SessionStateManager()
+        self._current_session_id: str | None = None
+
         logger.info("[TrainingWorker] Ready")
 
     def _touch(self) -> None:
         """Update last activity timestamp. Call at start of every method."""
         self._last_activity = time.time()
+
+    def _ensure_session_loaded(self, session_id: str) -> None:
+        """Ensure the specified session's state is loaded.
+
+        If a different session is currently loaded, this saves its state first,
+        then loads the requested session's state.
+
+        Args:
+            session_id: Session ID to load state for.
+        """
+        if self._current_session_id == session_id:
+            # Already loaded
+            return
+
+        # If we have a current session, its state should already be saved
+        # (save happens at end of optim_step)
+
+        # Load new session's state
+        if self._state_manager.session_exists(session_id):
+            meta = self._state_manager.load_state(
+                session_id, self.model, self.optimizer, self.device
+            )
+            self._step_count = meta.get("current_step", 0)
+            # Update learning rate if saved
+            if "learning_rate" in meta:
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = meta["learning_rate"]
+            logger.info(f"[TrainingWorker] Loaded session {session_id} (step={self._step_count})")
+        else:
+            # New session: reinitialize weights
+            self.reinit_lora_weights()
+            logger.info(f"[TrainingWorker] New session {session_id}, initialized fresh weights")
+
+        self._current_session_id = session_id
+
+    def _save_session_state(self, session_id: str) -> None:
+        """Save current session state to disk.
+
+        Called at the end of optim_step to persist state.
+
+        Args:
+            session_id: Session ID to save state for.
+        """
+        lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
+        self._state_manager.save_state(
+            session_id, self.model, self.optimizer, self._step_count, lr, self.device
+        )
+        logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
     def _idle_watchdog(self) -> None:
         """Background thread that monitors for idle timeout.
@@ -160,6 +378,7 @@ class TrainingWorker:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        session_id: str | None = None,
     ) -> dict:
         """Forward + backward pass using tinker Datum format.
 
@@ -175,11 +394,18 @@ class TrainingWorker:
                 - loss_fn_inputs.advantages: advantage estimates
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo")
             loss_fn_config: Optional config (e.g., {"epsilon": 0.2} for PPO)
+            session_id: Optional session ID for stateless trainer pattern.
+                       If provided, loads session state before forward pass.
 
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
         self._touch()
+
+        # Stateless trainer: load session state if session_id provided
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
         self.model.train()
         loss_fn_config = loss_fn_config or {}
 
@@ -288,9 +514,10 @@ class TrainingWorker:
                 log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)
                 target_logprobs = log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
 
+                logprobs_list = target_logprobs.detach().tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": target_logprobs.detach().tolist(),
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                 })
 
             elif loss_fn in ("importance_sampling", "ppo"):
@@ -366,9 +593,10 @@ class TrainingWorker:
                 total_ratio += masked_ratio.item()
                 num_rl_samples += 1
 
+                rl_logprobs_list = new_logprobs.detach().tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": new_logprobs.detach().tolist(),
+                    "logprobs": {"data": rl_logprobs_list, "shape": [len(rl_logprobs_list)], "dtype": "float32"},
                 })
 
             else:
@@ -403,7 +631,7 @@ class TrainingWorker:
             "metrics": metrics,
         }
 
-    def forward(self, data_items: list[dict]) -> dict:
+    def forward(self, data_items: list[dict], session_id: str | None = None) -> dict:
         """Forward pass only (no backward). Returns logprobs.
 
         Same input format as forward_backward but skips gradient computation.
@@ -414,11 +642,18 @@ class TrainingWorker:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
                 - loss_fn_inputs.weights: per-token weights (float)
+            session_id: Optional session ID for stateless trainer pattern.
+                       If provided, loads session state before forward pass.
 
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
         """
         self._touch()
+
+        # Stateless trainer: load session state if session_id provided
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
         self.model.eval()
 
         total_loss = 0.0
@@ -496,10 +731,11 @@ class TrainingWorker:
                 total_loss += item_loss * num_weighted.item()
                 total_tokens += num_weighted.item()
 
-                # Return logprobs in loss_fn_outputs
+                # Return logprobs in loss_fn_outputs (TensorData format required by Tinker SDK)
+                logprobs_list = target_logprobs.tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": target_logprobs.tolist(),
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                 })
 
         avg_loss = total_loss / max(total_tokens, 1)
@@ -535,16 +771,23 @@ class TrainingWorker:
             "unk_token_id": self.tokenizer.unk_token_id,
         }
 
-    def optim_step(self, learning_rate: float | None) -> dict:
+    def optim_step(self, learning_rate: float | None, session_id: str | None = None) -> dict:
         """Optimizer update step.
 
         Args:
             learning_rate: Optional new learning rate.
+            session_id: Optional session ID for stateless trainer pattern.
+                       If provided, saves session state after optimizer step.
 
         Returns:
             Dict with metrics.
         """
         self._touch()
+
+        # Stateless trainer: ensure session state is loaded
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
         # Update learning rate if provided
         if learning_rate is not None:
             for pg in self.optimizer.param_groups:
@@ -555,6 +798,10 @@ class TrainingWorker:
         self.optimizer.zero_grad()
 
         self._step_count += 1
+
+        # Stateless trainer: save session state after update
+        if session_id:
+            self._save_session_state(session_id)
 
         logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
@@ -833,6 +1080,73 @@ class TrainingWorker:
 
         return {"status": "ok", "learning_rate": learning_rate}
 
+    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+        """Reinitialize LoRA weights AND optimizer state for fresh session.
+
+        Uses standard initialization:
+        - lora_A: xavier_uniform
+        - lora_B: zeros
+
+        Also resets Adam optimizer state to prevent momentum from previous
+        sessions affecting new training.
+
+        Args:
+            learning_rate: New learning rate. If provided, updates param_groups.
+
+        Returns:
+            dict with reinit_count, opt_state_reset, lr_updated.
+        """
+        import torch.nn.init as init
+
+        reinit_count = 0
+        opt_state_reset = 0
+        lr_updated = False
+
+        # Find and reinitialize all LoRA parameters
+        for name, param in self.model.named_parameters():
+            name_lower = name.lower()
+            if 'lora' not in name_lower:
+                continue
+            if not param.requires_grad:
+                continue
+
+            is_lora_a = 'lora_a' in name_lower
+            is_lora_b = 'lora_b' in name_lower
+
+            if is_lora_a:
+                init.xavier_uniform_(param.data)
+                reinit_count += 1
+            elif is_lora_b:
+                init.zeros_(param.data)
+                reinit_count += 1
+
+        # Update learning rate
+        if learning_rate is not None:
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
+            lr_updated = True
+            logger.info(f"[TrainingWorker] Set learning rate to {learning_rate}")
+
+        # Zero gradients
+        self.optimizer.zero_grad()
+
+        # Reset optimizer state (momentum/variance)
+        opt_state_reset = len(self.optimizer.state)
+        self.optimizer.state.clear()
+        logger.info(f"[TrainingWorker] Reset optimizer state ({opt_state_reset} entries)")
+
+        # Reset step count
+        self._step_count = 0
+
+        logger.info(f"[TrainingWorker] Reinitialized {reinit_count} LoRA params")
+        return {
+            "status": "ok",
+            "reinit_count": reinit_count,
+            "opt_state_reset": opt_state_reset,
+            "lr_updated": lr_updated,
+            "learning_rate": learning_rate,
+        }
+
     def get_session_info(self) -> dict:
         """Get current session info for diagnostics.
 
@@ -1019,12 +1333,12 @@ class VerlTrainingEngine:
             base_model = requested_model
 
         if use_megatron:
-            # MoE models (30B+) need tensor + expert parallelism to fit model+optimizer
-            # 30B MoE with TP=4: ~76 GiB/GPU for model+gradients, no room for optimizer
-            # TP=4, EP=2 = 8 GPUs: distributes optimizer state, ~38 GiB/GPU
+            # MoE models (30B+) need tensor parallelism to fit model
+            # TP=4, EP=1 = 4 GPUs: all experts on each GPU, model sharded across 4 GPUs
+            # With param_offload=True, this fits in 4x 80GB A100s
             distributed_config = DistributedConfig(
                 tensor_parallel_size=4,
-                expert_parallel_size=2,
+                expert_parallel_size=1,  # Changed from 2 to 1 (cluster has 4 GPUs)
             )
             logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size}, EP={distributed_config.expert_parallel_size})")
 
@@ -1050,6 +1364,14 @@ class VerlTrainingEngine:
                 session_id=session.session_id,
             )
             worker = entry.actor
+
+            # Reinitialize LoRA weights for fresh session (statelessness)
+            # This ensures each new session starts with fresh random weights
+            # instead of inheriting trained weights from previous session
+            logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
+            import ray
+            result = ray.get(worker.reinit_lora_weights.remote(session.learning_rate))
+            logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
             # Update pool entry with current session
             entry.current_session = session.session_id
@@ -1088,8 +1410,10 @@ class VerlTrainingEngine:
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
 
-        # Remote call
-        result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
+        # Remote call - pass session_id for stateless trainer pattern
+        result = await worker.forward_backward.remote(
+            data_items, loss_fn, loss_fn_config, session.session_id
+        )
 
         # Update session state
         session.accumulated_gradients += 1
@@ -1118,8 +1442,8 @@ class VerlTrainingEngine:
         # ForwardRequest uses forward_input (not forward_backward_input)
         data_items = [item.model_dump() for item in request.forward_input.data]
 
-        # Remote call
-        result = await worker.forward.remote(data_items)
+        # Remote call - pass session_id for stateless trainer pattern
+        result = await worker.forward.remote(data_items, session.session_id)
 
         logger.info(f"[{model_id}] forward completed")
         return result
@@ -1163,8 +1487,8 @@ class VerlTrainingEngine:
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
 
-        # Remote call
-        result = await worker.optim_step.remote(lr)
+        # Remote call - pass session_id for stateless trainer pattern
+        result = await worker.optim_step.remote(lr, session.session_id)
 
         # Update session state
         session.current_step += 1
@@ -1213,8 +1537,11 @@ class VerlTrainingEngine:
             result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
-            fb_result = await worker.forward_backward.remote(data_items, loss_fn, loss_fn_config)
-            opt_result = await worker.optim_step.remote(lr)
+            # Pass session_id for stateless trainer pattern
+            fb_result = await worker.forward_backward.remote(
+                data_items, loss_fn, loss_fn_config, session.session_id
+            )
+            opt_result = await worker.optim_step.remote(lr, session.session_id)
 
             # Merge results
             result = fb_result.copy()
@@ -1499,8 +1826,15 @@ class DenseTrainerPool:
         """Get idle actors sorted by last access time (LRU first).
 
         Must be called with lock held.
+
+        An actor is evictable if:
+        1. It is idle (no active session)
+        2. It has been idle longer than MIN_ACTOR_AGE
+
+        Note: We use idle_time() (time since last access) rather than age()
+        (time since creation) to protect recently-active actors from eviction.
         """
-        idle = [e for e in self._actors.values() if e.is_idle() and e.age() > self.MIN_ACTOR_AGE]
+        idle = [e for e in self._actors.values() if e.is_idle() and e.idle_time() > self.MIN_ACTOR_AGE]
         return sorted(idle, key=lambda e: e.last_accessed)
 
     def _evict_for_gpus(self, needed_gpus: int, save_state: bool = True) -> int:
@@ -1576,17 +1910,41 @@ class DenseTrainerPool:
             # Return existing actor if available
             if key in self._actors:
                 entry = self._actors[key]
-                if lora_rank > entry.max_lora_rank:
-                    raise ValueError(
-                        f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
-                        f"Kill the actor and restart with higher max_lora_rank."
+
+                # Check if actor is still alive (may have self-terminated due to idle timeout)
+                try:
+                    ray.get(entry.actor.heartbeat.remote(), timeout=5)
+                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor for {base_model} is dead (idle timeout?), removing from pool"
                     )
-                entry.touch()  # Phase 9: Update LRU
-                logger.info(
-                    f"[DenseTrainerPool] Reusing existing actor for {base_model} "
-                    f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
-                )
-                return entry
+                    self._actors.pop(key, None)
+                    # Also remove from unified resource pool
+                    from tinker_server.backend.resource_pool import get_resource_pool
+                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                    resource_pool = get_resource_pool()
+                    resource_pool.unregister(actor_name)
+                    # Fall through to create new actor
+                else:
+                    if lora_rank > entry.max_lora_rank:
+                        raise ValueError(
+                            f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
+                            f"Kill the actor and restart with higher max_lora_rank."
+                        )
+                    entry.touch()  # Phase 9: Update LRU
+                    # Also update unified resource pool
+                    from tinker_server.backend.resource_pool import get_resource_pool
+                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                    resource_pool = get_resource_pool()
+                    pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                    if pool_entry:
+                        pool_entry.current_session = session_id
+
+                    logger.info(
+                        f"[DenseTrainerPool] Reusing existing actor for {base_model} "
+                        f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
+                    )
+                    return entry
 
             # Create new actor with max rank
             effective_max_rank = max(
@@ -1595,10 +1953,16 @@ class DenseTrainerPool:
                 self.DEFAULT_MAX_LORA_RANK,
             )
             actor_name = self._make_actor_name(base_model, effective_max_rank)
+            num_gpus = self.DEFAULT_NUM_GPUS  # 1 GPU for dense models
             logger.info(
                 f"[DenseTrainerPool] Creating new actor: {actor_name} for {base_model}, "
-                f"max_rank={effective_max_rank}"
+                f"max_rank={effective_max_rank}, gpus={num_gpus}"
             )
+
+            # Phase 9: Check available GPUs and evict LRU actors if necessary
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            resource_pool = get_resource_pool()
+            resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists
             try:
@@ -1643,6 +2007,18 @@ class DenseTrainerPool:
                 actual_rank=lora_rank,
             )
             self._actors[key] = entry
+
+            # Register with unified resource pool for LRU tracking
+            resource_pool.register(
+                actor_name=actor_name,
+                actor_type=ActorType.DENSE,
+                num_gpus=self.DEFAULT_NUM_GPUS,
+                actor_handle=actor,
+                namespace=PERSISTENT_DENSE_NAMESPACE,
+                base_model=base_model,
+                session_id=session_id,
+            )
+
             return entry
 
     def remove(self, base_model: str, kill_actor: bool = True) -> bool:

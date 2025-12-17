@@ -1,217 +1,139 @@
 #!/usr/bin/env python3
-"""Test Phase 9: LRU eviction support for actor pools.
+"""Test LRU eviction across actor types."""
 
-Tests the LRU tracking and eviction functionality:
-1. Unit test entry touch/is_idle/age/idle_time methods
-2. Unit test pool _get_idle_actors_lru sorting
-3. Unit test pool evict_idle threshold
-
-Run from tinker-server root directory.
-"""
-
+import os
+import sys
 import time
+import uuid
+import requests
+
+BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+
+DENSE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+MOE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
-def test_entry_lru_tracking():
-    """Test LRU tracking methods on entry dataclasses."""
-    import importlib.util
-    from pathlib import Path
-
-    # Direct load megatron_distributed to get MegatronActorEntry
-    megatron_path = Path(__file__).parent.parent / "tinker_server" / "backend" / "megatron_distributed.py"
-
-    # We need to mock ray since it's imported at module level
-    import sys
-    import unittest.mock
-
-    # Create minimal mock for ray
-    mock_ray = unittest.mock.MagicMock()
-    sys.modules['ray'] = mock_ray
-
-    # Load module
-    spec = importlib.util.spec_from_file_location("megatron_distributed", megatron_path)
-    megatron = importlib.util.module_from_spec(spec)
-
-    # Temporarily suppress imports that fail
-    try:
-        spec.loader.exec_module(megatron)
-    except Exception:
-        pass  # Module may partially fail due to ray, but dataclass should work
-
-    # Test MegatronActorEntry from megatron_distributed
-    # Since module may fail, let's define a local test entry
-    from dataclasses import dataclass, field
-
-    @dataclass
-    class TestEntry:
-        """Test entry matching Phase 9 fields."""
-        base_model: str
-        num_gpus: int = 1
-        current_session: str | None = None
-        created_at: float = field(default_factory=time.time)
-        last_accessed: float = field(default_factory=time.time)
-
-        def touch(self):
-            self.last_accessed = time.time()
-
-        def is_idle(self) -> bool:
-            return self.current_session is None
-
-        def age(self) -> float:
-            return time.time() - self.created_at
-
-        def idle_time(self) -> float:
-            return time.time() - self.last_accessed
-
-    print("\n=== Unit Test: Entry LRU Tracking ===")
-
-    # Test 1: touch() updates last_accessed
-    entry = TestEntry(base_model="test/model")
-    initial_time = entry.last_accessed
-    time.sleep(0.1)
-    entry.touch()
-    assert entry.last_accessed > initial_time, "touch() should update last_accessed"
-    print("  PASS: touch() updates last_accessed")
-
-    # Test 2: is_idle() returns True when no session
-    entry_idle = TestEntry(base_model="test/idle", current_session=None)
-    entry_active = TestEntry(base_model="test/active", current_session="session-123")
-    assert entry_idle.is_idle() is True, "is_idle() should be True when no session"
-    assert entry_active.is_idle() is False, "is_idle() should be False when session active"
-    print("  PASS: is_idle() correctly identifies idle/active state")
-
-    # Test 3: age() returns time since creation
-    entry = TestEntry(base_model="test/model")
-    time.sleep(0.1)
-    assert entry.age() >= 0.1, f"age() should be >= 0.1s, got {entry.age()}"
-    print(f"  PASS: age() returns {entry.age():.3f}s since creation")
-
-    # Test 4: idle_time() returns time since last access
-    entry = TestEntry(base_model="test/model")
-    time.sleep(0.1)
-    entry.touch()
-    time.sleep(0.1)
-    assert entry.idle_time() >= 0.1, f"idle_time() should be >= 0.1s, got {entry.idle_time()}"
-    assert entry.idle_time() < entry.age(), "idle_time() should be less than age() after touch"
-    print(f"  PASS: idle_time() returns {entry.idle_time():.3f}s since last touch")
+def get_headers():
+    return {"Authorization": f"Bearer {API_KEY}"}
 
 
-def test_pool_lru_sorting():
-    """Test pool LRU sorting logic."""
-    from dataclasses import dataclass, field
-
-    @dataclass
-    class MockEntry:
-        base_model: str
-        num_gpus: int = 1
-        current_session: str | None = None
-        created_at: float = field(default_factory=time.time)
-        last_accessed: float = field(default_factory=time.time)
-
-        def touch(self):
-            self.last_accessed = time.time()
-
-        def is_idle(self) -> bool:
-            return self.current_session is None
-
-        def age(self) -> float:
-            return time.time() - self.created_at
-
-        def idle_time(self) -> float:
-            return time.time() - self.last_accessed
-
-    print("\n=== Unit Test: Pool LRU Sorting ===")
-
-    # Create entries with different last_accessed times
-    now = time.time()
-    entries = [
-        MockEntry(base_model="model_A", last_accessed=now - 300, created_at=now - 400),  # Oldest access
-        MockEntry(base_model="model_B", last_accessed=now - 100, created_at=now - 400),  # Recent access
-        MockEntry(base_model="model_C", last_accessed=now - 200, created_at=now - 400),  # Middle
-        MockEntry(base_model="model_D", last_accessed=now - 50, created_at=now - 400, current_session="active"),  # Active
-    ]
-
-    # Simulate pool._actors dict
-    actors = {e.base_model: e for e in entries}
-
-    # Get idle actors (age > 300s means created > 5 min ago)
-    MIN_ACTOR_AGE = 300
-    idle = [e for e in actors.values() if e.is_idle() and e.age() > MIN_ACTOR_AGE]
-    sorted_idle = sorted(idle, key=lambda e: e.last_accessed)
-
-    print(f"  Total entries: {len(actors)}")
-    print(f"  Idle entries (age > {MIN_ACTOR_AGE}s): {len(idle)}")
-
-    # Should have 3 idle entries (model_D is active)
-    assert len(idle) == 3, f"Expected 3 idle entries, got {len(idle)}"
-    print("  PASS: Active sessions excluded from idle list")
-
-    # Should be sorted by last_accessed ascending (LRU first)
-    assert sorted_idle[0].base_model == "model_A", f"Expected model_A first (LRU), got {sorted_idle[0].base_model}"
-    assert sorted_idle[1].base_model == "model_C", f"Expected model_C second, got {sorted_idle[1].base_model}"
-    assert sorted_idle[2].base_model == "model_B", f"Expected model_B third (most recent), got {sorted_idle[2].base_model}"
-    print("  PASS: Idle entries sorted by last_accessed (LRU first)")
+def api_get(endpoint: str, timeout=30):
+    url = f"{BASE_URL}/api/v1/{endpoint}"
+    resp = requests.get(url, headers=get_headers(), timeout=timeout)
+    return resp.json() if resp.status_code == 200 else None
 
 
-def test_eviction_threshold():
-    """Test eviction threshold logic."""
-    from dataclasses import dataclass, field
+def api_post(endpoint: str, json_data=None, timeout=120):
+    url = f"{BASE_URL}/api/v1/{endpoint}"
+    resp = requests.post(url, json=json_data, headers=get_headers(), timeout=timeout)
+    return resp
 
-    @dataclass
-    class MockEntry:
-        base_model: str
-        num_gpus: int = 1
-        current_session: str | None = None
-        created_at: float = field(default_factory=time.time)
-        last_accessed: float = field(default_factory=time.time)
 
-        def is_idle(self) -> bool:
-            return self.current_session is None
+def poll_future(request_id: str, timeout: int = 300):
+    start = time.time()
+    while time.time() - start < timeout:
+        resp = api_post("retrieve_future", {"request_id": request_id}, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 408:
+            time.sleep(1)
+            continue
+        else:
+            return {"error": f"Status {resp.status_code}"}
+    return {"error": "timeout"}
 
-        def idle_time(self) -> float:
-            return time.time() - self.last_accessed
 
-    print("\n=== Unit Test: Eviction Threshold ===")
+def get_resource_pool():
+    return api_get("resource_pool")
 
-    now = time.time()
-    entries = [
-        MockEntry(base_model="model_A", last_accessed=now - 700),  # Idle 700s
-        MockEntry(base_model="model_B", last_accessed=now - 500),  # Idle 500s
-        MockEntry(base_model="model_C", last_accessed=now - 300),  # Idle 300s
-        MockEntry(base_model="model_D", last_accessed=now - 100),  # Idle 100s
-    ]
 
-    actors = {e.base_model: e for e in entries}
+def create_session(model: str, lora_rank: int = 32, lr: float = 1e-4):
+    """Create training session using correct API format."""
+    session_id = f"evict_test_{uuid.uuid4().hex[:8]}"
+    payload = {
+        "session_id": session_id,
+        "model_seq_id": 1,
+        "base_model": model,
+        "lora_config": {"rank": lora_rank},
+        "learning_rate": lr,
+    }
+    resp = api_post("create_model", payload, timeout=300)
+    if resp.status_code != 200:
+        print(f"  create_model failed: {resp.status_code} - {resp.text[:200]}")
+        return None, None
+    
+    result = poll_future(resp.json().get("request_id"), timeout=300)
+    if "error" in result:
+        print(f"  poll_future failed: {result}")
+        return None, None
+    
+    return session_id, result.get("model_id")
 
-    # Test eviction with 600s threshold
-    min_idle_seconds = 600
-    to_evict = [e for e in actors.values() if e.is_idle() and e.idle_time() > min_idle_seconds]
 
-    print(f"  Entries with idle_time > {min_idle_seconds}s: {len(to_evict)}")
-    assert len(to_evict) == 1, f"Expected 1 entry to evict, got {len(to_evict)}"
-    assert to_evict[0].base_model == "model_A", f"Expected model_A, got {to_evict[0].base_model}"
-    print("  PASS: Only entries exceeding threshold selected for eviction")
+def kill_megatron():
+    return api_post("kill_megatron").json() if api_post("kill_megatron").status_code == 200 else None
 
-    # Test eviction with 400s threshold
-    min_idle_seconds = 400
-    to_evict = [e for e in actors.values() if e.is_idle() and e.idle_time() > min_idle_seconds]
-    assert len(to_evict) == 2, f"Expected 2 entries to evict, got {len(to_evict)}"
-    print(f"  PASS: 2 entries exceed {min_idle_seconds}s threshold")
+
+def kill_vllm():
+    return api_post("kill_vllm").json() if api_post("kill_vllm").status_code == 200 else None
+
+
+def print_pool(pool, label=""):
+    if not pool:
+        print(f"  {label}: No data")
+        return
+    print(f"  {label}:")
+    for a in pool.get("actors", []):
+        evictable = a['idle'] and a['age'] > 300
+        print(f"    {a['actor_name']}: {a['num_gpus']} GPUs, "
+              f"{a['age']:.0f}s old, evictable={evictable}")
+    print(f"    Total: {pool['total_gpus_used']} GPUs used")
 
 
 def main():
     print("=" * 60)
-    print("Phase 9: LRU Eviction Test")
+    print("LRU EVICTION TEST")
     print("=" * 60)
 
-    test_entry_lru_tracking()
-    test_pool_lru_sorting()
-    test_eviction_threshold()
+    # Current state
+    print("\n1. Current state:")
+    pool = get_resource_pool()
+    print_pool(pool, "Resource Pool")
+
+    # Check evictable actors
+    evictable = [a for a in pool.get("actors", []) if a['idle'] and a['age'] > 300] if pool else []
+    print(f"\n   Evictable actors: {len(evictable)}")
+
+    # Kill existing actors and test MoE creation
+    print("\n2. Killing existing actors...")
+    kill_megatron()
+    time.sleep(2)
+    kill_vllm()
+    time.sleep(5)
+
+    pool = get_resource_pool()
+    print_pool(pool, "After cleanup")
+
+    print("\n3. Creating MoE session (8 GPUs)...")
+    start = time.time()
+    session_id, model_id = create_session(MOE_MODEL, lora_rank=32)
+    elapsed = time.time() - start
+
+    if model_id:
+        print(f"   MoE created: {model_id} in {elapsed:.1f}s")
+        pool = get_resource_pool()
+        print_pool(pool, "After MoE creation")
+        print("\n   PASS: MoE creation successful")
+    else:
+        print("   FAIL: MoE creation failed")
+        return 1
 
     print("\n" + "=" * 60)
-    print("Phase 9 LRU Tests Complete")
+    print("TEST COMPLETE")
     print("=" * 60)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

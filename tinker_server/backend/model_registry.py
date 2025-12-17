@@ -16,46 +16,58 @@ class ModelConfig:
         return self.recommended_tp * self.recommended_dp
 
 
-# Model-specific parallelism configurations
+# Supported models - only these are allowed
 MODEL_CONFIGS = {
-    # Dense models - Qwen2.5 series
-    "Qwen/Qwen2.5-0.5B-Instruct": ModelConfig(False, 1, 1),
-    "Qwen/Qwen2.5-1.5B-Instruct": ModelConfig(False, 1, 1),
-    "Qwen/Qwen2.5-3B-Instruct": ModelConfig(False, 1, 1),
+    # Dense models
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(False, 1, 1),
-    "Qwen/Qwen2.5-14B-Instruct": ModelConfig(False, 2, 1),
-    "Qwen/Qwen2.5-32B-Instruct": ModelConfig(False, 2, 1),
-    "Qwen/Qwen2.5-72B-Instruct": ModelConfig(False, 4, 1),
-    # MoE models - Qwen3 series
-    # EP = TP * DP, so Qwen3-30B with TP=1, DP=4 -> EP=4
-    "Qwen/Qwen3-30B-A3B": ModelConfig(True, 1, 4),
-    "Qwen/Qwen3-30B-A3B-Instruct": ModelConfig(True, 1, 4),
-    # Qwen3-235B with TP=2, DP=4 -> EP=8
-    "Qwen/Qwen3-235B-A22B": ModelConfig(True, 2, 4),
-    "Qwen/Qwen3-235B-A22B-Instruct": ModelConfig(True, 2, 4),
+    "Qwen/Qwen3-0.6B": ModelConfig(False, 1, 1),
+    # MoE models (TP=4, DP=1 for vLLM LoRA support - EP not supported in vLLM 0.12.0)
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(True, 4, 1),
+    "Qwen/Qwen3-30B-A3B": ModelConfig(True, 4, 1),
+    "Qwen/Qwen3-30B-A3B-Base": ModelConfig(True, 4, 1),
 }
 
 
 def get_model_config(model_name: str) -> ModelConfig:
-    """Get config for model, with fallback heuristics.
+    """Get config for a supported model.
 
     Args:
-        model_name: HuggingFace model name or path
+        model_name: HuggingFace model name (e.g., "Qwen/Qwen3-0.6B")
 
     Returns:
         ModelConfig with parallelism recommendations
+
+    Raises:
+        ValueError: If model is not in the supported list
     """
     if model_name in MODEL_CONFIGS:
         return MODEL_CONFIGS[model_name]
 
-    # Extract short name for heuristic matching
-    short_name = model_name.split("/")[-1]
+    raise ValueError(
+        f"Unsupported model: {model_name}. "
+        f"Supported models: {list(MODEL_CONFIGS.keys())}"
+    )
 
-    # Detect MoE from naming pattern "XXB-AXXB" (activated params suffix)
-    if "-A" in short_name:
-        return ModelConfig(True, 1, 4)  # Default MoE: TP=1, DP=4, EP=4
 
-    return ModelConfig(False, 1, 1)  # Default dense: single GPU
+def is_supported_model(model_name: str) -> bool:
+    """Check if a model is in the supported list."""
+    return model_name in MODEL_CONFIGS
+
+
+def is_moe_model(model_name: str) -> bool:
+    """Check if a model uses MoE architecture (requires Megatron backend).
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if model is MoE, False if dense
+
+    Raises:
+        ValueError: If model is not supported
+    """
+    config = get_model_config(model_name)
+    return config.is_moe
 
 
 def get_recommended_parallelism(model_name: str) -> tuple[int, int]:

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .multi_lora_engine import MultiLoRAInferenceEngine
+    from .multi_lora_engine import MultiLoRAInferenceEngine, MultiModelInferenceManager
     from .verl_inference import VerlInferenceEngine
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class SessionInfo:
     is_shared: bool = False  # True for sessions using the shared engine
     uses_multi_lora: bool = False  # True if using MultiLoRAInferenceEngine
     uses_base_model: bool = False  # True if multi-LoRA without any LoRA adapter
+    base_model: str | None = None  # Base model name for multi-model support
 
 
 class SessionManager:
@@ -368,25 +369,79 @@ class SessionManager:
         return list(self._sessions.keys())
 
     # =========================================================================
-    # Multi-LoRA Mode Methods
+    # Multi-LoRA Mode Methods (Multi-Model Support)
     # =========================================================================
 
-    def set_multi_lora_engine(self, engine: "MultiLoRAInferenceEngine") -> None:
-        """Set the shared multi-LoRA inference engine.
+    def set_multi_model_manager(self, manager: "MultiModelInferenceManager") -> None:
+        """Set the multi-model inference manager.
 
         Args:
-            engine: The MultiLoRAInferenceEngine instance.
+            manager: The MultiModelInferenceManager instance.
         """
-        self._multi_lora_engine = engine
-        logger.info("Multi-LoRA engine set")
+        self._multi_model_manager = manager
+        logger.info("Multi-model inference manager set")
+
+    def get_multi_model_manager(self) -> "MultiModelInferenceManager | None":
+        """Get the multi-model inference manager."""
+        return getattr(self, "_multi_model_manager", None)
 
     def get_multi_lora_engine(self) -> "MultiLoRAInferenceEngine | None":
-        """Get the shared multi-LoRA inference engine."""
-        return getattr(self, "_multi_lora_engine", None)
+        """Get multi-LoRA engine for backward compatibility.
+
+        DEPRECATED: Use get_engine_for_session() instead.
+        Returns the first engine from multi-model manager, or None.
+        """
+        manager = self.get_multi_model_manager()
+        if manager is None:
+            return getattr(self, "_multi_lora_engine", None)
+        # Return first available engine for backward compatibility
+        models = manager.list_models()
+        if models:
+            return manager.get_engine_if_exists(models[0])
+        return None
+
+    async def get_engine_for_model(self, model_name: str) -> "MultiLoRAInferenceEngine":
+        """Get or create vLLM engine for a specific model.
+
+        Args:
+            model_name: HuggingFace model name (e.g., "Qwen/Qwen2.5-7B-Instruct")
+
+        Returns:
+            MultiLoRAInferenceEngine for the model.
+        """
+        manager = await self.ensure_multi_model_manager()
+        return await manager.get_engine(model_name)
+
+    def get_session_base_model(self, session_id: str) -> str | None:
+        """Get the base model for a session.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            Base model name, or None if session not found.
+        """
+        info = self._sessions.get(session_id)
+        return info.base_model if info else None
+
+    async def get_engine_for_session(self, session_id: str) -> "MultiLoRAInferenceEngine | None":
+        """Get vLLM engine for a session's model.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            MultiLoRAInferenceEngine for the session's model, or None if not found.
+        """
+        base_model = self.get_session_base_model(session_id)
+        if base_model is None:
+            return None
+        return await self.get_engine_for_model(base_model)
 
     def register_multi_lora_session(
         self,
         session_id: str,
+        base_model: str,
         lora_rank: int = 32,
     ) -> None:
         """Register a sampling session that uses the shared multi-LoRA engine.
@@ -395,17 +450,14 @@ class SessionManager:
 
         Args:
             session_id: Unique identifier for the sampling session.
+            base_model: Base model name for this session.
             lora_rank: LoRA rank for the adapter.
 
         Raises:
             ValueError: If session_id already exists.
-            RuntimeError: If multi-LoRA engine not set.
         """
         if session_id in self._sessions:
             raise ValueError(f"Session {session_id} already exists")
-
-        if not hasattr(self, "_multi_lora_engine") or self._multi_lora_engine is None:
-            raise RuntimeError("Multi-LoRA engine not set")
 
         self._sessions[session_id] = SessionInfo(
             engine=None,  # No per-session engine
@@ -413,9 +465,10 @@ class SessionManager:
             lora_rank=lora_rank,
             is_shared=True,
             uses_multi_lora=True,
+            base_model=base_model,
         )
         logger.info(
-            f"Registered multi-LoRA session {session_id} (lora_rank={lora_rank})"
+            f"Registered multi-LoRA session {session_id} (model={base_model}, lora_rank={lora_rank})"
         )
 
     def is_multi_lora_session(self, session_id: str) -> bool:
@@ -442,23 +495,20 @@ class SessionManager:
         info = self._sessions.get(session_id)
         return info is not None and info.uses_base_model
 
-    def register_base_model_session(self, session_id: str) -> None:
+    def register_base_model_session(self, session_id: str, base_model: str) -> None:
         """Register a sampling session that uses base model on multi-LoRA engine.
 
         The session will use the shared multi-LoRA engine without any LoRA adapter.
 
         Args:
             session_id: Unique identifier for the sampling session.
+            base_model: Base model name for this session.
 
         Raises:
             ValueError: If session_id already exists.
-            RuntimeError: If multi-LoRA engine not set.
         """
         if session_id in self._sessions:
             raise ValueError(f"Session {session_id} already exists")
-
-        if not hasattr(self, "_multi_lora_engine") or self._multi_lora_engine is None:
-            raise RuntimeError("Multi-LoRA engine not set")
 
         self._sessions[session_id] = SessionInfo(
             engine=None,  # No per-session engine
@@ -467,32 +517,53 @@ class SessionManager:
             is_shared=True,
             uses_multi_lora=True,
             uses_base_model=True,
+            base_model=base_model,
         )
-        logger.info(f"Registered base model session {session_id}")
+        logger.info(f"Registered base model session {session_id} (model={base_model})")
+
+    async def ensure_multi_model_manager(self) -> "MultiModelInferenceManager":
+        """Initialize multi-model manager if not already done.
+
+        Lazily creates the manager. Engines are created on-demand per model.
+
+        Returns:
+            The MultiModelInferenceManager instance.
+        """
+        if not hasattr(self, "_multi_model_manager") or self._multi_model_manager is None:
+            from .multi_lora_engine import MultiModelInferenceManager
+
+            logger.info("Initializing multi-model inference manager...")
+            self._multi_model_manager = MultiModelInferenceManager(
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                max_model_len=self.max_model_len,
+            )
+            logger.info("Multi-model inference manager initialized")
+
+        return self._multi_model_manager
 
     async def ensure_multi_lora_engine(self) -> "MultiLoRAInferenceEngine":
         """Initialize multi-LoRA engine if not already done.
 
-        Lazily creates and initializes the shared multi-LoRA engine.
-        This is called by create_sampling_session when using multi-LoRA mode.
+        DEPRECATED: Use ensure_multi_model_manager() and get_engine_for_model() instead.
+        For backward compatibility, uses self.model_path.
 
         Returns:
             The initialized MultiLoRAInferenceEngine instance.
         """
-        if not hasattr(self, "_multi_lora_engine") or self._multi_lora_engine is None:
-            from .multi_lora_engine import MultiLoRAInferenceEngine
+        # For backward compatibility, get engine for the configured model_path
+        # This is deprecated - callers should use get_engine_for_model() directly
+        manager = await self.ensure_multi_model_manager()
 
-            logger.info("Initializing multi-LoRA engine lazily...")
-            self._multi_lora_engine = MultiLoRAInferenceEngine(
-                model_path=self.model_path,
-                tensor_parallel_size=self.tensor_parallel_size,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                max_model_len=self.max_model_len,
-            )
-            await self._multi_lora_engine.initialize()
-            logger.info("Multi-LoRA engine initialized")
+        # Extract model name from path if needed
+        model_name = self.model_path
+        if "/" in model_name and "models--" in model_name:
+            # Extract from HuggingFace cache path like /path/models--Qwen--Qwen2.5-7B/...
+            parts = model_name.split("models--")
+            if len(parts) > 1:
+                model_part = parts[1].split("/")[0]  # "Qwen--Qwen2.5-7B"
+                model_name = model_part.replace("--", "/")  # "Qwen/Qwen2.5-7B"
 
-        return self._multi_lora_engine
+        return await manager.get_engine(model_name)
 
 
 # Global session manager (initialized in app lifespan)

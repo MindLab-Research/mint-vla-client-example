@@ -192,6 +192,7 @@ class MultiLoRAInferenceEngine:
         max_loras: int = DEFAULT_MAX_LORAS,
         max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
         max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
+        actor_name: str | None = None,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
@@ -201,6 +202,8 @@ class MultiLoRAInferenceEngine:
         self.max_loras = max_loras
         self.max_cpu_loras = max_cpu_loras
         self.max_lora_rank = max_lora_rank
+        # Custom actor name for multi-model support (one actor per base model)
+        self.actor_name = actor_name or PERSISTENT_VLLM_ACTOR_NAME
 
         self.registry = LoRARegistry()
         self.server = None
@@ -225,20 +228,35 @@ class MultiLoRAInferenceEngine:
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
             # We must verify the actor is alive by calling a method on it
             try:
-                self.server = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
+                self.server = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 # Health check: try calling a method to verify actor is alive
                 # This will raise RayActorError if actor is dead
                 try:
                     ray.get(self.server.__ray_ready__.remote(), timeout=5)
                     logger.info(
-                        f"Connected to existing persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}"
+                        f"Connected to existing persistent vLLM actor: {self.actor_name}"
                     )
                     self._initialized = True
+
+                    # Register existing actor with resource pool for LRU tracking
+                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                    total_gpus = self.tensor_parallel_size * self.data_parallel_size
+                    resource_pool = get_resource_pool()
+                    logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool")
+                    resource_pool.register(
+                        actor_name=self.actor_name,
+                        actor_type=ActorType.VLLM,
+                        num_gpus=total_gpus,
+                        actor_handle=self.server,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=self.model_path,
+                    )
+                    logger.info(f"[DEBUG] ResourcePool now has {len(resource_pool._entries)} entries")
                     return
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive, need to create new one
                     logger.warning(
-                        f"vLLM actor {PERSISTENT_VLLM_ACTOR_NAME} is dead/unresponsive, creating new one"
+                        f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
                     )
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
@@ -246,7 +264,7 @@ class MultiLoRAInferenceEngine:
             except ValueError:
                 # Actor doesn't exist, create new one
                 logger.info(
-                    f"No existing vLLM actor found, creating new detached actor: {PERSISTENT_VLLM_ACTOR_NAME}"
+                    f"No existing vLLM actor found, creating new detached actor: {self.actor_name}"
                 )
 
             from verl.workers.config import HFModelConfig, RolloutConfig
@@ -324,7 +342,7 @@ class MultiLoRAInferenceEngine:
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
-                name=PERSISTENT_VLLM_ACTOR_NAME,
+                name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
                 runtime_env={
@@ -349,7 +367,19 @@ class MultiLoRAInferenceEngine:
             # Note: await on ObjectRef doesn't work - must use ray.get()
             ray.get(self.server.launch_server.remote())
             self._initialized = True
-            logger.info("MultiLoRAInferenceEngine initialized (detached actor)")
+            logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
+
+            # Register with unified resource pool for LRU tracking
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            resource_pool = get_resource_pool()
+            resource_pool.register(
+                actor_name=self.actor_name,
+                actor_type=ActorType.VLLM,
+                num_gpus=total_gpus,
+                actor_handle=self.server,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=self.model_path,
+            )
 
     async def add_lora_for_session(
         self,
@@ -575,6 +605,134 @@ class MultiLoRAInferenceEngine:
         logger.info("MultiLoRAInferenceEngine disconnected")
 
 
+def _model_to_actor_name(model_name: str) -> str:
+    """Convert model name to a valid Ray actor name.
+
+    Examples:
+        "Qwen/Qwen2.5-7B-Instruct" -> "tinker_vllm_qwen2.5-7b-instruct"
+        "Qwen/Qwen3-30B-A3B-Instruct-2507" -> "tinker_vllm_qwen3-30b-a3b-instruct-2507"
+    """
+    # Extract model part after "/"
+    if "/" in model_name:
+        model_part = model_name.split("/")[-1]
+    else:
+        model_part = model_name
+    # Lowercase and replace invalid chars
+    safe_name = model_part.lower().replace(" ", "_")
+    return f"tinker_vllm_{safe_name}"
+
+
+def _resolve_model_path(model_name: str) -> str:
+    """Resolve model name to full path on PFS.
+
+    Uses cached paths for known models.
+    """
+    # Map of model names to local paths
+    MODEL_PATHS = {
+        # Dense models
+        "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
+        "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+        # MoE models (all share same architecture, different checkpoints)
+        "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
+        "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
+        "Qwen/Qwen3-30B-A3B-Base": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/main",
+    }
+
+    if model_name in MODEL_PATHS:
+        return MODEL_PATHS[model_name]
+
+    # Fall back to model name as path
+    return model_name
+
+
+class MultiModelInferenceManager:
+    """Manages multiple vLLM engines, one per base model.
+
+    Provides dynamic engine creation based on model name.
+    Each base model gets its own persistent vLLM actor.
+    """
+
+    def __init__(
+        self,
+        gpu_memory_utilization: float = 0.85,
+        max_model_len: int | None = None,
+        max_loras: int = DEFAULT_MAX_LORAS,
+        max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
+        max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
+    ):
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        self.max_loras = max_loras
+        self.max_cpu_loras = max_cpu_loras
+        self.max_lora_rank = max_lora_rank
+
+        # Dict of model_name -> engine
+        self._engines: dict[str, MultiLoRAInferenceEngine] = {}
+        self._init_lock = asyncio.Lock()
+
+    async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
+        """Get or create engine for a model.
+
+        Args:
+            model_name: HuggingFace model name (e.g., "Qwen/Qwen2.5-7B-Instruct")
+
+        Returns:
+            Initialized MultiLoRAInferenceEngine for the model.
+        """
+        async with self._init_lock:
+            if model_name in self._engines:
+                return self._engines[model_name]
+
+            # Get model config for parallelism settings
+            from tinker_server.backend.model_registry import get_model_config
+            config = get_model_config(model_name)
+
+            # Create unique actor name for this model
+            actor_name = _model_to_actor_name(model_name)
+            model_path = _resolve_model_path(model_name)
+
+            logger.info(
+                f"Creating vLLM engine for model {model_name}: "
+                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}"
+            )
+
+            engine = MultiLoRAInferenceEngine(
+                model_path=model_path,
+                tensor_parallel_size=config.recommended_tp,
+                data_parallel_size=config.recommended_dp,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                max_model_len=self.max_model_len,
+                max_loras=self.max_loras,
+                max_cpu_loras=self.max_cpu_loras,
+                max_lora_rank=self.max_lora_rank,
+                actor_name=actor_name,
+            )
+            await engine.initialize()
+
+            self._engines[model_name] = engine
+            logger.info(f"Engine created for {model_name}")
+            return engine
+
+    def get_engine_if_exists(self, model_name: str) -> MultiLoRAInferenceEngine | None:
+        """Get engine for model if already created, None otherwise."""
+        return self._engines.get(model_name)
+
+    async def shutdown_all(self, kill_actors: bool = False) -> None:
+        """Shutdown all engines.
+
+        Args:
+            kill_actors: If True, kill the persistent actors. If False, just disconnect.
+        """
+        for model_name, engine in self._engines.items():
+            logger.info(f"Shutting down engine for {model_name}")
+            await engine.shutdown(kill_actor=kill_actors)
+        self._engines.clear()
+
+    def list_models(self) -> list[str]:
+        """List all models with active engines."""
+        return list(self._engines.keys())
+
+
 def kill_persistent_vllm_actor() -> bool:
     """Kill the persistent vLLM actor if it exists.
 
@@ -584,6 +742,8 @@ def kill_persistent_vllm_actor() -> bool:
     Returns:
         True if actor was killed, False if not found.
     """
+    from tinker_server.backend.resource_pool import get_resource_pool
+
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
@@ -591,6 +751,11 @@ def kill_persistent_vllm_actor() -> bool:
         actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
         ray.kill(actor)
         logger.info(f"Killed persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}")
+
+        # Unregister from resource pool
+        resource_pool = get_resource_pool()
+        resource_pool.unregister(PERSISTENT_VLLM_ACTOR_NAME)
+
         return True
     except ValueError:
         logger.info(f"No persistent vLLM actor found: {PERSISTENT_VLLM_ACTOR_NAME}")

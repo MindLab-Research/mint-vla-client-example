@@ -68,10 +68,10 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         for i in range(request.num_samples):
             if is_multi_lora:
                 # Multi-LoRA mode: handles both LoRA and base model sessions
-                # generate() internally checks if session has LoRA registered
-                multi_lora_engine = session_manager.get_multi_lora_engine()
+                # Get engine for this session's model (dynamically creates if needed)
+                multi_lora_engine = await session_manager.get_engine_for_session(session_id)
                 if multi_lora_engine is None:
-                    raise RuntimeError("Multi-LoRA engine not initialized")
+                    raise RuntimeError(f"No engine found for session {session_id}")
 
                 result = await multi_lora_engine.generate(
                     sampling_session_id=session_id,
@@ -130,7 +130,11 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
             # compute_logprobs returns len(sequence)-1 values: logprobs[i] = log P(token[i+1] | token[0:i+1])
             # The API expects len(sequence) values with prompt_logprobs[0] as placeholder (no conditioning)
             if is_multi_lora:
-                computed_logprobs = await multi_lora_engine.compute_logprobs(
+                # Get engine for session (already fetched above, but refetch to ensure exists)
+                engine_for_logprobs = await session_manager.get_engine_for_session(session_id)
+                if engine_for_logprobs is None:
+                    raise RuntimeError(f"No engine found for session {session_id}")
+                computed_logprobs = await engine_for_logprobs.compute_logprobs(
                     sampling_session_id=session_id,
                     prompt_ids=token_ids,
                     request_id=f"{request_id}_prompt_logprobs",
@@ -182,10 +186,10 @@ async def _do_compute_logprobs(
 
         if is_multi_lora:
             # Multi-LoRA mode: handles both LoRA and base model sessions
-            # compute_logprobs() internally checks if session has LoRA registered
-            multi_lora_engine = session_manager.get_multi_lora_engine()
+            # Get engine for this session's model (dynamically creates if needed)
+            multi_lora_engine = await session_manager.get_engine_for_session(session_id)
             if multi_lora_engine is None:
-                raise RuntimeError("Multi-LoRA engine not initialized")
+                raise RuntimeError(f"No engine found for session {session_id}")
 
             logprobs = await multi_lora_engine.compute_logprobs(
                 sampling_session_id=session_id,

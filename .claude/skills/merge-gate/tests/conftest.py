@@ -15,6 +15,7 @@ BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 
 DENSE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DENSE_SMALL_MODEL = "Qwen/Qwen3-0.6B"
 MOE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
@@ -26,12 +27,19 @@ def get_headers():
 # API Helpers
 # =============================================================================
 
-def poll_future(request_id: str, timeout: int = 300) -> dict:
-    """Poll for async operation result."""
+def poll_future(request_id: str, timeout: int = 300, request_timeout: int = 120) -> dict:
+    """Poll for async operation result.
+
+    Args:
+        request_id: The async request ID to poll.
+        timeout: Total timeout in seconds for the polling loop.
+        request_timeout: Per-request HTTP timeout. Set to 120s to accommodate
+            vLLM MoE model initialization which takes ~62+ seconds.
+    """
     poll_url = f"{BASE_URL}/api/v1/retrieve_future"
     start = time.time()
     while time.time() - start < timeout:
-        resp = requests.post(poll_url, json={"request_id": request_id}, headers=get_headers(), timeout=30)
+        resp = requests.post(poll_url, json={"request_id": request_id}, headers=get_headers(), timeout=request_timeout)
         if resp.status_code == 200:
             return resp.json()
         elif resp.status_code == 408:
@@ -140,14 +148,26 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 def tokenizer():
     """Get tokenizer for Dense model."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True, local_files_only=True)
 
 
 @pytest.fixture(scope="module")
 def moe_tokenizer():
     """Get tokenizer for MoE model."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True)
+    import os
+    # Use HF model ID with local_files_only=True to load from HF cache
+    # Set HF_HOME to ensure correct cache location
+    os.environ["HF_HOME"] = "/vePFS-Mindverse/share/huggingface"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True, local_files_only=True)
+
+
+@pytest.fixture(scope="module")
+def small_tokenizer():
+    """Get tokenizer for small Dense model (Qwen3-0.6B)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True, local_files_only=True)
 
 
 @pytest.fixture

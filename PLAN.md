@@ -19,7 +19,7 @@
 | MoE model training (Qwen3-30B-A3B) | Verified |
 | Multi-session actor sharing | Verified |
 | Unified rank support (max-rank padding) | Verified |
-| LRU-based actor eviction | Implemented |
+| LRU-based actor eviction | Verified (unified ResourcePool with cross-actor LRU) |
 | LoRA hot-swap to vLLM | Verified (0.16s extraction + 2.2s inference) |
 
 ---
@@ -32,8 +32,8 @@
 
 | Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
 |-------|------|--------------|------------|------------|-------|
-| Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | |
-| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | |
+| Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** |
 | moonshotai/Kimi-K2-Thinking | Reasoning | MoE | 64+ | 32+ | Block-FP8, infra team has working impl |
 
 #### T1 (Week 2-3) - Scale Up
@@ -119,25 +119,29 @@ Each tier involves:
 
 ---
 
-### 2. Resource Orchestration
+### 2. Resource Orchestration - COMPLETE
 
-#### Current State
+#### Implementation (2025-12-16)
 
-- Per-backend pools: `MegatronActorPool`, `DenseTrainerPool`
-- LRU eviction within each pool
-- No cross-pool awareness
-
-#### Target State
-
-Unified `ResourceManager` with global GPU tracking and cross-pool eviction.
+Unified `ResourcePool` singleton with global GPU tracking and cross-actor LRU eviction.
 
 ```
-ResourceManager
-├── total_gpus: int (cluster capacity)
-├── allocated: dict[actor_id, num_gpus]
-├── pools: [MegatronActorPool, DenseTrainerPool, InferencePool]
-└── allocate(model, num_gpus) → evicts across ALL pools if needed
+ResourcePool (tinker_server/backend/resource_pool.py)
+├── _entries: dict[actor_name, ResourceEntry]
+├── register(actor_name, actor_type, num_gpus, ...)
+├── ensure_gpus_available(needed_gpus) → evicts LRU idle actors
+├── evict_for_gpus(needed_gpus) → int (GPUs freed)
+└── list_actors() → status for monitoring
 ```
+
+**Actor Types Tracked**:
+| Type | Actor Name | GPU Usage |
+|------|------------|-----------|
+| MEGATRON | `persistent_megatron_worker_group_v2` | 8 (TP4,EP2) |
+| DENSE | `dense_trainer_*` | 1 |
+| VLLM | `tinker_vllm_server` | 1-4 |
+
+**Monitoring**: `GET /api/v1/resource_pool`
 
 #### GPU Requirements Reference
 
@@ -268,7 +272,7 @@ ray.init(address=\"auto\", ignore_reinit_error=True)
 r = ray.available_resources()
 t = ray.cluster_resources()
 print(f\"GPUs: {r.get('GPU', 0):.0f} / {t.get('GPU', 0):.0f}\")
-for name in ['persistent_megatron_worker_group', 'persistent_vllm_actor']:
+for name in ['persistent_megatron_worker_group_v2', 'tinker_vllm_server']:
     try:
         ray.get_actor(name, namespace='tinker')
         print(f'{name}: ALIVE')
@@ -288,7 +292,33 @@ for name in ['persistent_megatron_worker_group', 'persistent_vllm_actor']:
 
 ---
 
-### 6. Tinker API Alignment
+### 6. Stateless Trainer Architecture - COMPLETE
+
+#### Implementation (2025-12-16)
+
+`SessionStateManager` persists state per-iteration for stateless trainers:
+
+```
+/tmp/mint_sessions/{session_id}_checkpoint/
+├── adapter_model.safetensors  # LoRA weights
+├── optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
+└── training_meta.json         # step count, learning_rate
+```
+
+**Key Methods**:
+- `_ensure_session_loaded(session_id)`: Load if different from current
+- `_save_session_state(session_id)`: Save after optim_step
+- Overhead: ~0ms same session, ~100-200ms on switch
+
+**Verification**: Interleaved sessions test passes (Session A → B → A continues from correct loss)
+
+**Files Modified**:
+- `verl_training.py`: Added `SessionStateManager`, modified `TrainingWorker`
+- `scripts/test_interleaved_sessions.py`: Integration test
+
+---
+
+### 7. Tinker API Alignment
 
 Detailed verification that Mint matches official Tinker SDK behavior.
 
@@ -368,30 +398,129 @@ Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → o
 
 | Aspect | Tinker SDK | Mint | Compatible? |
 |--------|------------|------|-------------|
-| Per-token weights | `weights` | `loss_mask` | **NO** - field name mismatch |
+| Per-token weights | `weights` | `weights` or `loss_mask` | **Yes** - both accepted |
 | Model input | `chunks` with `EncodedTextChunk` | `chunks` format | Yes |
 | Tensor format | `TensorData{data, shape, dtype}` | `{data, shape, dtype}` | Yes |
-| Loss functions | `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | ? | Verify |
-
-**Action required**: Rename `loss_mask` → `weights` for Tinker API compatibility.
+| Loss functions | `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | Partial | `cispo`, `dro` pending |
 
 #### Implementation Tasks
 
 | Task | Priority | Status |
 |------|----------|--------|
-| Rename `loss_mask` → `weights` in forward_backward | **Critical** | Pending |
-| Verify all loss functions: `cross_entropy`, `importance_sampling`, `ppo`, `cispo`, `dro` | High | Pending |
-| Add `/api/v1/save_state` | High | Pending |
-| Add `/api/v1/load_state` | High | Pending |
+| Accept both `loss_mask` and `weights` field names | **Critical** | **DONE** |
+| Verify `cross_entropy`, `importance_sampling`, `ppo` loss functions | High | **DONE** |
+| Add `/api/v1/save_state` endpoint | High | **DONE** |
+| Add `/api/v1/load_state` endpoint | High | **DONE** |
+| Accept both `X-API-Key` and `Authorization: Bearer` auth | High | **DONE** |
+| Accept both `sampling_session_id` and `model_id` in sample requests | High | **DONE** |
+| Create merge-gate test suite | High | **DONE** (19/20 pass) |
+| Verify logprobs format matches `TensorData` spec | High | **DONE** |
+| Verify `include_prompt_logprobs` | Medium | **DONE** |
+| Add `cispo`, `dro` loss functions | Medium | Pending |
 | Add `forward_backward_custom` for arbitrary loss functions | Medium | Pending |
 | Verify LoRA config options: `train_unembed`, `train_mlp`, `train_attn` | Medium | Pending |
-| Verify logprobs format matches `TensorData` spec | High | Pending |
-| Create `test_tinker_api_alignment.py` | High | Pending |
-| Verify `include_prompt_logprobs` and `topk_prompt_logprobs` | Medium | Pending |
+| Verify `topk_prompt_logprobs` | Low | Pending |
+
+---
+
+### 8. DPO Support
+
+#### Problem Statement
+
+DPO (Direct Preference Optimization) requires comparing chosen vs rejected responses using reference model logprobs. Current implementation lacks reference model support.
+
+#### DPO Loss Function
+
+```
+L_DPO = -log σ(β * (log π(y_w|x) - log π(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x)))
+```
+
+Where:
+- `y_w`: chosen (winning) response
+- `y_l`: rejected (losing) response
+- `π`: policy model (being trained)
+- `π_ref`: reference model (frozen)
+- `β`: temperature parameter (default: 0.1)
+
+#### Required Data Format (Tinker API)
+
+```python
+{
+    "model_input": {"chunks": [{"tokens": [...], "type": "encoded_text"}]},
+    "loss_fn_inputs": {
+        "target_tokens": {"data": [...], "shape": [...], "dtype": "int64"},
+        "loss_mask": {"data": [...], "shape": [...], "dtype": "float32"},
+        "ref_logprobs": {"data": [...], "shape": [...], "dtype": "float32"},  # NEW
+        "is_chosen": true/false,  # NEW
+    }
+}
+```
+
+#### Implementation Options
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: External ref logprobs** | Client computes ref_logprobs before training | No extra GPU, simple implementation | Requires separate inference pass |
+| **B: Dual model loading** | Load ref model alongside policy model | One-shot training | 2x GPU memory |
+| **C: Cached ref logprobs** | Pre-compute ref logprobs on session create | Good throughput | Storage overhead, staleness |
+
+**Recommended: Option A** - Client-side ref logprobs computation matches tinker-cookbook pattern.
+
+#### Implementation Tasks
+
+| Task | Priority | Status |
+|------|----------|--------|
+| Add `dpo` loss function to TrainingWorker.forward_backward | High | Pending |
+| Add `dpo` loss function to MegatronRankWorker | High | Pending |
+| Add `ref_logprobs` and `is_chosen` to datum parsing | High | Pending |
+| Create DPO merge-gate test | High | Pending |
+| Document DPO workflow in API reference | Medium | Pending |
+
+#### Example Workflow
+
+```python
+# 1. Get ref logprobs using forward-only pass (no gradients)
+ref_result = training_client.forward(data=[chosen_datum, rejected_datum])
+ref_logprobs_chosen = ref_result["loss_fn_outputs"][0]["logprobs"]
+ref_logprobs_rejected = ref_result["loss_fn_outputs"][1]["logprobs"]
+
+# 2. Add ref_logprobs to training data
+chosen_datum["loss_fn_inputs"]["ref_logprobs"] = {"data": ref_logprobs_chosen, ...}
+chosen_datum["loss_fn_inputs"]["is_chosen"] = True
+rejected_datum["loss_fn_inputs"]["ref_logprobs"] = {"data": ref_logprobs_rejected, ...}
+rejected_datum["loss_fn_inputs"]["is_chosen"] = False
+
+# 3. Train with DPO loss
+result = training_client.forward_backward(data=[chosen_datum, rejected_datum], loss_fn="dpo")
+training_client.optim_step(adam_params)
+```
 
 ---
 
 ## Known Issues
+
+### LRU Eviction Not Wired Up - RESOLVED (2025-12-16)
+
+**Problem**: `_evict_for_gpus()` method existed in `MegatronActorPool` and `DenseTrainerPool` but was never called.
+
+**Solution**: Created unified `ResourcePool` singleton (`tinker_server/backend/resource_pool.py`) tracking ALL GPU-using actors with cross-actor LRU eviction.
+
+**Implementation**:
+- `ResourcePool.register()` called when creating vLLM, Megatron, and Dense actors
+- `ResourcePool.ensure_gpus_available()` called before actor creation - evicts LRU idle actors if needed
+- MIN_ACTOR_AGE = 300s prevents eviction thrashing
+- `/api/v1/resource_pool` endpoint for monitoring
+
+**Files modified**:
+- `resource_pool.py` (new)
+- `megatron_distributed.py` (added registration and ensure_gpus_available)
+- `verl_training.py` (added registration)
+- `multi_lora_engine.py` (added registration)
+- `routes/service.py` (added monitoring endpoint)
+
+**Limitation**: MoE requires STRICT_PACK (8 GPUs on single node). Evicting actors on different nodes doesn't help MoE creation.
+
+---
 
 ### train_step API Breaks Tinker Compatibility
 

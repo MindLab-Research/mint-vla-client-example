@@ -495,9 +495,10 @@ async def _do_save_weights_for_sampler(
 
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
+            base_model = session.base_model
 
-            # Check if multi-LoRA engine is available
-            multi_lora_engine = inference_manager.get_multi_lora_engine()
+            # Get or create engine for this model (dynamically creates vLLM actor if needed)
+            multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
 
             if multi_lora_engine is not None:
                 # Multi-LoRA mode: Each sampling session gets frozen weights
@@ -522,16 +523,17 @@ async def _do_save_weights_for_sampler(
                     peft_config=peft_config,
                 )
 
-                # Register in session manager
+                # Register in session manager with base_model for multi-model routing
                 inference_manager.register_multi_lora_session(
                     session_id=sampling_session_id,
+                    base_model=base_model,
                     lora_rank=lora_rank,
                 )
 
                 load_time = time.time() - start_time
                 logger.info(
                     f"[save_weights_for_sampler] Multi-LoRA: added lora_id={lora_id} "
-                    f"for session {sampling_session_id} in {load_time:.3f}s"
+                    f"for session {sampling_session_id} (model={base_model}) in {load_time:.3f}s"
                 )
             else:
                 # Fallback: Per-session engine mode (legacy)

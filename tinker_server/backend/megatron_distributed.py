@@ -832,130 +832,136 @@ class MegatronRankWorker:
     def get_lora_state_dict(self) -> dict:
         """Get LoRA state dict in PEFT format (rank 0 gathers from all ranks).
 
-        With use_mbridge=True, weights must be accessed via bridge.export_weights()
-        instead of model.named_parameters().
+        MBridge stores LoRA weights as lora_a/lora_b submodules, but bridge.export_weights()
+        MERGES them into base weights. We must extract directly from model.named_parameters()
+        to get separate lora_A/lora_B matrices for vLLM multi-LoRA inference.
 
-        IMPORTANT: ALL ranks must call bridge.export_weights() because it uses NCCL
-        collectives internally. Only rank 0 processes and returns the actual data;
-        other ranks return empty dict AFTER the collective completes.
+        IMPORTANT: ALL ranks must participate in extraction if using any NCCL collectives.
+        Only rank 0 processes and returns the actual data.
 
-        The bridge returns HuggingFace-style names like:
-            model.layers.0.self_attn.q_proj.lora_A.weight
-            model.layers.0.self_attn.q_proj.lora_B.weight
+        MBridge internal names (from named_parameters):
+            decoder.layers.0.self_attention.linear_qkv.lora_a.weight
+            decoder.layers.0.self_attention.linear_qkv.lora_b.weight
 
         PEFT expects names like:
             base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
             base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight
+
+        NOTE: vLLM 0.12.0 supports FusedMoE LoRA via FusedMoEWithLoRA class.
+        All modules (attention + MLP/expert) are now exported for both MoE and Dense models.
         """
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
-        
+
         # Write diagnostic output to shared PFS for debugging
         debug_file = "/vePFS-Mindverse/share/code/tinker-server/debug_lora_export.log"
 
         adapter_state = {}
 
-        # Patterns for identifying adapter/LoRA parameters
-        # MBridge uses HF-style names with "lora" suffix
-        # Megatron may use different naming conventions
-        adapter_patterns = ['lora', 'adapter', 'peft']
-
-        # Check if we have mbridge with export_weights (vanilla_mbridge=True only)
-        # Non-vanilla bridge uses different API - skip to fallback
-        bridge = getattr(self.engine, 'bridge', None)
-        has_export_weights = bridge is not None and hasattr(bridge, 'export_weights')
-
-        if has_export_weights:
-            logger.info(f"[Rank {self.rank}] Using bridge.export_weights() for vanilla mbridge mode")
+        # CRITICAL: With param_offload=True, model is on CPU. Must use eval_mode() context
+        # to load model onto GPU before accessing parameters.
+        with self.engine.eval_mode():
+            # FIRST: Try direct extraction from model.named_parameters()
+            # MBridge stores LoRA weights as .adapter.linear_in/.adapter.linear_out submodules
+            # This avoids the merge that export_weights() does
+            logger.info(f"[Rank {self.rank}] Trying direct named_parameters() extraction (within eval_mode)...")
             try:
-                # export_weights returns a generator of (name, tensor) tuples
-                # with HuggingFace-style parameter names
-                # ALL ranks must iterate through this generator for NCCL sync
+                from verl.utils.megatron_utils import unwrap_model
+
+                unwrapped = unwrap_model(self.engine.module)
+                if isinstance(unwrapped, list):
+                    unwrapped = unwrapped[0]
+
                 all_param_names = []
-                adapter_param_names = []
-                for name, tensor in bridge.export_weights(self.engine.module):
+                lora_param_names = []
+
+                for name, param in unwrapped.named_parameters():
                     all_param_names.append(name)
-                    # Only rank 0 collects the actual data
-                    if self.rank == 0:
-                        # Check multiple patterns for adapter parameters
-                        name_lower = name.lower()
-                        if any(pattern in name_lower for pattern in adapter_patterns):
-                            adapter_param_names.append(name)
-                            # Clone and move to CPU
-                            adapter_state[name] = tensor.data.clone().cpu() if tensor.is_cuda else tensor.data.clone()
+                    # Look for adapter patterns in name (MBridge uses .adapter.linear_in/.adapter.linear_out)
+                    name_lower = name.lower()
+                    if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
+                        lora_param_names.append(name)
+                        if self.rank == 0:
+                            # Copy to CPU for serialization
+                            adapter_state[name] = param.data.clone().cpu() if param.is_cuda else param.data.clone()
 
-                # Log diagnostic info
-                logger.info(f"[Rank {self.rank}] bridge.export_weights() returned {len(all_param_names)} total params")
-                
-                # Only rank 0 logs detailed info and writes debug file
+                logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
+
                 if self.rank == 0:
-                    logger.info(f"[Rank 0] Found {len(adapter_param_names)} adapter params (patterns: {adapter_patterns})")
-
-                    # Write to PFS for debugging (append mode)
+                    # Write diagnostic info
                     try:
                         import datetime
                         with open(debug_file, "a") as f:
-                            f.write(f"\n=== {datetime.datetime.now()} ===\n")
-                            f.write(f"Total params from bridge.export_weights(): {len(all_param_names)}\n")
-                            f.write(f"Adapter params found: {len(adapter_param_names)}\n")
-                            f.write(f"First 30 param names:\n")
-                            for n in all_param_names[:30]:
+                            f.write(f"\n=== {datetime.datetime.now()} (named_parameters within eval_mode) ===\n")
+                            f.write(f"Total params: {len(all_param_names)}\n")
+                            f.write(f"LoRA params found: {len(lora_param_names)}\n")
+                            f.write(f"Sample all params (first 20):\n")
+                            for n in all_param_names[:20]:
                                 f.write(f"  {n}\n")
-                            if len(all_param_names) > 100:
-                                f.write(f"Middle 10 param names (around index {len(all_param_names)//2}):\n")
-                                mid = len(all_param_names) // 2
-                                for n in all_param_names[mid:mid+10]:
-                                    f.write(f"  {n}\n")
-                            if adapter_param_names:
-                                f.write(f"Adapter param names:\n")
-                                for n in adapter_param_names[:30]:
+                            if lora_param_names:
+                                f.write(f"LoRA params:\n")
+                                for n in lora_param_names[:30]:
                                     f.write(f"  {n}\n")
                             f.write(f"===\n")
                     except Exception as e:
                         logger.warning(f"Failed to write debug file: {e}")
 
-                    # Show sample of ALL param names to debug naming convention
-                    if all_param_names:
-                        sample_all = all_param_names[:10]
-                        logger.info(f"[Rank 0] Sample ALL param names (first 10): {sample_all}")
-                        # Also show some from the middle
-                        if len(all_param_names) > 50:
-                            mid_idx = len(all_param_names) // 2
-                            sample_mid = all_param_names[mid_idx:mid_idx+5]
-                            logger.info(f"[Rank 0] Sample ALL param names (middle 5): {sample_mid}")
-
-                    if adapter_param_names:
-                        sample_adapter = adapter_param_names[:5]
-                        logger.info(f"[Rank 0] Sample adapter param names: {sample_adapter}")
+                    if lora_param_names:
+                        logger.info(f"[Rank 0] Sample LoRA params: {lora_param_names[:5]}")
                     else:
-                        logger.warning("[Rank 0] NO adapter params found via bridge.export_weights()!")
-
+                        logger.warning("[Rank 0] NO .adapter. params found in named_parameters()")
             except Exception as e:
-                logger.error(f"[Rank {self.rank}] bridge.export_weights() failed: {e}")
+                logger.error(f"[Rank {self.rank}] named_parameters() extraction failed: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
 
-        # Non-rank-0 workers return empty dict AFTER participating in NCCL collective
+            # SECOND: If direct extraction failed, try bridge.export_weights() (may give merged weights)
+            if not adapter_state:
+                bridge = getattr(self.engine, 'bridge', None)
+                has_export_weights = bridge is not None and hasattr(bridge, 'export_weights')
+
+                if has_export_weights:
+                    logger.info(f"[Rank {self.rank}] Fallback to bridge.export_weights() (may return merged weights)")
+                    try:
+                        adapter_patterns = ['lora', 'adapter', 'peft']
+                        all_param_names = []
+                        adapter_param_names = []
+
+                        for name, tensor in bridge.export_weights(self.engine.module):
+                            all_param_names.append(name)
+                            if self.rank == 0:
+                                name_lower = name.lower()
+                                if any(pattern in name_lower for pattern in adapter_patterns):
+                                    adapter_param_names.append(name)
+                                    adapter_state[name] = tensor.data.clone().cpu() if tensor.is_cuda else tensor.data.clone()
+
+                        logger.info(f"[Rank {self.rank}] bridge.export_weights() returned {len(all_param_names)} params, {len(adapter_param_names)} adapter")
+
+                        if self.rank == 0 and not adapter_param_names:
+                            logger.warning("[Rank 0] NO adapter params found via export_weights() - weights were merged!")
+                    except Exception as e:
+                        logger.error(f"[Rank {self.rank}] bridge.export_weights() failed: {e}")
+
+            # THIRD: Try verl's get_adapter_state_dict as last resort (also within eval_mode)
+            if not adapter_state and self.rank == 0:
+                logger.info("[Rank 0] Trying get_adapter_state_dict() fallback...")
+                try:
+                    from verl.utils.megatron_peft_utils import get_adapter_state_dict
+                    raw_state = get_adapter_state_dict(self.engine.module)
+                    logger.info(f"[Rank 0] get_adapter_state_dict returned {len(raw_state)} params")
+                    for name, tensor in raw_state.items():
+                        adapter_state[name] = tensor.cpu() if tensor.is_cuda else tensor.clone()
+                    if adapter_state:
+                        sample_keys = list(adapter_state.keys())[:5]
+                        logger.info(f"[Rank 0] Sample Megatron keys: {sample_keys}")
+                except ImportError:
+                    logger.warning("[Rank 0] verl.utils.megatron_peft_utils not available")
+                except Exception as e:
+                    logger.error(f"[Rank 0] get_adapter_state_dict failed: {e}")
+
+        # Non-rank-0 workers return empty dict
         if self.rank != 0:
             logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
             return {}
-
-        # Fallback: use get_adapter_state_dict if bridge method returned empty or doesn't exist
-        if not adapter_state:
-            logger.info("[Rank 0] Trying get_adapter_state_dict() fallback...")
-            try:
-                from verl.utils.megatron_peft_utils import get_adapter_state_dict
-                raw_state = get_adapter_state_dict(self.engine.module)
-                logger.info(f"[Rank 0] get_adapter_state_dict returned {len(raw_state)} params")
-                # Move all tensors to CPU for serialization to CPU-only WorkerGroup
-                for name, tensor in raw_state.items():
-                    adapter_state[name] = tensor.cpu() if tensor.is_cuda else tensor.clone()
-                if adapter_state:
-                    sample_keys = list(adapter_state.keys())[:5]
-                    logger.info(f"[Rank 0] Sample Megatron keys: {sample_keys}")
-            except ImportError:
-                logger.warning("[Rank 0] verl.utils.megatron_peft_utils not available")
-            except Exception as e:
-                logger.error(f"[Rank 0] get_adapter_state_dict failed: {e}")
 
         if not adapter_state:
             logger.warning("[Rank 0] No adapter/LoRA parameters found!")
@@ -964,8 +970,27 @@ class MegatronRankWorker:
         # Convert to PEFT format
         # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
         # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
+        #
+        # IMPORTANT: vLLM 0.12.0 does NOT support MoE expert LoRA inference.
+        # The FusedMoEWithLoRA class exists but is disabled with warning:
+        #   "For MoE models, vLLM currently does not support fused MoE LoRA inference"
+        # Only attention modules (q_proj, k_proj, v_proj, o_proj) + router gate are supported.
+        # MLP/expert modules must be filtered out for MoE models.
+        def _is_mlp_module(param_name: str) -> bool:
+            """Check if parameter is from MLP/expert layer (not supported in vLLM MoE LoRA)."""
+            mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
+                           'gate_proj', 'up_proj', 'down_proj']
+            name_lower = param_name.lower()
+            return any(p in name_lower for p in mlp_patterns)
+
         lora_state_dict = {}
+        filtered_count = 0
+        logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
+            # Filter out MLP modules for MoE models (vLLM doesn't support expert LoRA)
+            if _is_mlp_module(name):
+                filtered_count += 1
+                continue
             # Add PEFT prefix if not already present
             if name.startswith("model."):
                 peft_name = f"base_model.model.{name}"
@@ -979,7 +1004,7 @@ class MegatronRankWorker:
                     continue
             lora_state_dict[peft_name] = tensor
 
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format), filtered {filtered_count} MLP/expert modules")
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:3]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
@@ -999,7 +1024,9 @@ class MegatronRankWorker:
         PEFT names (HuggingFace style):
             base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
             base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight
-            base_model.model.model.layers.0.mlp.gate_proj.lora_A.weight
+
+        NOTE: vLLM 0.12.0 does NOT support MoE expert LoRA inference.
+        MLP/expert modules are filtered out - only attention modules exported.
         """
         import re
 
@@ -1025,16 +1052,17 @@ class MegatronRankWorker:
             return None
 
         # Determine the target module
-        # Handle both dense and MoE (experts) variants
         if 'linear_qkv.adapter' in name or 'linear_qkv.lora_' in name.lower():
             # Fused QKV - map to q_proj (vLLM will handle the fused format)
             target = 'self_attn.q_proj'
         elif 'self_attention.linear_proj' in name:
             target = 'self_attn.o_proj'
-        elif 'mlp.experts.linear_fc1' in name or 'mlp.linear_fc1' in name:
-            # gate_proj for Qwen-style models (gate is part of gate_up_proj)
+        elif 'linear_fc1' in name:
+            # MLP gate/up projection - map to gate_proj
+            # For MoE, this is the expert's first linear layer
             target = 'mlp.gate_proj'
-        elif 'mlp.experts.linear_fc2' in name or 'mlp.linear_fc2' in name:
+        elif 'linear_fc2' in name:
+            # MLP down projection
             target = 'mlp.down_proj'
         else:
             logger.warning(f"Unknown module pattern: {name}")
@@ -1268,7 +1296,7 @@ class MegatronRankWorker:
         config = {
             "r": self.lora_rank,
             "lora_alpha": self.lora_rank,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "bias": "none",
             "task_type": "CAUSAL_LM",
             "base_model_name_or_path": self.base_model,
@@ -2287,6 +2315,14 @@ class MegatronActorPool:
                         f"Kill the actor and restart with higher max_lora_rank."
                     )
                 entry.touch()  # Phase 9: Update LRU
+                # Also update unified resource pool
+                from tinker_server.backend.resource_pool import get_resource_pool
+                actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                resource_pool = get_resource_pool()
+                pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                if pool_entry:
+                    pool_entry.current_session = session_id
+
                 logger.info(
                     f"[MegatronActorPool] Reusing existing actor for {base_model} "
                     f"(max_rank={entry.max_lora_rank}, session_rank={lora_rank})"
@@ -2306,6 +2342,11 @@ class MegatronActorPool:
                 f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, "
                 f"max_rank={effective_max_rank}, gpus={num_gpus}"
             )
+
+            # Phase 9: Check available GPUs and evict LRU actors if necessary
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+            resource_pool = get_resource_pool()
+            resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists (e.g., from previous server run)
             try:
@@ -2350,6 +2391,18 @@ class MegatronActorPool:
                 actual_rank=lora_rank,
             )
             self._actors[key] = entry
+
+            # Register with unified resource pool for LRU tracking
+            resource_pool.register(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=num_gpus,
+                actor_handle=actor,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=base_model,
+                session_id=session_id,
+            )
+
             return entry
 
     def remove(self, base_model: str, kill_actor: bool = True) -> bool:
@@ -2487,16 +2540,30 @@ def get_or_create_megatron_worker_group(
     Returns:
         Ray actor handle to MegatronWorkerGroup.
     """
+    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
     config = distributed_config or DistributedConfig()
+    num_gpus = config.world_size
 
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    resource_pool = get_resource_pool()
 
     # Try to get existing persistent actor
     try:
         actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
         logger.info(
             f"Connected to existing Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
+        )
+        # Register with resource pool (reconnection case)
+        resource_pool.register(
+            actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=num_gpus,
+            actor_handle=actor,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model,
         )
         # Reinitialize LoRA weights for fresh session
         # This ensures each new session starts with fresh random weights
@@ -2513,6 +2580,9 @@ def get_or_create_megatron_worker_group(
         logger.info(
             f"Creating new detached Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
         )
+
+    # Phase 9: Check available GPUs and evict LRU actors if necessary
+    resource_pool.ensure_gpus_available(num_gpus)
 
     # Runtime env for PFS code access
     runtime_env = {
@@ -2542,6 +2612,16 @@ def get_or_create_megatron_worker_group(
     # Wait for initialization
     ray.get(actor.__ray_ready__.remote())
     logger.info("Megatron worker group initialized (detached actor)")
+
+    # Register with unified resource pool for LRU tracking
+    resource_pool.register(
+        actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+        actor_type=ActorType.MEGATRON,
+        num_gpus=num_gpus,
+        actor_handle=actor,
+        namespace=PERSISTENT_NAMESPACE,
+        base_model=base_model,
+    )
 
     return actor
 
@@ -2583,6 +2663,8 @@ def kill_megatron_actor() -> bool:
     Returns:
         True if actor was killed, False if not found.
     """
+    from tinker_server.backend.resource_pool import get_resource_pool
+
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
@@ -2595,6 +2677,11 @@ def kill_megatron_actor() -> bool:
             pass
         ray.kill(actor, no_restart=True)
         logger.info(f"Killed Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}")
+
+        # Unregister from resource pool
+        resource_pool = get_resource_pool()
+        resource_pool.unregister(PERSISTENT_MEGATRON_ACTOR_NAME)
+
         return True
     except ValueError:
         logger.info("No Megatron actor to kill")
