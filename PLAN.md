@@ -71,6 +71,101 @@ Each tier involves:
 | VL models | Vision encoder, multimodal inputs | New modality support |
 | pi0/pi0.5 (VLA) | See VLA investigation below | Tentative - may require new backend |
 
+#### K2 Support Details
+
+**Model Specifications (Kimi-K2)**
+
+| Spec | Value |
+|------|-------|
+| Total params | 1.04 trillion |
+| Active params | 32B per token |
+| Experts | 384 total, 8+1 per token |
+| Hidden dim | 7168 |
+| Context window | 128K tokens |
+| Architecture | DeepSeek-V3 style MoE with MLA attention |
+| Quantization | Block-FP8 (not per-tensor FP8) |
+
+**References**: [HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct), [Technical Report](https://arxiv.org/pdf/2507.20534)
+
+**Framework Landscape**
+
+Three relevant frameworks operate at different abstraction levels:
+
+| Framework | Purpose | Megatron Access | Distributed | Data Format |
+|-----------|---------|-----------------|-------------|-------------|
+| **Verl** | PPO/RLHF workflows | `MegatronEngine` wrapper | Ray actors | `DataProto`, `TensorDict` |
+| **MS-Swift** | Research training | Direct `megatron.training` | torch.distributed | HF datasets |
+| **Tinker-Server** | Multi-tenant API | Via verl wrapper + direct calls | Ray actors | Custom `Datum` |
+
+**What tinker-server uses from verl**:
+- `MegatronEngineWithLMHead` - engine wrapper
+- `HFModelConfig`, `McoreEngineConfig` - config dataclasses
+- `vLLMHttpServerBase` - Ray actor base class
+- Utility functions: `copy_to_local`, `get_adapter_state_dict`
+
+**What tinker-server does NOT use**:
+- `MegatronWorker` (PPO-specific actor/critic orchestration)
+- `DataProto` (PPO-specific data format)
+- Dispatch decorators (`@register`, `Dispatch`)
+
+**k2-workspace reference implementation** (ms-swift based):
+- Location: `../k2-workspace/workspace/ms-swift/examples/megatron/grpo/kimi-k2/`
+- Config: `moe_colocate_lora.sh` - 64 GPU setup (8 nodes × 8 GPUs)
+- Parallelism: TP=8, EP=64, PP=1, CP=1
+
+**GPU Requirements**
+
+| Configuration | GPUs | Notes |
+|---------------|------|-------|
+| Full (reference) | 64× H100 80GB | TP=8, EP=64, as in k2-workspace |
+| Minimum (with FP8) | 16× H100 80GB | TP=8, EP=16, requires FP8 + offload |
+| Minimum (INT4 inference only) | 8× H100 80GB | Inference only, no training |
+
+**16-GPU Configuration** (for debugging/development):
+```bash
+COMMON_TP=8 COMMON_EP=16 COMMON_PP=1 COMMON_CP=1 INFER_TP=16
+--fp8-param-gather                    # FP8 weights (H100 required)
+--recompute-granularity full          # Activation checkpointing
+--optimizer-cpu-offload               # Optimizer to CPU
+--train_type lora --lora_rank 8
+--micro_batch_size 1 --max_model_len 4096
+```
+
+Expected: 5-10× slower than 64-GPU baseline due to expert memory pressure and offloading.
+
+**Required Code Changes**
+
+| File | Change | Priority |
+|------|--------|----------|
+| `megatron_training.py:903` | Add `r"Kimi-K2"` to `moe_patterns` | Critical |
+| `model_registry.py` | Add K2 config: `ModelConfig(True, 8, 8)` | Critical |
+| `verl_training.py:941` | Use model registry instead of hardcoded TP=4, EP=2 | Critical |
+| `megatron_distributed.py:267` | Add FP8 dtype support to `McoreEngineConfig` | Critical |
+| `verl_inference.py:817` | Add `quantization="fp8"` to vLLM kwargs | High |
+| `megatron_training.py:204` | Extract auxiliary loss from MoE router | Medium |
+
+**Implementation Phases**
+
+| Phase | Tasks | Effort |
+|-------|-------|--------|
+| 1. Detection | Add K2 to `is_moe_model()`, populate registry | 1-2h |
+| 2. Parallelism | Dynamic TP/EP from registry, remove hardcoding | 2-3h |
+| 3. FP8 | Add dtype detection and config plumbing | 3-4h |
+| 4. Validation | Test standalone vLLM + ms-swift before integration | 4-8h |
+
+**Pre-integration validation** (run before code changes):
+```bash
+# Test 1: vLLM inference with FP8
+vllm serve moonshotai/Kimi-K2-Instruct \
+    --tensor-parallel-size 8 --quantization fp8
+
+# Test 2: ms-swift training (16 GPUs)
+cd ../k2-workspace/workspace/ms-swift/examples/megatron/grpo/kimi-k2
+COMMON_TP=8 COMMON_EP=16 INFER_TP=16 bash moe_colocate_lora.sh 2 0 127.0.0.1
+```
+
+If standalone tests fail, the issue is upstream (vLLM/Megatron K2 support), not tinker-server.
+
 #### VLA Models Investigation (Tentative)
 
 **What are VLA models?** Vision-Language-Action models for robot control. Output continuous action trajectories instead of text tokens.
