@@ -45,6 +45,7 @@ class DistributedConfig:
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
     context_parallel_size: int = 1
+    use_fp8: bool = False  # FP8 quantization for K2 and similar models
 
     @property
     def world_size(self) -> int:
@@ -264,6 +265,14 @@ class MegatronRankWorker:
         if self.lora_rank > 0:
             logger.info(f"[Rank {self.rank}] LoRA enabled (rank={self.lora_rank}), disabling grad_offload")
 
+        # FP8 support for large models like Kimi-K2
+        # FP8 is configured at model level via override_mcore_model_config, not dtype
+        override_model_config = {}
+        if self.config.use_fp8:
+            # Use e4m3 format for FP8 (8-bit floating point with 4-bit exponent, 3-bit mantissa)
+            override_model_config["fp8"] = "e4m3"
+            logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3) for memory-efficient training")
+
         engine_config = McoreEngineConfig(
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
@@ -272,11 +281,12 @@ class MegatronRankWorker:
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
-            dtype="bfloat16",
+            dtype="bfloat16",  # Base dtype, FP8 handled via override_mcore_model_config
             use_mbridge=True,
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
             override_transformer_config=override_tf_config,
+            override_mcore_model_config=override_model_config,
         )
 
         optimizer_config = McoreOptimizerConfig(
@@ -1608,6 +1618,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -1615,10 +1626,14 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            session_id: Unused - session management handled via swap_session().
 
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        # Note: session_id is not used here. For Megatron, session state is managed
+        # via swap_session() before calling forward_backward. This parameter exists
+        # for API consistency with TrainingWorker.
         loss_fn_config = loss_fn_config or {}
 
         # Send raw data_items to workers (TensorDict created locally on each worker
@@ -1659,6 +1674,7 @@ class MegatronWorkerGroup:
     def forward(
         self,
         data_items: list[dict],
+        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
     ) -> dict:
         """Run forward pass only on all workers. Returns per-token logprobs.
 
@@ -1667,6 +1683,7 @@ class MegatronWorkerGroup:
 
         Args:
             data_items: List of Tinker Datum dicts.
+            session_id: Unused - session management handled via swap_session().
 
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
@@ -1709,11 +1726,19 @@ class MegatronWorkerGroup:
             "log_probs": log_probs_data,  # Per-token log probabilities
         }
 
-    def optim_step(self, learning_rate: float) -> dict:
+    def optim_step(
+        self,
+        learning_rate: float,
+        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+    ) -> dict:
         """Run optimizer step on all workers.
 
         WARNING: With param_offload=True, gradients are zeroed when entering train_mode.
         Use train_step() instead for combined forward_backward + optim_step.
+
+        Args:
+            learning_rate: Learning rate for this step.
+            session_id: Unused - session management handled via swap_session().
         """
         futures = [w.optim_step.remote(learning_rate) for w in self.workers]
         ray.get(futures)

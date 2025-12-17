@@ -1333,14 +1333,18 @@ class VerlTrainingEngine:
             base_model = requested_model
 
         if use_megatron:
-            # MoE models (30B+) need tensor parallelism to fit model
-            # TP=4, EP=1 = 4 GPUs: all experts on each GPU, model sharded across 4 GPUs
-            # With param_offload=True, this fits in 4x 80GB A100s
+            # MoE models need tensor/expert parallelism from model registry
+            from .model_registry import get_training_parallelism, requires_fp8
+
+            # Get model-specific parallelism and FP8 config from registry
+            train_tp, train_ep = get_training_parallelism(requested_model or "")
+            use_fp8 = requires_fp8(requested_model or "")
             distributed_config = DistributedConfig(
-                tensor_parallel_size=4,
-                expert_parallel_size=1,  # Changed from 2 to 1 (cluster has 4 GPUs)
+                tensor_parallel_size=train_tp,
+                expert_parallel_size=train_ep,
+                use_fp8=use_fp8,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size}, EP={distributed_config.expert_parallel_size})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, world_size={train_tp * train_ep}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience

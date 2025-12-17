@@ -193,10 +193,12 @@ class MultiLoRAInferenceEngine:
         max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
         max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
         actor_name: str | None = None,
+        quantization: str | None = None,  # "fp8" for FP8 models like K2
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.data_parallel_size = data_parallel_size
+        self.quantization = quantization
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
@@ -325,9 +327,12 @@ class MultiLoRAInferenceEngine:
                 data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
                 expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
                 engine_kwargs=engine_kwargs,
+                quantization=self.quantization,  # "fp8" for FP8 models like K2
             )
             if self.max_model_len is not None:
                 rollout_config.max_model_len = self.max_model_len
+            if self.quantization:
+                logger.info(f"vLLM quantization enabled: {self.quantization}")
 
             # Model config with multi-LoRA parameters
             model_config = HFModelConfig(
@@ -739,9 +744,12 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            # Determine quantization from model config
+            quantization = "fp8" if config.use_fp8 else None
+
             logger.info(
                 f"Creating vLLM engine for model {model_name}: "
-                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}"
+                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}, quant={quantization}"
             )
 
             engine = MultiLoRAInferenceEngine(
@@ -754,6 +762,7 @@ class MultiModelInferenceManager:
                 max_cpu_loras=self.max_cpu_loras,
                 max_lora_rank=self.max_lora_rank,
                 actor_name=actor_name,
+                quantization=quantization,
             )
             await engine.initialize()
 
