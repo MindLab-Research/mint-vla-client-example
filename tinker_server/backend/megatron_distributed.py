@@ -971,13 +971,8 @@ class MegatronRankWorker:
         # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
         # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
         #
-        # NOTE: vLLM 0.12.0 has FusedMoEWithLoRA class but two blockers remain:
-        # 1. Module validation patch needed (patches/apply_vllm_patch.py) - DONE
-        # 2. Weight format adapter needed - PEFT format -> vLLM packed format - NOT DONE
-        #
-        # Until weight format adapter is implemented, MLP/expert modules are filtered
-        # for MoE models. Training still uses full MLP+attention LoRA via Megatron.
-        # Only inference is limited to attention-only LoRA.
+        # NOTE: vLLM 0.13.0+ supports expert LoRA for MoE models via FusedMoEWithLoRA.
+        # MLP/expert modules are now included in the exported LoRA state_dict.
         def _is_mlp_module(param_name: str) -> bool:
             """Check if parameter is from MLP/expert layer."""
             mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
@@ -986,13 +981,8 @@ class MegatronRankWorker:
             return any(p in name_lower for p in mlp_patterns)
 
         lora_state_dict = {}
-        filtered_count = 0
         logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
-            # Filter out MLP modules for MoE models (vLLM weight format adapter not ready)
-            if _is_mlp_module(name):
-                filtered_count += 1
-                continue
             # Add PEFT prefix if not already present
             if name.startswith("model."):
                 peft_name = f"base_model.model.{name}"
@@ -1006,7 +996,7 @@ class MegatronRankWorker:
                     continue
             lora_state_dict[peft_name] = tensor
 
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format), filtered {filtered_count} MLP/expert modules")
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, including MLP/expert modules)")
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:3]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")

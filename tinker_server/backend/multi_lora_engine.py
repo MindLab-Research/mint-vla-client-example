@@ -216,6 +216,8 @@ class MultiLoRAInferenceEngine:
         Uses a detached Ray actor that survives server restarts.
         First tries to connect to existing actor, creates new one if not found.
         """
+        import sys
+        print(f"[DEBUG INIT] initialize() called for actor {self.actor_name}", file=sys.stderr, flush=True)
         async with self._init_lock:
             if self._initialized:
                 return
@@ -227,12 +229,15 @@ class MultiLoRAInferenceEngine:
             # Try to get existing persistent actor
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
             # We must verify the actor is alive by calling a method on it
+            print(f"[DEBUG INIT] Trying to get existing actor {self.actor_name}", file=sys.stderr, flush=True)
             try:
                 self.server = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
+                print(f"[DEBUG INIT] Got actor handle, checking health", file=sys.stderr, flush=True)
                 # Health check: try calling a method to verify actor is alive
                 # This will raise RayActorError if actor is dead
                 try:
                     ray.get(self.server.__ray_ready__.remote(), timeout=5)
+                    print(f"[DEBUG INIT] REUSING existing actor (health check passed)", file=sys.stderr, flush=True)
                     logger.info(
                         f"Connected to existing persistent vLLM actor: {self.actor_name}"
                     )
@@ -255,6 +260,7 @@ class MultiLoRAInferenceEngine:
                     return
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive, need to create new one
+                    print(f"[DEBUG INIT] Actor dead/unresponsive, will create new", file=sys.stderr, flush=True)
                     logger.warning(
                         f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
                     )
@@ -263,10 +269,12 @@ class MultiLoRAInferenceEngine:
                     self._initialized = False
             except ValueError:
                 # Actor doesn't exist, create new one
+                print(f"[DEBUG INIT] Actor doesn't exist, will create new", file=sys.stderr, flush=True)
                 logger.info(
                     f"No existing vLLM actor found, creating new detached actor: {self.actor_name}"
                 )
 
+            print(f"[DEBUG INIT] CREATING NEW ACTOR - proceeding to scheduling logic", file=sys.stderr, flush=True)
             from verl.workers.config import HFModelConfig, RolloutConfig
             from verl.workers.rollout.replica import RolloutMode
 
@@ -340,11 +348,51 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+            #
+            # Find a node with enough free GPUs to avoid memory conflicts.
+            # When training and inference coexist, Megatron holds GPU memory even
+            # though Ray doesn't track actual CUDA memory usage. We must place
+            # vLLM on a separate node with completely free GPUs.
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+            # Find a node with enough free GPUs (not in placement groups)
+            target_node = None
+            print(f"[SCHEDULE DEBUG] Looking for node with {total_gpus} GPUs for vLLM", file=sys.stderr, flush=True)
+            for node in ray.nodes():
+                node_id_short = node["NodeID"][:8]
+                if node["Alive"]:
+                    resources = node.get("Resources", {})
+                    total_gpu = resources.get("GPU", 0)
+                    obj_store = resources.get("object_store_memory", 0)
+                    print(f"[SCHEDULE DEBUG]   Node {node_id_short}: GPUs={total_gpu}, obj_store={obj_store/1e9:.1f}GB", file=sys.stderr, flush=True)
+                    if total_gpu >= total_gpus and obj_store > 100_000_000_000:
+                        node_id = node["NodeID"]
+                        # Prefer nodes with exactly total_gpus (avoids 8-GPU nodes with Megatron)
+                        if total_gpu == total_gpus:
+                            target_node = node_id
+                            print(f"[SCHEDULE DEBUG] Selected {total_gpus}-GPU node {node_id[:8]} for vLLM (exact match)", file=sys.stderr, flush=True)
+                            break
+                        elif target_node is None:
+                            target_node = node_id
+                            print(f"[SCHEDULE DEBUG] Candidate node {node_id[:8]} with {total_gpu} GPUs (looking for exact {total_gpus})", file=sys.stderr, flush=True)
+
+            scheduling_opts = {}
+            if target_node:
+                scheduling_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                    node_id=target_node,
+                    soft=False,  # Hard constraint - fail if node unavailable
+                )
+                print(f"[SCHEDULE DEBUG] Using NodeAffinitySchedulingStrategy for node {target_node[:8]}", file=sys.stderr, flush=True)
+            else:
+                scheduling_opts["scheduling_strategy"] = "SPREAD"
+                print("[SCHEDULE DEBUG] No suitable node found, using SPREAD scheduling", file=sys.stderr, flush=True)
+
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                **scheduling_opts,
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,

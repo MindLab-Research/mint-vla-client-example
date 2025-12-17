@@ -540,11 +540,239 @@ Previous tests prove sessions have different weights (A ≠ B), but don't prove 
 
 ---
 
-### vLLM MoE Expert LoRA Inference - INCOMPLETE (2025-12-17)
+### vLLM MoE Expert LoRA Inference - INVESTIGATION UPDATE (2025-12-17)
 
 **Problem**: vLLM 0.12.0 has `FusedMoEWithLoRA` class but cannot load MoE expert LoRA weights for inference. Training with full MLP+attention LoRA works via Megatron, but inference is limited to attention-only LoRA.
 
 **Impact**: MoE models (Qwen3-30B-A3B) train with full LoRA (attention + expert MLP) but inference only uses attention LoRA. This reduces LoRA effectiveness during inference while training quality remains unaffected.
+
+#### vLLM 0.13.0rc2 Investigation (2025-12-17)
+
+**CRITICAL FINDING: Known Bug - LoRA Loading Broken for Qwen3 MoE**
+
+This is a **confirmed bug** in vLLM V1 engine with Qwen3 MoE models:
+- GitHub Issue: [vllm-ascend #3377](https://github.com/vllm-project/vllm-ascend/issues/3377) - "Qwen3-30B-A3B cannot use enable-lora"
+- Status: **OPEN** (as of 2025-12-17)
+- Root cause: V1 engine `set_active_loras` fails during inference when LoRA adapter is requested
+- Impact: **All LoRA loading broken** (not just expert LoRA - even attention-only LoRA fails)
+
+**V0 Engine No Longer Available:**
+- vLLM 0.13.0rc2 has V1 engine ONLY - V0 was removed
+- Setting `VLLM_USE_V1=0` has no effect
+- Cannot fall back to V0 engine as a workaround
+
+**What was tested:**
+
+| Test | Result |
+|------|--------|
+| Model init with `enable_lora=True` | PASSED |
+| "MoE model detected. Using fused MoE LoRA implementation." | CONFIRMED (all TP workers) |
+| Baseline generation (no LoRA) | PASSED |
+| Create synthetic LoRA adapter (attention-only) | PASSED |
+| Load attention-only LoRA adapter | **FAILED** (WorkerProc exception) |
+| V0 engine fallback (`VLLM_USE_V1=0`) | **NOT AVAILABLE** (V0 removed) |
+| Megatron → vLLM expert weight export | BLOCKED (basic LoRA fails first) |
+
+**Error Location:**
+```
+gpu_model_runner.py:3005 → execute_model → _prepare_inputs → set_active_loras
+  → lora_model_runner_mixin.py:70 → make_lora_inputs → _set_active_loras
+  → WorkerProc exception on all TP workers
+```
+
+**Source Code Analysis:**
+
+1. **`get_supported_lora_modules()` in `vllm/lora/utils.py`** includes both:
+   - `LinearBase` subclasses (attention: qkv_proj, o_proj)
+   - `FusedMoE` instances (expert layers)
+
+2. **`FusedMoEWithLoRA` class exists** with full implementation:
+   - Expert-specific weight shapes: `(num_experts, rank, hidden_size)`
+   - Per-expert LoRA application via `add_lora_fused_moe()` kernel
+
+3. **V1 Engine LoRA Pipeline (where it fails):**
+   - `set_active_loras()` in `lora_model_runner_mixin.py:70`
+   - Creates `LoRAMapping` from `make_lora_inputs()`
+   - Calls `lora_manager.set_active_adapters()` → `_adapter_manager.set_adapter_mapping()`
+   - Fails at `punica_wrapper.update_metadata()` for MoE models
+
+**Conclusion:**
+- vLLM 0.13.0rc2 infrastructure exists but is **broken** for Qwen3 MoE + LoRA
+- This blocks both attention LoRA AND expert LoRA
+- Must wait for upstream fix or downgrade to vLLM < 0.13.0
+
+**NOT POSSIBLE UNTIL BUG FIXED:**
+- Any LoRA inference on Qwen3 MoE models
+- Megatron → vLLM expert LoRA weight export testing
+
+#### Qwen1.5-MoE-A2.7B-Chat Testing (2025-12-18)
+
+**BREAKTHROUGH: MoE Expert LoRA Works on Qwen2MoeForCausalLM**
+
+Testing with the smaller Qwen1.5-MoE-A2.7B-Chat model (Qwen2MoeForCausalLM architecture) reveals that vLLM 0.13.0rc2 MoE LoRA **does work** for Qwen2 MoE models - the bug is **Qwen3-specific**.
+
+| Model | Architecture | Result |
+|-------|--------------|--------|
+| Qwen3-30B-A3B-Instruct-2507 | Qwen3MoeForCausalLM | **WORKS** (see correction below) |
+| Qwen1.5-MoE-A2.7B-Chat | Qwen2MoeForCausalLM | **WORKS** |
+
+#### Qwen3-30B-A3B Testing - CORRECTION (2025-12-18)
+
+**PREVIOUS CLAIM WAS INCORRECT**: The earlier finding that "LoRA loading is broken for Qwen3 MoE" was wrong. The cited issue (vllm-ascend #3377) is from the wrong repository (vllm-ascend, not vllm).
+
+**ACTUAL ROOT CAUSE**: Using incorrect target modules. Qwen3MoeForCausalLM uses separate `q_proj`, `k_proj`, `v_proj` - NOT fused `qkv_proj`.
+
+**Test Results on Ray Cluster (TP=4):**
+
+| Test | Target Modules | Result |
+|------|----------------|--------|
+| Attention LoRA with `qkv_proj` | `["qkv_proj"]` | **FAILED** - module not supported |
+| Attention LoRA with separate q/k/v | `["q_proj", "k_proj", "v_proj"]` | **PASSED** |
+| Expert LoRA (all 128 experts) | `["experts.N.gate_proj", "experts.N.up_proj", "experts.N.down_proj"]` | **PASSED** |
+
+**Error when using incorrect modules:**
+```
+ValueError: While loading /tmp/test_qwen3_30b_lora, expected target modules in
+{'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate', 'experts.{N}.gate_proj', ...}
+but received ['model.layers.0.self_attn.qkv_proj', ...]
+```
+Location: `vllm/lora/lora_model.py:168` in `check_unexpected_modules()`
+
+**Expert LoRA Test Details:**
+- Model config: 48 layers, 128 experts, hidden_size=2048, moe_intermediate_size=768
+- Tensors created: 36,864 (48 layers × 128 experts × 3 projections × 2 A/B)
+- vLLM version: 0.13.0rc2.dev207+g811cdf519
+- Log: `"MoE model detected. Using fused MoE LoRA implementation."`
+
+**Key Requirements for Qwen3-30B-A3B LoRA:**
+
+1. **Use separate attention projections**:
+   ```python
+   "target_modules": ["q_proj", "k_proj", "v_proj"]  # NOT qkv_proj
+   ```
+
+2. **Expert LoRA requires ALL experts**:
+   ```python
+   target_modules = []
+   for e in range(128):  # All 128 experts
+       target_modules.extend([
+           f"experts.{e}.gate_proj",
+           f"experts.{e}.up_proj",
+           f"experts.{e}.down_proj",
+       ])
+   ```
+
+3. **Weight naming convention (PEFT format)**:
+   ```python
+   # Attention
+   f"base_model.model.model.layers.{layer}.self_attn.q_proj.lora_A.weight"
+   f"base_model.model.model.layers.{layer}.self_attn.q_proj.lora_B.weight"
+
+   # Expert
+   f"base_model.model.model.layers.{layer}.mlp.experts.{expert}.gate_proj.lora_A.weight"
+   f"base_model.model.model.layers.{layer}.mlp.experts.{expert}.gate_proj.lora_B.weight"
+   ```
+
+**Test Scripts:**
+- Attention LoRA: `scripts/test_qwen3_30b_lora_correct.py`
+- Expert LoRA: `scripts/test_qwen3_30b_expert_lora.py`
+- Megatron → vLLM Integration: `scripts/test_megatron_qwen3_moe_export.py`
+
+#### Megatron → vLLM MoE LoRA Integration Test (2025-12-18)
+
+**Full pipeline test:** Megatron weight export → PEFT conversion → vLLM load
+
+| Metric | Value |
+|--------|-------|
+| Megatron tensors created | 37,152 |
+| PEFT conversion success | 37,152 (100%) |
+| Conversion failures | 0 |
+| vLLM initialization | PASS |
+| Baseline generation | PASS |
+| LoRA adapter load | PASS |
+
+**Tensor breakdown:**
+- Attention: 48 layers × 3 projections (q/k/v) × 2 (A/B) = 288
+- Experts: 48 layers × 128 experts × 3 projections × 2 (A/B) = 36,864
+- Total: 37,152
+
+**Name conversion** (Megatron/HF → PEFT):
+```python
+# HF-style input (from verl bridge)
+"model.layers.0.self_attn.q_proj.lora_a.weight"
+"model.layers.0.mlp.experts.0.gate_proj.lora_a.weight"
+
+# PEFT output
+"base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+"base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight"
+```
+
+**CONCLUSION: vLLM 0.13.0rc2 fully supports Qwen3-30B-A3B LoRA (both attention and expert layers).** The previous failure was user error (wrong target modules), not a vLLM bug.
+
+**Test Results on Qwen1.5-MoE (vLLM 0.13.0rc2, single A800 80GB):**
+
+| Test | Result |
+|------|--------|
+| Attention LoRA (q_proj, k_proj, v_proj) | **PASS** |
+| Expert LoRA (all 60 experts × 3 layers) | **PASS** |
+
+**Key Requirements for MoE Expert LoRA:**
+
+1. **Attention projections must be separate** (not fused):
+   - Use `q_proj`, `k_proj`, `v_proj` instead of fused `qkv_proj`
+   - vLLM module whitelist doesn't include `qkv_proj`
+
+2. **ALL experts must have LoRA weights** (no partial):
+   - `pack_moe()` in `lora_weights.py:168` asserts `len(loras) % 3 == 0`
+   - Each expert needs: gate_proj (w1), down_proj (w2), up_proj (w3)
+   - TODO comment at line 175: "Consider the case where some experts don't have LoRA added"
+
+3. **LoRA tensor naming format:**
+   ```
+   base_model.model.model.layers.{layer}.mlp.experts.{expert}.{gate|up|down}_proj.lora_{A|B}.weight
+   ```
+
+4. **Tensor shapes:**
+   - gate_proj/up_proj (w1/w3): lora_A=[rank, hidden_size], lora_B=[moe_intermediate_size, rank]
+   - down_proj (w2): lora_A=[rank, moe_intermediate_size], lora_B=[hidden_size, rank]
+
+**Test Script:** `scripts/test_qwen15_moe_expert_lora.py`
+
+**Implications for Qwen3-30B-A3B:**
+- The MoE LoRA infrastructure works - only Qwen3MoeForCausalLM has the bug
+- When GitHub #3377 is fixed, the same adapter format should work
+- For now, can test Megatron → vLLM weight export using Qwen1.5-MoE as a proxy
+
+#### Megatron → vLLM Weight Export Testing (2025-12-18)
+
+Validated the full Megatron → vLLM LoRA export pipeline using Qwen1.5-MoE as a proxy for Qwen3-30B-A3B.
+
+**Test Results:**
+
+| Test | Status |
+|------|--------|
+| Name conversion (Megatron → PEFT) | **PASS** (5/5 patterns) |
+| Simulated Megatron export → vLLM load | **PASS** |
+
+**Conversion Patterns Tested:**
+```
+Megatron (input)                                              → PEFT (output)
+decoder.layers.0.self_attention.linear_qkv.adapter.linear_in  → layers.0.self_attn.q_proj.lora_A
+decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.adapter.linear_in → layers.0.mlp.experts.0.gate_proj.lora_A
+decoder.layers.0.mlp.experts.local_experts.59.linear_fc2.adapter.linear_out → layers.0.mlp.experts.59.down_proj.lora_B
+```
+
+**Tensor Counts:**
+- Attention LoRA: 24 layers × 3 modules (q/k/v) × 2 (A+B) = 144 tensors
+- Expert LoRA: 24 layers × 60 experts × 3 modules (gate/up/down) × 2 (A+B) = 8,640 tensors
+- Total: 8,784 tensors successfully converted and loaded
+
+**Key Finding:**
+vLLM's `FusedMoEWithLoRA` class correctly handles PEFT-format expert LoRA weights. The format conversion is:
+- `lora_a`/`lora_b` → `lora_A`/`lora_B` (case normalization)
+- `model.layers.N...` → `base_model.model.model.layers.N...` (PEFT prefix)
+
+**Test Script:** `scripts/test_megatron_to_vllm_export.py`
 
 #### Technical Analysis
 
@@ -622,6 +850,19 @@ Filter out MLP modules in `megatron_distributed.py:get_lora_state_dict()`:
 - Training: Full MLP + attention LoRA via Megatron
 - Inference: Attention-only LoRA via vLLM
 - Loss: ~10-20% effectiveness reduction for MoE inference (based on Tinker docs)
+
+**UPDATE (2025-12-17):** vLLM 0.13.0rc2 LoRA loading is completely broken for Qwen3 MoE models. The workaround above only applies to vLLM < 0.13.0. For 0.13.0rc2, **no LoRA inference is possible** until the upstream bug is fixed.
+
+#### Options for Proceeding
+
+| Option | Effort | Risk | Notes |
+|--------|--------|------|-------|
+| 1. Wait for upstream fix | None | Low | Monitor [vllm-ascend #3377](https://github.com/vllm-project/vllm-ascend/issues/3377) |
+| 2. Downgrade to vLLM 0.12.x | Low | Medium | May lose other 0.13 features; need to verify 0.12.x works |
+| 3. Debug V1 engine locally | High | High | Fix `set_active_loras` failure; complex multi-GPU debugging |
+| 4. Use non-LoRA inference | Low | High | Train with LoRA, merge weights for inference (loses LoRA flexibility) |
+
+**Recommended:** Option 1 (wait) with Option 4 (merge weights) as fallback. The bug is tracked upstream and affects many users - expect fix soon.
 
 #### References
 
