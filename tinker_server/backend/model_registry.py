@@ -78,11 +78,51 @@ MODEL_CONFIGS = {
 }
 
 
+def normalize_model_name(model_name_or_path: str) -> str:
+    """Normalize a model path or name to HuggingFace model name format.
+
+    Args:
+        model_name_or_path: Either a HuggingFace model name (e.g., "Qwen/Qwen3-0.6B")
+            or a full path (e.g., "/vePFS/.../models--Qwen--Qwen3-0.6B/snapshots/...")
+
+    Returns:
+        Normalized model name
+
+    Raises:
+        ValueError: If model cannot be identified
+    """
+    # If already a valid model name, return as-is
+    if model_name_or_path in MODEL_CONFIGS:
+        return model_name_or_path
+
+    # Try to extract model name from HuggingFace cache path
+    # Path format: .../models--{org}--{model}/snapshots/...
+    import re
+    match = re.search(r'models--([^/]+)--([^/]+)', model_name_or_path)
+    if match:
+        org, model = match.groups()
+        candidate = f"{org}/{model}"
+        if candidate in MODEL_CONFIGS:
+            return candidate
+
+    # Try substring matching as fallback
+    for model_name in MODEL_CONFIGS:
+        # Normalize for comparison: Qwen/Qwen3-0.6B -> qwen--qwen3-0.6b
+        path_pattern = model_name.replace("/", "--").lower()
+        if path_pattern in model_name_or_path.lower():
+            return model_name
+
+    raise ValueError(
+        f"Cannot identify model from: {model_name_or_path}. "
+        f"Supported models: {list(MODEL_CONFIGS.keys())}"
+    )
+
+
 def get_model_config(model_name: str) -> ModelConfig:
     """Get config for a supported model.
 
     Args:
-        model_name: HuggingFace model name (e.g., "Qwen/Qwen3-0.6B")
+        model_name: HuggingFace model name (e.g., "Qwen/Qwen3-0.6B") or full path
 
     Returns:
         ModelConfig with parallelism recommendations
@@ -90,18 +130,18 @@ def get_model_config(model_name: str) -> ModelConfig:
     Raises:
         ValueError: If model is not in the supported list
     """
-    if model_name in MODEL_CONFIGS:
-        return MODEL_CONFIGS[model_name]
-
-    raise ValueError(
-        f"Unsupported model: {model_name}. "
-        f"Supported models: {list(MODEL_CONFIGS.keys())}"
-    )
+    # Normalize path to model name
+    normalized = normalize_model_name(model_name)
+    return MODEL_CONFIGS[normalized]
 
 
 def is_supported_model(model_name: str) -> bool:
     """Check if a model is in the supported list."""
-    return model_name in MODEL_CONFIGS
+    try:
+        normalize_model_name(model_name)
+        return True
+    except ValueError:
+        return False
 
 
 def is_moe_model(model_name: str) -> bool:

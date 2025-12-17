@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.backend.model_registry import is_moe_model
 
 # Persistent actor configuration - matches vLLM pattern
 PERSISTENT_MEGATRON_ACTOR_NAME = "persistent_megatron_worker_group_v2"
@@ -990,7 +991,16 @@ class MegatronRankWorker:
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
 
+        # Check if model is MoE - if so, filter MLP modules
+        # vLLM's FusedMoEWithLoRA expects per-expert LoRA weights, but Megatron exports
+        # shared LoRA (single adapter for all experts). This causes weight format mismatch.
+        # Solution: Only export attention modules for MoE models.
+        model_is_moe = is_moe_model(self.base_model)
+        if model_is_moe:
+            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (vLLM weight format incompatible)")
+
         lora_state_dict = {}
+        mlp_filtered_count = 0
         logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
             # Add PEFT prefix if not already present
@@ -1004,9 +1014,17 @@ class MegatronRankWorker:
                 if peft_name is None:
                     logger.warning(f"Could not convert to PEFT: {name}")
                     continue
+
+            # For MoE models, filter out MLP/expert modules
+            if model_is_moe and _is_mlp_module(peft_name):
+                mlp_filtered_count += 1
+                continue
+
             lora_state_dict[peft_name] = tensor
 
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, including MLP/expert modules)")
+        if model_is_moe:
+            logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, attention-only for MoE)")
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:3]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
