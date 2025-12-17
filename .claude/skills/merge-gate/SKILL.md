@@ -142,11 +142,33 @@ curl -s http://localhost:8000/api/v1/healthz
 | **moe_rl** | RL with importance_sampling | Gradients flow, loss computes | 5 min |
 | **moe_api** | Sampling from trained weights | Generation works | 3 min |
 
-### Phase 3: Stress Test
+### Phase 3: Stress & Multi-Tenant Tests
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|
 | **stress** | 5 concurrent clients with different configs | All complete without deadlock | 5 min |
+| **interleaved_sessions** | A → B → A session switching | Loss continuity preserved | 3 min |
+| **rapid_session_creation** | 5 sessions in quick succession | All create successfully | 1 min |
+| **mixed_model_lru_eviction** | Dense → MoE → Dense | Graceful actor replacement | 5 min |
+
+### Supported Model Variants
+
+The system supports multiple model variants. All variants of the same base model share vLLM/Megatron actors:
+
+| Model | Type | GPUs | Backend | Status |
+|-------|------|------|---------|--------|
+| `Qwen/Qwen2.5-7B-Instruct` | Dense | 1 | PEFT/vLLM | Primary test target |
+| `Qwen/Qwen3-0.6B` | Dense | 1 | PEFT/vLLM | Small model for quick tests |
+| `Qwen/Qwen3-30B-A3B-Instruct-2507` | MoE | 4 (TP=4) | Megatron/vLLM | Primary MoE test target |
+| `Qwen/Qwen3-30B-A3B` | MoE | 4 (TP=4) | Megatron/vLLM | Base model variant |
+| `Qwen/Qwen3-30B-A3B-Base` | MoE | 4 (TP=4) | Megatron/vLLM | Pre-training base |
+
+**Quick test with Qwen3-0.6B** (faster iteration, smaller footprint):
+```bash
+# Useful for rapid development testing
+TINKER_BASE_URL=http://localhost:8000 \
+python scripts/test_qwen3_06b.py
+```
 
 Stress test configurations:
 - Client 1: Dense model, SFT, rank=16
@@ -268,9 +290,78 @@ Simulates concurrent cookbook clients:
 - Different LoRA ranks (16, 32, 64)
 - Tests request serialization and session isolation
 
+### Multi-Tenant Concurrency Test (Interleaved Sessions)
+
+Tests stateless trainer architecture by interleaving sessions:
+
+```
+Session A: iter1 → iter2 → (switch to B) → iter3 → iter4
+Session B:                   iter1 → iter2
+```
+
+**This is CRITICAL for production use.** Multiple users switching between sessions must maintain correct state.
+
+**What to verify:**
+1. Session A's loss continues decreasing after switch (no state reset)
+2. Session B trains independently with different loss trajectory
+3. No weight contamination between sessions
+
+**Expected curve behavior:**
+```
+Session A: 6.42 → 0.18 → [B] → 0.009 → 0.0001  (continues from 0.18, not reset)
+Session B: 10.57 → 0.42                        (independent trajectory)
+```
+
+**Run the interleaved sessions test:**
+```bash
+TINKER_BASE_URL=http://localhost:8000 \
+python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_interleaved_sessions -v -s
+```
+
 ---
 
 ## Interpreting Results
+
+### CRITICAL: Visual Curve Inspection Required
+
+**The agent MUST visually inspect training curves, not just rely on pytest pass/fail.**
+
+Test scripts generate training curve plots in `.claude/skills/merge-gate/results/`:
+- `dense_sft_pig_latin_YYYYMMDD_HHMMSS.png`
+- `dense_sft_pig_latin_YYYYMMDD_HHMMSS.json`
+
+**What to check in training curves:**
+
+1. **Monotonic decrease**: Loss should generally decrease, not oscillate wildly
+2. **No spikes**: Sudden loss increases indicate training instability
+3. **No plateau**: Loss should continue decreasing, not flatten prematurely
+4. **Reasonable range**: Initial loss ~2-10, final loss ~0.01-0.5 for converged training
+
+**Example of healthy vs problematic curves:**
+
+```
+HEALTHY:                       PROBLEMATIC:
+Loss                           Loss
+│ ╲                            │ ╱╲
+│  ╲                           │╱  ╲ ╱╲
+│   ╲_                         │    ╳  ╲___
+│     ╲_                       │
+│       ╲___                   │
+└──────────── Iter             └──────────── Iter
+  (smooth decrease)              (spikes, then plateau)
+```
+
+**How to view plots:**
+```bash
+# From local machine (plots saved to remote server)
+ssh volcano 'ls /root/tinker_project/tinker-server/.claude/skills/merge-gate/results/*.png'
+
+# Copy plots locally for viewing
+scp volcano:/root/tinker_project/tinker-server/.claude/skills/merge-gate/results/*.png /tmp/
+
+# Or view JSON data directly
+cat .claude/skills/merge-gate/results/dense_sft_pig_latin_*.json | jq .losses
+```
 
 ### All Pass
 
@@ -289,6 +380,8 @@ test_stress.py::test_concurrent_clients PASSED
 
 ========================= 8 passed in 1823.45s =========================
 ```
+
+**IMPORTANT**: Even when all tests pass, visually inspect the training curves to ensure they show expected learning behavior.
 
 ### Failure
 
