@@ -71,6 +71,101 @@ Each tier involves:
 | VL models | Vision encoder, multimodal inputs | New modality support |
 | pi0/pi0.5 (VLA) | See VLA investigation below | Tentative - may require new backend |
 
+#### K2 Support Details
+
+**Model Specifications (Kimi-K2)**
+
+| Spec | Value |
+|------|-------|
+| Total params | 1.04 trillion |
+| Active params | 32B per token |
+| Experts | 384 total, 8+1 per token |
+| Hidden dim | 7168 |
+| Context window | 128K tokens |
+| Architecture | DeepSeek-V3 style MoE with MLA attention |
+| Quantization | Block-FP8 (not per-tensor FP8) |
+
+**References**: [HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct), [Technical Report](https://arxiv.org/pdf/2507.20534)
+
+**Framework Landscape**
+
+Three relevant frameworks operate at different abstraction levels:
+
+| Framework | Purpose | Megatron Access | Distributed | Data Format |
+|-----------|---------|-----------------|-------------|-------------|
+| **Verl** | PPO/RLHF workflows | `MegatronEngine` wrapper | Ray actors | `DataProto`, `TensorDict` |
+| **MS-Swift** | Research training | Direct `megatron.training` | torch.distributed | HF datasets |
+| **Tinker-Server** | Multi-tenant API | Via verl wrapper + direct calls | Ray actors | Custom `Datum` |
+
+**What tinker-server uses from verl**:
+- `MegatronEngineWithLMHead` - engine wrapper
+- `HFModelConfig`, `McoreEngineConfig` - config dataclasses
+- `vLLMHttpServerBase` - Ray actor base class
+- Utility functions: `copy_to_local`, `get_adapter_state_dict`
+
+**What tinker-server does NOT use**:
+- `MegatronWorker` (PPO-specific actor/critic orchestration)
+- `DataProto` (PPO-specific data format)
+- Dispatch decorators (`@register`, `Dispatch`)
+
+**k2-workspace reference implementation** (ms-swift based):
+- Location: `../k2-workspace/workspace/ms-swift/examples/megatron/grpo/kimi-k2/`
+- Config: `moe_colocate_lora.sh` - 64 GPU setup (8 nodes × 8 GPUs)
+- Parallelism: TP=8, EP=64, PP=1, CP=1
+
+**GPU Requirements**
+
+| Configuration | GPUs | Notes |
+|---------------|------|-------|
+| Full (reference) | 64× H100 80GB | TP=8, EP=64, as in k2-workspace |
+| Minimum (with FP8) | 16× H100 80GB | TP=8, EP=16, requires FP8 + offload |
+| Minimum (INT4 inference only) | 8× H100 80GB | Inference only, no training |
+
+**16-GPU Configuration** (for debugging/development):
+```bash
+COMMON_TP=8 COMMON_EP=16 COMMON_PP=1 COMMON_CP=1 INFER_TP=16
+--fp8-param-gather                    # FP8 weights (H100 required)
+--recompute-granularity full          # Activation checkpointing
+--optimizer-cpu-offload               # Optimizer to CPU
+--train_type lora --lora_rank 8
+--micro_batch_size 1 --max_model_len 4096
+```
+
+Expected: 5-10× slower than 64-GPU baseline due to expert memory pressure and offloading.
+
+**Required Code Changes**
+
+| File | Change | Priority |
+|------|--------|----------|
+| `megatron_training.py:903` | Add `r"Kimi-K2"` to `moe_patterns` | Critical |
+| `model_registry.py` | Add K2 config: `ModelConfig(True, 8, 8)` | Critical |
+| `verl_training.py:941` | Use model registry instead of hardcoded TP=4, EP=2 | Critical |
+| `megatron_distributed.py:267` | Add FP8 dtype support to `McoreEngineConfig` | Critical |
+| `verl_inference.py:817` | Add `quantization="fp8"` to vLLM kwargs | High |
+| `megatron_training.py:204` | Extract auxiliary loss from MoE router | Medium |
+
+**Implementation Phases**
+
+| Phase | Tasks | Effort |
+|-------|-------|--------|
+| 1. Detection | Add K2 to `is_moe_model()`, populate registry | 1-2h |
+| 2. Parallelism | Dynamic TP/EP from registry, remove hardcoding | 2-3h |
+| 3. FP8 | Add dtype detection and config plumbing | 3-4h |
+| 4. Validation | Test standalone vLLM + ms-swift before integration | 4-8h |
+
+**Pre-integration validation** (run before code changes):
+```bash
+# Test 1: vLLM inference with FP8
+vllm serve moonshotai/Kimi-K2-Instruct \
+    --tensor-parallel-size 8 --quantization fp8
+
+# Test 2: ms-swift training (16 GPUs)
+cd ../k2-workspace/workspace/ms-swift/examples/megatron/grpo/kimi-k2
+COMMON_TP=8 COMMON_EP=16 INFER_TP=16 bash moe_colocate_lora.sh 2 0 127.0.0.1
+```
+
+If standalone tests fail, the issue is upstream (vLLM/Megatron K2 support), not tinker-server.
+
 #### VLA Models Investigation (Tentative)
 
 **What are VLA models?** Vision-Language-Action models for robot control. Output continuous action trajectories instead of text tokens.
@@ -897,6 +992,76 @@ Filter out MLP modules in `megatron_distributed.py:get_lora_state_dict()`:
 │             └───────────────────────────────────────────────────────────┘
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Future Research
+
+### Multi-LoRA Batched Training
+
+**Problem**: Current architecture time-shares a single Megatron engine between different LoRA clients. Each `forward_backward` call trains one LoRA at a time. With N concurrent users, total time = N × single-user time.
+
+**Opportunity**: Batch multiple LoRAs in a single forward-backward pass. When GPUs are undersaturated (small per-user batches), this could yield 2-3× speedup.
+
+**How it works (conceptually)**:
+
+```python
+# Current: sequential
+for lora in [A, B, C]:
+    forward_backward(batch[lora], lora)  # 3 passes
+
+# Batched: single pass with per-sequence adapter routing
+batched_forward_backward(
+    combined_batch,
+    adapters=[A, B, C],
+    adapter_indices=[0,0,1,1,2,2]  # which sequence uses which LoRA
+)
+```
+
+**Current landscape**:
+
+| System | Multi-LoRA Training | Production-ready |
+|--------|---------------------|------------------|
+| [mLoRA](https://github.com/TUDB-Labs/mLoRA) | Yes (BatchLoRA kernels) | No - research code |
+| verl / Megatron | No | Yes |
+| vLLM (inference only) | Yes (BGMV kernels) | Yes |
+
+**Two approaches**:
+
+| Approach | Description | Speedup | Complexity |
+|----------|-------------|---------|------------|
+| mLoRA-style (PyTorch) | Batch base model ops, separate LoRA ops | ~80-90% of optimal | Medium |
+| Full BGMV/SGMV | Custom CUDA kernels for batched LoRA | ~100% of optimal | Very High |
+
+mLoRA batches the expensive base model computation (`X @ W`) but runs N separate LoRA ops (`x @ A @ B`). Since LoRA params are <1% of base model, this captures most of the benefit without custom CUDA.
+
+**Kernel backward pass status**:
+
+| Kernel | Forward | Backward (training) |
+|--------|---------|---------------------|
+| Punica BGMV/SGMV | ✓ | ✗ (not implemented) |
+| vLLM BGMV | ✓ | ✗ (inference only) |
+| mLoRA BatchLoRA | ✓ (PyTorch) | ✓ (autograd) |
+
+No public BGMV/SGMV backward implementations exist. All are inference-only.
+
+**Recommended path** (mLoRA-style):
+
+1. Modify `forward_backward_batch` to accept multiple adapter contexts
+2. Stack inputs from multiple sessions before forward pass
+3. Replace single-adapter LoRA modules with multi-adapter versions
+4. Route gradients to correct adapter's optimizer
+5. Manage per-adapter optimizer states
+
+No custom CUDA kernels needed. Main challenge is integration with Megatron's tensor parallelism.
+
+**When to prioritize**: Only worthwhile with 3+ concurrent users with small batches. Single-user or large-batch scenarios see minimal benefit.
+
+**References**:
+- [mLoRA Paper (VLDB 2024)](https://arxiv.org/abs/2312.02515) - BatchLoRA operator design (PyTorch-level)
+- [Punica Paper](https://arxiv.org/abs/2310.18547) - SGMV kernels for multi-LoRA inference (no backward)
+- [S-LoRA Blog](https://lmsys.org/blog/2023-11-15-slora/) - Serving thousands of adapters
+- [Punica BGMV source](https://github.com/punica-ai/punica/blob/master/csrc/bgmv/bgmv_impl.cuh) - Forward-only CUDA kernel
 
 ---
 
