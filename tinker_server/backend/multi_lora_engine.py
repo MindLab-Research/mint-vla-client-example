@@ -806,9 +806,17 @@ class MultiModelInferenceManager:
             # Determine quantization from model config
             quantization = "fp8" if config.use_fp8 else None
 
+            # For MoE models, use max_loras=1 to reduce memory usage.
+            # vLLM pre-allocates LoRA buffers for all experts, which is huge:
+            # max_loras × num_experts × lora_rank × hidden_size per layer.
+            # With default max_loras=64, 128 experts, this exceeds GPU memory.
+            model_max_loras = 1 if config.is_moe else self.max_loras
+            model_max_cpu_loras = 0 if config.is_moe else self.max_cpu_loras
+
             logger.info(
                 f"Creating vLLM engine for model {model_name}: "
-                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}, quant={quantization}"
+                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}, "
+                f"quant={quantization}, max_loras={model_max_loras}"
             )
 
             engine = MultiLoRAInferenceEngine(
@@ -817,8 +825,8 @@ class MultiModelInferenceManager:
                 data_parallel_size=config.recommended_dp,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
-                max_loras=self.max_loras,
-                max_cpu_loras=self.max_cpu_loras,
+                max_loras=model_max_loras,
+                max_cpu_loras=model_max_cpu_loras,
                 max_lora_rank=self.max_lora_rank,
                 actor_name=actor_name,
                 quantization=quantization,
