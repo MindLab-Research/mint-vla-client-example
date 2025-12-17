@@ -230,7 +230,7 @@ class MultiLoRAInferenceEngine:
 
             # Try to get existing persistent actor
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
-            # We must verify the actor is alive by calling a method on it
+            # We must verify the actor is alive AND engine is initialized
             print(f"[DEBUG INIT] Trying to get existing actor {self.actor_name}", file=sys.stderr, flush=True)
             try:
                 self.server = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
@@ -239,27 +239,44 @@ class MultiLoRAInferenceEngine:
                 # This will raise RayActorError if actor is dead
                 try:
                     ray.get(self.server.__ray_ready__.remote(), timeout=5)
-                    print(f"[DEBUG INIT] REUSING existing actor (health check passed)", file=sys.stderr, flush=True)
-                    logger.info(
-                        f"Connected to existing persistent vLLM actor: {self.actor_name}"
-                    )
-                    self._initialized = True
+                    print(f"[DEBUG INIT] Actor alive, checking engine status", file=sys.stderr, flush=True)
 
-                    # Register existing actor with resource pool for LRU tracking
-                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-                    total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                    resource_pool = get_resource_pool()
-                    logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool")
-                    resource_pool.register(
-                        actor_name=self.actor_name,
-                        actor_type=ActorType.VLLM,
-                        num_gpus=total_gpus,
-                        actor_handle=self.server,
-                        namespace=PERSISTENT_NAMESPACE,
-                        base_model=self.model_path,
-                    )
-                    logger.info(f"[DEBUG] ResourcePool now has {len(resource_pool._entries)} entries")
-                    return
+                    # Check if engine is actually initialized (not just actor alive)
+                    # A broken actor can be "alive" but have failed engine init
+                    engine_ready = ray.get(self.server.is_engine_ready.remote(), timeout=10)
+                    if not engine_ready:
+                        print(f"[DEBUG INIT] Engine NOT ready - actor is broken, killing it", file=sys.stderr, flush=True)
+                        logger.warning(
+                            f"vLLM actor {self.actor_name} has broken engine, killing and recreating"
+                        )
+                        try:
+                            ray.kill(self.server, no_restart=True)
+                        except Exception as kill_err:
+                            print(f"[DEBUG INIT] Failed to kill broken actor: {kill_err}", file=sys.stderr, flush=True)
+                        self.server = None
+                        self._initialized = False
+                    else:
+                        print(f"[DEBUG INIT] REUSING existing actor (engine ready)", file=sys.stderr, flush=True)
+                        logger.info(
+                            f"Connected to existing persistent vLLM actor: {self.actor_name}"
+                        )
+                        self._initialized = True
+
+                        # Register existing actor with resource pool for LRU tracking
+                        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                        total_gpus = self.tensor_parallel_size * self.data_parallel_size
+                        resource_pool = get_resource_pool()
+                        logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool")
+                        resource_pool.register(
+                            actor_name=self.actor_name,
+                            actor_type=ActorType.VLLM,
+                            num_gpus=total_gpus,
+                            actor_handle=self.server,
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=self.model_path,
+                        )
+                        logger.info(f"[DEBUG] ResourcePool now has {len(resource_pool._entries)} entries")
+                        return
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive, need to create new one
                     print(f"[DEBUG INIT] Actor dead/unresponsive, will create new", file=sys.stderr, flush=True)
@@ -360,26 +377,68 @@ class MultiLoRAInferenceEngine:
             # vLLM on a separate node with completely free GPUs.
             from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-            # Find a node with enough free GPUs (not in placement groups)
+            # Find a node with enough AVAILABLE GPUs (not just total GPUs).
+            # Ray's node.Resources shows total, but other actors (Megatron) may hold GPUs.
+            # We compute available by checking which nodes have active placement groups.
             target_node = None
-            print(f"[SCHEDULE DEBUG] Looking for node with {total_gpus} GPUs for vLLM", file=sys.stderr, flush=True)
+            print(f"[SCHEDULE DEBUG] Looking for node with {total_gpus} available GPUs for vLLM", file=sys.stderr, flush=True)
+
+            # Get cluster-wide available resources for validation
+            cluster_available = ray.available_resources()
+            cluster_gpus = cluster_available.get("GPU", 0)
+            print(f"[SCHEDULE DEBUG] Cluster has {cluster_gpus} GPUs available", file=sys.stderr, flush=True)
+
+            # Find GPUs used by active placement groups on each node
+            # Each bundle in a placement group typically uses 1 GPU
+            pg_table = ray.util.placement_group_table()
+            gpus_used_by_pg = {}  # node_id -> count of GPUs used by placement groups
+            for pg_id, pg_info in pg_table.items():
+                if pg_info.get("state") == "CREATED":
+                    # Count bundles per node (each bundle typically uses 1 GPU)
+                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
+                    for bundle_idx, node_id in bundles_to_node.items():
+                        gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
+
+            for node_id, gpu_count in gpus_used_by_pg.items():
+                print(f"[SCHEDULE DEBUG] Node {node_id[:8]} has {gpu_count} GPUs used by placement groups", file=sys.stderr, flush=True)
+
+            # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used)
+            candidates = []
             for node in ray.nodes():
-                node_id_short = node["NodeID"][:8]
+                node_id = node["NodeID"]
+                node_id_short = node_id[:8]
                 if node["Alive"]:
-                    resources = node.get("Resources", {})
-                    total_gpu = resources.get("GPU", 0)
-                    obj_store = resources.get("object_store_memory", 0)
-                    print(f"[SCHEDULE DEBUG]   Node {node_id_short}: GPUs={total_gpu}, obj_store={obj_store/1e9:.1f}GB", file=sys.stderr, flush=True)
-                    if total_gpu >= total_gpus and obj_store > 100_000_000_000:
-                        node_id = node["NodeID"]
-                        # Prefer nodes with exactly total_gpus (avoids 8-GPU nodes with Megatron)
-                        if total_gpu == total_gpus:
-                            target_node = node_id
-                            print(f"[SCHEDULE DEBUG] Selected {total_gpus}-GPU node {node_id[:8]} for vLLM (exact match)", file=sys.stderr, flush=True)
-                            break
-                        elif target_node is None:
-                            target_node = node_id
-                            print(f"[SCHEDULE DEBUG] Candidate node {node_id[:8]} with {total_gpu} GPUs (looking for exact {total_gpus})", file=sys.stderr, flush=True)
+                    total_res = node.get("Resources", {})
+                    total_gpu = total_res.get("GPU", 0)
+                    obj_store = total_res.get("object_store_memory", 0)
+                    pg_gpus = gpus_used_by_pg.get(node_id, 0)
+                    available_gpu = total_gpu - pg_gpus
+                    print(f"[SCHEDULE DEBUG]   Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, available={available_gpu}, obj_store={obj_store/1e9:.1f}GB", file=sys.stderr, flush=True)
+
+                    # Node must have enough AVAILABLE GPUs (after subtracting PG usage) and enough object store
+                    if available_gpu >= total_gpus and obj_store > 100_000_000_000:
+                        candidates.append((node_id, available_gpu))
+
+            # Prefer nodes with NO placement groups first (to avoid GPU assignment conflicts)
+            # Among those, prefer nodes with more GPUs (more room)
+            if candidates:
+                # Separate into "clean" nodes (no PG) and "partial" nodes (has PG but has free GPUs)
+                clean_nodes = [(nid, gpus) for nid, gpus in candidates if gpus_used_by_pg.get(nid, 0) == 0]
+                partial_nodes = [(nid, gpus) for nid, gpus in candidates if gpus_used_by_pg.get(nid, 0) > 0]
+
+                if clean_nodes:
+                    # Prefer clean nodes
+                    clean_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
+                    target_node = clean_nodes[0][0]
+                    available_gpus = clean_nodes[0][1]
+                    print(f"[SCHEDULE DEBUG] Selected clean node {target_node[:8]} with {available_gpus} GPUs (no PG)", file=sys.stderr, flush=True)
+                else:
+                    # Fall back to partial nodes
+                    partial_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
+                    target_node = partial_nodes[0][0]
+                    available_gpus = partial_nodes[0][1]
+                    pg_count = gpus_used_by_pg.get(target_node, 0)
+                    print(f"[SCHEDULE DEBUG] Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} used by PG)", file=sys.stderr, flush=True)
 
             scheduling_opts = {}
             if target_node:

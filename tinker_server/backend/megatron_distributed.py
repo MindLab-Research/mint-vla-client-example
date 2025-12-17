@@ -2135,9 +2135,17 @@ class MegatronWorkerGroup:
 
     def shutdown(self):
         """Shutdown all workers and release placement group."""
+        # First graceful shutdown
         for w in self.workers:
             try:
-                ray.get(w.shutdown.remote())
+                ray.get(w.shutdown.remote(), timeout=5)
+            except Exception:
+                pass
+
+        # Then force kill all workers to release GPU memory
+        for w in self.workers:
+            try:
+                ray.kill(w, no_restart=True)
             except Exception:
                 pass
 

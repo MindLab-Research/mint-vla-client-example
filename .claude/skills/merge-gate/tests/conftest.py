@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 
+
 import pytest
 import requests
 
@@ -148,26 +149,21 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 def tokenizer():
     """Get tokenizer for Dense model."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True, local_files_only=True)
+    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
 def moe_tokenizer():
     """Get tokenizer for MoE model."""
     from transformers import AutoTokenizer
-    import os
-    # Use HF model ID with local_files_only=True to load from HF cache
-    # Set HF_HOME to ensure correct cache location
-    os.environ["HF_HOME"] = "/vePFS-Mindverse/share/huggingface"
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True, local_files_only=True)
+    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
 def small_tokenizer():
     """Get tokenizer for small Dense model (Qwen3-0.6B)."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True, local_files_only=True)
+    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture

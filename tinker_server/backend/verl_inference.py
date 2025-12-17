@@ -83,6 +83,21 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
 
+        async def is_engine_ready(self) -> bool:
+            """Check if vLLM engine is properly initialized.
+
+            __ray_ready__ only checks if Ray actor is alive, not engine status.
+            This method verifies the engine was successfully created.
+            """
+            try:
+                if not hasattr(self, "engine") or self.engine is None:
+                    return False
+                # list_loras() requires engine to be initialized
+                await self.engine.list_loras()
+                return True
+            except Exception:
+                return False
+
         def _patch_lora_args(self, args):
             """Patch args Namespace with multi-LoRA config.
 
