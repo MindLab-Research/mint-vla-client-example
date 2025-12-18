@@ -194,6 +194,16 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+        # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
+        # These patches enable Flash Attention 2 with MLA by padding value tensors
+        # Must be applied before MLASelfAttention class is imported/instantiated
+        try:
+            from verl.models.mcore.patch_v012 import apply_patch
+            apply_patch()
+            logger.info(f"[Rank {self.rank}] Applied MLA patches from verl.models.mcore.patch_v012")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not apply MLA patch: {e}")
+
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
         from verl.trainer.config import CheckpointConfig
@@ -245,8 +255,11 @@ class MegatronRankWorker:
         )
 
         # Build override_transformer_config for MoE models
+        # Different HF configs use different attribute names:
+        # - Qwen3-MoE: num_experts
+        # - DeepseekV3/Moonlight: n_routed_experts
         override_tf_config = {}
-        num_experts = getattr(hf_config, "num_experts", None)
+        num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
         if num_experts is not None:
             # MoE model - pass expert parameters to TransformerConfig
             override_tf_config["num_moe_experts"] = num_experts
@@ -258,7 +271,7 @@ class MegatronRankWorker:
             override_tf_config["moe_permute_fusion"] = False
             logger.info(
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
-                f"top-{num_experts_per_tok} routing"
+                f"top-{num_experts_per_tok} routing, permute_fusion=False"
             )
 
         # For LoRA training, disable grad_offload to keep gradient buffers allocated.
@@ -283,19 +296,20 @@ class MegatronRankWorker:
 
         # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
         # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
-        # On A100 GPUs, fused/flash attention requires head_dim_qk <= 128
-        # Moonlight/K2 has head_dim_qk=192 (128+64), exceeding this limit
-        # Must use unfused attention backend for these models
+        # MLA has head_dim_qk=192 (qk_nope=128 + qk_rope=64) and head_dim_v=128
+        # Flash Attention 2 requires head_dim_qk == head_dim_v
+        # The MLA patch in verl/models/mcore/patch_v012.py pads value tensor to 192
+        # to match query dimension, enabling FA2 with THD format on sm80 (A100/A800)
+        #
+        # IMPORTANT: Do NOT force unfused backend here - it conflicts with THD format
+        # (TE disables unfused for THD). Let FA2 work with the value padding instead.
         qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
         qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
         head_dim_qk = qk_nope + qk_rope
-        logger.info(f"[Rank {self.rank}] MLA check: qk_nope={qk_nope}, qk_rope={qk_rope}, head_dim_qk={head_dim_qk}")
-        if head_dim_qk > 128:
-            from megatron.core.transformer.enums import AttnBackend
-            override_tf_config["attention_backend"] = AttnBackend.unfused
+        if head_dim_qk > 0:
             logger.info(
-                f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} > 128, "
-                f"using unfused attention backend"
+                f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
+                f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
             )
 
         logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
