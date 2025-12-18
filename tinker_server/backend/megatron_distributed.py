@@ -65,11 +65,13 @@ class DistributedConfig:
 def get_node_ip_and_free_port() -> tuple[str, int]:
     """Get node IP and free port for master address.
 
+    Uses Ray's node IP which correctly identifies the inter-node network interface.
     Self-contained to avoid module import issues on Ray workers.
     """
     import socket
-    hostname = socket.gethostname()
-    ip = socket.gethostbyname(hostname)
+    import ray
+    # Use Ray's IP detection which respects --node-ip-address and finds the correct interface
+    ip = ray.util.get_node_ip_address()
     # Get free port inline
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -1565,9 +1567,11 @@ class MegatronWorkerGroup:
 
         # Create placement group with N GPU bundles
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
+        # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
+        # STRICT_PACK would require single node, blocking on 8-GPU nodes
         self.placement_group = ray.util.placement_group(
             bundles,
-            strategy="STRICT_PACK",  # All on same node for NVLink
+            strategy="PACK",
         )
         ray.get(self.placement_group.ready())
 

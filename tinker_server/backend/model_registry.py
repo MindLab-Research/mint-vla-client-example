@@ -72,7 +72,7 @@ MODEL_CONFIGS = {
         recommended_tp=8,
         recommended_dp=1,
         train_tp=8,
-        train_ep=8,
+        train_ep=4,  # 32 GPUs (8×4) minimum - 16 GPUs OOM during model construction
         use_fp8=True,
     ),
 }
