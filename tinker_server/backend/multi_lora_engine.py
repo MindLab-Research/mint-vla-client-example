@@ -805,8 +805,8 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
-            # Determine quantization from model config
-            quantization = "fp8" if config.use_fp8 else None
+            # Determine quantization from model config (None = vLLM auto-detect from config.json)
+            quantization = config.quantization
 
             # For MoE models, use max_loras=1 to reduce memory usage.
             # vLLM pre-allocates LoRA buffers for all experts, which is huge:

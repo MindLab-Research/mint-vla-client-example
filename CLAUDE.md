@@ -83,3 +83,15 @@ python -m tinker_cookbook.recipes.math_rl.train \
 ```
 
 Note: `renderer_name="qwen3_instruct"` bypasses model lookup.
+
+---
+
+## Hall of Shame
+
+Agent mistakes that wasted time. Read this before starting any task.
+
+| Date | Mistake | What Should Have Been Done |
+|------|---------|---------------------------|
+| 2024-12-18 | Ran merge gate tests when user explicitly asked for K2 work | Focus on the requested task. Do not divert to "system health checks" unless specifically asked. |
+| 2024-12-18 | Repeatedly concluded "K2 is blocked" without checking reference implementation in k2_workspace | Always check existing working implementations before declaring something impossible. |
+| 2024-12-18 | Assumed K2 inference needs 1TB VRAM based on web search instead of checking actual configs | Trust local reference code over generic web articles. |

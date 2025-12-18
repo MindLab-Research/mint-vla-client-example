@@ -21,7 +21,7 @@ class ModelConfig:
     recommended_dp: int  # vLLM inference DP
     train_tp: int = 1  # Megatron training TP
     train_ep: int = 1  # Megatron training EP (MoE only)
-    use_fp8: bool = False  # Use FP8 quantization (K2, etc.)
+    quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
 
     @property
     def total_gpus(self) -> int:
@@ -68,7 +68,7 @@ MODEL_CONFIGS = {
         recommended_dp=1,
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum
-        use_fp8=True,
+        quantization=None,  # Let vLLM auto-detect from config.json
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -76,7 +76,17 @@ MODEL_CONFIGS = {
         recommended_dp=1,
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum - cannot fit in 32 GPUs
-        use_fp8=True,
+        quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
+    ),
+    # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
+    # Same DeepseekV3ForCausalLM architecture, fits on 8 GPUs
+    "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
+        is_moe=True,
+        recommended_tp=2,  # Inference: 2 GPUs (per reference script)
+        recommended_dp=1,
+        train_tp=2,
+        train_ep=8,  # Training: 16 GPUs (TP=2, EP=8) per reference
+        quantization=None,  # BF16, no quantization needed
     ),
 }
 
@@ -189,14 +199,26 @@ def get_training_parallelism(model_name: str) -> tuple[int, int]:
     return config.train_tp, config.train_ep
 
 
-def requires_fp8(model_name: str) -> bool:
-    """Check if model requires FP8 quantization.
+def get_quantization(model_name: str) -> str | None:
+    """Get quantization method for model.
 
     Args:
         model_name: HuggingFace model name
 
     Returns:
-        True if model uses FP8 (e.g., Kimi-K2)
+        Quantization method (None for auto-detect, "fp8", "compressed-tensors", etc.)
     """
     config = get_model_config(model_name)
-    return config.use_fp8
+    return config.quantization
+
+
+def requires_fp8(model_name: str) -> bool:
+    """Check if model requires FP8 quantization (deprecated, use get_quantization).
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if model uses FP8
+    """
+    return get_quantization(model_name) == "fp8"
