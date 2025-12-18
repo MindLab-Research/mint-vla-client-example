@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Test Kimi K2 training with 24 GPUs and FP8.
+"""Test Kimi K2 training with 64 GPUs and FP8.
 
-This tests the basic training workflow for K2 with reduced parallelism (TP=8, EP=3).
-Full K2 requires 64 GPUs (TP=8, EP=8).
+K2 (1.04T params) requires 64 GPUs minimum for training:
+- Architecture: 384 experts × 61 layers, hidden=7168, moe_intermediate=2048
+- TP=8, EP=8 (world_size=64)
+- FP8 quantization via Transformer Engine
+
+Memory constraint: TE builds BF16 weights then converts to FP8.
+During conversion, BOTH BF16 and FP8 tensors exist on GPU simultaneously.
+- EP=4 (32 GPUs): ~65GB BF16 + ~32.5GB FP8 = ~97.5GB peak > 80GB A100 → OOM
+- EP=8 (64 GPUs): ~32.5GB BF16 + ~16.25GB FP8 = ~49GB peak < 80GB → fits
 """
 
 import os
@@ -89,7 +96,7 @@ def train_step(model_id: str, data: list, lr: float = 1e-4):
 
 def main():
     print("=" * 60)
-    print("Kimi K2 Training Test (24 GPUs, FP8)")
+    print("Kimi K2 Training Test (64 GPUs, FP8)")
     print("=" * 60)
 
     # Check cluster resources
@@ -100,7 +107,7 @@ def main():
     # Create session
     print("\n" + "-" * 40)
     print("Creating K2 training session...")
-    print("This will create a 24-GPU Megatron worker group (TP=8, EP=3)")
+    print("This will create a 64-GPU Megatron worker group (TP=8, EP=8)")
     print("Expect ~5-10 minutes for model loading with FP8...")
     print("-" * 40)
 

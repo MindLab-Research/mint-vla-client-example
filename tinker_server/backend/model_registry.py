@@ -55,16 +55,19 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
     ),
-    # Kimi K2 - 1T param MoE (384 experts, 8+1 active per token)
-    # Reference: TP=8, EP=64 (64 GPUs)
-    # Minimum: TP=8, EP=16 (16 GPUs) with FP8 + offload
-    # Block-FP8 quantization required for memory efficiency
+    # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
+    # Architecture: hidden=7168, moe_intermediate=2048 per expert
+    # Memory constraint: TE builds BF16 weights then converts to FP8.
+    # During conversion, BOTH BF16 and FP8 tensors exist on GPU simultaneously.
+    # With EP=4 (32 GPUs): ~65GB BF16 + ~32.5GB FP8 = ~97.5GB peak > 80GB A100 → OOM
+    # With EP=8 (64 GPUs): ~32.5GB BF16 + ~16.25GB FP8 = ~49GB peak < 80GB → fits
+    # Minimum: TP=8, EP=8 (64 GPUs) for 80GB A100s without offloading
     "moonshotai/Kimi-K2-Instruct": ModelConfig(
         is_moe=True,
         recommended_tp=8,  # Inference: 8 GPUs minimum
         recommended_dp=1,
         train_tp=8,
-        train_ep=8,  # Training: 64 GPUs (8×8), can reduce to 16 with offload
+        train_ep=8,  # Training: 64 GPUs (8×8) minimum
         use_fp8=True,
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
@@ -72,7 +75,7 @@ MODEL_CONFIGS = {
         recommended_tp=8,
         recommended_dp=1,
         train_tp=8,
-        train_ep=4,  # 32 GPUs (8×4) - Model builds in BF16 (~65GB/GPU) then converts to FP8
+        train_ep=8,  # Training: 64 GPUs (8×8) minimum - cannot fit in 32 GPUs
         use_fp8=True,
     ),
 }
