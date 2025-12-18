@@ -13,8 +13,12 @@ PFS_TINKER_PATH = "/vePFS-Mindverse/share/code/tinker-server"
 # PFS verl path with _mutable_fields patch for LoRA config assignment
 PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
 
-# PYTHONPATH for Ray actors - verl first (for _mutable_fields patch), then tinker-server
-PFS_PYTHONPATH = f"{PFS_VERL_PATH}:{PFS_TINKER_PATH}"
+# HuggingFace modules path for trust_remote_code models (K2, etc.)
+# Custom model code is cached here when models are first loaded
+PFS_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
+
+# PYTHONPATH for Ray actors - verl first (for _mutable_fields patch), then tinker-server, then HF modules
+PFS_PYTHONPATH = f"{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
 
 
 @dataclass
