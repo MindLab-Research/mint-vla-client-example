@@ -34,7 +34,8 @@
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
 | Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** |
-| moonshotai/Kimi-K2-Thinking | Reasoning | MoE | 64+ | 32+ | Block-FP8, infra team has working impl |
+| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 16 (TP2,EP8) | 2 (TP2) | Inference OK, Training BLOCKED (MLA) |
+| moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA requires sm90, Block-FP8 |
 
 #### T1 (Week 2-3) - Scale Up
 

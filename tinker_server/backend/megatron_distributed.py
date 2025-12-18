@@ -281,6 +281,25 @@ class MegatronRankWorker:
             override_tf_config["use_cpu_initialization"] = True
             logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
 
+        # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
+        # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
+        # On A100 GPUs, fused/flash attention requires head_dim_qk <= 128
+        # Moonlight/K2 has head_dim_qk=192 (128+64), exceeding this limit
+        # Must use unfused attention backend for these models
+        qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
+        qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
+        head_dim_qk = qk_nope + qk_rope
+        logger.info(f"[Rank {self.rank}] MLA check: qk_nope={qk_nope}, qk_rope={qk_rope}, head_dim_qk={head_dim_qk}")
+        if head_dim_qk > 128:
+            from megatron.core.transformer.enums import AttnBackend
+            override_tf_config["attention_backend"] = AttnBackend.unfused
+            logger.info(
+                f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} > 128, "
+                f"using unfused attention backend"
+            )
+
+        logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
+
         engine_config = McoreEngineConfig(
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
