@@ -34,8 +34,8 @@
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
 | Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** |
-| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 16 (TP2,EP8) | 2 (TP2) | Inference OK, Training BLOCKED (MLA) |
-| moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA requires sm90, Block-FP8 |
+| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 16 (TP2,EP8) | 2 (TP2) | **Verified** (MLA via value padding) |
+| moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA works (value padding), memory blocked |
 
 #### T1 (Week 2-3) - Scale Up
 
@@ -67,7 +67,7 @@ Each tier involves:
 
 | Model | Challenge | Mitigation |
 |-------|-----------|------------|
-| Kimi-K2 | Block-FP8 quantization, 1T params | Infra team has working impl, migrate to Mint |
+| Kimi-K2 | 64 GPU memory requirement, Block-FP8 | MLA solved via value padding, need 64+ GPUs |
 | DeepSeek-V3.1 | Different MoE routing | Architecture analysis needed |
 | VL models | Vision encoder, multimodal inputs | New modality support |
 | pi0/pi0.5 (VLA) | See VLA investigation below | Tentative - may require new backend |
