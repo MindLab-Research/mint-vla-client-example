@@ -269,12 +269,17 @@ class MegatronRankWorker:
             logger.info(f"[Rank {self.rank}] LoRA enabled (rank={self.lora_rank}), disabling grad_offload")
 
         # FP8 support for large models like Kimi-K2
-        # FP8 is configured at model level via override_mcore_model_config, not dtype
-        override_model_config = {}
+        # FP8 is configured via override_transformer_config (not override_mcore_model_config)
+        # because TransformerConfig.fp8 and .fp8_param control FP8 during model creation
         if self.config.use_fp8:
             # Use e4m3 format for FP8 (8-bit floating point with 4-bit exponent, 3-bit mantissa)
-            override_model_config["fp8"] = "e4m3"
-            logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3) for memory-efficient training")
+            # fp8_param=True stores parameters in FP8 precision for memory savings
+            # use_cpu_initialization=True initializes on CPU first, then converts to FP8 before GPU transfer
+            # This avoids OOM during BF16→FP8 conversion which would require both in GPU memory
+            override_tf_config["fp8"] = "e4m3"
+            override_tf_config["fp8_param"] = True
+            override_tf_config["use_cpu_initialization"] = True
+            logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
 
         engine_config = McoreEngineConfig(
             tensor_model_parallel_size=self.config.tensor_parallel_size,
@@ -284,12 +289,11 @@ class MegatronRankWorker:
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
-            dtype="bfloat16",  # Base dtype, FP8 handled via override_mcore_model_config
+            dtype="bfloat16",  # Base dtype, FP8 handled via override_transformer_config
             use_mbridge=True,
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
             override_transformer_config=override_tf_config,
-            override_mcore_model_config=override_model_config,
         )
 
         optimizer_config = McoreOptimizerConfig(

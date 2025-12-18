@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Test Kimi K2 training with 16 GPUs and FP8.
+"""Test Kimi K2 training with 24 GPUs and FP8.
 
-This tests the basic training workflow for K2 with reduced parallelism (TP=8, EP=2).
+This tests the basic training workflow for K2 with reduced parallelism (TP=8, EP=3).
 Full K2 requires 64 GPUs (TP=8, EP=8).
 """
 
@@ -89,7 +89,7 @@ def train_step(model_id: str, data: list, lr: float = 1e-4):
 
 def main():
     print("=" * 60)
-    print("Kimi K2 Training Test (16 GPUs, FP8)")
+    print("Kimi K2 Training Test (24 GPUs, FP8)")
     print("=" * 60)
 
     # Check cluster resources
@@ -100,7 +100,7 @@ def main():
     # Create session
     print("\n" + "-" * 40)
     print("Creating K2 training session...")
-    print("This will create a 16-GPU Megatron worker group (TP=8, EP=2)")
+    print("This will create a 24-GPU Megatron worker group (TP=8, EP=3)")
     print("Expect ~5-10 minutes for model loading with FP8...")
     print("-" * 40)
 

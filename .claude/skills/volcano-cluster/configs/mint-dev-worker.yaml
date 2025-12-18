@@ -27,7 +27,7 @@ Entrypoint: |
   # Connect to Ray head
   ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=8 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 

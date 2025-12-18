@@ -7,7 +7,7 @@ Description: "Ray head node - CPU only, long-running"
 Entrypoint: |
   ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-cpus=4 --num-gpus=0 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 
