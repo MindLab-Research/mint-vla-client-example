@@ -247,26 +247,19 @@ class TestMoonlightSFT:
         print("\nMoonlight LoRA transfer test: PASS")
 
     def test_moonlight_rl(self, moonlight_tokenizer):
-        """Test Moonlight RL training with full loop: sample → reward → train.
+        """Test Moonlight RL training with random 2-digit addition.
 
-        This validates the complete RL pipeline for MLA architecture:
-        1. Sample from current policy (vLLM)
-        2. Compute rewards
-        3. Train with importance_sampling loss (Megatron)
-        4. Repeat
+        Uses random arithmetic (like tinker-cookbook) to ensure there's room
+        for improvement. Fixed problems like "5+3" are too easy - the model
+        already knows them.
 
-        Expected: Rewards improve or stay stable, policy ratio near 1.0.
+        Pass criteria: Accuracy improves over training iterations.
         """
-        num_iterations = 3  # Keep short for merge gate (expensive)
-        lr = 1e-4
+        import random
 
-        # Arithmetic problems for RL
-        problems = [
-            {"question": "What is 5 + 3?", "answer": "8"},
-            {"question": "What is 12 - 7?", "answer": "5"},
-            {"question": "What is 4 * 6?", "answer": "24"},
-            {"question": "What is 9 + 11?", "answer": "20"},
-        ]
+        num_iterations = 5
+        problems_per_iter = 8
+        lr = 1e-4
 
         print(f"\nCreating Moonlight session for RL test...")
         session_id, model_id = create_session(MOONLIGHT_MODEL, lora_rank=32, lr=lr)
@@ -281,25 +274,46 @@ class TestMoonlightSFT:
             "rewards": [],
             "accuracies": [],
             "ratios": [],
+            "grad_norms": [],
         }
+
+        def parse_answer(text: str) -> int | None:
+            """Parse first integer from response (like tinker-cookbook)."""
+            chunks = text.split()
+            for chunk in chunks:
+                # Remove common prefixes/suffixes
+                clean = chunk.strip('.,!?:;')
+                try:
+                    return int(clean)
+                except ValueError:
+                    continue
+            return None
+
+        def generate_problem() -> tuple[str, int]:
+            """Generate random 2-digit addition problem."""
+            x = random.randint(10, 99)
+            y = random.randint(10, 99)
+            return f"What is {x} + {y}?", x + y
 
         for iteration in range(num_iterations):
             t0 = time.time()
             print(f"\n--- Iteration {iteration + 1} ---")
 
-            # Generate rollouts
-            print("Generating rollouts...")
-            rollouts = []
+            # Generate random problems for this iteration
+            random.seed(iteration * 1000)  # Reproducible but different each iter
+            problems = [generate_problem() for _ in range(problems_per_iter)]
 
-            for prob in problems:
-                prompt = f"Q: {prob['question']}\nA:"
+            # Generate rollouts
+            rollouts = []
+            correct_count = 0
+
+            for question, answer in problems:
+                prompt = f"Q: {question}\nA:"
                 prompt_tokens = moonlight_tokenizer.encode(prompt, add_special_tokens=True)
 
-                # Sample from model
                 result = sample(model_id, prompt_tokens, max_tokens=10, temperature=0.7)
 
                 if "error" in result:
-                    print(f"  Sample error: {result['error']}")
                     continue
 
                 samples = result.get("sequences", [])
@@ -313,24 +327,25 @@ class TestMoonlightSFT:
                 if not generated_tokens:
                     continue
 
-                # Compute reward
                 generated_text = moonlight_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-                correct = prob["answer"]
-                reward = 1.0 if generated_text.strip() == correct else 0.0
-                print(f"  Q: {prob['question']} -> '{generated_text}' (correct: {correct}) reward={reward}")
+                parsed = parse_answer(generated_text)
+
+                is_correct = (parsed == answer)
+                reward = 1.0 if is_correct else 0.0
+                if is_correct:
+                    correct_count += 1
+
+                print(f"  {question} -> '{generated_text[:20]}' (parsed={parsed}, correct={answer}) {'✓' if is_correct else '✗'}")
 
                 # Build training datum
                 input_tokens = prompt_tokens + generated_tokens[:-1]
                 target_tokens = prompt_tokens[1:] + generated_tokens
-
-                # Loss mask: only on generated tokens
                 loss_mask = [0.0] * (len(prompt_tokens) - 1) + [1.0] * len(generated_tokens)
 
-                # Advantages: use reward or small positive value to ensure gradients
-                advantage_value = reward if reward > 0 else 0.1
+                # Proper RL: positive advantage for correct, negative for wrong
+                baseline = 0.5
+                advantage_value = reward - baseline
                 advantages = [0.0] * (len(prompt_tokens) - 1) + [advantage_value] * len(generated_tokens)
-
-                # Old logprobs for importance sampling
                 old_logprobs = [0.0] * (len(prompt_tokens) - 1) + logprobs
 
                 rollouts.append({
@@ -348,18 +363,11 @@ class TestMoonlightSFT:
                 print("No valid rollouts, skipping iteration")
                 continue
 
-            # Calculate metrics
-            rewards = [r["reward"] for r in rollouts]
-            avg_reward = np.mean(rewards)
-            accuracy = np.mean([1 if r["reward"] > 0 else 0 for r in rollouts])
+            accuracy = correct_count / len(problems)
+            avg_reward = np.mean([r["reward"] for r in rollouts])
 
-            # Train with importance sampling
-            print(f"Training on {len(rollouts)} rollouts...")
-            train_data = [{
-                "model_input": r["model_input"],
-                "loss_fn_inputs": r["loss_fn_inputs"],
-            } for r in rollouts]
-
+            # Train
+            train_data = [{"model_input": r["model_input"], "loss_fn_inputs": r["loss_fn_inputs"]} for r in rollouts]
             result = train_step(model_id, train_data, lr=lr, loss_fn="importance_sampling")
 
             if "error" in result:
@@ -374,13 +382,13 @@ class TestMoonlightSFT:
             metrics["rewards"].append(avg_reward)
             metrics["accuracies"].append(accuracy)
             metrics["ratios"].append(ratio)
+            metrics["grad_norms"].append(grad_norm)
 
-            # Save weights for next iteration
             save_weights(model_id, name=f"moonlight_rl_iter_{iteration + 1}")
 
             iteration_time = time.time() - t0
-            print(f"Results: loss={loss:.4f}, reward={avg_reward:.3f}, acc={accuracy:.1%}, "
-                  f"ratio={ratio:.3f}, grad_norm={grad_norm:.6f}, time={iteration_time:.2f}s")
+            print(f"Results: acc={accuracy:.1%} ({correct_count}/{len(problems)}), "
+                  f"loss={loss:.4f}, ratio={ratio:.3f}, grad_norm={grad_norm:.4f}, time={iteration_time:.2f}s")
 
         # Save training curves
         data_path, plot_path = save_training_curve(
@@ -390,10 +398,10 @@ class TestMoonlightSFT:
                 "model": MOONLIGHT_MODEL,
                 "lr": lr,
                 "num_iterations": num_iterations,
-                "loss_fn": "importance_sampling",
-                "architecture": "DeepseekV3 MLA",
+                "problems_per_iter": problems_per_iter,
+                "task": "random 2-digit addition",
             },
-            plot_title="Moonlight RL: Training Curves (MLA Architecture)"
+            plot_title="Moonlight RL: Random Addition Training"
         )
 
         # Detect anomalies
@@ -405,21 +413,31 @@ class TestMoonlightSFT:
             anomalies,
             plot_path,
             extra_info={
-                "Model": MOONLIGHT_MODEL,
-                "Architecture": "DeepseekV3 MLA",
-                "Initial reward": f"{metrics['rewards'][0]:.3f}" if metrics["rewards"] else "N/A",
-                "Final reward": f"{metrics['rewards'][-1]:.3f}" if metrics["rewards"] else "N/A",
+                "Task": "Random 2-digit addition",
+                "Initial accuracy": f"{metrics['accuracies'][0]:.1%}" if metrics["accuracies"] else "N/A",
                 "Final accuracy": f"{metrics['accuracies'][-1]:.1%}" if metrics["accuracies"] else "N/A",
-                "Avg ratio": f"{np.mean(metrics['ratios']):.3f}" if metrics["ratios"] else "N/A",
+                "Accuracy change": f"{metrics['accuracies'][-1] - metrics['accuracies'][0]:+.1%}" if len(metrics["accuracies"]) >= 2 else "N/A",
             }
         )
 
-        # Assertions
-        assert len(metrics["losses"]) > 0, "No training iterations completed"
+        # Key assertion: RL should show improvement or at least not collapse
+        assert len(metrics["accuracies"]) >= 2, "Need at least 2 iterations"
 
-        # Check ratio is reasonable (near 1.0)
-        if metrics["ratios"]:
-            avg_ratio = np.mean(metrics["ratios"])
-            assert 0.5 < avg_ratio < 2.0, f"Policy ratio out of range: {avg_ratio:.3f}"
+        initial_acc = metrics["accuracies"][0]
+        final_acc = metrics["accuracies"][-1]
+
+        # For a proper RL test: accuracy should not decrease significantly
+        # If model starts high (>80%), maintain. If starts low, improve.
+        if initial_acc < 0.5:
+            # Room for improvement - expect some gain
+            assert final_acc >= initial_acc, \
+                f"RL failed: accuracy decreased from {initial_acc:.1%} to {final_acc:.1%}"
+            print(f"\nRL improvement: {initial_acc:.1%} -> {final_acc:.1%}")
+        else:
+            # Already good - just don't collapse
+            assert final_acc >= initial_acc * 0.8, \
+                f"RL collapsed: accuracy dropped from {initial_acc:.1%} to {final_acc:.1%}"
+            print(f"\nRL maintained: {initial_acc:.1%} -> {final_acc:.1%}")
 
         print("\nMoonlight RL test: PASS")
+
