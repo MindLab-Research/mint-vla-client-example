@@ -21,13 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 async def _cleanup_stale_actors() -> None:
-    """Clean up stale Ray actors from previous server runs.
+    """Clean up stale Ray actors and register alive ones with ResourcePool.
 
     Detached actors survive server restarts and can block resources.
-    This function kills all actors in the 'tinker' namespace on startup.
-
-    Only actors in DEAD or PENDING_CREATION state are killed to preserve
-    actively running actors (e.g., if multiple servers share the cluster).
+    This function:
+    1. Kills dead/unresponsive actors in the 'tinker' namespace
+    2. Registers alive actors with ResourcePool for proper GPU tracking
     """
     import os
 
@@ -39,6 +38,7 @@ async def _cleanup_stale_actors() -> None:
     try:
         import ray
         from .backend.multi_lora_engine import PERSISTENT_NAMESPACE
+        from .backend.resource_pool import get_resource_pool, ActorType
 
         if not ray.is_initialized():
             ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
@@ -48,22 +48,50 @@ async def _cleanup_stale_actors() -> None:
         tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
 
         if not tinker_actors:
-            logger.info("No stale actors found in tinker namespace")
+            logger.info("No actors found in tinker namespace")
             return
 
-        logger.info(f"Found {len(tinker_actors)} actors in tinker namespace, checking for stale ones...")
+        logger.info(f"Found {len(tinker_actors)} actors in tinker namespace, checking status...")
 
+        resource_pool = get_resource_pool()
         cleaned = 0
+        registered = 0
+
         for actor_info in tinker_actors:
             name = actor_info["name"]
             try:
                 actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
 
-                # Check if actor is alive by calling a lightweight method
-                # Use very short timeout - we just want to know if it responds
+                # Check if actor is alive
                 try:
                     ray.get(actor.__ray_ready__.remote(), timeout=2)
-                    logger.debug(f"Actor {name} is alive, keeping")
+
+                    # Actor is alive - register it with ResourcePool
+                    # Determine actor type and GPU count from name
+                    if name.startswith("tinker_vllm_"):
+                        actor_type = ActorType.VLLM
+                        # vLLM GPU count depends on model - default 1, could query actor
+                        num_gpus = 1  # Most models use 1 GPU
+                    elif name.startswith("dense_trainer_pool_"):
+                        actor_type = ActorType.DENSE
+                        num_gpus = 1
+                    elif name.startswith("persistent_megatron"):
+                        actor_type = ActorType.MEGATRON
+                        num_gpus = 8  # MoE uses 8 GPUs
+                    else:
+                        logger.debug(f"Unknown actor type for {name}, skipping registration")
+                        continue
+
+                    resource_pool.register(
+                        actor_name=name,
+                        actor_type=actor_type,
+                        num_gpus=num_gpus,
+                        actor_handle=actor,
+                        namespace=PERSISTENT_NAMESPACE,
+                    )
+                    registered += 1
+                    logger.info(f"Registered existing actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
+
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive
                     logger.info(f"Cleaning up dead/unresponsive actor: {name}")
@@ -74,13 +102,10 @@ async def _cleanup_stale_actors() -> None:
                         logger.warning(f"Failed to kill actor {name}: {kill_err}")
 
             except ValueError:
-                # Actor name registered but no actor exists (shouldn't happen)
+                # Actor name registered but no actor exists
                 logger.debug(f"Actor {name} not found (name registered but no actor)")
 
-        if cleaned > 0:
-            logger.info(f"Cleaned up {cleaned} stale actors")
-        else:
-            logger.info("All actors are alive, no cleanup needed")
+        logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
 
     except Exception as e:
         # Don't fail startup if cleanup fails
