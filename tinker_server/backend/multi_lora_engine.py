@@ -38,18 +38,19 @@ from tinker_server.config import PFS_PYTHONPATH
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
     """Get the node_id where an actor is running.
 
-    Uses Ray's internal API to get actor location.
+    Uses Ray's state API to get actor location.
     Returns None if unable to determine.
     """
     try:
-        # Get actor ID from handle
         actor_id = actor_handle._actor_id
-        # Use Ray state API to get actor info
+        # Convert ActorID to hex string for the state API
+        actor_id_hex = actor_id.hex()
         from ray._private.state import actors as state_actors
-        actor_info = state_actors(actor_id)
+        actor_info = state_actors(actor_id_hex)
         if actor_info:
-            # Actor info is a dict with 'NodeID' key
-            return actor_info.get("NodeID")
+            # NodeID is nested under Address
+            address = actor_info.get("Address", {})
+            return address.get("NodeID")
     except Exception as e:
         logger.debug(f"Could not get node_id for actor: {e}")
     return None

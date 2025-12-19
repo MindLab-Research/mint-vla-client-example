@@ -381,10 +381,14 @@ class ResourcePool:
         """Get node_id where an actor is running via Ray state API."""
         try:
             actor_id = actor_handle._actor_id
+            # Convert ActorID to hex string for the state API
+            actor_id_hex = actor_id.hex()
             from ray._private.state import actors as state_actors
-            actor_info = state_actors(actor_id)
+            actor_info = state_actors(actor_id_hex)
             if actor_info:
-                return actor_info.get("NodeID")
+                # NodeID is nested under Address
+                address = actor_info.get("Address", {})
+                return address.get("NodeID")
         except Exception as e:
             logger.debug(f"[ResourcePool] Could not get node_id: {e}")
         return None
