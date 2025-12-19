@@ -2439,12 +2439,27 @@ class MegatronActorPool:
             resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists (e.g., from previous server run)
+            actor = None
+            need_create = True
             try:
-                actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                existing_actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
                 logger.info(f"[MegatronActorPool] Found existing detached actor: {actor_name}")
                 # Verify it's alive
-                ray.get(actor.get_diagnostics.remote(), timeout=10)
-            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                ray.get(existing_actor.get_diagnostics.remote(), timeout=10)
+                actor = existing_actor  # Use existing actor
+                need_create = False
+            except ValueError:
+                # Actor doesn't exist, will create new one
+                pass
+            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                # Actor is dead or unresponsive, kill to free name before creating new one
+                logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead/unresponsive, killing to free name")
+                try:
+                    ray.kill(existing_actor, no_restart=True)
+                except Exception as kill_err:
+                    logger.warning(f"[MegatronActorPool] Could not kill dead actor: {kill_err}")
+
+            if need_create:
                 # Create new detached actor
                 runtime_env = {
                     "env_vars": {

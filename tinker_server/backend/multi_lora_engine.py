@@ -283,6 +283,13 @@ class MultiLoRAInferenceEngine:
                     logger.warning(
                         f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
                     )
+                    # Must kill dead actor to free the name for reuse
+                    # Ray keeps names registered even for dead actors
+                    try:
+                        ray.kill(self.server, no_restart=True)
+                        print(f"[DEBUG INIT] Killed dead actor to free name", file=sys.stderr, flush=True)
+                    except Exception as kill_err:
+                        print(f"[DEBUG INIT] Could not kill dead actor: {kill_err}", file=sys.stderr, flush=True)
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
                     self._initialized = False
