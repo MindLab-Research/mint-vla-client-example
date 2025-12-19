@@ -30,8 +30,9 @@ The merge gate validates that code on `develop` is ready to merge to `main`. It 
 | Qwen2.5-7B (Dense) | 1 | 1 | 2 |
 | Qwen3-0.6B (Dense) | 1 | 1 | 2 |
 | Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4) | 8 |
+| Moonlight-16B-A3B (MLA) | 4 (TP=4) | 8 (TP=2,EP=4) | 12 |
 
-**Note**: MoE uses TP=4 for both vLLM and Megatron. Expert Parallelism (EP) is not used because vLLM 0.12.0 does not support MoE expert LoRA inference with EP enabled.
+**Note**: MoE uses TP=4 for both vLLM and Megatron. Moonlight uses DeepseekV3 MLA architecture requiring EP=4 for training.
 
 ### Full Merge Gate Procedure
 
@@ -142,6 +143,16 @@ curl -s http://localhost:8000/api/v1/healthz
 | **moe_rl** | RL with importance_sampling | Gradients flow, loss computes | 5 min |
 | **moe_api** | Sampling from trained weights | Generation works | 3 min |
 
+### Phase 2.5: Moonlight Tests (moonshotai/Moonlight-16B-A3B-Instruct)
+
+**Requires 12 GPUs.** Tests DeepseekV3 MLA (Multi-Latent Attention) architecture.
+
+| Test | Description | Pass Criteria | Duration |
+|------|-------------|---------------|----------|
+| **moonlight_sft** | SFT with MLA attention | Loss decreases >30% over 10 iterations | 5 min |
+| **moonlight_lora_transfer** | Train → Extract → vLLM Load → Generate | Full pipeline succeeds | 3 min |
+| **moonlight_rl** | Full RL loop: sample → reward → train | Policy ratio 0.5-2.0, gradients flow | 3 min |
+
 ### Phase 3: Stress & Multi-Tenant Tests
 
 | Test | Description | Pass Criteria | Duration |
@@ -162,6 +173,7 @@ The system supports multiple model variants. All variants of the same base model
 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | MoE | 4 (TP=4) | Megatron/vLLM | Primary MoE test target |
 | `Qwen/Qwen3-30B-A3B` | MoE | 4 (TP=4) | Megatron/vLLM | Base model variant |
 | `Qwen/Qwen3-30B-A3B-Base` | MoE | 4 (TP=4) | Megatron/vLLM | Pre-training base |
+| `moonshotai/Moonlight-16B-A3B-Instruct` | MLA | 12 (8+4) | Megatron/vLLM | DeepseekV3 MLA architecture |
 
 **Quick test with Qwen3-0.6B** (faster iteration, smaller footprint):
 ```bash

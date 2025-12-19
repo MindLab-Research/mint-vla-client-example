@@ -18,6 +18,7 @@ API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 DENSE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DENSE_SMALL_MODEL = "Qwen/Qwen3-0.6B"
 MOE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+MOONLIGHT_MODEL = "moonshotai/Moonlight-16B-A3B-Instruct"  # DeepseekV3 MLA architecture
 
 
 def get_headers():
@@ -157,6 +158,13 @@ def moe_tokenizer():
     """Get tokenizer for MoE model."""
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True)
+
+
+@pytest.fixture(scope="module")
+def moonlight_tokenizer():
+    """Get tokenizer for Moonlight model (DeepseekV3 MLA)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(MOONLIGHT_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
