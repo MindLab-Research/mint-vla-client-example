@@ -39,7 +39,7 @@
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
 | Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** (SFT 94.9% reduction, RL 87.5% acc, LoRA transfer) |
-| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 8 (TP2,EP4) | 4 (TP4) | **Verified** (SFT 93.8% loss reduction, LoRA transfer 102s, RL pass) |
+| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 8 (TP2,EP4) | 4 (TP4) | **Verified** (SFT 93.8%, LoRA transfer, RL 25%→62.5% acc) |
 | moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA works (value padding), memory blocked |
 
 #### T1 (Week 2-3) - Scale Up
