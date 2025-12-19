@@ -569,9 +569,10 @@ class MegatronRankWorker:
                 for seq_len in seq_lengths:
                     sample_log_probs = combined_log_probs[offset:offset + seq_len]
                     offset += seq_len
+                    logprobs_list = sample_log_probs.tolist()
                     loss_fn_outputs.append({
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": sample_log_probs.tolist(),
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
             # Return CPU-safe scalars and loss_fn_outputs
@@ -688,15 +689,17 @@ class MegatronRankWorker:
                     for seq_len in seq_lengths:
                         sample_log_probs = combined_log_probs[offset:offset + seq_len]
                         offset += seq_len
+                        logprobs_list = sample_log_probs.tolist()
                         loss_fn_outputs.append({
                             "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                            "logprobs": sample_log_probs.tolist(),
+                            "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                         })
                 elif combined_log_probs is not None:
                     # Fallback: single entry with all log_probs (legacy behavior)
+                    logprobs_list = combined_log_probs.tolist()
                     loss_fn_outputs.append({
                         "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
-                        "logprobs": combined_log_probs.tolist(),
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
             return {
@@ -854,9 +857,10 @@ class MegatronRankWorker:
                 for seq_len in seq_lengths:
                     sample_log_probs = combined_log_probs[offset:offset + seq_len]
                     offset += seq_len
+                    logprobs_list = sample_log_probs.tolist()
                     loss_fn_outputs.append({
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": sample_log_probs.tolist(),
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
             # Handle learning rate
