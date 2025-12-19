@@ -33,7 +33,7 @@
 | Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
-| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** (training + LoRA transfer) |
 | moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 16 (TP2,EP8) | 2 (TP2) | **Verified** (MLA via value padding) |
 | moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA works (value padding), memory blocked |
 
