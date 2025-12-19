@@ -82,11 +82,13 @@ def generate_rollouts(tokenizer, model_id: str, problems: list) -> list[dict]:
         # Loss mask: only on generated tokens
         loss_mask = [0.0] * (len(prompt_tokens) - 1) + [1.0] * len(generated_tokens)
 
-        # Advantages: use non-zero value to ensure gradients flow
-        # In real RL: advantage = reward - baseline
-        # For testing: use reward or small positive to ensure training happens
+        # Advantages: use reward - baseline for proper RL
+        # Baseline = 0.5 (expected value for binary 0/1 rewards)
+        # Correct answers: advantage = 1.0 - 0.5 = +0.5 (reinforce)
+        # Wrong answers: advantage = 0.0 - 0.5 = -0.5 (discourage)
         # NOTE: advantages must match target_tokens length (prompt[1:] + generated)
-        advantage_value = reward if reward > 0 else 0.1  # Small positive for exploration
+        baseline = 0.5
+        advantage_value = reward - baseline
         advantages = [0.0] * (len(prompt_tokens) - 1) + [advantage_value] * len(generated_tokens)
 
         # Old logprobs for importance sampling

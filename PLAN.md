@@ -16,11 +16,16 @@
 | Feature | Status |
 |---------|--------|
 | Dense model training (Qwen2.5-7B) | Verified |
-| MoE model training (Qwen3-30B-A3B) | Verified |
+| Dense model RL (importance_sampling) | Verified |
+| MoE model training (Qwen3-30B-A3B) | Verified (94.9% loss reduction) |
+| MoE model RL (importance_sampling) | Verified (87.5% accuracy) |
+| Moonlight (DeepseekV3 MLA) training | Verified (93.8% loss reduction) |
+| Moonlight LoRA transfer | Verified (102s transfer time) |
 | Multi-session actor sharing | Verified |
 | Unified rank support (max-rank padding) | Verified |
 | LRU-based actor eviction | Verified (unified ResourcePool with cross-actor LRU) |
 | LoRA hot-swap to vLLM | Verified (0.16s extraction + 2.2s inference) |
+| Stress tests (concurrent, eviction, rapid) | Verified (4/4 pass) |
 
 ---
 
@@ -33,8 +38,8 @@
 | Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
-| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** (training + LoRA transfer) |
-| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 16 (TP2,EP8) | 2 (TP2) | **Verified** (MLA via value padding) |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** (SFT 94.9% reduction, RL 87.5% acc, LoRA transfer) |
+| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 8 (TP2,EP4) | 4 (TP4) | **Verified** (SFT 93.8% loss reduction, LoRA transfer 102s, RL pass) |
 | moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA works (value padding), memory blocked |
 
 #### T1 (Week 2-3) - Scale Up
@@ -509,7 +514,7 @@ Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → o
 | Add `/api/v1/load_state` endpoint | High | **DONE** |
 | Accept both `X-API-Key` and `Authorization: Bearer` auth | High | **DONE** |
 | Accept both `sampling_session_id` and `model_id` in sample requests | High | **DONE** |
-| Create merge-gate test suite | High | **DONE** (19/20 pass) |
+| Create merge-gate test suite | High | **DONE** (20/20 pass) |
 | Verify logprobs format matches `TensorData` spec | High | **DONE** |
 | Verify `include_prompt_logprobs` | Medium | **DONE** |
 | Add `cispo`, `dro` loss functions | Medium | Pending |

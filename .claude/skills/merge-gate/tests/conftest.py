@@ -113,12 +113,17 @@ def train_step(model_id: str, data: list, lr: float = 1e-4, loss_fn: str = "cros
 
 
 def save_weights(model_id: str, name: str = "test") -> dict:
-    """Save weights for sampling."""
+    """Save weights for sampling.
+
+    Note: For MoE models, vLLM engine creation + CUDA graph capture takes ~120s,
+    so we use a longer timeout.
+    """
     url = f"{BASE_URL}/api/v1/save_weights"
     payload = {"model_id": model_id, "name": name}
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=120)
+    # MoE models need longer timeout for vLLM engine + CUDA graph capture
+    return poll_future(resp.json().get("request_id"), timeout=300, request_timeout=180)
 
 
 def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
