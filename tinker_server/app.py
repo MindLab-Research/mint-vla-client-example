@@ -20,6 +20,73 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _cleanup_stale_actors() -> None:
+    """Clean up stale Ray actors from previous server runs.
+
+    Detached actors survive server restarts and can block resources.
+    This function kills all actors in the 'tinker' namespace on startup.
+
+    Only actors in DEAD or PENDING_CREATION state are killed to preserve
+    actively running actors (e.g., if multiple servers share the cluster).
+    """
+    import os
+
+    # Skip cleanup if disabled (useful for debugging)
+    if os.environ.get("MINT_SKIP_ACTOR_CLEANUP", "").lower() in ("1", "true"):
+        logger.info("Skipping actor cleanup (MINT_SKIP_ACTOR_CLEANUP=1)")
+        return
+
+    try:
+        import ray
+        from .backend.multi_lora_engine import PERSISTENT_NAMESPACE
+
+        if not ray.is_initialized():
+            ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+        # Get all named actors in the tinker namespace
+        actors = ray.util.list_named_actors(all_namespaces=True)
+        tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
+
+        if not tinker_actors:
+            logger.info("No stale actors found in tinker namespace")
+            return
+
+        logger.info(f"Found {len(tinker_actors)} actors in tinker namespace, checking for stale ones...")
+
+        cleaned = 0
+        for actor_info in tinker_actors:
+            name = actor_info["name"]
+            try:
+                actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
+
+                # Check if actor is alive by calling a lightweight method
+                # Use very short timeout - we just want to know if it responds
+                try:
+                    ray.get(actor.__ray_ready__.remote(), timeout=2)
+                    logger.debug(f"Actor {name} is alive, keeping")
+                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    # Actor is dead or unresponsive
+                    logger.info(f"Cleaning up dead/unresponsive actor: {name}")
+                    try:
+                        ray.kill(actor, no_restart=True)
+                        cleaned += 1
+                    except Exception as kill_err:
+                        logger.warning(f"Failed to kill actor {name}: {kill_err}")
+
+            except ValueError:
+                # Actor name registered but no actor exists (shouldn't happen)
+                logger.debug(f"Actor {name} not found (name registered but no actor)")
+
+        if cleaned > 0:
+            logger.info(f"Cleaned up {cleaned} stale actors")
+        else:
+            logger.info("All actors are alive, no cleanup needed")
+
+    except Exception as e:
+        # Don't fail startup if cleanup fails
+        logger.warning(f"Actor cleanup failed (continuing anyway): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager.
@@ -27,6 +94,11 @@ async def lifespan(app: FastAPI):
     Initializes both inference SessionManager and training components
     on startup, shuts down all sessions on application exit.
     """
+    # ==========================================================================
+    # Cleanup: Kill stale actors from previous server runs
+    # ==========================================================================
+    await _cleanup_stale_actors()
+
     # ==========================================================================
     # Inference: Initialize SessionManager
     # ==========================================================================

@@ -37,6 +37,8 @@ class ActorEntry:
     base_model: str = ""
     # Session tracking (training actors only)
     current_session: str | None = None
+    # Node tracking for scheduling
+    node_id: str | None = None
     # LRU tracking
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
@@ -118,6 +120,7 @@ class ResourcePool:
         namespace: str = "tinker",
         base_model: str = "",
         session_id: str | None = None,
+        node_id: str | None = None,
     ) -> ActorEntry:
         """Register an actor with the pool.
 
@@ -129,6 +132,7 @@ class ResourcePool:
             namespace: Ray namespace.
             base_model: Model path being used.
             session_id: Active session ID (for training actors).
+            node_id: Ray node ID where actor is running.
 
         Returns:
             The registered ActorEntry.
@@ -142,6 +146,8 @@ class ResourcePool:
                     entry.current_session = session_id
                 if actor_handle:
                     entry.actor_handle = actor_handle
+                if node_id:
+                    entry.node_id = node_id
                 logger.info(f"[ResourcePool] Updated existing entry: {actor_name}")
             else:
                 entry = ActorEntry(
@@ -152,11 +158,12 @@ class ResourcePool:
                     namespace=namespace,
                     base_model=base_model,
                     current_session=session_id,
+                    node_id=node_id,
                 )
                 self._entries[actor_name] = entry
                 logger.info(
                     f"[ResourcePool] Registered {actor_type.value} actor: {actor_name} "
-                    f"({num_gpus} GPUs, model={base_model})"
+                    f"({num_gpus} GPUs, model={base_model}, node={node_id[:8] if node_id else 'unknown'})"
                 )
             return entry
 
@@ -334,6 +341,7 @@ class ResourcePool:
                     "num_gpus": e.num_gpus,
                     "base_model": e.base_model,
                     "current_session": e.current_session,
+                    "node_id": e.node_id,
                     "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
                     "idle_time": e.idle_time(),
                     "age": e.age(),
@@ -345,6 +353,20 @@ class ResourcePool:
         """Total GPUs used by all tracked actors."""
         with self._pool_lock:
             return sum(e.num_gpus for e in self._entries.values())
+
+    def gpus_used_by_node(self) -> dict[str, int]:
+        """Get GPU usage per node from tracked actors.
+
+        Returns:
+            Dict mapping node_id -> number of GPUs used by actors on that node.
+            Actors with unknown node_id are excluded.
+        """
+        with self._pool_lock:
+            usage: dict[str, int] = {}
+            for e in self._entries.values():
+                if e.node_id:
+                    usage[e.node_id] = usage.get(e.node_id, 0) + e.num_gpus
+            return usage
 
     def clear(self, kill_actors: bool = True) -> int:
         """Remove all actors from the pool.

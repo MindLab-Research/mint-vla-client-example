@@ -35,6 +35,26 @@ PERSISTENT_NAMESPACE = "tinker"
 from tinker_server.config import PFS_PYTHONPATH
 
 
+def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
+    """Get the node_id where an actor is running.
+
+    Uses Ray's internal API to get actor location.
+    Returns None if unable to determine.
+    """
+    try:
+        # Get actor ID from handle
+        actor_id = actor_handle._actor_id
+        # Use Ray state API to get actor info
+        from ray._private.state import actors as state_actors
+        actor_info = state_actors(actor_id)
+        if actor_info:
+            # Actor info is a dict with 'NodeID' key
+            return actor_info.get("NodeID")
+    except Exception as e:
+        logger.debug(f"Could not get node_id for actor: {e}")
+    return None
+
+
 @dataclass
 class LoRASlotInfo:
     """Metadata for a loaded LoRA adapter."""
@@ -263,10 +283,12 @@ class MultiLoRAInferenceEngine:
                         self._initialized = True
 
                         # Register existing actor with resource pool for LRU tracking
+                        # Include node_id for proper per-node GPU scheduling
                         from tinker_server.backend.resource_pool import get_resource_pool, ActorType
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         resource_pool = get_resource_pool()
-                        logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool")
+                        actor_node_id = _get_actor_node_id(self.server)
+                        logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
                         resource_pool.register(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
@@ -274,6 +296,7 @@ class MultiLoRAInferenceEngine:
                             actor_handle=self.server,
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=self.model_path,
+                            node_id=actor_node_id,
                         )
                         logger.info(f"[DEBUG] ResourcePool now has {len(resource_pool._entries)} entries")
                         return
@@ -397,7 +420,9 @@ class MultiLoRAInferenceEngine:
 
             # Find a node with enough AVAILABLE GPUs (not just total GPUs).
             # Ray's node.Resources shows total, but other actors (Megatron) may hold GPUs.
-            # We compute available by checking which nodes have active placement groups.
+            # We compute available by checking:
+            # 1. GPUs used by active placement groups (Megatron training)
+            # 2. GPUs used by actors tracked in ResourcePool (vLLM, dense training)
             target_node = None
             print(f"[SCHEDULE DEBUG] Looking for node with {total_gpus} available GPUs for vLLM", file=sys.stderr, flush=True)
 
@@ -420,7 +445,13 @@ class MultiLoRAInferenceEngine:
             for node_id, gpu_count in gpus_used_by_pg.items():
                 print(f"[SCHEDULE DEBUG] Node {node_id[:8]} has {gpu_count} GPUs used by placement groups", file=sys.stderr, flush=True)
 
-            # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used)
+            # Also get GPUs used by actors tracked in ResourcePool (vLLM, dense training)
+            # This is critical - without it, we may schedule to a node that already has vLLM actors
+            gpus_used_by_actors = resource_pool.gpus_used_by_node()
+            for node_id, gpu_count in gpus_used_by_actors.items():
+                print(f"[SCHEDULE DEBUG] Node {node_id[:8]} has {gpu_count} GPUs used by ResourcePool actors", file=sys.stderr, flush=True)
+
+            # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used - actor_used)
             candidates = []
             for node in ray.nodes():
                 node_id = node["NodeID"]
@@ -430,33 +461,37 @@ class MultiLoRAInferenceEngine:
                     total_gpu = total_res.get("GPU", 0)
                     obj_store = total_res.get("object_store_memory", 0)
                     pg_gpus = gpus_used_by_pg.get(node_id, 0)
-                    available_gpu = total_gpu - pg_gpus
-                    print(f"[SCHEDULE DEBUG]   Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, available={available_gpu}, obj_store={obj_store/1e9:.1f}GB", file=sys.stderr, flush=True)
+                    actor_gpus = gpus_used_by_actors.get(node_id, 0)
+                    available_gpu = total_gpu - pg_gpus - actor_gpus
+                    print(f"[SCHEDULE DEBUG]   Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpu}, obj_store={obj_store/1e9:.1f}GB", file=sys.stderr, flush=True)
 
-                    # Node must have enough AVAILABLE GPUs (after subtracting PG usage) and enough object store
+                    # Node must have enough AVAILABLE GPUs (after subtracting all usage) and enough object store
                     if available_gpu >= total_gpus and obj_store > 100_000_000_000:
                         candidates.append((node_id, available_gpu))
 
             # Prefer nodes with NO placement groups first (to avoid GPU assignment conflicts)
             # Among those, prefer nodes with more GPUs (more room)
             if candidates:
-                # Separate into "clean" nodes (no PG) and "partial" nodes (has PG but has free GPUs)
-                clean_nodes = [(nid, gpus) for nid, gpus in candidates if gpus_used_by_pg.get(nid, 0) == 0]
-                partial_nodes = [(nid, gpus) for nid, gpus in candidates if gpus_used_by_pg.get(nid, 0) > 0]
+                # Separate into "clean" nodes (no PG or actors) and "partial" nodes
+                clean_nodes = [(nid, gpus) for nid, gpus in candidates
+                               if gpus_used_by_pg.get(nid, 0) == 0 and gpus_used_by_actors.get(nid, 0) == 0]
+                partial_nodes = [(nid, gpus) for nid, gpus in candidates
+                                 if gpus_used_by_pg.get(nid, 0) > 0 or gpus_used_by_actors.get(nid, 0) > 0]
 
                 if clean_nodes:
                     # Prefer clean nodes
                     clean_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
                     target_node = clean_nodes[0][0]
                     available_gpus = clean_nodes[0][1]
-                    print(f"[SCHEDULE DEBUG] Selected clean node {target_node[:8]} with {available_gpus} GPUs (no PG)", file=sys.stderr, flush=True)
+                    print(f"[SCHEDULE DEBUG] Selected clean node {target_node[:8]} with {available_gpus} GPUs (no PG/actors)", file=sys.stderr, flush=True)
                 else:
                     # Fall back to partial nodes
                     partial_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
                     target_node = partial_nodes[0][0]
                     available_gpus = partial_nodes[0][1]
                     pg_count = gpus_used_by_pg.get(target_node, 0)
-                    print(f"[SCHEDULE DEBUG] Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} used by PG)", file=sys.stderr, flush=True)
+                    actor_count = gpus_used_by_actors.get(target_node, 0)
+                    print(f"[SCHEDULE DEBUG] Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} PG, {actor_count} actors)", file=sys.stderr, flush=True)
 
             scheduling_opts = {}
             if target_node:
@@ -517,8 +552,10 @@ class MultiLoRAInferenceEngine:
             logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
 
             # Register with unified resource pool for LRU tracking
+            # Include node_id for proper per-node GPU scheduling
             from tinker_server.backend.resource_pool import get_resource_pool, ActorType
             resource_pool = get_resource_pool()
+            actor_node_id = _get_actor_node_id(self.server)
             resource_pool.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
@@ -526,7 +563,10 @@ class MultiLoRAInferenceEngine:
                 actor_handle=self.server,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
+                node_id=actor_node_id,
             )
+            if actor_node_id:
+                logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 
     async def add_lora_for_session(
         self,
