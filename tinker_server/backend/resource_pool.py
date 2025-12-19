@@ -357,6 +357,8 @@ class ResourcePool:
     def gpus_used_by_node(self) -> dict[str, int]:
         """Get GPU usage per node from tracked actors.
 
+        For actors without node_id, tries to look it up via Ray state API.
+
         Returns:
             Dict mapping node_id -> number of GPUs used by actors on that node.
             Actors with unknown node_id are excluded.
@@ -364,9 +366,28 @@ class ResourcePool:
         with self._pool_lock:
             usage: dict[str, int] = {}
             for e in self._entries.values():
-                if e.node_id:
-                    usage[e.node_id] = usage.get(e.node_id, 0) + e.num_gpus
+                node_id = e.node_id
+                # Try to look up node_id if missing
+                if not node_id and e.actor_handle:
+                    node_id = self._get_actor_node_id(e.actor_handle)
+                    if node_id:
+                        e.node_id = node_id  # Cache it for future calls
+                        logger.debug(f"[ResourcePool] Resolved node_id for {e.actor_name}: {node_id[:8]}")
+                if node_id:
+                    usage[node_id] = usage.get(node_id, 0) + e.num_gpus
             return usage
+
+    def _get_actor_node_id(self, actor_handle: ray.actor.ActorHandle) -> str | None:
+        """Get node_id where an actor is running via Ray state API."""
+        try:
+            actor_id = actor_handle._actor_id
+            from ray._private.state import actors as state_actors
+            actor_info = state_actors(actor_id)
+            if actor_info:
+                return actor_info.get("NodeID")
+        except Exception as e:
+            logger.debug(f"[ResourcePool] Could not get node_id: {e}")
+        return None
 
     def clear(self, kill_actors: bool = True) -> int:
         """Remove all actors from the pool.
