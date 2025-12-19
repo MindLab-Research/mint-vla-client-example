@@ -190,7 +190,8 @@ def test_moe_lora_transfer():
     print("TEST: MoE LoRA Transfer (Phase 3)")
     print("=" * 70)
 
-    moe_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    # Use Moonlight for DeepseekV3 MLA architecture test
+    moe_model = "moonshotai/Moonlight-16B-A3B-Instruct"
 
     # Step 1: Create training session
     print(f"\n[1/6] Creating MoE training session for: {moe_model}")

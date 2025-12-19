@@ -79,13 +79,13 @@ MODEL_CONFIGS = {
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
-    # Same DeepseekV3ForCausalLM architecture, fits on 8 GPUs
+    # Same DeepseekV3ForCausalLM architecture
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
-        recommended_tp=2,  # Inference: 2 GPUs (per reference script)
+        recommended_tp=4,  # Inference: 4 GPUs
         recommended_dp=1,
         train_tp=2,
-        train_ep=8,  # Training: 16 GPUs (TP=2, EP=8) per reference
+        train_ep=4,  # Training: 8 GPUs (TP=2, EP=4) - 64 experts / 4 = 16 per rank
         quantization=None,  # BF16, no quantization needed
     ),
 }
