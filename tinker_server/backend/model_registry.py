@@ -43,6 +43,9 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-0.6B": ModelConfig(
         is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
     ),
+    "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+    ),
     # MoE models - Qwen3 30B variants
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters

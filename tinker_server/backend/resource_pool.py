@@ -45,15 +45,23 @@ class ActorEntry:
         """Update last_accessed timestamp."""
         self.last_accessed = time.time()
 
-    def is_idle(self) -> bool:
+    def is_idle(self, session_idle_timeout: float = 300) -> bool:
         """Check if actor can be evicted.
 
-        Training actors: idle when no active session.
-        vLLM: always considered evictable (will be recreated on demand).
+        An actor is idle if ANY of the following:
+        1. It's a vLLM actor (always evictable, recreated on demand)
+        2. It has no current_session
+        3. It hasn't been accessed in session_idle_timeout seconds
+
+        Note: Tinker clients don't explicitly end sessions - they just stop
+        sending requests. We use time-based idle detection to handle this.
         """
         if self.actor_type == ActorType.VLLM:
             return True  # vLLM can always be evicted
-        return self.current_session is None
+        if self.current_session is None:
+            return True  # No session loaded
+        # Time-based idle detection for sessions
+        return self.idle_time() > session_idle_timeout
 
     def age(self) -> float:
         """Seconds since actor was created."""
@@ -95,7 +103,10 @@ class ResourcePool:
         # Read MIN_ACTOR_AGE at init time (not class definition time)
         # Set MINT_MIN_ACTOR_AGE=0 for testing to allow immediate eviction
         self.MIN_ACTOR_AGE = int(os.environ.get("MINT_MIN_ACTOR_AGE", "300"))
-        logger.info(f"[ResourcePool] Initialized with MIN_ACTOR_AGE={self.MIN_ACTOR_AGE}")
+        # Session idle timeout: after this period of inactivity, session is considered stale
+        # Set MINT_SESSION_IDLE_TIMEOUT=0 for testing to allow immediate eviction
+        self.SESSION_IDLE_TIMEOUT = int(os.environ.get("MINT_SESSION_IDLE_TIMEOUT", "300"))
+        logger.info(f"[ResourcePool] Initialized with MIN_ACTOR_AGE={self.MIN_ACTOR_AGE}, SESSION_IDLE_TIMEOUT={self.SESSION_IDLE_TIMEOUT}")
         self._initialized = True
 
     def register(
@@ -184,7 +195,7 @@ class ResourcePool:
         Must be called with lock held.
 
         An actor is evictable if:
-        1. It is idle (no active session)
+        1. It is idle (no active session OR session inactive > SESSION_IDLE_TIMEOUT)
         2. It has been idle longer than MIN_ACTOR_AGE
 
         Note: We use idle_time() (time since last access) rather than age()
@@ -192,7 +203,7 @@ class ResourcePool:
         """
         evictable = [
             e for e in self._entries.values()
-            if e.is_idle() and e.idle_time() > self.MIN_ACTOR_AGE
+            if e.is_idle(self.SESSION_IDLE_TIMEOUT) and e.idle_time() > self.MIN_ACTOR_AGE
         ]
         return sorted(evictable, key=lambda e: e.last_accessed)
 
@@ -323,7 +334,7 @@ class ResourcePool:
                     "num_gpus": e.num_gpus,
                     "base_model": e.base_model,
                     "current_session": e.current_session,
-                    "idle": e.is_idle(),
+                    "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
                     "idle_time": e.idle_time(),
                     "age": e.age(),
                 }

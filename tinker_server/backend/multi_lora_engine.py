@@ -309,6 +309,17 @@ class MultiLoRAInferenceEngine:
             # For EP (expert parallelism), total_gpus = TP * DP
             total_gpus = self.tensor_parallel_size * self.data_parallel_size
 
+            # Ensure GPUs available, evicting idle actors if needed (LRU)
+            # This is critical to prevent server hangs when no GPUs are free.
+            from tinker_server.backend.resource_pool import get_resource_pool
+            resource_pool = get_resource_pool()
+            try:
+                resource_pool.ensure_gpus_available(total_gpus)
+            except ValueError as e:
+                # Unable to free enough GPUs even after eviction
+                logger.error(f"Cannot create vLLM actor: {e}")
+                raise
+
             # Build engine_kwargs for expert parallelism
             # Pass enable_expert_parallel directly to vLLM, bypassing verl's worker-based EP
             # This allows vLLM to handle EP internally via multiprocessing
@@ -475,9 +486,26 @@ class MultiLoRAInferenceEngine:
                 nnodes=1,
             )
 
-            # ray.get() blocks until launch_server completes (sets self.engine)
-            # Note: await on ObjectRef doesn't work - must use ray.get()
-            ray.get(self.server.launch_server.remote())
+            # Run blocking ray.get() in thread executor to avoid blocking the event loop.
+            # This allows the server to remain responsive during vLLM initialization (~60-120s for MoE).
+            import asyncio
+            loop = asyncio.get_event_loop()
+            logger.info(f"Launching vLLM server (non-blocking)...")
+            try:
+                await loop.run_in_executor(
+                    None,  # Use default thread pool
+                    lambda: ray.get(self.server.launch_server.remote(), timeout=300)
+                )
+            except ray.exceptions.GetTimeoutError:
+                logger.error(f"vLLM launch timed out after 300s for {self.actor_name}")
+                # Kill the stuck actor
+                try:
+                    ray.kill(self.server, no_restart=True)
+                except Exception:
+                    pass
+                self.server = None
+                raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out")
+
             self._initialized = True
             logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
 
@@ -744,6 +772,7 @@ def _resolve_model_path(model_name: str) -> str:
         # Dense models
         "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+        "Qwen/Qwen3-4B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554",
         # MoE models (all share same architecture, different checkpoints)
         "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
