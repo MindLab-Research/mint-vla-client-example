@@ -864,6 +864,9 @@ class MultiModelInferenceManager:
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
 
+        If cached engine exists, verifies actor is alive before returning.
+        If actor is dead, removes from cache and creates new engine.
+
         Args:
             model_name: HuggingFace model name (e.g., "Qwen/Qwen2.5-7B-Instruct")
 
@@ -872,7 +875,22 @@ class MultiModelInferenceManager:
         """
         async with self._init_lock:
             if model_name in self._engines:
-                return self._engines[model_name]
+                engine = self._engines[model_name]
+                # Check if actor is still alive before returning cached engine
+                if engine.server is not None:
+                    try:
+                        ray.get(engine.server.__ray_ready__.remote(), timeout=5)
+                        # Actor alive, return cached engine
+                        return engine
+                    except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                        # Actor is dead, remove from cache and recreate
+                        logger.warning(
+                            f"Cached vLLM engine for {model_name} has dead actor, recreating"
+                        )
+                        del self._engines[model_name]
+                else:
+                    # Engine has no server handle, remove stale entry
+                    del self._engines[model_name]
 
             # Get model config for parallelism settings
             from tinker_server.backend.model_registry import get_model_config
