@@ -36,9 +36,27 @@ PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
 def _make_megatron_actor_name(base_model: str) -> str:
     """Generate per-model Megatron actor name.
 
-    Same pattern as vLLM: one actor per base model.
+    Normalizes input to handle both:
+    - HuggingFace model ID: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    - Resolved cache path: "/vePFS/.../models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/..."
+
+    Both produce the same actor name for consistent lookup.
     """
-    model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    import re
+
+    # Check if this is a resolved HuggingFace cache path
+    # Pattern: models--{org}--{model}/snapshots/{hash}
+    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
+    match = re.search(hf_cache_pattern, base_model)
+
+    if match:
+        # Extract org and model from cache path
+        org, model = match.groups()
+        model_name = model.lower().replace("-", "_").replace(".", "_")
+    else:
+        # HuggingFace model ID or plain path - take last component
+        model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+
     return f"megatron_{model_name}"
 
 
@@ -2690,6 +2708,8 @@ def get_or_create_megatron_worker_group(
             namespace=PERSISTENT_NAMESPACE,
             base_model=base_model,
         )
+        # Existing actor is already ready
+        resource_pool.mark_ready(actor_name)
         # Reinitialize LoRA weights for fresh session
         logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate})...")
         result = ray.get(actor.reinit_lora_weights.remote(learning_rate))
@@ -2739,6 +2759,8 @@ def get_or_create_megatron_worker_group(
         namespace=PERSISTENT_NAMESPACE,
         base_model=base_model,
     )
+    # Mark as ready after initialization completes
+    resource_pool.mark_ready(actor_name)
 
     return actor
 
@@ -2809,7 +2831,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
             logger.info(f"No Megatron actor to kill for {base_model}")
     else:
         # Kill ALL Megatron actors from resource pool
-        for entry in resource_pool.list_actors():
+        for entry in resource_pool.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
@@ -2852,7 +2874,7 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
         # Check for any Megatron actor from resource pool
         from tinker_server.backend.resource_pool import get_resource_pool, ActorType
         resource_pool = get_resource_pool()
-        for entry in resource_pool.list_actors():
+        for entry in resource_pool.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)

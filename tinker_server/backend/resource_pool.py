@@ -42,24 +42,37 @@ class ActorEntry:
     # LRU tracking
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
+    # Protection flag: actor being created/initialized is not evictable
+    # Set to False after initialization completes
+    creating: bool = True
 
     def touch(self):
         """Update last_accessed timestamp."""
         self.last_accessed = time.time()
 
+    def mark_ready(self):
+        """Mark actor as ready (no longer creating)."""
+        self.creating = False
+        self.touch()
+
     def is_idle(self, session_idle_timeout: float = 300) -> bool:
         """Check if actor can be evicted.
 
-        An actor is idle if ANY of the following:
-        1. It's a vLLM actor (always evictable, recreated on demand)
-        2. It has no current_session
-        3. It hasn't been accessed in session_idle_timeout seconds
+        An actor is idle if ALL of the following:
+        1. It's not currently being created/initialized
+        2. AND one of:
+           a. It's a vLLM actor (always evictable once ready)
+           b. It has no current_session
+           c. It hasn't been accessed in session_idle_timeout seconds
 
         Note: Tinker clients don't explicitly end sessions - they just stop
         sending requests. We use time-based idle detection to handle this.
         """
+        # Actors being created are NEVER idle
+        if self.creating:
+            return False
         if self.actor_type == ActorType.VLLM:
-            return True  # vLLM can always be evicted
+            return True  # vLLM can always be evicted (once ready)
         if self.current_session is None:
             return True  # No session loaded
         # Time-based idle detection for sessions
@@ -196,6 +209,17 @@ class ResourcePool:
                 entry.current_session = session_id
                 entry.touch()
 
+    def mark_ready(self, actor_name: str):
+        """Mark an actor as ready (no longer creating).
+
+        Call this after actor initialization completes to allow LRU eviction.
+        """
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            if entry:
+                entry.mark_ready()
+                logger.info(f"[ResourcePool] Actor {actor_name} marked ready")
+
     def _get_evictable_actors_lru(self) -> list[ActorEntry]:
         """Get evictable actors sorted by last access time (LRU first).
 
@@ -275,45 +299,66 @@ class ResourcePool:
 
         return freed_gpus
 
-    def ensure_gpus_available(self, needed_gpus: int) -> bool:
-        """Ensure at least needed_gpus are available, evicting if necessary.
+    def ensure_gpus_available(self, needed_gpus: int, timeout: float = 600) -> bool:
+        """Ensure at least needed_gpus are available, evicting and waiting if necessary.
 
         Args:
             needed_gpus: Number of GPUs needed.
+            timeout: Maximum time to wait for resources (seconds). Default 10 minutes.
 
         Returns:
             True if enough GPUs are available.
 
         Raises:
-            ValueError: If unable to free enough GPUs.
+            ValueError: If unable to free enough GPUs within timeout.
         """
-        available = int(ray.available_resources().get("GPU", 0))
+        import time as time_module
 
-        if available >= needed_gpus:
-            logger.debug(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
-            return True
+        start_time = time_module.time()
+        poll_interval = 5  # seconds between checks
 
-        need_to_free = needed_gpus - available
-        logger.info(
-            f"[ResourcePool] Need {needed_gpus} GPUs, only {available} available. "
-            f"Evicting LRU actors to free {need_to_free} GPUs."
-        )
+        while True:
+            available = int(ray.available_resources().get("GPU", 0))
 
-        freed = self.evict_for_gpus(need_to_free)
+            if available >= needed_gpus:
+                logger.debug(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
+                return True
 
-        # Wait for Ray to reclaim resources
-        time.sleep(2)
-        available = int(ray.available_resources().get("GPU", 0))
+            need_to_free = needed_gpus - available
+            logger.info(
+                f"[ResourcePool] Need {needed_gpus} GPUs, only {available} available. "
+                f"Attempting to evict LRU actors to free {need_to_free} GPUs."
+            )
 
-        if available >= needed_gpus:
-            logger.info(f"[ResourcePool] After eviction: {available} GPUs available")
-            return True
+            freed = self.evict_for_gpus(need_to_free)
 
-        raise ValueError(
-            f"Insufficient GPUs: need {needed_gpus}, available {available} after eviction. "
-            f"Freed {freed} GPUs but may have resource fragmentation. "
-            f"Check cluster status with 'ray status'."
-        )
+            if freed > 0:
+                # Wait for Ray to reclaim resources
+                time_module.sleep(2)
+                available = int(ray.available_resources().get("GPU", 0))
+
+                if available >= needed_gpus:
+                    logger.info(f"[ResourcePool] After eviction: {available} GPUs available")
+                    return True
+
+            # Check timeout
+            elapsed = time_module.time() - start_time
+            if elapsed >= timeout:
+                raise ValueError(
+                    f"Insufficient GPUs: need {needed_gpus}, available {available} after eviction. "
+                    f"Freed {freed} GPUs but resources did not become available within {timeout}s timeout. "
+                    f"Other actors may be in use. Check cluster status with 'ray status'."
+                )
+
+            # Wait before retrying - resources may become available when other actors finish
+            remaining = timeout - elapsed
+            wait_time = min(poll_interval, remaining)
+            logger.info(
+                f"[ResourcePool] Waiting for resources... "
+                f"(available={available}, needed={needed_gpus}, elapsed={elapsed:.1f}s, "
+                f"timeout={timeout}s, next check in {wait_time:.1f}s)"
+            )
+            time_module.sleep(wait_time)
 
     def list_actors(self) -> list[dict]:
         """List all tracked actors (validates liveness)."""
@@ -342,12 +387,22 @@ class ResourcePool:
                     "base_model": e.base_model,
                     "current_session": e.current_session,
                     "node_id": e.node_id,
+                    "creating": e.creating,
                     "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
                     "idle_time": e.idle_time(),
                     "age": e.age(),
                 }
                 for e in self._entries.values()
             ]
+
+    def iter_entries(self) -> list[ActorEntry]:
+        """Return list of ActorEntry objects (for internal use).
+
+        Unlike list_actors() which returns dicts, this returns the actual
+        ActorEntry objects for operations that need the full object.
+        """
+        with self._pool_lock:
+            return list(self._entries.values())
 
     def total_gpus_used(self) -> int:
         """Total GPUs used by all tracked actors."""
