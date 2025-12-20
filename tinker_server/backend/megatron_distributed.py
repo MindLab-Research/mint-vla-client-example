@@ -29,9 +29,17 @@ logger = logging.getLogger(__name__)
 from tinker_server.config import PFS_PYTHONPATH
 from tinker_server.backend.model_registry import is_moe_model
 
-# Persistent actor configuration - matches vLLM pattern
-PERSISTENT_MEGATRON_ACTOR_NAME = "persistent_megatron_worker_group_v2"
+# Persistent actor configuration
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
+
+
+def _make_megatron_actor_name(base_model: str) -> str:
+    """Generate per-model Megatron actor name.
+
+    Same pattern as vLLM: one actor per base model.
+    """
+    model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    return f"megatron_{model_name}"
 
 
 @dataclass
@@ -2631,10 +2639,10 @@ def get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
 ) -> ray.actor.ActorHandle:
-    """Get existing or create new persistent MegatronWorkerGroup.
+    """Get existing or create new persistent MegatronWorkerGroup for this model.
 
     Uses detached Ray actor pattern like vLLM for crash resilience.
-    First tries to connect to existing actor, creates new one if not found.
+    Each base_model gets its own Megatron actor (per-model isolation).
 
     Args:
         base_model: HuggingFace model path.
@@ -2654,16 +2662,28 @@ def get_or_create_megatron_worker_group(
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     resource_pool = get_resource_pool()
+    actor_name = _make_megatron_actor_name(base_model)
 
-    # Try to get existing persistent actor
+    # Try to get existing persistent actor for this model
     try:
-        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        logger.info(
-            f"Connected to existing Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
-        )
+        actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+        logger.info(f"Connected to existing Megatron actor: {actor_name}")
+        
+        # Verify actor is alive
+        try:
+            ray.get(actor.get_diagnostics.remote(), timeout=10)
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+            # Actor is dead, kill to free name
+            logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+            raise ValueError("Actor dead, will recreate")
+        
         # Register with resource pool (reconnection case)
         resource_pool.register(
-            actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+            actor_name=actor_name,
             actor_type=ActorType.MEGATRON,
             num_gpus=num_gpus,
             actor_handle=actor,
@@ -2671,22 +2691,15 @@ def get_or_create_megatron_worker_group(
             base_model=base_model,
         )
         # Reinitialize LoRA weights for fresh session
-        # This ensures each new session starts with fresh random weights
-        # instead of inheriting trained weights from previous session
-        # CRITICAL: Pass learning_rate to update optimizer param_groups
         logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate})...")
-        print(f"[API SERVER] Calling reinit_lora_weights with lr={learning_rate}", flush=True)
         result = ray.get(actor.reinit_lora_weights.remote(learning_rate))
-        print(f"[API SERVER] reinit_lora_weights returned: reinit_count={result.get('reinit_count', 0)}, opt_state_reset={result.get('opt_state_reset', 0)}, lr_updated={result.get('lr_updated', False)}", flush=True)
         logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
         return actor
     except ValueError:
         # Actor doesn't exist, create new one
-        logger.info(
-            f"Creating new detached Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
-        )
+        logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
-    # Phase 9: Check available GPUs and evict LRU actors if necessary
+    # Check available GPUs and evict LRU actors if necessary
     resource_pool.ensure_gpus_available(num_gpus)
 
     # Runtime env for PFS code access
@@ -2696,14 +2709,13 @@ def get_or_create_megatron_worker_group(
             "HF_HOME": "/vePFS-Mindverse/share/huggingface",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
     }
 
-    # Create detached Ray actor with well-known name
-    # lifetime="detached" ensures actor survives owner process termination
+    # Create detached Ray actor with per-model name
     actor = MegatronWorkerGroup.options(
-        name=PERSISTENT_MEGATRON_ACTOR_NAME,
+        name=actor_name,
         namespace=PERSISTENT_NAMESPACE,
         lifetime="detached",
         runtime_env=runtime_env,
@@ -2716,11 +2728,11 @@ def get_or_create_megatron_worker_group(
 
     # Wait for initialization
     ray.get(actor.__ray_ready__.remote())
-    logger.info("Megatron worker group initialized (detached actor)")
+    logger.info(f"Megatron worker group {actor_name} initialized (detached actor)")
 
     # Register with unified resource pool for LRU tracking
     resource_pool.register(
-        actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+        actor_name=actor_name,
         actor_type=ActorType.MEGATRON,
         num_gpus=num_gpus,
         actor_handle=actor,
@@ -2762,39 +2774,65 @@ async def async_get_or_create_megatron_worker_group(
     )
 
 
-def kill_megatron_actor() -> bool:
-    """Kill persistent Megatron actor and release resources.
+def kill_megatron_actor(base_model: str | None = None) -> bool:
+    """Kill persistent Megatron actor(s) and release resources.
+
+    Args:
+        base_model: If provided, kill actor for this specific model.
+                   If None, kill ALL Megatron actors.
 
     Returns:
-        True if actor was killed, False if not found.
+        True if any actor was killed, False if none found.
     """
-    from tinker_server.backend.resource_pool import get_resource_pool
+    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
 
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
-    try:
-        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        # Graceful shutdown first
+    resource_pool = get_resource_pool()
+    killed_any = False
+
+    if base_model:
+        # Kill specific model's actor
+        actor_name = _make_megatron_actor_name(base_model)
         try:
-            ray.get(actor.shutdown.remote(), timeout=10)
-        except Exception:
-            pass
-        ray.kill(actor, no_restart=True)
-        logger.info(f"Killed Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}")
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            try:
+                ray.get(actor.shutdown.remote(), timeout=10)
+            except Exception:
+                pass
+            ray.kill(actor, no_restart=True)
+            logger.info(f"Killed Megatron actor: {actor_name}")
+            resource_pool.unregister(actor_name)
+            killed_any = True
+        except ValueError:
+            logger.info(f"No Megatron actor to kill for {base_model}")
+    else:
+        # Kill ALL Megatron actors from resource pool
+        for entry in resource_pool.list_actors():
+            if entry.actor_type == ActorType.MEGATRON:
+                try:
+                    actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
+                    try:
+                        ray.get(actor.shutdown.remote(), timeout=10)
+                    except Exception:
+                        pass
+                    ray.kill(actor, no_restart=True)
+                    logger.info(f"Killed Megatron actor: {entry.actor_name}")
+                    resource_pool.unregister(entry.actor_name)
+                    killed_any = True
+                except ValueError:
+                    pass
 
-        # Unregister from resource pool
-        resource_pool = get_resource_pool()
-        resource_pool.unregister(PERSISTENT_MEGATRON_ACTOR_NAME)
-
-        return True
-    except ValueError:
-        logger.info("No Megatron actor to kill")
-        return False
+    return killed_any
 
 
-def is_megatron_actor_running() -> bool:
+def is_megatron_actor_running(base_model: str | None = None) -> bool:
     """Check if persistent Megatron actor is running.
+
+    Args:
+        base_model: If provided, check for this specific model's actor.
+                   If None, check for ANY running Megatron actor.
 
     Returns:
         True if actor exists and is actually alive (not dead).
@@ -2802,22 +2840,23 @@ def is_megatron_actor_running() -> bool:
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
-    try:
-        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        # ray.get_actor() returns handle even for DEAD actors
-        # Need to actually verify actor is alive by calling a method
-        # Use short timeout to avoid hanging on dead actors
-        ray.get(actor.get_diagnostics.remote(), timeout=5)
-        return True
-    except ValueError:
-        # Actor doesn't exist
-        return False
-    except ray.exceptions.RayActorError:
-        # Actor is dead
-        return False
-    except ray.exceptions.GetTimeoutError:
-        # Actor not responding
-        return False
-    except Exception:
-        # Any other error - assume not running
+    if base_model:
+        actor_name = _make_megatron_actor_name(base_model)
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            ray.get(actor.get_diagnostics.remote(), timeout=5)
+            return True
+        except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError, Exception):
+            return False
+    else:
+        # Check for any Megatron actor from resource pool
+        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+        resource_pool = get_resource_pool()
+        for entry in resource_pool.list_actors():
+            if entry.actor_type == ActorType.MEGATRON:
+                try:
+                    ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)
+                    return True
+                except Exception:
+                    pass
         return False

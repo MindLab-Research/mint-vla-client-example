@@ -93,8 +93,18 @@ async def create_sampling_session(
 
     sampling_session_id = str(uuid.uuid4())
 
-    # Get base model (required for multi-model support)
-    base_model = request.base_model or "Qwen/Qwen2.5-7B-Instruct"
+    # Determine base_model from request or infer from model_path
+    base_model = request.base_model
+    if not base_model and request.model_path:
+        # Try to infer base_model from adapter_config.json
+        adapter_path = _resolve_model_path(request.model_path)
+        base_model = _infer_base_model_from_adapter(adapter_path)
+
+    if not base_model:
+        raise HTTPException(
+            status_code=422,
+            detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
+        )
 
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
     multi_lora_engine = await session_manager.get_engine_for_model(base_model)
@@ -151,6 +161,26 @@ def _resolve_model_path(model_path: str) -> str:
     else:
         # Assume absolute path
         return model_path
+
+
+def _infer_base_model_from_adapter(adapter_path: str) -> str | None:
+    """Infer base_model from adapter_config.json if present.
+
+    Args:
+        adapter_path: Filesystem path to adapter directory.
+
+    Returns:
+        base_model name if found, None otherwise.
+    """
+    import json
+    import os
+
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+            return config.get("base_model_name_or_path") or config.get("base_model")
+    return None
 
 
 def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, dict]:
