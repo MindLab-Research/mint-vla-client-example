@@ -1,0 +1,42 @@
+diff --git a/vllm/lora/models.py b/vllm/lora/models.py
+--- a/vllm/lora/models.py
++++ b/vllm/lora/models.py
+@@ -185,6 +185,12 @@ class LoRAModel:
+         tensors: dict[str, torch.Tensor] = {}
+         unexpected_modules: list[list[str] | str] = []
+
++        # Valid MoE expert module suffixes (after experts.{N}.)
++        VALID_EXPERT_SUFFIXES = {
++            'gate_proj', 'up_proj', 'down_proj',  # Standard MLP names
++            'w1', 'w2', 'w3',  # Alternative names
++        }
++
+         def check_unexpected_modules(modules: dict):
+             for lora_module in modules.keys():  # noqa
+                 if is_base_embeddding_weights(lora_module):
+@@ -196,10 +202,22 @@ class LoRAModel:
+                 module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
+                 # Case for expert lora weights
+                 if ".experts" in module_name:
+-                    expert_idx = module_name.find(".experts")
+-                    expert_suffix = module_name[expert_idx + 1 :]
+-                    if expert_suffix not in expected_lora_modules:
+-                        unexpected_modules.append(module_name)
++                    # Handle expert patterns like: experts.0.gate_proj, experts.1.down_proj
++                    # Extract the module name after experts.{N}.
++                    import re
++                    expert_match = re.search(r'\.experts\.(\d+)\.(\w+)$', module_name)
++                    if expert_match:
++                        expert_module = expert_match.group(2)  # e.g., 'gate_proj'
++                        # Accept if it's a valid expert suffix or in expected modules
++                        if expert_module not in VALID_EXPERT_SUFFIXES and \
++                           expert_module not in expected_lora_modules and \
++                           'experts' not in expected_lora_modules:
++                            unexpected_modules.append(module_name)
++                    else:
++                        # Fallback: check if 'experts' is in expected modules
++                        if 'experts' not in expected_lora_modules:
++                            unexpected_modules.append(module_name)
+
+                 elif module_name.rsplit(".", 1)[-1] not in expected_lora_modules:
+                     unexpected_modules.append(module_name)

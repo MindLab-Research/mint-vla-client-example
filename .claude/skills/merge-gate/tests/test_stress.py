@@ -412,3 +412,117 @@ class TestStress:
 
         created = sum(1 for s in sessions if s["status"] == "created")
         assert created == num_sessions, f"Failed to create all sessions: {created}/{num_sessions}"
+
+    def test_interleaved_sessions(self):
+        """Test multi-tenant concurrency with interleaved sessions.
+
+        This is CRITICAL for production: multiple users switching between
+        sessions must maintain correct state via stateless trainer pattern.
+
+        Pattern: Session A → B → A should continue correctly.
+
+        Expected:
+        - Session A: loss continues decreasing after switch (no state reset)
+        - Session B: independent loss trajectory
+        - No weight contamination between sessions
+        """
+        print("\n=== Interleaved Sessions Test ===")
+        print("Testing stateless trainer with session switching...")
+
+        # Prepare different training data for each session
+        tokenizer = get_dense_tokenizer()
+
+        # Session A: Pig Latin style
+        prompt_a = "Translate: hello"
+        response_a = "ellohay"
+        tokens_a = tokenizer.encode(f"{prompt_a} {response_a}", add_special_tokens=True)
+        data_a = [{
+            "model_input": {"chunks": [{"tokens": tokens_a[:-1], "type": "encoded_text"}]},
+            "loss_fn_inputs": {
+                "target_tokens": {"data": tokens_a[1:], "shape": [len(tokens_a) - 1], "dtype": "int64"},
+                "loss_mask": {"data": [1.0] * (len(tokens_a) - 1), "shape": [len(tokens_a) - 1], "dtype": "float32"},
+            },
+        }]
+
+        # Session B: Different data (arithmetic)
+        prompt_b = "What is 2+2?"
+        response_b = "4"
+        tokens_b = tokenizer.encode(f"{prompt_b} {response_b}", add_special_tokens=True)
+        data_b = [{
+            "model_input": {"chunks": [{"tokens": tokens_b[:-1], "type": "encoded_text"}]},
+            "loss_fn_inputs": {
+                "target_tokens": {"data": tokens_b[1:], "shape": [len(tokens_b) - 1], "dtype": "int64"},
+                "loss_mask": {"data": [1.0] * (len(tokens_b) - 1), "shape": [len(tokens_b) - 1], "dtype": "float32"},
+            },
+        }]
+
+        # Create both sessions
+        print("\nPhase 1: Creating sessions...")
+        session_a_id, model_a_id = create_session(DENSE_MODEL, lora_rank=32, lr=1e-4)
+        session_b_id, model_b_id = create_session(DENSE_MODEL, lora_rank=32, lr=1e-4)
+        print(f"  Session A: {session_a_id}")
+        print(f"  Session B: {session_b_id}")
+
+        losses_a = []
+        losses_b = []
+
+        # Train A for 2 iterations
+        print("\nPhase 2: Training Session A (iter 1-2)...")
+        for i in range(2):
+            result = forward_backward(model_a_id, data_a, loss_fn="cross_entropy")
+            loss = result.get("metrics", {}).get("loss:mean", 0)
+            losses_a.append(loss)
+            optim_step(model_a_id, lr=1e-4)
+            print(f"  A iter {i+1}: loss={loss:.4f}")
+
+        # Switch to B, train for 2 iterations
+        print("\nPhase 3: Training Session B (iter 1-2)...")
+        for i in range(2):
+            result = forward_backward(model_b_id, data_b, loss_fn="cross_entropy")
+            loss = result.get("metrics", {}).get("loss:mean", 0)
+            losses_b.append(loss)
+            optim_step(model_b_id, lr=1e-4)
+            print(f"  B iter {i+1}: loss={loss:.4f}")
+
+        # Switch back to A, train for 2 more iterations
+        print("\nPhase 4: Training Session A (iter 3-4, after switch)...")
+        for i in range(2):
+            result = forward_backward(model_a_id, data_a, loss_fn="cross_entropy")
+            loss = result.get("metrics", {}).get("loss:mean", 0)
+            losses_a.append(loss)
+            optim_step(model_a_id, lr=1e-4)
+            print(f"  A iter {i+3}: loss={loss:.4f}")
+
+        # Analyze results
+        print(f"\n{'='*60}")
+        print("INTERLEAVED SESSIONS TEST RESULTS")
+        print(f"{'='*60}")
+        print(f"Session A losses: {[f'{l:.4f}' for l in losses_a]}")
+        print(f"Session B losses: {[f'{l:.4f}' for l in losses_b]}")
+
+        # Verify A's loss continues decreasing after switch
+        # losses_a[1] is before switch, losses_a[2] is after switch
+        loss_before_switch = losses_a[1]
+        loss_after_switch = losses_a[2]
+        loss_continued = loss_after_switch <= loss_before_switch * 1.1  # Allow 10% tolerance
+
+        print(f"\nA loss before switch (iter 2): {loss_before_switch:.4f}")
+        print(f"A loss after switch (iter 3): {loss_after_switch:.4f}")
+        print(f"Loss continuity: {'PASS' if loss_continued else 'FAIL'}")
+
+        # Verify B trained independently
+        b_decreased = losses_b[-1] < losses_b[0]
+        print(f"\nB loss decreased: {losses_b[0]:.4f} -> {losses_b[-1]:.4f} ({'PASS' if b_decreased else 'FAIL'})")
+
+        # Verify A's overall training
+        a_overall_decrease = (losses_a[0] - losses_a[-1]) / losses_a[0]
+        print(f"A overall reduction: {a_overall_decrease:.1%}")
+
+        # Assertions
+        assert loss_continued, (
+            f"Session A state not preserved after switch: "
+            f"loss jumped from {loss_before_switch:.4f} to {loss_after_switch:.4f}"
+        )
+        assert a_overall_decrease > 0.3, (
+            f"Session A did not learn: only {a_overall_decrease:.1%} reduction"
+        )

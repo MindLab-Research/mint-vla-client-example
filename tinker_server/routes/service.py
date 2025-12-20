@@ -16,6 +16,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from safetensors.torch import load_file
 
 from ..models.types import (
@@ -93,8 +94,18 @@ async def create_sampling_session(
 
     sampling_session_id = str(uuid.uuid4())
 
-    # Get base model (required for multi-model support)
-    base_model = request.base_model or "Qwen/Qwen2.5-7B-Instruct"
+    # Determine base_model from request or infer from model_path
+    base_model = request.base_model
+    if not base_model and request.model_path:
+        # Try to infer base_model from adapter_config.json
+        adapter_path = _resolve_model_path(request.model_path)
+        base_model = _infer_base_model_from_adapter(adapter_path)
+
+    if not base_model:
+        raise HTTPException(
+            status_code=422,
+            detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
+        )
 
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
     multi_lora_engine = await session_manager.get_engine_for_model(base_model)
@@ -151,6 +162,26 @@ def _resolve_model_path(model_path: str) -> str:
     else:
         # Assume absolute path
         return model_path
+
+
+def _infer_base_model_from_adapter(adapter_path: str) -> str | None:
+    """Infer base_model from adapter_config.json if present.
+
+    Args:
+        adapter_path: Filesystem path to adapter directory.
+
+    Returns:
+        base_model name if found, None otherwise.
+    """
+    import json
+    import os
+
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+            return config.get("base_model_name_or_path") or config.get("base_model")
+    return None
 
 
 def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, dict]:
@@ -255,39 +286,63 @@ async def vllm_status() -> dict:
     return {"alive": alive, "actor_name": PERSISTENT_VLLM_ACTOR_NAME}
 
 
+class KillMegatronRequest(BaseModel):
+    """Request to kill Megatron actor(s)."""
+
+    base_model: str | None = None  # Kill specific model's actor, or all if None
+
+
 @router.post("/kill_megatron")
-async def kill_megatron() -> dict:
-    """Kill the persistent Megatron training actor.
+async def kill_megatron(request: KillMegatronRequest | None = None) -> dict:
+    """Kill Megatron training actor(s).
+
+    Args:
+        base_model: If provided, kill actor for this specific model.
+                   If None/omitted, kill ALL Megatron actors.
 
     Use this to force a full restart of the Megatron worker group.
     The next training request will create a new actor.
-
-    This is useful when:
-    - Workers are in a bad state after a crash
-    - You want to free GPU memory
-    - You need to reload code changes
     """
     from ..backend.megatron_distributed import kill_megatron_actor
 
-    killed = kill_megatron_actor()
-    return {"killed": killed, "message": "Megatron actor killed" if killed else "No Megatron actor found"}
+    base_model = request.base_model if request else None
+    killed = kill_megatron_actor(base_model)
+
+    if base_model:
+        msg = f"Killed Megatron actor for {base_model}" if killed else f"No Megatron actor found for {base_model}"
+    else:
+        msg = "All Megatron actors killed" if killed else "No Megatron actors found"
+
+    return {"killed": killed, "message": msg}
+
 
 
 @router.get("/megatron_status")
-async def megatron_status() -> dict:
-    """Check if persistent Megatron actor exists.
+async def megatron_status(base_model: str | None = None) -> dict:
+    """Check if Megatron actor(s) exist.
+
+    Args:
+        base_model: If provided, check for this specific model's actor.
+                   If None, check for ANY running Megatron actor.
 
     Returns:
-        alive: True if actor exists and is alive
-        actor_name: The well-known actor name
+        alive: True if matching actor exists and is alive
+        actors: List of running Megatron actors from resource pool
     """
-    from ..backend.megatron_distributed import (
-        PERSISTENT_MEGATRON_ACTOR_NAME,
-        is_megatron_actor_running,
-    )
+    from ..backend.megatron_distributed import is_megatron_actor_running
+    from ..backend.resource_pool import get_resource_pool, ActorType
 
-    alive = is_megatron_actor_running()
-    return {"alive": alive, "actor_name": PERSISTENT_MEGATRON_ACTOR_NAME}
+    alive = is_megatron_actor_running(base_model)
+
+    # Get list of all Megatron actors
+    resource_pool = get_resource_pool()
+    actors = [
+        {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
+        for e in resource_pool.list_actors()
+        if e.actor_type == ActorType.MEGATRON
+    ]
+
+    return {"alive": alive, "actors": actors, "query_base_model": base_model}
 
 
 @router.get("/resource_pool")

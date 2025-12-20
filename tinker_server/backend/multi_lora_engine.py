@@ -35,6 +35,27 @@ PERSISTENT_NAMESPACE = "tinker"
 from tinker_server.config import PFS_PYTHONPATH
 
 
+def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
+    """Get the node_id where an actor is running.
+
+    Uses Ray's state API to get actor location.
+    Returns None if unable to determine.
+    """
+    try:
+        actor_id = actor_handle._actor_id
+        # Convert ActorID to hex string for the state API
+        actor_id_hex = actor_id.hex()
+        from ray._private.state import actors as state_actors
+        actor_info = state_actors(actor_id_hex)
+        if actor_info:
+            # NodeID is nested under Address
+            address = actor_info.get("Address", {})
+            return address.get("NodeID")
+    except Exception as e:
+        logger.debug(f"Could not get node_id for actor: {e}")
+    return None
+
+
 @dataclass
 class LoRASlotInfo:
     """Metadata for a loaded LoRA adapter."""
@@ -193,10 +214,12 @@ class MultiLoRAInferenceEngine:
         max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
         max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
         actor_name: str | None = None,
+        quantization: str | None = None,  # "fp8" for FP8 models like K2
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.data_parallel_size = data_parallel_size
+        self.quantization = quantization
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
@@ -226,38 +249,64 @@ class MultiLoRAInferenceEngine:
 
             # Try to get existing persistent actor
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
-            # We must verify the actor is alive by calling a method on it
+            # We must verify the actor is alive AND engine is initialized
             try:
                 self.server = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 # Health check: try calling a method to verify actor is alive
                 # This will raise RayActorError if actor is dead
                 try:
                     ray.get(self.server.__ray_ready__.remote(), timeout=5)
-                    logger.info(
-                        f"Connected to existing persistent vLLM actor: {self.actor_name}"
-                    )
-                    self._initialized = True
 
-                    # Register existing actor with resource pool for LRU tracking
-                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-                    total_gpus = self.tensor_parallel_size * self.data_parallel_size
-                    resource_pool = get_resource_pool()
-                    logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool")
-                    resource_pool.register(
-                        actor_name=self.actor_name,
-                        actor_type=ActorType.VLLM,
-                        num_gpus=total_gpus,
-                        actor_handle=self.server,
-                        namespace=PERSISTENT_NAMESPACE,
-                        base_model=self.model_path,
-                    )
-                    logger.info(f"[DEBUG] ResourcePool now has {len(resource_pool._entries)} entries")
-                    return
+                    # Check if engine is actually initialized (not just actor alive)
+                    # A broken actor can be "alive" but have failed engine init
+                    engine_ready = ray.get(self.server.is_engine_ready.remote(), timeout=10)
+                    if not engine_ready:
+                        logger.warning(
+                            f"vLLM actor {self.actor_name} has broken engine, killing and recreating"
+                        )
+                        try:
+                            ray.kill(self.server, no_restart=True)
+                        except Exception as kill_err:
+                            logger.debug(f"Failed to kill broken actor: {kill_err}")
+                        self.server = None
+                        self._initialized = False
+                    else:
+                        logger.info(
+                            f"Connected to existing persistent vLLM actor: {self.actor_name}"
+                        )
+                        self._initialized = True
+
+                        # Register existing actor with resource pool for LRU tracking
+                        # Include node_id for proper per-node GPU scheduling
+                        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                        total_gpus = self.tensor_parallel_size * self.data_parallel_size
+                        resource_pool = get_resource_pool()
+                        actor_node_id = _get_actor_node_id(self.server)
+                        logger.info(f"Registering existing actor {self.actor_name} with ResourcePool (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
+                        resource_pool.register(
+                            actor_name=self.actor_name,
+                            actor_type=ActorType.VLLM,
+                            num_gpus=total_gpus,
+                            actor_handle=self.server,
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=self.model_path,
+                            node_id=actor_node_id,
+                        )
+                        # Mark as ready since it's an existing actor that responded to health check
+                        resource_pool.mark_ready(self.actor_name)
+                        return
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive, need to create new one
                     logger.warning(
                         f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
                     )
+                    # Must kill dead actor to free the name for reuse
+                    # Ray keeps names registered even for dead actors
+                    try:
+                        ray.kill(self.server, no_restart=True)
+                        logger.debug(f"Killed dead actor to free name: {self.actor_name}")
+                    except Exception as kill_err:
+                        logger.debug(f"Could not kill dead actor: {kill_err}")
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
                     self._initialized = False
@@ -281,6 +330,17 @@ class MultiLoRAInferenceEngine:
             # Compute total GPUs needed for MoE models
             # For EP (expert parallelism), total_gpus = TP * DP
             total_gpus = self.tensor_parallel_size * self.data_parallel_size
+
+            # Ensure GPUs available, evicting idle actors if needed (LRU)
+            # This is critical to prevent server hangs when no GPUs are free.
+            from tinker_server.backend.resource_pool import get_resource_pool
+            resource_pool = get_resource_pool()
+            try:
+                resource_pool.ensure_gpus_available(total_gpus)
+            except ValueError as e:
+                # Unable to free enough GPUs even after eviction
+                logger.error(f"Cannot create vLLM actor: {e}")
+                raise
 
             # Build engine_kwargs for expert parallelism
             # Pass enable_expert_parallel directly to vLLM, bypassing verl's worker-based EP
@@ -317,9 +377,12 @@ class MultiLoRAInferenceEngine:
                 data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
                 expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
                 engine_kwargs=engine_kwargs,
+                quantization=self.quantization,  # "fp8" for FP8 models like K2
             )
             if self.max_model_len is not None:
                 rollout_config.max_model_len = self.max_model_len
+            if self.quantization:
+                logger.info(f"vLLM quantization enabled: {self.quantization}")
 
             # Model config with multi-LoRA parameters
             model_config = HFModelConfig(
@@ -340,11 +403,99 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+            #
+            # Find a node with enough free GPUs to avoid memory conflicts.
+            # When training and inference coexist, Megatron holds GPU memory even
+            # though Ray doesn't track actual CUDA memory usage. We must place
+            # vLLM on a separate node with completely free GPUs.
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+            # Find a node with enough AVAILABLE GPUs (not just total GPUs).
+            # Ray's node.Resources shows total, but other actors (Megatron) may hold GPUs.
+            # We compute available by checking:
+            # 1. GPUs used by active placement groups (Megatron training)
+            # 2. GPUs used by actors tracked in ResourcePool (vLLM, dense training)
+            target_node = None
+            logger.debug(f"Looking for node with {total_gpus} available GPUs for vLLM")
+
+            # Get cluster-wide available resources for validation
+            cluster_available = ray.available_resources()
+            cluster_gpus = cluster_available.get("GPU", 0)
+            logger.debug(f"Cluster has {cluster_gpus} GPUs available")
+
+            # Find GPUs used by active placement groups on each node
+            # Each bundle in a placement group typically uses 1 GPU
+            pg_table = ray.util.placement_group_table()
+            gpus_used_by_pg = {}  # node_id -> count of GPUs used by placement groups
+            for pg_id, pg_info in pg_table.items():
+                if pg_info.get("state") == "CREATED":
+                    # Count bundles per node (each bundle typically uses 1 GPU)
+                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
+                    for bundle_idx, node_id in bundles_to_node.items():
+                        gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
+
+            # Also get GPUs used by actors tracked in ResourcePool (vLLM, dense training)
+            # This is critical - without it, we may schedule to a node that already has vLLM actors
+            gpus_used_by_actors = resource_pool.gpus_used_by_node()
+
+            # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used - actor_used)
+            candidates = []
+            for node in ray.nodes():
+                node_id = node["NodeID"]
+                node_id_short = node_id[:8]
+                if node["Alive"]:
+                    total_res = node.get("Resources", {})
+                    total_gpu = total_res.get("GPU", 0)
+                    obj_store = total_res.get("object_store_memory", 0)
+                    pg_gpus = gpus_used_by_pg.get(node_id, 0)
+                    actor_gpus = gpus_used_by_actors.get(node_id, 0)
+                    available_gpu = total_gpu - pg_gpus - actor_gpus
+                    logger.debug(f"Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpu}")
+
+                    # Node must have enough AVAILABLE GPUs (after subtracting all usage) and enough object store
+                    if available_gpu >= total_gpus and obj_store > 100_000_000_000:
+                        candidates.append((node_id, available_gpu))
+
+            # Prefer nodes with NO placement groups first (to avoid GPU assignment conflicts)
+            # Among those, prefer nodes with more GPUs (more room)
+            if candidates:
+                # Separate into "clean" nodes (no PG or actors) and "partial" nodes
+                clean_nodes = [(nid, gpus) for nid, gpus in candidates
+                               if gpus_used_by_pg.get(nid, 0) == 0 and gpus_used_by_actors.get(nid, 0) == 0]
+                partial_nodes = [(nid, gpus) for nid, gpus in candidates
+                                 if gpus_used_by_pg.get(nid, 0) > 0 or gpus_used_by_actors.get(nid, 0) > 0]
+
+                if clean_nodes:
+                    # Prefer clean nodes
+                    clean_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
+                    target_node = clean_nodes[0][0]
+                    available_gpus = clean_nodes[0][1]
+                    logger.info(f"Selected clean node {target_node[:8]} with {available_gpus} available GPUs")
+                else:
+                    # Fall back to partial nodes
+                    partial_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
+                    target_node = partial_nodes[0][0]
+                    available_gpus = partial_nodes[0][1]
+                    pg_count = gpus_used_by_pg.get(target_node, 0)
+                    actor_count = gpus_used_by_actors.get(target_node, 0)
+                    logger.info(f"Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} PG, {actor_count} actors)")
+
+            scheduling_opts = {}
+            if target_node:
+                scheduling_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                    node_id=target_node,
+                    soft=False,  # Hard constraint - fail if node unavailable
+                )
+            else:
+                scheduling_opts["scheduling_strategy"] = "SPREAD"
+                logger.warning("No suitable node found, using SPREAD scheduling")
+
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                **scheduling_opts,
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,
@@ -363,15 +514,34 @@ class MultiLoRAInferenceEngine:
                 nnodes=1,
             )
 
-            # ray.get() blocks until launch_server completes (sets self.engine)
-            # Note: await on ObjectRef doesn't work - must use ray.get()
-            ray.get(self.server.launch_server.remote())
+            # Run blocking ray.get() in thread executor to avoid blocking the event loop.
+            # This allows the server to remain responsive during vLLM initialization (~60-120s for MoE).
+            import asyncio
+            loop = asyncio.get_event_loop()
+            logger.info(f"Launching vLLM server (non-blocking)...")
+            try:
+                await loop.run_in_executor(
+                    None,  # Use default thread pool
+                    lambda: ray.get(self.server.launch_server.remote(), timeout=300)
+                )
+            except ray.exceptions.GetTimeoutError:
+                logger.error(f"vLLM launch timed out after 300s for {self.actor_name}")
+                # Kill the stuck actor
+                try:
+                    ray.kill(self.server, no_restart=True)
+                except Exception:
+                    pass
+                self.server = None
+                raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out")
+
             self._initialized = True
             logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
 
             # Register with unified resource pool for LRU tracking
+            # Include node_id for proper per-node GPU scheduling
             from tinker_server.backend.resource_pool import get_resource_pool, ActorType
             resource_pool = get_resource_pool()
+            actor_node_id = _get_actor_node_id(self.server)
             resource_pool.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
@@ -379,7 +549,12 @@ class MultiLoRAInferenceEngine:
                 actor_handle=self.server,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
+                node_id=actor_node_id,
             )
+            # Mark as ready now that launch completed successfully
+            resource_pool.mark_ready(self.actor_name)
+            if actor_node_id:
+                logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 
     async def add_lora_for_session(
         self,
@@ -632,10 +807,13 @@ def _resolve_model_path(model_name: str) -> str:
         # Dense models
         "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+        "Qwen/Qwen3-4B-Instruct-2507": "/vePFS-Mindverse/share/modelscope/models/Qwen/Qwen3-4B-Instruct-2507",
         # MoE models (all share same architecture, different checkpoints)
         "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
         "Qwen/Qwen3-30B-A3B-Base": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/main",
+        # K2 models (1T params MoE, requires FP8)
+        "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
     }
 
     if model_name in MODEL_PATHS:
@@ -673,6 +851,9 @@ class MultiModelInferenceManager:
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
 
+        If cached engine exists, verifies actor is alive before returning.
+        If actor is dead, removes from cache and creates new engine.
+
         Args:
             model_name: HuggingFace model name (e.g., "Qwen/Qwen2.5-7B-Instruct")
 
@@ -681,7 +862,22 @@ class MultiModelInferenceManager:
         """
         async with self._init_lock:
             if model_name in self._engines:
-                return self._engines[model_name]
+                engine = self._engines[model_name]
+                # Check if actor is still alive before returning cached engine
+                if engine.server is not None:
+                    try:
+                        ray.get(engine.server.__ray_ready__.remote(), timeout=5)
+                        # Actor alive, return cached engine
+                        return engine
+                    except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                        # Actor is dead, remove from cache and recreate
+                        logger.warning(
+                            f"Cached vLLM engine for {model_name} has dead actor, recreating"
+                        )
+                        del self._engines[model_name]
+                else:
+                    # Engine has no server handle, remove stale entry
+                    del self._engines[model_name]
 
             # Get model config for parallelism settings
             from tinker_server.backend.model_registry import get_model_config
@@ -691,9 +887,20 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            # Determine quantization from model config (None = vLLM auto-detect from config.json)
+            quantization = config.quantization
+
+            # For MoE models, use max_loras=1 to reduce memory usage.
+            # vLLM pre-allocates LoRA buffers for all experts, which is huge:
+            # max_loras × num_experts × lora_rank × hidden_size per layer.
+            # With default max_loras=64, 128 experts, this exceeds GPU memory.
+            model_max_loras = 1 if config.is_moe else self.max_loras
+            model_max_cpu_loras = 0 if config.is_moe else self.max_cpu_loras
+
             logger.info(
                 f"Creating vLLM engine for model {model_name}: "
-                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}"
+                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}, "
+                f"quant={quantization}, max_loras={model_max_loras}"
             )
 
             engine = MultiLoRAInferenceEngine(
@@ -702,10 +909,11 @@ class MultiModelInferenceManager:
                 data_parallel_size=config.recommended_dp,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
-                max_loras=self.max_loras,
-                max_cpu_loras=self.max_cpu_loras,
+                max_loras=model_max_loras,
+                max_cpu_loras=model_max_cpu_loras,
                 max_lora_rank=self.max_lora_rank,
                 actor_name=actor_name,
+                quantization=quantization,
             )
             await engine.initialize()
 

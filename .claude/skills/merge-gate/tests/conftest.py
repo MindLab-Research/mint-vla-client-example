@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 
+
 import pytest
 import requests
 
@@ -17,6 +18,7 @@ API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 DENSE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DENSE_SMALL_MODEL = "Qwen/Qwen3-0.6B"
 MOE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+MOONLIGHT_MODEL = "moonshotai/Moonlight-16B-A3B-Instruct"  # DeepseekV3 MLA architecture
 
 
 def get_headers():
@@ -111,12 +113,17 @@ def train_step(model_id: str, data: list, lr: float = 1e-4, loss_fn: str = "cros
 
 
 def save_weights(model_id: str, name: str = "test") -> dict:
-    """Save weights for sampling."""
+    """Save weights for sampling.
+
+    Note: For MoE models, vLLM engine creation + CUDA graph capture takes ~120s,
+    so we use a longer timeout.
+    """
     url = f"{BASE_URL}/api/v1/save_weights"
     payload = {"model_id": model_id, "name": name}
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=120)
+    # MoE models need longer timeout for vLLM engine + CUDA graph capture
+    return poll_future(resp.json().get("request_id"), timeout=300, request_timeout=180)
 
 
 def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
@@ -148,26 +155,28 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 def tokenizer():
     """Get tokenizer for Dense model."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True, local_files_only=True)
+    return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
 def moe_tokenizer():
     """Get tokenizer for MoE model."""
     from transformers import AutoTokenizer
-    import os
-    # Use HF model ID with local_files_only=True to load from HF cache
-    # Set HF_HOME to ensure correct cache location
-    os.environ["HF_HOME"] = "/vePFS-Mindverse/share/huggingface"
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True, local_files_only=True)
+    return AutoTokenizer.from_pretrained(MOE_MODEL, trust_remote_code=True)
+
+
+@pytest.fixture(scope="module")
+def moonlight_tokenizer():
+    """Get tokenizer for Moonlight model (DeepseekV3 MLA)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(MOONLIGHT_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
 def small_tokenizer():
     """Get tokenizer for small Dense model (Qwen3-0.6B)."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True, local_files_only=True)
+    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture

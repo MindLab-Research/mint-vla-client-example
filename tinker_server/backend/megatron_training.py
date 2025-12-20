@@ -360,11 +360,15 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         clip_frac = (clipped * loss_mask).sum() / max(num_tokens, 1)
         ratio_mean = (ratio * loss_mask).sum() / max(num_tokens, 1)
 
+        # Return new_log_probs in metrics for loss_fn_outputs (like SFT does)
+        new_log_probs_cpu = new_log_probs.detach().cpu()
+
         metrics = {
             "loss": loss.detach().item(),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
             "clip_frac": clip_frac.detach().item() if hasattr(clip_frac, 'item') else float(clip_frac),
             "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, 'item') else float(ratio_mean),
+            "log_probs": new_log_probs_cpu,  # For loss_fn_outputs in MegatronDistributedWorker
         }
         return loss, metrics
 
@@ -655,9 +659,18 @@ class MegatronTrainingWorker:
 
         logger.info(f"[MegatronTrainingWorker] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
+        # Return placeholder loss_fn_outputs - one per data item
+        # The tinker SDK uses len(loss_fn_outputs) as weights for metrics aggregation
+        # Without this, the SDK's _metrics_reduction() fails with "Weights sum to zero"
+        # Note: logprobs must be a plain list, not dict {data, shape, dtype}
+        loss_fn_outputs = [
+            {"logprobs": []}
+            for _ in data_items
+        ]
+
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
-            "loss_fn_outputs": [],  # Simplified - logprobs computed on demand
+            "loss_fn_outputs": loss_fn_outputs,
             "metrics": metrics,
         }
 

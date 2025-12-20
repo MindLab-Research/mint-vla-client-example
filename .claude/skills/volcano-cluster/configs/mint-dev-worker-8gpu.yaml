@@ -15,9 +15,9 @@ Entrypoint: |
   ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
 
   # Connect to Ray head
-  ray start --address='192.168.47.243:6379' --num-gpus=8 && sleep infinity
+  ray start --address='192.168.32.21:6379' --num-gpus=8 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 

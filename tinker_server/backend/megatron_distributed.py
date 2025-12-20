@@ -27,10 +27,37 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.backend.model_registry import is_moe_model
 
-# Persistent actor configuration - matches vLLM pattern
-PERSISTENT_MEGATRON_ACTOR_NAME = "persistent_megatron_worker_group_v2"
+# Persistent actor configuration
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
+
+
+def _make_megatron_actor_name(base_model: str) -> str:
+    """Generate per-model Megatron actor name.
+
+    Normalizes input to handle both:
+    - HuggingFace model ID: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    - Resolved cache path: "/vePFS/.../models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/..."
+
+    Both produce the same actor name for consistent lookup.
+    """
+    import re
+
+    # Check if this is a resolved HuggingFace cache path
+    # Pattern: models--{org}--{model}/snapshots/{hash}
+    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
+    match = re.search(hf_cache_pattern, base_model)
+
+    if match:
+        # Extract org and model from cache path
+        org, model = match.groups()
+        model_name = model.lower().replace("-", "_").replace(".", "_")
+    else:
+        # HuggingFace model ID or plain path - take last component
+        model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+
+    return f"megatron_{model_name}"
 
 
 @dataclass
@@ -45,6 +72,7 @@ class DistributedConfig:
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
     context_parallel_size: int = 1
+    use_fp8: bool = False  # FP8 quantization for K2 and similar models
 
     @property
     def world_size(self) -> int:
@@ -63,11 +91,13 @@ class DistributedConfig:
 def get_node_ip_and_free_port() -> tuple[str, int]:
     """Get node IP and free port for master address.
 
+    Uses Ray's node IP which correctly identifies the inter-node network interface.
     Self-contained to avoid module import issues on Ray workers.
     """
     import socket
-    hostname = socket.gethostname()
-    ip = socket.gethostbyname(hostname)
+    import ray
+    # Use Ray's IP detection which respects --node-ip-address and finds the correct interface
+    ip = ray.util.get_node_ip_address()
     # Get free port inline
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -190,6 +220,16 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+        # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
+        # These patches enable Flash Attention 2 with MLA by padding value tensors
+        # Must be applied before MLASelfAttention class is imported/instantiated
+        try:
+            from verl.models.mcore.patch_v012 import apply_patch
+            apply_patch()
+            logger.info(f"[Rank {self.rank}] Applied MLA patches from verl.models.mcore.patch_v012")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not apply MLA patch: {e}")
+
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
         from verl.trainer.config import CheckpointConfig
@@ -241,8 +281,11 @@ class MegatronRankWorker:
         )
 
         # Build override_transformer_config for MoE models
+        # Different HF configs use different attribute names:
+        # - Qwen3-MoE: num_experts
+        # - DeepseekV3/Moonlight: n_routed_experts
         override_tf_config = {}
-        num_experts = getattr(hf_config, "num_experts", None)
+        num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
         if num_experts is not None:
             # MoE model - pass expert parameters to TransformerConfig
             override_tf_config["num_moe_experts"] = num_experts
@@ -254,7 +297,7 @@ class MegatronRankWorker:
             override_tf_config["moe_permute_fusion"] = False
             logger.info(
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
-                f"top-{num_experts_per_tok} routing"
+                f"top-{num_experts_per_tok} routing, permute_fusion=False"
             )
 
         # For LoRA training, disable grad_offload to keep gradient buffers allocated.
@@ -264,6 +307,39 @@ class MegatronRankWorker:
         if self.lora_rank > 0:
             logger.info(f"[Rank {self.rank}] LoRA enabled (rank={self.lora_rank}), disabling grad_offload")
 
+        # FP8 support for large models like Kimi-K2
+        # FP8 is configured via override_transformer_config (not override_mcore_model_config)
+        # because TransformerConfig.fp8 and .fp8_param control FP8 during model creation
+        if self.config.use_fp8:
+            # Use e4m3 format for FP8 (8-bit floating point with 4-bit exponent, 3-bit mantissa)
+            # fp8_param=True stores parameters in FP8 precision for memory savings
+            # use_cpu_initialization=True initializes on CPU first, then converts to FP8 before GPU transfer
+            # This avoids OOM during BF16→FP8 conversion which would require both in GPU memory
+            override_tf_config["fp8"] = "e4m3"
+            override_tf_config["fp8_param"] = True
+            override_tf_config["use_cpu_initialization"] = True
+            logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
+
+        # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
+        # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
+        # MLA has head_dim_qk=192 (qk_nope=128 + qk_rope=64) and head_dim_v=128
+        # Flash Attention 2 requires head_dim_qk == head_dim_v
+        # The MLA patch in verl/models/mcore/patch_v012.py pads value tensor to 192
+        # to match query dimension, enabling FA2 with THD format on sm80 (A100/A800)
+        #
+        # IMPORTANT: Do NOT force unfused backend here - it conflicts with THD format
+        # (TE disables unfused for THD). Let FA2 work with the value padding instead.
+        qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
+        qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
+        head_dim_qk = qk_nope + qk_rope
+        if head_dim_qk > 0:
+            logger.info(
+                f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
+                f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
+            )
+
+        logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
+
         engine_config = McoreEngineConfig(
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
@@ -272,7 +348,7 @@ class MegatronRankWorker:
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
-            dtype="bfloat16",
+            dtype="bfloat16",  # Base dtype, FP8 handled via override_transformer_config
             use_mbridge=True,
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
@@ -519,9 +595,10 @@ class MegatronRankWorker:
                 for seq_len in seq_lengths:
                     sample_log_probs = combined_log_probs[offset:offset + seq_len]
                     offset += seq_len
+                    logprobs_list = sample_log_probs.tolist()
                     loss_fn_outputs.append({
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": sample_log_probs.tolist(),
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
             # Return CPU-safe scalars and loss_fn_outputs
@@ -638,15 +715,17 @@ class MegatronRankWorker:
                     for seq_len in seq_lengths:
                         sample_log_probs = combined_log_probs[offset:offset + seq_len]
                         offset += seq_len
+                        logprobs_list = sample_log_probs.tolist()
                         loss_fn_outputs.append({
                             "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                            "logprobs": sample_log_probs.tolist(),
+                            "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                         })
                 elif combined_log_probs is not None:
                     # Fallback: single entry with all log_probs (legacy behavior)
+                    logprobs_list = combined_log_probs.tolist()
                     loss_fn_outputs.append({
                         "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
-                        "logprobs": combined_log_probs.tolist(),
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
             return {
@@ -804,9 +883,10 @@ class MegatronRankWorker:
                 for seq_len in seq_lengths:
                     sample_log_probs = combined_log_probs[offset:offset + seq_len]
                     offset += seq_len
+                    logprobs_list = sample_log_probs.tolist()
                     loss_fn_outputs.append({
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": sample_log_probs.tolist(),
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
             # Handle learning rate
@@ -971,26 +1051,27 @@ class MegatronRankWorker:
         # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
         # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
         #
-        # IMPORTANT: vLLM 0.12.0 does NOT support MoE expert LoRA inference.
-        # The FusedMoEWithLoRA class exists but is disabled with warning:
-        #   "For MoE models, vLLM currently does not support fused MoE LoRA inference"
-        # Only attention modules (q_proj, k_proj, v_proj, o_proj) + router gate are supported.
-        # MLP/expert modules must be filtered out for MoE models.
+        # NOTE: vLLM 0.13.0+ supports expert LoRA for MoE models via FusedMoEWithLoRA.
+        # MLP/expert modules are now included in the exported LoRA state_dict.
         def _is_mlp_module(param_name: str) -> bool:
-            """Check if parameter is from MLP/expert layer (not supported in vLLM MoE LoRA)."""
+            """Check if parameter is from MLP/expert layer."""
             mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
                            'gate_proj', 'up_proj', 'down_proj']
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
 
+        # Check if model is MoE - if so, filter MLP modules
+        # vLLM's FusedMoEWithLoRA expects per-expert LoRA weights, but Megatron exports
+        # shared LoRA (single adapter for all experts). This causes weight format mismatch.
+        # Solution: Only export attention modules for MoE models.
+        model_is_moe = is_moe_model(self.base_model)
+        if model_is_moe:
+            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (vLLM weight format incompatible)")
+
         lora_state_dict = {}
-        filtered_count = 0
+        mlp_filtered_count = 0
         logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
-            # Filter out MLP modules for MoE models (vLLM doesn't support expert LoRA)
-            if _is_mlp_module(name):
-                filtered_count += 1
-                continue
             # Add PEFT prefix if not already present
             if name.startswith("model."):
                 peft_name = f"base_model.model.{name}"
@@ -1002,9 +1083,17 @@ class MegatronRankWorker:
                 if peft_name is None:
                     logger.warning(f"Could not convert to PEFT: {name}")
                     continue
+
+            # For MoE models, filter out MLP/expert modules
+            if model_is_moe and _is_mlp_module(peft_name):
+                mlp_filtered_count += 1
+                continue
+
             lora_state_dict[peft_name] = tensor
 
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format), filtered {filtered_count} MLP/expert modules")
+        if model_is_moe:
+            logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, attention-only for MoE)")
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:3]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
@@ -1025,8 +1114,10 @@ class MegatronRankWorker:
             base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
             base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight
 
-        NOTE: vLLM 0.12.0 does NOT support MoE expert LoRA inference.
-        MLP/expert modules are filtered out - only attention modules exported.
+        NOTE: vLLM 0.12.0 has FusedMoEWithLoRA class but two blockers remain:
+        1. Module validation patch needed (patches/apply_vllm_patch.py) - DONE
+        2. Weight format adapter needed - PEFT format -> vLLM packed format - NOT DONE
+        MLP/expert modules are filtered until weight format adapter is implemented.
         """
         import re
 
@@ -1096,7 +1187,6 @@ class MegatronRankWorker:
         from megatron.core.optimizer import ChainedOptimizer
 
         logger.info(f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate})")
-        print(f"[REINIT DEBUG Rank {self.rank}] reinit_lora_weights ENTRY lr={learning_rate}", flush=True)
 
         # Must use train_mode context for param_offload
         reinit_count = 0
@@ -1183,25 +1273,21 @@ class MegatronRankWorker:
                         #
                         # Handle ProxyDict from ChainedOptimizer - it wraps multiple optimizer
                         # states and doesn't have .clear(). Access underlying dicts directly.
-                        print(f"[REINIT DEBUG Rank {self.rank}] state type={type(state).__name__}, has _inner_dicts={hasattr(state, '_inner_dicts')}, has clear={hasattr(state, 'clear')}, count={state_count}", flush=True)
                         if hasattr(state, '_inner_dicts'):
                             # ProxyDict from ChainedOptimizer
                             for inner_dict in state._inner_dicts:
                                 inner_dict.clear()
                             logger.info(f"[Rank {self.rank}] Cleared ProxyDict optimizer state ({state_count} entries from {len(state._inner_dicts)} inner dicts)")
-                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared ProxyDict, now len={len(state)}", flush=True)
                         elif hasattr(state, 'clear'):
                             # Regular dict
                             state.clear()
                             logger.info(f"[Rank {self.rank}] Cleared optimizer state dict ({state_count} entries)")
-                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared dict via .clear(), now len={len(state)}", flush=True)
                         else:
                             # Unknown type - try to clear via iteration
                             keys = list(state.keys()) if hasattr(state, 'keys') else []
                             for key in keys:
                                 del state[key]
                             logger.info(f"[Rank {self.rank}] Cleared optimizer state via key deletion ({len(keys)} entries)")
-                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared via key deletion, now len={len(state)}", flush=True)
                         opt_state_reset_count = state_count
                     else:
                         logger.warning(f"[Rank {self.rank}] Optimizer {i} has no inner optimizer or it's None")
@@ -1543,9 +1629,11 @@ class MegatronWorkerGroup:
 
         # Create placement group with N GPU bundles
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
+        # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
+        # STRICT_PACK would require single node, blocking on 8-GPU nodes
         self.placement_group = ray.util.placement_group(
             bundles,
-            strategy="STRICT_PACK",  # All on same node for NVLink
+            strategy="PACK",
         )
         ray.get(self.placement_group.ready())
 
@@ -1614,6 +1702,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -1621,10 +1710,14 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            session_id: Unused - session management handled via swap_session().
 
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        # Note: session_id is not used here. For Megatron, session state is managed
+        # via swap_session() before calling forward_backward. This parameter exists
+        # for API consistency with TrainingWorker.
         loss_fn_config = loss_fn_config or {}
 
         # Send raw data_items to workers (TensorDict created locally on each worker
@@ -1665,6 +1758,7 @@ class MegatronWorkerGroup:
     def forward(
         self,
         data_items: list[dict],
+        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
     ) -> dict:
         """Run forward pass only on all workers. Returns per-token logprobs.
 
@@ -1673,6 +1767,7 @@ class MegatronWorkerGroup:
 
         Args:
             data_items: List of Tinker Datum dicts.
+            session_id: Unused - session management handled via swap_session().
 
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
@@ -1715,11 +1810,19 @@ class MegatronWorkerGroup:
             "log_probs": log_probs_data,  # Per-token log probabilities
         }
 
-    def optim_step(self, learning_rate: float) -> dict:
+    def optim_step(
+        self,
+        learning_rate: float,
+        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+    ) -> dict:
         """Run optimizer step on all workers.
 
         WARNING: With param_offload=True, gradients are zeroed when entering train_mode.
         Use train_step() instead for combined forward_backward + optim_step.
+
+        Args:
+            learning_rate: Learning rate for this step.
+            session_id: Unused - session management handled via swap_session().
         """
         futures = [w.optim_step.remote(learning_rate) for w in self.workers]
         ray.get(futures)
@@ -2116,9 +2219,17 @@ class MegatronWorkerGroup:
 
     def shutdown(self):
         """Shutdown all workers and release placement group."""
+        # First graceful shutdown
         for w in self.workers:
             try:
-                ray.get(w.shutdown.remote())
+                ray.get(w.shutdown.remote(), timeout=5)
+            except Exception:
+                pass
+
+        # Then force kill all workers to release GPU memory
+        for w in self.workers:
+            try:
+                ray.kill(w, no_restart=True)
             except Exception:
                 pass
 
@@ -2349,12 +2460,27 @@ class MegatronActorPool:
             resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists (e.g., from previous server run)
+            actor = None
+            need_create = True
             try:
-                actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                existing_actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
                 logger.info(f"[MegatronActorPool] Found existing detached actor: {actor_name}")
                 # Verify it's alive
-                ray.get(actor.get_diagnostics.remote(), timeout=10)
-            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                ray.get(existing_actor.get_diagnostics.remote(), timeout=10)
+                actor = existing_actor  # Use existing actor
+                need_create = False
+            except ValueError:
+                # Actor doesn't exist, will create new one
+                pass
+            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                # Actor is dead or unresponsive, kill to free name before creating new one
+                logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead/unresponsive, killing to free name")
+                try:
+                    ray.kill(existing_actor, no_restart=True)
+                except Exception as kill_err:
+                    logger.warning(f"[MegatronActorPool] Could not kill dead actor: {kill_err}")
+
+            if need_create:
                 # Create new detached actor
                 runtime_env = {
                     "env_vars": {
@@ -2526,10 +2652,10 @@ def get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
 ) -> ray.actor.ActorHandle:
-    """Get existing or create new persistent MegatronWorkerGroup.
+    """Get existing or create new persistent MegatronWorkerGroup for this model.
 
     Uses detached Ray actor pattern like vLLM for crash resilience.
-    First tries to connect to existing actor, creates new one if not found.
+    Each base_model gets its own Megatron actor (per-model isolation).
 
     Args:
         base_model: HuggingFace model path.
@@ -2549,81 +2675,97 @@ def get_or_create_megatron_worker_group(
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     resource_pool = get_resource_pool()
+    actor_name = _make_megatron_actor_name(base_model)
 
-    # Try to get existing persistent actor
+    # Try to get existing persistent actor for this model
     try:
-        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        logger.info(
-            f"Connected to existing Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
-        )
+        actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+        logger.info(f"Connected to existing Megatron actor: {actor_name}")
+        
+        # Verify actor is alive
+        try:
+            ray.get(actor.get_diagnostics.remote(), timeout=10)
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+            # Actor is dead, kill to free name
+            logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+            raise ValueError("Actor dead, will recreate")
+        
         # Register with resource pool (reconnection case)
         resource_pool.register(
-            actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
+            actor_name=actor_name,
             actor_type=ActorType.MEGATRON,
             num_gpus=num_gpus,
             actor_handle=actor,
             namespace=PERSISTENT_NAMESPACE,
             base_model=base_model,
         )
+        # Existing actor is already ready
+        resource_pool.mark_ready(actor_name)
         # Reinitialize LoRA weights for fresh session
-        # This ensures each new session starts with fresh random weights
-        # instead of inheriting trained weights from previous session
-        # CRITICAL: Pass learning_rate to update optimizer param_groups
         logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate})...")
-        print(f"[API SERVER] Calling reinit_lora_weights with lr={learning_rate}", flush=True)
         result = ray.get(actor.reinit_lora_weights.remote(learning_rate))
-        print(f"[API SERVER] reinit_lora_weights returned: reinit_count={result.get('reinit_count', 0)}, opt_state_reset={result.get('opt_state_reset', 0)}, lr_updated={result.get('lr_updated', False)}", flush=True)
         logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
         return actor
     except ValueError:
         # Actor doesn't exist, create new one
-        logger.info(
-            f"Creating new detached Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}"
-        )
+        logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
-    # Phase 9: Check available GPUs and evict LRU actors if necessary
+    # Check available GPUs and evict LRU actors if necessary
     resource_pool.ensure_gpus_available(num_gpus)
 
-    # Runtime env for PFS code access
-    runtime_env = {
-        "env_vars": {
-            "PYTHONPATH": PFS_PYTHONPATH,
-            "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
+    # Reserve GPUs to prevent race conditions with concurrent requests
+    # This must be done AFTER ensure_gpus_available and BEFORE actor creation
+    resource_pool.reserve_gpus(num_gpus)
+
+    try:
+        # Runtime env for PFS code access
+        runtime_env = {
+            "env_vars": {
+                "PYTHONPATH": PFS_PYTHONPATH,
+                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
         }
-    }
 
-    # Create detached Ray actor with well-known name
-    # lifetime="detached" ensures actor survives owner process termination
-    actor = MegatronWorkerGroup.options(
-        name=PERSISTENT_MEGATRON_ACTOR_NAME,
-        namespace=PERSISTENT_NAMESPACE,
-        lifetime="detached",
-        runtime_env=runtime_env,
-    ).remote(
-        base_model=base_model,
-        lora_rank=lora_rank,
-        learning_rate=learning_rate,
-        distributed_config=config,
-    )
+        # Create detached Ray actor with per-model name
+        actor = MegatronWorkerGroup.options(
+            name=actor_name,
+            namespace=PERSISTENT_NAMESPACE,
+            lifetime="detached",
+            runtime_env=runtime_env,
+        ).remote(
+            base_model=base_model,
+            lora_rank=lora_rank,
+            learning_rate=learning_rate,
+            distributed_config=config,
+        )
 
-    # Wait for initialization
-    ray.get(actor.__ray_ready__.remote())
-    logger.info("Megatron worker group initialized (detached actor)")
+        # Wait for initialization
+        ray.get(actor.__ray_ready__.remote())
+        logger.info(f"Megatron worker group {actor_name} initialized (detached actor)")
 
-    # Register with unified resource pool for LRU tracking
-    resource_pool.register(
-        actor_name=PERSISTENT_MEGATRON_ACTOR_NAME,
-        actor_type=ActorType.MEGATRON,
-        num_gpus=num_gpus,
-        actor_handle=actor,
-        namespace=PERSISTENT_NAMESPACE,
-        base_model=base_model,
-    )
+        # Register with unified resource pool for LRU tracking
+        resource_pool.register(
+            actor_name=actor_name,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=num_gpus,
+            actor_handle=actor,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model,
+        )
+        # Mark as ready after initialization completes
+        resource_pool.mark_ready(actor_name)
 
-    return actor
+        return actor
+    finally:
+        # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
+        resource_pool.release_pending_gpus(num_gpus)
 
 
 async def async_get_or_create_megatron_worker_group(
@@ -2657,39 +2799,65 @@ async def async_get_or_create_megatron_worker_group(
     )
 
 
-def kill_megatron_actor() -> bool:
-    """Kill persistent Megatron actor and release resources.
+def kill_megatron_actor(base_model: str | None = None) -> bool:
+    """Kill persistent Megatron actor(s) and release resources.
+
+    Args:
+        base_model: If provided, kill actor for this specific model.
+                   If None, kill ALL Megatron actors.
 
     Returns:
-        True if actor was killed, False if not found.
+        True if any actor was killed, False if none found.
     """
-    from tinker_server.backend.resource_pool import get_resource_pool
+    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
 
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
-    try:
-        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        # Graceful shutdown first
+    resource_pool = get_resource_pool()
+    killed_any = False
+
+    if base_model:
+        # Kill specific model's actor
+        actor_name = _make_megatron_actor_name(base_model)
         try:
-            ray.get(actor.shutdown.remote(), timeout=10)
-        except Exception:
-            pass
-        ray.kill(actor, no_restart=True)
-        logger.info(f"Killed Megatron actor: {PERSISTENT_MEGATRON_ACTOR_NAME}")
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            try:
+                ray.get(actor.shutdown.remote(), timeout=10)
+            except Exception:
+                pass
+            ray.kill(actor, no_restart=True)
+            logger.info(f"Killed Megatron actor: {actor_name}")
+            resource_pool.unregister(actor_name)
+            killed_any = True
+        except ValueError:
+            logger.info(f"No Megatron actor to kill for {base_model}")
+    else:
+        # Kill ALL Megatron actors from resource pool
+        for entry in resource_pool.iter_entries():
+            if entry.actor_type == ActorType.MEGATRON:
+                try:
+                    actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
+                    try:
+                        ray.get(actor.shutdown.remote(), timeout=10)
+                    except Exception:
+                        pass
+                    ray.kill(actor, no_restart=True)
+                    logger.info(f"Killed Megatron actor: {entry.actor_name}")
+                    resource_pool.unregister(entry.actor_name)
+                    killed_any = True
+                except ValueError:
+                    pass
 
-        # Unregister from resource pool
-        resource_pool = get_resource_pool()
-        resource_pool.unregister(PERSISTENT_MEGATRON_ACTOR_NAME)
-
-        return True
-    except ValueError:
-        logger.info("No Megatron actor to kill")
-        return False
+    return killed_any
 
 
-def is_megatron_actor_running() -> bool:
+def is_megatron_actor_running(base_model: str | None = None) -> bool:
     """Check if persistent Megatron actor is running.
+
+    Args:
+        base_model: If provided, check for this specific model's actor.
+                   If None, check for ANY running Megatron actor.
 
     Returns:
         True if actor exists and is actually alive (not dead).
@@ -2697,22 +2865,23 @@ def is_megatron_actor_running() -> bool:
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
-    try:
-        actor = ray.get_actor(PERSISTENT_MEGATRON_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        # ray.get_actor() returns handle even for DEAD actors
-        # Need to actually verify actor is alive by calling a method
-        # Use short timeout to avoid hanging on dead actors
-        ray.get(actor.get_diagnostics.remote(), timeout=5)
-        return True
-    except ValueError:
-        # Actor doesn't exist
-        return False
-    except ray.exceptions.RayActorError:
-        # Actor is dead
-        return False
-    except ray.exceptions.GetTimeoutError:
-        # Actor not responding
-        return False
-    except Exception:
-        # Any other error - assume not running
+    if base_model:
+        actor_name = _make_megatron_actor_name(base_model)
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            ray.get(actor.get_diagnostics.remote(), timeout=5)
+            return True
+        except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError, Exception):
+            return False
+    else:
+        # Check for any Megatron actor from resource pool
+        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+        resource_pool = get_resource_pool()
+        for entry in resource_pool.iter_entries():
+            if entry.actor_type == ActorType.MEGATRON:
+                try:
+                    ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)
+                    return True
+                except Exception:
+                    pass
         return False

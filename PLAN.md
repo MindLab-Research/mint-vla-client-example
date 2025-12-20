@@ -16,11 +16,16 @@
 | Feature | Status |
 |---------|--------|
 | Dense model training (Qwen2.5-7B) | Verified |
-| MoE model training (Qwen3-30B-A3B) | Verified |
+| Dense model RL (importance_sampling) | Verified |
+| MoE model training (Qwen3-30B-A3B) | Verified (94.9% loss reduction) |
+| MoE model RL (importance_sampling) | Verified (87.5% accuracy) |
+| Moonlight (DeepseekV3 MLA) training | Verified (93.8% loss reduction) |
+| Moonlight LoRA transfer | Verified (102s transfer time) |
 | Multi-session actor sharing | Verified |
 | Unified rank support (max-rank padding) | Verified |
 | LRU-based actor eviction | Verified (unified ResourcePool with cross-actor LRU) |
 | LoRA hot-swap to vLLM | Verified (0.16s extraction + 2.2s inference) |
+| Stress tests (concurrent, eviction, rapid) | Verified (4/4 pass) |
 
 ---
 
@@ -33,8 +38,9 @@
 | Model | Type | Architecture | Train GPUs | Infer GPUs | Notes |
 |-------|------|--------------|------------|------------|-------|
 | Qwen/Qwen3-0.6B | Hybrid | Dense | 1 | 1 | **Verified** (90.8% loss reduction) |
-| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** |
-| moonshotai/Kimi-K2-Thinking | Reasoning | MoE | 64+ | 32+ | Block-FP8, infra team has working impl |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | 8 (TP4,EP2) | 4 (TP4) | **Verified** (SFT 94.9% reduction, RL 87.5% acc, LoRA transfer) |
+| moonshotai/Moonlight-16B-A3B-Instruct | Instruction | DeepSeekV3 MoE | 8 (TP2,EP4) | 4 (TP4) | **Verified** (SFT 93.8%, LoRA transfer, RL 25%→62.5% acc) |
+| moonshotai/Kimi-K2-Thinking | Reasoning | DeepSeekV3 MoE | 64+ (H100+) | 32+ | MLA works (value padding), memory blocked |
 
 #### T1 (Week 2-3) - Scale Up
 
@@ -66,10 +72,105 @@ Each tier involves:
 
 | Model | Challenge | Mitigation |
 |-------|-----------|------------|
-| Kimi-K2 | Block-FP8 quantization, 1T params | Infra team has working impl, migrate to Mint |
+| Kimi-K2 | 64 GPU memory requirement, Block-FP8 | MLA solved via value padding, need 64+ GPUs |
 | DeepSeek-V3.1 | Different MoE routing | Architecture analysis needed |
 | VL models | Vision encoder, multimodal inputs | New modality support |
 | pi0/pi0.5 (VLA) | See VLA investigation below | Tentative - may require new backend |
+
+#### K2 Support Details
+
+**Model Specifications (Kimi-K2)**
+
+| Spec | Value |
+|------|-------|
+| Total params | 1.04 trillion |
+| Active params | 32B per token |
+| Experts | 384 total, 8+1 per token |
+| Hidden dim | 7168 |
+| Context window | 128K tokens |
+| Architecture | DeepSeek-V3 style MoE with MLA attention |
+| Quantization | Block-FP8 (not per-tensor FP8) |
+
+**References**: [HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct), [Technical Report](https://arxiv.org/pdf/2507.20534)
+
+**Framework Landscape**
+
+Three relevant frameworks operate at different abstraction levels:
+
+| Framework | Purpose | Megatron Access | Distributed | Data Format |
+|-----------|---------|-----------------|-------------|-------------|
+| **Verl** | PPO/RLHF workflows | `MegatronEngine` wrapper | Ray actors | `DataProto`, `TensorDict` |
+| **MS-Swift** | Research training | Direct `megatron.training` | torch.distributed | HF datasets |
+| **Tinker-Server** | Multi-tenant API | Via verl wrapper + direct calls | Ray actors | Custom `Datum` |
+
+**What tinker-server uses from verl**:
+- `MegatronEngineWithLMHead` - engine wrapper
+- `HFModelConfig`, `McoreEngineConfig` - config dataclasses
+- `vLLMHttpServerBase` - Ray actor base class
+- Utility functions: `copy_to_local`, `get_adapter_state_dict`
+
+**What tinker-server does NOT use**:
+- `MegatronWorker` (PPO-specific actor/critic orchestration)
+- `DataProto` (PPO-specific data format)
+- Dispatch decorators (`@register`, `Dispatch`)
+
+**k2-workspace reference implementation** (ms-swift based):
+- Location: `../k2-workspace/workspace/ms-swift/examples/megatron/grpo/kimi-k2/`
+- Config: `moe_colocate_lora.sh` - 64 GPU setup (8 nodes × 8 GPUs)
+- Parallelism: TP=8, EP=64, PP=1, CP=1
+
+**GPU Requirements**
+
+| Configuration | GPUs | Notes |
+|---------------|------|-------|
+| Full (reference) | 64× H100 80GB | TP=8, EP=64, as in k2-workspace |
+| Minimum (with FP8) | 16× H100 80GB | TP=8, EP=16, requires FP8 + offload |
+| Minimum (INT4 inference only) | 8× H100 80GB | Inference only, no training |
+
+**16-GPU Configuration** (for debugging/development):
+```bash
+COMMON_TP=8 COMMON_EP=16 COMMON_PP=1 COMMON_CP=1 INFER_TP=16
+--fp8-param-gather                    # FP8 weights (H100 required)
+--recompute-granularity full          # Activation checkpointing
+--optimizer-cpu-offload               # Optimizer to CPU
+--train_type lora --lora_rank 8
+--micro_batch_size 1 --max_model_len 4096
+```
+
+Expected: 5-10× slower than 64-GPU baseline due to expert memory pressure and offloading.
+
+**Required Code Changes**
+
+| File | Change | Priority |
+|------|--------|----------|
+| `megatron_training.py:903` | Add `r"Kimi-K2"` to `moe_patterns` | Critical |
+| `model_registry.py` | Add K2 config: `ModelConfig(True, 8, 8)` | Critical |
+| `verl_training.py:941` | Use model registry instead of hardcoded TP=4, EP=2 | Critical |
+| `megatron_distributed.py:267` | Add FP8 dtype support to `McoreEngineConfig` | Critical |
+| `verl_inference.py:817` | Add `quantization="fp8"` to vLLM kwargs | High |
+| `megatron_training.py:204` | Extract auxiliary loss from MoE router | Medium |
+
+**Implementation Phases**
+
+| Phase | Tasks | Effort |
+|-------|-------|--------|
+| 1. Detection | Add K2 to `is_moe_model()`, populate registry | 1-2h |
+| 2. Parallelism | Dynamic TP/EP from registry, remove hardcoding | 2-3h |
+| 3. FP8 | Add dtype detection and config plumbing | 3-4h |
+| 4. Validation | Test standalone vLLM + ms-swift before integration | 4-8h |
+
+**Pre-integration validation** (run before code changes):
+```bash
+# Test 1: vLLM inference with FP8
+vllm serve moonshotai/Kimi-K2-Instruct \
+    --tensor-parallel-size 8 --quantization fp8
+
+# Test 2: ms-swift training (16 GPUs)
+cd ../k2-workspace/workspace/ms-swift/examples/megatron/grpo/kimi-k2
+COMMON_TP=8 COMMON_EP=16 INFER_TP=16 bash moe_colocate_lora.sh 2 0 127.0.0.1
+```
+
+If standalone tests fail, the issue is upstream (vLLM/Megatron K2 support), not tinker-server.
 
 #### VLA Models Investigation (Tentative)
 
@@ -413,7 +514,7 @@ Train on Pig Latin → `save_weights_and_get_sampling_client()` → sample → o
 | Add `/api/v1/load_state` endpoint | High | **DONE** |
 | Accept both `X-API-Key` and `Authorization: Bearer` auth | High | **DONE** |
 | Accept both `sampling_session_id` and `model_id` in sample requests | High | **DONE** |
-| Create merge-gate test suite | High | **DONE** (19/20 pass) |
+| Create merge-gate test suite | High | **DONE** (20/20 pass) |
 | Verify logprobs format matches `TensorData` spec | High | **DONE** |
 | Verify `include_prompt_logprobs` | Medium | **DONE** |
 | Add `cispo`, `dro` loss functions | Medium | Pending |
@@ -540,6 +641,339 @@ Previous tests prove sessions have different weights (A ≠ B), but don't prove 
 
 ---
 
+### vLLM MoE Expert LoRA Inference - INVESTIGATION UPDATE (2025-12-17)
+
+**Problem**: vLLM 0.12.0 has `FusedMoEWithLoRA` class but cannot load MoE expert LoRA weights for inference. Training with full MLP+attention LoRA works via Megatron, but inference is limited to attention-only LoRA.
+
+**Impact**: MoE models (Qwen3-30B-A3B) train with full LoRA (attention + expert MLP) but inference only uses attention LoRA. This reduces LoRA effectiveness during inference while training quality remains unaffected.
+
+#### vLLM 0.13.0rc2 Investigation (2025-12-17)
+
+**CRITICAL FINDING: Known Bug - LoRA Loading Broken for Qwen3 MoE**
+
+This is a **confirmed bug** in vLLM V1 engine with Qwen3 MoE models:
+- GitHub Issue: [vllm-ascend #3377](https://github.com/vllm-project/vllm-ascend/issues/3377) - "Qwen3-30B-A3B cannot use enable-lora"
+- Status: **OPEN** (as of 2025-12-17)
+- Root cause: V1 engine `set_active_loras` fails during inference when LoRA adapter is requested
+- Impact: **All LoRA loading broken** (not just expert LoRA - even attention-only LoRA fails)
+
+**V0 Engine No Longer Available:**
+- vLLM 0.13.0rc2 has V1 engine ONLY - V0 was removed
+- Setting `VLLM_USE_V1=0` has no effect
+- Cannot fall back to V0 engine as a workaround
+
+**What was tested:**
+
+| Test | Result |
+|------|--------|
+| Model init with `enable_lora=True` | PASSED |
+| "MoE model detected. Using fused MoE LoRA implementation." | CONFIRMED (all TP workers) |
+| Baseline generation (no LoRA) | PASSED |
+| Create synthetic LoRA adapter (attention-only) | PASSED |
+| Load attention-only LoRA adapter | **FAILED** (WorkerProc exception) |
+| V0 engine fallback (`VLLM_USE_V1=0`) | **NOT AVAILABLE** (V0 removed) |
+| Megatron → vLLM expert weight export | BLOCKED (basic LoRA fails first) |
+
+**Error Location:**
+```
+gpu_model_runner.py:3005 → execute_model → _prepare_inputs → set_active_loras
+  → lora_model_runner_mixin.py:70 → make_lora_inputs → _set_active_loras
+  → WorkerProc exception on all TP workers
+```
+
+**Source Code Analysis:**
+
+1. **`get_supported_lora_modules()` in `vllm/lora/utils.py`** includes both:
+   - `LinearBase` subclasses (attention: qkv_proj, o_proj)
+   - `FusedMoE` instances (expert layers)
+
+2. **`FusedMoEWithLoRA` class exists** with full implementation:
+   - Expert-specific weight shapes: `(num_experts, rank, hidden_size)`
+   - Per-expert LoRA application via `add_lora_fused_moe()` kernel
+
+3. **V1 Engine LoRA Pipeline (where it fails):**
+   - `set_active_loras()` in `lora_model_runner_mixin.py:70`
+   - Creates `LoRAMapping` from `make_lora_inputs()`
+   - Calls `lora_manager.set_active_adapters()` → `_adapter_manager.set_adapter_mapping()`
+   - Fails at `punica_wrapper.update_metadata()` for MoE models
+
+**Conclusion:**
+- vLLM 0.13.0rc2 infrastructure exists but is **broken** for Qwen3 MoE + LoRA
+- This blocks both attention LoRA AND expert LoRA
+- Must wait for upstream fix or downgrade to vLLM < 0.13.0
+
+**NOT POSSIBLE UNTIL BUG FIXED:**
+- Any LoRA inference on Qwen3 MoE models
+- Megatron → vLLM expert LoRA weight export testing
+
+#### Qwen1.5-MoE-A2.7B-Chat Testing (2025-12-18)
+
+**BREAKTHROUGH: MoE Expert LoRA Works on Qwen2MoeForCausalLM**
+
+Testing with the smaller Qwen1.5-MoE-A2.7B-Chat model (Qwen2MoeForCausalLM architecture) reveals that vLLM 0.13.0rc2 MoE LoRA **does work** for Qwen2 MoE models - the bug is **Qwen3-specific**.
+
+| Model | Architecture | Result |
+|-------|--------------|--------|
+| Qwen3-30B-A3B-Instruct-2507 | Qwen3MoeForCausalLM | **WORKS** (see correction below) |
+| Qwen1.5-MoE-A2.7B-Chat | Qwen2MoeForCausalLM | **WORKS** |
+
+#### Qwen3-30B-A3B Testing - CORRECTION (2025-12-18)
+
+**PREVIOUS CLAIM WAS INCORRECT**: The earlier finding that "LoRA loading is broken for Qwen3 MoE" was wrong. The cited issue (vllm-ascend #3377) is from the wrong repository (vllm-ascend, not vllm).
+
+**ACTUAL ROOT CAUSE**: Using incorrect target modules. Qwen3MoeForCausalLM uses separate `q_proj`, `k_proj`, `v_proj` - NOT fused `qkv_proj`.
+
+**Test Results on Ray Cluster (TP=4):**
+
+| Test | Target Modules | Result |
+|------|----------------|--------|
+| Attention LoRA with `qkv_proj` | `["qkv_proj"]` | **FAILED** - module not supported |
+| Attention LoRA with separate q/k/v | `["q_proj", "k_proj", "v_proj"]` | **PASSED** |
+| Expert LoRA (all 128 experts) | `["experts.N.gate_proj", "experts.N.up_proj", "experts.N.down_proj"]` | **PASSED** |
+
+**Error when using incorrect modules:**
+```
+ValueError: While loading /tmp/test_qwen3_30b_lora, expected target modules in
+{'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate', 'experts.{N}.gate_proj', ...}
+but received ['model.layers.0.self_attn.qkv_proj', ...]
+```
+Location: `vllm/lora/lora_model.py:168` in `check_unexpected_modules()`
+
+**Expert LoRA Test Details:**
+- Model config: 48 layers, 128 experts, hidden_size=2048, moe_intermediate_size=768
+- Tensors created: 36,864 (48 layers × 128 experts × 3 projections × 2 A/B)
+- vLLM version: 0.13.0rc2.dev207+g811cdf519
+- Log: `"MoE model detected. Using fused MoE LoRA implementation."`
+
+**Key Requirements for Qwen3-30B-A3B LoRA:**
+
+1. **Use separate attention projections**:
+   ```python
+   "target_modules": ["q_proj", "k_proj", "v_proj"]  # NOT qkv_proj
+   ```
+
+2. **Expert LoRA requires ALL experts**:
+   ```python
+   target_modules = []
+   for e in range(128):  # All 128 experts
+       target_modules.extend([
+           f"experts.{e}.gate_proj",
+           f"experts.{e}.up_proj",
+           f"experts.{e}.down_proj",
+       ])
+   ```
+
+3. **Weight naming convention (PEFT format)**:
+   ```python
+   # Attention
+   f"base_model.model.model.layers.{layer}.self_attn.q_proj.lora_A.weight"
+   f"base_model.model.model.layers.{layer}.self_attn.q_proj.lora_B.weight"
+
+   # Expert
+   f"base_model.model.model.layers.{layer}.mlp.experts.{expert}.gate_proj.lora_A.weight"
+   f"base_model.model.model.layers.{layer}.mlp.experts.{expert}.gate_proj.lora_B.weight"
+   ```
+
+**Test Scripts:**
+- Attention LoRA: `scripts/test_qwen3_30b_lora_correct.py`
+- Expert LoRA: `scripts/test_qwen3_30b_expert_lora.py`
+- Megatron → vLLM Integration: `scripts/test_megatron_qwen3_moe_export.py`
+
+#### Megatron → vLLM MoE LoRA Integration Test (2025-12-18)
+
+**Full pipeline test:** Megatron weight export → PEFT conversion → vLLM load
+
+| Metric | Value |
+|--------|-------|
+| Megatron tensors created | 37,152 |
+| PEFT conversion success | 37,152 (100%) |
+| Conversion failures | 0 |
+| vLLM initialization | PASS |
+| Baseline generation | PASS |
+| LoRA adapter load | PASS |
+
+**Tensor breakdown:**
+- Attention: 48 layers × 3 projections (q/k/v) × 2 (A/B) = 288
+- Experts: 48 layers × 128 experts × 3 projections × 2 (A/B) = 36,864
+- Total: 37,152
+
+**Name conversion** (Megatron/HF → PEFT):
+```python
+# HF-style input (from verl bridge)
+"model.layers.0.self_attn.q_proj.lora_a.weight"
+"model.layers.0.mlp.experts.0.gate_proj.lora_a.weight"
+
+# PEFT output
+"base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+"base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight"
+```
+
+**CONCLUSION: vLLM 0.13.0rc2 fully supports Qwen3-30B-A3B LoRA (both attention and expert layers).** The previous failure was user error (wrong target modules), not a vLLM bug.
+
+**Test Results on Qwen1.5-MoE (vLLM 0.13.0rc2, single A800 80GB):**
+
+| Test | Result |
+|------|--------|
+| Attention LoRA (q_proj, k_proj, v_proj) | **PASS** |
+| Expert LoRA (all 60 experts × 3 layers) | **PASS** |
+
+**Key Requirements for MoE Expert LoRA:**
+
+1. **Attention projections must be separate** (not fused):
+   - Use `q_proj`, `k_proj`, `v_proj` instead of fused `qkv_proj`
+   - vLLM module whitelist doesn't include `qkv_proj`
+
+2. **ALL experts must have LoRA weights** (no partial):
+   - `pack_moe()` in `lora_weights.py:168` asserts `len(loras) % 3 == 0`
+   - Each expert needs: gate_proj (w1), down_proj (w2), up_proj (w3)
+   - TODO comment at line 175: "Consider the case where some experts don't have LoRA added"
+
+3. **LoRA tensor naming format:**
+   ```
+   base_model.model.model.layers.{layer}.mlp.experts.{expert}.{gate|up|down}_proj.lora_{A|B}.weight
+   ```
+
+4. **Tensor shapes:**
+   - gate_proj/up_proj (w1/w3): lora_A=[rank, hidden_size], lora_B=[moe_intermediate_size, rank]
+   - down_proj (w2): lora_A=[rank, moe_intermediate_size], lora_B=[hidden_size, rank]
+
+**Test Script:** `scripts/test_qwen15_moe_expert_lora.py`
+
+**Implications for Qwen3-30B-A3B:**
+- The MoE LoRA infrastructure works - only Qwen3MoeForCausalLM has the bug
+- When GitHub #3377 is fixed, the same adapter format should work
+- For now, can test Megatron → vLLM weight export using Qwen1.5-MoE as a proxy
+
+#### Megatron → vLLM Weight Export Testing (2025-12-18)
+
+Validated the full Megatron → vLLM LoRA export pipeline using Qwen1.5-MoE as a proxy for Qwen3-30B-A3B.
+
+**Test Results:**
+
+| Test | Status |
+|------|--------|
+| Name conversion (Megatron → PEFT) | **PASS** (5/5 patterns) |
+| Simulated Megatron export → vLLM load | **PASS** |
+
+**Conversion Patterns Tested:**
+```
+Megatron (input)                                              → PEFT (output)
+decoder.layers.0.self_attention.linear_qkv.adapter.linear_in  → layers.0.self_attn.q_proj.lora_A
+decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.adapter.linear_in → layers.0.mlp.experts.0.gate_proj.lora_A
+decoder.layers.0.mlp.experts.local_experts.59.linear_fc2.adapter.linear_out → layers.0.mlp.experts.59.down_proj.lora_B
+```
+
+**Tensor Counts:**
+- Attention LoRA: 24 layers × 3 modules (q/k/v) × 2 (A+B) = 144 tensors
+- Expert LoRA: 24 layers × 60 experts × 3 modules (gate/up/down) × 2 (A+B) = 8,640 tensors
+- Total: 8,784 tensors successfully converted and loaded
+
+**Key Finding:**
+vLLM's `FusedMoEWithLoRA` class correctly handles PEFT-format expert LoRA weights. The format conversion is:
+- `lora_a`/`lora_b` → `lora_A`/`lora_B` (case normalization)
+- `model.layers.N...` → `base_model.model.model.layers.N...` (PEFT prefix)
+
+**Test Script:** `scripts/test_megatron_to_vllm_export.py`
+
+#### Technical Analysis
+
+**Location**: `/root/tinker_project/vllm/vllm/lora/`
+
+**Blocker 1: Expert Parallelism Assertion** (`layers/fused_moe.py:48`)
+```python
+assert not self.base_layer.use_ep, (
+    "EP support for Fused MoE LoRA is not implemented yet."
+)
+```
+- Blocks when Expert Parallelism (EP) is enabled
+- **Workaround**: Use TP=4 only (no EP) - currently implemented
+
+**Blocker 2: Module Validation** (`models.py:188-213`)
+```python
+def check_unexpected_modules(modules: dict):
+    for lora_module in modules.keys():
+        # ...
+        if ".experts" in module_name:
+            expert_suffix = module_name[expert_idx + 1:]
+            if expert_suffix not in expected_lora_modules:
+                unexpected_modules.append(module_name)
+```
+- Rejects expert LoRA weights because suffix format doesn't match
+- Expert weights have paths like `model.layers.0.mlp.experts.0.gate_proj`
+- Suffix `experts.0.gate_proj` not in `expected_lora_modules` (which has `q_proj`, `k_proj`, etc.)
+
+**Blocker 3: LoRA Weight Loading Format**
+- `FusedMoEWithLoRA.set_lora()` expects 3 weight pairs: `(w1_lora_a, w2_lora_a, w3_lora_a), (w1_lora_b, w2_lora_b, w3_lora_b)`
+- PEFT exports per-expert weights with different naming convention
+- Need adapter to convert PEFT format to vLLM's expected tensor layout
+
+#### vLLM 0.12.0 MoE LoRA Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| FusedMoEWithLoRA class | EXISTS | Full implementation present |
+| Module validation | BLOCKS | Rejects expert weight names |
+| EP assertion | BLOCKS | Disabled for EP=0 |
+| LoRA weight format | INCOMPATIBLE | PEFT → vLLM conversion needed |
+| Attention-only LoRA | WORKS | Current workaround |
+
+#### Patching Approach
+
+**Option A: Minimal Patch (Recommended)**
+
+1. **Patch `models.py` module validation** (~20 lines)
+   - Modify `check_unexpected_modules` to recognize expert LoRA patterns
+   - Allow `experts.{N}.gate_proj`, `experts.{N}.up_proj`, `experts.{N}.down_proj`
+
+2. **Add weight format adapter** (~50 lines)
+   - Convert PEFT expert LoRA format to vLLM's `(w1, w2, w3)` tensor layout
+   - Handle per-expert indexing
+
+**Option B: Full Patch**
+
+In addition to Option A:
+3. **Remove EP assertion** for TP-only mode
+4. **Add expert weight routing** for multi-tenant scenarios
+
+#### Implementation Plan
+
+| Phase | Task | Effort | Risk |
+|-------|------|--------|------|
+| 1 | Fork vLLM 0.12.0, create `mint-vllm` branch | Low | Low |
+| 2 | Patch module validation in `models.py` | Medium | Low |
+| 3 | Add PEFT → vLLM weight format adapter | Medium | Medium |
+| 4 | Test with Qwen3-30B-A3B expert LoRA | High | Medium |
+| 5 | Upstream PR or maintain fork | - | - |
+
+#### Current Workaround
+
+Filter out MLP modules in `megatron_distributed.py:get_lora_state_dict()`:
+- Training: Full MLP + attention LoRA via Megatron
+- Inference: Attention-only LoRA via vLLM
+- Loss: ~10-20% effectiveness reduction for MoE inference (based on Tinker docs)
+
+**UPDATE (2025-12-17):** vLLM 0.13.0rc2 LoRA loading is completely broken for Qwen3 MoE models. The workaround above only applies to vLLM < 0.13.0. For 0.13.0rc2, **no LoRA inference is possible** until the upstream bug is fixed.
+
+#### Options for Proceeding
+
+| Option | Effort | Risk | Notes |
+|--------|--------|------|-------|
+| 1. Wait for upstream fix | None | Low | Monitor [vllm-ascend #3377](https://github.com/vllm-project/vllm-ascend/issues/3377) |
+| 2. Downgrade to vLLM 0.12.x | Low | Medium | May lose other 0.13 features; need to verify 0.12.x works |
+| 3. Debug V1 engine locally | High | High | Fix `set_active_loras` failure; complex multi-GPU debugging |
+| 4. Use non-LoRA inference | Low | High | Train with LoRA, merge weights for inference (loses LoRA flexibility) |
+
+**Recommended:** Option 1 (wait) with Option 4 (merge weights) as fallback. The bug is tracked upstream and affects many users - expect fix soon.
+
+#### References
+
+- [vLLM Forum: MoE LoRA on expert layers](https://discuss.vllm.ai/t/do-the-current-moe-models-support-setting-lora-adapters-on-expert-layers/1726)
+- [vLLM Issue #18120: Qwen 3 MoE LoRA](https://github.com/vllm-project/vllm/issues/18120)
+- [vLLM PR #20932: Adds warning but no fix](https://github.com/vllm-project/vllm/pull/20932)
+- [TRL Issue #4584: vLLM upgrade for FusedMoE LoRA](https://github.com/huggingface/trl/issues/4584)
+
+---
+
 ## Architecture Reference
 
 ```
@@ -564,6 +998,76 @@ Previous tests prove sessions have different weights (A ≠ B), but don't prove 
 │             └───────────────────────────────────────────────────────────┘
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Future Research
+
+### Multi-LoRA Batched Training
+
+**Problem**: Current architecture time-shares a single Megatron engine between different LoRA clients. Each `forward_backward` call trains one LoRA at a time. With N concurrent users, total time = N × single-user time.
+
+**Opportunity**: Batch multiple LoRAs in a single forward-backward pass. When GPUs are undersaturated (small per-user batches), this could yield 2-3× speedup.
+
+**How it works (conceptually)**:
+
+```python
+# Current: sequential
+for lora in [A, B, C]:
+    forward_backward(batch[lora], lora)  # 3 passes
+
+# Batched: single pass with per-sequence adapter routing
+batched_forward_backward(
+    combined_batch,
+    adapters=[A, B, C],
+    adapter_indices=[0,0,1,1,2,2]  # which sequence uses which LoRA
+)
+```
+
+**Current landscape**:
+
+| System | Multi-LoRA Training | Production-ready |
+|--------|---------------------|------------------|
+| [mLoRA](https://github.com/TUDB-Labs/mLoRA) | Yes (BatchLoRA kernels) | No - research code |
+| verl / Megatron | No | Yes |
+| vLLM (inference only) | Yes (BGMV kernels) | Yes |
+
+**Two approaches**:
+
+| Approach | Description | Speedup | Complexity |
+|----------|-------------|---------|------------|
+| mLoRA-style (PyTorch) | Batch base model ops, separate LoRA ops | ~80-90% of optimal | Medium |
+| Full BGMV/SGMV | Custom CUDA kernels for batched LoRA | ~100% of optimal | Very High |
+
+mLoRA batches the expensive base model computation (`X @ W`) but runs N separate LoRA ops (`x @ A @ B`). Since LoRA params are <1% of base model, this captures most of the benefit without custom CUDA.
+
+**Kernel backward pass status**:
+
+| Kernel | Forward | Backward (training) |
+|--------|---------|---------------------|
+| Punica BGMV/SGMV | ✓ | ✗ (not implemented) |
+| vLLM BGMV | ✓ | ✗ (inference only) |
+| mLoRA BatchLoRA | ✓ (PyTorch) | ✓ (autograd) |
+
+No public BGMV/SGMV backward implementations exist. All are inference-only.
+
+**Recommended path** (mLoRA-style):
+
+1. Modify `forward_backward_batch` to accept multiple adapter contexts
+2. Stack inputs from multiple sessions before forward pass
+3. Replace single-adapter LoRA modules with multi-adapter versions
+4. Route gradients to correct adapter's optimizer
+5. Manage per-adapter optimizer states
+
+No custom CUDA kernels needed. Main challenge is integration with Megatron's tensor parallelism.
+
+**When to prioritize**: Only worthwhile with 3+ concurrent users with small batches. Single-user or large-batch scenarios see minimal benefit.
+
+**References**:
+- [mLoRA Paper (VLDB 2024)](https://arxiv.org/abs/2312.02515) - BatchLoRA operator design (PyTorch-level)
+- [Punica Paper](https://arxiv.org/abs/2310.18547) - SGMV kernels for multi-LoRA inference (no backward)
+- [S-LoRA Blog](https://lmsys.org/blog/2023-11-15-slora/) - Serving thousands of adapters
+- [Punica BGMV source](https://github.com/punica-ai/punica/blob/master/csrc/bgmv/bgmv_impl.cuh) - Forward-only CUDA kernel
 
 ---
 

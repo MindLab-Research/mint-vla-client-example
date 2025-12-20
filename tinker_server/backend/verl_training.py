@@ -1261,6 +1261,27 @@ class VerlTrainingEngine:
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
+    def _touch_actor(self, session: "TrainingSession") -> None:
+        """Update last_accessed timestamp and session for the session's actor.
+
+        Called during training operations to:
+        1. Mark actor as recently used (prevents LRU eviction)
+        2. Associate current session with actor (prevents idle eviction)
+        """
+        from .resource_pool import get_resource_pool
+        from .megatron_distributed import _make_megatron_actor_name
+
+        # Only Megatron actors are tracked in the unified resource pool
+        # Dense trainers use their own DenseTrainerPool with touch() calls
+        if session.backend == "megatron":
+            base_model = session.base_model or self.default_base_model
+            if base_model:
+                actor_name = _make_megatron_actor_name(base_model)
+                resource_pool = get_resource_pool()
+                resource_pool.touch(actor_name)
+                # Associate session with actor to prevent idle eviction
+                resource_pool.set_session(actor_name, session.session_id)
+
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
 
@@ -1333,14 +1354,18 @@ class VerlTrainingEngine:
             base_model = requested_model
 
         if use_megatron:
-            # MoE models (30B+) need tensor parallelism to fit model
-            # TP=4, EP=1 = 4 GPUs: all experts on each GPU, model sharded across 4 GPUs
-            # With param_offload=True, this fits in 4x 80GB A100s
+            # MoE models need tensor/expert parallelism from model registry
+            from .model_registry import get_training_parallelism, requires_fp8
+
+            # Get model-specific parallelism and FP8 config from registry
+            train_tp, train_ep = get_training_parallelism(requested_model or "")
+            use_fp8 = requires_fp8(requested_model or "")
             distributed_config = DistributedConfig(
-                tensor_parallel_size=4,
-                expert_parallel_size=1,  # Changed from 2 to 1 (cluster has 4 GPUs)
+                tensor_parallel_size=train_tp,
+                expert_parallel_size=train_ep,
+                use_fp8=use_fp8,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={distributed_config.tensor_parallel_size}, EP={distributed_config.expert_parallel_size})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, world_size={train_tp * train_ep}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -1352,6 +1377,8 @@ class VerlTrainingEngine:
                 distributed_config=distributed_config,
             )
             session.backend = "megatron"
+            # Associate session with actor in resource pool immediately
+            self._touch_actor(session)
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
@@ -1405,6 +1432,9 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
+
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
@@ -1437,6 +1467,9 @@ class VerlTrainingEngine:
         """
         model_id = session.model_id
         worker = self._workers[model_id]
+
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
 
         # Serialize data for Ray
         # ForwardRequest uses forward_input (not forward_backward_input)
@@ -1484,6 +1517,9 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
+
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
 
@@ -1522,6 +1558,9 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = self._workers[model_id]
+
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -1965,12 +2004,27 @@ class DenseTrainerPool:
             resource_pool.ensure_gpus_available(num_gpus)
 
             # Check if detached actor already exists
+            actor = None
+            need_create = True
             try:
-                actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
+                existing_actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
                 logger.info(f"[DenseTrainerPool] Found existing detached actor: {actor_name}")
                 # Verify it's alive
-                ray.get(actor.get_session_info.remote(), timeout=10)
-            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                ray.get(existing_actor.get_session_info.remote(), timeout=10)
+                actor = existing_actor  # Use existing actor
+                need_create = False
+            except ValueError:
+                # Actor doesn't exist, will create new one
+                pass
+            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                # Actor is dead or unresponsive, kill to free name before creating new one
+                logger.warning(f"[DenseTrainerPool] Actor {actor_name} is dead/unresponsive, killing to free name")
+                try:
+                    ray.kill(existing_actor, no_restart=True)
+                except Exception as kill_err:
+                    logger.warning(f"[DenseTrainerPool] Could not kill dead actor: {kill_err}")
+
+            if need_create:
                 # Create new detached actor
                 runtime_env = {
                     "env_vars": {

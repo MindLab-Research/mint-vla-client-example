@@ -20,6 +20,100 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _cleanup_stale_actors() -> None:
+    """Clean up stale Ray actors and register alive ones with ResourcePool.
+
+    Detached actors survive server restarts and can block resources.
+    This function:
+    1. Kills dead/unresponsive actors in the 'tinker' namespace
+    2. Registers alive actors with ResourcePool for proper GPU tracking
+    """
+    import os
+
+    # Skip cleanup if disabled (useful for debugging)
+    if os.environ.get("MINT_SKIP_ACTOR_CLEANUP", "").lower() in ("1", "true"):
+        logger.info("Skipping actor cleanup (MINT_SKIP_ACTOR_CLEANUP=1)")
+        return
+
+    try:
+        import ray
+        from .backend.multi_lora_engine import PERSISTENT_NAMESPACE
+        from .backend.resource_pool import get_resource_pool, ActorType
+
+        if not ray.is_initialized():
+            ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+        # Get all named actors in the tinker namespace
+        actors = ray.util.list_named_actors(all_namespaces=True)
+        tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
+
+        if not tinker_actors:
+            logger.info("No actors found in tinker namespace")
+            return
+
+        logger.info(f"Found {len(tinker_actors)} actors in tinker namespace, checking status...")
+
+        resource_pool = get_resource_pool()
+        cleaned = 0
+        registered = 0
+
+        for actor_info in tinker_actors:
+            name = actor_info["name"]
+            try:
+                actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
+
+                # Check if actor is alive
+                try:
+                    ray.get(actor.__ray_ready__.remote(), timeout=2)
+
+                    # Actor is alive - register it with ResourcePool
+                    # Determine actor type and GPU count from name
+                    if name.startswith("tinker_vllm_"):
+                        actor_type = ActorType.VLLM
+                        # vLLM GPU count depends on model - default 1, could query actor
+                        num_gpus = 1  # Most models use 1 GPU
+                    elif name.startswith("dense_trainer_pool_"):
+                        actor_type = ActorType.DENSE
+                        num_gpus = 1
+                    elif name.startswith("persistent_megatron"):
+                        actor_type = ActorType.MEGATRON
+                        num_gpus = 8  # MoE uses 8 GPUs
+                    else:
+                        logger.debug(f"Unknown actor type for {name}, skipping registration")
+                        continue
+
+                    resource_pool.register(
+                        actor_name=name,
+                        actor_type=actor_type,
+                        num_gpus=num_gpus,
+                        actor_handle=actor,
+                        namespace=PERSISTENT_NAMESPACE,
+                    )
+                    # Mark as ready since the actor passed health check
+                    resource_pool.mark_ready(name)
+                    registered += 1
+                    logger.info(f"Registered existing actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
+
+                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    # Actor is dead or unresponsive
+                    logger.info(f"Cleaning up dead/unresponsive actor: {name}")
+                    try:
+                        ray.kill(actor, no_restart=True)
+                        cleaned += 1
+                    except Exception as kill_err:
+                        logger.warning(f"Failed to kill actor {name}: {kill_err}")
+
+            except ValueError:
+                # Actor name registered but no actor exists
+                logger.debug(f"Actor {name} not found (name registered but no actor)")
+
+        logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
+
+    except Exception as e:
+        # Don't fail startup if cleanup fails
+        logger.warning(f"Actor cleanup failed (continuing anyway): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager.
@@ -27,6 +121,11 @@ async def lifespan(app: FastAPI):
     Initializes both inference SessionManager and training components
     on startup, shuts down all sessions on application exit.
     """
+    # ==========================================================================
+    # Cleanup: Kill stale actors from previous server runs
+    # ==========================================================================
+    await _cleanup_stale_actors()
+
     # ==========================================================================
     # Inference: Initialize SessionManager
     # ==========================================================================
