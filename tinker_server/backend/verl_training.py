@@ -1261,6 +1261,24 @@ class VerlTrainingEngine:
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
+    def _touch_actor(self, session: "TrainingSession") -> None:
+        """Update last_accessed timestamp for the session's actor.
+
+        Called during training operations to mark actor as recently used,
+        preventing LRU eviction while training is active.
+        """
+        from .resource_pool import get_resource_pool
+        from .megatron_distributed import _make_megatron_actor_name
+
+        # Only Megatron actors are tracked in the unified resource pool
+        # Dense trainers use their own DenseTrainerPool with touch() calls
+        if session.backend == "megatron":
+            base_model = session.base_model or self.default_base_model
+            if base_model:
+                actor_name = _make_megatron_actor_name(base_model)
+                resource_pool = get_resource_pool()
+                resource_pool.touch(actor_name)
+
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
 
@@ -1409,6 +1427,9 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
+
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
@@ -1441,6 +1462,9 @@ class VerlTrainingEngine:
         """
         model_id = session.model_id
         worker = self._workers[model_id]
+
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
 
         # Serialize data for Ray
         # ForwardRequest uses forward_input (not forward_backward_input)
@@ -1488,6 +1512,9 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
+
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
 
@@ -1526,6 +1553,9 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = self._workers[model_id]
+
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]

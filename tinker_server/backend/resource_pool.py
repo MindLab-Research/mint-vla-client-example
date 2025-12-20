@@ -207,7 +207,23 @@ class ResourcePool:
             entry = self._entries.get(actor_name)
             if entry:
                 entry.current_session = session_id
+
+    def touch(self, actor_name: str) -> bool:
+        """Update last_accessed timestamp to mark actor as recently used.
+
+        Called during training operations to prevent eviction of active actors.
+        Without this, actors are evicted based on creation time rather than
+        actual usage, causing unexpected termination of active training.
+
+        Returns:
+            True if actor was found and touched.
+        """
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            if entry:
                 entry.touch()
+                return True
+            return False
 
     def mark_ready(self, actor_name: str):
         """Mark an actor as ready (no longer creating).
@@ -316,19 +332,36 @@ class ResourcePool:
 
         start_time = time_module.time()
         poll_interval = 5  # seconds between checks
+        iteration = 0
+
+        logger.info(f"[ResourcePool] ensure_gpus_available: need {needed_gpus} GPUs, timeout={timeout}s")
 
         while True:
+            iteration += 1
             available = int(ray.available_resources().get("GPU", 0))
 
             if available >= needed_gpus:
-                logger.debug(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
+                logger.info(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
                 return True
 
             need_to_free = needed_gpus - available
+
+            # Log actor states for debugging
+            evictable_list = self._get_evictable_actors_lru()
+            with self._pool_lock:
+                all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating) 
+                              for e in self._entries.values()]
             logger.info(
-                f"[ResourcePool] Need {needed_gpus} GPUs, only {available} available. "
-                f"Attempting to evict LRU actors to free {need_to_free} GPUs."
+                f"[ResourcePool] Iteration {iteration}: need {needed_gpus} GPUs, available {available}, "
+                f"need_to_free {need_to_free}, evictable={len(evictable_list)}, "
+                f"all_actors={all_actors}"
             )
+
+            if evictable_list:
+                logger.info(
+                    f"[ResourcePool] Evicting {len(evictable_list)} actors: "
+                    f"{[(e.actor_name, e.num_gpus) for e in evictable_list]}"
+                )
 
             freed = self.evict_for_gpus(need_to_free)
 
@@ -344,6 +377,10 @@ class ResourcePool:
             # Check timeout
             elapsed = time_module.time() - start_time
             if elapsed >= timeout:
+                logger.error(
+                    f"[ResourcePool] TIMEOUT: need {needed_gpus} GPUs, available {available}, "
+                    f"elapsed {elapsed:.1f}s >= timeout {timeout}s"
+                )
                 raise ValueError(
                     f"Insufficient GPUs: need {needed_gpus}, available {available} after eviction. "
                     f"Freed {freed} GPUs but resources did not become available within {timeout}s timeout. "
@@ -353,11 +390,12 @@ class ResourcePool:
             # Wait before retrying - resources may become available when other actors finish
             remaining = timeout - elapsed
             wait_time = min(poll_interval, remaining)
-            logger.info(
-                f"[ResourcePool] Waiting for resources... "
-                f"(available={available}, needed={needed_gpus}, elapsed={elapsed:.1f}s, "
-                f"timeout={timeout}s, next check in {wait_time:.1f}s)"
-            )
+            if iteration % 10 == 0:  # Log every 10 iterations (~50s)
+                logger.info(
+                    f"[ResourcePool] Waiting for resources... "
+                    f"(iteration={iteration}, available={available}, needed={needed_gpus}, "
+                    f"elapsed={elapsed:.1f}s, timeout={timeout}s)"
+                )
             time_module.sleep(wait_time)
 
     def list_actors(self) -> list[dict]:
