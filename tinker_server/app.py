@@ -89,6 +89,8 @@ async def _cleanup_stale_actors() -> None:
                         actor_handle=actor,
                         namespace=PERSISTENT_NAMESPACE,
                     )
+                    # Mark as ready since the actor passed health check
+                    resource_pool.mark_ready(name)
                     registered += 1
                     logger.info(f"Registered existing actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
 
