@@ -2720,49 +2720,61 @@ def get_or_create_megatron_worker_group(
         logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
     # Check available GPUs and evict LRU actors if necessary
+    print(f"[DEBUG] Before ensure_gpus_available({num_gpus}) for {base_model}", flush=True)
     resource_pool.ensure_gpus_available(num_gpus)
+    print(f"[DEBUG] After ensure_gpus_available for {base_model}", flush=True)
 
-    # Runtime env for PFS code access
-    runtime_env = {
-        "env_vars": {
-            "PYTHONPATH": PFS_PYTHONPATH,
-            "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
+    # Reserve GPUs to prevent race conditions with concurrent requests
+    # This must be done AFTER ensure_gpus_available and BEFORE actor creation
+    resource_pool.reserve_gpus(num_gpus)
+    print(f"[DEBUG] Reserved {num_gpus} GPUs for {base_model}", flush=True)
+
+    try:
+        # Runtime env for PFS code access
+        runtime_env = {
+            "env_vars": {
+                "PYTHONPATH": PFS_PYTHONPATH,
+                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
         }
-    }
 
-    # Create detached Ray actor with per-model name
-    actor = MegatronWorkerGroup.options(
-        name=actor_name,
-        namespace=PERSISTENT_NAMESPACE,
-        lifetime="detached",
-        runtime_env=runtime_env,
-    ).remote(
-        base_model=base_model,
-        lora_rank=lora_rank,
-        learning_rate=learning_rate,
-        distributed_config=config,
-    )
+        # Create detached Ray actor with per-model name
+        actor = MegatronWorkerGroup.options(
+            name=actor_name,
+            namespace=PERSISTENT_NAMESPACE,
+            lifetime="detached",
+            runtime_env=runtime_env,
+        ).remote(
+            base_model=base_model,
+            lora_rank=lora_rank,
+            learning_rate=learning_rate,
+            distributed_config=config,
+        )
 
-    # Wait for initialization
-    ray.get(actor.__ray_ready__.remote())
-    logger.info(f"Megatron worker group {actor_name} initialized (detached actor)")
+        # Wait for initialization
+        ray.get(actor.__ray_ready__.remote())
+        logger.info(f"Megatron worker group {actor_name} initialized (detached actor)")
 
-    # Register with unified resource pool for LRU tracking
-    resource_pool.register(
-        actor_name=actor_name,
-        actor_type=ActorType.MEGATRON,
-        num_gpus=num_gpus,
-        actor_handle=actor,
-        namespace=PERSISTENT_NAMESPACE,
-        base_model=base_model,
-    )
-    # Mark as ready after initialization completes
-    resource_pool.mark_ready(actor_name)
+        # Register with unified resource pool for LRU tracking
+        resource_pool.register(
+            actor_name=actor_name,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=num_gpus,
+            actor_handle=actor,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model,
+        )
+        # Mark as ready after initialization completes
+        resource_pool.mark_ready(actor_name)
 
-    return actor
+        return actor
+    finally:
+        # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
+        resource_pool.release_pending_gpus(num_gpus)
+        print(f"[DEBUG] Released pending {num_gpus} GPUs for {base_model}", flush=True)
 
 
 async def async_get_or_create_megatron_worker_group(

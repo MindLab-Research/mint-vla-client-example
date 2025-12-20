@@ -115,6 +115,10 @@ class ResourcePool:
             return
         self._entries: dict[str, ActorEntry] = {}  # key: actor_name
         self._pool_lock = threading.Lock()
+        # Pending GPU reservations - GPUs reserved but not yet allocated to actors
+        # This prevents race conditions where multiple concurrent requests
+        # both think they have enough GPUs available
+        self._pending_gpus: int = 0
         # Read MIN_ACTOR_AGE at init time (not class definition time)
         # Set MINT_MIN_ACTOR_AGE=0 for testing to allow immediate eviction
         self.MIN_ACTOR_AGE = int(os.environ.get("MINT_MIN_ACTOR_AGE", "300"))
@@ -236,6 +240,51 @@ class ResourcePool:
                 entry.mark_ready()
                 logger.info(f"[ResourcePool] Actor {actor_name} marked ready")
 
+    def reserve_gpus(self, num_gpus: int) -> bool:
+        """Reserve GPUs before actor creation.
+
+        This prevents race conditions where multiple concurrent requests
+        both pass availability checks before either creates an actor.
+
+        Args:
+            num_gpus: Number of GPUs to reserve.
+
+        Returns:
+            True if reservation was made (caller should release after actor creation).
+        """
+        with self._pool_lock:
+            self._pending_gpus += num_gpus
+            logger.info(f"[ResourcePool] Reserved {num_gpus} GPUs (pending total: {self._pending_gpus})")
+            return True
+
+    def release_pending_gpus(self, num_gpus: int):
+        """Release pending GPU reservation.
+
+        Call this after actor creation completes (success or failure).
+        On success, the GPUs are now tracked by the registered actor.
+        On failure, the reservation is simply released.
+
+        Args:
+            num_gpus: Number of GPUs to release from pending.
+        """
+        with self._pool_lock:
+            self._pending_gpus = max(0, self._pending_gpus - num_gpus)
+            logger.info(f"[ResourcePool] Released {num_gpus} pending GPUs (pending total: {self._pending_gpus})")
+
+    def get_effective_available_gpus(self) -> int:
+        """Get available GPUs minus pending reservations.
+
+        This is the correct number to check when deciding if there are
+        enough GPUs for a new actor.
+
+        Returns:
+            Number of GPUs available for allocation.
+        """
+        ray_available = int(ray.available_resources().get("GPU", 0))
+        with self._pool_lock:
+            effective = ray_available - self._pending_gpus
+        return max(0, effective)
+
     def _get_evictable_actors_lru(self) -> list[ActorEntry]:
         """Get evictable actors sorted by last access time (LRU first).
 
@@ -318,6 +367,9 @@ class ResourcePool:
     def ensure_gpus_available(self, needed_gpus: int, timeout: float = 600) -> bool:
         """Ensure at least needed_gpus are available, evicting and waiting if necessary.
 
+        Uses get_effective_available_gpus() which accounts for pending reservations
+        from other concurrent requests that haven't yet created their actors.
+
         Args:
             needed_gpus: Number of GPUs needed.
             timeout: Maximum time to wait for resources (seconds). Default 10 minutes.
@@ -334,13 +386,16 @@ class ResourcePool:
         poll_interval = 5  # seconds between checks
         iteration = 0
 
+        print(f"[DEBUG ensure_gpus] ENTRY: need {needed_gpus} GPUs, timeout={timeout}s", flush=True)
         logger.info(f"[ResourcePool] ensure_gpus_available: need {needed_gpus} GPUs, timeout={timeout}s")
 
         while True:
             iteration += 1
-            available = int(ray.available_resources().get("GPU", 0))
+            # Use effective available GPUs (accounts for pending reservations)
+            available = self.get_effective_available_gpus()
 
             if available >= needed_gpus:
+                print(f"[DEBUG ensure_gpus] RETURN: Sufficient GPUs: {available} >= {needed_gpus}", flush=True)
                 logger.info(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
                 return True
 
@@ -349,11 +404,13 @@ class ResourcePool:
             # Log actor states for debugging
             evictable_list = self._get_evictable_actors_lru()
             with self._pool_lock:
-                all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating) 
+                all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating)
                               for e in self._entries.values()]
+                pending = self._pending_gpus
+            print(f"[DEBUG ensure_gpus] Iter {iteration}: available={available}, pending={pending}, need={needed_gpus}, evictable={len(evictable_list)}, actors={all_actors}", flush=True)
             logger.info(
                 f"[ResourcePool] Iteration {iteration}: need {needed_gpus} GPUs, available {available}, "
-                f"need_to_free {need_to_free}, evictable={len(evictable_list)}, "
+                f"pending {pending}, need_to_free {need_to_free}, evictable={len(evictable_list)}, "
                 f"all_actors={all_actors}"
             )
 
@@ -368,7 +425,7 @@ class ResourcePool:
             if freed > 0:
                 # Wait for Ray to reclaim resources
                 time_module.sleep(2)
-                available = int(ray.available_resources().get("GPU", 0))
+                available = self.get_effective_available_gpus()
 
                 if available >= needed_gpus:
                     logger.info(f"[ResourcePool] After eviction: {available} GPUs available")
