@@ -1262,10 +1262,11 @@ class VerlTrainingEngine:
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
     def _touch_actor(self, session: "TrainingSession") -> None:
-        """Update last_accessed timestamp for the session's actor.
+        """Update last_accessed timestamp and session for the session's actor.
 
-        Called during training operations to mark actor as recently used,
-        preventing LRU eviction while training is active.
+        Called during training operations to:
+        1. Mark actor as recently used (prevents LRU eviction)
+        2. Associate current session with actor (prevents idle eviction)
         """
         from .resource_pool import get_resource_pool
         from .megatron_distributed import _make_megatron_actor_name
@@ -1278,6 +1279,8 @@ class VerlTrainingEngine:
                 actor_name = _make_megatron_actor_name(base_model)
                 resource_pool = get_resource_pool()
                 resource_pool.touch(actor_name)
+                # Associate session with actor to prevent idle eviction
+                resource_pool.set_session(actor_name, session.session_id)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -1374,6 +1377,8 @@ class VerlTrainingEngine:
                 distributed_config=distributed_config,
             )
             session.backend = "megatron"
+            # Associate session with actor in resource pool immediately
+            self._touch_actor(session)
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
