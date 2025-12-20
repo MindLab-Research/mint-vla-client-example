@@ -1187,7 +1187,6 @@ class MegatronRankWorker:
         from megatron.core.optimizer import ChainedOptimizer
 
         logger.info(f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate})")
-        print(f"[REINIT DEBUG Rank {self.rank}] reinit_lora_weights ENTRY lr={learning_rate}", flush=True)
 
         # Must use train_mode context for param_offload
         reinit_count = 0
@@ -1274,25 +1273,21 @@ class MegatronRankWorker:
                         #
                         # Handle ProxyDict from ChainedOptimizer - it wraps multiple optimizer
                         # states and doesn't have .clear(). Access underlying dicts directly.
-                        print(f"[REINIT DEBUG Rank {self.rank}] state type={type(state).__name__}, has _inner_dicts={hasattr(state, '_inner_dicts')}, has clear={hasattr(state, 'clear')}, count={state_count}", flush=True)
                         if hasattr(state, '_inner_dicts'):
                             # ProxyDict from ChainedOptimizer
                             for inner_dict in state._inner_dicts:
                                 inner_dict.clear()
                             logger.info(f"[Rank {self.rank}] Cleared ProxyDict optimizer state ({state_count} entries from {len(state._inner_dicts)} inner dicts)")
-                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared ProxyDict, now len={len(state)}", flush=True)
                         elif hasattr(state, 'clear'):
                             # Regular dict
                             state.clear()
                             logger.info(f"[Rank {self.rank}] Cleared optimizer state dict ({state_count} entries)")
-                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared dict via .clear(), now len={len(state)}", flush=True)
                         else:
                             # Unknown type - try to clear via iteration
                             keys = list(state.keys()) if hasattr(state, 'keys') else []
                             for key in keys:
                                 del state[key]
                             logger.info(f"[Rank {self.rank}] Cleared optimizer state via key deletion ({len(keys)} entries)")
-                            print(f"[REINIT DEBUG Rank {self.rank}] Cleared via key deletion, now len={len(state)}", flush=True)
                         opt_state_reset_count = state_count
                     else:
                         logger.warning(f"[Rank {self.rank}] Optimizer {i} has no inner optimizer or it's None")
@@ -2720,14 +2715,11 @@ def get_or_create_megatron_worker_group(
         logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
     # Check available GPUs and evict LRU actors if necessary
-    print(f"[DEBUG] Before ensure_gpus_available({num_gpus}) for {base_model}", flush=True)
     resource_pool.ensure_gpus_available(num_gpus)
-    print(f"[DEBUG] After ensure_gpus_available for {base_model}", flush=True)
 
     # Reserve GPUs to prevent race conditions with concurrent requests
     # This must be done AFTER ensure_gpus_available and BEFORE actor creation
     resource_pool.reserve_gpus(num_gpus)
-    print(f"[DEBUG] Reserved {num_gpus} GPUs for {base_model}", flush=True)
 
     try:
         # Runtime env for PFS code access
@@ -2774,7 +2766,6 @@ def get_or_create_megatron_worker_group(
     finally:
         # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
         resource_pool.release_pending_gpus(num_gpus)
-        print(f"[DEBUG] Released pending {num_gpus} GPUs for {base_model}", flush=True)
 
 
 async def async_get_or_create_megatron_worker_group(

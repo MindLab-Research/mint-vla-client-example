@@ -239,8 +239,6 @@ class MultiLoRAInferenceEngine:
         Uses a detached Ray actor that survives server restarts.
         First tries to connect to existing actor, creates new one if not found.
         """
-        import sys
-        print(f"[DEBUG INIT] initialize() called for actor {self.actor_name}", file=sys.stderr, flush=True)
         async with self._init_lock:
             if self._initialized:
                 return
@@ -252,32 +250,27 @@ class MultiLoRAInferenceEngine:
             # Try to get existing persistent actor
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
             # We must verify the actor is alive AND engine is initialized
-            print(f"[DEBUG INIT] Trying to get existing actor {self.actor_name}", file=sys.stderr, flush=True)
             try:
                 self.server = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
-                print(f"[DEBUG INIT] Got actor handle, checking health", file=sys.stderr, flush=True)
                 # Health check: try calling a method to verify actor is alive
                 # This will raise RayActorError if actor is dead
                 try:
                     ray.get(self.server.__ray_ready__.remote(), timeout=5)
-                    print(f"[DEBUG INIT] Actor alive, checking engine status", file=sys.stderr, flush=True)
 
                     # Check if engine is actually initialized (not just actor alive)
                     # A broken actor can be "alive" but have failed engine init
                     engine_ready = ray.get(self.server.is_engine_ready.remote(), timeout=10)
                     if not engine_ready:
-                        print(f"[DEBUG INIT] Engine NOT ready - actor is broken, killing it", file=sys.stderr, flush=True)
                         logger.warning(
                             f"vLLM actor {self.actor_name} has broken engine, killing and recreating"
                         )
                         try:
                             ray.kill(self.server, no_restart=True)
                         except Exception as kill_err:
-                            print(f"[DEBUG INIT] Failed to kill broken actor: {kill_err}", file=sys.stderr, flush=True)
+                            logger.debug(f"Failed to kill broken actor: {kill_err}")
                         self.server = None
                         self._initialized = False
                     else:
-                        print(f"[DEBUG INIT] REUSING existing actor (engine ready)", file=sys.stderr, flush=True)
                         logger.info(
                             f"Connected to existing persistent vLLM actor: {self.actor_name}"
                         )
@@ -289,7 +282,7 @@ class MultiLoRAInferenceEngine:
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         resource_pool = get_resource_pool()
                         actor_node_id = _get_actor_node_id(self.server)
-                        logger.info(f"[DEBUG] Registering existing actor {self.actor_name} with ResourcePool (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
+                        logger.info(f"Registering existing actor {self.actor_name} with ResourcePool (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
                         resource_pool.register(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
@@ -299,11 +292,11 @@ class MultiLoRAInferenceEngine:
                             base_model=self.model_path,
                             node_id=actor_node_id,
                         )
-                        logger.info(f"[DEBUG] ResourcePool now has {len(resource_pool._entries)} entries")
+                        # Mark as ready since it's an existing actor that responded to health check
+                        resource_pool.mark_ready(self.actor_name)
                         return
                 except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     # Actor is dead or unresponsive, need to create new one
-                    print(f"[DEBUG INIT] Actor dead/unresponsive, will create new", file=sys.stderr, flush=True)
                     logger.warning(
                         f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
                     )
@@ -311,20 +304,18 @@ class MultiLoRAInferenceEngine:
                     # Ray keeps names registered even for dead actors
                     try:
                         ray.kill(self.server, no_restart=True)
-                        print(f"[DEBUG INIT] Killed dead actor to free name", file=sys.stderr, flush=True)
+                        logger.debug(f"Killed dead actor to free name: {self.actor_name}")
                     except Exception as kill_err:
-                        print(f"[DEBUG INIT] Could not kill dead actor: {kill_err}", file=sys.stderr, flush=True)
+                        logger.debug(f"Could not kill dead actor: {kill_err}")
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
                     self._initialized = False
             except ValueError:
                 # Actor doesn't exist, create new one
-                print(f"[DEBUG INIT] Actor doesn't exist, will create new", file=sys.stderr, flush=True)
                 logger.info(
                     f"No existing vLLM actor found, creating new detached actor: {self.actor_name}"
                 )
 
-            print(f"[DEBUG INIT] CREATING NEW ACTOR - proceeding to scheduling logic", file=sys.stderr, flush=True)
             from verl.workers.config import HFModelConfig, RolloutConfig
             from verl.workers.rollout.replica import RolloutMode
 
@@ -425,12 +416,12 @@ class MultiLoRAInferenceEngine:
             # 1. GPUs used by active placement groups (Megatron training)
             # 2. GPUs used by actors tracked in ResourcePool (vLLM, dense training)
             target_node = None
-            print(f"[SCHEDULE DEBUG] Looking for node with {total_gpus} available GPUs for vLLM", file=sys.stderr, flush=True)
+            logger.debug(f"Looking for node with {total_gpus} available GPUs for vLLM")
 
             # Get cluster-wide available resources for validation
             cluster_available = ray.available_resources()
             cluster_gpus = cluster_available.get("GPU", 0)
-            print(f"[SCHEDULE DEBUG] Cluster has {cluster_gpus} GPUs available", file=sys.stderr, flush=True)
+            logger.debug(f"Cluster has {cluster_gpus} GPUs available")
 
             # Find GPUs used by active placement groups on each node
             # Each bundle in a placement group typically uses 1 GPU
@@ -443,14 +434,9 @@ class MultiLoRAInferenceEngine:
                     for bundle_idx, node_id in bundles_to_node.items():
                         gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
 
-            for node_id, gpu_count in gpus_used_by_pg.items():
-                print(f"[SCHEDULE DEBUG] Node {node_id[:8]} has {gpu_count} GPUs used by placement groups", file=sys.stderr, flush=True)
-
             # Also get GPUs used by actors tracked in ResourcePool (vLLM, dense training)
             # This is critical - without it, we may schedule to a node that already has vLLM actors
             gpus_used_by_actors = resource_pool.gpus_used_by_node()
-            for node_id, gpu_count in gpus_used_by_actors.items():
-                print(f"[SCHEDULE DEBUG] Node {node_id[:8]} has {gpu_count} GPUs used by ResourcePool actors", file=sys.stderr, flush=True)
 
             # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used - actor_used)
             candidates = []
@@ -464,7 +450,7 @@ class MultiLoRAInferenceEngine:
                     pg_gpus = gpus_used_by_pg.get(node_id, 0)
                     actor_gpus = gpus_used_by_actors.get(node_id, 0)
                     available_gpu = total_gpu - pg_gpus - actor_gpus
-                    print(f"[SCHEDULE DEBUG]   Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpu}, obj_store={obj_store/1e9:.1f}GB", file=sys.stderr, flush=True)
+                    logger.debug(f"Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpu}")
 
                     # Node must have enough AVAILABLE GPUs (after subtracting all usage) and enough object store
                     if available_gpu >= total_gpus and obj_store > 100_000_000_000:
@@ -484,7 +470,7 @@ class MultiLoRAInferenceEngine:
                     clean_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
                     target_node = clean_nodes[0][0]
                     available_gpus = clean_nodes[0][1]
-                    print(f"[SCHEDULE DEBUG] Selected clean node {target_node[:8]} with {available_gpus} GPUs (no PG/actors)", file=sys.stderr, flush=True)
+                    logger.info(f"Selected clean node {target_node[:8]} with {available_gpus} available GPUs")
                 else:
                     # Fall back to partial nodes
                     partial_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
@@ -492,7 +478,7 @@ class MultiLoRAInferenceEngine:
                     available_gpus = partial_nodes[0][1]
                     pg_count = gpus_used_by_pg.get(target_node, 0)
                     actor_count = gpus_used_by_actors.get(target_node, 0)
-                    print(f"[SCHEDULE DEBUG] Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} PG, {actor_count} actors)", file=sys.stderr, flush=True)
+                    logger.info(f"Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} PG, {actor_count} actors)")
 
             scheduling_opts = {}
             if target_node:
@@ -500,10 +486,9 @@ class MultiLoRAInferenceEngine:
                     node_id=target_node,
                     soft=False,  # Hard constraint - fail if node unavailable
                 )
-                print(f"[SCHEDULE DEBUG] Using NodeAffinitySchedulingStrategy for node {target_node[:8]}", file=sys.stderr, flush=True)
             else:
                 scheduling_opts["scheduling_strategy"] = "SPREAD"
-                print("[SCHEDULE DEBUG] No suitable node found, using SPREAD scheduling", file=sys.stderr, flush=True)
+                logger.warning("No suitable node found, using SPREAD scheduling")
 
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
@@ -566,6 +551,8 @@ class MultiLoRAInferenceEngine:
                 base_model=self.model_path,
                 node_id=actor_node_id,
             )
+            # Mark as ready now that launch completed successfully
+            resource_pool.mark_ready(self.actor_name)
             if actor_node_id:
                 logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
 

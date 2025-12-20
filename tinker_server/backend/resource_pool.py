@@ -386,7 +386,6 @@ class ResourcePool:
         poll_interval = 5  # seconds between checks
         iteration = 0
 
-        print(f"[DEBUG ensure_gpus] ENTRY: need {needed_gpus} GPUs, timeout={timeout}s", flush=True)
         logger.info(f"[ResourcePool] ensure_gpus_available: need {needed_gpus} GPUs, timeout={timeout}s")
 
         while True:
@@ -395,7 +394,6 @@ class ResourcePool:
             available = self.get_effective_available_gpus()
 
             if available >= needed_gpus:
-                print(f"[DEBUG ensure_gpus] RETURN: Sufficient GPUs: {available} >= {needed_gpus}", flush=True)
                 logger.info(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
                 return True
 
@@ -407,7 +405,6 @@ class ResourcePool:
                 all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating)
                               for e in self._entries.values()]
                 pending = self._pending_gpus
-            print(f"[DEBUG ensure_gpus] Iter {iteration}: available={available}, pending={pending}, need={needed_gpus}, evictable={len(evictable_list)}, actors={all_actors}", flush=True)
             logger.info(
                 f"[ResourcePool] Iteration {iteration}: need {needed_gpus} GPUs, available {available}, "
                 f"pending {pending}, need_to_free {need_to_free}, evictable={len(evictable_list)}, "
