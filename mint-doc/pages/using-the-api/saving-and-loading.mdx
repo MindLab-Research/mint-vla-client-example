@@ -1,0 +1,48 @@
+# Saving and Loading
+
+MinT provides flexible methods for saving and loading model weights and optimizer states.
+
+## Save Methods
+
+### Save Weights for Sampler
+
+Stores weights optimized for inference (faster):
+
+```python
+sampling_path = training_client.save_weights_for_sampler(name="0000").result().path
+```
+
+### Save Full State
+
+Preserves both weights and optimizer state for resuming training:
+
+```python
+resume_path = training_client.save_state(name="0010").result().path
+```
+
+## Creating a Sampling Client
+
+```python
+import tinker
+service_client = tinker.ServiceClient()
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.2-1B", rank=32
+)
+
+sampling_path = training_client.save_weights_for_sampler(name="0000").result().path
+sampling_client = service_client.create_sampling_client(model_path=sampling_path)
+```
+
+## Resuming Training
+
+```python
+resume_path = training_client.save_state(name="0010").result().path
+training_client.load_state(resume_path)
+```
+
+## Use Cases
+
+- **Multi-stage workflows** - Save intermediate checkpoints
+- **Hyperparameter adjustments** - Resume from a checkpoint with new settings
+- **Failure recovery** - Restore training after interruptions
+- **Optimizer state preservation** - Maintain training momentum across sessions

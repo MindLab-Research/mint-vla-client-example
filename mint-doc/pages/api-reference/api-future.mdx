@@ -1,0 +1,74 @@
+# APIFuture
+
+**Generic interface for asynchronous operations**
+
+## Classes
+
+### APIFuture\<T\>
+
+Abstract generic class representing an asynchronous operation that will produce a value of type T.
+
+### AwaitableConcurrentFuture\<T\>
+
+Concrete implementation wrapping Python's `concurrent.futures.Future` with async/await support.
+
+## Methods
+
+### result_async
+
+```python
+async def result_async(timeout: Optional[float] = None) -> T
+```
+
+Get the result asynchronously (non-blocking).
+
+**Parameters:**
+- `timeout` - Optional timeout in seconds
+
+**Raises:** `TimeoutError` if operation doesn't complete within timeout.
+
+### result
+
+```python
+def result(timeout: Optional[float] = None) -> T
+```
+
+Get the result synchronously (blocking).
+
+**Parameters:**
+- `timeout` - Optional timeout in seconds
+
+**Raises:** `TimeoutError` if operation doesn't complete within timeout.
+
+### future
+
+```python
+def future() -> concurrent.futures.Future\[T\]
+```
+
+Access the underlying `concurrent.futures.Future` object.
+
+## Usage
+
+### Asynchronous
+
+```python
+api_future = await client.some_operation_async(...)
+result = await api_future
+```
+
+### Synchronous
+
+```python
+api_future = client.some_operation(...)
+result = api_future.result()
+```
+
+### With Timeout
+
+```python
+try:
+    result = api_future.result(timeout=30.0)  # 30 seconds
+except TimeoutError:
+    print("Operation timed out")
+```

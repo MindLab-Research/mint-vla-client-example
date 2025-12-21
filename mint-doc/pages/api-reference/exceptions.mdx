@@ -1,0 +1,78 @@
+# Exceptions
+
+**Error types raised by the MinT API**
+
+## Base Exceptions
+
+### TinkerError
+
+Root exception for all MinT errors.
+
+All MinT-specific exceptions inherit from this class.
+
+### APIError
+
+Base class for API-related errors.
+
+**Properties:**
+- `body` - Response body containing error details
+
+## Connection Errors
+
+### APIConnectionError
+
+Raised when connection to the MinT server fails.
+
+### APITimeoutError
+
+Raised when a request times out.
+
+**Inherits from:** `APIConnectionError`
+
+### APIResponseValidationError
+
+Raised when server response doesn't match expected schema.
+
+## HTTP Status Errors
+
+| Exception | Status Code | Description |
+|-----------|------------|-------------|
+| `BadRequestError` | 400 | Invalid request format or parameters |
+| `AuthenticationError` | 401 | Missing or invalid credentials |
+| `PermissionDeniedError` | 403 | Insufficient permissions for operation |
+| `NotFoundError` | 404 | Requested resource doesn't exist |
+| `ConflictError` | 409 | Resource state conflict |
+| `UnprocessableEntityError` | 422 | Request is semantically invalid |
+| `RateLimitError` | 429 | Too many requests (rate limit exceeded) |
+| `InternalServerError` | 500+ | Server-side error |
+
+## Async Errors
+
+### RequestFailedError
+
+Raised when an async request fails to complete successfully.
+
+## Usage Example
+
+```python
+import tinker
+from tinker.exceptions import (
+    AuthenticationError,
+    NotFoundError,
+    RateLimitError
+)
+
+try:
+    service_client = tinker.ServiceClient()
+    training_client = service_client.create_lora_training_client(
+        base_model="Qwen/Qwen3-8B"
+    )
+except AuthenticationError:
+    print("Invalid API key")
+except NotFoundError:
+    print("Model not found")
+except RateLimitError:
+    print("Rate limit exceeded, please wait")
+except tinker.TinkerError as e:
+    print(f"MinT error: {e}")
+```

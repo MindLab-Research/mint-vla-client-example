@@ -1,0 +1,38 @@
+# Async and Futures
+
+MinT provides both synchronous and asynchronous APIs for efficient operations.
+
+## Synchronous Example
+
+```python
+future = client.forward_backward(data, loss_fn)
+result = future.result()  # Blocks until complete
+```
+
+## Asynchronous Example (Double Await)
+
+```python
+future = await client.forward_backward_async(data, loss_fn)
+result = await future
+```
+
+- **First `await`** confirms submission (ensures ordering)
+- **Second `await`** waits for completion
+
+## Performance Optimization
+
+Queue operations efficiently by submitting them before waiting:
+
+```python
+# Submit forward_backward
+fwd_bwd_future = await client.forward_backward_async(batch, loss_fn)
+
+# Queue next operation immediately
+optim_future = await client.optim_step_async(adam_params)
+
+# Retrieve results
+fwd_bwd_result = await fwd_bwd_future
+optim_result = await optim_future
+```
+
+This approach overlaps computation and communication, maximizing GPU utilization.

@@ -1,0 +1,77 @@
+# SamplingClient
+
+**Interface for generating text from trained models**
+
+## Key Methods
+
+### Sample
+
+```python
+sample(
+    prompt,
+    num_samples,
+    sampling_params,
+    include_prompt_logprobs=False,
+    topk_prompt_logprobs=None
+)
+sample_async(...)
+```
+
+Generate text completions from a prompt.
+
+**Parameters:**
+- `prompt` - ModelInput containing tokens
+- `num_samples` - Number of completions to generate
+- `sampling_params` - SamplingParams controlling generation
+- `include_prompt_logprobs` - Return log probabilities for prompt tokens
+- `topk_prompt_logprobs` - Return top-k token alternatives per position
+
+**Returns:** Future containing generated tokens and optional logprobs.
+
+### Compute Logprobs
+
+```python
+compute_logprobs(prompt)
+compute_logprobs_async(prompt)
+```
+
+Calculate log probabilities for tokens in the prompt without generating new text.
+
+## Usage Example
+
+```python
+import tinker
+from tinker import types
+
+service_client = tinker.ServiceClient()
+sampling_client = service_client.create_sampling_client(
+    base_model="Qwen/Qwen3-8B"
+)
+
+# Prepare prompt
+tokenizer = ...  # Get tokenizer
+prompt = types.ModelInput.from_ints(
+    tokenizer.encode("The weather today is")
+)
+
+# Configure sampling
+params = types.SamplingParams(
+    max_tokens=20,
+    temperature=0.7
+)
+
+# Generate
+future = sampling_client.sample(
+    prompt=prompt,
+    sampling_params=params,
+    num_samples=1
+)
+result = future.result()
+```
+
+## Async Usage
+
+```python
+future = await sampling_client.sample_async(prompt, params, num_samples=1)
+result = await future
+```

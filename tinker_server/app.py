@@ -1,10 +1,13 @@
 """FastAPI application for tinker-server."""
 
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .backend.multi_lora_engine import MultiModelInferenceManager
 from .backend.session_manager import SessionManager
@@ -223,6 +226,8 @@ app = FastAPI(
 
 # Paths that don't require authentication
 UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
+# Path prefixes that don't require authentication
+UNAUTHENTICATED_PREFIXES = ("/doc",)
 
 print("=== REGISTERING AUTH MIDDLEWARE ===", flush=True)
 
@@ -235,6 +240,10 @@ async def api_key_auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     if request.url.path in UNAUTHENTICATED_PATHS:
+        return await call_next(request)
+
+    # Skip auth for paths with unauthenticated prefixes (e.g., /doc)
+    if request.url.path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
 
     # Try X-API-Key header first, then Authorization: Bearer
@@ -259,6 +268,15 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+
+# Mount documentation static files
+# Use MINT_DOC_PATH env var to override the default path
+_doc_path = os.environ.get("MINT_DOC_PATH", str(Path(__file__).parent.parent / "mint-doc" / "out"))
+if Path(_doc_path).exists():
+    app.mount("/doc", StaticFiles(directory=_doc_path, html=True), name="documentation")
+    logger.info(f"Documentation mounted at /doc from {_doc_path}")
+else:
+    logger.warning(f"Documentation directory not found at {_doc_path}, /doc will not be available")
 
 
 # Root redirect to docs

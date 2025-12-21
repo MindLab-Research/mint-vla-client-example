@@ -1,0 +1,85 @@
+# Parameters and Types
+
+**Core data types used throughout the MinT API**
+
+## AdamParams
+
+Configuration for Adam optimizer.
+
+**Fields:**
+- `learning_rate` - Step size for parameter updates
+- `beta1` - Exponential decay rate for first moment estimates
+- `beta2` - Exponential decay rate for second moment estimates
+- `eps` - Small constant for numerical stability
+- `weight_decay` - L2 regularization coefficient
+- `gradient_clip_norm` - Maximum gradient norm (for clipping)
+
+## ModelInput
+
+Represents tokenized input to the model.
+
+**Methods:**
+- `from_ints(tokens)` - Create from list of token IDs
+- `to_ints()` - Convert to list of token IDs
+- `context_length()` - Get total number of tokens
+- `append_tokens(tokens)` - Add tokens to the end
+- `append_chunks(chunks)` - Add text/image chunks
+
+**Supports:**
+- Pure text (list of token IDs)
+- Multimodal (mixed `EncodedTextChunk` and `ImageChunk`)
+
+## SamplingParams
+
+Controls text generation behavior.
+
+**Fields:**
+- `max_tokens` - Maximum tokens to generate
+- `temperature` - Randomness (0.0 = deterministic, higher = more random)
+- `top_k` - Consider only top-k tokens
+- `top_p` - Nucleus sampling threshold
+- `seed` - Random seed for reproducibility
+- `stop_sequences` - Strings that halt generation
+
+## LoraConfig
+
+Configuration for LoRA adaptation.
+
+**Fields:**
+- `rank` - Rank dimension for low-rank matrices
+- `seed` - Initialization seed
+- `train_unembed` - Train unembedding layer
+- `train_mlp` - Train MLP layers
+- `train_attn` - Train attention layers
+
+## Checkpoint
+
+Represents a saved model checkpoint.
+
+**Fields:**
+- `id` - Unique identifier
+- `type` - "training" or "sampler"
+- `timestamp` - Creation time
+- `size` - File size in bytes
+- `public` - Whether publicly accessible
+
+## TensorData
+
+Wrapper for tensor data with conversion utilities.
+
+**Methods:**
+- `to_numpy()` - Convert to NumPy array
+- `to_torch()` - Convert to PyTorch tensor
+- `shape` - Get tensor dimensions
+
+## TrainingRun
+
+Metadata about a training session.
+
+**Fields:**
+- `id` - Unique identifier
+- `base_model` - Foundation model used
+- `owner` - User who created the run
+- `corrupted` - Whether run encountered errors
+- `checkpoints` - List of saved checkpoints
+- `created_at` - Timestamp

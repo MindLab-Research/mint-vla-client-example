@@ -1,0 +1,36 @@
+# Publishing Weights
+
+Share your trained models by making checkpoints publicly accessible.
+
+## Publishing a Checkpoint
+
+```bash
+tinker checkpoint publish $TINKER_CHECKPOINT_PATH
+```
+
+**Format:** `tinker://[UUID]:train:[ID]/weights/[checkpoint_id]`
+
+## Verifying Publication
+
+```bash
+tinker checkpoint info tinker://[UUID]/weights/[checkpoint_id]
+```
+
+Check for the `Public` property to confirm the checkpoint is publicly accessible.
+
+## Unpublishing
+
+To make a checkpoint private again (owner-only access):
+
+```bash
+tinker checkpoint unpublish $TINKER_CHECKPOINT_PATH
+```
+
+## Accessing Published Weights
+
+Other users can access your published weights:
+
+```python
+ckpt_path = "tinker://[UUID]/weights/[checkpoint_id]"
+training_client = service_client.create_training_client_from_state(ckpt_path)
+```

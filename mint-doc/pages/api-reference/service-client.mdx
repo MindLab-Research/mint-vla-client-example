@@ -1,0 +1,73 @@
+# ServiceClient
+
+**Primary entry point for the MinT API**
+
+## Overview
+
+ServiceClient is the main interface for accessing MinT's functionality. All operations begin by creating a ServiceClient instance.
+
+## Key Methods
+
+### Server Information
+
+```python
+get_server_capabilities()
+get_server_capabilities_async()
+```
+
+Query supported features and capabilities of the MinT server.
+
+### Training Client Creation
+
+```python
+create_lora_training_client(
+    base_model,
+    rank=32,
+    train_mlp=True,
+    train_attn=True,
+    train_unembed=True,
+    seed=None
+)
+```
+
+Initialize a TrainingClient for LoRA fine-tuning.
+
+**Parameters:**
+- `base_model` - Model identifier (e.g., "Qwen/Qwen3-8B")
+- `rank` - LoRA rank dimension (default: 32)
+- `train_mlp` - Train MLP layers (default: True)
+- `train_attn` - Train attention layers (default: True)
+- `train_unembed` - Train unembedding layer (default: True)
+- `seed` - Random seed for reproducibility
+
+### Load from Checkpoint
+
+```python
+create_training_client_from_state(path)
+create_training_client_from_state_with_optimizer(path)
+```
+
+- **from_state** - Load weights only
+- **from_state_with_optimizer** - Load weights and optimizer state
+
+### Sampling Client Creation
+
+```python
+create_sampling_client(model_path=None, base_model=None)
+```
+
+Create a SamplingClient from either:
+- A saved checkpoint (`model_path`)
+- A base model (`base_model`)
+
+### REST Client
+
+```python
+create_rest_client()
+```
+
+Access REST endpoints for checkpoint management and metadata operations.
+
+## Async Variants
+
+All methods include async variants (e.g., `create_lora_training_client_async()`).
