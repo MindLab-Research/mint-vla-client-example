@@ -222,10 +222,11 @@ app = FastAPI(
     title="MinT",
     description="Mind Lab Toolkit - Training API for LLMs",
     version="0.1.0",
+    docs_url=None,  # Disable built-in Swagger UI, /docs redirects to /doc/
 )
 
 # Paths that don't require authentication
-UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/"}
+UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/", "/docs", "/docs/"}
 # Path prefixes that don't require authentication
 UNAUTHENTICATED_PREFIXES = ("/doc/", "/doc")
 
@@ -283,6 +284,20 @@ async def doc_redirect():
     """Redirect /doc to /doc/ for consistent behavior."""
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/doc/", status_code=301)
+
+
+@app.get("/docs")
+async def docs_redirect():
+    """Alias /docs to /doc."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/doc/", status_code=302)
+
+
+@app.get("/docs/")
+async def docs_slash_redirect():
+    """Alias /docs/ to /doc/."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/doc/", status_code=302)
 
 
 # Mount documentation static files at /doc/
