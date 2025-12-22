@@ -40,10 +40,10 @@ Calculate log probabilities for tokens in the prompt without generating new text
 ## Usage Example
 
 ```python
-import tinker
-from tinker import types
+import mint
+from mint import types
 
-service_client = tinker.ServiceClient()
+service_client = mint.ServiceClient()
 sampling_client = service_client.create_sampling_client(
     base_model="Qwen/Qwen3-8B"
 )

@@ -23,8 +23,8 @@ resume_path = training_client.save_state(name="0010").result().path
 ## Creating a Sampling Client
 
 ```python
-import tinker
-service_client = tinker.ServiceClient()
+import mint
+service_client = mint.ServiceClient()
 training_client = service_client.create_lora_training_client(
     base_model="meta-llama/Llama-3.2-1B", rank=32
 )

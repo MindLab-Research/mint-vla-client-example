@@ -5,16 +5,16 @@ You can download trained model weights for use outside of MinT.
 ## Using the CLI
 
 ```bash
-tinker checkpoint download $TINKER_CHECKPOINT_PATH
+mint checkpoint download $TINKER_CHECKPOINT_PATH
 ```
 
 ## Using the SDK
 
 ```python
-import tinker
+import mint
 import urllib.request
 
-sc = tinker.ServiceClient()
+sc = mint.ServiceClient()
 rc = sc.create_rest_client()
 future = rc.get_checkpoint_archive_url_from_tinker_path("tinker://<unique_id>/sampler_weights/final")
 checkpoint_archive_url_response = future.result()

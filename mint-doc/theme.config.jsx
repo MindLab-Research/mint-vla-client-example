@@ -1,9 +1,9 @@
 export default {
   logo: <span>Mind Lab Toolkit (MinT)</span>,
   project: {
-    link: 'https://github.com/thinking-machines-lab/tinker'
+    link: 'https://github.com/MindLab-Research/mindlab-toolkit'
   },
-  docsRepositoryBase: 'https://github.com/thinking-machines-lab/tinker',
+  docsRepositoryBase: 'https://github.com/MindLab-Research/mindlab-toolkit',
   footer: {
     text: 'Mind Lab Toolkit (MinT) Documentation'
   },

@@ -219,31 +219,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     lifespan=lifespan,
-    title="Tinker Server",
-    description="Tinker-compatible inference server wrapping verl",
+    title="MinT",
+    description="Mind Lab Toolkit - Training API for LLMs",
     version="0.1.0",
 )
 
 # Paths that don't require authentication
-UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
+UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/"}
 # Path prefixes that don't require authentication
-UNAUTHENTICATED_PREFIXES = ("/doc",)
-
-print("=== REGISTERING AUTH MIDDLEWARE ===", flush=True)
+UNAUTHENTICATED_PREFIXES = ("/doc/", "/doc")
 
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
     """Validate API key from X-API-Key or Authorization: Bearer header."""
+    path = request.url.path
+
     # Skip auth if no API key configured (dev mode)
     if not config.api_key:
         return await call_next(request)
 
-    if request.url.path in UNAUTHENTICATED_PATHS:
+    # Skip auth for specific paths
+    if path in UNAUTHENTICATED_PATHS:
         return await call_next(request)
 
     # Skip auth for paths with unauthenticated prefixes (e.g., /doc)
-    if request.url.path.startswith(UNAUTHENTICATED_PREFIXES):
+    if path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
 
     # Try X-API-Key header first, then Authorization: Bearer
@@ -269,21 +270,29 @@ app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
 
-# Mount documentation static files
+# Redirects to documentation (must be defined BEFORE mount)
+@app.get("/")
+async def root():
+    """Redirect root to documentation."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/doc/", status_code=302)
+
+
+@app.get("/doc")
+async def doc_redirect():
+    """Redirect /doc to /doc/ for consistent behavior."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/doc/", status_code=301)
+
+
+# Mount documentation static files at /doc/
 # Use MINT_DOC_PATH env var to override the default path
 _doc_path = os.environ.get("MINT_DOC_PATH", str(Path(__file__).parent.parent / "mint-doc" / "out"))
 if Path(_doc_path).exists():
-    app.mount("/doc", StaticFiles(directory=_doc_path, html=True), name="documentation")
-    logger.info(f"Documentation mounted at /doc from {_doc_path}")
+    app.mount("/doc/", StaticFiles(directory=_doc_path, html=True), name="documentation")
+    logger.info(f"Documentation mounted at /doc/ from {_doc_path}")
 else:
     logger.warning(f"Documentation directory not found at {_doc_path}, /doc will not be available")
-
-
-# Root redirect to docs
-@app.get("/")
-async def root():
-    """Redirect to API docs."""
-    return {"message": "Tinker Server", "docs": "/docs"}
 
 
 if __name__ == "__main__":

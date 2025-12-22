@@ -55,15 +55,15 @@ Raised when an async request fails to complete successfully.
 ## Usage Example
 
 ```python
-import tinker
-from tinker.exceptions import (
+import mint
+from mint.exceptions import (
     AuthenticationError,
     NotFoundError,
     RateLimitError
 )
 
 try:
-    service_client = tinker.ServiceClient()
+    service_client = mint.ServiceClient()
     training_client = service_client.create_lora_training_client(
         base_model="Qwen/Qwen3-8B"
     )
@@ -73,6 +73,6 @@ except NotFoundError:
     print("Model not found")
 except RateLimitError:
     print("Rate limit exceeded, please wait")
-except tinker.TinkerError as e:
+except mint.TinkerError as e:
     print(f"MinT error: {e}")
 ```
