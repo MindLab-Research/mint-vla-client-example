@@ -27,20 +27,14 @@ export MINT_API_KEY=sk-mint-your-key-here
 
 ## Tinker Compatibility
 
-MinT is fully API-compatible with [Tinker](https://tinker.thinkingmachines.ai). You can use the `tinker` package as an alternative:
-
-```bash
-pip install tinker
-```
-
-Configure environment variables to point to the MinT server:
+MinT is fully API-compatible with [Tinker](https://tinker.thinkingmachines.ai). If you already have the `tinker` package installed, you can use it with MinT by setting environment variables:
 
 ```bash
 export TINKER_BASE_URL=https://mint-alpha.macaron.im
 export TINKER_API_KEY=<your-mint-api-key>
 ```
 
-All MinT code works identically with `import tinker` instead of `import mint`.
+All code using `import tinker` will work with MinT without modification.
 
 ## Quickstart
 
