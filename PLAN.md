@@ -68,7 +68,26 @@
 
 ### 2. Resource Orchestration
 
-**Status**: Framework implemented. Refinement needed.
+**Status**: Framework implemented. Critical limitation on MoE multi-tenancy.
+
+#### Critical: MoE max_loras=1 Defeats Multi-Tenancy
+
+**This undermines the core value proposition of the project.**
+
+Currently `multi_lora_engine.py:897` hardcodes `max_loras=1` for MoE models:
+
+```python
+model_max_loras = 1 if config.is_moe else self.max_loras
+```
+
+**Why it exists**: vLLM pre-allocates LoRA buffers for all experts. With 128 experts and default `max_loras=64`, memory explodes: `max_loras × num_experts × lora_rank × hidden_size` per layer.
+
+**Impact**: Only ONE user can run inference on MoE models at a time. Other users must wait for the single LoRA slot. This reduces the multi-tenant server to single-tenant for MoE workloads.
+
+**Required investigation**:
+- Measure actual memory usage per LoRA slot for Qwen3-30B-A3B (128 experts)
+- Determine maximum `max_loras` that fits in 4×A800 80GB (inference config)
+- Test concurrent inference with 2, 4, 8 LoRA adapters
 
 #### Implemented
 
@@ -81,8 +100,8 @@
 
 | Task | Priority | Description |
 |------|----------|-------------|
+| **MoE max_loras** | **Critical** | **Increase from 1. Current setting defeats multi-tenancy.** |
 | Parallelism validation | High | Determine correct TP, EP, DP for each model through intensive testing. Current values may be arbitrary. |
-| Max parallel LoRAs | High | Per-model limit on concurrent LoRA adapters in vLLM engine. |
 | Max LoRA rank | High | Per-model maximum LoRA rank that fits in memory. |
 | Orphaned CUDA memory | Medium | GPU memory not freed when actors crash inside Docker containers. Ray reports GPUs available, but OOM on actor start. Investigate container-level GPU cleanup and volcano platform specifics. |
 
@@ -141,6 +160,22 @@ Architectural design documents for internal reference:
 | Search for "tinker" occurrences across client repos | High |
 | Standardize to "MinT" in all client-facing content | High |
 | Acknowledge Tinker compatibility explicitly | Medium |
+
+#### Application Layer Support
+
+**Current deployment**: GPU cluster → Azure reverse proxy → clients. No dedicated application server.
+
+Missing application server responsibilities (out of scope for this project):
+- Multi-tenant authentication
+- Usage metering and billing
+- Load balancing across GPU clusters
+
+**Required support from this project**:
+
+| Task | Priority | Description |
+|------|----------|-------------|
+| Interface separation | High | Distinguish client-facing endpoints (training, inference) from internal endpoints (kill actor, resource pool status, health checks). Internal endpoints should not be exposed through Azure gateway. |
+| Token metering | High | Measure token usage per request (input tokens, output tokens, training tokens). Define interface to return usage metrics to application server for billing. |
 
 **Naming Policy**: Official name is "MinT" for all client-facing content. Tinker API compatibility is a feature to be documented, not hidden.
 
