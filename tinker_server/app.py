@@ -300,12 +300,12 @@ async def docs_slash_redirect():
     return RedirectResponse(url="/doc/", status_code=302)
 
 
-# Mount documentation static files at /doc/
+# Mount documentation static files
 # Use MINT_DOC_PATH env var to override the default path
 _doc_path = os.environ.get("MINT_DOC_PATH", str(Path(__file__).parent.parent / "mint-doc" / "out"))
 if Path(_doc_path).exists():
-    app.mount("/doc/", StaticFiles(directory=_doc_path, html=True), name="documentation")
-    logger.info(f"Documentation mounted at /doc/ from {_doc_path}")
+    app.mount("/doc", StaticFiles(directory=_doc_path, html=True), name="documentation")
+    logger.info(f"Documentation mounted at /doc from {_doc_path}")
 else:
     logger.warning(f"Documentation directory not found at {_doc_path}, /doc will not be available")
 

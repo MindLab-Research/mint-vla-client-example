@@ -8,6 +8,7 @@ const withNextra = nextra({
 export default withNextra({
   output: 'export',
   basePath: '/doc',
+  trailingSlash: true,
   images: {
     unoptimized: true
   }
