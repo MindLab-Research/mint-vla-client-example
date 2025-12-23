@@ -251,22 +251,57 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # =============================================================================
 
 
+class KillVLLMRequest(BaseModel):
+    """Request to kill a vLLM actor."""
+
+    model_name: str | None = None  # If None, kills default actor; if set, kills that model's actor
+
+
 @router.post("/kill_vllm")
-async def kill_vllm() -> dict:
-    """Kill the persistent vLLM actor.
+async def kill_vllm(request: KillVLLMRequest | None = None) -> dict:
+    """Kill a vLLM actor.
 
     Use this to force a full restart of the vLLM engine.
     The next request that needs vLLM will create a new actor (~80s init).
+
+    Args:
+        model_name: If provided, kills the vLLM actor for that specific model.
+                   If None, kills the default actor.
 
     This is useful when:
     - You need to reload the base model
     - vLLM is in a bad state
     - You want to free GPU memory
     """
-    from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+    model_name = request.model_name if request else None
 
-    killed = kill_persistent_vllm_actor()
-    return {"killed": killed, "message": "vLLM actor killed" if killed else "No vLLM actor found"}
+    if model_name:
+        # Kill specific model's vLLM actor
+        if session_manager is None:
+            return {"killed": False, "message": "Session manager not initialized"}
+
+        multi_model_manager = session_manager.get_multi_model_manager()
+        if multi_model_manager is None:
+            return {"killed": False, "message": "Multi-model manager not initialized"}
+
+        engine = multi_model_manager.get_engine_if_exists(model_name)
+        if engine is None:
+            return {"killed": False, "message": f"No vLLM engine found for model: {model_name}"}
+
+        try:
+            await engine.shutdown(kill_actor=True)
+            # Remove from manager's cache
+            if model_name in multi_model_manager._engines:
+                del multi_model_manager._engines[model_name]
+            return {"killed": True, "message": f"vLLM actor for {model_name} killed"}
+        except Exception as e:
+            return {"killed": False, "message": f"Error killing actor: {e}"}
+    else:
+        # Kill default actor
+        from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+
+        killed = kill_persistent_vllm_actor()
+        return {"killed": killed, "message": "vLLM actor killed" if killed else "No vLLM actor found"}
 
 
 @router.get("/vllm_status")
@@ -376,3 +411,16 @@ async def clear_resource_pool() -> dict:
     pool = get_resource_pool()
     count = pool.clear(kill_actors=False)
     return {"cleared": count, "message": f"Cleared {count} entries from resource pool"}
+
+
+@router.post("/kill_all_actors")
+async def kill_all_actors() -> dict:
+    """Kill all actors and clear the resource pool.
+
+    Use this to free all GPUs when actors are stuck or not being evicted properly.
+    """
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    count = pool.clear(kill_actors=True)
+    return {"killed": count, "message": f"Killed {count} actors and freed GPUs"}

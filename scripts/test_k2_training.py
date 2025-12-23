@@ -21,6 +21,8 @@ import time
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 K2_MODEL = "moonshotai/Kimi-K2-Thinking"
+# Local path for offline tokenizer loading (Volcano has no internet)
+K2_MODEL_PATH = "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd"
 
 HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
@@ -79,18 +81,33 @@ def create_session(model: str, lora_rank: int = 32, lr: float = 1e-4):
 
 
 def train_step(model_id: str, data: list, lr: float = 1e-4):
-    """Run one training step."""
+    """Run one training step using combined forward-backward + optim step API."""
     resp = requests.post(
         f"{BASE_URL}/api/v1/train_step",
         json={
             "model_id": model_id,
-            "data": data,
-            "hyperparameters": {"lr": lr},
-            "loss_fn": "cross_entropy",
+            "forward_backward_input": {
+                "data": data,
+                "loss_fn": "cross_entropy",
+            },
+            "adam_params": {
+                "learning_rate": lr,
+                "beta1": 0.9,
+                "beta2": 0.95,
+                "eps": 1e-12,
+            },
         },
         headers=HEADERS,
         timeout=300,
     )
+
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    # Async endpoint - poll for result
+    request_id = resp.json().get("request_id")
+    if request_id:
+        return poll_future(request_id, timeout=600)
     return resp.json()
 
 
@@ -125,11 +142,12 @@ def main():
     prompt = "Q: What is 2+2?\nA: "
     target = "4"
 
-    # K2 uses same tokenizer as Qwen3
+    # K2 uses same tokenizer as Qwen3 (use local path for offline environment)
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        "moonshotai/Kimi-K2-Thinking",
+        K2_MODEL_PATH,
         trust_remote_code=True,
+        local_files_only=True,
     )
 
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)

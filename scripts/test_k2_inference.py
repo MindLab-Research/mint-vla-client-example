@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Test Kimi K2 inference with vLLM (TP=8).
+"""Test Kimi K2 inference with vLLM (TP=16 multi-node for LoRA support).
 
-K2 inference requires TP=8 = 8 GPUs minimum.
-This test verifies vLLM can load and serve K2 without training.
+K2 inference with LoRA requires TP=16 = 16 GPUs across 2 nodes.
+TP=8 OOMs when allocating LoRA buffers for 384 experts.
+LoRA is REQUIRED for weight transfer from training to inference.
 
 NOTE: K2 training requires 64 GPUs (TP=8, EP=8) due to FP8 conversion memory.
-This test only verifies inference works on 8 GPUs.
 """
 
 import os
@@ -19,6 +19,8 @@ BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 
 K2_MODEL = "moonshotai/Kimi-K2-Thinking"
+# Local path for offline tokenizer loading (Volcano has no internet)
+K2_MODEL_PATH = "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd"
 
 
 def get_headers():
@@ -52,7 +54,8 @@ def create_sampling_session(base_model: str) -> str:
     print(f"Creating sampling session: {session_id}")
     print(f"Base model: {base_model}")
 
-    resp = requests.post(url, json=payload, headers=get_headers(), timeout=300)
+    # K2 model loading takes ~20-30 minutes for 62 shards at ~22s/shard
+    resp = requests.post(url, json=payload, headers=get_headers(), timeout=1800)
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
 
@@ -64,9 +67,9 @@ def create_sampling_session(base_model: str) -> str:
 
 def sample(sampling_session_id: str, prompt: str, max_tokens: int = 50, temperature: float = 0.7) -> dict:
     """Sample from model."""
-    # First tokenize the prompt
+    # First tokenize the prompt (use local path for offline environment)
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(K2_MODEL, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(K2_MODEL_PATH, trust_remote_code=True, local_files_only=True)
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
 
     url = f"{BASE_URL}/api/v1/asample"
@@ -87,10 +90,11 @@ def sample(sampling_session_id: str, prompt: str, max_tokens: int = 50, temperat
 
 def main():
     print("=" * 70)
-    print("Kimi K2 Inference Test (vLLM, TP=8)")
+    print("Kimi K2 Inference Test (vLLM, TP=16 multi-node for LoRA)")
     print("=" * 70)
     print(f"Model: {K2_MODEL}")
-    print(f"Config: TP=8, DP=1 (8 GPUs)")
+    print(f"Config: TP=16 across 2 nodes (16 GPUs) - LoRA ENABLED for weight transfer")
+    print("Uses MultiNodeInferenceEngine with vLLM's native Ray distributed backend")
     print()
 
     # Check vLLM status first
@@ -128,9 +132,9 @@ def main():
             print(f"FAILED: {result['error']}")
             return 1
 
-        # Decode output
+        # Decode output (use local path for offline environment)
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(K2_MODEL, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(K2_MODEL_PATH, trust_remote_code=True, local_files_only=True)
 
         sequences = result.get("sequences", [])
         if sequences:
@@ -157,7 +161,7 @@ def main():
     print(f"Sampling: {'OK' if sample_ok else 'FAILED'}")
 
     if sample_ok:
-        print("\nK2 vLLM inference (TP=8): WORKING")
+        print("\nK2 vLLM inference (TP=16, LoRA enabled): WORKING")
         return 0
     else:
         print("\nK2 vLLM inference: FAILED")

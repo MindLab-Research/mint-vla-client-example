@@ -70,17 +70,30 @@ async def _cleanup_stale_actors() -> None:
                     ray.get(actor.__ray_ready__.remote(), timeout=2)
 
                     # Actor is alive - register it with ResourcePool
-                    # Determine actor type and GPU count from name
-                    if name.startswith("tinker_vllm_"):
+                    # Determine actor type and GPU count from name/diagnostics
+                    if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
-                        # vLLM GPU count depends on model - default 1, could query actor
-                        num_gpus = 1  # Most models use 1 GPU
+                        # vLLM GPU count depends on model - query actor for accurate count
+                        try:
+                            # MultiNodeVLLMEngine has tensor_parallel_size attribute
+                            if hasattr(actor, "tensor_parallel_size"):
+                                num_gpus = ray.get(getattr(actor, "tensor_parallel_size").remote(), timeout=5)
+                            else:
+                                num_gpus = 1  # Single-node default
+                        except Exception:
+                            num_gpus = 1
                     elif name.startswith("dense_trainer_pool_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
-                    elif name.startswith("persistent_megatron"):
+                    elif name.startswith("megatron_"):
+                        # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
-                        num_gpus = 8  # MoE uses 8 GPUs
+                        # Query actual GPU count from diagnostics
+                        try:
+                            diag = ray.get(actor.get_diagnostics.remote(), timeout=10)
+                            num_gpus = diag.get("world_size", 8)
+                        except Exception:
+                            num_gpus = 8  # Default fallback
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue

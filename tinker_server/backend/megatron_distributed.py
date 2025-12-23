@@ -1051,25 +1051,10 @@ class MegatronRankWorker:
         # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
         # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
         #
-        # NOTE: vLLM 0.13.0+ supports expert LoRA for MoE models via FusedMoEWithLoRA.
-        # MLP/expert modules are now included in the exported LoRA state_dict.
-        def _is_mlp_module(param_name: str) -> bool:
-            """Check if parameter is from MLP/expert layer."""
-            mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
-                           'gate_proj', 'up_proj', 'down_proj']
-            name_lower = param_name.lower()
-            return any(p in name_lower for p in mlp_patterns)
-
-        # Check if model is MoE - if so, filter MLP modules
-        # vLLM's FusedMoEWithLoRA expects per-expert LoRA weights, but Megatron exports
-        # shared LoRA (single adapter for all experts). This causes weight format mismatch.
-        # Solution: Only export attention modules for MoE models.
-        model_is_moe = is_moe_model(self.base_model)
-        if model_is_moe:
-            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (vLLM weight format incompatible)")
+        # All modules (attention + MLP) are exported for both MoE and Dense models.
+        # vLLM 0.13.0+ supports expert LoRA via FusedMoEWithLoRA.
 
         lora_state_dict = {}
-        mlp_filtered_count = 0
         logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
             # Add PEFT prefix if not already present
@@ -1084,16 +1069,9 @@ class MegatronRankWorker:
                     logger.warning(f"Could not convert to PEFT: {name}")
                     continue
 
-            # For MoE models, filter out MLP/expert modules
-            if model_is_moe and _is_mlp_module(peft_name):
-                mlp_filtered_count += 1
-                continue
-
             lora_state_dict[peft_name] = tensor
 
-        if model_is_moe:
-            logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, attention-only for MoE)")
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, all modules)")
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:3]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
@@ -1925,15 +1903,21 @@ class MegatronWorkerGroup:
 
     def get_lora_config(self) -> dict:
         """Get LoRA configuration as dictionary.
-        
+
         Returns:
             PEFT config dict compatible with vLLM's PEFTHelper.
+
+        All modules (attention + MLP) are exported for both MoE and Dense models.
+        vLLM 0.13.0+ supports expert LoRA via FusedMoEWithLoRA.
         """
+        # All modules for both MoE and dense models
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
         return {
             "r": self.lora_rank,
             "lora_alpha": self.lora_rank * 2,
             "lora_dropout": 0.0,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
             "peft_type": "LORA",

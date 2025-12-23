@@ -95,3 +95,4 @@ Agent mistakes that wasted time. Read this before starting any task.
 | 2024-12-18 | Ran merge gate tests when user explicitly asked for K2 work | Focus on the requested task. Do not divert to "system health checks" unless specifically asked. |
 | 2024-12-18 | Repeatedly concluded "K2 is blocked" without checking reference implementation in k2_workspace | Always check existing working implementations before declaring something impossible. |
 | 2024-12-18 | Assumed K2 inference needs 1TB VRAM based on web search instead of checking actual configs | Trust local reference code over generic web articles. |
+| 2024-12-23 | After K2 RL loop succeeded, ran Qwen2.5-7B cookbook instead of K2 12-hour training | User said "run K2 for 12 hours". Run K2, not a different model. Read the request literally. |
