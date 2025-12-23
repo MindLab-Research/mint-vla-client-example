@@ -26,11 +26,13 @@ from tinker.lib.public_interfaces.service_client import ServiceClient
 def main():
     print(f"Connecting to: {os.environ.get('TINKER_BASE_URL')}")
 
+    # Test model - uses same model for tokenizer and sampling
+    base_model = "Qwen/Qwen2.5-7B-Instruct"
+
     # Load tokenizer for decoding
     print("\nLoading tokenizer...")
     from transformers import AutoTokenizer
-    model_path = os.environ.get("TINKER_MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
 
     # Create service client
     client = ServiceClient()
@@ -39,7 +41,7 @@ def main():
     # Create sampling client
     print("\nCreating SamplingClient...")
     sampling_client = client.create_sampling_client(
-        base_model="Qwen/Qwen2.5-7B-Instruct"
+        base_model=base_model
     )
     print(f"SamplingClient created, sampling_session_id: {sampling_client._sampling_session_id}")
 

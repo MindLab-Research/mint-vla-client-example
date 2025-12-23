@@ -537,7 +537,9 @@ async def _do_save_weights_for_sampler(
                 )
             else:
                 # Fallback: Per-session engine mode (legacy)
+                # This path is used when multi-LoRA engine creation fails
                 from ..backend.verl_inference import VerlInferenceEngine
+                from ..backend.multi_lora_engine import _resolve_model_path
 
                 if session.inference_engine is None:
                     # First call: Create dedicated inference engine
@@ -547,8 +549,11 @@ async def _do_save_weights_for_sampler(
                     )
                     start_time = time.time()
 
+                    # Resolve model path and use session's base_model
+                    resolved_model_path = _resolve_model_path(base_model)
+
                     engine = VerlInferenceEngine(
-                        model_path=inference_manager.model_path,
+                        model_path=resolved_model_path,
                         tensor_parallel_size=inference_manager.tensor_parallel_size,
                         data_parallel_size=inference_manager.data_parallel_size,
                         gpu_memory_utilization=inference_manager.gpu_memory_utilization,

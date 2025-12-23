@@ -55,7 +55,6 @@ class SessionManager:
 
     def __init__(
         self,
-        model_path: str,
         tensor_parallel_size: int = 1,
         data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
@@ -63,7 +62,6 @@ class SessionManager:
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
         shared_engine_lora_rank: int = 32,
     ):
-        self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
         self.data_parallel_size = data_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization

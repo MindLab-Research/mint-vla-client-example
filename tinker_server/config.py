@@ -32,8 +32,7 @@ class ServerConfig:
     # Authentication
     api_key: str = ""  # If empty, auth disabled; if set, all endpoints require it
 
-    # Model settings
-    model_path: str = "Qwen/Qwen2.5-7B-Instruct"
+    # Model settings (no default model - clients specify per-request)
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1  # For MoE: EP = TP * DP
     gpu_memory_utilization: float = 0.9
@@ -55,7 +54,6 @@ class ServerConfig:
             host=os.environ.get("TINKER_HOST", "0.0.0.0"),
             port=int(os.environ.get("TINKER_PORT", "8000")),
             api_key=api_key,
-            model_path=os.environ.get("TINKER_MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct"),
             tensor_parallel_size=int(os.environ.get("TINKER_TP_SIZE", "1")),
             data_parallel_size=int(os.environ.get("TINKER_DP_SIZE", "1")),
             gpu_memory_utilization=float(os.environ.get("TINKER_GPU_MEM_UTIL", "0.9")),

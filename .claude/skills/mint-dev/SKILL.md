@@ -14,6 +14,22 @@ description: |
 
 # Mint Development Environment
 
+> **STOP. USE THESE COMMANDS EXACTLY.**
+>
+> Do NOT guess SSH hosts, log locations, or process names. Everything is documented below.
+>
+> | Task | Command |
+> |------|---------|
+> | SSH to server | `ssh volcano` (NOT direct IP) |
+> | Server logs | `ssh volcano "tail -50 /tmp/tinker_server.log"` |
+> | Health check | `curl http://localhost:8000/api/v1/healthz` |
+> | Restart server | See "Start Server" section below |
+> | Kill vLLM | `curl -X POST http://localhost:8000/api/v1/kill_vllm` |
+>
+> If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
+
+---
+
 ## NEVER Do These (Production Belongs to mint-prod)
 
 - **NEVER** `ssh mint-prod` - that's production
@@ -39,6 +55,24 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 | Ray Configs | `mint-dev-head.yaml`, `mint-dev-worker.yaml` |
 | API Key | Not required (auth disabled when `TINKER_API_KEY` unset) |
 | Log File | `/tmp/tinker_server.log` |
+
+---
+
+## Finding the Server Process
+
+**Always verify the actual log file location before tailing logs:**
+
+```bash
+# Find server process
+ssh volcano 'ps aux | grep run_server | grep -v grep'
+
+# Check where stdout goes (actual log file)
+ssh volcano 'ls -la /proc/<PID>/fd/1'
+
+# Example output: /proc/12345/fd/1 -> /tmp/tinker_server.log
+```
+
+The log file is typically `/tmp/tinker_server.log`, but verify with the above if logs seem stale.
 
 ---
 
@@ -108,8 +142,9 @@ export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
-export TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
 ```
+
+**Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
 
 ### Start Server
 
@@ -118,7 +153,6 @@ ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
   "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
-   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
    python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 ```
 
@@ -194,7 +228,6 @@ ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
   "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
-   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
    python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 ```
 
@@ -210,7 +243,6 @@ ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
   "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
-   TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
    python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 
 # Wait for vLLM init (~80s)
@@ -321,6 +353,33 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 
 ---
 
+## 8. Running Test Scripts
+
+> **CRITICAL: Test Scripts Run LOCALLY, Not on Server**
+>
+> Test scripts that use HTTP API (pytest, test_client.py, etc.) run on your LOCAL machine.
+> Local machine has internet access for downloading tokenizers from HuggingFace Hub.
+>
+> **Do NOT:**
+> - Run test scripts on the server (no internet for tokenizer downloads)
+> - Set `HF_HUB_OFFLINE=1` or `HF_HOME=/vePFS-...` for test scripts
+>
+> **Server commands** (ssh volcano '...') need HF_HUB_OFFLINE because the server has no internet.
+> **Test commands** run locally and download tokenizers automatically.
+
+```bash
+# Ensure SSH tunnel is active
+ssh -f -N -L 8000:localhost:8000 volcano
+
+# Run test script LOCALLY (downloads tokenizer from HuggingFace)
+TINKER_BASE_URL=http://localhost:8000 python scripts/test_client.py
+
+# Run merge gate tests LOCALLY
+TINKER_BASE_URL=http://localhost:8000 python -m pytest .claude/skills/merge-gate/tests/ -v
+```
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -332,3 +391,4 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 | vLLM OOM | Kill vLLM actor, restart server |
 | Pending placement groups | Not enough GPUs. Kill stale actors (see section 6) |
 | MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
+| Tokenizer download fails | Run test script locally, not on server (server has no internet) |

@@ -35,14 +35,20 @@ from tinker_server.config import PFS_PYTHONPATH
 # =====================================================================
 
 class SessionStateManager:
-    """Manages session state (LoRA weights + optimizer) for stateless trainers.
+    """Manages session state (LoRA weights + optimizer + gradients) for stateless trainers.
 
     Enables multiple sessions to share a single trainer by loading/saving
     state per iteration. Each session has its own checkpoint directory.
 
+    Full session state tuple:
+        - LoRA weights (theta): trainable adapter parameters
+        - Gradients (grad theta): accumulated gradients for gradient accumulation
+        - Optimizer state: Adam momentum (exp_avg) and variance (exp_avg_sq)
+
     Storage layout:
         {base_path}/{session_id}_checkpoint/
             adapter_model.safetensors  # LoRA weights
+            gradients.pt               # Accumulated gradients (optional)
             optimizer.pt               # Adam state (exp_avg, exp_avg_sq)
             training_meta.json         # step count, learning_rate
     """
@@ -78,8 +84,9 @@ class SessionStateManager:
         step: int,
         lr: float,
         device: torch.device,
+        save_gradients: bool = True,
     ) -> str:
-        """Save session state (LoRA weights + optimizer + metadata).
+        """Save session state (LoRA weights + optimizer + gradients + metadata).
 
         Args:
             session_id: Unique session identifier.
@@ -88,6 +95,7 @@ class SessionStateManager:
             step: Current training step.
             lr: Current learning rate.
             device: Device for tensor operations.
+            save_gradients: If True, save accumulated gradients for later restoration.
 
         Returns:
             Absolute path to saved checkpoint.
@@ -110,7 +118,22 @@ class SessionStateManager:
         # 2. Save optimizer state
         torch.save(optimizer.state_dict(), os.path.join(session_path, "optimizer.pt"))
 
-        # 3. Save metadata
+        # 3. Save gradients (for gradient accumulation across session switches)
+        if save_gradients:
+            grads = {}
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    grads[name] = param.grad.cpu().clone()
+            if grads:
+                torch.save(grads, os.path.join(session_path, "gradients.pt"))
+                logger.debug(f"[SessionStateManager] Saved {len(grads)} gradient tensors for {session_id}")
+            else:
+                # Remove old gradients file if no gradients to save
+                grads_path = os.path.join(session_path, "gradients.pt")
+                if os.path.exists(grads_path):
+                    os.remove(grads_path)
+
+        # 4. Save metadata
         meta = {"current_step": step, "learning_rate": lr}
         with open(os.path.join(session_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -124,6 +147,7 @@ class SessionStateManager:
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        load_gradients: bool = True,
     ) -> dict:
         """Load session state into model/optimizer.
 
@@ -132,9 +156,10 @@ class SessionStateManager:
             model: PEFT model to load weights into.
             optimizer: Optimizer to load state into.
             device: Device for tensor operations.
+            load_gradients: If True, restore accumulated gradients.
 
         Returns:
-            Dict with metadata (current_step, learning_rate).
+            Dict with metadata (current_step, learning_rate, has_gradients).
 
         Raises:
             FileNotFoundError: If session checkpoint doesn't exist.
@@ -162,14 +187,33 @@ class SessionStateManager:
                 torch.load(optimizer_path, map_location=device, weights_only=True)
             )
 
-        # 3. Load metadata
-        meta = {"current_step": 0, "learning_rate": optimizer.param_groups[0]["lr"]}
+        # 3. Load gradients (for gradient accumulation across session switches)
+        has_gradients = False
+        if load_gradients:
+            grads_path = os.path.join(session_path, "gradients.pt")
+            if os.path.exists(grads_path):
+                grads = torch.load(grads_path, map_location=device, weights_only=True)
+                grad_count = 0
+                for name, param in model.named_parameters():
+                    if name in grads:
+                        if param.grad is None:
+                            param.grad = grads[name].to(device)
+                        else:
+                            param.grad.copy_(grads[name])
+                        grad_count += 1
+                has_gradients = grad_count > 0
+                logger.debug(f"[SessionStateManager] Restored {grad_count} gradient tensors for {session_id}")
+
+        # 4. Load metadata
+        meta = {"current_step": 0, "learning_rate": optimizer.param_groups[0]["lr"], "has_gradients": has_gradients}
         meta_path = os.path.join(session_path, "training_meta.json")
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
-                meta = json.load(f)
+                loaded_meta = json.load(f)
+                meta.update(loaded_meta)
+                meta["has_gradients"] = has_gradients
 
-        logger.debug(f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)})")
+        logger.debug(f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)}, has_gradients={has_gradients})")
         return meta
 
     def delete_session(self, session_id: str) -> bool:
@@ -295,28 +339,48 @@ class TrainingWorker:
         Args:
             session_id: Session ID to load state for.
         """
+        print(f"[DEBUG] _ensure_session_loaded: current={self._current_session_id}, target={session_id}", flush=True)
+
         if self._current_session_id == session_id:
             # Already loaded
+            print(f"[DEBUG] Session {session_id} already loaded, no switch needed", flush=True)
             return
 
-        # If we have a current session, its state should already be saved
-        # (save happens at end of optim_step)
+        # Save outgoing session's state INCLUDING gradients
+        # This is critical for gradient accumulation across session switches
+        if self._current_session_id is not None:
+            # Check current gradient state before saving
+            grad_count = sum(1 for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None)
+            grad_norm = sum((p.grad.norm().item() ** 2) for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None) ** 0.5
+            print(f"[DEBUG] Saving session {self._current_session_id}: {grad_count} grads, norm={grad_norm:.4f}", flush=True)
+
+            lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
+            self._state_manager.save_state(
+                self._current_session_id, self.model, self.optimizer,
+                self._step_count, lr, self.device, save_gradients=True
+            )
+            print(f"[DEBUG] Saved outgoing session {self._current_session_id} before switch", flush=True)
 
         # Load new session's state
         if self._state_manager.session_exists(session_id):
             meta = self._state_manager.load_state(
-                session_id, self.model, self.optimizer, self.device
+                session_id, self.model, self.optimizer, self.device, load_gradients=True
             )
             self._step_count = meta.get("current_step", 0)
             # Update learning rate if saved
             if "learning_rate" in meta:
                 for pg in self.optimizer.param_groups:
                     pg["lr"] = meta["learning_rate"]
-            logger.info(f"[TrainingWorker] Loaded session {session_id} (step={self._step_count})")
+            # Check actual gradient state after loading
+            grad_count = sum(1 for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None)
+            grad_norm = sum((p.grad.norm().item() ** 2) for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None) ** 0.5
+            print(f"[DEBUG] Loaded session {session_id}: step={self._step_count}, actual_grads={grad_count}, norm={grad_norm:.4f}", flush=True)
         else:
-            # New session: reinitialize weights
+            # New session: reinitialize weights and zero gradients
             self.reinit_lora_weights()
-            logger.info(f"[TrainingWorker] New session {session_id}, initialized fresh weights")
+            self.optimizer.zero_grad()
+            self._step_count = 0
+            print(f"[DEBUG] New session {session_id}, initialized fresh weights", flush=True)
 
         self._current_session_id = session_id
 
@@ -324,13 +388,15 @@ class TrainingWorker:
         """Save current session state to disk.
 
         Called at the end of optim_step to persist state.
+        Note: Gradients are NOT saved here because optim_step zeros them.
 
         Args:
             session_id: Session ID to save state for.
         """
         lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
         self._state_manager.save_state(
-            session_id, self.model, self.optimizer, self._step_count, lr, self.device
+            session_id, self.model, self.optimizer, self._step_count, lr, self.device,
+            save_gradients=False  # Gradients already applied and zeroed
         )
         logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
@@ -793,6 +859,11 @@ class TrainingWorker:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = learning_rate
 
+        # Log gradient state before applying update
+        grad_count = sum(1 for p in self.model.parameters() if p.requires_grad and p.grad is not None)
+        pre_clip_norm = sum((p.grad.norm().item() ** 2) for p in self.model.parameters() if p.requires_grad and p.grad is not None) ** 0.5
+        print(f"[DEBUG] optim_step: {grad_count} grads, pre_clip_norm={pre_clip_norm:.4f}", flush=True)
+
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -1248,9 +1319,8 @@ class VerlTrainingEngine:
         default_base_model: str | None = None,
         default_lora_rank: int = 32,
     ):
-        # Use config model_path if not specified (supports local paths)
-        from ..config import config
-        self.default_base_model = default_base_model or config.model_path
+        # No default model - clients specify per-request
+        self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
 
