@@ -235,3 +235,25 @@ def make_dpo_datum(input_tokens: list, target_tokens: list, loss_mask: list,
             "is_chosen": is_chosen,
         },
     }
+
+
+# =============================================================================
+# Checkpoint APIs
+# =============================================================================
+
+def save_state(model_id: str, name: str = "checkpoint") -> dict:
+    """Save full checkpoint (LoRA + optimizer state) for training resume."""
+    url = f"{BASE_URL}/api/v1/save_state"
+    payload = {"model_id": model_id, "path": name}
+    resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+    resp.raise_for_status()
+    return poll_future(resp.json().get("request_id"), timeout=300)
+
+
+def load_state(model_id: str, path: str, load_optimizer: bool = True) -> dict:
+    """Load checkpoint to resume training."""
+    url = f"{BASE_URL}/api/v1/load_state"
+    payload = {"model_id": model_id, "path": path, "optimizer": load_optimizer}
+    resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+    resp.raise_for_status()
+    return poll_future(resp.json().get("request_id"), timeout=120)

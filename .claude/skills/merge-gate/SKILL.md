@@ -531,6 +531,73 @@ gh pr create --base main --head develop --title "Release: <version>" --body-file
 
 ---
 
+## Error Analysis Protocol
+
+**CRITICAL: When errors occur, use sequential thinking to carefully distinguish between implementation issues and test suite issues.**
+
+### Step-by-Step Analysis
+
+When a test fails, follow this protocol:
+
+1. **Identify the failure point**: What exact error message? What operation failed?
+
+2. **Check if it's an infrastructure issue**:
+   - Connection timeout → Server down? Network issue?
+   - GPU OOM → Need to kill stale actors?
+   - Resource unavailable → Cluster has insufficient GPUs?
+
+3. **Check if it's a test design issue**:
+   - High correlation flagged as "shared state" but initial/final losses are different → Task too easy, not a bug
+   - Loss didn't decrease enough → Is the threshold realistic? Is the training data appropriate?
+   - Test timeout → Is the timeout reasonable for this operation?
+
+4. **Check if it's an implementation bug**:
+   - CUDA memory corruption → Code accessing GPU tensors outside correct context?
+   - Gradients zero or NaN → Loss function or gradient flow issue?
+   - Session state contamination → State management bug?
+
+### Example Analysis with Sequential Thinking
+
+```
+Observation: MoE test shows correlation=0.927, flagged as "possible shared state"
+
+Step 1: Check initial losses
+- Session A: 0.9713
+- Session B: 1.0810
+- DIFFERENT → Sessions started independently ✓
+
+Step 2: Check final losses
+- Session A: 0.2361
+- Session B: 0.1386
+- DIFFERENT → Sessions ended independently ✓
+
+Step 3: Check reduction rates
+- Session A: 75.7%
+- Session B: 87.2%
+- DIFFERENT → Learning at different rates ✓
+
+Conclusion: NOT a shared state bug. High correlation is because both sessions
+successfully learned similar tasks. The anomaly detection correctly flagged
+a pattern worth reviewing, but analysis shows implementation is correct.
+```
+
+### When to Suspect Implementation Bug
+
+- Initial losses are **identical** across sessions (should differ with different seeds)
+- One session's update immediately affects another session's loss
+- CUDA errors when switching between sessions
+- Gradients are zero when they should have values
+- Loss is NaN or Inf
+
+### When to Suspect Test Design Issue
+
+- High correlation but initial/final losses differ (task too easy)
+- Loss doesn't decrease but training runs without error (data or hyperparameters)
+- Timeout on operation that normally succeeds (timeout too short)
+- Anomaly flagged but pattern matches expected behavior
+
+---
+
 ## Known Limitations
 
 ### MoE LoRA Inference
