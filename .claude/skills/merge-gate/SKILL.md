@@ -193,10 +193,23 @@ Stress test configurations:
 
 ## Running the Tests
 
+> **CRITICAL: Tests Run LOCALLY, Not on Server**
+>
+> All pytest commands run on your LOCAL machine (which has internet access for tokenizer downloads).
+> Tests connect to the server via SSH tunnel (localhost:8000 → volcano:8000).
+>
+> **Do NOT:**
+> - Run pytest on the server (no internet for tokenizer downloads)
+> - Set `HF_HUB_OFFLINE=1` or `HF_HOME=/vePFS-...` for test scripts
+>
+> **Server commands** (ssh volcano '...') set HF_HUB_OFFLINE because the server has no internet.
+> **Test commands** (python -m pytest) run locally and download tokenizers from HuggingFace Hub.
+
 ### Complete Merge Gate
 
 ```bash
-# Ensure 8 GPUs available (one 8-GPU worker)
+# Run from LOCAL machine (has internet for tokenizer downloads)
+# Ensure SSH tunnel is active: ssh -f -N -L 8000:localhost:8000 volcano
 cd /home/yiwen/tinker_project/tinker-server
 
 # Run all functional tests (do NOT kill actors between)
@@ -215,7 +228,6 @@ ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-
   nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 MINT_MIN_ACTOR_AGE=0 \
-  TINKER_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct \
   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 
 # Wait for server to start

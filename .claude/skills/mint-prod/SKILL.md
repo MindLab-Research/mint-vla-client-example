@@ -14,6 +14,22 @@ description: |
 
 # Mint Production Environment
 
+> **STOP. USE THESE COMMANDS EXACTLY.**
+>
+> Do NOT guess SSH hosts, log locations, or process names. Everything is documented below.
+>
+> | Task | Command |
+> |------|---------|
+> | SSH to server | `ssh mint-prod` (NOT `volcano`, NOT direct IP) |
+> | Server logs | `ssh mint-prod "tail -50 /tmp/tinker_server_auth.log"` |
+> | Health check | `curl http://localhost:18000/api/v1/healthz` |
+> | Stop server | `ssh mint-prod 'fuser -k 18000/tcp'` (NOT pkill) |
+> | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm` |
+>
+> If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
+
+---
+
 ## NEVER Do These (Development Belongs to mint-dev)
 
 - **NEVER** `ssh volcano` - that's development
@@ -35,6 +51,7 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 |----------|-------|
 | SSH Host | `mint-prod` |
 | Port | 18000 |
+| External URL | `https://mint-alpha.macaron.im` |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
 | Unison Profile | `volcano-tinker-auth` |
@@ -42,7 +59,27 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
+**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint-alpha.macaron.im`. No additional setup required.
+
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
+
+---
+
+## Finding the Server Process
+
+**Always verify the actual log file location before tailing logs:**
+
+```bash
+# Find server process
+ssh mint-prod 'ps aux | grep run_server | grep -v grep'
+
+# Check where stdout goes (actual log file)
+ssh mint-prod 'ls -la /proc/<PID>/fd/1'
+
+# Example output: /proc/31501/fd/1 -> /tmp/tinker_server_auth.log
+```
+
+The log file is typically `/tmp/tinker_server_auth.log`, but verify with the above if logs seem stale.
 
 ---
 
@@ -106,12 +143,13 @@ export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH
-export TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
 export TINKER_API_KEY=<API_KEY>
 export TINKER_PORT=18000
 ```
 
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
+
+**Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
 
 ### Start Server
 
@@ -121,7 +159,6 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
   HF_HUB_OFFLINE=1 \
   HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
   TINKER_API_KEY=<API_KEY> \
   TINKER_PORT=18000 \
   python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
@@ -202,7 +239,6 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
   HF_HUB_OFFLINE=1 \
   HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
   TINKER_API_KEY=<API_KEY> \
   TINKER_PORT=18000 \
   python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
@@ -221,7 +257,6 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
   HF_HUB_OFFLINE=1 \
   HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_MODEL_PATH=/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
   TINKER_API_KEY=<API_KEY> \
   TINKER_PORT=18000 \
   python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'

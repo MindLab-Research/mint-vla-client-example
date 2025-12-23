@@ -7,17 +7,16 @@ Tests:
 3. Full forward_backward_custom workflow simulation
 
 Usage:
-    TINKER_MODEL_PATH=/path/to/model python scripts/test_custom_loss.py
+    python scripts/test_custom_loss.py
 """
 
 import os
 import time
 import requests
 
-MODEL_PATH = os.environ.get(
-    "TINKER_MODEL_PATH",
-    "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
-)
+# Default test model (Dense, PEFT backend)
+DEFAULT_MODEL = "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
+MODEL_PATH = DEFAULT_MODEL
 BASE_URL = "http://localhost:8000/api/v1"
 
 

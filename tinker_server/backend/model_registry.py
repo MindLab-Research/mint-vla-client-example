@@ -58,6 +58,9 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
     ),
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+    ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
     # Memory constraint: TE builds BF16 weights then converts to FP8.
@@ -158,6 +161,11 @@ def is_supported_model(model_name: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def list_supported_models() -> list[str]:
+    """Return list of all supported model names."""
+    return list(MODEL_CONFIGS.keys())
 
 
 def is_moe_model(model_name: str) -> bool:
