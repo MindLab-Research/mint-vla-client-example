@@ -42,7 +42,7 @@ def main():
     )
 
     # Configuration
-    base_model = os.environ.get("TINKER_MODEL_PATH", DEFAULT_MODEL)
+    base_model = DEFAULT_MODEL
     lora_rank = 8
     learning_rate = 1e-4
     # MoE requires multiple GPUs with expert parallelism

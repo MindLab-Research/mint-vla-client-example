@@ -515,17 +515,24 @@ class MultiLoRAInferenceEngine:
             )
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
-            # This allows the server to remain responsive during vLLM initialization (~60-120s for MoE).
+            # MoE models need longer timeout due to larger weights and torch.compile cold starts.
+            from tinker_server.backend.model_registry import is_moe_model
+            try:
+                is_moe = is_moe_model(self.model_path)
+            except ValueError:
+                is_moe = False  # Unknown model, use default timeout
+            launch_timeout = 600 if is_moe else 300  # 10 min for MoE, 5 min for dense
+
             import asyncio
             loop = asyncio.get_event_loop()
-            logger.info(f"Launching vLLM server (non-blocking)...")
+            logger.info(f"Launching vLLM server (non-blocking, timeout={launch_timeout}s)...")
             try:
                 await loop.run_in_executor(
                     None,  # Use default thread pool
-                    lambda: ray.get(self.server.launch_server.remote(), timeout=300)
+                    lambda: ray.get(self.server.launch_server.remote(), timeout=launch_timeout)
                 )
             except ray.exceptions.GetTimeoutError:
-                logger.error(f"vLLM launch timed out after 300s for {self.actor_name}")
+                logger.error(f"vLLM launch timed out after {launch_timeout}s for {self.actor_name}")
                 # Kill the stuck actor
                 try:
                     ray.kill(self.server, no_restart=True)
@@ -812,6 +819,7 @@ def _resolve_model_path(model_name: str) -> str:
         "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
         "Qwen/Qwen3-30B-A3B-Base": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/main",
+        "Qwen/Qwen3-30B-A3B-Thinking-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Thinking-2507/snapshots/main",
         # K2 models (1T params MoE, requires FP8)
         "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
     }

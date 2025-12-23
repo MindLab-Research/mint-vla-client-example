@@ -1,0 +1,60 @@
+# MINT Production Ray GPU Worker (4 GPU) - vLLM Inference
+# Submit with: volc ml_task submit -c mint-prod-worker-4gpu.yaml --output json
+
+TaskName: "mint-prod-worker-4gpu"
+Description: "MINT PRODUCTION - 4 GPU worker for vLLM inference"
+
+Entrypoint: |
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
+  export PYTHONDONTWRITEBYTECODE=1
+
+  # Use PFS verl (has abort_all_requests method, needed for multi-lora)
+  export PYTHONPATH=/vePFS-Mindverse/share/code/verl:$PYTHONPATH
+
+  # Symlink to PFS code (tinker-server-auth for production)
+  rm -rf /root/tinker_project/tinker-server-auth
+  mkdir -p /root/tinker_project
+  ln -s /vePFS-Mindverse/share/code/tinker-server-auth /root/tinker_project/tinker-server-auth
+
+  echo "=== MINT PRODUCTION WORKER (4 GPU) ==="
+  echo "Started at $(date)"
+  echo "Using PFS code via symlink:"
+  ls -la /root/tinker_project/tinker-server-auth/
+
+  # Read Ray head IP from PFS
+  RAY_HEAD_IP=$(cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt 2>/dev/null || echo "")
+  if [ -z "${RAY_HEAD_IP}" ]; then
+    echo "ERROR: Ray head IP not found. Ensure mint-prod-head is running."
+    echo "Expected file: /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"
+    sleep 300
+    exit 1
+  fi
+  echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
+
+  # Start Ray worker with 4 GPUs
+  ray start --address="${RAY_HEAD_IP}:6379" --num-gpus=4 && sleep infinity
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ResourceQueueID: "q-20251126180002-26lwz"
+Framework: "Custom"
+
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.pni2l.14xlarge"  # 4x A800 80GB
+
+# No time limit - runs indefinitely
+ActiveDeadlineSeconds: 0
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+
+Storages:
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse"
+      SubPath: ""
+      ReadOnly: true
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse/share"
+      SubPath: "share"
+      ReadOnly: false

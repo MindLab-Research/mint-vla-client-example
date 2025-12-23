@@ -132,10 +132,9 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Inference: Initialize SessionManager
     # ==========================================================================
-    logger.info(f"Initializing inference session manager with model: {config.model_path}")
+    logger.info("Initializing inference session manager")
 
     inference_manager = SessionManager(
-        model_path=config.model_path,
         tensor_parallel_size=config.tensor_parallel_size,
         data_parallel_size=config.data_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,

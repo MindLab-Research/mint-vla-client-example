@@ -141,8 +141,195 @@ class MegatronRankWorker:
         self.learning_rate = learning_rate
         self.config = distributed_config
         self.engine = None  # Set in initialize()
-        
+        self._current_session_id = None
+        self._session_gradients: dict[str, list[torch.Tensor]] = {}  # Per-session gradient storage (CPU)
+        self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
+
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
+
+    def _capture_gradients(self) -> list[torch.Tensor]:
+        """Capture all gradient buffers from DDP modules to CPU.
+
+        Returns a list of CPU tensors containing gradient data.
+        Must be called while in train_mode context (gradients on GPU).
+        """
+        import torch
+        from megatron.core.distributed import DistributedDataParallel as DDP
+
+        grads = []
+        for model_chunk in self.engine.module:
+            if isinstance(model_chunk, DDP):
+                for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
+                    for buffer in buffers:
+                        if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
+                            grads.append(buffer.grad_data.cpu().clone())
+
+        logger.debug(f"[Rank {self.rank}] Captured {len(grads)} gradient buffers")
+        return grads
+
+    def _restore_gradients(self, grads: list[torch.Tensor]) -> None:
+        """Restore gradient buffers from CPU back to GPU.
+
+        Must be called while in train_mode context (after model loaded to GPU).
+        Args:
+            grads: List of CPU tensors from _capture_gradients.
+        """
+        import torch
+        from megatron.core.distributed import DistributedDataParallel as DDP
+
+        idx = 0
+        for model_chunk in self.engine.module:
+            if isinstance(model_chunk, DDP):
+                for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
+                    for buffer in buffers:
+                        if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
+                            if idx < len(grads):
+                                buffer.grad_data.copy_(grads[idx].cuda())
+                                idx += 1
+
+        logger.debug(f"[Rank {self.rank}] Restored {idx} gradient buffers")
+
+    def _capture_optimizer_state(self) -> dict:
+        """Capture optimizer state (momentum, variance) to CPU.
+
+        Returns a dict containing optimizer state.
+        """
+        import torch
+        from megatron.core.optimizer import ChainedOptimizer
+
+        state_dict = {}
+        optimizer = self.engine.optimizer
+
+        if optimizer is None:
+            return state_dict
+
+        def iter_optimizers(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        for i, _opt in enumerate(iter_optimizers(optimizer)):
+            if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
+                inner_opt = _opt.optimizer
+                # Deep copy state to CPU
+                opt_state = {}
+                for param, state in inner_opt.state.items():
+                    opt_state[id(param)] = {
+                        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
+                        for k, v in state.items()
+                    }
+                state_dict[f"optimizer_{i}"] = {
+                    "state": opt_state,
+                    "param_groups": [
+                        {k: v for k, v in pg.items() if k != 'params'}
+                        for pg in inner_opt.param_groups
+                    ]
+                }
+
+        logger.debug(f"[Rank {self.rank}] Captured optimizer state for {len(state_dict)} optimizers")
+        return state_dict
+
+    def _restore_optimizer_state(self, state_dict: dict) -> None:
+        """Restore optimizer state from CPU.
+
+        Args:
+            state_dict: Dict from _capture_optimizer_state.
+        """
+        import torch
+        from megatron.core.optimizer import ChainedOptimizer
+
+        if not state_dict:
+            return
+
+        optimizer = self.engine.optimizer
+        if optimizer is None:
+            return
+
+        def iter_optimizers(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        for i, _opt in enumerate(iter_optimizers(optimizer)):
+            key = f"optimizer_{i}"
+            if key not in state_dict:
+                continue
+
+            if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
+                inner_opt = _opt.optimizer
+                saved_state = state_dict[key]["state"]
+
+                # Map saved state back to current params by position
+                # (param objects may have changed due to offloading)
+                current_params = list(inner_opt.state.keys())
+                saved_param_ids = list(saved_state.keys())
+
+                for j, param in enumerate(current_params):
+                    if j < len(saved_param_ids):
+                        saved_id = saved_param_ids[j]
+                        for k, v in saved_state[saved_id].items():
+                            if isinstance(v, torch.Tensor):
+                                inner_opt.state[param][k] = v.cuda()
+                            else:
+                                inner_opt.state[param][k] = v
+
+                # Restore param group settings (like lr)
+                saved_groups = state_dict[key].get("param_groups", [])
+                for j, pg in enumerate(inner_opt.param_groups):
+                    if j < len(saved_groups):
+                        for k, v in saved_groups[j].items():
+                            pg[k] = v
+
+        logger.debug(f"[Rank {self.rank}] Restored optimizer state")
+
+    def swap_session_state(self, new_session_id: str) -> None:
+        """Swap session state: save outgoing session's gradients/optimizer, load incoming.
+
+        Must be called within train_mode context.
+
+        Args:
+            new_session_id: Session ID to switch to.
+        """
+        if self._current_session_id == new_session_id:
+            return
+
+        # Save outgoing session's state
+        if self._current_session_id is not None:
+            grads = self._capture_gradients()
+            opt_state = self._capture_optimizer_state()
+            self._session_gradients[self._current_session_id] = grads
+            self._session_optimizer_states[self._current_session_id] = opt_state
+            logger.debug(
+                f"[Rank {self.rank}] Saved session {self._current_session_id}: "
+                f"{len(grads)} grad buffers, {len(opt_state)} optimizer states"
+            )
+
+        # Restore incoming session's state (or initialize fresh)
+        if new_session_id in self._session_gradients:
+            self._restore_gradients(self._session_gradients[new_session_id])
+            logger.debug(f"[Rank {self.rank}] Restored gradients for session {new_session_id}")
+        else:
+            # New session - zero gradients
+            self.engine.optimizer_zero_grad()
+            logger.debug(f"[Rank {self.rank}] New session {new_session_id} - zeroed gradients")
+
+        if new_session_id in self._session_optimizer_states:
+            self._restore_optimizer_state(self._session_optimizer_states[new_session_id])
+            logger.debug(f"[Rank {self.rank}] Restored optimizer state for session {new_session_id}")
+
+        self._current_session_id = new_session_id
+
+    def clear_session_state(self, session_id: str) -> None:
+        """Clear saved state for a session (call after session completes).
+
+        Args:
+            session_id: Session ID to clear.
+        """
+        if session_id in self._session_gradients:
+            del self._session_gradients[session_id]
+        if session_id in self._session_optimizer_states:
+            del self._session_optimizer_states[session_id]
+        logger.debug(f"[Rank {self.rank}] Cleared state for session {session_id}")
 
     def initialize(self):
         """Initialize distributed backend and Megatron engine.
@@ -467,6 +654,7 @@ class MegatronRankWorker:
         data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
+        session_id: str | None = None,
     ) -> dict:
         """Run forward and backward pass on this rank's shard.
 
@@ -480,6 +668,8 @@ class MegatronRankWorker:
         from tinker_server.backend.megatron_training import (
             create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
         )
+
+        # Session state swap moved inside train_mode() - see below
 
         # Get sequence lengths from raw data (before tensor creation)
         seq_lengths = []
@@ -517,16 +707,26 @@ class MegatronRankWorker:
 
         # Use train_mode context to load model from CPU to GPU (required for param_offload)
         # The context manager handles: load to GPU on __enter__, offload to CPU on __exit__
+        # IMPORTANT: verl zeros gradients on train_mode entry, and destroys them on exit.
+        # For gradient isolation: restore cached grads after entry, capture before exit.
         with self.engine.train_mode():
-            # Zero gradients (must be after model is on GPU)
-            self.engine.optimizer_zero_grad()
+            # 1. Restore this session's cached gradients (if any)
+            # verl already zeroed grads on entry, so we overwrite with cached values
+            if session_id is not None and session_id in self._session_gradients:
+                self._restore_gradients(self._session_gradients[session_id])
+                logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
 
-            # Run forward-backward (engine handles gradient sync)
+            # 2. Run forward-backward (accumulates gradients on top of restored/zero grads)
             result = self.engine.forward_backward_batch(
                 data=data,
                 loss_function=loss_function,
                 forward_only=False,
             )
+
+            # 3. Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
+            if session_id is not None:
+                self._session_gradients[session_id] = self._capture_gradients()
+                logger.debug(f"[Rank {self.rank}] Captured gradients for session {session_id}")
 
         # Only rank 0 returns metrics
         if self.rank == 0:
@@ -736,18 +936,29 @@ class MegatronRankWorker:
             }
         return {}
 
-    def optim_step(self, learning_rate: float) -> dict:
+    def optim_step(self, learning_rate: float, session_id: str | None = None) -> dict:
         """Run optimizer step (synchronized across ranks).
 
-        WARNING: With param_offload=True, gradients are zeroed when entering train_mode.
-        Use train_step() instead for combined forward_backward + optim_step.
+        Restores session's cached gradients before applying optimizer step.
+        Clears cache after - gradients are consumed.
         """
-        # Note: learning_rate not used directly - verl engine handles LR scheduling
         # Use train_mode context to ensure model/gradients are on GPU (required for param_offload)
-        # Without this, optimizer would access offloaded tensors with invalid CUDA pointers
+        # IMPORTANT: verl zeros gradients on train_mode entry.
+        # We must restore cached gradients before optimizer_step.
         with self.engine.train_mode():
+            # 1. Restore this session's cached gradients
+            if session_id is not None and session_id in self._session_gradients:
+                self._restore_gradients(self._session_gradients[session_id])
+                logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
+
+            # 2. Apply gradients
             grad_norm = self.engine.optimizer_step()
             current_lr = self.engine.lr_scheduler_step()
+
+            # 3. Clear cache - gradients have been consumed
+            if session_id is not None and session_id in self._session_gradients:
+                del self._session_gradients[session_id]
+                logger.debug(f"[Rank {self.rank}] Cleared gradient cache for session {session_id}")
 
         if self.rank == 0:
             # Handle current_lr being either a float or a list
@@ -1188,6 +1399,11 @@ class MegatronRankWorker:
 
         logger.info(f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate})")
 
+        # Clear session state since we're reinitializing
+        self._session_gradients.clear()
+        self._session_optimizer_states.clear()
+        self._current_session_id = None
+
         # Must use train_mode context for param_offload
         reinit_count = 0
         opt_state_reset_count = 0
@@ -1589,6 +1805,12 @@ class MegatronRankWorker:
 
     def shutdown(self):
         """Clean shutdown of distributed process."""
+        import torch
+        # Clear session state
+        self._session_gradients.clear()
+        self._session_optimizer_states.clear()
+        self._current_session_id = None
+
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
@@ -1702,7 +1924,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
-        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+        session_id: str | None = None,
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -1710,20 +1932,20 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
-            session_id: Unused - session management handled via swap_session().
+            session_id: Session ID for multi-tenant gradient isolation.
 
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
-        # Note: session_id is not used here. For Megatron, session state is managed
-        # via swap_session() before calling forward_backward. This parameter exists
-        # for API consistency with TrainingWorker.
         loss_fn_config = loss_fn_config or {}
+
+        # Use current session if session_id not provided
+        effective_session_id = session_id or self._current_session
 
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
         futures = [
-            w.forward_backward.remote(data_items, loss_fn, loss_fn_config)
+            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id)
             for w in self.workers
         ]
         results = ray.get(futures)
@@ -1813,18 +2035,21 @@ class MegatronWorkerGroup:
     def optim_step(
         self,
         learning_rate: float,
-        session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+        session_id: str | None = None,
     ) -> dict:
         """Run optimizer step on all workers.
 
-        WARNING: With param_offload=True, gradients are zeroed when entering train_mode.
-        Use train_step() instead for combined forward_backward + optim_step.
+        Uses per-session gradient storage for multi-tenant isolation.
+        Restores session's gradients before applying optimizer step.
 
         Args:
             learning_rate: Learning rate for this step.
-            session_id: Unused - session management handled via swap_session().
+            session_id: Session ID for multi-tenant gradient isolation.
         """
-        futures = [w.optim_step.remote(learning_rate) for w in self.workers]
+        # Use current session if session_id not provided
+        effective_session_id = session_id or self._current_session
+
+        futures = [w.optim_step.remote(learning_rate, effective_session_id) for w in self.workers]
         ray.get(futures)
 
         self._step_count += 1

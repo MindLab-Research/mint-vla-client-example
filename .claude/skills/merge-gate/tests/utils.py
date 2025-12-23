@@ -137,8 +137,10 @@ def detect_anomalies(losses: list, metric_name: str = "loss") -> list[str]:
 
     # Check for loss spikes
     for i in range(1, len(losses)):
-        if losses[i] > losses[i-1] * 1.1:
-            anomalies.append(f"{metric_name} spike at iter {i+1}: {losses[i-1]:.4f} -> {losses[i]:.4f} (+{(losses[i]/losses[i-1]-1)*100:.1f}%)")
+        prev = losses[i-1]
+        curr = losses[i]
+        if prev > 0 and curr > prev * 1.1:
+            anomalies.append(f"{metric_name} spike at iter {i+1}: {prev:.4f} -> {curr:.4f} (+{(curr/prev-1)*100:.1f}%)")
 
     # Check for plateaus
     if len(losses) >= 3:
