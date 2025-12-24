@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
-from tinker_server.backend.model_registry import is_moe_model
+from tinker_server.backend.model_registry import is_moe_model, get_max_position_embeddings
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
@@ -626,7 +626,7 @@ class MegatronRankWorker:
 
         # Add non-tensor metadata for verl's prepare_micro_batches
         dummy_data["use_dynamic_bsz"] = NonTensorData(True)
-        dummy_data["max_token_len_per_gpu"] = NonTensorData(8192)
+        dummy_data["max_token_len_per_gpu"] = NonTensorData(get_max_position_embeddings(self.base_model))
         dummy_data.set_non_tensor("dp_size", 1)
         dummy_data.set_non_tensor("batch_num_tokens", seq_len)
         dummy_data.set_non_tensor("temperature", 1.0)
@@ -692,7 +692,8 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
-        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
+        max_token_len = get_max_position_embeddings(self.base_model)
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
@@ -841,7 +842,8 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
-        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
+        max_token_len = get_max_position_embeddings(self.base_model)
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn
@@ -1011,7 +1013,8 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU
         device = torch.cuda.current_device()
-        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
+        max_token_len = get_max_position_embeddings(self.base_model)
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Select loss function
         if loss_fn == "cross_entropy":

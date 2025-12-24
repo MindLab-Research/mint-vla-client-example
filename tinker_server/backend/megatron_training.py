@@ -25,6 +25,8 @@ from tensordict.tensorclass import NonTensorData
 if TYPE_CHECKING:
     pass
 
+from tinker_server.backend.model_registry import get_max_position_embeddings
+
 logger = logging.getLogger(__name__)
 
 
@@ -605,8 +607,9 @@ class MegatronTrainingWorker:
         """
         loss_fn_config = loss_fn_config or {}
 
-        # Convert data to TensorDict
-        data = tinker_to_tensordict(data_items)
+        # Convert data to TensorDict with model-specific max token length
+        max_token_len = get_max_position_embeddings(self.base_model)
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len)
         device = f"cuda:{torch.distributed.get_rank() % 8}"
         data = data.to(device)
 
@@ -683,7 +686,8 @@ class MegatronTrainingWorker:
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
-        data = tinker_to_tensordict(data_items)
+        max_token_len = get_max_position_embeddings(self.base_model)
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len)
         device = f"cuda:{torch.distributed.get_rank() % 8}"
         data = data.to(device)
 

@@ -14,6 +14,9 @@ class ModelConfig:
     Training parallelism (Megatron):
         - train_tp: Tensor parallelism
         - train_ep: Expert parallelism (MoE only, 1 for dense)
+
+    Context limits:
+        - max_position_embeddings: Model's native context length
     """
 
     is_moe: bool
@@ -22,6 +25,7 @@ class ModelConfig:
     train_tp: int = 1  # Megatron training TP
     train_ep: int = 1  # Megatron training EP (MoE only)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
+    max_position_embeddings: int = 8192  # Model's native context length (from HuggingFace config)
 
     @property
     def total_gpus(self) -> int:
@@ -38,28 +42,35 @@ class ModelConfig:
 MODEL_CONFIGS = {
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
-        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
+        max_position_embeddings=32768,  # 32K context
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
-        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
+        max_position_embeddings=40960,  # 40K context
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
-        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
+        max_position_embeddings=262144,  # 256K context
     ),
-    # MoE models - Qwen3 30B variants
+    # MoE models - Qwen3 30B variants (262K context)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=262144,  # 256K context
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=262144,  # 256K context
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=262144,  # 256K context
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=262144,  # 256K context
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
@@ -93,6 +104,7 @@ MODEL_CONFIGS = {
         train_tp=2,
         train_ep=4,  # Training: 8 GPUs (TP=2, EP=4) - 64 experts / 4 = 16 per rank
         quantization=None,  # BF16, no quantization needed
+        max_position_embeddings=8192,  # 8K context (DeepseekV3 architecture)
     ),
 }
 
@@ -233,3 +245,16 @@ def requires_fp8(model_name: str) -> bool:
         True if model uses FP8
     """
     return get_quantization(model_name) == "fp8"
+
+
+def get_max_position_embeddings(model_name: str) -> int:
+    """Get the model's maximum context length (max_position_embeddings).
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        Maximum sequence length the model can process
+    """
+    config = get_model_config(model_name)
+    return config.max_position_embeddings
