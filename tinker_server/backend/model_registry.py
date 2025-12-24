@@ -26,6 +26,7 @@ class ModelConfig:
     train_ep: int = 1  # Megatron training EP (MoE only)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
     max_position_embeddings: int = 8192  # Model's native context length (from HuggingFace config)
+    gradient_checkpointing: bool = False  # Enable for large dense models to reduce VRAM usage
 
     @property
     def total_gpus(self) -> int:
@@ -41,17 +42,21 @@ class ModelConfig:
 # Supported models - only these are allowed
 MODEL_CONFIGS = {
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
+    # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
         is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
         max_position_embeddings=32768,  # 32K context
+        gradient_checkpointing=True,  # Required for sequences >5000 tokens
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
         is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
         max_position_embeddings=40960,  # 40K context
+        # Small model: no gradient checkpointing needed
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
         is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
         max_position_embeddings=262144,  # 256K context
+        gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     # MoE models - Qwen3 30B variants (262K context)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
@@ -258,3 +263,20 @@ def get_max_position_embeddings(model_name: str) -> int:
     """
     config = get_model_config(model_name)
     return config.max_position_embeddings
+
+
+def get_gradient_checkpointing(model_name: str) -> bool:
+    """Check if model should use gradient checkpointing during training.
+
+    Gradient checkpointing trades compute for memory by recomputing
+    activations during backward pass instead of storing them.
+    Recommended for large dense models (4B+) with long sequences.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if gradient checkpointing should be enabled
+    """
+    config = get_model_config(model_name)
+    return config.gradient_checkpointing

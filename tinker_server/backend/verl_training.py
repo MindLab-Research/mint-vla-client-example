@@ -295,6 +295,19 @@ class TrainingWorker:
             device_map="cuda",  # Use this worker's GPU
         )
 
+        # Enable gradient checkpointing for large dense models (trades compute for memory)
+        # Must be done before PEFT wrapping to properly set up the model
+        from .model_registry import get_gradient_checkpointing
+        try:
+            use_grad_ckpt = get_gradient_checkpointing(base_model)
+        except ValueError:
+            # Model not in registry, default to no checkpointing
+            use_grad_ckpt = False
+
+        if use_grad_ckpt:
+            self.model.gradient_checkpointing_enable()
+            logger.info(f"[TrainingWorker] Gradient checkpointing enabled for {base_model}")
+
         # Apply LoRA
         # Per Tinker docs: "LoRA performs better when applied to all weight matrices,
         # especially MLP and MoE layers. Attention-only LoRA underperforms."
