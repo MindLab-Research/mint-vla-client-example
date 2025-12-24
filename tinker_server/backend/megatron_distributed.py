@@ -966,6 +966,7 @@ class MegatronRankWorker:
                 lr_value = current_lr[0] if isinstance(current_lr, (list, tuple)) else current_lr
             else:
                 lr_value = learning_rate
+            print(f"[Rank {self.rank}] optim_step: grad_norm={grad_norm}, lr={lr_value}, session={session_id}", flush=True)
             # Return CPU-safe scalars only
             return {
                 "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
@@ -1106,6 +1107,7 @@ class MegatronRankWorker:
             else:
                 lr_value = learning_rate
 
+            print(f"[Rank {self.rank}] train_step: loss={loss_value:.4f}, grad_norm={grad_norm}, lr={lr_value}", flush=True)
             logger.info(f"[Rank {self.rank}] train_step: loss={loss_value:.4f}, grad_norm={grad_norm:.4f}")
 
             return {
@@ -2023,15 +2025,36 @@ class MegatronWorkerGroup:
         Args:
             learning_rate: Learning rate for this step.
             session_id: Session ID for multi-tenant gradient isolation.
+
+        Returns:
+            Dict with metrics including grad_norm from rank 0.
         """
         # Use current session if session_id not provided
         effective_session_id = session_id or self._current_session
 
         futures = [w.optim_step.remote(learning_rate, effective_session_id) for w in self.workers]
-        ray.get(futures)
+        results = ray.get(futures)
+
+        # Rank 0 returns the actual result with grad_norm
+        rank0_result = results[0]
+        grad_norm = rank0_result.get("grad_norm", 0.0)
+        lr = rank0_result.get("lr", learning_rate)
 
         self._step_count += 1
-        return {"metrics": {"step": self._step_count}}
+
+        print(
+            f"[MegatronWorkerGroup] optim_step: grad_norm={grad_norm:.4f}, "
+            f"lr={lr}, step={self._step_count}",
+            flush=True
+        )
+
+        return {
+            "metrics": {
+                "step": self._step_count,
+                "grad_norm": grad_norm,
+                "lr": lr,
+            }
+        }
 
     def train_step(
         self,
@@ -2089,6 +2112,11 @@ class MegatronWorkerGroup:
             metrics["clipfrac:mean"] = clip_frac_sum / n_ppo_results
             metrics["ratio:mean"] = ratio_mean_sum / n_ppo_results
 
+        print(
+            f"[MegatronWorkerGroup] train_step: loss={loss_value:.4f}, "
+            f"grad_norm={grad_norm:.4f}, step={self._step_count}",
+            flush=True
+        )
         logger.info(
             f"[MegatronWorkerGroup] train_step: loss={loss_value:.4f}, "
             f"grad_norm={grad_norm:.4f}, step={self._step_count}"
