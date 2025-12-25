@@ -17,6 +17,9 @@ class ModelConfig:
 
     Context limits:
         - max_position_embeddings: Model's native context length
+
+    Architecture flags:
+        - is_mla: Uses Multi-Latent Attention (DeepSeek V3/Moonlight/K2)
     """
 
     is_moe: bool
@@ -27,6 +30,7 @@ class ModelConfig:
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
     max_position_embeddings: int = 8192  # Model's native context length (from HuggingFace config)
     gradient_checkpointing: bool = False  # Enable for large dense models to reduce VRAM usage
+    is_mla: bool = False  # Uses Multi-Latent Attention (DeepSeek V3 architecture)
 
     @property
     def total_gpus(self) -> int:
@@ -58,27 +62,29 @@ MODEL_CONFIGS = {
         max_position_embeddings=262144,  # 256K context
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
-    # MoE models - Qwen3 30B variants (262K context)
+    # MoE models - Qwen3 30B variants (40K context per model config)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
+    # Note: HuggingFace config has max_position_embeddings=40960, not 262144
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
-        max_position_embeddings=262144,  # 256K context
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
-        max_position_embeddings=262144,  # 256K context
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
-        max_position_embeddings=262144,  # 256K context
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
-        max_position_embeddings=262144,  # 256K context
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
+    # Uses MLA (Multi-Latent Attention) from DeepSeek V3 architecture
     # Memory constraint: TE builds BF16 weights then converts to FP8.
     # During conversion, BOTH BF16 and FP8 tensors exist on GPU simultaneously.
     # With EP=4 (32 GPUs): ~65GB BF16 + ~32.5GB FP8 = ~97.5GB peak > 80GB A100 → OOM
@@ -91,6 +97,7 @@ MODEL_CONFIGS = {
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum
         quantization=None,  # Let vLLM auto-detect from config.json
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -99,9 +106,10 @@ MODEL_CONFIGS = {
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum - cannot fit in 32 GPUs
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
-    # Same DeepseekV3ForCausalLM architecture
+    # Same DeepseekV3ForCausalLM architecture with MLA attention
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
         recommended_tp=4,  # Inference: 4 GPUs
@@ -110,6 +118,7 @@ MODEL_CONFIGS = {
         train_ep=4,  # Training: 8 GPUs (TP=2, EP=4) - 64 experts / 4 = 16 per rank
         quantization=None,  # BF16, no quantization needed
         max_position_embeddings=8192,  # 8K context (DeepseekV3 architecture)
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
 }
 
@@ -199,6 +208,27 @@ def is_moe_model(model_name: str) -> bool:
     """
     config = get_model_config(model_name)
     return config.is_moe
+
+
+def is_mla_model(model_name: str) -> bool:
+    """Check if a model uses Multi-Latent Attention (MLA) architecture.
+
+    MLA is used by DeepSeek V3 family models (Moonlight, Kimi-K2).
+    These models have different attention projection names:
+    - Standard: q_proj, k_proj, v_proj, o_proj
+    - MLA: q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if model uses MLA architecture
+
+    Raises:
+        ValueError: If model is not supported
+    """
+    config = get_model_config(model_name)
+    return config.is_mla
 
 
 def get_recommended_parallelism(model_name: str) -> tuple[int, int]:

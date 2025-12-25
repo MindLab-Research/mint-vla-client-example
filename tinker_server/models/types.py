@@ -348,6 +348,7 @@ class SaveWeightsForSamplerRequest(BaseModel):
     path: str | None = None  # checkpoint name for named save (None for ephemeral)
     seq_id: int | None = None
     sampling_session_seq_id: int | None = None  # For ephemeral flow
+    use_per_expert_lora: bool = False  # If True, expand shared MLP LoRA to per-expert format for MoE
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
 
