@@ -14,7 +14,8 @@ from .backend.session_manager import SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
-from .routes import futures, sampling, service, training, weights
+from .routes import futures, internal, sampling, service, training, weights
+from .token_encryptor import TokenEncryptor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -229,14 +230,28 @@ UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/", "/docs", "/doc
 # Path prefixes that don't require authentication
 UNAUTHENTICATED_PREFIXES = ("/doc/", "/doc")
 
+# Token encryptor for sk- token validation (initialized lazily)
+_token_encryptor: TokenEncryptor | None = None
+
+
+def get_token_encryptor() -> TokenEncryptor | None:
+    """Get or create token encryptor if secret key is configured."""
+    global _token_encryptor
+    if _token_encryptor is None and config.token_secret_key:
+        _token_encryptor = TokenEncryptor(config.token_secret_key)
+    return _token_encryptor
+
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
-    """Validate API key from X-API-Key or Authorization: Bearer header."""
+    """Validate sk- token from X-API-Key or Authorization: Bearer header.
+
+    Decrypts sk- prefixed tokens using TINKER_TOKEN_SECRET_KEY to extract user_id.
+    """
     path = request.url.path
 
-    # Skip auth if no API key configured (dev mode)
-    if not config.api_key:
+    # Skip auth if no token_secret_key configured (dev mode)
+    if not config.token_secret_key:
         return await call_next(request)
 
     # Skip auth for specific paths
@@ -254,12 +269,29 @@ async def api_key_auth_middleware(request: Request, call_next):
         if auth_header.startswith("Bearer "):
             api_key = auth_header[7:]
 
-    if not config.validate_api_key(api_key):
+    if not api_key:
         return JSONResponse(
             status_code=401,
-            content={"error": "Invalid or missing API key"},
+            content={"error": "Missing API key"},
         )
 
+    # Decrypt sk- token
+    if not api_key.startswith("sk-"):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Invalid token format (must start with sk-)"},
+        )
+
+    encryptor = get_token_encryptor()
+    user_data = encryptor.decrypt_token(api_key)
+    if user_data is None:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Invalid token"},
+        )
+
+    # Token is valid - store user_data in request state for later use
+    request.state.user_data = user_data
     return await call_next(request)
 
 
@@ -269,6 +301,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
 # Redirects to documentation (must be defined BEFORE mount)
 @app.get("/")

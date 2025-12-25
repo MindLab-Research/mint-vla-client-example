@@ -21,7 +21,7 @@ import os
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
 from ..models.types import (
@@ -40,6 +40,7 @@ from ..models.types import (
     TrainStepRequest,
     UntypedAPIFuture,
 )
+from ..usage_logger import get_usage_logger
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -53,6 +54,14 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For ephemeral flow
+
+
+def _get_user_id(request: Request) -> str | None:
+    """Extract user_id from request state (set by auth middleware)."""
+    user_data = getattr(request.state, "user_data", None)
+    if user_data:
+        return user_data.get("user_id")
+    return None
 
 
 def _generate_model_id(session_id: str, model_seq_id: int) -> str:
@@ -249,6 +258,7 @@ async def _do_create_model_from_state(
 async def forward_backward(
     request: ForwardBackwardRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform forward + backward pass on training data."""
     if training_engine is None or training_manager is None:
@@ -261,12 +271,13 @@ async def forward_backward(
         )
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_forward_backward, request_id, session, request)
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_forward_backward, request_id, session, request, user_id)
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_forward_backward(
-    request_id: str, session, request: ForwardBackwardRequest
+    request_id: str, session, request: ForwardBackwardRequest, user_id: str | None
 ) -> None:
     """Background task for forward_backward."""
     try:
@@ -275,6 +286,21 @@ async def _do_forward_backward(
 
         result = await training_engine.forward_backward(session, request)
         future_store.resolve(request_id, result)
+
+        # Log usage
+        if user_id:
+            # Count tokens in the batch
+            token_count = sum(
+                len(item.input_ids) for item in request.forward_backward_input
+            )
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="forward_backward",
+                model_name=session.base_model,
+                token_count=token_count,
+                session_id=session.model_id,
+                request_id=request_id,
+            )
 
     except Exception as e:
         logger.exception(f"[forward_backward] Failed: {e}")
