@@ -937,18 +937,20 @@ class MultiModelInferenceManager:
             from .model_registry import get_max_model_len
             model_max_model_len = get_max_model_len(model_name) or self.max_model_len
 
-            # Check if model needs multi-node (TP > 8)
-            # K2 requires TP=16 across 2 nodes for LoRA support
-            needs_multinode = config.recommended_tp > 8
+            # Check if model needs multi-node (PP > 1 means pipeline parallelism across nodes)
+            # K2 requires TP=8, PP=2 (16 GPUs across 2 nodes) for inference
+            needs_multinode = getattr(config, 'recommended_pp', 1) > 1
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
                 from .multinode_inference import MultiNodeInferenceEngine
 
-                total_gpus = config.recommended_tp  # TP=16 for K2
+                # Total GPUs = TP * PP (e.g., K2: 8 * 2 = 16)
+                recommended_pp = getattr(config, 'recommended_pp', 1)
+                total_gpus = config.recommended_tp * recommended_pp
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
-                    f"actor={actor_name}, TP={config.recommended_tp}, total_gpus={total_gpus}, "
+                    f"actor={actor_name}, TP={config.recommended_tp}, PP={recommended_pp}, total_gpus={total_gpus}, "
                     f"gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
                     f"max_model_len={model_max_model_len}"
@@ -967,6 +969,7 @@ class MultiModelInferenceManager:
                 engine = MultiNodeInferenceEngine(
                     model_path=model_path,
                     tensor_parallel_size=config.recommended_tp,
+                    pipeline_parallel_size=recommended_pp,
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
                     max_loras=model_max_loras,

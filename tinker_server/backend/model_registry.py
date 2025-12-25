@@ -8,7 +8,8 @@ class ModelConfig:
     """Hardware configuration for a model.
 
     Inference parallelism (vLLM):
-        - recommended_tp: Tensor parallelism (shards weights)
+        - recommended_tp: Tensor parallelism (shards weights within a node)
+        - recommended_pp: Pipeline parallelism (distributes layers across nodes)
         - recommended_dp: Data parallelism (replicas)
 
     Training parallelism (Megatron):
@@ -27,8 +28,9 @@ class ModelConfig:
     """
 
     is_moe: bool
-    recommended_tp: int  # vLLM inference TP
+    recommended_tp: int  # vLLM inference TP (within node)
     recommended_dp: int  # vLLM inference DP
+    recommended_pp: int = 1  # vLLM inference PP (across nodes)
     train_tp: int = 1  # Megatron training TP
     train_ep: int = 1  # Megatron training EP (MoE only)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
@@ -36,11 +38,12 @@ class ModelConfig:
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
     max_lora_rank: int | None = None  # None = use global default, or override for large models
     max_model_len: int | None = None  # None = use model's default, or override for large models with KV cache constraints
+    is_mla: bool = False  # Uses Multi-Latent Attention (DeepSeek V3/K2 architecture)
 
     @property
     def total_gpus(self) -> int:
         """Total GPUs for inference."""
-        return self.recommended_tp * self.recommended_dp
+        return self.recommended_tp * self.recommended_dp * self.recommended_pp
 
     @property
     def train_gpus(self) -> int:
@@ -96,18 +99,21 @@ MODEL_CONFIGS = {
         max_loras=1,  # LoRA REQUIRED for weight transfer
         max_lora_rank=8,  # Reduced rank for 384 experts
         max_model_len=131072,  # 128K context (default 262K exceeds KV cache at 80% util)
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
-        recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
+        recommended_tp=8,  # Inference: 8 GPUs per node (TP within node)
+        recommended_pp=2,  # Inference: 2 nodes (PP across nodes) = 16 GPUs total
         recommended_dp=1,
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
-        gpu_memory_utilization=0.98,  # Near max - 67GB model + overhead leaves minimal margin
+        gpu_memory_utilization=0.90,  # Leave room for KV cache and activations
         max_loras=1,  # LoRA REQUIRED for weight transfer
         max_lora_rank=32,  # Attention-only LoRA (MLP filtered), rank 32 fits in memory
-        max_model_len=2048,  # 2K context - minimal KV cache for 78.4GB budget
+        max_model_len=8192,  # 8K context - verified working (2K got 6,944 tokens)
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
     # Same DeepseekV3ForCausalLM architecture
@@ -209,6 +215,25 @@ def is_moe_model(model_name: str) -> bool:
     return config.is_moe
 
 
+def is_mla_model(model_name: str) -> bool:
+    """Check if a model uses Multi-Latent Attention (MLA) architecture.
+
+    MLA is used by DeepSeek V3 and K2 models. These require special
+    attention handling in Megatron training.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if model uses MLA, False otherwise
+
+    Raises:
+        ValueError: If model is not supported
+    """
+    config = get_model_config(model_name)
+    return getattr(config, 'is_mla', False)
+
+
 def get_recommended_parallelism(model_name: str) -> tuple[int, int]:
     """Return (tensor_parallel_size, data_parallel_size) for inference.
 
@@ -289,6 +314,64 @@ def get_max_model_len(model_name: str) -> int | None:
     """
     config = get_model_config(model_name)
     return config.max_model_len
+
+
+def get_max_position_embeddings(model_path: str) -> int | None:
+    """Get max_position_embeddings from model's config.json.
+
+    Used to determine max_model_len when not explicitly configured.
+    Falls back to model config override if available.
+
+    Args:
+        model_path: Path to model directory or HuggingFace model name
+
+    Returns:
+        max_position_embeddings from config.json, or None if not found.
+    """
+    import json
+    import os
+
+    # Try to get from model_registry first (override takes precedence)
+    try:
+        from .model_registry import get_max_model_len
+        override = get_max_model_len(model_path)
+        if override is not None:
+            return override
+    except (ValueError, ImportError):
+        pass
+
+    # Try HuggingFace cache path
+    hf_home = os.environ.get("HF_HOME", "/vePFS-Mindverse/share/huggingface")
+
+    # Check if it's already a full path
+    if os.path.isdir(model_path):
+        config_path = os.path.join(model_path, "config.json")
+    else:
+        # Convert HF model name to cache path
+        # e.g., "Qwen/Qwen2.5-7B-Instruct" -> "models--Qwen--Qwen2.5-7B-Instruct"
+        cache_name = f"models--{model_path.replace('/', '--')}"
+        cache_dir = os.path.join(hf_home, "hub", cache_name)
+
+        # Find snapshot directory
+        snapshots_dir = os.path.join(cache_dir, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            snapshots = os.listdir(snapshots_dir)
+            if snapshots:
+                config_path = os.path.join(snapshots_dir, snapshots[0], "config.json")
+            else:
+                return None
+        else:
+            return None
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            return config.get("max_position_embeddings")
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    return None
 
 
 def get_max_loras(model_name: str) -> int | None:
