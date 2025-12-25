@@ -36,9 +36,9 @@ http://<RAY_HEAD_IP>:8265
 
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
-| `ml.pni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training |
-| `ml.pni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training |
-| `ml.pni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE |
+| `ml.hpcpni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training (RDMA) |
+| `ml.hpcpni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training (RDMA) |
+| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE (RDMA) |
 
 Update both `Flavor` and `--num-gpus=N` in YAML config when changing.
 

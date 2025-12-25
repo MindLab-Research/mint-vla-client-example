@@ -507,6 +507,15 @@ class MegatronRankWorker:
             override_tf_config["use_cpu_initialization"] = True
             logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
 
+        # MoE activation checkpointing for memory-efficient training
+        # When enabled, MoE layer activations are checkpointed and recomputed during backward pass
+        # This trades ~30% extra compute for significant memory savings on long sequences
+        # Essential for K2 (1.04T params) with variable-length thinking outputs
+        if num_experts is not None:
+            override_tf_config["recompute_granularity"] = "selective"
+            override_tf_config["recompute_modules"] = ["moe"]
+            logger.info(f"[Rank {self.rank}] MoE recompute enabled (selective granularity, moe modules)")
+
         # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
         # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
         # MLA has head_dim_qk=192 (qk_nope=128 + qk_rope=64) and head_dim_v=128

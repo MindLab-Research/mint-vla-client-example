@@ -277,6 +277,9 @@ class TrainingWorker:
             self._watchdog_thread.start()
             logger.info(f"[TrainingWorker] Idle watchdog started (timeout={idle_timeout}s)")
 
+        # Store base model name for checkpoint saving
+        self.base_model = base_model
+
         logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
 
         # Load tokenizer
@@ -909,6 +912,7 @@ class TrainingWorker:
             "bias": peft_config.bias,
             "task_type": peft_config.task_type.value if peft_config.task_type else None,
             "peft_type": "LORA",
+            "base_model_name_or_path": self.base_model,
         }
 
     def save_lora_weights(self, save_path: str) -> str:

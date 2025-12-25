@@ -5,9 +5,9 @@
 #   1. Look up the Ray head IP from task logs: volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 #   2. Replace <RAY_HEAD_IP> with the actual IP address
 #   3. Adjust Flavor and --num-gpus as needed:
-#      - ml.pni2l.7xlarge  = 2 GPUs
-#      - ml.pni2l.14xlarge = 4 GPUs
-#      - ml.pni2l.28xlarge = 8 GPUs
+#      - ml.hpcpni2l.7xlarge  = 2 GPUs (RDMA)
+#      - ml.hpcpni2l.14xlarge = 4 GPUs (RDMA)
+#      - ml.hpcpni2l.28xlarge = 8 GPUs (RDMA)
 #
 # Submit with: volc ml_task submit -c ray_worker.yaml --output json
 
@@ -34,7 +34,7 @@ Framework: "Custom"
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.pni2l.28xlarge"  # 8x A800 80GB
+      Flavor: "ml.hpcpni2l.28xlarge"  # 8x A800 80GB (RDMA)
 
 # Ephemeral: 12 hours default
 ActiveDeadlineSeconds: 43200

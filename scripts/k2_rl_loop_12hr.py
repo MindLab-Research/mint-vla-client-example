@@ -21,7 +21,8 @@ import requests
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 K2_MODEL = "moonshotai/Kimi-K2-Thinking"
-# Use HuggingFace model name for tokenizer (downloads from internet on local machine)
+# Local path for tokenizer (server has no internet)
+K2_TOKENIZER_PATH = "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd"
 
 LOG_FILE = "/tmp/k2_rl_12hr.jsonl"
 
@@ -133,7 +134,7 @@ def save_weights_for_sampler(model_id: str) -> str:
         raise RuntimeError(f"save_weights_for_sampler failed: {resp.status_code}: {resp.text}")
 
     request_id = resp.json().get("request_id")
-    result = poll_future(request_id, timeout=1800)  # vLLM init can take 20+ min for K2
+    result = poll_future(request_id, timeout=2400)  # vLLM init can take 20+ min for K2
     if "error" in result:
         raise RuntimeError(f"save_weights poll failed: {result['error']}")
 
@@ -190,9 +191,9 @@ def main():
     print(f"Log file: {LOG_FILE}", flush=True)
     print(flush=True)
 
-    # Load tokenizer (downloads from HuggingFace on local machine)
+    # Load tokenizer from local path (server has no internet)
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(K2_MODEL, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(K2_TOKENIZER_PATH, trust_remote_code=True, local_files_only=True)
 
     # Training data (simple math problems)
     prompts_and_targets = [

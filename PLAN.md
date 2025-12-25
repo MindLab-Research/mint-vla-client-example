@@ -261,6 +261,41 @@ Existing Tinker client code for MoE models will silently fail to learn (zero gra
 
 ## Other Known Issues
 
+### SDK Heartbeat Timeout During vLLM Init (K2)
+
+**Status**: Unresolved. Affects K2 (and likely other large models).
+
+**Symptom**:
+```
+tinker.lib.internal_client_holder:202 [WARNING] Session heartbeat failed for
+    240.51 seconds for session xxx. Last exception: APITimeoutError: Request timed out.
+    Your connection may be unreliable or Tinker is down. If this persists, the
+    session will be terminated.
+```
+
+**Root Cause Analysis**:
+1. SDK heartbeat has 10-second timeout, warns after 120s of consecutive failures
+2. K2 vLLM initialization takes ~18 minutes (62 shards @ 11s/shard + warmup)
+3. During vLLM init, server is under load and some requests time out
+4. Server DOES use `run_in_executor()` for blocking calls, but timeouts still occur
+
+**Investigation Needed**:
+- Why do heartbeats timeout when server uses `run_in_executor()`?
+- Possible causes: Python GIL, connection pool exhaustion, uvicorn worker limits
+- Server logs show some heartbeats succeed (200 OK), others timeout
+
+**Potential Fixes**:
+| Fix | Location | Effort |
+|-----|----------|--------|
+| Increase SDK heartbeat timeout | tinker SDK (external) | Low (if we control SDK) |
+| Add "long operation" status | Server + SDK protocol | Medium |
+| Investigate server blocking | `multinode_inference.py` | High |
+| Accept as warning (not fatal) | Documentation | Low |
+
+**Note**: The "session will be terminated" message is misleading. SDK code shows it's just a warning with no auto-termination. But the warnings indicate real stress on the server during large model init.
+
+---
+
 ### vLLM MoE Expert LoRA
 
 **Status**: Resolved for Qwen3-30B-A3B.

@@ -13,9 +13,9 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
 
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
-| `ml.pni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training |
-| `ml.pni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training |
-| `ml.pni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE |
+| `ml.hpcpni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training (RDMA) |
+| `ml.hpcpni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training (RDMA) |
+| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE (RDMA) |
 
 **GPU allocation is flexible.** Adjust `Flavor` and `--num-gpus` in configs as needed.
 
