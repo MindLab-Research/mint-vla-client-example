@@ -14,6 +14,12 @@ class ModelConfig:
     Training parallelism (Megatron):
         - train_tp: Tensor parallelism
         - train_ep: Expert parallelism (MoE only, 1 for dense)
+
+    Context limits:
+        - max_position_embeddings: Model's native context length
+
+    Architecture flags:
+        - is_mla: Uses Multi-Latent Attention (DeepSeek V3/Moonlight/K2)
     """
 
     is_moe: bool
@@ -22,6 +28,9 @@ class ModelConfig:
     train_tp: int = 1  # Megatron training TP
     train_ep: int = 1  # Megatron training EP (MoE only)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
+    max_position_embeddings: int = 8192  # Model's native context length (from HuggingFace config)
+    gradient_checkpointing: bool = False  # Enable for large dense models to reduce VRAM usage
+    is_mla: bool = False  # Uses Multi-Latent Attention (DeepSeek V3 architecture)
 
     @property
     def total_gpus(self) -> int:
@@ -37,32 +46,45 @@ class ModelConfig:
 # Supported models - only these are allowed
 MODEL_CONFIGS = {
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
+    # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
-        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
+        max_position_embeddings=32768,  # 32K context
+        gradient_checkpointing=True,  # Required for sequences >5000 tokens
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
-        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
+        max_position_embeddings=40960,  # 40K context
+        # Small model: no gradient checkpointing needed
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
-        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1
+        is_moe=False, recommended_tp=1, recommended_dp=1, train_tp=1, train_ep=1,
+        max_position_embeddings=262144,  # 256K context
+        gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
-    # MoE models - Qwen3 30B variants
+    # MoE models - Qwen3 30B variants (40K context per model config)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
+    # Note: HuggingFace config has max_position_embeddings=40960, not 262144
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_position_embeddings=40960,  # 40K context (from HF config)
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
+    # Uses MLA (Multi-Latent Attention) from DeepSeek V3 architecture
     # Memory constraint: TE builds BF16 weights then converts to FP8.
     # During conversion, BOTH BF16 and FP8 tensors exist on GPU simultaneously.
     # With EP=4 (32 GPUs): ~65GB BF16 + ~32.5GB FP8 = ~97.5GB peak > 80GB A100 → OOM
@@ -75,6 +97,7 @@ MODEL_CONFIGS = {
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum
         quantization=None,  # Let vLLM auto-detect from config.json
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -83,9 +106,10 @@ MODEL_CONFIGS = {
         train_tp=8,
         train_ep=8,  # Training: 64 GPUs (8×8) minimum - cannot fit in 32 GPUs
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
-    # Same DeepseekV3ForCausalLM architecture
+    # Same DeepseekV3ForCausalLM architecture with MLA attention
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
         recommended_tp=4,  # Inference: 4 GPUs
@@ -93,6 +117,8 @@ MODEL_CONFIGS = {
         train_tp=2,
         train_ep=4,  # Training: 8 GPUs (TP=2, EP=4) - 64 experts / 4 = 16 per rank
         quantization=None,  # BF16, no quantization needed
+        max_position_embeddings=8192,  # 8K context (DeepseekV3 architecture)
+        is_mla=True,  # DeepSeek V3 MLA architecture
     ),
 }
 
@@ -184,6 +210,27 @@ def is_moe_model(model_name: str) -> bool:
     return config.is_moe
 
 
+def is_mla_model(model_name: str) -> bool:
+    """Check if a model uses Multi-Latent Attention (MLA) architecture.
+
+    MLA is used by DeepSeek V3 family models (Moonlight, Kimi-K2).
+    These models have different attention projection names:
+    - Standard: q_proj, k_proj, v_proj, o_proj
+    - MLA: q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if model uses MLA architecture
+
+    Raises:
+        ValueError: If model is not supported
+    """
+    config = get_model_config(model_name)
+    return config.is_mla
+
+
 def get_recommended_parallelism(model_name: str) -> tuple[int, int]:
     """Return (tensor_parallel_size, data_parallel_size) for inference.
 
@@ -233,3 +280,33 @@ def requires_fp8(model_name: str) -> bool:
         True if model uses FP8
     """
     return get_quantization(model_name) == "fp8"
+
+
+def get_max_position_embeddings(model_name: str) -> int:
+    """Get the model's maximum context length (max_position_embeddings).
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        Maximum sequence length the model can process
+    """
+    config = get_model_config(model_name)
+    return config.max_position_embeddings
+
+
+def get_gradient_checkpointing(model_name: str) -> bool:
+    """Check if model should use gradient checkpointing during training.
+
+    Gradient checkpointing trades compute for memory by recomputing
+    activations during backward pass instead of storing them.
+    Recommended for large dense models (4B+) with long sequences.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if gradient checkpointing should be enabled
+    """
+    config = get_model_config(model_name)
+    return config.gradient_checkpointing

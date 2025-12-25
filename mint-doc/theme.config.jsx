@@ -3,7 +3,12 @@ export default {
   project: {
     link: 'https://github.com/MindLab-Research/mindlab-toolkit'
   },
-  docsRepositoryBase: 'https://github.com/MindLab-Research/mindlab-toolkit',
+  editLink: {
+    component: null
+  },
+  feedback: {
+    content: null
+  },
   footer: {
     text: 'Mind Lab Toolkit (MinT) Documentation'
   },

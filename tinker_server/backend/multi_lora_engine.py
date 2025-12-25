@@ -34,6 +34,9 @@ PERSISTENT_NAMESPACE = "tinker"
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
 
+# Import model registry for max_position_embeddings
+from tinker_server.backend.model_registry import get_max_position_embeddings
+
 
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
     """Get the node_id where an actor is running.
@@ -354,6 +357,20 @@ class MultiLoRAInferenceEngine:
                 }
                 logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
 
+            # Use model's max_position_embeddings if max_model_len not explicitly set
+            # This fixes issue #9: vLLM default max_model_len (4096) is too small for
+            # models like Qwen2.5-7B-Instruct (32K context)
+            max_model_len = self.max_model_len or get_max_position_embeddings(self.model_path)
+            # verl calculates max_model_len = prompt_length + response_length
+            # We split evenly, but this does NOT restrict actual prompt/response sizes:
+            # - The split only affects verl's default max_new_tokens (response_length)
+            # - Our generate() computes actual limit dynamically: max_model_len - len(prompt)
+            # - A 32K model can do 25K prompt + 7K response, or 5K prompt + 27K response
+            # The sum (total context window) is what matters, not the individual values.
+            prompt_length = max_model_len // 2
+            response_length = max_model_len - prompt_length
+            logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
+
             # Configure rollout with multi-LoRA support
             # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
             # Expert parallelism is enabled via engine_kwargs instead
@@ -361,8 +378,8 @@ class MultiLoRAInferenceEngine:
                 name="vllm",
                 tensor_model_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
-                prompt_length=2048,
-                response_length=2048,
+                prompt_length=prompt_length,
+                response_length=response_length,
                 max_num_seqs=256,
                 dtype="auto",
                 load_format="auto",
@@ -379,8 +396,6 @@ class MultiLoRAInferenceEngine:
                 engine_kwargs=engine_kwargs,
                 quantization=self.quantization,  # "fp8" for FP8 models like K2
             )
-            if self.max_model_len is not None:
-                rollout_config.max_model_len = self.max_model_len
             if self.quantization:
                 logger.info(f"vLLM quantization enabled: {self.quantization}")
 

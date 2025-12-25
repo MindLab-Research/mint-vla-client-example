@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
 
+# Import model registry for max_position_embeddings
+from tinker_server.backend.model_registry import get_max_position_embeddings
+
 # Apply verl's hijack for TensorLoRARequest support
 # Must be done before engine initialization
 def _apply_vllm_hijack():
@@ -325,6 +328,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             verl_max_tokens = self.config.max_model_len - len(prompt_ids)
             effective_max_tokens = min(max_tokens, verl_max_tokens)
 
+            # Validate prompt fits in context window
+            if effective_max_tokens < 1:
+                raise ValueError(
+                    f"Prompt length ({len(prompt_ids):,} tokens) exceeds model context limit "
+                    f"({self.config.max_model_len:,} tokens). Reduce prompt or use a model with larger context."
+                )
+
             # Build sampling params
             sampling_params = SamplingParams(
                 max_tokens=effective_max_tokens,
@@ -417,6 +427,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             verl_max_tokens = self.config.max_model_len - len(prompt_ids)
             effective_max_tokens = min(max_tokens, verl_max_tokens)
 
+            # Validate prompt fits in context window
+            if effective_max_tokens < 1:
+                raise ValueError(
+                    f"Prompt length ({len(prompt_ids):,} tokens) exceeds model context limit "
+                    f"({self.config.max_model_len:,} tokens). Reduce prompt or use a model with larger context."
+                )
+
             # Build sampling params
             sampling_params = SamplingParams(
                 max_tokens=effective_max_tokens,
@@ -498,6 +515,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 max_tokens = min(user_max_tokens, verl_max_tokens)
             else:
                 max_tokens = verl_max_tokens
+
+            # Validate prompt fits in context window
+            if max_tokens < 1:
+                raise ValueError(
+                    f"Prompt length ({len(prompt_ids):,} tokens) exceeds model context limit "
+                    f"({self.config.max_model_len:,} tokens). Reduce prompt or use a model with larger context."
+                )
 
             # Rest of verl's generate() logic
             sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
@@ -838,6 +862,20 @@ class VerlInferenceEngine:
             }
             logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
 
+        # Use model's max_position_embeddings if max_model_len not explicitly set
+        # This fixes issue #9: vLLM default max_model_len (4096) is too small for
+        # models like Qwen2.5-7B-Instruct (32K context)
+        max_model_len = self.max_model_len or get_max_position_embeddings(self.model_path)
+        # verl calculates max_model_len = prompt_length + response_length
+        # We split evenly, but this does NOT restrict actual prompt/response sizes:
+        # - The split only affects verl's default max_new_tokens (response_length)
+        # - Our generate() computes actual limit dynamically: max_model_len - len(prompt)
+        # - A 32K model can do 25K prompt + 7K response, or 5K prompt + 27K response
+        # The sum (total context window) is what matters, not the individual values.
+        prompt_length = max_model_len // 2
+        response_length = max_model_len - prompt_length
+        logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
+
         # Create rollout config using dataclass
         # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
         # Expert parallelism is enabled via engine_kwargs instead
@@ -845,8 +883,8 @@ class VerlInferenceEngine:
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            prompt_length=2048,
-            response_length=2048,
+            prompt_length=prompt_length,
+            response_length=response_length,
             max_num_seqs=256,
             dtype="auto",
             load_format="auto",
@@ -862,8 +900,6 @@ class VerlInferenceEngine:
             expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
             engine_kwargs=engine_kwargs,
         )
-        if self.max_model_len is not None:
-            rollout_config.max_model_len = self.max_model_len
 
         # Create model config using dataclass
         model_config = HFModelConfig(
