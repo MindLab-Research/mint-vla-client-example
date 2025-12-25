@@ -262,12 +262,15 @@ async def api_key_auth_middleware(request: Request, call_next):
     if path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
 
-    # Try X-API-Key header first, then Authorization: Bearer
+    # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")
     if not api_key:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             api_key = auth_header[7:]
+        elif auth_header.startswith("sk-"):
+            # Support direct Authorization: sk-xxx format
+            api_key = auth_header
 
     if not api_key:
         return JSONResponse(

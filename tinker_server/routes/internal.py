@@ -11,6 +11,14 @@ from ..usage_logger import get_usage_logger
 router = APIRouter()
 
 
+def _get_user_id(request: Request) -> str | None:
+    """Extract user_id from request state (set by auth middleware)."""
+    user_data = getattr(request.state, "user_data", None)
+    if user_data:
+        return user_data.get("user_id")
+    return None
+
+
 class UsageLogEntry(BaseModel):
     """Single usage log entry."""
 
@@ -54,13 +62,18 @@ async def get_usage_logs(
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
-    """Query usage logs with optional filters.
+    """Query usage logs for the authenticated user.
+
+    Logs are automatically filtered by the user_id extracted from the sk- token.
 
     Args:
         since: Only return logs after this timestamp (ISO 8601)
         limit: Maximum number of logs to return (1-1000)
         offset: Number of logs to skip for pagination
     """
+    # Get user_id from authenticated token
+    user_id = _get_user_id(request)
+
     # Parse 'since' timestamp if provided
     since_dt = None
     if since:
@@ -72,6 +85,7 @@ async def get_usage_logs(
     logger = get_usage_logger()
     logs, total_count, has_more = logger.query_logs(
         since=since_dt,
+        user_id=user_id,  # Filter by authenticated user
         limit=limit,
         offset=offset,
     )
