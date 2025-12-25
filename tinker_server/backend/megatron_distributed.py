@@ -1336,7 +1336,7 @@ class MegatronRankWorker:
         except ValueError:
             model_is_moe = False
 
-        # Get number of experts for per-expert expansion
+        # Get number of experts for per-expert expansion (only when use_per_expert_lora=True)
         num_experts = 0
         if model_is_moe and use_per_expert_lora:
             try:
@@ -1350,8 +1350,8 @@ class MegatronRankWorker:
                 use_per_expert_lora = False
 
         if model_is_moe and not use_per_expert_lora:
-            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (vLLM weight format incompatible)")
-            logger.info("[Rank 0] Set use_per_expert_lora=True to expand shared LoRA to per-expert format instead")
+            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (no MLP LoRA trained)")
+            logger.info("[Rank 0] Set use_per_expert_lora=True if MLP LoRA was trained")
 
         lora_state_dict = {}
         mlp_filtered_count = 0
@@ -1380,6 +1380,19 @@ class MegatronRankWorker:
                     for expanded_name in expanded_names:
                         lora_state_dict[expanded_name] = tensor.clone()
                         mlp_expanded_count += 1
+
+                    # vLLM pack_moe requires gate_proj, up_proj, down_proj (all 3)
+                    # Megatron only has linear_fc1 (gate_proj) and linear_fc2 (down_proj)
+                    # Create dummy zero up_proj weights when expanding gate_proj
+                    if '.gate_proj.' in peft_name:
+                        import torch
+                        up_proj_peft_name = peft_name.replace('.gate_proj.', '.up_proj.')
+                        up_proj_expanded = self._expand_shared_to_per_expert(up_proj_peft_name, num_experts)
+                        for expanded_name in up_proj_expanded:
+                            # Create zero tensor with same shape as gate_proj
+                            lora_state_dict[expanded_name] = torch.zeros_like(tensor)
+                            mlp_expanded_count += 1
+                        logger.info(f"[Rank 0] Created {len(up_proj_expanded)} dummy up_proj weights for vLLM compatibility")
                 else:
                     # Filter out MLP modules when not using per-expert expansion
                     mlp_filtered_count += 1
