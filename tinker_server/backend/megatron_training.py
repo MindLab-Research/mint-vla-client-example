@@ -790,7 +790,10 @@ class MegatronTrainingWorker:
     def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights in PEFT format.
 
-        Uses bridge.export_weights() and filters for LoRA parameters.
+        NOTE: This class is DEPRECATED. Use MegatronWorkerGroup from megatron_distributed.py instead.
+        This method uses the legacy single-actor approach and may not work with modern Megatron-Bridge.
+
+        Uses bridge.export_hf_weights() and filters for LoRA parameters.
         Converts mbridge HuggingFace names to PEFT format for vLLM compatibility.
 
         mbridge format: layers.0.self_attn.q_proj.lora_A.weight
@@ -799,11 +802,26 @@ class MegatronTrainingWorker:
         Returns:
             Dict mapping LoRA parameter names (PEFT format) to CPU tensors.
         """
+        import warnings
+        warnings.warn(
+            "MegatronTrainingWorker is deprecated. Use MegatronWorkerGroup from megatron_distributed.py instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
         if self.bridge is None:
             raise RuntimeError("Bridge not initialized - cannot export weights")
 
-        # Export all weights via bridge
-        full_state_dict = dict(self.bridge.export_weights(self.engine.module))
+        # Export all weights via bridge - requires export_hf_weights() API
+        # The old export_weights() API merges LoRA into base weights, which is unusable
+        # for multi-LoRA inference. We must have separate lora_A/lora_B matrices.
+        if not hasattr(self.bridge, 'export_hf_weights'):
+            raise RuntimeError(
+                "Bridge lacks export_hf_weights() method. "
+                "The old export_weights() API merges LoRA into base weights, "
+                "which cannot be used for vLLM multi-LoRA inference."
+            )
+        full_state_dict = dict(self.bridge.export_hf_weights(self.engine.module))
 
         # Filter for LoRA parameters and convert to PEFT format
         lora_state_dict = {}

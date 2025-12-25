@@ -1688,6 +1688,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -1699,6 +1700,7 @@ class VerlTrainingEngine:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1711,7 +1713,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
-        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY")
+        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY (use_per_expert_lora={use_per_expert_lora})")
         logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
 
         # Fetch weights and config from remote worker via Ray object store
@@ -1721,13 +1723,14 @@ class VerlTrainingEngine:
         loop = asyncio.get_running_loop()
 
         # Schedule remote calls
-        state_dict_ref = worker.get_lora_state_dict.remote()
+        state_dict_ref = worker.get_lora_state_dict.remote(use_per_expert_lora)
         config_ref = worker.get_lora_config.remote()
         logger.info(f"[{model_id}] save_weights_for_sampler: remote calls scheduled, waiting for results...")
 
         # Use ray.get() with timeout in executor to avoid blocking event loop
+        # Increased timeout for large models with many LoRA params (MoE + MLA = 428 params)
         def get_with_timeout():
-            return ray.get([state_dict_ref, config_ref], timeout=120)
+            return ray.get([state_dict_ref, config_ref], timeout=300)
 
         state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 # NOTE: vLLM 0.12.0 requires PyTorch 2.9.0, which requires NCCL 2.21+
 # System has NCCL 2.x (older) - cannot use PFS PyTorch 2.9.0
 # MoE LoRA blocked until Docker image upgraded with newer CUDA stack
-PFS_TINKER_PATH = "/vePFS-Mindverse/share/code/tinker-server"
+PFS_TINKER_PATH = "/vePFS-Mindverse/share/code/tinker-server-bugfix"
 
 # PFS verl path with _mutable_fields patch for LoRA config assignment
 PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
