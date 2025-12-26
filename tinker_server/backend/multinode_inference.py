@@ -177,7 +177,7 @@ def _create_multinode_vllm_actor(
                 disable_log_stats=True,
                 enforce_eager=True,  # CUDA graphs OOM on K2 at 0.98 util
                 quantization=self.quantization,
-                kv_cache_dtype=self.kv_cache_dtype,  # FP8 KV cache halves memory
+                kv_cache_dtype=self.kv_cache_dtype or "auto",  # None -> "auto" for vLLM CacheConfig validation
                 # LoRA config
                 enable_lora=self.enable_lora,
                 max_loras=self.max_loras if self.enable_lora else None,
@@ -584,7 +584,7 @@ class MultiNodeInferenceEngine:
                 max_model_len=self.max_model_len,
                 quantization=self.quantization,
                 enable_lora=self.max_loras > 0,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype or "auto",
             )
 
             # Initialize engine (this spawns vLLM's Ray workers)

@@ -29,8 +29,9 @@ class ModelConfig:
     is_moe: bool
     recommended_tp: int  # vLLM inference TP
     recommended_dp: int  # vLLM inference DP
-    train_tp: int = 1  # Megatron training TP
-    train_ep: int = 1  # Megatron training EP (MoE only)
+    train_tp: int = 1  # Megatron training TP (attention/shared layers)
+    train_ep: int = 1  # Megatron training EP (MoE expert distribution, 1 for dense)
+    train_etp: int | None = None  # Expert tensor parallelism (None = use TP, 1 = no expert splitting)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
     gpu_memory_utilization: float | None = None  # None = use global default (0.85), or override for large models
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
@@ -103,15 +104,16 @@ MODEL_CONFIGS = {
         is_moe=True,
         recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
         recommended_dp=1,
-        train_tp=1,  # Training: TP=1 (no tensor-parallel within attention/MLP)
+        train_tp=8,  # Training: TP=8 (attention parallelism across 8 GPUs per node)
         train_ep=64,  # Training: EP=64 (384 experts / 64 = 6 experts per GPU)
+        train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU, not split)
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
         gpu_memory_utilization=0.98,  # Near max - 67GB model + overhead leaves minimal margin
         max_loras=1,  # LoRA REQUIRED for weight transfer
-        max_lora_rank=32,  # Attention-only LoRA (MLP filtered), rank 32 fits in memory
+        max_lora_rank=8,  # Reduced from 32 to avoid OOM during training forward_backward
         max_model_len=2048,  # 2K context - minimal KV cache for 78.4GB budget
-        kv_cache_dtype="fp8_e5m2",  # FP8 KV cache halves memory usage
-        max_token_len_per_gpu=1024,  # Force micro_batch_size=1 behavior (sample-by-sample gradient accumulation)
+        # Note: FP8 KV cache not supported by MLA backends on Ampere (A100) GPUs
+        max_token_len_per_gpu=2048,  # Match max_model_len to handle full sequences
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
     # Same DeepseekV3ForCausalLM architecture
@@ -226,17 +228,18 @@ def get_recommended_parallelism(model_name: str) -> tuple[int, int]:
     return config.recommended_tp, config.recommended_dp
 
 
-def get_training_parallelism(model_name: str) -> tuple[int, int]:
-    """Return (tensor_parallel_size, expert_parallel_size) for training.
+def get_training_parallelism(model_name: str) -> tuple[int, int, int | None]:
+    """Return (tensor_parallel_size, expert_parallel_size, expert_tensor_parallel_size) for training.
 
     Args:
         model_name: HuggingFace model name
 
     Returns:
-        Tuple of (TP, EP) sizes for Megatron training
+        Tuple of (TP, EP, ETP) sizes for Megatron training.
+        ETP is None if not specified (defaults to TP in Megatron).
     """
     config = get_model_config(model_name)
-    return config.train_tp, config.train_ep
+    return config.train_tp, config.train_ep, config.train_etp
 
 
 def get_quantization(model_name: str) -> str | None:

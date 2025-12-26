@@ -1432,14 +1432,16 @@ class VerlTrainingEngine:
             from .model_registry import get_training_parallelism, requires_fp8
 
             # Get model-specific parallelism and FP8 config from registry
-            train_tp, train_ep = get_training_parallelism(requested_model or "")
+            train_tp, train_ep, train_etp = get_training_parallelism(requested_model or "")
             use_fp8 = requires_fp8(requested_model or "")
             distributed_config = DistributedConfig(
                 tensor_parallel_size=train_tp,
                 expert_parallel_size=train_ep,
+                expert_tensor_parallel_size=train_etp,
                 use_fp8=use_fp8,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, world_size={train_tp * train_ep}, fp8={use_fp8})")
+            world_size = distributed_config.world_size
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, ETP={train_etp}, world_size={world_size}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
