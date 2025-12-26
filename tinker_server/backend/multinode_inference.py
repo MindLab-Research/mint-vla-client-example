@@ -129,7 +129,6 @@ def _create_multinode_vllm_actor(
             self,
             model_path: str,
             tensor_parallel_size: int,
-            pipeline_parallel_size: int = 1,
             gpu_memory_utilization: float = 0.80,
             max_model_len: int | None = None,
             quantization: str | None = None,
@@ -137,7 +136,6 @@ def _create_multinode_vllm_actor(
         ):
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
-            self.pipeline_parallel_size = pipeline_parallel_size
             self.gpu_memory_utilization = gpu_memory_utilization
             self.max_model_len = max_model_len
             self.quantization = quantization
@@ -161,11 +159,10 @@ def _create_multinode_vllm_actor(
             # Import vLLM components AFTER setting env var
             from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-            # Build engine args for multi-node TP+PP
+            # Build engine args for multi-node TP
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
-                pipeline_parallel_size=self.pipeline_parallel_size,
                 distributed_executor_backend="ray",  # Key: use Ray for multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 dtype="auto",
@@ -185,7 +182,7 @@ def _create_multinode_vllm_actor(
             )
 
             logger.info(
-                f"Creating AsyncLLMEngine: TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
+                f"Creating AsyncLLMEngine: TP={self.tensor_parallel_size}, "
                 f"backend=ray, enable_lora={self.enable_lora}"
             )
 
@@ -409,8 +406,7 @@ class MultiNodeInferenceEngine:
     def __init__(
         self,
         model_path: str,
-        tensor_parallel_size: int = 8,
-        pipeline_parallel_size: int = 2,
+        tensor_parallel_size: int = 16,
         gpu_memory_utilization: float = 0.80,
         max_model_len: int | None = None,
         max_loras: int = 1,
@@ -421,7 +417,6 @@ class MultiNodeInferenceEngine:
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
-        self.pipeline_parallel_size = pipeline_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
@@ -580,7 +575,6 @@ class MultiNodeInferenceEngine:
             ).remote(
                 model_path=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
-                pipeline_parallel_size=self.pipeline_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
                 quantization=self.quantization,
@@ -588,11 +582,10 @@ class MultiNodeInferenceEngine:
             )
 
             # Initialize engine (this spawns vLLM's Ray workers)
-            total_gpus = self.tensor_parallel_size * self.pipeline_parallel_size
-            logger.info(f"Initializing MultiNodeVLLMEngine with TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, total_gpus={total_gpus}")
-            # K2 (TP=8, PP=2): ~30 min shard loading + post-init (CUDA graphs, KV cache)
+            logger.info(f"Initializing MultiNodeVLLMEngine with TP={self.tensor_parallel_size}")
+            # K2 (TP=16): ~30 min shard loading + post-init (CUDA graphs, KV cache)
             # Need 3600s (1h) to be safe; 1800s times out at edge cases
-            init_timeout = 3600 if total_gpus >= 16 else (1800 if total_gpus >= 8 else 600)
+            init_timeout = 3600 if self.tensor_parallel_size >= 16 else (1800 if self.tensor_parallel_size >= 8 else 600)
 
             loop = asyncio.get_event_loop()
             try:
