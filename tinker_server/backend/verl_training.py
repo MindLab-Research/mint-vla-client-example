@@ -894,8 +894,12 @@ class TrainingWorker:
             "type": "optim_step",
         }
 
-    def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
+    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights as state dict.
+
+        Args:
+            use_per_expert_lora: Ignored for dense models (TrainingWorker).
+                Only applies to MoE models using MegatronWorkerGroup.
 
         Returns:
             Dict mapping parameter names to tensors (on CPU).

@@ -787,7 +787,7 @@ class MegatronTrainingWorker:
             "type": "optim_step",
         }
 
-    def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
+    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights in PEFT format.
 
         NOTE: This class is DEPRECATED. Use MegatronWorkerGroup from megatron_distributed.py instead.
@@ -798,6 +798,10 @@ class MegatronTrainingWorker:
 
         mbridge format: layers.0.self_attn.q_proj.lora_A.weight
         PEFT format:    base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+
+        Args:
+            use_per_expert_lora: Ignored for legacy actor. Only applies to
+                MegatronWorkerGroup for MoE models.
 
         Returns:
             Dict mapping LoRA parameter names (PEFT format) to CPU tensors.

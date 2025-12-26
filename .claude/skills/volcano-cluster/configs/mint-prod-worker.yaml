@@ -39,16 +39,16 @@ Entrypoint: |
   echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
 
   # Start Ray worker
-  ray start --address="${RAY_HEAD_IP}:6379" --num-gpus=2 && sleep infinity
+  ray start --address="${RAY_HEAD_IP}:6379" --num-gpus=8 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl-vllm-megatron-lora:v0.1"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.pni2l.7xlarge"  # 2x A800 80GB
+      Flavor: "ml.pni2l.28xlarge"  # 8x A800 80GB
 
 # No time limit - runs indefinitely
 ActiveDeadlineSeconds: 0
