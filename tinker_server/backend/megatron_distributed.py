@@ -701,7 +701,10 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
-        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
+        # Get model-specific max_token_len_per_gpu for micro-batching (gradient accumulation)
+        from tinker_server.backend.model_registry import get_max_token_len_per_gpu
+        max_token_len = get_max_token_len_per_gpu(self.base_model) or 8192
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
@@ -849,8 +852,11 @@ class MegatronRankWorker:
                 seq_lengths.append(len(chunks[0]["tokens"]))
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
+        # Get model-specific max_token_len_per_gpu for micro-batching (gradient accumulation)
         device = torch.cuda.current_device()
-        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
+        from tinker_server.backend.model_registry import get_max_token_len_per_gpu
+        max_token_len = get_max_token_len_per_gpu(self.base_model) or 8192
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn

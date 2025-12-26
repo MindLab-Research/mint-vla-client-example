@@ -937,6 +937,10 @@ class MultiModelInferenceManager:
             from .model_registry import get_max_model_len
             model_max_model_len = get_max_model_len(model_name) or self.max_model_len
 
+            # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
+            from .model_registry import get_kv_cache_dtype
+            model_kv_cache_dtype = get_kv_cache_dtype(model_name)
+
             # Check if model needs multi-node (TP > 8)
             # K2 requires TP=16 across 2 nodes for LoRA support
             needs_multinode = config.recommended_tp > 8
@@ -951,7 +955,7 @@ class MultiModelInferenceManager:
                     f"actor={actor_name}, TP={config.recommended_tp}, total_gpus={total_gpus}, "
                     f"gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
-                    f"max_model_len={model_max_model_len}"
+                    f"max_model_len={model_max_model_len}, kv_cache_dtype={model_kv_cache_dtype}"
                 )
 
                 # Ensure GPUs available, evicting idle actors if needed (LRU)
@@ -972,6 +976,7 @@ class MultiModelInferenceManager:
                     max_loras=model_max_loras,
                     max_lora_rank=model_max_lora_rank,
                     quantization=quantization,
+                    kv_cache_dtype=model_kv_cache_dtype,
                     actor_name=actor_name,
                 )
             else:

@@ -36,6 +36,8 @@ class ModelConfig:
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
     max_lora_rank: int | None = None  # None = use global default, or override for large models
     max_model_len: int | None = None  # None = use model's default, or override for large models with KV cache constraints
+    kv_cache_dtype: str | None = None  # None = use model default, "fp8_e5m2" halves KV cache memory
+    max_token_len_per_gpu: int | None = None  # None = use default (8192), lower = more micro-batches (gradient accumulation)
 
     @property
     def total_gpus(self) -> int:
@@ -101,13 +103,15 @@ MODEL_CONFIGS = {
         is_moe=True,
         recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
         recommended_dp=1,
-        train_tp=8,
-        train_ep=8,  # Training: 64 GPUs (8×8) minimum
+        train_tp=1,  # Training: TP=1 (no tensor-parallel within attention/MLP)
+        train_ep=64,  # Training: EP=64 (384 experts / 64 = 6 experts per GPU)
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
         gpu_memory_utilization=0.98,  # Near max - 67GB model + overhead leaves minimal margin
         max_loras=1,  # LoRA REQUIRED for weight transfer
         max_lora_rank=32,  # Attention-only LoRA (MLP filtered), rank 32 fits in memory
         max_model_len=2048,  # 2K context - minimal KV cache for 78.4GB budget
+        kv_cache_dtype="fp8_e5m2",  # FP8 KV cache halves memory usage
+        max_token_len_per_gpu=1024,  # Force micro_batch_size=1 behavior (sample-by-sample gradient accumulation)
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
     # Same DeepseekV3ForCausalLM architecture
@@ -305,3 +309,37 @@ def get_max_loras(model_name: str) -> int | None:
     """
     config = get_model_config(model_name)
     return config.max_loras
+
+
+def get_kv_cache_dtype(model_name: str) -> str | None:
+    """Get per-model kv_cache_dtype override.
+
+    FP8 KV cache (fp8_e5m2) halves KV cache memory usage, enabling
+    larger context or batch sizes.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        KV cache dtype for this model, or None to use model default.
+    """
+    config = get_model_config(model_name)
+    return config.kv_cache_dtype
+
+
+def get_max_token_len_per_gpu(model_name: str) -> int | None:
+    """Get per-model max_token_len_per_gpu override.
+
+    Controls micro-batch sizing for gradient accumulation. Lower values
+    mean more micro-batches per batch, reducing GPU memory per step.
+    Setting to a low value (e.g., 1024) forces sample-by-sample processing,
+    equivalent to micro_batch_size=1.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        Max tokens per GPU for micro-batching, or None to use default (8192).
+    """
+    config = get_model_config(model_name)
+    return config.max_token_len_per_gpu

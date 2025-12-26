@@ -133,6 +133,7 @@ def _create_multinode_vllm_actor(
             max_model_len: int | None = None,
             quantization: str | None = None,
             enable_lora: bool = True,
+            kv_cache_dtype: str | None = None,
         ):
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
@@ -142,6 +143,7 @@ def _create_multinode_vllm_actor(
             self.enable_lora = enable_lora
             self.max_loras = max_loras
             self.max_lora_rank = max_lora_rank
+            self.kv_cache_dtype = kv_cache_dtype
 
             self.engine = None
             self._initialized = False
@@ -175,6 +177,7 @@ def _create_multinode_vllm_actor(
                 disable_log_stats=True,
                 enforce_eager=True,  # CUDA graphs OOM on K2 at 0.98 util
                 quantization=self.quantization,
+                kv_cache_dtype=self.kv_cache_dtype,  # FP8 KV cache halves memory
                 # LoRA config
                 enable_lora=self.enable_lora,
                 max_loras=self.max_loras if self.enable_lora else None,
@@ -412,6 +415,7 @@ class MultiNodeInferenceEngine:
         max_loras: int = 1,
         max_lora_rank: int = 8,
         quantization: str | None = None,
+        kv_cache_dtype: str | None = None,
         actor_name: str | None = None,
         shared_adapter_dir: str = "/vePFS-Mindverse/share/tinker_adapters",
     ):
@@ -422,6 +426,7 @@ class MultiNodeInferenceEngine:
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
         self.quantization = quantization
+        self.kv_cache_dtype = kv_cache_dtype
         self.actor_name = actor_name or f"multinode_vllm_{model_path.split('/')[-1].lower()}"
         self.shared_adapter_dir = shared_adapter_dir
 
@@ -579,6 +584,7 @@ class MultiNodeInferenceEngine:
                 max_model_len=self.max_model_len,
                 quantization=self.quantization,
                 enable_lora=self.max_loras > 0,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
 
             # Initialize engine (this spawns vLLM's Ray workers)
