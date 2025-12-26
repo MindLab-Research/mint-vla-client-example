@@ -5,7 +5,7 @@ instead of hardcoded defaults.
 
 Tests:
 - Dense model (Qwen2.5-7B): 32K context
-- MoE model (Qwen3-30B-A3B): 262K context
+- MoE model (Qwen3-30B-A3B): 40K context (vLLM limit, model supports 262K)
 - Prompt near context limit should succeed
 - Prompt exceeding context limit should give clear error
 
@@ -25,9 +25,9 @@ from .conftest import (
 )
 
 
-# Context limits from model_registry.py
+# Context limits (vLLM operational limits)
 DENSE_CONTEXT = 32768   # Qwen2.5-7B-Instruct
-MOE_CONTEXT = 262144    # Qwen3-30B-A3B-Instruct-2507
+MOE_CONTEXT = 40960     # Qwen3-30B-A3B-Instruct-2507 (vLLM limit; model supports 262K)
 
 
 def generate_tokens(tokenizer, target_length: int) -> list[int]:
@@ -83,7 +83,7 @@ class TestDenseLongContext:
 
 @pytest.mark.moe
 class TestMoELongContext:
-    """Long context tests for MoE model (262K context).
+    """Long context tests for MoE model (40K vLLM context).
 
     Marked with @pytest.mark.moe - these tests require 4 GPUs and take longer.
     Skip with: pytest -m "not moe"
@@ -107,12 +107,12 @@ class TestMoELongContext:
 
     @pytest.mark.slow
     def test_large_context(self, moe_tokenizer):
-        """Test MoE with large prompt (100K tokens).
+        """Test MoE with large prompt (30K tokens).
 
         Marked slow - takes significant time for prefill.
         Skip with: pytest -m "not slow"
         """
-        prompt_size = 100000
+        prompt_size = 30000
         prompt_tokens = generate_tokens(moe_tokenizer, prompt_size)
 
         session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=1e-4)
@@ -128,12 +128,12 @@ class TestMoELongContext:
 
     @pytest.mark.slow
     def test_near_context_limit(self, moe_tokenizer):
-        """Test MoE with prompt near 262K limit (260K tokens).
+        """Test MoE with prompt near 40K limit (38K tokens).
 
         Marked slow - stress test for memory.
         Skip with: pytest -m "not slow"
         """
-        prompt_size = 260000
+        prompt_size = 38000
         prompt_tokens = generate_tokens(moe_tokenizer, prompt_size)
 
         session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=1e-4)
@@ -146,3 +146,24 @@ class TestMoELongContext:
         assert len(result["sequences"][0].get("tokens", [])) > 0, "No tokens generated"
 
         print(f"MoE near-limit ({prompt_size:,} tokens): Generated {len(result['sequences'][0]['tokens'])} tokens")
+
+    def test_exceed_context_limit(self, moe_tokenizer):
+        """Test MoE prompt exceeding 40K limit gives clear error."""
+        prompt_size = 45000
+        prompt_tokens = generate_tokens(moe_tokenizer, prompt_size)
+
+        session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=1e-4)
+        save_weights(model_id, name="moe_exceed_context_test")
+
+        result = sample(model_id, prompt_tokens, max_tokens=50, temperature=0.7)
+
+        # Should get an error
+        assert "error" in result or "sequences" not in result or not result.get("sequences"), \
+            f"Expected error for {prompt_size:,} token prompt exceeding {MOE_CONTEXT:,} limit"
+
+        # Error should be clear (mention context/length/tokens)
+        error_msg = str(result.get("error", ""))
+        assert any(kw in error_msg.lower() for kw in ["context", "length", "token", "exceed", "limit"]), \
+            f"Error message not clear: {error_msg[:200]}"
+
+        print(f"MoE exceed-limit ({prompt_size:,} tokens): Got expected clear error")
