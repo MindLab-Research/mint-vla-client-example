@@ -69,18 +69,22 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
         max_position_embeddings=40960,  # 40K context (from HF config)
+        gradient_checkpointing=True,  # Required for 40K context training
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
         max_position_embeddings=40960,  # 40K context (from HF config)
+        gradient_checkpointing=True,  # Required for 40K context training
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
         max_position_embeddings=40960,  # 40K context (from HF config)
+        gradient_checkpointing=True,  # Required for 40K context training
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
         is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
         max_position_embeddings=40960,  # 40K context (from HF config)
+        gradient_checkpointing=True,  # Required for 40K context training
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert

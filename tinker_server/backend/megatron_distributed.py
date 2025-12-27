@@ -407,6 +407,7 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+
         # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
         # These patches enable Flash Attention 2 with MLA by padding value tensors
         # Must be applied before MLASelfAttention class is imported/instantiated
@@ -533,6 +534,22 @@ class MegatronRankWorker:
             override_tf_config["fp8_param"] = True
             override_tf_config["use_cpu_initialization"] = True
             logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
+
+        # Activation recomputation (gradient checkpointing) for memory-constrained training
+        # Required for long context training on large models (e.g., 40K tokens on 30B)
+        from .model_registry import get_gradient_checkpointing
+        try:
+            use_gradient_checkpointing = get_gradient_checkpointing(self.base_model)
+        except ValueError:
+            use_gradient_checkpointing = False
+        if use_gradient_checkpointing:
+            # Use FULL recomputation for maximum memory savings
+            # For 40K context on 30B MoE, "selective" isn't enough - need full recompute
+            # This recomputes ALL activations during backward pass, trading compute for memory
+            override_tf_config["recompute_granularity"] = "full"
+            override_tf_config["recompute_method"] = "uniform"  # Uniform distribution across layers
+            override_tf_config["recompute_num_layers"] = 1  # Recompute every layer
+            logger.info(f"[Rank {self.rank}] Activation recomputation enabled (full: all layers)")
 
         # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
         # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
