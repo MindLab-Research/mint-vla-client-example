@@ -244,14 +244,18 @@ def get_token_encryptor() -> TokenEncryptor | None:
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
-    """Validate sk- token from X-API-Key or Authorization: Bearer header.
+    """Validate API key or sk- token from X-API-Key or Authorization header.
 
-    Decrypts sk- prefixed tokens using TINKER_TOKEN_SECRET_KEY to extract user_id.
+    Supports two authentication methods (checked in order):
+    1. Hardcoded API key (TINKER_API_KEY) - direct string comparison
+    2. Encrypted sk- tokens (TINKER_TOKEN_SECRET_KEY) - AES decryption
+
+    If neither is configured, auth is disabled (dev mode).
     """
     path = request.url.path
 
-    # Skip auth if no token_secret_key configured (dev mode)
-    if not config.token_secret_key:
+    # Skip auth if no authentication configured (dev mode)
+    if not config.auth_enabled:
         return await call_next(request)
 
     # Skip auth for specific paths
@@ -278,24 +282,26 @@ async def api_key_auth_middleware(request: Request, call_next):
             content={"error": "Missing API key"},
         )
 
-    # Decrypt sk- token
-    if not api_key.startswith("sk-"):
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Invalid token format (must start with sk-)"},
-        )
+    # Method 1: Check hardcoded API key (legacy)
+    if config.validate_api_key(api_key):
+        # Hardcoded key valid - no user_data available
+        request.state.user_data = None
+        return await call_next(request)
 
-    encryptor = get_token_encryptor()
-    user_data = encryptor.decrypt_token(api_key)
-    if user_data is None:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Invalid token"},
-        )
+    # Method 2: Try sk- token decryption
+    if api_key.startswith("sk-") and config.token_secret_key:
+        encryptor = get_token_encryptor()
+        if encryptor:
+            user_data = encryptor.decrypt_token(api_key)
+            if user_data is not None:
+                request.state.user_data = user_data
+                return await call_next(request)
 
-    # Token is valid - store user_data in request state for later use
-    request.state.user_data = user_data
-    return await call_next(request)
+    # Neither method succeeded
+    return JSONResponse(
+        status_code=401,
+        content={"error": "Invalid API key or token"},
+    )
 
 
 # Register routes with API prefix

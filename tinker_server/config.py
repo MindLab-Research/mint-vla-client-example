@@ -1,6 +1,7 @@
 """Server configuration."""
 
 import os
+import secrets
 from dataclasses import dataclass
 
 # PFS paths for Ray worker runtime_env
@@ -28,8 +29,9 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Authentication (sk- token decryption)
-    token_secret_key: str = ""  # Secret key for sk- token decryption. If empty, auth disabled (dev mode)
+    # Authentication
+    api_key: str = ""  # Hardcoded API key (legacy). If set, accepts this key directly.
+    token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
 
     # Usage logging
     usage_log_dir: str = "/tmp/tinker_usage"  # Directory to store usage logs
@@ -49,12 +51,14 @@ class ServerConfig:
     @classmethod
     def from_env(cls) -> "ServerConfig":
         """Load configuration from environment variables."""
+        api_key = os.environ.get("TINKER_API_KEY", "")
         token_secret_key = os.environ.get("TINKER_TOKEN_SECRET_KEY", "")
-        # If no token_secret_key set, auth is disabled (dev mode)
+        # Auth disabled (dev mode) if neither api_key nor token_secret_key is set
 
         return cls(
             host=os.environ.get("TINKER_HOST", "0.0.0.0"),
             port=int(os.environ.get("TINKER_PORT", "8000")),
+            api_key=api_key,
             token_secret_key=token_secret_key,
             usage_log_dir=os.environ.get("TINKER_USAGE_LOG_DIR", "/tmp/tinker_usage"),
             tensor_parallel_size=int(os.environ.get("TINKER_TP_SIZE", "1")),
@@ -70,6 +74,17 @@ class ServerConfig:
             max_cpu_loras=int(os.environ.get("TINKER_MAX_CPU_LORAS", "1024")),
             max_lora_rank=int(os.environ.get("TINKER_MAX_LORA_RANK", "64")),
         )
+
+    @property
+    def auth_enabled(self) -> bool:
+        """Check if any authentication is configured."""
+        return bool(self.api_key or self.token_secret_key)
+
+    def validate_api_key(self, provided_key: str) -> bool:
+        """Validate hardcoded API key using constant-time comparison."""
+        if not self.api_key:
+            return False
+        return secrets.compare_digest(self.api_key, provided_key)
 
 # Global config instance
 config = ServerConfig.from_env()
