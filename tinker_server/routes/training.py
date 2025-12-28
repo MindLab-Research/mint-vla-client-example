@@ -41,6 +41,7 @@ from ..models.types import (
     UntypedAPIFuture,
 )
 from ..usage_logger import get_usage_logger
+from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -56,11 +57,24 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For ephemeral flow
 
 
+def _get_user_data(request: Request) -> dict | None:
+    """Extract full user_data from request state (set by auth middleware)."""
+    return getattr(request.state, "user_data", None)
+
+
 def _get_user_id(request: Request) -> str | None:
     """Extract user_id from request state (set by auth middleware)."""
-    user_data = getattr(request.state, "user_data", None)
+    user_data = _get_user_data(request)
     if user_data:
         return user_data.get("user_id")
+    return None
+
+
+def _get_webhook_url(request: Request) -> str | None:
+    """Extract webhook_url from request state (set by auth middleware)."""
+    user_data = _get_user_data(request)
+    if user_data:
+        return user_data.get("webhook_url")
     return None
 
 
@@ -78,23 +92,45 @@ def _generate_model_id(session_id: str, model_seq_id: int) -> str:
 async def create_model(
     request: CreateModelRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_create_model, request_id, request)
+    user_id = _get_user_id(http_request)
+    webhook_url = _get_webhook_url(http_request)
+
+    # 1. 发送 pending 状态 - 任务已创建，等待执行
+    model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    if webhook_url and user_id:
+        send_task_event(
+            webhook_url=webhook_url,
+            event_type=EventType.TASK_CREATED,  # pending
+            user_id=user_id,
+            session_id=model_id,
+            task_name=f"Training {request.base_model}",
+            task_type="training",
+            model_name=request.base_model,
+            config={"lora_rank": request.lora_config.get("r") if request.lora_config else None},
+        )
+
+    background_tasks.add_task(_do_create_model, request_id, request, user_id, webhook_url)
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_create_model(request_id: str, request: CreateModelRequest) -> None:
+async def _do_create_model(
+    request_id: str,
+    request: CreateModelRequest,
+    user_id: str | None,
+    webhook_url: str | None,
+) -> None:
     """Background task to create training model."""
+    model_id = _generate_model_id(request.session_id, request.model_seq_id)
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
-
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
@@ -125,13 +161,37 @@ async def _do_create_model(request_id: str, request: CreateModelRequest) -> None
         )
         future_store.resolve(request_id, response.model_dump())
 
+        # 2. 发送 running 状态 - 模型创建成功，训练就绪
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_STARTED,  # running
+                user_id=user_id,
+                session_id=model_id,
+                task_name=f"Training {request.base_model}",
+                task_type="training",
+                model_name=request.base_model,
+            )
+
     except Exception as e:
         logger.exception(f"[create_model] Failed: {e}")
         # Clean up session if it was created
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
         if training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
         future_store.fail(request_id, str(e))
+
+        # 发送 failed 状态
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_FAILED,
+                user_id=user_id,
+                session_id=model_id,
+                task_name=f"Training {request.base_model}",
+                task_type="training",
+                model_name=request.base_model,
+                error=str(e),
+            )
 
 
 # =============================================================================
