@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Request
 
 from ..backend.future_store import future_store
 from ..models.types import (
@@ -21,6 +21,7 @@ from ..models.types import (
     SampleResponse,
     UntypedAPIFuture,
 )
+from ..usage_logger import get_usage_logger
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -33,10 +34,19 @@ router = APIRouter()
 session_manager: SessionManager | None = None
 
 
+def _get_user_id(request: Request) -> str | None:
+    """Extract user_id from request state (set by auth middleware)."""
+    user_data = getattr(request.state, "user_data", None)
+    if user_data:
+        return user_data.get("user_id")
+    return None
+
+
 @router.post("/asample")
 async def asample(
     request: SampleRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Submit an async sampling request.
 
@@ -44,11 +54,14 @@ async def asample(
     with the returned request_id to get results.
     """
     request_id = future_store.create()
-    background_tasks.add_task(_do_sample, request_id, request)
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_sample, request_id, request, user_id)
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_sample(request_id: str, request: SampleRequest) -> None:
+async def _do_sample(
+    request_id: str, request: SampleRequest, user_id: str | None
+) -> None:
     """Background task to perform sampling."""
     try:
         if session_manager is None:
@@ -150,6 +163,18 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
         future_store.resolve(request_id, response.model_dump())
         logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
 
+        # Log usage
+        if user_id:
+            total_tokens = len(token_ids) + sum(len(seq.tokens) for seq in sequences)
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="sample",
+                model_name=session_id,  # Use session_id as model identifier
+                token_count=total_tokens,
+                session_id=session_id,
+                request_id=request_id,
+            )
+
     except Exception as e:
         logger.exception(f"Request {request_id} failed: {e}")
         future_store.fail(request_id, str(e))
@@ -159,6 +184,7 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
 async def compute_logprobs(
     request: ComputeLogprobsRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Compute logprobs for a sequence.
 
@@ -166,12 +192,13 @@ async def compute_logprobs(
     Output length is len(sequence) - 1.
     """
     request_id = future_store.create()
-    background_tasks.add_task(_do_compute_logprobs, request_id, request)
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_compute_logprobs, request_id, request, user_id)
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_compute_logprobs(
-    request_id: str, request: ComputeLogprobsRequest
+    request_id: str, request: ComputeLogprobsRequest, user_id: str | None
 ) -> None:
     """Background task to compute logprobs."""
     try:
@@ -212,6 +239,17 @@ async def _do_compute_logprobs(
         logger.debug(
             f"Request {request_id} computed {len(logprobs)} logprobs"
         )
+
+        # Log usage
+        if user_id:
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="compute_logprobs",
+                model_name=session_id,
+                token_count=len(token_ids),
+                session_id=session_id,
+                request_id=request_id,
+            )
 
     except Exception as e:
         logger.exception(f"Request {request_id} failed: {e}")
