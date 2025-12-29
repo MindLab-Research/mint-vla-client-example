@@ -59,16 +59,23 @@ class ModelConfig:
     def train_gpus(self) -> int:
         """Total GPUs for training.
 
-        With MoE Parallel Folding (when both EP > 1 and CP > 1):
-            world_size = TP * PP * max(EP, CP)
-        Without folding:
-            world_size = TP * PP * EP * CP
+        MoE Parallel Folding cases:
+        1. EP > TP with ETP < TP: world_size = EP
+           (TP is a subgroup for attention within EP dimension)
+        2. CP > 1 and EP > 1: world_size = TP * max(EP, CP)
+           (CP and EP share GPU ranks)
+        3. Traditional: world_size = TP * EP * CP
         """
-        if self.train_ep > 1 and self.train_cp > 1:
-            # MoE Parallel Folding: CP and EP share the same GPU ranks
+        etp = self.train_etp if self.train_etp is not None else self.train_tp
+
+        if self.train_ep > self.train_tp and etp < self.train_tp:
+            # MoE Parallel Folding with ETP: TP is subgroup within EP
+            return self.train_ep * self.train_cp
+        elif self.train_ep > 1 and self.train_cp > 1:
+            # CP/EP Folding: CP and EP share GPU ranks
             return self.train_tp * max(self.train_ep, self.train_cp)
         else:
-            # Traditional: all dimensions are orthogonal
+            # Traditional: all dimensions orthogonal
             return self.train_tp * self.train_ep * self.train_cp
 
 
@@ -125,11 +132,12 @@ MODEL_CONFIGS = {
         is_moe=True,
         recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
         recommended_dp=1,
-        train_tp=8,  # Training: TP=8 (attention parallelism)
-        train_ep=8,  # Training: EP=8 (expert distribution)
-        train_cp=2,  # Training: CP=2 (context parallelism for 32K+ sequences)
+        train_tp=8,  # Training: TP=8 (attention parallelism within each of 8 TP subgroups)
+        train_ep=64,  # Training: EP=64 (expert distribution across 64 GPUs, 6 experts/GPU)
+        train_cp=1,  # Training: CP=1 (CP=2 adds 9 GiB ring attention overhead)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU, not split)
-        # MoE Parallel Folding: world_size = TP * max(EP, CP) = 8 * 8 = 64 GPUs
+        # MoE Parallel Folding: world_size = EP = 64 GPUs
+        # TP=8 operates as subgroups within the 64 GPU EP dimension
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
         gpu_memory_utilization=0.98,  # 52 GB model+LoRA, 15.6 GB available for KV cache
         max_loras=1,  # LoRA for weight transfer

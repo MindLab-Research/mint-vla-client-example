@@ -67,12 +67,12 @@ class DistributedConfig:
     Defaults configured for 1-GPU setup (GPU 0 has leaked memory).
     For multi-GPU: tensor_parallel_size=2 (2-GPU) or TP=2,PP=2,EP=2 (8-GPU)
 
-    MoE Parallel Folding:
-        When both expert_parallel_size > 1 and context_parallel_size > 1,
-        MoE Parallel Folding is used. This folds CP and EP onto the same GPU ranks:
-        - Attention uses CP groups (sequence sharded across CP ranks)
-        - MoE uses EP groups (experts distributed across EP ranks)
-        - world_size = TP * PP * max(EP, CP) instead of TP * PP * EP * CP
+    MoE Parallel Folding cases:
+    1. EP > TP with ETP < TP: world_size = EP
+       (TP is a subgroup for attention within EP dimension)
+    2. CP > 1 and EP > 1: world_size = TP * PP * max(EP, CP)
+       (CP and EP share GPU ranks)
+    3. Traditional: world_size = TP * PP * EP * CP
     """
 
     tensor_parallel_size: int = 1  # Single GPU - GPU 0 has corrupted memory
@@ -86,13 +86,26 @@ class DistributedConfig:
     def world_size(self) -> int:
         """Total number of processes needed.
 
-        With MoE Parallel Folding (when both EP > 1 and CP > 1):
-            world_size = TP * PP * max(EP, CP)
-        Without folding:
-            world_size = TP * PP * EP * CP
+        MoE Parallel Folding cases:
+        1. EP > TP with ETP < TP: world_size = EP
+           (TP is a subgroup for attention within EP dimension)
+        2. CP > 1 and EP > 1: world_size = TP * PP * max(EP, CP)
+           (CP and EP share GPU ranks)
+        3. Traditional: world_size = TP * PP * EP * CP
         """
-        if self.expert_parallel_size > 1 and self.context_parallel_size > 1:
-            # MoE Parallel Folding: CP and EP share the same GPU ranks
+        etp = self.expert_tensor_parallel_size
+        if etp is None:
+            etp = self.tensor_parallel_size
+
+        if self.expert_parallel_size > self.tensor_parallel_size and etp < self.tensor_parallel_size:
+            # MoE Parallel Folding with ETP: TP is subgroup within EP
+            return (
+                self.expert_parallel_size
+                * self.pipeline_parallel_size
+                * self.context_parallel_size
+            )
+        elif self.expert_parallel_size > 1 and self.context_parallel_size > 1:
+            # CP/EP Folding: CP and EP share GPU ranks
             return (
                 self.tensor_parallel_size
                 * self.pipeline_parallel_size
@@ -577,16 +590,7 @@ class MegatronRankWorker:
             override_tf_config["use_cpu_initialization"] = True
             logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
 
-        # MoE activation checkpointing for memory-efficient training
-        # When enabled, MoE layer activations are checkpointed and recomputed during backward pass
-        # This trades ~30% extra compute for significant memory savings on long sequences
-        # Essential for K2 (1.04T params) with variable-length thinking outputs
-        if num_experts is not None:
-            override_tf_config["recompute_granularity"] = "selective"
-            override_tf_config["recompute_modules"] = ["moe"]
-            logger.info(f"[Rank {self.rank}] MoE recompute enabled (selective granularity, moe modules)")
-
-        # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
+        # MLA attention (Multi-Latent Attention) detection for DeepSeekV3/K2/Moonlight models
         # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
         # MLA has head_dim_qk=192 (qk_nope=128 + qk_rope=64) and head_dim_v=128
         # Flash Attention 2 requires head_dim_qk == head_dim_v
@@ -598,11 +602,36 @@ class MegatronRankWorker:
         qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
         qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
         head_dim_qk = qk_nope + qk_rope
-        if head_dim_qk > 0:
+        is_mla_model = head_dim_qk > 0
+        if is_mla_model:
             logger.info(
                 f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
                 f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
             )
+
+        # Activation checkpointing for memory-efficient training
+        # When enabled, activations are checkpointed and recomputed during backward pass
+        # This trades ~30-40% extra compute for significant memory savings on long sequences
+        # Essential for K2 (1.04T params) with variable-length thinking outputs
+        #
+        # Available modules for selective recompute:
+        # - "moe": recompute MoE layer (biggest saver for MoE models)
+        # - "mla_up_proj": recompute MLA up projection and RoPE (important for K2)
+        # - "shared_experts": recompute shared experts
+        # - "core_attn": recompute core attention
+        # - "layernorm": recompute layernorms
+        if num_experts is not None:
+            override_tf_config["recompute_granularity"] = "selective"
+            # Aggressive recompute for maximum memory savings:
+            # - moe: MoE FFN activations (~40% of memory)
+            # - mla_up_proj: MLA up projections for K2/DeepSeekV3 (~15% of memory)
+            # NOTE: shared_experts conflicts with moe-shared-expert-overlap (enabled by default in new megatron-bridge)
+            recompute_modules = ["moe"]
+            # Add MLA-specific recompute for MLA models
+            if is_mla_model:
+                recompute_modules.append("mla_up_proj")
+            override_tf_config["recompute_modules"] = recompute_modules
+            logger.info(f"[Rank {self.rank}] Selective recompute enabled: {recompute_modules}")
 
         logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
 
@@ -610,6 +639,7 @@ class MegatronRankWorker:
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
             expert_model_parallel_size=self.config.expert_parallel_size,
+            expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
             context_parallel_size=self.config.context_parallel_size,
             param_offload=True,
             optimizer_offload=True,
@@ -619,6 +649,12 @@ class MegatronRankWorker:
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
             override_transformer_config=override_tf_config,
+        )
+        print(
+            f"[Rank {self.rank}] McoreEngineConfig: TP={engine_config.tensor_model_parallel_size}, "
+            f"EP={engine_config.expert_model_parallel_size}, ETP={engine_config.expert_tensor_parallel_size}, "
+            f"CP={engine_config.context_parallel_size}, PP={engine_config.pipeline_model_parallel_size}",
+            flush=True
         )
 
         optimizer_config = McoreOptimizerConfig(
@@ -2554,7 +2590,7 @@ class MegatronActorPool:
                 self.DEFAULT_MAX_LORA_RANK,
             )
             actor_name = self._make_actor_name(base_model, effective_max_rank)
-            num_gpus = config.tensor_parallel_size * config.expert_parallel_size
+            num_gpus = config.world_size  # Use world_size which accounts for MoE Parallel Folding
 
             logger.info(
                 f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, "
