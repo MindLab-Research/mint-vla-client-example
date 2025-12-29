@@ -66,25 +66,46 @@ class DistributedConfig:
 
     Defaults configured for 1-GPU setup (GPU 0 has leaked memory).
     For multi-GPU: tensor_parallel_size=2 (2-GPU) or TP=2,PP=2,EP=2 (8-GPU)
+
+    MoE Parallel Folding:
+        When both expert_parallel_size > 1 and context_parallel_size > 1,
+        MoE Parallel Folding is used. This folds CP and EP onto the same GPU ranks:
+        - Attention uses CP groups (sequence sharded across CP ranks)
+        - MoE uses EP groups (experts distributed across EP ranks)
+        - world_size = TP * PP * max(EP, CP) instead of TP * PP * EP * CP
     """
 
     tensor_parallel_size: int = 1  # Single GPU - GPU 0 has corrupted memory
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
+    expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
 
     @property
     def world_size(self) -> int:
-        """Total number of processes needed."""
-        # For MoE models: world_size = TP * PP * EP * CP
-        # Each rank handles one shard of tensor/pipeline/expert parallelism
-        return (
-            self.tensor_parallel_size
-            * self.pipeline_parallel_size
-            * self.expert_parallel_size
-            * self.context_parallel_size
-        )
+        """Total number of processes needed.
+
+        With MoE Parallel Folding (when both EP > 1 and CP > 1):
+            world_size = TP * PP * max(EP, CP)
+        Without folding:
+            world_size = TP * PP * EP * CP
+        """
+        if self.expert_parallel_size > 1 and self.context_parallel_size > 1:
+            # MoE Parallel Folding: CP and EP share the same GPU ranks
+            return (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * max(self.expert_parallel_size, self.context_parallel_size)
+            )
+        else:
+            # Traditional: all dimensions are orthogonal
+            return (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * self.expert_parallel_size
+                * self.context_parallel_size
+            )
 
 
 @ray.remote(num_gpus=0)
@@ -146,6 +167,52 @@ class MegatronRankWorker:
         self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
+
+    def log_memory_breakdown(self, phase: str) -> dict:
+        """Log detailed GPU memory breakdown for profiling.
+
+        Args:
+            phase: Description of current phase (e.g., "after_init", "after_forward")
+
+        Returns:
+            Dict with memory stats in GiB for analysis.
+        """
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+
+        # Get memory stats
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # GiB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # GiB
+        max_allocated = torch.cuda.max_memory_allocated() / (1024**3)  # GiB
+        max_reserved = torch.cuda.max_memory_reserved() / (1024**3)  # GiB
+
+        # Get detailed stats
+        stats = torch.cuda.memory_stats()
+        active_bytes = stats.get("active_bytes.all.current", 0) / (1024**3)
+        inactive_bytes = stats.get("inactive_split_bytes.all.current", 0) / (1024**3)
+
+        memory_info = {
+            "phase": phase,
+            "allocated_gib": round(allocated, 3),
+            "reserved_gib": round(reserved, 3),
+            "max_allocated_gib": round(max_allocated, 3),
+            "max_reserved_gib": round(max_reserved, 3),
+            "active_gib": round(active_bytes, 3),
+            "inactive_gib": round(inactive_bytes, 3),
+            "fragmentation_gib": round(reserved - allocated, 3),
+        }
+
+        # Only rank 0 logs to avoid spam
+        if self.rank == 0:
+            logger.info(
+                f"[MEMORY] {phase}: "
+                f"allocated={allocated:.2f}GiB, reserved={reserved:.2f}GiB, "
+                f"peak={max_allocated:.2f}GiB, fragmentation={reserved-allocated:.2f}GiB"
+            )
+
+        return memory_info
 
     def _capture_gradients(self) -> list[torch.Tensor]:
         """Capture all gradient buffers from DDP modules to CPU.
@@ -372,6 +439,9 @@ class MegatronRankWorker:
 
         self._initialize_distributed()
         self._initialize_megatron()
+
+        # Log memory after initialization
+        self.log_memory_breakdown("after_init")
 
         logger.info(f"[Rank {self.rank}] initialize() complete")
 
@@ -635,7 +705,7 @@ class MegatronRankWorker:
 
         # Add non-tensor metadata for verl's prepare_micro_batches
         dummy_data["use_dynamic_bsz"] = NonTensorData(True)
-        dummy_data["max_token_len_per_gpu"] = NonTensorData(8192)
+        dummy_data["max_token_len_per_gpu"] = NonTensorData(32768)  # Support up to 32K context
         dummy_data.set_non_tensor("dp_size", 1)
         dummy_data.set_non_tensor("batch_num_tokens", seq_len)
         dummy_data.set_non_tensor("temperature", 1.0)
@@ -703,6 +773,9 @@ class MegatronRankWorker:
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
         data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
 
+        # Log memory before forward-backward
+        self.log_memory_breakdown("before_forward_backward")
+
         # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
             loss_function = create_sft_loss_fn(return_logprobs=True)
@@ -731,6 +804,9 @@ class MegatronRankWorker:
                 loss_function=loss_function,
                 forward_only=False,
             )
+
+            # Log memory after forward-backward (peak usage during training)
+            self.log_memory_breakdown("after_forward_backward")
 
             # 3. Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
             if session_id is not None:
@@ -963,6 +1039,9 @@ class MegatronRankWorker:
             # 2. Apply gradients
             grad_norm = self.engine.optimizer_step()
             current_lr = self.engine.lr_scheduler_step()
+
+            # Log memory after optimizer step
+            self.log_memory_breakdown("after_optim_step")
 
             # 3. Clear cache - gradients have been consumed
             if session_id is not None and session_id in self._session_gradients:
@@ -1711,6 +1790,7 @@ class MegatronWorkerGroup:
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
             },
         }
 
@@ -2516,6 +2596,7 @@ class MegatronActorPool:
                         "HF_HUB_OFFLINE": "1",
                         "TRANSFORMERS_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     }
                 }
 
@@ -2757,6 +2838,7 @@ def get_or_create_megatron_worker_group(
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
             }
         }
 

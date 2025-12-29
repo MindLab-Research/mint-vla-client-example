@@ -14,6 +14,15 @@ class ModelConfig:
     Training parallelism (Megatron):
         - train_tp: Tensor parallelism
         - train_ep: Expert parallelism (MoE only, 1 for dense)
+        - train_cp: Context parallelism (shards sequence for long context)
+        - train_etp: Expert tensor parallelism (None = use TP, 1 = no expert splitting)
+
+    MoE Parallel Folding:
+        When both train_ep > 1 and train_cp > 1, MoE Parallel Folding is used.
+        This folds CP and EP onto the same GPU ranks:
+        - Attention uses CP groups (sequence sharded)
+        - MoE uses EP groups (experts distributed)
+        - world_size = TP * max(EP, CP) instead of TP * EP * CP
 
     Memory configuration:
         - gpu_memory_utilization: Override for vLLM memory utilization (None = use global default 0.85).
@@ -29,13 +38,17 @@ class ModelConfig:
     is_moe: bool
     recommended_tp: int  # vLLM inference TP
     recommended_dp: int  # vLLM inference DP
-    train_tp: int = 1  # Megatron training TP
-    train_ep: int = 1  # Megatron training EP (MoE only)
+    train_tp: int = 1  # Megatron training TP (attention/shared layers)
+    train_ep: int = 1  # Megatron training EP (MoE expert distribution, 1 for dense)
+    train_cp: int = 1  # Megatron training CP (context parallelism for long sequences)
+    train_etp: int | None = None  # Expert tensor parallelism (None = use TP, 1 = no expert splitting)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
     gpu_memory_utilization: float | None = None  # None = use global default (0.85), or override for large models
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
     max_lora_rank: int | None = None  # None = use global default, or override for large models
     max_model_len: int | None = None  # None = use model's default, or override for large models with KV cache constraints
+    max_num_seqs: int | None = None  # None = use default (256), or lower for large MoE models with KV cache constraints
+    kv_cache_dtype: str | None = None  # None = use model's default, "fp8_e5m2" halves KV cache memory
 
     @property
     def total_gpus(self) -> int:
@@ -44,8 +57,19 @@ class ModelConfig:
 
     @property
     def train_gpus(self) -> int:
-        """Total GPUs for training (world_size = TP * EP)."""
-        return self.train_tp * self.train_ep
+        """Total GPUs for training.
+
+        With MoE Parallel Folding (when both EP > 1 and CP > 1):
+            world_size = TP * PP * max(EP, CP)
+        Without folding:
+            world_size = TP * PP * EP * CP
+        """
+        if self.train_ep > 1 and self.train_cp > 1:
+            # MoE Parallel Folding: CP and EP share the same GPU ranks
+            return self.train_tp * max(self.train_ep, self.train_cp)
+        else:
+            # Traditional: all dimensions are orthogonal
+            return self.train_tp * self.train_ep * self.train_cp
 
 
 # Supported models - only these are allowed
@@ -101,13 +125,17 @@ MODEL_CONFIGS = {
         is_moe=True,
         recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
         recommended_dp=1,
-        train_tp=8,
-        train_ep=8,  # Training: 64 GPUs (8×8) minimum
+        train_tp=8,  # Training: TP=8 (attention parallelism)
+        train_ep=8,  # Training: EP=8 (expert distribution)
+        train_cp=2,  # Training: CP=2 (context parallelism for 32K+ sequences)
+        train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU, not split)
+        # MoE Parallel Folding: world_size = TP * max(EP, CP) = 8 * 8 = 64 GPUs
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
-        gpu_memory_utilization=0.98,  # Near max - 67GB model + overhead leaves minimal margin
-        max_loras=1,  # LoRA REQUIRED for weight transfer
-        max_lora_rank=32,  # Attention-only LoRA (MLP filtered), rank 32 fits in memory
-        max_model_len=2048,  # 2K context - minimal KV cache for 78.4GB budget
+        gpu_memory_utilization=0.98,  # 52 GB model+LoRA, 15.6 GB available for KV cache
+        max_loras=1,  # LoRA for weight transfer
+        max_lora_rank=16,  # Rank 16: 15 GB LoRA buffers (rank 32 = 30 GB, too high)
+        max_model_len=131072,  # 128K context - fits in 15.6 GB KV cache (238K tokens capacity)
+        # Note: FP8 KV cache not supported with MLA on A100
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
     # Same DeepseekV3ForCausalLM architecture
@@ -222,17 +250,22 @@ def get_recommended_parallelism(model_name: str) -> tuple[int, int]:
     return config.recommended_tp, config.recommended_dp
 
 
-def get_training_parallelism(model_name: str) -> tuple[int, int]:
-    """Return (tensor_parallel_size, expert_parallel_size) for training.
+def get_training_parallelism(model_name: str) -> tuple[int, int, int, int | None]:
+    """Return (tensor_parallel_size, expert_parallel_size, context_parallel_size, expert_tensor_parallel_size) for training.
 
     Args:
         model_name: HuggingFace model name
 
     Returns:
-        Tuple of (TP, EP) sizes for Megatron training
+        Tuple of (TP, EP, CP, ETP) sizes for Megatron training.
+        ETP is None if not specified (defaults to TP in Megatron).
+
+    Note:
+        When both EP > 1 and CP > 1, MoE Parallel Folding is used.
+        world_size = TP * max(EP, CP) instead of TP * EP * CP.
     """
     config = get_model_config(model_name)
-    return config.train_tp, config.train_ep
+    return config.train_tp, config.train_ep, config.train_cp, config.train_etp
 
 
 def get_quantization(model_name: str) -> str | None:
@@ -291,6 +324,22 @@ def get_max_model_len(model_name: str) -> int | None:
     return config.max_model_len
 
 
+def get_max_num_seqs(model_name: str) -> int | None:
+    """Get per-model max_num_seqs override.
+
+    Large models (K2) with high max_model_len need reduced max_num_seqs to fit
+    KV cache in GPU memory. With 8K context and 256 max_seqs, KV cache is massive.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        Max concurrent sequences for this model, or None to use default (256).
+    """
+    config = get_model_config(model_name)
+    return config.max_num_seqs
+
+
 def get_max_loras(model_name: str) -> int | None:
     """Get per-model max_loras override.
 
@@ -305,3 +354,19 @@ def get_max_loras(model_name: str) -> int | None:
     """
     config = get_model_config(model_name)
     return config.max_loras
+
+
+def get_kv_cache_dtype(model_name: str) -> str | None:
+    """Get per-model kv_cache_dtype override.
+
+    FP8 KV cache (fp8_e5m2) halves KV cache memory usage, enabling
+    larger context or batch sizes.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        KV cache dtype for this model, or None to use model's default.
+    """
+    config = get_model_config(model_name)
+    return config.kv_cache_dtype
