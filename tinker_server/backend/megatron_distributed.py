@@ -66,53 +66,25 @@ class DistributedConfig:
 
     Defaults configured for 1-GPU setup (GPU 0 has leaked memory).
     For multi-GPU: tensor_parallel_size=2 (2-GPU) or TP=2,PP=2,EP=2 (8-GPU)
-
-    For MoE models with ETP=1:
-    - TP groups are co-located with EP ranks
-    - world_size = PP × EP (not TP × PP × EP)
-    - Example: K2 with TP=8, EP=64 → 64 GPUs, each 8-GPU node is a TP group
     """
 
     tensor_parallel_size: int = 1  # Single GPU - GPU 0 has corrupted memory
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
-    expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
 
     @property
-    def effective_etp(self) -> int:
-        """Get effective expert tensor parallel size (defaults to TP if not set)."""
-        return self.expert_tensor_parallel_size if self.expert_tensor_parallel_size is not None else self.tensor_parallel_size
-
-    @property
     def world_size(self) -> int:
-        """Total number of processes needed.
-
-        For MoE models with ETP=1:
-        - TP groups exist within EP ranks (co-located)
-        - world_size = PP × EP × CP (TP is subsumed by EP)
-
-        For dense models or ETP=TP:
-        - world_size = TP × PP × EP × CP
-        """
-        etp = self.effective_etp
-        if etp == 1 and self.expert_parallel_size > 1:
-            # MoE with ETP=1: TP groups co-located with EP ranks
-            # world_size = PP × EP × CP (TP is within each EP rank's node)
-            return (
-                self.pipeline_parallel_size
-                * self.expert_parallel_size
-                * self.context_parallel_size
-            )
-        else:
-            # Dense models or MoE with ETP=TP: standard formula
-            return (
-                self.tensor_parallel_size
-                * self.pipeline_parallel_size
-                * self.expert_parallel_size
-                * self.context_parallel_size
-            )
+        """Total number of processes needed."""
+        # For MoE models: world_size = TP * PP * EP * CP
+        # Each rank handles one shard of tensor/pipeline/expert parallelism
+        return (
+            self.tensor_parallel_size
+            * self.pipeline_parallel_size
+            * self.expert_parallel_size
+            * self.context_parallel_size
+        )
 
 
 @ray.remote(num_gpus=0)
@@ -175,65 +147,47 @@ class MegatronRankWorker:
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
 
-    def _capture_gradients(self) -> list[tuple[int, int, int, torch.Tensor]]:
+    def _capture_gradients(self) -> list[torch.Tensor]:
         """Capture all gradient buffers from DDP modules to CPU.
 
-        Returns a list of (chunk_idx, buffers_idx, buffer_idx, gradient) tuples.
+        Returns a list of CPU tensors containing gradient data.
         Must be called while in train_mode context (gradients on GPU).
-        
-        Fix: Store buffer coordinates to avoid restore misalignment when
-        storage().size() evaluates differently between capture and restore.
         """
         import torch
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         grads = []
-        for chunk_idx, model_chunk in enumerate(self.engine.module):
+        for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
-                for buffers_idx, buffers in enumerate([model_chunk.buffers, model_chunk.expert_parallel_buffers]):
-                    for buffer_idx, buffer in enumerate(buffers):
+                for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
+                    for buffer in buffers:
                         if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                            grads.append((chunk_idx, buffers_idx, buffer_idx, buffer.grad_data.cpu().clone()))
+                            grads.append(buffer.grad_data.cpu().clone())
 
         logger.debug(f"[Rank {self.rank}] Captured {len(grads)} gradient buffers")
         return grads
 
-    def _restore_gradients(self, grads: list[tuple[int, int, int, torch.Tensor]]) -> None:
+    def _restore_gradients(self, grads: list[torch.Tensor]) -> None:
         """Restore gradient buffers from CPU back to GPU.
 
         Must be called while in train_mode context (after model loaded to GPU).
         Args:
-            grads: List of (chunk_idx, buffers_idx, buffer_idx, gradient) tuples from _capture_gradients.
-            
-        Fix: Use stored coordinates for direct buffer access, avoiding
-        misalignment when storage().size() changes between capture/restore.
+            grads: List of CPU tensors from _capture_gradients.
         """
         import torch
         from megatron.core.distributed import DistributedDataParallel as DDP
 
-        # Build lookup for direct access
-        model_chunks = list(self.engine.module)
-        
-        for chunk_idx, buffers_idx, buffer_idx, grad in grads:
-            if chunk_idx >= len(model_chunks):
-                continue
-            model_chunk = model_chunks[chunk_idx]
-            if not isinstance(model_chunk, DDP):
-                continue
-            buffers_list = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
-            if buffers_idx >= len(buffers_list):
-                continue
-            buffers = buffers_list[buffers_idx]
-            if buffer_idx >= len(buffers):
-                continue
-            buffer = buffers[buffer_idx]
-            if buffer.grad_data is not None:
-                # Ensure storage is allocated before copying
-                if buffer.grad_data.storage().size() == 0:
-                    buffer.grad_data.set_(torch.empty_like(buffer.grad_data))
-                buffer.grad_data.copy_(grad.cuda())
+        idx = 0
+        for model_chunk in self.engine.module:
+            if isinstance(model_chunk, DDP):
+                for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
+                    for buffer in buffers:
+                        if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
+                            if idx < len(grads):
+                                buffer.grad_data.copy_(grads[idx].cuda())
+                                idx += 1
 
-        logger.debug(f"[Rank {self.rank}] Restored {len(grads)} gradient buffers")
+        logger.debug(f"[Rank {self.rank}] Restored {idx} gradient buffers")
 
     def _capture_optimizer_state(self) -> dict:
         """Capture optimizer state (momentum, variance) to CPU.
@@ -586,7 +540,6 @@ class MegatronRankWorker:
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
             expert_model_parallel_size=self.config.expert_parallel_size,
-            expert_tensor_parallel_size=self.config.effective_etp,  # ETP for MoE expert splitting
             context_parallel_size=self.config.context_parallel_size,
             param_offload=True,
             optimizer_offload=True,
@@ -748,10 +701,7 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
-        # Get model-specific max_token_len_per_gpu for micro-batching (gradient accumulation)
-        from tinker_server.backend.model_registry import get_max_token_len_per_gpu
-        max_token_len = get_max_token_len_per_gpu(self.base_model) or 8192
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
 
         # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
@@ -899,11 +849,8 @@ class MegatronRankWorker:
                 seq_lengths.append(len(chunks[0]["tokens"]))
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
-        # Get model-specific max_token_len_per_gpu for micro-batching (gradient accumulation)
         device = torch.cuda.current_device()
-        from tinker_server.backend.model_registry import get_max_token_len_per_gpu
-        max_token_len = get_max_token_len_per_gpu(self.base_model) or 8192
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        data = tinker_to_tensordict(data_items, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn
@@ -2102,19 +2049,7 @@ class MegatronWorkerGroup:
         return result
 
     def get_diagnostics(self) -> dict:
-        """Return diagnostic info about the worker group.
-        
-        Also verifies workers are alive by pinging one worker.
-        Raises RayActorError if workers are dead (e.g., placement group removed).
-        """
-        # Verify at least one worker is alive before returning diagnostics
-        # This catches the case where placement groups were removed but
-        # the coordinator actor remains (as a detached actor)
-        if self.workers:
-            # Ping first worker with short timeout - let exception propagate
-            # so get_or_create_megatron_worker_group can catch and recreate
-            ray.get(self.workers[0].get_session_info.remote(), timeout=5)
-        
+        """Return diagnostic info about the worker group."""
         return {
             "code_version": "test-reload-v1",  # Trivial change to test code reload
             "world_size": self.config.world_size,
@@ -2557,20 +2492,10 @@ class MegatronActorPool:
             try:
                 existing_actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
                 logger.info(f"[MegatronActorPool] Found existing detached actor: {actor_name}")
-
-                # Check if actor is already registered in resource pool
-                # If so, skip health check - actor is likely busy with training
-                existing_entry = resource_pool.get(actor_name)
-                if existing_entry is not None and existing_entry.actor_handle is not None:
-                    logger.info(f"[MegatronActorPool] Actor already in resource pool, reusing (may be busy)")
-                    actor = existing_actor
-                    need_create = False
-                else:
-                    # Actor exists but not in resource pool - verify it's alive with longer timeout
-                    logger.info(f"[MegatronActorPool] Actor not in pool, checking health with 120s timeout...")
-                    ray.get(existing_actor.get_diagnostics.remote(), timeout=120)
-                    actor = existing_actor  # Use existing actor
-                    need_create = False
+                # Verify it's alive
+                ray.get(existing_actor.get_diagnostics.remote(), timeout=10)
+                actor = existing_actor  # Use existing actor
+                need_create = False
             except ValueError:
                 # Actor doesn't exist, will create new one
                 pass
@@ -2783,29 +2708,13 @@ def get_or_create_megatron_worker_group(
     try:
         actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
         logger.info(f"Connected to existing Megatron actor: {actor_name}")
-
-        # Check if actor is already registered and in use
-        # If so, the actor is likely busy with training - don't kill it!
-        existing_entry = resource_pool.get(actor_name)
-        if existing_entry is not None and existing_entry.actor_handle is not None:
-            logger.info(f"Actor {actor_name} already registered in resource pool, reusing (may be busy)")
-            # Skip health check - actor is known to the system and in use
-            # Just mark last_used and return
-            resource_pool.mark_ready(actor_name)
-            return actor
-
-        # Actor exists but not in resource pool (e.g., after server restart)
-        # Verify actor is alive with a longer timeout for large models
-        # K2 forward_backward can take several minutes, use 120s timeout
+        
+        # Verify actor is alive
         try:
-            logger.info(f"Checking actor health with 120s timeout (actor not in resource pool)...")
-            ray.get(actor.get_diagnostics.remote(), timeout=120)
-        except Exception as e:
-            # Actor or workers are dead - catch broadly because:
-            # - RayActorError: coordinator is dead
-            # - RayTaskError(ActorDiedError): worker died during diagnostics
-            # - GetTimeoutError: actor is hung (but 120s is long enough for most cases)
-            logger.warning(f"Megatron actor {actor_name} is unhealthy ({type(e).__name__}), killing to free name")
+            ray.get(actor.get_diagnostics.remote(), timeout=10)
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+            # Actor is dead, kill to free name
+            logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
             try:
                 ray.kill(actor, no_restart=True)
             except Exception:
