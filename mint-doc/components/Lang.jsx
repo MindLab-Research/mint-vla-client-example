@@ -4,6 +4,26 @@ import { createContext, useContext, useState, useEffect } from 'react'
 
 const LanguageContext = createContext({ lang: 'en', toggle: () => {} })
 
+// Check if text contains Chinese characters
+function containsChinese(text) {
+  return /[\u4e00-\u9fff]/.test(text)
+}
+
+// Filter TOC entries based on language
+function filterTocEntries(lang) {
+  const tocLinks = document.querySelectorAll('.nextra-toc a[href^="#"]')
+  tocLinks.forEach(link => {
+    const href = decodeURIComponent(link.getAttribute('href') || '')
+    const isChinese = containsChinese(href)
+    const li = link.closest('li')
+    if (li) {
+      // Show if language matches: Chinese href for zh, non-Chinese href for en
+      const shouldShow = (lang === 'zh' && isChinese) || (lang === 'en' && !isChinese)
+      li.style.display = shouldShow ? '' : 'none'
+    }
+  })
+}
+
 export function LanguageProvider({ children }) {
   const [lang, setLang] = useState('en')
   const [mounted, setMounted] = useState(false)
@@ -15,6 +35,26 @@ export function LanguageProvider({ children }) {
       setLang(saved)
     }
   }, [])
+
+  // Filter TOC entries when language changes
+  useEffect(() => {
+    if (mounted) {
+      filterTocEntries(lang)
+    }
+  }, [lang, mounted])
+
+  // Re-filter on route change (Nextra rebuilds TOC on navigation)
+  useEffect(() => {
+    if (!mounted) return
+    const observer = new MutationObserver(() => {
+      filterTocEntries(lang)
+    })
+    const toc = document.querySelector('.nextra-toc')
+    if (toc) {
+      observer.observe(toc, { childList: true, subtree: true })
+    }
+    return () => observer.disconnect()
+  }, [lang, mounted])
 
   const toggle = () => {
     const next = lang === 'en' ? 'zh' : 'en'
