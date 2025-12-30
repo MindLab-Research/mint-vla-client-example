@@ -176,7 +176,7 @@ def tinker_to_tensordict(
 
     # Add non-tensor metadata for verl's prepare_micro_batches
     # These control how verl splits the batch into micro-batches
-    td["use_dynamic_bsz"] = NonTensorData(True)
+    td["use_dynamic_bsz"] = NonTensorData(False)  # Disabled to allow micro_batch_size_per_gpu settings
     td["max_token_len_per_gpu"] = NonTensorData(max_token_len_per_gpu)
 
     # Add fields required by verl's sft_loss

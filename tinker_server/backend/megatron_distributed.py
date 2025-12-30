@@ -740,7 +740,7 @@ class MegatronRankWorker:
         )
 
         # Add non-tensor metadata for verl's prepare_micro_batches
-        dummy_data["use_dynamic_bsz"] = NonTensorData(True)
+        dummy_data["use_dynamic_bsz"] = NonTensorData(False)  # Disabled to allow micro_batch_size_per_gpu settings
         dummy_data["max_token_len_per_gpu"] = NonTensorData(32768)  # Support up to 32K context
         dummy_data.set_non_tensor("dp_size", 1)
         dummy_data.set_non_tensor("batch_num_tokens", seq_len)
