@@ -26,7 +26,7 @@ async def test_128k_context():
     try:
         training_client = await client.create_lora_training_client_async(
             base_model="moonshotai/Kimi-K2-Thinking",
-            rank=32,
+            rank=16,
         )
         print(f"    Training session created: {training_client.model_id}")
     except Exception as e:

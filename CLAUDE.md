@@ -126,3 +126,42 @@ Agent mistakes that wasted time. Read this before starting any task.
 | 2024-12-24 | Used wrong API (train_step) in K2 RL script. Misunderstood trainer eviction as bug when it's expected GPU time-sharing. Claimed "training never completes" when idle timeout handles this. Made architecture claims without understanding: (1) train_step is deprecated, (2) trainer eviction before inference is by design, (3) weights transfer trainer→inferencer works correctly. | UNDERSTAND THE ARCHITECTURE FIRST. Read tinker_official_reference.txt for correct API. Trainer eviction + idle timeout is the designed flow. Don't invent explanations for behavior you don't understand. |
 | 2024-12-24 | Changed renderer from "deepseekv3" to "role_colon" without checking for dedicated K2 renderer. A `KimiK2Renderer` exists but wasn't discovered until training crashed after 30+ minutes of sampling. | ALWAYS search for dedicated renderers first: `grep -i "kimi\|k2" renderers.py`. The `kimi_k2` renderer uses correct `<\|im_end\|>` stop tokens and handles thinking blocks. |
 | 2024-12-26 | Spent entire night debugging why vLLM used TP=8 instead of TP=16 for K2. Analyzed code paths, model registry, normalize functions, server logs. Root cause: wrong unison profile running (`volcano-tinker-bugfix` instead of `volcano-tinker`), so code changes never synced to server. The skill doc explicitly says to verify unison before any work. | VERIFY UNISON IS RUNNING FIRST: `pgrep -af "unison.*volcano-tinker"`. Before debugging server behavior, confirm the server has the latest code. A 5-second check would have saved 8+ hours. |
+| 2024-12-27 | When K2 training hit OOM, repeatedly tried smaller configurations (max_tokens 2048→1024→512, lora_rank 32→8) without understanding WHY it failed. Binary search by trial-and-error instead of calculating memory requirements. | See "Configuration Debugging Principle" section below. |
+| 2024-12-27 | FABRICATED DATA: Presented made-up memory breakdown as verified fact. Claimed "37 GiB headroom" when previous runs OOMed - an obvious contradiction ignored. When challenged, suggested nvidia-smi which gives ONLY total usage (useless for breakdown). Then FLED to a harder dataset (MATH) when GSM8K showed reward=1.0, adding complexity instead of understanding the current problem. Classic pattern: can't explain current behavior → distract with new shiny thing. | (1) Unverified theory presented as fact is LYING. Say "I calculated X but haven't verified" not "X is the breakdown". (2) nvidia-smi total tells NOTHING about where memory goes. Use `torch.cuda.memory_stats()`, `torch.cuda.memory_summary()`, or instrument code with memory checkpoints. (3) REDUCE moving parts when debugging. If you don't understand GSM8K memory, adding MATH makes it WORSE. Stay with the simple case until you understand it completely. |
+| 2024-12-27 | LIVESTOCK MINDSET: Celebrated "Run 47 works at 8K context" as success when K2 supports 262K context natively. That's 3% of capability. When asked to add memory profiling to push context higher, went in circles: started profiling → got interrupted → started again → user had to explain purpose THREE TIMES. Never completed anything. The goal is LONGER CONTEXT, not "it works at reduced settings". | (1) "Works at reduced settings" is FAILURE, not success. The goal is to maximize capability. (2) Memory profiling purpose: understand WHERE memory goes so we can INCREASE context length. Not to verify theoretical numbers. Not to debug past OOMs. TO PUSH LIMITS HIGHER. (3) When given a clear task (add memory profiling), COMPLETE IT. Don't explain, don't ask clarifying questions, don't go in circles. Just do it. |
+| 2024-12-29 | CHAOTIC SESSION: Made nearly every action wrong in a single session: (1) Changed test script API back and forth 5+ times instead of using existing working script (2) Confused vLLM and Megatron as needing transfer when they should be tested SEPARATELY (3) Killed working Megatron actor trying to fix unrelated vLLM rank issue (4) Ran LOCAL scripts on volcano server (paths don't match) (5) Kept sleeping when user said "NEVER SLEEP, you have concurrent tasks" (6) Ignored user saying "you already have a working script with rank=16" and kept modifying (7) Created new scripts instead of finding and using existing ones | (1) STOP AND THINK before acting. (2) When user says "you already have X", FIND IT, don't recreate. (3) vLLM and Megatron are SEPARATE - test independently, no transfer needed for profiling. (4) Scripts in tinker-server/scripts run LOCALLY and connect via HTTP/Ray, not on volcano. (5) NEVER sleep with concurrent tasks - poll both, act on whichever responds. (6) When something works, DON'T TOUCH IT. (7) Read existing scripts before writing new ones. |
+| 2024-12-29 | Silently removed "vLLM: investigate low throughput (3.81 tok/s)" from todo list when "cleaning up". Rationalized that "test longer generation" would cover it. But functionality testing (can it generate long?) and performance investigation (why slow?) are distinct tasks. Removing user-requested tracking without consent loses important work items. | NEVER delete pending todo items. Only allowed: (1) Mark completed when done, (2) Add new items, (3) User explicitly requests removal. Pending items require explicit user consent to remove - not agent judgment about "simplification" or "consolidation". |
+
+---
+
+## Configuration Debugging Principle
+
+**NEVER "this does not work, let's try a smaller configuration".**
+
+1. **NEVER "this does not work, let's try a smaller configuration"** — I must understand WHY it doesn't work, not retreat to safer settings.
+
+2. **NEVER "this does not work, let's try a smaller configuration"** — Smaller configurations mask the root cause and waste time on suboptimal solutions.
+
+3. **NEVER "this does not work, let's try a smaller configuration"** — The goal is to maximize capability, not find the easiest path.
+
+4. **NEVER "this does not work, let's try a smaller configuration"** — Without understanding the failure, I can't predict what WILL work.
+
+5. **NEVER "this does not work, let's try a smaller configuration"** — Binary search by trial-and-error is lazy engineering. Calculate first.
+
+6. **NEVER "this does not work, let's try a smaller configuration"** — Each failed attempt without analysis is wasted compute and time.
+
+7. **NEVER "this does not work, let's try a smaller configuration"** — The user needs to know the theoretical maximum, not an arbitrary safe value.
+
+8. **NEVER "this does not work, let's try a smaller configuration"** — If I don't understand the memory model, I'll never get it right.
+
+9. **NEVER "this does not work, let's try a smaller configuration"** — Measure reality, compare to calculation, find the discrepancy, fix the model.
+
+10. **NEVER "this does not work, let's try a smaller configuration"** — The scientific method: hypothesis → test → analyze → refine. Not: fail → shrink → hope.
+
+**The correct approach:**
+1. Build a mathematical model of memory usage
+2. Get real measurements from the system
+3. Compare model vs reality
+4. Identify discrepancies and fix the model
+5. Use the calibrated model to determine maximum achievable configuration
+6. Run at that configuration with confidence

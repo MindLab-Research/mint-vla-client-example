@@ -132,14 +132,15 @@ MODEL_CONFIGS = {
         is_moe=True,
         recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
         recommended_dp=1,
-        train_tp=8,  # Training: TP=8 (attention parallelism within each of 8 TP subgroups)
-        train_ep=64,  # Training: EP=64 (expert distribution across 64 GPUs, 6 experts/GPU)
-        train_cp=1,  # Training: CP=1 (CP=2 adds 9 GiB ring attention overhead)
+        train_tp=32,  # Training: TP=32 (attention parallelism, 64/32=2 heads per GPU)
+        train_ep=96,  # Training: EP=96 (expert distribution across 96 GPUs, 4 experts/GPU)
+        train_cp=1,  # Training: CP=1 (no context parallelism)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU, not split)
-        # MoE Parallel Folding: world_size = EP = 64 GPUs
-        # TP=8 operates as subgroups within the 64 GPU EP dimension
+        # MoE Parallel Folding: world_size = EP = 96 GPUs
+        # TP=32 operates as 3 subgroups (96/32) within the 96 GPU EP dimension
+        # Each GPU has 4 experts (384/96), attention sharded across 32 GPUs per subgroup
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
-        gpu_memory_utilization=0.98,  # 52 GB model+LoRA, 15.6 GB available for KV cache
+        gpu_memory_utilization=0.90,  # 52 GB model, need ~8 GB headroom for LoRA static+runtime buffers
         max_loras=1,  # LoRA for weight transfer
         max_lora_rank=16,  # Rank 16: 15 GB LoRA buffers (rank 32 = 30 GB, too high)
         max_model_len=131072,  # 128K context - fits in 15.6 GB KV cache (238K tokens capacity)

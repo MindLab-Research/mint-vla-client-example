@@ -368,10 +368,11 @@ async def megatron_status(base_model: str | None = None) -> dict:
     alive = is_megatron_actor_running(base_model)
 
     # Get list of all Megatron actors
+    # Use iter_entries() which returns ActorEntry objects (not dicts)
     resource_pool = get_resource_pool()
     actors = [
         {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
-        for e in resource_pool.list_actors()
+        for e in resource_pool.iter_entries()
         if e.actor_type == ActorType.MEGATRON
     ]
 

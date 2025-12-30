@@ -55,7 +55,7 @@ class MegatronTrainingConfig:
 
 def tinker_to_tensordict(
     data_items: list[dict],
-    max_token_len_per_gpu: int = 8192,
+    max_token_len_per_gpu: int = 32768,  # Support up to 32K context
     device: str | torch.device | None = None,
 ) -> TensorDict:
     """Convert Tinker Datum format to verl TensorDict.

@@ -1776,8 +1776,8 @@ class VerlTrainingEngine:
 PERSISTENT_DENSE_NAMESPACE = "tinker"
 PERSISTENT_DENSE_ACTOR_PREFIX = "dense_trainer_pool_"
 
-# PFS PYTHONPATH for worker processes
-PFS_PYTHONPATH_DENSE = "/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/vllm"
+# Use centralized PFS_PYTHONPATH from config (includes megatron-bridge for ETP fix)
+from tinker_server.config import PFS_PYTHONPATH as PFS_PYTHONPATH_DENSE
 
 
 @dataclass

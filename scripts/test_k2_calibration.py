@@ -131,11 +131,9 @@ def main():
         return 1
 
     # Test various context lengths to find max working context
-    # Based on calibrated memory model:
-    # - 8K: ~67.88 GiB peak (known working)
-    # - 14K: ~75.65 GiB peak (theoretical max with 2 GiB headroom)
-    # - 16K: ~78.24 GiB peak (OOM observed)
-    test_lengths = [8192, 10240, 12288, 13312, 14336, 15360]
+    # With TP=16, EP=96, rank=16: max working is 15,360 tokens
+    # Note: TP=32 requires rank≥32 (LoRA divisibility constraint)
+    test_lengths = [8192, 10240, 12288, 14336, 15360, 16384]
 
     print("\n" + "-" * 60)
     print("Testing context lengths...")

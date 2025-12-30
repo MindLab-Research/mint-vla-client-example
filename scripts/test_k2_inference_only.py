@@ -25,7 +25,7 @@ async def test_inference():
     try:
         training_client = await client.create_lora_training_client_async(
             base_model="moonshotai/Kimi-K2-Thinking",
-            rank=32,
+            rank=16,
         )
         print(f"    Session: {training_client.model_id}")
     except Exception as e:
@@ -53,7 +53,7 @@ async def test_inference():
         )
         prompt_text = "What is 2 + 2?"
         prompt = tinker.types.ModelInput.from_ints(tokenizer.encode(prompt_text))
-        params = tinker.SamplingParams(max_tokens=100, temperature=0.7)
+        params = tinker.SamplingParams(max_tokens=2000, temperature=0.7)
 
         print(f"    Prompt: {prompt_text}")
         print("    Calling sample_async...")

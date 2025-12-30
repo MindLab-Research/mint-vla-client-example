@@ -13,12 +13,16 @@ PFS_TINKER_PATH = "/vePFS-Mindverse/share/code/tinker-server"
 # PFS verl path with _mutable_fields patch for LoRA config assignment
 PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
 
+# PFS megatron-bridge path for MoE LoRA ETP fix (PR #1380)
+# Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+PFS_MEGATRON_BRIDGE_PATH = "/vePFS-Mindverse/share/code/megatron-bridge/src"
+
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
 PFS_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
 
-# PYTHONPATH for Ray actors - verl first (for _mutable_fields patch), then tinker-server, then HF modules
-PFS_PYTHONPATH = f"{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+# PYTHONPATH for Ray actors - megatron-bridge first (ETP fix), then verl, tinker-server, HF modules
+PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
 
 
 @dataclass

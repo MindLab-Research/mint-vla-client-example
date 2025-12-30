@@ -110,6 +110,7 @@ class MultiNodeLoRARegistry:
 def _create_multinode_vllm_actor(
     max_loras: int = 1,
     max_lora_rank: int = 8,
+    max_num_seqs: int = 256,
 ):
     """Create a Ray actor class that wraps vLLM's AsyncLLMEngine for multi-node TP.
 
@@ -119,6 +120,7 @@ def _create_multinode_vllm_actor(
     Args:
         max_loras: Maximum LoRAs in a single batch.
         max_lora_rank: Maximum LoRA rank.
+        max_num_seqs: Maximum concurrent sequences (reduce for large models with KV cache constraints).
     """
 
     @ray.remote(num_cpus=1)  # num_gpus=0: vLLM's internal Ray backend manages GPU allocation
@@ -143,6 +145,7 @@ def _create_multinode_vllm_actor(
             self.enable_lora = enable_lora
             self.max_loras = max_loras
             self.max_lora_rank = max_lora_rank
+            self.max_num_seqs = max_num_seqs
             self.kv_cache_dtype = kv_cache_dtype
 
             self.engine = None
@@ -170,7 +173,7 @@ def _create_multinode_vllm_actor(
                 dtype="auto",
                 trust_remote_code=True,
                 max_model_len=self.max_model_len,
-                max_num_seqs=256,
+                max_num_seqs=self.max_num_seqs,
                 enable_chunked_prefill=True,
                 max_num_batched_tokens=8192,
                 enable_prefix_caching=True,
@@ -186,7 +189,8 @@ def _create_multinode_vllm_actor(
 
             logger.info(
                 f"Creating AsyncLLMEngine: TP={self.tensor_parallel_size}, "
-                f"backend=ray, enable_lora={self.enable_lora}"
+                f"backend=ray, enable_lora={self.enable_lora}, "
+                f"gpu_memory_utilization={self.gpu_memory_utilization}"
             )
 
             # Create engine - vLLM will spawn Ray workers across nodes
@@ -414,6 +418,7 @@ class MultiNodeInferenceEngine:
         max_model_len: int | None = None,
         max_loras: int = 1,
         max_lora_rank: int = 8,
+        max_num_seqs: int = 256,
         quantization: str | None = None,
         kv_cache_dtype: str | None = None,
         actor_name: str | None = None,
@@ -425,6 +430,7 @@ class MultiNodeInferenceEngine:
         self.max_model_len = max_model_len
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
+        self.max_num_seqs = max_num_seqs
         self.quantization = quantization
         self.kv_cache_dtype = kv_cache_dtype
         self.actor_name = actor_name or f"multinode_vllm_{model_path.split('/')[-1].lower()}"
@@ -551,6 +557,7 @@ class MultiNodeInferenceEngine:
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
                 max_loras=self.max_loras,
                 max_lora_rank=self.max_lora_rank,
+                max_num_seqs=self.max_num_seqs,
             )
 
             # target_node is guaranteed set (RuntimeError raised above if no candidates)
