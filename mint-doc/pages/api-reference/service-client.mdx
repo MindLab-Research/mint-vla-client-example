@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # ServiceClient
 
 **Primary entry point for the MinT API**
@@ -71,3 +75,83 @@ Access REST endpoints for checkpoint management and metadata operations.
 ## Async Variants
 
 All methods include async variants (e.g., `create_lora_training_client_async()`).
+
+</En>
+
+<Zh>
+
+# ServiceClient
+
+**MinT API 的主要入口点**
+
+## 概述
+
+ServiceClient 是访问 MinT 功能的主要接口。所有操作都从创建 ServiceClient 实例开始。
+
+## 主要方法
+
+### 服务器信息
+
+```python
+get_server_capabilities()
+get_server_capabilities_async()
+```
+
+查询 MinT 服务器支持的功能和能力。
+
+### 创建训练客户端
+
+```python
+create_lora_training_client(
+    base_model,
+    rank=32,
+    train_mlp=True,
+    train_attn=True,
+    train_unembed=True,
+    seed=None
+)
+```
+
+初始化用于 LoRA 微调的 TrainingClient。
+
+**参数：**
+- `base_model` - 模型标识符（例如 "Qwen/Qwen3-8B"）
+- `rank` - LoRA 秩维度（默认：32）
+- `train_mlp` - 训练 MLP 层（默认：True）
+- `train_attn` - 训练注意力层（默认：True）
+- `train_unembed` - 训练反嵌入层（默认：True）
+- `seed` - 用于可重复性的随机种子
+
+### 从检查点加载
+
+```python
+create_training_client_from_state(path)
+create_training_client_from_state_with_optimizer(path)
+```
+
+- **from_state** - 仅加载权重
+- **from_state_with_optimizer** - 加载权重和优化器状态
+
+### 创建采样客户端
+
+```python
+create_sampling_client(model_path=None, base_model=None)
+```
+
+从以下来源创建 SamplingClient：
+- 保存的检查点（`model_path`）
+- 基础模型（`base_model`）
+
+### REST 客户端
+
+```python
+create_rest_client()
+```
+
+访问用于检查点管理和元数据操作的 REST 端点。
+
+## 异步变体
+
+所有方法都包含异步变体（例如 `create_lora_training_client_async()`）。
+
+</Zh>

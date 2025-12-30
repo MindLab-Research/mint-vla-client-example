@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # APIFuture
 
 **Generic interface for asynchronous operations**
@@ -72,3 +76,84 @@ try:
 except TimeoutError:
     print("Operation timed out")
 ```
+
+</En>
+
+<Zh>
+
+# APIFuture
+
+**异步操作的通用接口**
+
+## 类
+
+### APIFuture\<T\>
+
+表示将产生类型 T 值的异步操作的抽象泛型类。
+
+### AwaitableConcurrentFuture\<T\>
+
+包装 Python 的 `concurrent.futures.Future` 并支持 async/await 的具体实现。
+
+## 方法
+
+### result_async
+
+```python
+async def result_async(timeout: Optional[float] = None) -> T
+```
+
+异步获取结果（非阻塞）。
+
+**参数：**
+- `timeout` - 可选的超时时间（秒）
+
+**抛出：** 如果操作未在超时时间内完成则抛出 `TimeoutError`。
+
+### result
+
+```python
+def result(timeout: Optional[float] = None) -> T
+```
+
+同步获取结果（阻塞）。
+
+**参数：**
+- `timeout` - 可选的超时时间（秒）
+
+**抛出：** 如果操作未在超时时间内完成则抛出 `TimeoutError`。
+
+### future
+
+```python
+def future() -> concurrent.futures.Future\[T\]
+```
+
+访问底层的 `concurrent.futures.Future` 对象。
+
+## 使用方法
+
+### 异步
+
+```python
+api_future = await client.some_operation_async(...)
+result = await api_future
+```
+
+### 同步
+
+```python
+api_future = client.some_operation(...)
+result = api_future.result()
+```
+
+### 带超时
+
+```python
+try:
+    result = api_future.result(timeout=30.0)  # 30 秒
+except TimeoutError:
+    print("操作超时")
+```
+
+</Zh>

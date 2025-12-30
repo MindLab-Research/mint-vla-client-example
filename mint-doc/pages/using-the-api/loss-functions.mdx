@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Loss Functions
 
 MinT provides several built-in loss functions optimized for different training scenarios.
@@ -62,3 +66,74 @@ training_client.forward_backward_custom(data, custom_loss)
 ```
 
 **Trade-off:** Custom losses use 1.5x FLOPs and up to 3x wall time, but enable arbitrary differentiable objectives like Bradley-Terry or DPO.
+
+</En>
+
+<Zh>
+
+# 损失函数
+
+MinT 提供多种针对不同训练场景优化的内置损失函数。
+
+## 内置损失函数
+
+### 交叉熵（监督学习）
+
+```python
+elementwise_loss = -target_logprobs * weights
+loss = elementwise_loss.sum()
+```
+
+**输入：** `target_tokens`、`weights`
+**输出：** `logprobs`
+
+### 重要性采样（策略梯度）
+
+```python
+prob_ratio = torch.exp(target_logprobs - sampling_logprobs)
+loss = -(prob_ratio * advantages).sum()
+```
+
+### PPO（近端策略优化）
+
+```python
+prob_ratio = torch.exp(target_logprobs - sampling_logprobs)
+clipped_ratio = torch.clamp(prob_ratio, clip_low_threshold, clip_high_threshold)
+unclipped_objective = prob_ratio * advantages
+clipped_objective = clipped_ratio * advantages
+loss = -torch.min(unclipped_objective, clipped_objective).sum()
+```
+
+**配置：** `loss_fn_config={"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}`
+
+### CISPO（裁剪重要性采样策略优化）
+
+```python
+clipped_ratio = torch.clamp(prob_ratio, clip_low_threshold, clip_high_threshold)
+loss = -(clipped_ratio.detach() * target_logprobs * advantages).sum()
+```
+
+### DRO（直接奖励优化）
+
+```python
+quadratic_term = (target_logprobs - sampling_logprobs) ** 2
+loss = -(target_logprobs * advantages - 0.5 * beta * quadratic_term).sum()
+```
+
+**配置：** `loss_fn_config={"beta": 0.05}`
+
+## 自定义损失函数
+
+对于高级用例，您可以定义自定义损失函数：
+
+```python
+def custom_loss(data: list[Datum], logprobs: list[torch.Tensor]) -> tuple[torch.Tensor, dict]:
+    loss = compute_your_loss(logprobs)
+    return loss, {"metric_name": loss.item()}
+
+training_client.forward_backward_custom(data, custom_loss)
+```
+
+**权衡：** 自定义损失使用 1.5 倍 FLOPs 和最多 3 倍实际时间，但可以实现任意可微分目标，如 Bradley-Terry 或 DPO。
+
+</Zh>

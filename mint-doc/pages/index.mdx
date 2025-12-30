@@ -1,3 +1,7 @@
+import { En, Zh } from '../components/Lang'
+
+<En>
+
 # Mind Lab Toolkit (MinT)
 
 ## Building the Infrastructure for Experiential Intelligence
@@ -45,3 +49,57 @@ MinT abstracts away infrastructure complexity—GPU clusters, model states, dist
 ## Values
 
 We insist on real experience as the primary constraint. We insist on transparent engineering. We insist on delivering reusable workflows to the community.
+
+</En>
+
+<Zh>
+
+# Mind Lab Toolkit (MinT)
+
+## 构建体验智能的基础设施
+
+MinT 是 Mind Lab Toolkit 的缩写。我们正在构建强化学习基础设施，使智能体和模型能够"从真实体验中学习"。
+
+我们的使命是为体验智能提供一个务实、透明且可复用的基础——确保现实世界的复杂性及其噪声和细微差别成为学习的资源，而非发展的障碍。
+
+## 什么是 MinT？
+
+MinT 专注于跨多模型和任务的强化学习（RL）的工程和算法实现。我们特别强调使 **LoRA RL**（低秩适应强化学习）对于主流和前沿模型都简单、稳定且高效。
+
+![MinT 架构](/images/mint-architecture.png)
+
+MinT 抽象掉基础设施的复杂性——GPU 集群、模型状态、分布式训练——让您可以专注于重要的事情：选择模型、准备数据、定义学习目标和评估结果。
+
+### 核心特性
+
+- **模型支持**：Kimi、K2、DeepSeek、Qwen、Pi0 等——确保从推理到训练的快速闭环
+- **算法支持**：以 RLHF/GRPO 和通用策略优化为中心的稳健训练流水线
+- **无缝迁移**：与 [ThinkingMachines Tinker](https://thinkingmachines.ai/tinker/) 的初始 API 兼容，设计为熟悉的即插即用升级
+- **规模化智能体 RL**：在更广泛的任务分布、更长的交互时间和更丰富的环境约束下大规模捕获和利用经验
+
+### 核心能力
+
+- 用于大模型高效训练的 LoRA 微调
+- 分布式数据收集和滚动训练
+- 支持视觉语言模型（Qwen3-VL）
+- 权重管理和模型发布
+- 标准 CPU 集群上的在线评估
+
+## 我们为谁而建
+
+**面向构建者**：专注于理解您的问题和设计机制——让 MinT 处理基础设施。我们开放在真实业务场景中使用的工作流、评估方案和训练基础设施。
+
+**面向研究者**：通过标准化日志记录、可复现的评估、可移植的工作流和可解释的训练数据血统来减少 RL 研究中的工程摩擦。
+
+## 核心 API 函数
+
+- `forward_backward`：计算并累积梯度
+- `optim_step`：更新模型参数
+- `sample`：从训练好的模型生成输出
+- 权重/优化器状态持久化函数
+
+## 价值观
+
+我们坚持以真实体验为首要约束。我们坚持透明的工程实践。我们坚持向社区提供可复用的工作流。
+
+</Zh>

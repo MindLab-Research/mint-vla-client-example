@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Downloading Weights
 
 You can download trained model weights for use outside of MinT.
@@ -18,3 +22,30 @@ urllib.request.urlretrieve(checkpoint_archive_url_response.url, "archive.tar")
 ```
 
 The downloaded archive contains the model weights in a format compatible with standard ML frameworks.
+
+</En>
+
+<Zh>
+
+# 下载权重
+
+您可以下载训练好的模型权重以在 MinT 之外使用。
+
+## 使用 SDK
+
+```python
+import mint
+import urllib.request
+
+sc = mint.ServiceClient()
+rc = sc.create_rest_client()
+future = rc.get_checkpoint_archive_url_from_tinker_path("tinker://<unique_id>/sampler_weights/final")
+checkpoint_archive_url_response = future.result()
+
+# checkpoint_archive_url_response.url 是一个签名 URL，有效期至 checkpoint_archive_url_response.expires
+urllib.request.urlretrieve(checkpoint_archive_url_response.url, "archive.tar")
+```
+
+下载的存档包含与标准机器学习框架兼容格式的模型权重。
+
+</Zh>

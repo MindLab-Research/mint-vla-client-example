@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # TrainingClient
 
 **Core interface for model training operations**
@@ -131,3 +135,143 @@ optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 
 sampling_client = training_client.save_weights_and_get_sampling_client("my-model")
 ```
+
+</En>
+
+<Zh>
+
+# TrainingClient
+
+**模型训练操作的核心接口**
+
+## 前向/反向操作
+
+### 仅前向传播
+
+```python
+forward(data, loss_fn, loss_fn_config=None)
+forward_async(data, loss_fn, loss_fn_config=None)
+```
+
+计算损失但不计算梯度（评估模式）。
+
+### 前向-反向传播
+
+```python
+forward_backward(data, loss_fn, loss_fn_config=None)
+forward_backward_async(data, loss_fn, loss_fn_config=None)
+```
+
+计算损失和梯度用于训练。
+
+**内置损失函数：**
+- `"cross_entropy"`
+- `"importance_sampling"`
+- `"ppo"`
+- `"cispo"`
+- `"dro"`
+
+### 自定义损失函数
+
+```python
+forward_backward_custom(data, custom_loss_fn)
+forward_backward_custom_async(data, custom_loss_fn)
+```
+
+使用具有以下签名的自定义损失函数：
+```python
+def custom_loss(data: list[Datum], logprobs: list[torch.Tensor]) -> tuple[torch.Tensor, dict]
+```
+
+## 优化
+
+```python
+optim_step(params)
+optim_step_async(params)
+```
+
+使用 Adam 优化器更新模型参数。
+
+**示例：**
+```python
+optim_future = training_client.optim_step(
+    types.AdamParams(learning_rate=1e-4)
+)
+```
+
+## 状态管理
+
+### 保存
+
+```python
+save_state(name)
+save_state_async(name)
+```
+
+保存权重和优化器状态（用于恢复训练）。
+
+```python
+save_weights_for_sampler(name)
+save_weights_for_sampler_async(name)
+```
+
+保存为推理优化的权重（更快，无优化器状态）。
+
+### 加载
+
+```python
+load_state(path)
+load_state_async(path)
+```
+
+仅加载权重。
+
+```python
+load_state_with_optimizer(path)
+load_state_with_optimizer_async(path)
+```
+
+加载权重和优化器状态。
+
+## 创建采样客户端
+
+```python
+create_sampling_client()
+```
+
+从当前权重创建 SamplingClient（不保存）。
+
+```python
+save_weights_and_get_sampling_client(name)
+```
+
+保存权重并在一次操作中返回 SamplingClient。
+
+## 工具方法
+
+```python
+get_info()
+```
+
+获取模型配置和元数据。
+
+```python
+get_tokenizer()
+```
+
+获取模型的分词器用于编码/解码文本。
+
+## 示例模式
+
+```python
+training_client = service_client.create_lora_training_client(
+    base_model="Qwen/Qwen3-8B"
+)
+
+fwdbwd_future = training_client.forward_backward(training_data, "cross_entropy")
+optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
+
+sampling_client = training_client.save_weights_and_get_sampling_client("my-model")
+```
+
+</Zh>

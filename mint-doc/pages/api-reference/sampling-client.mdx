@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # SamplingClient
 
 **Interface for generating text from trained models**
@@ -75,3 +79,87 @@ result = future.result()
 future = await sampling_client.sample_async(prompt, params, num_samples=1)
 result = await future
 ```
+
+</En>
+
+<Zh>
+
+# SamplingClient
+
+**从训练好的模型生成文本的接口**
+
+## 主要方法
+
+### 采样
+
+```python
+sample(
+    prompt,
+    num_samples,
+    sampling_params,
+    include_prompt_logprobs=False,
+    topk_prompt_logprobs=None
+)
+sample_async(...)
+```
+
+从提示词生成文本补全。
+
+**参数：**
+- `prompt` - 包含词元的 ModelInput
+- `num_samples` - 要生成的补全数量
+- `sampling_params` - 控制生成的 SamplingParams
+- `include_prompt_logprobs` - 返回提示词词元的对数概率
+- `topk_prompt_logprobs` - 返回每个位置的 top-k 词元替代项
+
+**返回：** 包含生成的词元和可选对数概率的 Future。
+
+### 计算对数概率
+
+```python
+compute_logprobs(prompt)
+compute_logprobs_async(prompt)
+```
+
+计算提示词中词元的对数概率，不生成新文本。
+
+## 使用示例
+
+```python
+import mint
+from mint import types
+
+service_client = mint.ServiceClient()
+sampling_client = service_client.create_sampling_client(
+    base_model="Qwen/Qwen3-8B"
+)
+
+# 准备提示词
+tokenizer = ...  # 获取分词器
+prompt = types.ModelInput.from_ints(
+    tokenizer.encode("The weather today is")
+)
+
+# 配置采样
+params = types.SamplingParams(
+    max_tokens=20,
+    temperature=0.7
+)
+
+# 生成
+future = sampling_client.sample(
+    prompt=prompt,
+    sampling_params=params,
+    num_samples=1
+)
+result = future.result()
+```
+
+## 异步使用
+
+```python
+future = await sampling_client.sample_async(prompt, params, num_samples=1)
+result = await future
+```
+
+</Zh>

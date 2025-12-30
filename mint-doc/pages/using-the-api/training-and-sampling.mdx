@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Training and Sampling
 
 MinT uses **LoRA (Low-Rank Adaptation)** for efficient fine-tuning. Instead of updating all model weights, LoRA trains small adapter matrices that are added to the frozen base model:
@@ -54,3 +58,66 @@ You can retrieve token probabilities:
 
 - `include_prompt_logprobs=True` returns token probabilities
 - `topk_prompt_logprobs=k` returns top-k alternatives per token position
+
+</En>
+
+<Zh>
+
+# 训练与采样
+
+MinT 使用 **LoRA（低秩适应）** 进行高效微调。LoRA 不更新所有模型权重，而是训练添加到冻结基础模型上的小型适配器矩阵：
+
+![LoRA 图示](/images/lora-diagram.png)
+
+输出变为 *h = Wx + BAx*，其中 *W* 是冻结的，只有低秩矩阵 *A* 和 *B* 被训练。这大大减少了内存和计算需求。
+
+## 创建训练客户端
+
+```python
+import mint
+service_client = mint.ServiceClient()
+training_client = service_client.create_lora_training_client(
+    base_model="Qwen/Qwen3-VL-30B-A3B-Instruct"
+)
+```
+
+## 数据准备
+
+将数据转换为包含模型输入和损失参数的 `Datum` 对象：
+
+- 分别对提示词和补全内容进行分词
+- 分配权重（提示词为 0，目标为 1）
+- 为下一个词预测创建移位的词元序列
+
+## 训练循环
+
+```python
+for _ in range(6):
+    fwdbwd_future = training_client.forward_backward(examples, "cross_entropy")
+    optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
+```
+
+## 视觉支持
+
+对于视觉语言模型：
+
+- `ModelInput` 接受混合块：文本用 `EncodedTextChunk`，图像用 `ImageChunk`
+- 视觉语言模型需要特殊标记，如 `<|vision_start|>` 和 `<|vision_end|>`
+
+## 采样
+
+训练后，创建采样客户端以生成输出：
+
+```python
+sampling_client = training_client.save_weights_and_get_sampling_client(name='model')
+result = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
+```
+
+## 对数概率
+
+您可以获取词元概率：
+
+- `include_prompt_logprobs=True` 返回词元概率
+- `topk_prompt_logprobs=k` 返回每个词元位置的 top-k 替代项
+
+</Zh>

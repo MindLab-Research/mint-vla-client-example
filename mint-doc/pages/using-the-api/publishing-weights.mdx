@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Publishing Weights
 
 Share your trained models by making checkpoints publicly accessible.
@@ -34,3 +38,46 @@ Other users can access your published weights:
 ckpt_path = "tinker://[UUID]/weights/[checkpoint_id]"
 training_client = service_client.create_training_client_from_state(ckpt_path)
 ```
+
+</En>
+
+<Zh>
+
+# 发布权重
+
+通过公开检查点来分享您训练好的模型。
+
+## 发布检查点
+
+```bash
+tinker checkpoint publish $TINKER_CHECKPOINT_PATH
+```
+
+**格式：** `tinker://[UUID]:train:[ID]/weights/[checkpoint_id]`
+
+## 验证发布
+
+```bash
+tinker checkpoint info tinker://[UUID]/weights/[checkpoint_id]
+```
+
+检查 `Public` 属性以确认检查点已公开可访问。
+
+## 取消发布
+
+要使检查点再次变为私有（仅所有者可访问）：
+
+```bash
+tinker checkpoint unpublish $TINKER_CHECKPOINT_PATH
+```
+
+## 访问已发布的权重
+
+其他用户可以访问您发布的权重：
+
+```python
+ckpt_path = "tinker://[UUID]/weights/[checkpoint_id]"
+training_client = service_client.create_training_client_from_state(ckpt_path)
+```
+
+</Zh>

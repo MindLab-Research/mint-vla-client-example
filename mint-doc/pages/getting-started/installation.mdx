@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Installation
 
 ## Install from Source
@@ -39,3 +43,51 @@ All code using `import tinker` will work with MinT without modification.
 ## Quickstart
 
 For a hands-on tutorial, see the [mint-quickstart](https://github.com/MindLab-Research/mint-quickstart) repository which demonstrates SFT and RL training workflows.
+
+</En>
+
+<Zh>
+
+# 安装
+
+## 从源码安装
+
+克隆仓库并以开发模式安装：
+
+```bash
+git clone https://github.com/MindLab-Research/mindlab-toolkit.git
+cd mindlab-toolkit
+pip install -e .
+```
+
+## 包含内容
+
+MinT Python SDK 提供底层操作，包括 `forward_backward`、`sample`、`optim_step` 和 `save_state` 功能。
+
+## 身份验证
+
+API 访问需要设置凭据：
+
+1. 从 **Mind Lab 团队**获取 API 密钥
+2. 设置 `MINT_API_KEY` 环境变量
+
+```bash
+export MINT_API_KEY=sk-mint-your-key-here
+```
+
+## Tinker 兼容性
+
+MinT 与 [Tinker](https://tinker.thinkingmachines.ai) 完全 API 兼容。如果您已安装 `tinker` 包，可以通过设置环境变量将其与 MinT 一起使用：
+
+```bash
+export TINKER_BASE_URL=https://mint-alpha.macaron.im
+export TINKER_API_KEY=<your-mint-api-key>
+```
+
+所有使用 `import tinker` 的代码无需修改即可与 MinT 配合使用。
+
+## 快速入门
+
+如需实践教程，请参阅 [mint-quickstart](https://github.com/MindLab-Research/mint-quickstart) 仓库，其中演示了 SFT 和 RL 训练工作流。
+
+</Zh>
