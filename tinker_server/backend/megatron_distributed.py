@@ -1150,9 +1150,13 @@ class MegatronRankWorker:
                     name_lower = name.lower()
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
+                        # CRITICAL: ALL ranks must do the same work to avoid NCCL deadlock!
+                        # eval_mode().__exit__ has a barrier - if rank 0 is slower (due to CPU copies),
+                        # other ranks wait at barrier indefinitely.
+                        # Fix: all ranks clone to CPU, only rank 0 keeps the result.
+                        cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
                         if self.rank == 0:
-                            # Copy to CPU for serialization
-                            adapter_state[name] = param.data.clone().cpu() if param.is_cuda else param.data.clone()
+                            adapter_state[name] = cloned
 
                 logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
 
@@ -1184,49 +1188,59 @@ class MegatronRankWorker:
                 import traceback
                 logger.error(traceback.format_exc())
 
-            # SECOND: If direct extraction failed, try bridge.export_weights() (may give merged weights)
-            if not adapter_state:
+            # SECOND: If direct extraction failed, try bridge.export_hf_weights()
+            # NOTE: Modern Megatron-Bridge uses export_hf_weights(), not the old export_weights() API.
+            # export_weights() merges LoRA into base weights, which is not what we want.
+            # CRITICAL: Use lora_param_names (same across all ranks) not adapter_state (only rank 0 has data)
+            adapter_param_names = []  # Track across fallbacks for symmetric branching
+            if not lora_param_names:
                 bridge = getattr(self.engine, 'bridge', None)
-                has_export_weights = bridge is not None and hasattr(bridge, 'export_weights')
+                has_export_hf_weights = bridge is not None and hasattr(bridge, 'export_hf_weights')
 
-                if has_export_weights:
-                    logger.info(f"[Rank {self.rank}] Fallback to bridge.export_weights() (may return merged weights)")
+                if has_export_hf_weights:
+                    logger.info(f"[Rank {self.rank}] Fallback to bridge.export_hf_weights()")
                     try:
                         adapter_patterns = ['lora', 'adapter', 'peft']
                         all_param_names = []
-                        adapter_param_names = []
 
-                        for name, tensor in bridge.export_weights(self.engine.module):
+                        for name, tensor in bridge.export_hf_weights(self.engine.module):
                             all_param_names.append(name)
-                            if self.rank == 0:
-                                name_lower = name.lower()
-                                if any(pattern in name_lower for pattern in adapter_patterns):
-                                    adapter_param_names.append(name)
-                                    adapter_state[name] = tensor.data.clone().cpu() if tensor.is_cuda else tensor.data.clone()
+                            name_lower = name.lower()
+                            if any(pattern in name_lower for pattern in adapter_patterns):
+                                adapter_param_names.append(name)
+                                # CRITICAL: ALL ranks must do the same work to avoid NCCL deadlock!
+                                cloned = tensor.data.clone().cpu() if tensor.is_cuda else tensor.data.clone()
+                                if self.rank == 0:
+                                    adapter_state[name] = cloned
 
-                        logger.info(f"[Rank {self.rank}] bridge.export_weights() returned {len(all_param_names)} params, {len(adapter_param_names)} adapter")
+                        logger.info(f"[Rank {self.rank}] bridge.export_hf_weights() returned {len(all_param_names)} params, {len(adapter_param_names)} adapter")
 
                         if self.rank == 0 and not adapter_param_names:
-                            logger.warning("[Rank 0] NO adapter params found via export_weights() - weights were merged!")
+                            logger.warning("[Rank 0] NO adapter params found via export_hf_weights()")
                     except Exception as e:
-                        logger.error(f"[Rank {self.rank}] bridge.export_weights() failed: {e}")
+                        logger.error(f"[Rank {self.rank}] bridge.export_hf_weights() failed: {e}")
 
             # THIRD: Try verl's get_adapter_state_dict as last resort (also within eval_mode)
-            if not adapter_state and self.rank == 0:
-                logger.info("[Rank 0] Trying get_adapter_state_dict() fallback...")
+            # CRITICAL: ALL ranks must attempt this to stay synchronized
+            # Use symmetric condition: no params found from prior methods
+            if not lora_param_names and not adapter_param_names:
+                logger.info(f"[Rank {self.rank}] Trying get_adapter_state_dict() fallback...")
                 try:
                     from verl.utils.megatron_peft_utils import get_adapter_state_dict
                     raw_state = get_adapter_state_dict(self.engine.module)
-                    logger.info(f"[Rank 0] get_adapter_state_dict returned {len(raw_state)} params")
+                    logger.info(f"[Rank {self.rank}] get_adapter_state_dict returned {len(raw_state)} params")
                     for name, tensor in raw_state.items():
-                        adapter_state[name] = tensor.cpu() if tensor.is_cuda else tensor.clone()
-                    if adapter_state:
+                        # ALL ranks do the work, only rank 0 stores result
+                        cloned = tensor.cpu() if tensor.is_cuda else tensor.clone()
+                        if self.rank == 0:
+                            adapter_state[name] = cloned
+                    if self.rank == 0 and adapter_state:
                         sample_keys = list(adapter_state.keys())[:5]
                         logger.info(f"[Rank 0] Sample Megatron keys: {sample_keys}")
                 except ImportError:
-                    logger.warning("[Rank 0] verl.utils.megatron_peft_utils not available")
+                    logger.warning(f"[Rank {self.rank}] verl.utils.megatron_peft_utils not available")
                 except Exception as e:
-                    logger.error(f"[Rank 0] get_adapter_state_dict failed: {e}")
+                    logger.error(f"[Rank {self.rank}] get_adapter_state_dict failed: {e}")
 
         # Non-rank-0 workers return empty dict
         if self.rank != 0:
@@ -1240,10 +1254,24 @@ class MegatronRankWorker:
         # Convert to PEFT format
         # HF names: model.layers.X.self_attn.q_proj.lora_A.weight
         # PEFT names: base_model.model.model.layers.X.self_attn.q_proj.lora_A.weight
-        #
-        # All modules (attention + MLP) are exported for both MoE and Dense models.
-        # vLLM 0.13.0+ supports expert LoRA via FusedMoEWithLoRA.
+        def _is_mlp_module(param_name: str) -> bool:
+            """Check if parameter is from MLP/expert layer."""
+            mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
+                           'gate_proj', 'up_proj', 'down_proj']
+            name_lower = param_name.lower()
+            return any(p in name_lower for p in mlp_patterns)
 
+        # Check if model is MoE - filter MLP modules for MoE models
+        # MoE models have shared LoRA for experts which needs special handling
+        try:
+            model_is_moe = is_moe_model(self.base_model)
+        except ValueError:
+            model_is_moe = False
+
+        if model_is_moe:
+            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (vLLM uses shared LoRA differently)")
+
+        mlp_filtered_count = 0
         lora_state_dict = {}
         logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
@@ -1259,12 +1287,27 @@ class MegatronRankWorker:
                     logger.warning(f"Could not convert to PEFT: {name}")
                     continue
 
+            # Handle MoE MLP/expert modules - filter them out for now
+            # vLLM FusedMoEWithLoRA expects per-expert format which is complex
+            if model_is_moe and _is_mlp_module(peft_name):
+                mlp_filtered_count += 1
+                continue
+
             lora_state_dict[peft_name] = tensor
 
-        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format, all modules)")
+        if model_is_moe and mlp_filtered_count > 0:
+            logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
+        logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:3]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
+
+        # Warn if all weights were filtered (e.g., LoRA targeted only MLP for MoE)
+        if not lora_state_dict and mlp_filtered_count > 0:
+            logger.warning(
+                f"[Rank 0] ALL LoRA weights were filtered ({mlp_filtered_count} MLP modules). "
+                "This may indicate LoRA was configured to target only expert layers."
+            )
 
         return lora_state_dict
 
@@ -2047,7 +2090,7 @@ class MegatronWorkerGroup:
             # Call ALL workers - bridge.export_weights() may use NCCL allgather
             # Rank 0 returns actual data, other ranks return empty dict
             futures = [w.get_lora_state_dict.remote() for w in self.workers]
-            results = ray.get(futures, timeout=120)
+            results = ray.get(futures, timeout=300)  # Increased timeout for large MoE models
 
             # Rank 0's result has the actual data
             result = results[0]
