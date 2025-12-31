@@ -105,10 +105,10 @@ async def result_async(timeout: Optional[float] = None) -> T
 
 异步获取结果（非阻塞）。
 
-**参数：**
-- `timeout` - 可选的超时时间（秒）
+**参数**：
+- `timeout`：可选 timeout（秒）
 
-**抛出：** 如果操作未在超时时间内完成则抛出 `TimeoutError`。
+**抛出**：操作未在 timeout 内完成则抛出 `TimeoutError`。
 
 ### result
 
@@ -118,10 +118,10 @@ def result(timeout: Optional[float] = None) -> T
 
 同步获取结果（阻塞）。
 
-**参数：**
-- `timeout` - 可选的超时时间（秒）
+**参数**：
+- `timeout`：可选 timeout（秒）
 
-**抛出：** 如果操作未在超时时间内完成则抛出 `TimeoutError`。
+**抛出**：操作未在 timeout 内完成则抛出 `TimeoutError`。
 
 ### future
 
@@ -147,7 +147,7 @@ api_future = client.some_operation(...)
 result = api_future.result()
 ```
 
-### 带超时
+### 带 Timeout
 
 ```python
 try:

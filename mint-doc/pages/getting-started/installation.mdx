@@ -34,7 +34,7 @@ export MINT_API_KEY=sk-mint-your-key-here
 MinT is fully API-compatible with [Tinker](https://tinker.thinkingmachines.ai). If you already have the `tinker` package installed, you can use it with MinT by setting environment variables:
 
 ```bash
-export TINKER_BASE_URL=https://mint-alpha.macaron.im
+export TINKER_BASE_URL=https://mint.macaron.im/
 export TINKER_API_KEY=<your-mint-api-key>
 ```
 
@@ -60,34 +60,34 @@ cd mindlab-toolkit
 pip install -e .
 ```
 
-## 包含内容
+## SDK 内容
 
-MinT Python SDK 提供底层操作，包括 `forward_backward`、`sample`、`optim_step` 和 `save_state` 功能。
+MinT Python SDK 提供底层操作原语：`forward_backward`、`sample`、`optim_step`、`save_state`。
 
-## 身份验证
+## 认证
 
-API 访问需要设置凭据：
+API 访问需要配置凭据：
 
-1. 从 **Mind Lab 团队**获取 API 密钥
-2. 设置 `MINT_API_KEY` 环境变量
+1. 从 **Mind Lab 团队**获取 API key
+2. 设置环境变量 `MINT_API_KEY`
 
 ```bash
 export MINT_API_KEY=sk-mint-your-key-here
 ```
 
-## Tinker 兼容性
+## Tinker 兼容
 
-MinT 与 [Tinker](https://tinker.thinkingmachines.ai) 完全 API 兼容。如果您已安装 `tinker` 包，可以通过设置环境变量将其与 MinT 一起使用：
+MinT 与 [Tinker](https://tinker.thinkingmachines.ai) 完全 API 兼容。已有 `tinker` 代码只需设置环境变量即可迁移：
 
 ```bash
-export TINKER_BASE_URL=https://mint-alpha.macaron.im
+export TINKER_BASE_URL=https://mint.macaron.im/
 export TINKER_API_KEY=<your-mint-api-key>
 ```
 
-所有使用 `import tinker` 的代码无需修改即可与 MinT 配合使用。
+所有 `import tinker` 的代码无需修改即可运行。
 
-## 快速入门
+## 快速上手
 
-如需实践教程，请参阅 [mint-quickstart](https://github.com/MindLab-Research/mint-quickstart) 仓库，其中演示了 SFT 和 RL 训练工作流。
+参考 [mint-quickstart](https://github.com/MindLab-Research/mint-quickstart) 仓库，包含 SFT 和 RL 训练的完整示例。
 
 </Zh>

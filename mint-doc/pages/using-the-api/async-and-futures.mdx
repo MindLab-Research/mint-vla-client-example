@@ -47,7 +47,7 @@ This approach overlaps computation and communication, maximizing GPU utilization
 
 # 异步与 Future
 
-MinT 提供同步和异步 API 以实现高效操作。
+MinT 同时提供同步和异步 API。
 
 ## 同步示例
 
@@ -63,12 +63,12 @@ future = await client.forward_backward_async(data, loss_fn)
 result = await future
 ```
 
-- **第一个 `await`** 确认提交（确保顺序）
-- **第二个 `await`** 等待完成
+- **第一个 `await`**：确认提交（保证顺序）
+- **第二个 `await`**：等待完成
 
 ## 性能优化
 
-通过在等待之前提交操作来高效排队：
+在等待之前先提交操作，实现流水线：
 
 ```python
 # 提交 forward_backward
@@ -82,6 +82,6 @@ fwd_bwd_result = await fwd_bwd_future
 optim_result = await optim_future
 ```
 
-这种方法重叠了计算和通信，最大化 GPU 利用率。
+这种方式重叠计算和通信，最大化 GPU 利用率。
 
 </Zh>

@@ -71,30 +71,30 @@ training_client.forward_backward_custom(data, custom_loss)
 
 <Zh>
 
-# 损失函数
+# Loss 函数
 
-MinT 提供多种针对不同训练场景优化的内置损失函数。
+MinT 提供多种内置 loss 函数，针对不同训练场景优化。
 
-## 内置损失函数
+## 内置 Loss 函数
 
-### 交叉熵（监督学习）
+### Cross-Entropy（监督学习）
 
 ```python
 elementwise_loss = -target_logprobs * weights
 loss = elementwise_loss.sum()
 ```
 
-**输入：** `target_tokens`、`weights`
-**输出：** `logprobs`
+**输入**：`target_tokens`、`weights`
+**输出**：`logprobs`
 
-### 重要性采样（策略梯度）
+### Importance Sampling（Policy Gradient）
 
 ```python
 prob_ratio = torch.exp(target_logprobs - sampling_logprobs)
 loss = -(prob_ratio * advantages).sum()
 ```
 
-### PPO（近端策略优化）
+### PPO（Proximal Policy Optimization）
 
 ```python
 prob_ratio = torch.exp(target_logprobs - sampling_logprobs)
@@ -104,27 +104,27 @@ clipped_objective = clipped_ratio * advantages
 loss = -torch.min(unclipped_objective, clipped_objective).sum()
 ```
 
-**配置：** `loss_fn_config={"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}`
+**配置**：`loss_fn_config={"clip_low_threshold": 0.9, "clip_high_threshold": 1.1}`
 
-### CISPO（裁剪重要性采样策略优化）
+### CISPO（Clipped Importance Sampling Policy Optimization）
 
 ```python
 clipped_ratio = torch.clamp(prob_ratio, clip_low_threshold, clip_high_threshold)
 loss = -(clipped_ratio.detach() * target_logprobs * advantages).sum()
 ```
 
-### DRO（直接奖励优化）
+### DRO（Direct Reward Optimization）
 
 ```python
 quadratic_term = (target_logprobs - sampling_logprobs) ** 2
 loss = -(target_logprobs * advantages - 0.5 * beta * quadratic_term).sum()
 ```
 
-**配置：** `loss_fn_config={"beta": 0.05}`
+**配置**：`loss_fn_config={"beta": 0.05}`
 
-## 自定义损失函数
+## 自定义 Loss 函数
 
-对于高级用例，您可以定义自定义损失函数：
+高级用例可自定义 loss 函数：
 
 ```python
 def custom_loss(data: list[Datum], logprobs: list[torch.Tensor]) -> tuple[torch.Tensor, dict]:
@@ -134,6 +134,6 @@ def custom_loss(data: list[Datum], logprobs: list[torch.Tensor]) -> tuple[torch.
 training_client.forward_backward_custom(data, custom_loss)
 ```
 
-**权衡：** 自定义损失使用 1.5 倍 FLOPs 和最多 3 倍实际时间，但可以实现任意可微分目标，如 Bradley-Terry 或 DPO。
+**代价**：自定义 loss 约 1.5x FLOPs，最多 3x wall time。但可实现任意可微目标，如 Bradley-Terry 或 DPO。
 
 </Zh>
