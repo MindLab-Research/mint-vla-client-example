@@ -144,41 +144,41 @@ sampling_client = training_client.save_weights_and_get_sampling_client("my-model
 
 **模型训练操作的核心接口**
 
-## 前向/反向操作
+## Forward/Backward 操作
 
-### 仅前向传播
+### 仅 Forward
 
 ```python
 forward(data, loss_fn, loss_fn_config=None)
 forward_async(data, loss_fn, loss_fn_config=None)
 ```
 
-计算损失但不计算梯度（评估模式）。
+计算 loss，不计算 gradient（评估模式）。
 
-### 前向-反向传播
+### Forward-Backward
 
 ```python
 forward_backward(data, loss_fn, loss_fn_config=None)
 forward_backward_async(data, loss_fn, loss_fn_config=None)
 ```
 
-计算损失和梯度用于训练。
+计算 loss 和 gradient，用于训练。
 
-**内置损失函数：**
+**内置 Loss 函数**：
 - `"cross_entropy"`
 - `"importance_sampling"`
 - `"ppo"`
 - `"cispo"`
 - `"dro"`
 
-### 自定义损失函数
+### 自定义 Loss 函数
 
 ```python
 forward_backward_custom(data, custom_loss_fn)
 forward_backward_custom_async(data, custom_loss_fn)
 ```
 
-使用具有以下签名的自定义损失函数：
+使用自定义 loss 函数，签名：
 ```python
 def custom_loss(data: list[Datum], logprobs: list[torch.Tensor]) -> tuple[torch.Tensor, dict]
 ```
@@ -190,9 +190,9 @@ optim_step(params)
 optim_step_async(params)
 ```
 
-使用 Adam 优化器更新模型参数。
+使用 Adam optimizer 更新模型参数。
 
-**示例：**
+**示例**：
 ```python
 optim_future = training_client.optim_step(
     types.AdamParams(learning_rate=1e-4)
@@ -208,14 +208,14 @@ save_state(name)
 save_state_async(name)
 ```
 
-保存权重和优化器状态（用于恢复训练）。
+保存 weight 和 optimizer 状态（用于恢复训练）。
 
 ```python
 save_weights_for_sampler(name)
 save_weights_for_sampler_async(name)
 ```
 
-保存为推理优化的权重（更快，无优化器状态）。
+保存为 inference 优化的 weight（更快，无 optimizer 状态）。
 
 ### 加载
 
@@ -224,28 +224,28 @@ load_state(path)
 load_state_async(path)
 ```
 
-仅加载权重。
+仅加载 weight。
 
 ```python
 load_state_with_optimizer(path)
 load_state_with_optimizer_async(path)
 ```
 
-加载权重和优化器状态。
+加载 weight 和 optimizer 状态。
 
-## 创建采样客户端
+## 创建 Sampling Client
 
 ```python
 create_sampling_client()
 ```
 
-从当前权重创建 SamplingClient（不保存）。
+从当前 weight 创建 SamplingClient（不保存）。
 
 ```python
 save_weights_and_get_sampling_client(name)
 ```
 
-保存权重并在一次操作中返回 SamplingClient。
+保存 weight 并返回 SamplingClient，一步完成。
 
 ## 工具方法
 
@@ -259,9 +259,9 @@ get_info()
 get_tokenizer()
 ```
 
-获取模型的分词器用于编码/解码文本。
+获取模型的 tokenizer，用于编码/解码文本。
 
-## 示例模式
+## 示例
 
 ```python
 training_client = service_client.create_lora_training_client(

@@ -63,15 +63,15 @@ You can retrieve token probabilities:
 
 <Zh>
 
-# 训练与采样
+# Training 与 Sampling
 
-MinT 使用 **LoRA（低秩适应）** 进行高效微调。LoRA 不更新所有模型权重，而是训练添加到冻结基础模型上的小型适配器矩阵：
+MinT 使用 **LoRA（Low-Rank Adaptation）** 进行高效 fine-tune。核心思路：冻结基座模型 weight，仅训练附加的低秩适配器矩阵。
 
 ![LoRA 图示](/images/lora-diagram.png)
 
-输出变为 *h = Wx + BAx*，其中 *W* 是冻结的，只有低秩矩阵 *A* 和 *B* 被训练。这大大减少了内存和计算需求。
+输出变为 *h = Wx + BAx*，其中 *W* 冻结，只有低秩矩阵 *A* 和 *B* 参与训练。显著降低显存和计算开销。
 
-## 创建训练客户端
+## 创建 Training Client
 
 ```python
 import mint
@@ -83,13 +83,13 @@ training_client = service_client.create_lora_training_client(
 
 ## 数据准备
 
-将数据转换为包含模型输入和损失参数的 `Datum` 对象：
+将数据转换为 `Datum` 对象，包含 model input 和 loss 参数：
 
-- 分别对提示词和补全内容进行分词
-- 分配权重（提示词为 0，目标为 1）
-- 为下一个词预测创建移位的词元序列
+- 分别 tokenize prompt 和 completion
+- 分配 weight（prompt 为 0，target 为 1）
+- 构造 shifted token 序列用于 next-token prediction
 
-## 训练循环
+## Training 循环
 
 ```python
 for _ in range(6):
@@ -97,27 +97,27 @@ for _ in range(6):
     optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 ```
 
-## 视觉支持
+## 视觉模型支持
 
 对于视觉语言模型：
 
-- `ModelInput` 接受混合块：文本用 `EncodedTextChunk`，图像用 `ImageChunk`
-- 视觉语言模型需要特殊标记，如 `<|vision_start|>` 和 `<|vision_end|>`
+- `ModelInput` 支持混合 chunk：文本用 `EncodedTextChunk`，图像用 `ImageChunk`
+- 需要特殊 token：`<|vision_start|>` 和 `<|vision_end|>`
 
-## 采样
+## Sampling
 
-训练后，创建采样客户端以生成输出：
+训练后创建 sampling client 生成输出：
 
 ```python
 sampling_client = training_client.save_weights_and_get_sampling_client(name='model')
 result = sampling_client.sample(prompt=prompt, sampling_params=params, num_samples=8)
 ```
 
-## 对数概率
+## Logprobs
 
-您可以获取词元概率：
+可获取 token 概率：
 
-- `include_prompt_logprobs=True` 返回词元概率
-- `topk_prompt_logprobs=k` 返回每个词元位置的 top-k 替代项
+- `include_prompt_logprobs=True`：返回 prompt token 的 logprobs
+- `topk_prompt_logprobs=k`：返回每个位置的 top-k 候选 token
 
 </Zh>

@@ -43,17 +43,17 @@ training_client = service_client.create_training_client_from_state(ckpt_path)
 
 <Zh>
 
-# 发布权重
+# 发布 Weight
 
-通过公开检查点来分享您训练好的模型。
+公开 checkpoint 以分享训练好的模型。
 
-## 发布检查点
+## 发布 Checkpoint
 
 ```bash
 tinker checkpoint publish $TINKER_CHECKPOINT_PATH
 ```
 
-**格式：** `tinker://[UUID]:train:[ID]/weights/[checkpoint_id]`
+**格式**：`tinker://[UUID]:train:[ID]/weights/[checkpoint_id]`
 
 ## 验证发布
 
@@ -61,19 +61,19 @@ tinker checkpoint publish $TINKER_CHECKPOINT_PATH
 tinker checkpoint info tinker://[UUID]/weights/[checkpoint_id]
 ```
 
-检查 `Public` 属性以确认检查点已公开可访问。
+检查 `Public` 属性确认 checkpoint 已公开。
 
 ## 取消发布
 
-要使检查点再次变为私有（仅所有者可访问）：
+将 checkpoint 设为私有（仅 owner 可访问）：
 
 ```bash
 tinker checkpoint unpublish $TINKER_CHECKPOINT_PATH
 ```
 
-## 访问已发布的权重
+## 访问已发布的 Weight
 
-其他用户可以访问您发布的权重：
+其他用户可访问你发布的 weight：
 
 ```python
 ckpt_path = "tinker://[UUID]/weights/[checkpoint_id]"

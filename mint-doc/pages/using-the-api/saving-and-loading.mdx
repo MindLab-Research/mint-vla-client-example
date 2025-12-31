@@ -57,13 +57,13 @@ training_client.load_state(resume_path)
 
 # 保存与加载
 
-MinT 提供灵活的方法来保存和加载模型权重及优化器状态。
+MinT 提供灵活的 weight 和 optimizer 状态保存/加载方法。
 
 ## 保存方法
 
-### 保存权重供采样器使用
+### 保存 Weight 用于 Sampling
 
-存储为推理优化的权重（更快）：
+存储为 inference 优化的 weight（更快）：
 
 ```python
 sampling_path = training_client.save_weights_for_sampler(name="0000").result().path
@@ -71,13 +71,13 @@ sampling_path = training_client.save_weights_for_sampler(name="0000").result().p
 
 ### 保存完整状态
 
-保留权重和优化器状态以便恢复训练：
+保留 weight 和 optimizer 状态，用于恢复训练：
 
 ```python
 resume_path = training_client.save_state(name="0010").result().path
 ```
 
-## 创建采样客户端
+## 创建 Sampling Client
 
 ```python
 import mint
@@ -99,9 +99,9 @@ training_client.load_state(resume_path)
 
 ## 使用场景
 
-- **多阶段工作流** - 保存中间检查点
-- **超参数调整** - 从检查点恢复并使用新设置
-- **故障恢复** - 在中断后恢复训练
-- **优化器状态保留** - 在会话之间保持训练动量
+- **多阶段工作流**：保存中间 checkpoint
+- **超参调整**：从 checkpoint 恢复并修改配置
+- **故障恢复**：中断后继续训练
+- **Optimizer 状态保留**：跨 session 保持训练状态
 
 </Zh>
