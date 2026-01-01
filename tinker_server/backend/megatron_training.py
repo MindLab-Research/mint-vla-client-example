@@ -55,7 +55,7 @@ class MegatronTrainingConfig:
 
 def tinker_to_tensordict(
     data_items: list[dict],
-    max_token_len_per_gpu: int = 32768,  # Support up to 32K context
+    max_token_len_per_gpu: int = 10240,  # Single sample max: prompt (~2K) + max_tokens (8K)
     device: str | torch.device | None = None,
 ) -> TensorDict:
     """Convert Tinker Datum format to verl TensorDict.
@@ -74,14 +74,15 @@ def tinker_to_tensordict(
     verl TensorDict format:
         TensorDict({
             "input_ids": tensor [batch, seq_len],
-            "attention_mask": tensor [batch, seq_len],
+            "attention_mask": tensor [batch, seq_len],  # 1 for real tokens, 0 for padding
             "loss_mask": tensor [batch, seq_len],
             "position_ids": tensor [batch, seq_len],  # 0 to seq_len-1
             "temperature": tensor [batch, 1],         # logits scaling (1.0 = no scaling)
             "old_log_probs": tensor [batch, seq_len],  # for RL
             "advantages": tensor [batch, seq_len],     # for RL
             # Non-tensor metadata for verl's prepare_micro_batches:
-            "use_dynamic_bsz": NonTensorData(True),
+            "use_dynamic_bsz": NonTensorData(False),  # Disabled for micro_batch control
+            "micro_batch_size_per_gpu": NonTensorData(1),  # Gradient accumulation
             "max_token_len_per_gpu": NonTensorData(int),
         })
 
@@ -142,18 +143,17 @@ def tinker_to_tensordict(
     batch_size = len(input_ids_list)
 
     # verl expects nested/jagged tensors for variable-length sequences
-    # Create tensors directly on target device (GPU) to avoid .to() issues
-    # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
+    # This is required for gptmodel_forward_no_padding which calls input_ids.offsets()
     input_ids_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in input_ids_list]
     loss_mask_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in loss_mask_list]
     position_ids_tensors = [torch.arange(len(seq), dtype=torch.long, device=device) for seq in input_ids_list]
 
-    # Create nested tensors with jagged layout
+    # Create NestedTensors with jagged layout (variable-length sequences)
     input_ids = torch.nested.as_nested_tensor(input_ids_tensors, layout=torch.jagged)
     loss_mask = torch.nested.as_nested_tensor(loss_mask_tensors, layout=torch.jagged)
     position_ids = torch.nested.as_nested_tensor(position_ids_tensors, layout=torch.jagged)
 
-    # TensorDict (don't pass device= as it triggers .to() on nested tensors)
+    # TensorDict with NestedTensors
     td = TensorDict({
         "input_ids": input_ids,
         "loss_mask": loss_mask,
@@ -166,7 +166,7 @@ def tinker_to_tensordict(
     # Using set_non_tensor with float prevents batching/slicing by prepare_micro_batches
     td.set_non_tensor("temperature", 1.0)
 
-    # Add RL inputs if present (also as nested tensors on target device)
+    # Add RL inputs if present (as NestedTensor for variable-length sequences)
     if has_rl_inputs and old_log_probs_list:
         old_log_probs_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in old_log_probs_list]
         td["old_log_probs"] = torch.nested.as_nested_tensor(old_log_probs_tensors, layout=torch.jagged)
@@ -175,9 +175,11 @@ def tinker_to_tensordict(
         td["advantages"] = torch.nested.as_nested_tensor(advantages_tensors, layout=torch.jagged)
 
     # Add non-tensor metadata for verl's prepare_micro_batches
-    # These control how verl splits the batch into micro-batches
-    td["use_dynamic_bsz"] = NonTensorData(False)  # Disabled to allow micro_batch_size_per_gpu settings
+    # use_dynamic_bsz=True is REQUIRED for NestedTensor compatibility with verl's forward
+    # verl's rearrange_micro_batches handles dynamic batching based on token count
+    td["use_dynamic_bsz"] = NonTensorData(True)
     td["max_token_len_per_gpu"] = NonTensorData(max_token_len_per_gpu)
+    td.set_non_tensor("sp_size", 1)  # Sequence parallel size (default 1)
 
     # Add fields required by verl's sft_loss
     # Compute total tokens in batch for loss normalization

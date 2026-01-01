@@ -130,22 +130,23 @@ MODEL_CONFIGS = {
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
-        recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
+        recommended_tp=32,  # Inference: TP=32 (PROMPT.md spec)
         recommended_dp=1,
-        train_tp=8,  # Training: TP=8 for attention layers
-        train_ep=64,  # Training: EP=64 (64 GPUs total, 6 experts/GPU)
+        train_tp=16,  # Training: TP=16 (PROMPT.md: lora_rank=16 requires TP<=16)
+        train_ep=64,  # Training: EP=64 (64 GPUs total)
         train_cp=1,  # Training: CP=1 (no context parallelism)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
-        # world_size = TP * EP = 8 * 64 = 512? No - MoE Parallel Folding:
-        # With ETP=1 < TP=8: world_size = EP = 64 GPUs
-        # TP=8 operates as 8 subgroups within EP dimension
+        # PROMPT.md settings:
+        # - Megatron: TP=16, EP=64, ETP=1, lora_rank=16 (64 GPUs)
+        # - vLLM: TP=32, max_lora_rank=16 (32 GPUs)
+        # - Total: 96 GPUs
+        # MoE Parallel Folding: world_size = EP = 64 GPUs
         # 384 experts / 64 GPUs = 6 experts per GPU
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
-        gpu_memory_utilization=0.98,  # 52 GB model+LoRA, 15.6 GB available for KV cache
+        gpu_memory_utilization=0.85,  # Lower util to avoid OOM on long sequences
         max_loras=1,  # LoRA for weight transfer
-        max_lora_rank=8,  # Rank 8: smaller LoRA for memory efficiency
-        max_model_len=131072,  # 128K context - fits in 15.6 GB KV cache (238K tokens capacity)
-        # Note: FP8 KV cache not supported with MLA on A100
+        max_lora_rank=16,  # Rank 16: matches training lora_rank
+        max_model_len=65536,  # 64K context
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
     # Same DeepseekV3ForCausalLM architecture
