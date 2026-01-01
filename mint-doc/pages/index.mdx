@@ -20,7 +20,7 @@ MinT abstracts away infrastructure complexity—GPU clusters, model states, dist
 
 ### Key Features
 
-- **Model Support**: Kimi, K2, DeepSeek, Qwen, Pi0, and others—ensuring a rapid closed loop from inference to training
+- **Model Support**: Kimi, K2, DeepSeek, Qwen, π0, and others—ensuring a rapid closed loop from inference to training
 - **Algorithm Support**: Robust training pipeline centered on RLHF/GRPO and general policy optimization
 - **Frictionless Migration**: Initial API compatibility with [ThinkingMachines Tinker](https://thinkingmachines.ai/tinker/), designed as a familiar drop-in upgrade
 - **Scaled Agentic RL**: Capture and utilize experience at scale across wider task distributions, longer interaction horizons, and richer environmental constraints
@@ -56,56 +56,50 @@ We insist on real experience as the primary constraint. We insist on transparent
 
 # Mind Lab Toolkit (MinT)
 
-## 概述
+## 为 Experiential Intelligence 构建基础设施
 
-MinT 是大模型 post-training 和强化学习的托管平台。
+MinT（Mind Lab Toolkit）是一套 RL 基础设施，帮助 agent 和模型从真实经验中学习。它封装了计算调度、分布式 rollout 和训练编排，让团队可以在真实任务、真实反馈、真实产品约束下快速迭代学习循环。
 
-你提供数据和训练逻辑，MinT 负责分布式训练和基础设施。
+MinT 提供统一且可复现的方式来运行多模型、多任务的强化学习，重点是让 LoRA RL 变得简单、稳定、高效——无论是主流模型还是前沿大模型。你只需定义训练什么、用什么数据、怎么优化、怎么评估，剩下的交给 MinT。
 
-**三个核心价值：低成本试错、简单运行、易于复现。**
+## MinT 是什么
 
-## 你定义什么
-
-MinT 让你专注于训练逻辑本身：
-
-| 你定义 | 说明 |
-|-------|------|
-| 训练什么 | 选择要适配的模型 |
-| 用什么数据 | 数据集、环境或经验来源 |
-| 怎么学 | 配置 post-training 或 RL 方法 |
-| 怎么评估 | 定义评估指标和成功信号 |
-
-剩下的交给 MinT：GPU 调度、分布式训练、模型状态管理、故障恢复。
+MinT 专注于多模型、多任务强化学习的工程和算法实现。我们特别强调让 **LoRA RL**（Low-Rank Adaptation Reinforcement Learning）对主流和前沿模型都做到简单、稳定、高效。
 
 ![MinT 架构](/images/mint-architecture.png)
 
-## 核心能力
+MinT 封装了基础设施的复杂性——GPU 集群、模型状态、分布式训练——让你专注于核心问题：选择模型、准备数据、定义学习目标、评估结果。
 
-**快速跑通第一个闭环**
-- 跟随 quickstart 即可完成一个完整的训练-推理循环
+### 核心特性
 
-**training 到 inference 无缝衔接**
-- 训练完成后直接生成 sampling client，评估和迭代紧密相连
+- **模型支持**：Kimi、K2、DeepSeek、Qwen、π0 等，确保推理到训练的快速闭环
+- **算法支持**：以 RLHF/GRPO 和通用策略优化为核心的稳健训练 pipeline
+- **无缝迁移**：初始 API 兼容 [ThinkingMachines Tinker](https://thinkingmachines.ai/tinker/)，作为熟悉的平替升级
+- **规模化 Agentic RL**：在更广泛的任务分布、更长的交互 horizon、更丰富的环境约束下采集和利用经验
 
-**内置主流开源模型支持**
-- Qwen3、DeepSeek V3.1、Kimi K2 Thinking
-- 多模态：Qwen3-VL
-- 机器人：Pi0
+### 核心能力
 
-**兼容 Tinker API**
-- 已有 Tinker 代码可直接迁移
-- 提供 verl、TRL、OpenRLHF 迁移工具
+- 大模型高效训练的 LoRA fine-tuning
+- 分布式数据采集和滚动训练
+- 支持视觉语言模型（Qwen3-VL）
+- 权重管理和模型发布
+- 标准 CPU 集群上的在线评估
 
-## API 概览
+## 我们为谁而建
 
-四个核心操作：
-- `forward_backward`：计算并累积 gradient
+**对于构建者**：专注于理解问题和设计机制，把基础设施交给 MinT。我们开放真实业务场景中使用的工作流、评估方案和训练基础设施。
+
+**对于研究者**：通过标准化日志、可复现评估、可移植工作流和清晰的训练数据血缘，降低 RL 研究中的工程摩擦。
+
+## 核心 API
+
+- `forward_backward`：计算并累积梯度
 - `optim_step`：更新模型参数
 - `sample`：从训练后的模型生成输出
-- 状态持久化：保存/加载 weight 与 optimizer 状态
+- 权重/优化器状态持久化函数
 
-## 技术背书
+## 价值观
 
-MinT 源自 Macaron 的生产实践，已完成万亿参数级模型的端到端 LoRA（Low-Rank Adaptation）RL 训练。
+我们坚持以真实经验为首要约束。我们坚持工程透明。我们坚持向社区交付可复用的工作流。
 
 </Zh>
