@@ -61,9 +61,8 @@ class ActorEntry:
         An actor is idle if ALL of the following:
         1. It's not currently being created/initialized
         2. AND one of:
-           a. It's a vLLM actor (always evictable once ready)
-           b. It has no current_session
-           c. It hasn't been accessed in session_idle_timeout seconds
+           a. It has no current_session (training actors only)
+           b. It hasn't been accessed in session_idle_timeout seconds
 
         Note: Tinker clients don't explicitly end sessions - they just stop
         sending requests. We use time-based idle detection to handle this.
@@ -72,7 +71,8 @@ class ActorEntry:
         if self.creating:
             return False
         if self.actor_type == ActorType.VLLM:
-            return True  # vLLM can always be evicted (once ready)
+            # vLLM uses same idle timeout as other actors to prevent eviction during active use
+            return self.idle_time() > session_idle_timeout
         if self.current_session is None:
             return True  # No session loaded
         # Time-based idle detection for sessions
