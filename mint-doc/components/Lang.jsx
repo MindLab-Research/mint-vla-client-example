@@ -110,6 +110,18 @@ export function Zh({ children }) {
   return lang === 'zh' ? <>{children}</> : null
 }
 
+export function NavTitle({ en, zh }) {
+  const { lang } = useLanguage()
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  if (!mounted) return en
+  return lang === 'zh' ? zh : en
+}
+
 export function LanguageSwitcher() {
   const { lang, toggle } = useLanguage()
   const [mounted, setMounted] = useState(false)
