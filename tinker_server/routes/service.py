@@ -141,22 +141,23 @@ def _resolve_model_path(model_path: str) -> str:
     """Resolve model_path URI to filesystem path.
 
     Args:
-        model_path: URI like file:///path, tinker://localhost/path, or absolute path.
+        model_path: URI like file:///path, mint://{uuid}/..., or absolute path.
 
     Returns:
         Absolute filesystem path to adapter directory.
     """
+    # Get checkpoint base directory
+    checkpoint_dir = os.environ.get(
+        "TINKER_CHECKPOINT_DIR",
+        os.path.join(os.getcwd(), "checkpoints")
+    )
+
     if model_path.startswith("file://"):
         return model_path[7:]  # Strip file:// prefix
-    elif model_path.startswith("tinker://localhost"):
-        # Local server tinker:// format: tinker://localhost/<absolute_path>
-        return model_path[len("tinker://localhost"):]
-    elif model_path.startswith("tinker://"):
-        # Cloud tinker:// paths not supported locally
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cloud tinker:// paths not supported locally: {model_path}",
-        )
+    elif model_path.startswith("mint://"):
+        # Local mint:// format: mint://{model_id}/{checkpoint_name}
+        path_part = model_path[len("mint://"):]
+        return os.path.join(checkpoint_dir, path_part)
     else:
         # Assume absolute path
         return model_path

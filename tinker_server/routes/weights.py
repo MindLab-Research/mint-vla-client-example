@@ -68,30 +68,27 @@ def _get_webhook_url(request: Request) -> str | None:
     return None
 
 
-def _resolve_tinker_path(tinker_uri: str) -> str:
-    """Convert tinker://local/model_id/name to filesystem path.
+def _resolve_mint_path(mint_uri: str) -> str:
+    """Convert mint://{model_id}/name to filesystem path.
 
     Args:
-        tinker_uri: URI like tinker://local/..., file://..., or absolute path.
+        mint_uri: URI like mint://{uuid}/..., file://..., or absolute path.
 
     Returns:
         Filesystem path.
     """
-    if tinker_uri.startswith("tinker://local/"):
-        # tinker://local/model_id/checkpoint-100 -> ./checkpoints/model_id/checkpoint-100
-        path_part = tinker_uri[len("tinker://local/"):]
+    if mint_uri.startswith("mint://"):
+        # mint://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
+        path_part = mint_uri[len("mint://"):]
         return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif tinker_uri.startswith("tinker://localhost"):
-        # tinker://localhost/abs/path -> /abs/path
-        return tinker_uri[len("tinker://localhost"):]
-    elif tinker_uri.startswith("file://"):
-        return tinker_uri[7:]
-    return tinker_uri
+    elif mint_uri.startswith("file://"):
+        return mint_uri[7:]
+    return mint_uri
 
 
-def _to_tinker_path(model_id: str, checkpoint_name: str) -> str:
-    """Convert to tinker://local/ URI."""
-    return f"tinker://local/{model_id}/{checkpoint_name}"
+def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
+    """Convert to mint://{model_id}/ URI."""
+    return f"mint://{model_id}/{checkpoint_name}"
 
 
 # =============================================================================
@@ -243,15 +240,15 @@ async def _do_save_state(
                           f"state_dict={state_dict is not None}, "
                           f"peft_config={peft_config is not None}")
 
-        # Build tinker:// path for response
-        tinker_path = _to_tinker_path(session.model_id, checkpoint_name)
+        # Build mint:// path for response
+        mint_path = _to_mint_path(session.model_id, checkpoint_name)
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
         state_dict_keys = list(state_dict.keys()) if state_dict else []
 
         future_store.resolve(request_id, {
-            "path": tinker_path,
+            "path": mint_path,
             "type": "save_weights",
             "state_dict_keys": state_dict_keys,  # List of parameter names for verification
             "peft_config": peft_config,
@@ -268,7 +265,7 @@ async def _do_save_state(
                 task_name=f"Training {session.base_model}",
                 task_type="training",
                 model_name=session.base_model,
-                result={"checkpoint_path": tinker_path, "step": session.current_step},
+                result={"checkpoint_path": mint_path, "step": session.current_step},
             )
 
     except Exception as e:
@@ -319,7 +316,7 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
             raise RuntimeError("Training engine not initialized")
 
         # Resolve path
-        load_path = _resolve_tinker_path(request.path)
+        load_path = _resolve_mint_path(request.path)
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
@@ -373,7 +370,7 @@ async def list_checkpoints(model_id: str) -> CheckpointsListResponse:
 
                 checkpoints.append(CheckpointInfo(
                     checkpoint_id=name,
-                    path=_to_tinker_path(model_id, name),
+                    path=_to_mint_path(model_id, name),
                     step=step,
                     created_at=created_at,
                 ))

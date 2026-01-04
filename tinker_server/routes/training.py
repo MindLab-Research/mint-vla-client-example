@@ -203,22 +203,18 @@ CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
 
 
 def _resolve_state_path(state_uri: str) -> str:
-    """Convert tinker://local/model_id/name or file:// to filesystem path.
+    """Convert mint://{model_id}/name or file:// to filesystem path.
 
     Args:
-        state_uri: URI like tinker://local/..., tinker://localhost/...,
-                   file://..., or absolute path.
+        state_uri: URI like mint://{uuid}/..., file://..., or absolute path.
 
     Returns:
         Filesystem path.
     """
-    if state_uri.startswith("tinker://local/"):
-        # tinker://local/model_id/checkpoint-100 -> ./checkpoints/model_id/checkpoint-100
-        path_part = state_uri[len("tinker://local/"):]
+    if state_uri.startswith("mint://"):
+        # mint://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
+        path_part = state_uri[len("mint://"):]
         return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif state_uri.startswith("tinker://localhost"):
-        # tinker://localhost/abs/path -> /abs/path
-        return state_uri[len("tinker://localhost"):]
     elif state_uri.startswith("file://"):
         return state_uri[7:]
     return state_uri
@@ -558,9 +554,9 @@ async def _do_save_weights_for_sampler(
             use_per_expert_lora=request.use_per_expert_lora,
         )
 
-        # Use tinker:// URI format for SDK compatibility
-        # Format: tinker://localhost/<absolute_path>
-        path_uri = f"tinker://localhost{save_path}"
+        # Use mint:// URI format (local mint server scheme)
+        # Format: mint://{model_id}/{checkpoint_name}
+        path_uri = f"mint://{session.model_id}/{checkpoint_name}"
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately
