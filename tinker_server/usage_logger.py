@@ -14,7 +14,7 @@ from .config import config
 
 logger = logging.getLogger(__name__)
 
-OperationType = Literal["sample", "forward_backward", "compute_logprobs"]
+OperationType = Literal["forward_backward", "sample_prefill", "sample_generation"]
 
 
 @dataclass
