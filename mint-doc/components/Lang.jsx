@@ -4,6 +4,47 @@ import { createContext, useContext, useState, useEffect } from 'react'
 
 const LanguageContext = createContext({ lang: 'en', toggle: () => {} })
 
+// 侧边栏翻译映射
+const sidebarTranslations = {
+  "Introduction": "简介",
+  "Getting Started": "快速开始",
+  "Using the API": "使用指南",
+  "API Reference": "API 参考",
+  "Installation": "安装",
+  "Navigating These Docs": "文档导航",
+  "Training and Sampling": "训练与采样",
+  "Loss Functions": "损失函数",
+  "Saving and Loading": "保存与加载",
+  "Downloading Weights": "下载权重",
+  "Publishing Weights": "发布权重",
+  "Async and Futures": "异步操作",
+  "Model Lineup": "支持的模型",
+  "Parameters": "参数类型",
+  "Exceptions": "异常"
+}
+
+// 翻译侧边栏
+function translateSidebar(lang) {
+  // 使用精确选择器：侧边栏中的 nextra-focus 链接
+  const links = document.querySelectorAll('aside a.nextra-focus')
+  links.forEach(link => {
+    const text = link.textContent?.trim()
+    if (!text) return
+
+    // 避免重复翻译：使用 data-en 存储原始英文
+    const enText = link.getAttribute('data-en') || text
+
+    if (lang === 'zh' && sidebarTranslations[enText]) {
+      if (!link.getAttribute('data-en')) {
+        link.setAttribute('data-en', enText)
+      }
+      link.textContent = sidebarTranslations[enText]
+    } else if (lang === 'en' && link.getAttribute('data-en')) {
+      link.textContent = link.getAttribute('data-en')
+    }
+  })
+}
+
 // Check if text contains Chinese characters
 function containsChinese(text) {
   return /[\u4e00-\u9fff]/.test(text)
@@ -36,10 +77,11 @@ export function LanguageProvider({ children }) {
     }
   }, [])
 
-  // Filter TOC entries when language changes
+  // Filter TOC entries and translate sidebar when language changes
   useEffect(() => {
     if (mounted) {
       filterTocEntries(lang)
+      translateSidebar(lang)
     }
   }, [lang, mounted])
 
@@ -54,6 +96,32 @@ export function LanguageProvider({ children }) {
       observer.observe(toc, { childList: true, subtree: true })
     }
     return () => observer.disconnect()
+  }, [lang, mounted])
+
+  // Re-translate sidebar on route change with debounce
+  useEffect(() => {
+    if (!mounted) return
+
+    let timeoutId = null
+    const observer = new MutationObserver(() => {
+      if (timeoutId) clearTimeout(timeoutId)
+      timeoutId = setTimeout(() => translateSidebar(lang), 50)
+    })
+
+    // 延迟查找，确保 DOM 已渲染
+    const timer = setTimeout(() => {
+      const sidebar = document.querySelector('aside')
+      if (sidebar) {
+        observer.observe(sidebar, { childList: true, subtree: true })
+      }
+      translateSidebar(lang)
+    }, 100)
+
+    return () => {
+      clearTimeout(timer)
+      if (timeoutId) clearTimeout(timeoutId)
+      observer.disconnect()
+    }
   }, [lang, mounted])
 
   const toggle = () => {
