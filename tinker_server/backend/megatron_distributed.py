@@ -1819,7 +1819,7 @@ class MegatronRankWorker:
         # Include all possible module types for both standard and MLA models
         config = {
             "r": self.lora_rank,
-            "lora_alpha": self.lora_rank,
+            "lora_alpha": self.lora_rank * 2,
             "target_modules": [
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
