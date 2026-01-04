@@ -218,6 +218,10 @@ async def _do_save_state(
         result = await training_engine.save_weights(session, save_path)
 
         # Save ownership metadata (for user-scoped checkpoint API)
+        # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
+        # sync may not be complete yet. Create directory on API server to ensure it exists.
+        os.makedirs(save_path, exist_ok=True)
+
         metadata = {
             "checkpoint_id": checkpoint_id,
             "owner_id": user_id,
