@@ -6,7 +6,7 @@ Endpoints:
 - POST /load_state: Load checkpoint to resume training
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
-- GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download (501)
+- GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download as tar.gz
 """
 
 from __future__ import annotations
@@ -14,10 +14,12 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
 from ..models.types import (
@@ -67,30 +69,60 @@ def _get_webhook_url(request: Request) -> str | None:
     return None
 
 
-def _resolve_tinker_path(tinker_uri: str) -> str:
-    """Convert tinker://local/model_id/name to filesystem path.
+def _resolve_mint_path(mint_uri: str) -> str:
+    """Convert path identifier to filesystem path.
 
     Args:
-        tinker_uri: URI like tinker://local/..., file://..., or absolute path.
+        mint_uri: One of:
+            - checkpoint_id (ckpt_xxx): Search in all checkpoint directories
+            - mint://{model_id}/{name}: Legacy format -> /checkpoints/{model_id}/{name}
+            - file:///path: Strip prefix
+            - Absolute path: Return as-is
 
     Returns:
         Filesystem path.
     """
-    if tinker_uri.startswith("tinker://local/"):
-        # tinker://local/model_id/checkpoint-100 -> ./checkpoints/model_id/checkpoint-100
-        path_part = tinker_uri[len("tinker://local/"):]
+    import json
+
+    # New format: checkpoint_id (ckpt_xxx)
+    if mint_uri.startswith("ckpt_"):
+        # Search for checkpoint by ID in metadata
+        for top_level in os.listdir(CHECKPOINTS_DIR):
+            top_path = os.path.join(CHECKPOINTS_DIR, top_level)
+            if not os.path.isdir(top_path):
+                continue
+            for sub_dir in os.listdir(top_path):
+                sub_path = os.path.join(top_path, sub_dir)
+                if not os.path.isdir(sub_path):
+                    continue
+                metadata_path = os.path.join(sub_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path) as f:
+                            metadata = json.load(f)
+                        if metadata.get("checkpoint_id") == mint_uri:
+                            return sub_path
+                    except (json.JSONDecodeError, OSError):
+                        pass
+        # Not found - return as-is (will fail later)
+        return mint_uri
+
+    # Legacy format: mint://{model_id}/checkpoint-100
+    if mint_uri.startswith("mint://"):
+        path_part = mint_uri[len("mint://"):]
         return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif tinker_uri.startswith("tinker://localhost"):
-        # tinker://localhost/abs/path -> /abs/path
-        return tinker_uri[len("tinker://localhost"):]
-    elif tinker_uri.startswith("file://"):
-        return tinker_uri[7:]
-    return tinker_uri
+
+    # File URI
+    if mint_uri.startswith("file://"):
+        return mint_uri[7:]
+
+    # Absolute path
+    return mint_uri
 
 
-def _to_tinker_path(model_id: str, checkpoint_name: str) -> str:
-    """Convert to tinker://local/ URI."""
-    return f"tinker://local/{model_id}/{checkpoint_name}"
+def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
+    """Convert to mint://{model_id}/ URI (legacy format)."""
+    return f"mint://{model_id}/{checkpoint_name}"
 
 
 # =============================================================================
@@ -163,22 +195,45 @@ async def _do_save_state(
 ) -> None:
     """Background task to save state.
 
-    Also registers the model for sampling via multi-LoRA engine, enabling
-    subsequent asample calls with the same model_id.
+    Uses new storage schema: /checkpoints/{user_id}/{checkpoint_id}/
+    Also registers the model for sampling via multi-LoRA engine.
     """
+    import json
+
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Build save path
-        checkpoint_name = request.path or f"checkpoint-{session.current_step}"
-        save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
+        # Generate unique checkpoint_id (spec format: ckpt_xxx)
+        checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
+
+        # Use user-based directory (fallback to "anonymous" if no user)
+        owner_dir = user_id or "anonymous"
+        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Call training engine to save full checkpoint
         # Returns dict with path, state_dict, and peft_config
         result = await training_engine.save_weights(session, save_path)
+
+        # Save ownership metadata (for user-scoped checkpoint API)
+        # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
+        # sync may not be complete yet. Create directory on API server to ensure it exists.
+        os.makedirs(save_path, exist_ok=True)
+
+        metadata = {
+            "checkpoint_id": checkpoint_id,
+            "owner_id": user_id,
+            "model_id": session.model_id,
+            "model_name": session.base_model,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "step": session.current_step,
+            "type": "training",  # vs "inference" for sampler-only weights
+        }
+        metadata_path = os.path.join(save_path, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
         # Register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
         # This allows asample to work with model_id after save_weights
@@ -226,15 +281,13 @@ async def _do_save_state(
                           f"state_dict={state_dict is not None}, "
                           f"peft_config={peft_config is not None}")
 
-        # Build tinker:// path for response
-        tinker_path = _to_tinker_path(session.model_id, checkpoint_name)
-
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
         state_dict_keys = list(state_dict.keys()) if state_dict else []
 
         future_store.resolve(request_id, {
-            "path": tinker_path,
+            "checkpoint_id": checkpoint_id,
+            "path": save_path,  # Filesystem path for debugging
             "type": "save_weights",
             "state_dict_keys": state_dict_keys,  # List of parameter names for verification
             "peft_config": peft_config,
@@ -251,7 +304,7 @@ async def _do_save_state(
                 task_name=f"Training {session.base_model}",
                 task_type="training",
                 model_name=session.base_model,
-                result={"checkpoint_path": tinker_path, "step": session.current_step},
+                result={"checkpoint_id": checkpoint_id, "step": session.current_step},
             )
 
     except Exception as e:
@@ -302,7 +355,7 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
             raise RuntimeError("Training engine not initialized")
 
         # Resolve path
-        load_path = _resolve_tinker_path(request.path)
+        load_path = _resolve_mint_path(request.path)
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
@@ -325,41 +378,51 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
 
 
 @router.get("/training_runs/{model_id}/checkpoints", response_model=CheckpointsListResponse)
-async def list_checkpoints(model_id: str) -> CheckpointsListResponse:
-    """List all checkpoints for a model."""
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListResponse:
+    """List all checkpoints for a model.
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-
+    Works for both active training sessions and saved checkpoints.
+    Ownership verified via metadata.json (admin can access all).
+    """
+    user_id = _get_user_id(request)
     checkpoints_path = os.path.join(CHECKPOINTS_DIR, model_id)
+
+    if not os.path.exists(checkpoints_path):
+        raise HTTPException(status_code=404, detail=f"No checkpoints found for model '{model_id}'")
+
     checkpoints = []
+    for name in os.listdir(checkpoints_path):
+        ckpt_path = os.path.join(checkpoints_path, name)
+        if os.path.isdir(ckpt_path):
+            # Check ownership via metadata.json (admin can access all)
+            if user_id != "admin":
+                metadata_path = os.path.join(ckpt_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    import json
+                    with open(metadata_path) as f:
+                        metadata = json.load(f)
+                    if metadata.get("owner_id") not in (user_id, "admin", None):
+                        continue  # Skip checkpoints owned by other users
 
-    if os.path.exists(checkpoints_path):
-        for name in os.listdir(checkpoints_path):
-            ckpt_path = os.path.join(checkpoints_path, name)
-            if os.path.isdir(ckpt_path):
-                # Try to parse step from directory name
-                step = None
-                if name.startswith("checkpoint-"):
-                    try:
-                        step = int(name.split("-")[1])
-                    except (IndexError, ValueError):
-                        pass
+            # Try to parse step from directory name
+            step = None
+            if name.startswith("checkpoint-"):
+                try:
+                    step = int(name.split("-")[1])
+                except (IndexError, ValueError):
+                    pass
 
-                # Get creation time
-                created_at = datetime.fromtimestamp(
-                    os.path.getctime(ckpt_path)
-                ).isoformat()
+            # Get creation time
+            created_at = datetime.fromtimestamp(
+                os.path.getctime(ckpt_path)
+            ).isoformat()
 
-                checkpoints.append(CheckpointInfo(
-                    checkpoint_id=name,
-                    path=_to_tinker_path(model_id, name),
-                    step=step,
-                    created_at=created_at,
-                ))
+            checkpoints.append(CheckpointInfo(
+                checkpoint_id=name,
+                path=_to_mint_path(model_id, name),
+                step=step,
+                created_at=created_at,
+            ))
 
     # Sort by step (descending)
     checkpoints.sort(key=lambda x: x.step or 0, reverse=True)
@@ -376,19 +439,26 @@ async def list_checkpoints(model_id: str) -> CheckpointsListResponse:
 
 
 @router.delete("/training_runs/{model_id}/checkpoints/{checkpoint_id}")
-async def delete_checkpoint(model_id: str, checkpoint_id: str):
-    """Delete a specific checkpoint."""
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request):
+    """Delete a specific checkpoint.
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-
+    Ownership verified via metadata.json (admin can delete all).
+    """
+    user_id = _get_user_id(request)
     ckpt_path = os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id)
 
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+
+    # Check ownership (admin can delete all)
+    if user_id != "admin":
+        metadata_path = os.path.join(ckpt_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            if metadata.get("owner_id") not in (user_id, "admin", None):
+                raise HTTPException(status_code=403, detail="Access denied")
 
     shutil.rmtree(ckpt_path)
 
@@ -403,26 +473,53 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str):
 
 
 @router.get("/training_runs/{model_id}/checkpoints/{checkpoint_id}/archive")
-async def download_checkpoint_archive(model_id: str, checkpoint_id: str):
-    """Download checkpoint as archive.
+async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request: Request):
+    """Download checkpoint as tar.gz archive.
 
-    Not implemented - returns 501.
+    Uses subprocess tar+gzip for true streaming without loading into memory.
+    Essential for large checkpoints (7GB+).
+    Ownership verified via metadata.json (admin can download all).
     """
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+    import subprocess
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-
+    user_id = _get_user_id(request)
     ckpt_path = os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id)
 
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    # TODO: Implement archive download
-    # Options: 1) Create tar.gz 2) Upload to object storage 3) Return signed URL
-    raise HTTPException(
-        status_code=501,
-        detail="Checkpoint archive download not implemented"
+    # Check ownership (admin can download all)
+    if user_id != "admin":
+        metadata_path = os.path.join(ckpt_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            if metadata.get("owner_id") not in (user_id, "admin", None):
+                raise HTTPException(status_code=403, detail="Access denied")
+
+    def stream_tar_gz():
+        """Stream tar.gz via subprocess to avoid memory explosion."""
+        # Run tar in parent directory, archive the checkpoint_id folder
+        parent_dir = os.path.dirname(ckpt_path)
+        proc = subprocess.Popen(
+            ["tar", "czf", "-", checkpoint_id],
+            cwd=parent_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            while chunk := proc.stdout.read(65536):
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
+    filename = f"{model_id}_{checkpoint_id}.tar.gz"
+    logger.info(f"[{model_id}] Streaming checkpoint archive: {checkpoint_id}")
+
+    return StreamingResponse(
+        stream_tar_gz(),
+        media_type="application/gzip",
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
     )
