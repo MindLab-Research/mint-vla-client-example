@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -69,25 +70,58 @@ def _get_webhook_url(request: Request) -> str | None:
 
 
 def _resolve_mint_path(mint_uri: str) -> str:
-    """Convert mint://{model_id}/name to filesystem path.
+    """Convert path identifier to filesystem path.
 
     Args:
-        mint_uri: URI like mint://{uuid}/..., file://..., or absolute path.
+        mint_uri: One of:
+            - checkpoint_id (ckpt_xxx): Search in all checkpoint directories
+            - mint://{model_id}/{name}: Legacy format -> /checkpoints/{model_id}/{name}
+            - file:///path: Strip prefix
+            - Absolute path: Return as-is
 
     Returns:
         Filesystem path.
     """
+    import json
+
+    # New format: checkpoint_id (ckpt_xxx)
+    if mint_uri.startswith("ckpt_"):
+        # Search for checkpoint by ID in metadata
+        for top_level in os.listdir(CHECKPOINTS_DIR):
+            top_path = os.path.join(CHECKPOINTS_DIR, top_level)
+            if not os.path.isdir(top_path):
+                continue
+            for sub_dir in os.listdir(top_path):
+                sub_path = os.path.join(top_path, sub_dir)
+                if not os.path.isdir(sub_path):
+                    continue
+                metadata_path = os.path.join(sub_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path) as f:
+                            metadata = json.load(f)
+                        if metadata.get("checkpoint_id") == mint_uri:
+                            return sub_path
+                    except (json.JSONDecodeError, OSError):
+                        pass
+        # Not found - return as-is (will fail later)
+        return mint_uri
+
+    # Legacy format: mint://{model_id}/checkpoint-100
     if mint_uri.startswith("mint://"):
-        # mint://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
         path_part = mint_uri[len("mint://"):]
         return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif mint_uri.startswith("file://"):
+
+    # File URI
+    if mint_uri.startswith("file://"):
         return mint_uri[7:]
+
+    # Absolute path
     return mint_uri
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
-    """Convert to mint://{model_id}/ URI."""
+    """Convert to mint://{model_id}/ URI (legacy format)."""
     return f"mint://{model_id}/{checkpoint_name}"
 
 
@@ -161,8 +195,8 @@ async def _do_save_state(
 ) -> None:
     """Background task to save state.
 
-    Also registers the model for sampling via multi-LoRA engine, enabling
-    subsequent asample calls with the same model_id.
+    Uses new storage schema: /checkpoints/{user_id}/{checkpoint_id}/
+    Also registers the model for sampling via multi-LoRA engine.
     """
     import json
 
@@ -170,9 +204,12 @@ async def _do_save_state(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Build save path
-        checkpoint_name = request.path or f"checkpoint-{session.current_step}"
-        save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
+        # Generate unique checkpoint_id (spec format: ckpt_xxx)
+        checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
+
+        # Use user-based directory (fallback to "anonymous" if no user)
+        owner_dir = user_id or "anonymous"
+        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
@@ -182,10 +219,10 @@ async def _do_save_state(
 
         # Save ownership metadata (for user-scoped checkpoint API)
         metadata = {
+            "checkpoint_id": checkpoint_id,
             "owner_id": user_id,
             "model_id": session.model_id,
             "model_name": session.base_model,
-            "checkpoint_name": checkpoint_name,
             "created_at": datetime.utcnow().isoformat() + "Z",
             "step": session.current_step,
             "type": "training",  # vs "inference" for sampler-only weights
@@ -240,15 +277,13 @@ async def _do_save_state(
                           f"state_dict={state_dict is not None}, "
                           f"peft_config={peft_config is not None}")
 
-        # Build mint:// path for response
-        mint_path = _to_mint_path(session.model_id, checkpoint_name)
-
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
         state_dict_keys = list(state_dict.keys()) if state_dict else []
 
         future_store.resolve(request_id, {
-            "path": mint_path,
+            "checkpoint_id": checkpoint_id,
+            "path": save_path,  # Filesystem path for debugging
             "type": "save_weights",
             "state_dict_keys": state_dict_keys,  # List of parameter names for verification
             "peft_config": peft_config,
@@ -265,7 +300,7 @@ async def _do_save_state(
                 task_name=f"Training {session.base_model}",
                 task_type="training",
                 model_name=session.base_model,
-                result={"checkpoint_path": mint_path, "step": session.current_step},
+                result={"checkpoint_id": checkpoint_id, "step": session.current_step},
             )
 
     except Exception as e:
