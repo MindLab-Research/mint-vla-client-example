@@ -351,7 +351,7 @@ async def _do_forward_backward(
         if user_id:
             # Count tokens in the batch
             token_count = sum(
-                len(item.input_ids) for item in request.forward_backward_input
+                len(datum.model_input.to_token_ids()) for datum in request.forward_backward_input.data
             )
             get_usage_logger().log(
                 user_id=user_id,
