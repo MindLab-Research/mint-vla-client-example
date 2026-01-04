@@ -339,41 +339,51 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
 
 
 @router.get("/training_runs/{model_id}/checkpoints", response_model=CheckpointsListResponse)
-async def list_checkpoints(model_id: str) -> CheckpointsListResponse:
-    """List all checkpoints for a model."""
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListResponse:
+    """List all checkpoints for a model.
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-
+    Works for both active training sessions and saved checkpoints.
+    Ownership verified via metadata.json (admin can access all).
+    """
+    user_id = _get_user_id(request)
     checkpoints_path = os.path.join(CHECKPOINTS_DIR, model_id)
+
+    if not os.path.exists(checkpoints_path):
+        raise HTTPException(status_code=404, detail=f"No checkpoints found for model '{model_id}'")
+
     checkpoints = []
+    for name in os.listdir(checkpoints_path):
+        ckpt_path = os.path.join(checkpoints_path, name)
+        if os.path.isdir(ckpt_path):
+            # Check ownership via metadata.json (admin can access all)
+            if user_id != "admin":
+                metadata_path = os.path.join(ckpt_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    import json
+                    with open(metadata_path) as f:
+                        metadata = json.load(f)
+                    if metadata.get("owner_id") not in (user_id, "admin", None):
+                        continue  # Skip checkpoints owned by other users
 
-    if os.path.exists(checkpoints_path):
-        for name in os.listdir(checkpoints_path):
-            ckpt_path = os.path.join(checkpoints_path, name)
-            if os.path.isdir(ckpt_path):
-                # Try to parse step from directory name
-                step = None
-                if name.startswith("checkpoint-"):
-                    try:
-                        step = int(name.split("-")[1])
-                    except (IndexError, ValueError):
-                        pass
+            # Try to parse step from directory name
+            step = None
+            if name.startswith("checkpoint-"):
+                try:
+                    step = int(name.split("-")[1])
+                except (IndexError, ValueError):
+                    pass
 
-                # Get creation time
-                created_at = datetime.fromtimestamp(
-                    os.path.getctime(ckpt_path)
-                ).isoformat()
+            # Get creation time
+            created_at = datetime.fromtimestamp(
+                os.path.getctime(ckpt_path)
+            ).isoformat()
 
-                checkpoints.append(CheckpointInfo(
-                    checkpoint_id=name,
-                    path=_to_mint_path(model_id, name),
-                    step=step,
-                    created_at=created_at,
-                ))
+            checkpoints.append(CheckpointInfo(
+                checkpoint_id=name,
+                path=_to_mint_path(model_id, name),
+                step=step,
+                created_at=created_at,
+            ))
 
     # Sort by step (descending)
     checkpoints.sort(key=lambda x: x.step or 0, reverse=True)
@@ -390,19 +400,26 @@ async def list_checkpoints(model_id: str) -> CheckpointsListResponse:
 
 
 @router.delete("/training_runs/{model_id}/checkpoints/{checkpoint_id}")
-async def delete_checkpoint(model_id: str, checkpoint_id: str):
-    """Delete a specific checkpoint."""
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
+async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request):
+    """Delete a specific checkpoint.
 
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-
+    Ownership verified via metadata.json (admin can delete all).
+    """
+    user_id = _get_user_id(request)
     ckpt_path = os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id)
 
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+
+    # Check ownership (admin can delete all)
+    if user_id != "admin":
+        metadata_path = os.path.join(ckpt_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            if metadata.get("owner_id") not in (user_id, "admin", None):
+                raise HTTPException(status_code=403, detail="Access denied")
 
     shutil.rmtree(ckpt_path)
 
@@ -417,25 +434,30 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str):
 
 
 @router.get("/training_runs/{model_id}/checkpoints/{checkpoint_id}/archive")
-async def download_checkpoint_archive(model_id: str, checkpoint_id: str):
+async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request: Request):
     """Download checkpoint as tar.gz archive.
 
     Uses subprocess tar+gzip for true streaming without loading into memory.
     Essential for large checkpoints (7GB+).
+    Ownership verified via metadata.json (admin can download all).
     """
     import subprocess
 
-    if training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
-    session = training_manager.get_session(model_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-
+    user_id = _get_user_id(request)
     ckpt_path = os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id)
 
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+
+    # Check ownership (admin can download all)
+    if user_id != "admin":
+        metadata_path = os.path.join(ckpt_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            import json
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            if metadata.get("owner_id") not in (user_id, "admin", None):
+                raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
