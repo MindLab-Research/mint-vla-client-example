@@ -6,7 +6,7 @@ Endpoints:
 - POST /load_state: Load checkpoint to resume training
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
-- GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download (501)
+- GET /training_runs/{model_id}/checkpoints/{checkpoint_id}/archive: Download as tar.gz
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
 from ..models.types import (
@@ -166,6 +167,8 @@ async def _do_save_state(
     Also registers the model for sampling via multi-LoRA engine, enabling
     subsequent asample calls with the same model_id.
     """
+    import json
+
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
@@ -179,6 +182,20 @@ async def _do_save_state(
         # Call training engine to save full checkpoint
         # Returns dict with path, state_dict, and peft_config
         result = await training_engine.save_weights(session, save_path)
+
+        # Save ownership metadata (for user-scoped checkpoint API)
+        metadata = {
+            "owner_id": user_id,
+            "model_id": session.model_id,
+            "model_name": session.base_model,
+            "checkpoint_name": checkpoint_name,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "step": session.current_step,
+            "type": "training",  # vs "inference" for sampler-only weights
+        }
+        metadata_path = os.path.join(save_path, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
         # Register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
         # This allows asample to work with model_id after save_weights
@@ -404,10 +421,13 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str):
 
 @router.get("/training_runs/{model_id}/checkpoints/{checkpoint_id}/archive")
 async def download_checkpoint_archive(model_id: str, checkpoint_id: str):
-    """Download checkpoint as archive.
+    """Download checkpoint as tar.gz archive.
 
-    Not implemented - returns 501.
+    Uses subprocess tar+gzip for true streaming without loading into memory.
+    Essential for large checkpoints (7GB+).
     """
+    import subprocess
+
     if training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
@@ -420,9 +440,28 @@ async def download_checkpoint_archive(model_id: str, checkpoint_id: str):
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    # TODO: Implement archive download
-    # Options: 1) Create tar.gz 2) Upload to object storage 3) Return signed URL
-    raise HTTPException(
-        status_code=501,
-        detail="Checkpoint archive download not implemented"
+    def stream_tar_gz():
+        """Stream tar.gz via subprocess to avoid memory explosion."""
+        # Run tar in parent directory, archive the checkpoint_id folder
+        parent_dir = os.path.dirname(ckpt_path)
+        proc = subprocess.Popen(
+            ["tar", "czf", "-", checkpoint_id],
+            cwd=parent_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            while chunk := proc.stdout.read(65536):
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
+    filename = f"{model_id}_{checkpoint_id}.tar.gz"
+    logger.info(f"[{model_id}] Streaming checkpoint archive: {checkpoint_id}")
+
+    return StreamingResponse(
+        stream_tar_gz(),
+        media_type="application/gzip",
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
     )
