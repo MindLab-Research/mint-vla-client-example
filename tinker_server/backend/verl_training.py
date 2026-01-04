@@ -1705,7 +1705,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        use_per_expert_lora: bool = False,
+        use_per_expert_lora: bool | None = None,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -1718,6 +1718,7 @@ class VerlTrainingEngine:
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
             use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
+                If None (default), auto-detect based on model type: True for MoE models.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1729,6 +1730,17 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = self._workers[model_id]
+
+        # Auto-detect use_per_expert_lora for MoE models
+        # MoE models train MLP LoRA that must be exported to vLLM for train-inference consistency
+        if use_per_expert_lora is None:
+            from ..backend.model_registry import is_moe_model
+            try:
+                use_per_expert_lora = is_moe_model(session.base_model)
+                if use_per_expert_lora:
+                    logger.info(f"[{model_id}] Auto-enabled use_per_expert_lora for MoE model {session.base_model}")
+            except ValueError:
+                use_per_expert_lora = False
 
         logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY (use_per_expert_lora={use_per_expert_lora})")
         logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")

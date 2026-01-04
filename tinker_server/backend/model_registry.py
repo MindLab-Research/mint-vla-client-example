@@ -123,10 +123,10 @@ MODEL_CONFIGS = {
         train_cp=1,  # Training: CP=1 (no context parallelism)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
         quantization=None,  # Let vLLM auto-detect from config.json
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=0.98,  # K2 uses 77 GiB/79 GiB, need high utilization
         max_loras=1,  # LoRA REQUIRED for weight transfer
         max_lora_rank=16,  # Rank 16: matches training lora_rank
-        max_model_len=65536,  # 64K context
+        max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -143,20 +143,27 @@ MODEL_CONFIGS = {
         # MoE Parallel Folding: world_size = EP = 64 GPUs
         # 384 experts / 64 GPUs = 6 experts per GPU
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
-        gpu_memory_utilization=0.85,  # Lower util to avoid OOM on long sequences
+        gpu_memory_utilization=0.98,  # K2 uses 77 GiB/79 GiB, need high utilization
         max_loras=1,  # LoRA for weight transfer
         max_lora_rank=16,  # Rank 16: matches training lora_rank
-        max_model_len=65536,  # 64K context
+        max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
     ),
     # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
     # Same DeepseekV3ForCausalLM architecture
+    # PROMPT.md settings:
+    # - Megatron: TP=8, CP=1, PP=1, EP=8, ETP=1, lora_rank=16
+    # - vLLM: TP=8, max_lora_rank=16 (8 GPUs)
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
-        recommended_tp=4,  # Inference: 4 GPUs
+        recommended_tp=8,  # Inference: TP=8 (PROMPT.md spec)
         recommended_dp=1,
-        train_tp=2,
-        train_ep=4,  # Training: 8 GPUs (TP=2, EP=4) - 64 experts / 4 = 16 per rank
+        train_tp=8,  # Training: TP=8 (PROMPT.md spec)
+        train_ep=8,  # Training: EP=8 (PROMPT.md spec)
+        train_cp=1,
+        train_etp=1,
         quantization=None,  # BF16, no quantization needed
+        max_loras=1,
+        max_lora_rank=16,
     ),
 }
 

@@ -1348,31 +1348,74 @@ class MegatronRankWorker:
             if model_is_moe and _is_mlp_module(peft_name):
                 if use_per_expert_lora and num_experts > 0:
                     # Expand shared LoRA to per-expert format
-                    # Shared: base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
-                    # Per-expert: base_model.model.model.layers.X.mlp.experts.{i}.gate_proj.lora_A.weight
-                    expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
-                    for expanded_name in expanded_names:
-                        lora_state_dict[expanded_name] = tensor.clone()
-                        mlp_expanded_count += 1
-
-                    # vLLM pack_moe requires gate_proj, up_proj, down_proj (all 3)
-                    # Megatron only has linear_fc1 (gate_proj) and linear_fc2 (down_proj)
-                    # Create dummy zero up_proj weights when expanding gate_proj
-                    if '.gate_proj.' in peft_name:
+                    # First check if this is a fused gate_up_proj that needs splitting
+                    if '.gate_up_proj_fused.' in peft_name:
                         import torch
-                        up_proj_peft_name = peft_name.replace('.gate_proj.', '.up_proj.')
-                        up_proj_expanded = self._expand_shared_to_per_expert(up_proj_peft_name, num_experts)
-                        for expanded_name in up_proj_expanded:
-                            # Create zero tensor with same shape as gate_proj
-                            lora_state_dict[expanded_name] = torch.zeros_like(tensor)
+                        # Split the fused projection before expanding to per-expert
+                        gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
+                        up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
+
+                        if '.lora_A.' in peft_name:
+                            # lora_A is shared - duplicate for both gate and up
+                            gate_tensor = tensor.clone()
+                            up_tensor = tensor.clone()
+                        elif '.lora_B.' in peft_name:
+                            # lora_B is split in half
+                            half_size = tensor.shape[-1] // 2
+                            gate_tensor = tensor[..., :half_size].clone()
+                            up_tensor = tensor[..., half_size:].clone()
+                        else:
+                            logger.warning(f"[Rank 0] Unknown lora type for fused MoE: {peft_name}")
+                            continue
+
+                        # Expand both gate and up to per-expert format
+                        for proj_name, proj_tensor in [(gate_peft_name, gate_tensor), (up_peft_name, up_tensor)]:
+                            expanded_names = self._expand_shared_to_per_expert(proj_name, num_experts)
+                            for expanded_name in expanded_names:
+                                lora_state_dict[expanded_name] = proj_tensor.clone()
+                                mlp_expanded_count += 1
+                        logger.info(f"[Rank 0] Split and expanded fused MLP LoRA to {len(expanded_names)*2} per-expert weights")
+                    else:
+                        # Non-fused modules: just expand to per-expert
+                        expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
+                        for expanded_name in expanded_names:
+                            lora_state_dict[expanded_name] = tensor.clone()
                             mlp_expanded_count += 1
-                        logger.info(f"[Rank 0] Created {len(up_proj_expanded)} dummy up_proj weights for vLLM compatibility")
                 else:
                     # Filter out MLP modules when not using per-expert expansion
                     mlp_filtered_count += 1
                 continue
 
             lora_state_dict[peft_name] = tensor
+
+            # Special handling for fused gate+up projection (linear_fc1)
+            # vLLM's MergedColumnParallelLinearWithLoRA expects separate gate_proj and up_proj
+            # lora_A is duplicated, lora_B is split in half
+            if '.gate_up_proj_fused.' in peft_name:
+                import torch
+                gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
+                up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
+
+                if '.lora_A.' in peft_name:
+                    # lora_A is shared between gate and up projections
+                    lora_state_dict[gate_peft_name] = tensor.clone()
+                    lora_state_dict[up_peft_name] = tensor.clone()
+                    logger.info(f"[Rank 0] Split fused lora_A: {gate_peft_name}, {up_peft_name}")
+                elif '.lora_B.' in peft_name:
+                    # lora_B must be split in half:
+                    # Shape is (rank, 2*intermediate_size)
+                    # First half → gate_proj, Second half → up_proj
+                    half_size = tensor.shape[-1] // 2
+                    gate_tensor = tensor[..., :half_size].clone()
+                    up_tensor = tensor[..., half_size:].clone()
+                    lora_state_dict[gate_peft_name] = gate_tensor
+                    lora_state_dict[up_peft_name] = up_tensor
+                    logger.info(f"[Rank 0] Split fused lora_B: {gate_peft_name} shape {gate_tensor.shape}, {up_peft_name} shape {up_tensor.shape}")
+                else:
+                    logger.warning(f"[Rank 0] Unknown lora type for fused projection: {peft_name}")
+
+                # Remove the placeholder entry
+                del lora_state_dict[peft_name]
 
         if model_is_moe:
             if use_per_expert_lora:
@@ -1488,9 +1531,11 @@ class MegatronRankWorker:
             target = 'self_attn.o_proj'
         # MLP/Expert projections
         elif 'linear_fc1' in name:
-            # MLP gate/up projection - map to gate_proj
-            # For MoE, this is the expert's first linear layer
-            target = 'mlp.gate_proj'
+            # MLP gate/up fused projection - map to gate_up_proj
+            # For vLLM MergedColumnParallelLinear, we need separate gate_proj and up_proj
+            # This is handled specially in get_lora_state_dict to split the B matrix
+            # Here we mark it as gate_up_proj_fused to trigger special handling
+            target = 'mlp.gate_up_proj_fused'
         elif 'linear_fc2' in name:
             # MLP down projection
             target = 'mlp.down_proj'
@@ -1771,10 +1816,15 @@ class MegatronRankWorker:
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
+        # Include all possible module types for both standard and MLA models
         config = {
             "r": self.lora_rank,
             "lora_alpha": self.lora_rank,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+                "gate_proj", "up_proj", "down_proj"
+            ],
             "bias": "none",
             "task_type": "CAUSAL_LM",
             "base_model_name_or_path": self.base_model,
@@ -2253,19 +2303,23 @@ class MegatronWorkerGroup:
             }
         }
 
-    def get_lora_state_dict(self) -> dict:
+    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict:
         """Get LoRA state dict from all workers (rank 0 returns data, others empty).
 
         IMPORTANT: Must call ALL workers in parallel because bridge.export_weights()
         may use NCCL collectives internally. Calling only rank 0 would deadlock.
+
+        Args:
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format
+                for vLLM FusedMoEWithLoRA compatibility.
         """
-        logger.info("[MegatronWorkerGroup] get_lora_state_dict: ENTRY")
+        logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: ENTRY (use_per_expert_lora={use_per_expert_lora})")
         logger.info(f"[MegatronWorkerGroup] Calling get_lora_state_dict.remote() on all {len(self.workers)} workers...")
 
         try:
             # Call ALL workers - bridge.export_weights() may use NCCL allgather
             # Rank 0 returns actual data, other ranks return empty dict
-            futures = [w.get_lora_state_dict.remote() for w in self.workers]
+            futures = [w.get_lora_state_dict.remote(use_per_expert_lora) for w in self.workers]
             results = ray.get(futures, timeout=300)  # Increased timeout for large MoE models
 
             # Rank 0's result has the actual data
@@ -2289,7 +2343,14 @@ class MegatronWorkerGroup:
         vLLM 0.13.0+ supports expert LoRA via FusedMoEWithLoRA.
         """
         # All modules for both MoE and dense models
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        # Standard attention: q_proj, k_proj, v_proj, o_proj
+        # MLA attention: q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj
+        # MLP: gate_proj, up_proj, down_proj
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ]
 
         return {
             "r": self.lora_rank,
