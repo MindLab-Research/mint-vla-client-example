@@ -151,12 +151,19 @@ ssh mint-prod "rm -rf /root/tinker_project/tinker-server-auth && \
 
 ### Environment Variables
 
+**Secrets are stored in `.secrets.env` (gitignored). Source before use:**
+```bash
+# Read secrets from local file
+source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
+```
+
 ```bash
 export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH
-export TINKER_API_KEY=<API_KEY>
+export TINKER_API_KEY=$TINKER_API_KEY          # from .secrets.env
+export TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY  # from .secrets.env
 export TINKER_PORT=18000
 ```
 
@@ -166,15 +173,21 @@ export TINKER_PORT=18000
 
 ### Start Server
 
+**First source secrets locally, then start server:**
 ```bash
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
-  PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH \
+# Source secrets (run locally)
+source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
+
+# Start server with secrets
+ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
+  PYTHONPATH=/root/tinker_project/tinker-server-auth:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 \
   HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_API_KEY=<API_KEY> \
+  TINKER_API_KEY=$TINKER_API_KEY \
+  TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
   TINKER_PORT=18000 \
-  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
+  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
 ```
 
 ### Stop Server
@@ -246,33 +259,41 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill
 ### Fast Restart (no vLLM changes)
 
 ```bash
+# Source secrets first
+source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
+
 ssh mint-prod 'fuser -k 18000/tcp 2>/dev/null; sleep 2'
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
-  PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH \
+ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
+  PYTHONPATH=/root/tinker_project/tinker-server-auth:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 \
   HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_API_KEY=<API_KEY> \
+  TINKER_API_KEY=$TINKER_API_KEY \
+  TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
   TINKER_PORT=18000 \
-  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
+  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
 ```
 
 ### Full Restart (vLLM changes)
 
 ```bash
+# Source secrets first
+source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
+
 # Kill vLLM (requires auth)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
 # Restart server
 ssh mint-prod 'fuser -k 18000/tcp 2>/dev/null; sleep 2'
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && nohup env \
-  PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH \
+ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
+  PYTHONPATH=/root/tinker_project/tinker-server-auth:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 \
   HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_API_KEY=<API_KEY> \
+  TINKER_API_KEY=$TINKER_API_KEY \
+  TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
   TINKER_PORT=18000 \
-  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &'
+  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
 
 # Wait for vLLM init (~80s)
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
