@@ -1168,6 +1168,111 @@ class MegatronRankWorker:
         # Write diagnostic output to shared PFS for debugging
         debug_file = "/vePFS-Mindverse/share/code/tinker-server/debug_lora_export.log"
 
+        # ========== TP Gathering Helpers ==========
+        # LoRA weights are sharded across TP ranks. We must gather before export.
+        # Based on Megatron-Bridge gpt_bridge.py _get_tp_split_dim() logic.
+        #
+        # Sharding rules for LoRA:
+        # - linear_proj, linear_fc2 (RowParallel): lora_A sharded on dim 1
+        # - linear_q_proj, linear_kv_up_proj (ColumnParallel): lora_B sharded on dim 0
+        # - linear_fc1 (fused gate+up): lora_B sharded on dim 1 (special case)
+        # - linear_kv_down_proj: lora_B sharded on dim 0 (for mcore < 0.14)
+
+        def _get_lora_tp_split_dim(param_name: str) -> int | None:
+            """Determine TP split dimension for a LoRA parameter.
+
+            Returns None if parameter is not TP-sharded.
+            Returns 0 for column-parallel (output sharded).
+            Returns 1 for row-parallel (input sharded) or fused linear_fc1.
+            """
+            # Identify lora_A vs lora_B
+            is_lora_a = '.adapter.linear_in.' in param_name or '.lora_a.' in param_name.lower()
+            is_lora_b = '.adapter.linear_out.' in param_name or '.lora_b.' in param_name.lower()
+
+            if not (is_lora_a or is_lora_b):
+                return None
+
+            # RowParallel layers: linear_proj, linear_fc2
+            # - lora_A is sharded on dim 1 (input dimension)
+            row_parallel_keys = {'linear_proj', 'linear_fc2'}
+
+            # ColumnParallel layers: linear_qkv, linear_q_proj, linear_kv_up_proj, linear_kv_down_proj
+            # - lora_B is sharded on dim 0 (output dimension)
+            col_parallel_keys = {'linear_qkv', 'linear_q_proj', 'linear_kv_up_proj', 'linear_kv_down_proj'}
+
+            # Extract base layer name (e.g., "linear_fc1" from "decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight")
+            # Find the layer name before ".adapter." or ".lora_"
+            import re
+            match = re.search(r'(linear_\w+)\.(?:adapter|lora)', param_name)
+            if not match:
+                return None
+            base_layer = match.group(1)
+
+            if is_lora_a:
+                # lora_A is sharded if base layer is RowParallel
+                if base_layer in row_parallel_keys:
+                    return 1
+            elif is_lora_b:
+                # lora_B sharding depends on base layer type
+                if base_layer in col_parallel_keys:
+                    return 0
+                elif base_layer == 'linear_fc1':
+                    # Special case: fused gate+up projection
+                    return 1
+
+            return None
+
+        def _gather_tensor_across_tp(tensor, tp_group, split_dim: int):
+            """Gather tensor across TP ranks along the specified dimension.
+
+            Args:
+                tensor: Local shard of the tensor
+                tp_group: Tensor parallel process group
+                split_dim: Dimension along which tensor is sharded (0 or 1)
+
+            Returns:
+                Gathered tensor (full tensor on all ranks)
+            """
+            import torch
+            import torch.distributed as dist
+
+            tp_size = dist.get_world_size(tp_group)
+            if tp_size == 1:
+                return tensor
+
+            # Ensure tensor is on GPU for NCCL
+            device = torch.cuda.current_device()
+            tensor = tensor.to(device) if not tensor.is_cuda else tensor
+
+            if split_dim == 0:
+                # Gather along first dimension (ColumnParallel lora_B)
+                # Output shape: [tp_size * local_size, ...]
+                local_shape = list(tensor.shape)
+                gathered_shape = local_shape.copy()
+                gathered_shape[0] *= tp_size
+                output = torch.empty(gathered_shape, dtype=tensor.dtype, device=device)
+                dist.all_gather_into_tensor(output, tensor.contiguous(), group=tp_group)
+                return output
+            else:
+                # Gather along other dimension (RowParallel lora_A, fused lora_B)
+                # Need to use all_gather then cat
+                gathered_list = [torch.empty_like(tensor) for _ in range(tp_size)]
+                dist.all_gather(gathered_list, tensor.contiguous(), group=tp_group)
+                return torch.cat(gathered_list, dim=split_dim)
+
+        # Get TP group and size for gathering
+        try:
+            from megatron.core import parallel_state as mpu
+            tp_group = mpu.get_tensor_model_parallel_group()
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            logger.info(f"[Rank {self.rank}] TP size: {tp_size}")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not get TP group: {e}, assuming TP=1")
+            tp_group = None
+            tp_size = 1
+
+        # ========== End TP Gathering Helpers ==========
+
         adapter_state = {}
 
         # CRITICAL: With param_offload=True, model is on CPU. Must use eval_mode() context
@@ -1193,11 +1298,20 @@ class MegatronRankWorker:
                     name_lower = name.lower()
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
-                        # CRITICAL: ALL ranks must do the same work to avoid NCCL deadlock!
-                        # eval_mode().__exit__ has a barrier - if rank 0 is slower (due to CPU copies),
-                        # other ranks wait at barrier indefinitely.
-                        # Fix: all ranks clone to CPU, only rank 0 keeps the result.
-                        cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
+                        # CRITICAL: ALL ranks must participate in gathering to avoid NCCL deadlock!
+                        # Check if this parameter needs TP gathering
+                        split_dim = _get_lora_tp_split_dim(name)
+                        if split_dim is not None and tp_group is not None and tp_size > 1:
+                            # Gather across TP ranks, then clone to CPU
+                            gathered = _gather_tensor_across_tp(param.data, tp_group, split_dim)
+                            cloned = gathered.cpu()
+                            if self.rank == 0:
+                                logger.debug(f"[Rank 0] Gathered {name}: {param.data.shape} -> {cloned.shape} (dim={split_dim})")
+                        else:
+                            # No gathering needed - just clone
+                            cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
+
+                        # Only rank 0 keeps the result
                         if self.rank == 0:
                             adapter_state[name] = cloned
 
@@ -1273,8 +1387,13 @@ class MegatronRankWorker:
                     raw_state = get_adapter_state_dict(self.engine.module)
                     logger.info(f"[Rank {self.rank}] get_adapter_state_dict returned {len(raw_state)} params")
                     for name, tensor in raw_state.items():
-                        # ALL ranks do the work, only rank 0 stores result
-                        cloned = tensor.cpu() if tensor.is_cuda else tensor.clone()
+                        # ALL ranks must participate in gathering
+                        split_dim = _get_lora_tp_split_dim(name)
+                        if split_dim is not None and tp_group is not None and tp_size > 1:
+                            gathered = _gather_tensor_across_tp(tensor, tp_group, split_dim)
+                            cloned = gathered.cpu()
+                        else:
+                            cloned = tensor.cpu() if tensor.is_cuda else tensor.clone()
                         if self.rank == 0:
                             adapter_state[name] = cloned
                     if self.rank == 0 and adapter_state:
