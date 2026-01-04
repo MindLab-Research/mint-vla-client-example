@@ -108,25 +108,25 @@ MODEL_CONFIGS = {
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
-    # Memory constraint for training: TE builds BF16 weights then converts to FP8.
-    # During conversion, BOTH BF16 and FP8 tensors exist on GPU simultaneously.
-    # With EP=4 (32 GPUs): ~65GB BF16 + ~32.5GB FP8 = ~97.5GB peak > 80GB A100 → OOM
-    # With EP=8 (64 GPUs): ~32.5GB BF16 + ~16.25GB FP8 = ~49GB peak < 80GB → fits
-    # Inference LoRA constraint: 384 experts require LoRA buffers.
-    # With TP=8: base model uses 79.31/79.33 GiB, no room for LoRA buffers.
-    # With TP=16: base model uses ~40 GiB, leaving ~40 GiB for LoRA + KV cache.
-    # LoRA is REQUIRED for weight transfer from training to inference.
+    # PROMPT.md settings for K2-Instruct (same as K2-Thinking):
+    # - Megatron: TP=16, EP=64, ETP=1, lora_rank=16 (64 GPUs)
+    # - vLLM: TP=32, max_lora_rank=16 (32 GPUs)
+    # - Total: 96 GPUs
+    # MoE Parallel Folding: world_size = EP = 64 GPUs (TP folds into EP)
+    # 384 experts / 64 GPUs = 6 experts per GPU
     "moonshotai/Kimi-K2-Instruct": ModelConfig(
         is_moe=True,
-        recommended_tp=16,  # Inference: 16 GPUs for LoRA support (8 GPUs OOM)
+        recommended_tp=32,  # Inference: TP=32 (PROMPT.md spec)
         recommended_dp=1,
-        train_tp=8,
-        train_ep=8,  # Training: 64 GPUs (8×8) minimum
+        train_tp=16,  # Training: TP=16 (folds into EP)
+        train_ep=64,  # Training: EP=64 (64 GPUs total)
+        train_cp=1,  # Training: CP=1 (no context parallelism)
+        train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
         quantization=None,  # Let vLLM auto-detect from config.json
-        gpu_memory_utilization=0.80,  # Lower to leave room for LoRA buffers
+        gpu_memory_utilization=0.85,
         max_loras=1,  # LoRA REQUIRED for weight transfer
-        max_lora_rank=8,  # Reduced rank for 384 experts
-        max_model_len=131072,  # 128K context (default 262K exceeds KV cache at 80% util)
+        max_lora_rank=16,  # Rank 16: matches training lora_rank
+        max_model_len=65536,  # 64K context
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -246,6 +246,34 @@ def is_moe_model(model_name: str) -> bool:
     """
     config = get_model_config(model_name)
     return config.is_moe
+
+
+def is_mla_model(model_name: str) -> bool:
+    """Check if a model uses Multi-Latent Attention (MLA) architecture.
+
+    MLA models (DeepSeek V3 / Moonlight / Kimi-K2) use different attention
+    projections that require special handling for LoRA:
+    - linear_q_proj, linear_kv_down_proj, linear_kv_up_proj instead of linear_qkv
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if model uses MLA, False otherwise
+
+    Raises:
+        ValueError: If model is not supported
+    """
+    # Normalize the model name first
+    normalized = normalize_model_name(model_name)
+
+    # MLA models: DeepSeek V3 architecture (Moonlight, Kimi-K2)
+    mla_models = {
+        "moonshotai/Kimi-K2-Instruct",
+        "moonshotai/Kimi-K2-Thinking",
+        "moonshotai/Moonlight-16B-A3B-Instruct",
+    }
+    return normalized in mla_models
 
 
 def get_recommended_parallelism(model_name: str) -> tuple[int, int]:

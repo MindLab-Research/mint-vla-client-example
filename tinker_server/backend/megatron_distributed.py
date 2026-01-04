@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
-from tinker_server.backend.model_registry import is_moe_model
+from tinker_server.backend.model_registry import is_moe_model, is_mla_model
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
@@ -529,14 +529,41 @@ class MegatronRankWorker:
                     except KeyError:
                         raise AttributeError(key)
 
+            # Determine target modules based on model architecture
+            # MLA models (DeepSeek V3 / Moonlight / K2) use different attention projections
+            try:
+                model_uses_mla = is_mla_model(self.base_model)
+            except ValueError:
+                # Unknown model, check HF config for MLA-specific attributes
+                model_uses_mla = hasattr(hf_config, 'qk_nope_head_dim') and hasattr(hf_config, 'kv_lora_rank')
+
+            if model_uses_mla:
+                # MLA attention projections (DeepSeek V3 / Moonlight / K2)
+                # Megatron module names (from named_parameters):
+                # - linear_q_proj: Q projection
+                # - linear_kv_down_proj: KV down projection
+                # - linear_kv_up_proj: KV up projection
+                # - linear_proj: output projection
+                target_modules = [
+                    "linear_q_proj",
+                    "linear_kv_down_proj", "linear_kv_up_proj",
+                    "linear_proj",
+                    "linear_fc1", "linear_fc2"  # MLP/Expert modules
+                ]
+                logger.info(f"[Rank {self.rank}] MLA model detected - using MLA target modules")
+            else:
+                # Standard attention projections
+                # Megatron uses: linear_qkv (fused QKV), linear_proj (output)
+                target_modules = ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]
+
             lora_config = LoraConfigDict(
                 rank=self.lora_rank,
                 alpha=self.lora_rank * 2,
                 type="lora",
-                target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+                target_modules=target_modules,
                 dropout=0.0,
             )
-            logger.info(f"[Rank {self.rank}] LoRA config: rank={self.lora_rank}, alpha={self.lora_rank * 2}")
+            logger.info(f"[Rank {self.rank}] LoRA config: rank={self.lora_rank}, alpha={self.lora_rank * 2}, target_modules={target_modules}")
 
         model_config = HFModelConfig(
             path=self.base_model,
@@ -602,8 +629,8 @@ class MegatronRankWorker:
         qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
         qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
         head_dim_qk = qk_nope + qk_rope
-        is_mla_model = head_dim_qk > 0
-        if is_mla_model:
+        has_mla_attention = head_dim_qk > 0
+        if has_mla_attention:
             logger.info(
                 f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
                 f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
@@ -628,7 +655,7 @@ class MegatronRankWorker:
             # NOTE: shared_experts conflicts with moe-shared-expert-overlap (enabled by default in new megatron-bridge)
             recompute_modules = ["moe"]
             # Add MLA-specific recompute for MLA models
-            if is_mla_model:
+            if has_mla_attention:
                 recompute_modules.append("mla_up_proj")
             override_tf_config["recompute_modules"] = recompute_modules
             logger.info(f"[Rank {self.rank}] Selective recompute enabled: {recompute_modules}")
@@ -1100,7 +1127,7 @@ class MegatronRankWorker:
             }
         return {}
 
-    def get_lora_state_dict(self) -> dict:
+    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict:
         """Get LoRA state dict in PEFT format (rank 0 gathers from all ranks).
 
         MBridge stores LoRA weights as lora_a/lora_b submodules, but bridge.export_weights()
@@ -1118,8 +1145,23 @@ class MegatronRankWorker:
             base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
             base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight
 
-        NOTE: vLLM 0.12.0 supports FusedMoE LoRA via FusedMoEWithLoRA class.
-        All modules (attention + MLP/expert) are now exported for both MoE and Dense models.
+        Args:
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format
+                for vLLM FusedMoEWithLoRA compatibility. If False (default), filter out
+                MLP/expert modules for MoE models to avoid weight format mismatch.
+
+        MoE Weight Format Issue:
+            Megatron-Bridge exports shared LoRA weights (single adapter applied to all experts):
+                decoder.layers.X.mlp.experts.linear_fc1.adapter.linear_in.weight
+
+            vLLM FusedMoEWithLoRA expects per-expert weights:
+                base_model.model.model.layers.X.mlp.experts.0.gate_proj.lora_A.weight
+                base_model.model.model.layers.X.mlp.experts.1.gate_proj.lora_A.weight
+                ...
+
+            When use_per_expert_lora=True, we expand the shared weights to per-expert format
+            by replicating the shared weights for each expert. This ensures train-inference
+            consistency but may use more memory during inference.
         """
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
 
@@ -1262,18 +1304,32 @@ class MegatronRankWorker:
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
 
-        # Check if model is MoE - filter MLP modules for MoE models
-        # MoE models have shared LoRA for experts which needs special handling
+        # Check if model is MoE
         try:
             model_is_moe = is_moe_model(self.base_model)
         except ValueError:
             model_is_moe = False
 
-        if model_is_moe:
-            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (vLLM uses shared LoRA differently)")
+        # Get number of experts for per-expert expansion (only when use_per_expert_lora=True)
+        num_experts = 0
+        if model_is_moe and use_per_expert_lora:
+            try:
+                from transformers import AutoConfig
+                hf_config = AutoConfig.from_pretrained(self.base_model, trust_remote_code=True)
+                # Different HF configs use different attribute names
+                num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", 0)
+                logger.info(f"[Rank 0] MoE model with {num_experts} experts - expanding shared LoRA to per-expert format")
+            except Exception as e:
+                logger.warning(f"[Rank 0] Could not get num_experts: {e}, disabling per-expert expansion")
+                use_per_expert_lora = False
 
-        mlp_filtered_count = 0
+        if model_is_moe and not use_per_expert_lora:
+            logger.info("[Rank 0] MoE model detected - filtering MLP/expert modules (no MLP LoRA trained)")
+            logger.info("[Rank 0] Set use_per_expert_lora=True if MLP LoRA was trained")
+
         lora_state_dict = {}
+        mlp_filtered_count = 0
+        mlp_expanded_count = 0
         logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
         for name, tensor in adapter_state.items():
             # Add PEFT prefix if not already present
@@ -1288,27 +1344,54 @@ class MegatronRankWorker:
                     logger.warning(f"Could not convert to PEFT: {name}")
                     continue
 
-            # Handle MoE MLP/expert modules - filter them out for now
-            # vLLM FusedMoEWithLoRA expects per-expert format which is complex
+            # Handle MoE MLP/expert modules
             if model_is_moe and _is_mlp_module(peft_name):
-                mlp_filtered_count += 1
+                if use_per_expert_lora and num_experts > 0:
+                    # Expand shared LoRA to per-expert format
+                    # Shared: base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
+                    # Per-expert: base_model.model.model.layers.X.mlp.experts.{i}.gate_proj.lora_A.weight
+                    expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
+                    for expanded_name in expanded_names:
+                        lora_state_dict[expanded_name] = tensor.clone()
+                        mlp_expanded_count += 1
+
+                    # vLLM pack_moe requires gate_proj, up_proj, down_proj (all 3)
+                    # Megatron only has linear_fc1 (gate_proj) and linear_fc2 (down_proj)
+                    # Create dummy zero up_proj weights when expanding gate_proj
+                    if '.gate_proj.' in peft_name:
+                        import torch
+                        up_proj_peft_name = peft_name.replace('.gate_proj.', '.up_proj.')
+                        up_proj_expanded = self._expand_shared_to_per_expert(up_proj_peft_name, num_experts)
+                        for expanded_name in up_proj_expanded:
+                            # Create zero tensor with same shape as gate_proj
+                            lora_state_dict[expanded_name] = torch.zeros_like(tensor)
+                            mlp_expanded_count += 1
+                        logger.info(f"[Rank 0] Created {len(up_proj_expanded)} dummy up_proj weights for vLLM compatibility")
+                else:
+                    # Filter out MLP modules when not using per-expert expansion
+                    mlp_filtered_count += 1
                 continue
 
             lora_state_dict[peft_name] = tensor
 
-        if model_is_moe and mlp_filtered_count > 0:
-            logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
+        if model_is_moe:
+            if use_per_expert_lora:
+                logger.info(f"[Rank 0] Expanded {mlp_expanded_count} shared MLP modules to per-expert format")
+            else:
+                logger.info(f"[Rank 0] Filtered {mlp_filtered_count} MLP/expert modules for MoE model")
         logger.info(f"[Rank 0] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
-        if lora_state_dict:
-            sample_peft_keys = list(lora_state_dict.keys())[:3]
-            logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
 
         # Warn if all weights were filtered (e.g., LoRA targeted only MLP for MoE)
         if not lora_state_dict and mlp_filtered_count > 0:
             logger.warning(
                 f"[Rank 0] ALL LoRA weights were filtered ({mlp_filtered_count} MLP modules). "
-                "This may indicate LoRA was configured to target only expert layers."
+                "This may indicate LoRA was configured to target only expert layers. "
+                "Set use_per_expert_lora=True to expand shared MLP LoRA to per-expert format."
             )
+
+        if lora_state_dict:
+            sample_peft_keys = list(lora_state_dict.keys())[:5]
+            logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
 
         return lora_state_dict
 
@@ -1316,20 +1399,32 @@ class MegatronRankWorker:
         """Convert Megatron LoRA param name to PEFT format.
 
         Megatron-Bridge names (with vanilla_mbridge=False):
-            decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight
-            decoder.layers.0.self_attention.linear_qkv.adapter.linear_out.weight
-            decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight
-            decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight
-            decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_out.weight
+            Standard attention:
+                decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight
+                decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight
+
+            MLA attention (DeepSeek V3/Moonlight/K2):
+                decoder.layers.0.self_attention.linear_q_down_proj.adapter.linear_in.weight
+                decoder.layers.0.self_attention.linear_q_up_proj.adapter.linear_in.weight
+                decoder.layers.0.self_attention.linear_kv_down_proj.adapter.linear_in.weight
+                decoder.layers.0.self_attention.linear_kv_up_proj.adapter.linear_in.weight
+                decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight
+
+            MLP/Expert:
+                decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight
+                decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_out.weight
 
         PEFT names (HuggingFace style):
-            base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
-            base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight
+            Standard attention:
+                base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
+                base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight
 
-        NOTE: vLLM 0.12.0 has FusedMoEWithLoRA class but two blockers remain:
-        1. Module validation patch needed (patches/apply_vllm_patch.py) - DONE
-        2. Weight format adapter needed - PEFT format -> vLLM packed format - NOT DONE
-        MLP/expert modules are filtered until weight format adapter is implemented.
+            MLA attention:
+                base_model.model.model.layers.0.self_attn.q_a_proj.lora_A.weight
+                base_model.model.model.layers.0.self_attn.q_b_proj.lora_A.weight
+                base_model.model.model.layers.0.self_attn.kv_a_proj_with_mqa.lora_A.weight
+                base_model.model.model.layers.0.self_attn.kv_b_proj.lora_A.weight
+                base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight
         """
         import re
 
@@ -1354,12 +1449,44 @@ class MegatronRankWorker:
             logger.warning(f"Could not determine LoRA type from: {name}")
             return None
 
+        # Check if this is an MLA model based on parameter names
+        # MLA models have linear_q_down_proj, linear_kv_down_proj, etc.
+        model_is_mla = any(p in name for p in [
+            'linear_q_down_proj', 'linear_q_up_proj',
+            'linear_kv_down_proj', 'linear_kv_up_proj'
+        ])
+
+        # Also check model registry for MLA flag (fallback)
+        if not model_is_mla:
+            try:
+                model_is_mla = is_mla_model(self.base_model)
+            except (ValueError, AttributeError):
+                pass
+
         # Determine the target module
-        if 'linear_qkv.adapter' in name or 'linear_qkv.lora_' in name.lower():
+        target = None
+
+        # MLA attention projections (DeepSeek V3 / Moonlight / K2)
+        # Note: Megatron uses linear_q_proj (single), not linear_q_down_proj/linear_q_up_proj
+        if 'linear_q_proj' in name and 'linear_kv' not in name:
+            # MLA Q projection - maps to q_proj for vLLM
+            # (vLLM's DeepseekV3 model uses q_a_proj/q_b_proj internally but expects q_proj for LoRA)
+            target = 'self_attn.q_proj'
+        elif 'linear_q_down_proj' in name:
+            target = 'self_attn.q_a_proj'
+        elif 'linear_q_up_proj' in name:
+            target = 'self_attn.q_b_proj'
+        elif 'linear_kv_down_proj' in name:
+            target = 'self_attn.kv_a_proj_with_mqa'
+        elif 'linear_kv_up_proj' in name:
+            target = 'self_attn.kv_b_proj'
+        # Standard attention projections
+        elif 'linear_qkv.adapter' in name or 'linear_qkv.lora_' in name.lower():
             # Fused QKV - map to q_proj (vLLM will handle the fused format)
             target = 'self_attn.q_proj'
         elif 'self_attention.linear_proj' in name:
             target = 'self_attn.o_proj'
+        # MLP/Expert projections
         elif 'linear_fc1' in name:
             # MLP gate/up projection - map to gate_proj
             # For MoE, this is the expert's first linear layer
@@ -1367,12 +1494,60 @@ class MegatronRankWorker:
         elif 'linear_fc2' in name:
             # MLP down projection
             target = 'mlp.down_proj'
-        else:
+
+        if target is None:
             logger.warning(f"Unknown module pattern: {name}")
             return None
 
         peft_name = f"base_model.model.model.layers.{layer_num}.{target}.{lora_type}.weight"
         return peft_name
+
+    def _expand_shared_to_per_expert(self, peft_name: str, num_experts: int) -> list[str]:
+        """Expand shared MLP LoRA to per-expert format for vLLM FusedMoEWithLoRA.
+
+        Megatron-Bridge exports shared LoRA (single adapter for all experts):
+            base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
+
+        vLLM FusedMoEWithLoRA expects per-expert weights:
+            base_model.model.model.layers.X.mlp.experts.0.gate_proj.lora_A.weight
+            base_model.model.model.layers.X.mlp.experts.1.gate_proj.lora_A.weight
+            ...
+
+        This method generates the per-expert weight names by inserting "experts.{i}."
+        into the MLP path for each expert.
+
+        Supported naming conventions:
+        - Qwen/standard: gate_proj, up_proj, down_proj
+        - DeepSeek/alternative: w1, w2, w3, gate_up_proj
+
+        Args:
+            peft_name: The shared PEFT name (e.g., ...mlp.gate_proj.lora_A.weight)
+            num_experts: Number of experts in the MoE model
+
+        Returns:
+            List of per-expert PEFT names
+        """
+        import re
+
+        # Pattern to match MLP module paths
+        # Shared: base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
+        # Per-expert: base_model.model.model.layers.X.mlp.experts.{i}.gate_proj.lora_A.weight
+        # Support multiple naming conventions: gate_proj/up_proj/down_proj (Qwen), w1/w2/w3 (DeepSeek), gate_up_proj (fused)
+        mlp_patterns = r'(gate_proj|up_proj|down_proj|w1|w2|w3|gate_up_proj)'
+        mlp_match = re.search(r'(\.mlp\.)(' + mlp_patterns + r')', peft_name)
+        if mlp_match:
+            # Insert experts.{i}. after .mlp.
+            prefix = peft_name[:mlp_match.end(1)]  # ...mlp.
+            suffix = peft_name[mlp_match.end(1):]  # gate_proj.lora_A.weight
+            return [f"{prefix}experts.{i}.{suffix}" for i in range(num_experts)]
+
+        # If already has experts in path, just return the original
+        if '.experts.' in peft_name:
+            return [peft_name]
+
+        # Fallback: return original name if pattern not matched
+        logger.warning(f"Could not expand to per-expert format: {peft_name}")
+        return [peft_name]
 
     def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.

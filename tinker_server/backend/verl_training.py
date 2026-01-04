@@ -277,9 +277,6 @@ class TrainingWorker:
             self._watchdog_thread.start()
             logger.info(f"[TrainingWorker] Idle watchdog started (timeout={idle_timeout}s)")
 
-        # Store base model name for checkpoint saving
-        self.base_model = base_model
-
         logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
 
         # Load tokenizer
@@ -297,6 +294,19 @@ class TrainingWorker:
             local_files_only=True,
             device_map="cuda",  # Use this worker's GPU
         )
+
+        # Enable gradient checkpointing for large dense models (trades compute for memory)
+        # Must be done before PEFT wrapping to properly set up the model
+        from .model_registry import get_gradient_checkpointing
+        try:
+            use_grad_ckpt = get_gradient_checkpointing(base_model)
+        except ValueError:
+            # Model not in registry, default to no checkpointing
+            use_grad_ckpt = False
+
+        if use_grad_ckpt:
+            self.model.gradient_checkpointing_enable()
+            logger.info(f"[TrainingWorker] Gradient checkpointing enabled for {base_model}")
 
         # Apply LoRA
         # Per Tinker docs: "LoRA performs better when applied to all weight matrices,
@@ -884,8 +894,12 @@ class TrainingWorker:
             "type": "optim_step",
         }
 
-    def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
+    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights as state dict.
+
+        Args:
+            use_per_expert_lora: Ignored for dense models (TrainingWorker).
+                Only applies to MoE models using MegatronWorkerGroup.
 
         Returns:
             Dict mapping parameter names to tensors (on CPU).
@@ -912,7 +926,6 @@ class TrainingWorker:
             "bias": peft_config.bias,
             "task_type": peft_config.task_type.value if peft_config.task_type else None,
             "peft_type": "LORA",
-            "base_model_name_or_path": self.base_model,
         }
 
     def save_lora_weights(self, save_path: str) -> str:
@@ -1321,7 +1334,7 @@ class VerlTrainingEngine:
     def __init__(
         self,
         default_base_model: str | None = None,
-        default_lora_rank: int = 8,  # Must match max_lora_rank in model_registry for K2
+        default_lora_rank: int = 32,
     ):
         # No default model - clients specify per-request
         self.default_base_model = default_base_model
@@ -1369,6 +1382,17 @@ class VerlTrainingEngine:
         """
         import os
         from pathlib import Path
+
+        # Explicit path overrides for models with non-standard cache locations
+        MODEL_PATH_OVERRIDES = {
+            "moonshotai/Kimi-K2-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--unsloth--Kimi-K2-Instruct-0905-BF16/snapshots/fbaf30b3baf5fdc2b2170ae04f4ff4948b0487cb",
+            "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
+        }
+
+        if hf_model_id in MODEL_PATH_OVERRIDES:
+            override_path = MODEL_PATH_OVERRIDES[hf_model_id]
+            logger.info(f"Using path override for {hf_model_id} -> {override_path}")
+            return override_path
 
         hf_home = os.environ.get("HF_HOME", "/vePFS-Mindverse/share/huggingface")
         # Convert "org/model" to "models--org--model"
@@ -1441,8 +1465,7 @@ class VerlTrainingEngine:
                 expert_tensor_parallel_size=train_etp,
                 use_fp8=use_fp8,
             )
-            world_size = distributed_config.world_size
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={world_size}, fp8={use_fp8})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -1613,11 +1636,76 @@ class VerlTrainingEngine:
         logger.info(f"[{model_id}] optim_step: step={session.current_step}")
         return result
 
+    async def train_step(
+        self,
+        session: TrainingSession,
+        request: Any,
+    ) -> dict:
+        """Combined forward_backward + optim_step in a single call.
+
+        This is the correct way to train MoE models with param_offload=True.
+        Keeping both operations in a single remote call ensures they run in
+        the same train_mode context, so gradients survive for the optimizer step.
+
+        Args:
+            session: TrainingSession.
+            request: ForwardBackwardRequest with training data.
+
+        Returns:
+            Dict with loss_fn_outputs, metrics, and optimizer results.
+        """
+        from .megatron_training import is_moe_model
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+
+        # Mark actor as recently used to prevent LRU eviction during training
+        self._touch_actor(session)
+
+        # Serialize data for Ray
+        data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        loss_fn = request.forward_backward_input.loss_fn
+        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+        lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
+
+        # Check if this is an MoE model (uses MegatronWorkerGroup with train_step)
+        use_train_step = session.backend == "megatron" and is_moe_model(session.base_model or "")
+
+        if use_train_step:
+            # MoE: Use combined train_step to keep gradients in same context
+            result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
+        else:
+            # Dense models: Use separate calls (they don't have param_offload issues)
+            # Pass session_id for stateless trainer pattern
+            fb_result = await worker.forward_backward.remote(
+                data_items, loss_fn, loss_fn_config, session.session_id
+            )
+            opt_result = await worker.optim_step.remote(lr, session.session_id)
+
+            # Merge results
+            result = fb_result.copy()
+            if "metrics" not in result:
+                result["metrics"] = {}
+            result["metrics"].update(opt_result.get("metrics", {}))
+
+        # Update session state
+        session.current_step += 1
+        session.accumulated_gradients = 0
+
+        # Ensure step is in metrics
+        if "metrics" not in result:
+            result["metrics"] = {}
+        result["metrics"]["step"] = session.current_step
+
+        logger.info(f"[{model_id}] train_step: step={session.current_step}")
+        return result
+
     async def save_weights_for_sampler(
         self,
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -1629,6 +1717,7 @@ class VerlTrainingEngine:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1641,7 +1730,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
-        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY")
+        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY (use_per_expert_lora={use_per_expert_lora})")
         logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
 
         # Fetch weights and config from remote worker via Ray object store
@@ -1651,13 +1740,14 @@ class VerlTrainingEngine:
         loop = asyncio.get_running_loop()
 
         # Schedule remote calls
-        state_dict_ref = worker.get_lora_state_dict.remote()
+        state_dict_ref = worker.get_lora_state_dict.remote(use_per_expert_lora)
         config_ref = worker.get_lora_config.remote()
         logger.info(f"[{model_id}] save_weights_for_sampler: remote calls scheduled, waiting for results...")
 
         # Use ray.get() with timeout in executor to avoid blocking event loop
+        # Increased timeout for large models with many LoRA params (MoE + MLA = 428 params)
         def get_with_timeout():
-            return ray.get([state_dict_ref, config_ref], timeout=120)
+            return ray.get([state_dict_ref, config_ref], timeout=300)
 
         state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
@@ -1776,8 +1866,8 @@ class VerlTrainingEngine:
 PERSISTENT_DENSE_NAMESPACE = "tinker"
 PERSISTENT_DENSE_ACTOR_PREFIX = "dense_trainer_pool_"
 
-# Use centralized PFS_PYTHONPATH from config (includes megatron-bridge for ETP fix)
-from tinker_server.config import PFS_PYTHONPATH as PFS_PYTHONPATH_DENSE
+# PFS PYTHONPATH for worker processes
+PFS_PYTHONPATH_DENSE = "/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/vllm"
 
 
 @dataclass
