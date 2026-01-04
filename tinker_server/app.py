@@ -282,10 +282,10 @@ async def api_key_auth_middleware(request: Request, call_next):
             content={"error": "Missing API key"},
         )
 
-    # Method 1: Check hardcoded API key (legacy)
+    # Method 1: Check hardcoded API key (admin)
     if config.validate_api_key(api_key):
-        # Hardcoded key valid - no user_data available
-        request.state.user_data = None
+        # Admin key - assign special "admin" user_id for checkpoint ownership
+        request.state.user_data = {"user_id": "admin"}
         return await call_next(request)
 
     # Method 2: Try sk- token decryption
