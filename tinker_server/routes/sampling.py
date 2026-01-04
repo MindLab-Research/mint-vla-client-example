@@ -163,14 +163,27 @@ async def _do_sample(
         future_store.resolve(request_id, response.model_dump())
         logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
 
-        # Log usage
+        # Log usage - separate prefill and sampling tokens
         if user_id:
-            total_tokens = len(token_ids) + sum(len(seq.tokens) for seq in sequences)
+            prefill_tokens = len(token_ids)
+            sampling_tokens = sum(len(seq.tokens) for seq in sequences)
+
+            # Log prefill (input prompt) tokens
             get_usage_logger().log(
                 user_id=user_id,
-                operation_type="sample",
+                operation_type="sample_prefill",
                 model_name=session_id,  # Use session_id as model identifier
-                token_count=total_tokens,
+                token_count=prefill_tokens,
+                session_id=session_id,
+                request_id=request_id,
+            )
+
+            # Log sampling (generated) tokens
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="sample_generation",
+                model_name=session_id,
+                token_count=sampling_tokens,
                 session_id=session_id,
                 request_id=request_id,
             )
@@ -239,17 +252,6 @@ async def _do_compute_logprobs(
         logger.debug(
             f"Request {request_id} computed {len(logprobs)} logprobs"
         )
-
-        # Log usage
-        if user_id:
-            get_usage_logger().log(
-                user_id=user_id,
-                operation_type="compute_logprobs",
-                model_name=session_id,
-                token_count=len(token_ids),
-                session_id=session_id,
-                request_id=request_id,
-            )
 
     except Exception as e:
         logger.exception(f"Request {request_id} failed: {e}")
