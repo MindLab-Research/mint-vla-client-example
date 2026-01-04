@@ -113,7 +113,7 @@ async def create_model(
             task_name=f"Training {request.base_model}",
             task_type="training",
             model_name=request.base_model,
-            config={"lora_rank": request.lora_config.get("r") if request.lora_config else None},
+            config={"lora_rank": request.lora_config.rank if request.lora_config else None},
         )
 
     background_tasks.add_task(_do_create_model, request_id, request, user_id, webhook_url)
