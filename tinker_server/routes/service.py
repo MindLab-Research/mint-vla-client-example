@@ -293,8 +293,8 @@ async def kill_vllm(request: Request, body: KillVllmRequest | None = None) -> di
 
 
 @router.get("/vllm_status")
-async def vllm_status(model_name: str | None = None) -> dict:
-    """Check if vLLM actor(s) exist.
+async def vllm_status(request: Request, model_name: str | None = None) -> dict:
+    """Check if vLLM actor(s) exist. Admin only.
 
     Args:
         model_name: If provided, check for this specific model's actor.
@@ -304,6 +304,7 @@ async def vllm_status(model_name: str | None = None) -> dict:
         alive: True if matching actor exists and is alive
         actors: List of running vLLM actors from resource pool
     """
+    _require_admin(request)
     from ..backend.multi_lora_engine import check_persistent_vllm_actor, list_vllm_actors
 
     alive = check_persistent_vllm_actor(model_name)
@@ -345,8 +346,8 @@ async def kill_megatron(request: Request, body: KillMegatronRequest | None = Non
 
 
 @router.get("/megatron_status")
-async def megatron_status(base_model: str | None = None) -> dict:
-    """Check if Megatron actor(s) exist.
+async def megatron_status(request: Request, base_model: str | None = None) -> dict:
+    """Check if Megatron actor(s) exist. Admin only.
 
     Args:
         base_model: If provided, check for this specific model's actor.
@@ -356,8 +357,9 @@ async def megatron_status(base_model: str | None = None) -> dict:
         alive: True if matching actor exists and is alive
         actors: List of running Megatron actors from resource pool
     """
+    _require_admin(request)
     from ..backend.megatron_distributed import is_megatron_actor_running
-    from ..backend.resource_pool import get_resource_pool, ActorType
+    from ..backend.resource_pool import ActorType, get_resource_pool
 
     alive = is_megatron_actor_running(base_model)
 
@@ -373,14 +375,15 @@ async def megatron_status(base_model: str | None = None) -> dict:
 
 
 @router.get("/resource_pool")
-async def resource_pool_status() -> dict:
-    """Get unified resource pool status.
+async def resource_pool_status(request: Request) -> dict:
+    """Get unified resource pool status. Admin only.
 
     Returns:
         actors: List of all tracked actors with LRU info
         total_gpus: Total GPUs used
         min_actor_age: Minimum actor age before eviction eligible
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()
