@@ -1244,9 +1244,11 @@ class MegatronRankWorker:
                 elif base_layer in col_parallel_keys:
                     return 0  # ColumnParallel: lora_A sharded on rank dim
             elif is_lora_b:
-                # lora_B sharding depends on base layer type
-                if base_layer in col_parallel_keys:
-                    return 0  # ColumnParallel: lora_B sharded on output dim
+                # CRITICAL: linear_out in ParallelLinearAdapter is ALWAYS ColumnParallelLinear
+                # regardless of whether base layer is RowParallel or ColumnParallel.
+                # So lora_B is ALWAYS sharded on dim 0 (output dimension).
+                if base_layer in col_parallel_keys or base_layer in row_parallel_keys:
+                    return 0  # lora_B always sharded on output dim
 
             return None
 
