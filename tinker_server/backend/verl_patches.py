@@ -23,6 +23,51 @@ def apply_verl_patches():
     logger.info("[verl_patches] All patches applied")
 
 
+def _shift_labels_left(input_ids):
+    """Shift labels left by 1 position for next-token prediction alignment.
+
+    For each sequence: label[i] = input_ids[i+1]
+    Handles both regular tensors and NestedTensors (jagged layout).
+
+    The last position wraps around, but this is typically masked out anyway.
+    """
+    import torch
+
+    # Check if this is a NestedTensor (jagged layout for variable-length sequences)
+    if hasattr(input_ids, 'values') and hasattr(input_ids, 'offsets'):
+        # NestedTensor with jagged layout
+        # Values are stored contiguously, offsets mark sequence boundaries
+        values = input_ids.values()  # Flat tensor of all tokens
+        offsets = input_ids.offsets()  # Tensor of cumulative lengths
+
+        # Create shifted values
+        # For each sequence, shift left by 1 (last token wraps around)
+        shifted_values = torch.empty_like(values)
+
+        for i in range(len(offsets) - 1):
+            start = offsets[i].item()
+            end = offsets[i + 1].item()
+            seq_len = end - start
+            if seq_len > 0:
+                # Copy tokens[1:] to positions [0:seq_len-1]
+                shifted_values[start:end-1] = values[start+1:end]
+                # Wrap last token (typically masked out)
+                shifted_values[end-1] = values[start]
+
+        # Reconstruct nested tensor using the nested_tensor constructor
+        # Split shifted values back into list of tensors
+        shifted_sequences = []
+        for i in range(len(offsets) - 1):
+            start = offsets[i].item()
+            end = offsets[i + 1].item()
+            shifted_sequences.append(shifted_values[start:end])
+
+        return torch.nested.as_nested_tensor(shifted_sequences, layout=torch.jagged)
+    else:
+        # Regular tensor - use torch.roll
+        return torch.roll(input_ids, shifts=-1, dims=-1)
+
+
 def _apply_label_shift_patch():
     """Fix label alignment in MegatronEngineWithLMHead.forward_step.
 
@@ -67,7 +112,7 @@ def _apply_label_shift_patch():
             if pad_mode == DatasetPadMode.NO_PADDING:
                 # PATCH: Shift labels left to align with next-token prediction
                 # logits[i] predicts token at position i+1, so label[i] should be input_ids[i+1]
-                label = torch.roll(input_ids, shifts=-1, dims=-1)
+                label = _shift_labels_left(input_ids)
             else:
                 raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
