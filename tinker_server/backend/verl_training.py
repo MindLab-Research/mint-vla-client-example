@@ -1741,6 +1741,9 @@ class VerlTrainingEngine:
         state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
 
+        # Override base_model_name_or_path with user-provided model name (not resolved path)
+        config["base_model_name_or_path"] = session.base_model
+
         # Save locally on API server
         save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)
         os.makedirs(save_path, exist_ok=True)
