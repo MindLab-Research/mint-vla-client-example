@@ -16,11 +16,20 @@ def apply_verl_patches():
     """Apply all verl patches. Safe to call multiple times."""
     global _patches_applied
     if _patches_applied:
+        print("[verl_patches] Patches already applied, skipping", flush=True)
         return
 
+    print("[verl_patches] Applying patches...", flush=True)
     _apply_label_shift_patch()
     _patches_applied = True
+    print("[verl_patches] All patches applied successfully", flush=True)
     logger.info("[verl_patches] All patches applied")
+
+
+_shift_debug_count = [0]
+
+# Set to True to disable shift for debugging
+_DISABLE_SHIFT = False
 
 
 def _shift_labels_left(input_ids):
@@ -33,39 +42,73 @@ def _shift_labels_left(input_ids):
     """
     import torch
 
-    # Check if this is a NestedTensor (jagged layout for variable-length sequences)
-    if hasattr(input_ids, 'values') and hasattr(input_ids, 'offsets'):
-        # NestedTensor with jagged layout
-        # Values are stored contiguously, offsets mark sequence boundaries
-        values = input_ids.values()  # Flat tensor of all tokens
-        offsets = input_ids.offsets()  # Tensor of cumulative lengths
+    _shift_debug_count[0] += 1
+    do_debug = _shift_debug_count[0] <= 3
 
-        # Create shifted values
-        # For each sequence, shift left by 1 (last token wraps around)
+    # Bypass mode for debugging
+    if _DISABLE_SHIFT:
+        if do_debug:
+            print(f"[_shift_labels_left] BYPASS MODE - returning input_ids unchanged", flush=True)
+        return input_ids.clone()
+
+    # Check for NestedTensor using the proper API
+    try:
+        is_nested = input_ids.is_nested
+    except AttributeError:
+        is_nested = False
+
+    if do_debug:
+        print(f"[_shift_labels_left] call #{_shift_debug_count[0]}", flush=True)
+        print(f"  type: {type(input_ids).__name__}, is_nested: {is_nested}", flush=True)
+        print(f"  dtype: {input_ids.dtype}", flush=True)
+
+    # Extra debug for positions 115-122 to check action region
+    extra_debug = _shift_debug_count[0] <= 2
+
+    if is_nested:
+        values = input_ids.values()
+        offsets = input_ids.offsets()
+
+        if do_debug:
+            print(f"  [NestedTensor] values.shape: {values.shape}, num_seqs: {len(offsets)-1}", flush=True)
+            print(f"  first 10 tokens: {values[:10].tolist()}", flush=True)
+
         shifted_values = torch.empty_like(values)
-
         for i in range(len(offsets) - 1):
             start = offsets[i].item()
             end = offsets[i + 1].item()
-            seq_len = end - start
-            if seq_len > 0:
-                # Copy tokens[1:] to positions [0:seq_len-1]
+            if end - start > 0:
                 shifted_values[start:end-1] = values[start+1:end]
-                # Wrap last token (typically masked out)
-                shifted_values[end-1] = values[start]
+                shifted_values[end-1] = values[start]  # wrap around
 
-        # Reconstruct nested tensor using the nested_tensor constructor
-        # Split shifted values back into list of tensors
-        shifted_sequences = []
-        for i in range(len(offsets) - 1):
-            start = offsets[i].item()
-            end = offsets[i + 1].item()
-            shifted_sequences.append(shifted_values[start:end])
+        if do_debug:
+            print(f"  shifted first 10: {shifted_values[:10].tolist()}", flush=True)
 
+        # Check positions around 117 (typical first action position)
+        if extra_debug and len(values) > 122:
+            print(f"  [ACTION REGION CHECK] original[115:122]: {values[115:122].tolist()}", flush=True)
+            print(f"  [ACTION REGION CHECK] shifted[115:122]: {shifted_values[115:122].tolist()}", flush=True)
+            print(f"  Expected: shifted[116] should equal original[117]", flush=True)
+            print(f"    original[117] = {values[117].item()}", flush=True)
+            print(f"    shifted[116] = {shifted_values[116].item()}", flush=True)
+            print(f"  Expected: shifted[117] should equal original[118]", flush=True)
+            print(f"    original[118] = {values[118].item()}", flush=True)
+            print(f"    shifted[117] = {shifted_values[117].item()}", flush=True)
+
+        shifted_sequences = [shifted_values[offsets[i].item():offsets[i+1].item()]
+                            for i in range(len(offsets) - 1)]
         return torch.nested.as_nested_tensor(shifted_sequences, layout=torch.jagged)
     else:
-        # Regular tensor - use torch.roll
-        return torch.roll(input_ids, shifts=-1, dims=-1)
+        if do_debug:
+            print(f"  [Regular tensor] shape: {input_ids.shape}", flush=True)
+            if input_ids.dim() >= 2:
+                print(f"  first seq tokens: {input_ids[0, :10].tolist()}", flush=True)
+
+        result = torch.roll(input_ids, shifts=-1, dims=-1)
+
+        if do_debug and input_ids.dim() >= 2:
+            print(f"  shifted tokens: {result[0, :10].tolist()}", flush=True)
+        return result
 
 
 def _apply_label_shift_patch():
@@ -82,6 +125,7 @@ def _apply_label_shift_patch():
     This matches vLLM's convention where old_log_probs[i] = log P(token[i+1] | context[0:i+1]).
     """
     try:
+        print("[verl_patches] _apply_label_shift_patch starting imports...", flush=True)
         import torch
         from functools import partial
         from typing import Iterator
@@ -92,12 +136,17 @@ def _apply_label_shift_patch():
         from verl.utils.device import get_device_id
         from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits, vocab_parallel_entropy
         from verl.models.mcore import get_mcore_forward_no_padding_fn
+        print("[verl_patches] Imports successful, patching forward_step...", flush=True)
 
         original_forward_step = MegatronEngineWithLMHead.forward_step
+        _patch_call_count = [0]  # Use list for mutable closure
 
         @wraps(original_forward_step)
         def patched_forward_step(self, batch_iter: Iterator[TensorDict], model, postprocess_micro_batch_func):
             """Patched forward_step that shifts labels for correct log_prob alignment."""
+            _patch_call_count[0] += 1
+            if _patch_call_count[0] <= 3:
+                print(f"[verl_patches] PATCHED forward_step called (call #{_patch_call_count[0]})", flush=True)
             batch: TensorDict = next(batch_iter)
             batch = batch.to(get_device_id())
             use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
@@ -155,7 +204,12 @@ def _apply_label_shift_patch():
             return output, partial(postprocess_micro_batch_func, data=batch)
 
         MegatronEngineWithLMHead.forward_step = patched_forward_step
+        print("[verl_patches] SUCCESS: Patched MegatronEngineWithLMHead.forward_step", flush=True)
         logger.info("[verl_patches] Applied label shift patch to MegatronEngineWithLMHead.forward_step")
 
     except ImportError as e:
+        print(f"[verl_patches] FAILED - ImportError: {e}", flush=True)
+        logger.warning(f"[verl_patches] Could not apply label shift patch: {e}")
+    except Exception as e:
+        print(f"[verl_patches] FAILED - Exception: {e}", flush=True)
         logger.warning(f"[verl_patches] Could not apply label shift patch: {e}")
