@@ -254,39 +254,54 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # =============================================================================
 
 
+class KillVllmRequest(BaseModel):
+    """Request to kill vLLM actor(s)."""
+
+    model_name: str | None = None  # Kill specific model's actor, or all if None
+
+
 @router.post("/kill_vllm")
-async def kill_vllm() -> dict:
-    """Kill the persistent vLLM actor.
+async def kill_vllm(request: KillVllmRequest | None = None) -> dict:
+    """Kill vLLM inference actor(s).
+
+    Args:
+        model_name: If provided, kill actor for this specific model.
+                   If None/omitted, kill ALL vLLM actors.
 
     Use this to force a full restart of the vLLM engine.
     The next request that needs vLLM will create a new actor (~80s init).
-
-    This is useful when:
-    - You need to reload the base model
-    - vLLM is in a bad state
-    - You want to free GPU memory
     """
     from ..backend.multi_lora_engine import kill_persistent_vllm_actor
 
-    killed = kill_persistent_vllm_actor()
-    return {"killed": killed, "message": "vLLM actor killed" if killed else "No vLLM actor found"}
+    model_name = request.model_name if request else None
+    killed = kill_persistent_vllm_actor(model_name)
+
+    if model_name:
+        msg = f"Killed vLLM actor for {model_name}" if killed else f"No vLLM actor found for {model_name}"
+    else:
+        msg = "All vLLM actors killed" if killed else "No vLLM actors found"
+
+    return {"killed": killed, "message": msg}
 
 
 @router.get("/vllm_status")
-async def vllm_status() -> dict:
-    """Check if persistent vLLM actor exists.
+async def vllm_status(model_name: str | None = None) -> dict:
+    """Check if vLLM actor(s) exist.
+
+    Args:
+        model_name: If provided, check for this specific model's actor.
+                   If None, check for ANY running vLLM actor.
 
     Returns:
-        alive: True if actor exists and is alive
-        actor_name: The well-known actor name
+        alive: True if matching actor exists and is alive
+        actors: List of running vLLM actors from resource pool
     """
-    from ..backend.multi_lora_engine import (
-        PERSISTENT_VLLM_ACTOR_NAME,
-        check_persistent_vllm_actor,
-    )
+    from ..backend.multi_lora_engine import check_persistent_vllm_actor, list_vllm_actors
 
-    alive = check_persistent_vllm_actor()
-    return {"alive": alive, "actor_name": PERSISTENT_VLLM_ACTOR_NAME}
+    alive = check_persistent_vllm_actor(model_name)
+    actors = list_vllm_actors()
+
+    return {"alive": alive, "actors": actors, "query_model_name": model_name}
 
 
 class KillMegatronRequest(BaseModel):
