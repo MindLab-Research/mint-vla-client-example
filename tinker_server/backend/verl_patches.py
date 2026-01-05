@@ -159,9 +159,10 @@ def _apply_label_shift_patch():
             multi_modal_inputs = model_inputs["multi_modal_inputs"]
 
             if pad_mode == DatasetPadMode.NO_PADDING:
-                # PATCH: Shift labels left to align with next-token prediction
-                # logits[i] predicts token at position i+1, so label[i] should be input_ids[i+1]
-                label = _shift_labels_left(input_ids)
+                # DO NOT shift here - verl's preprocess_packed_seqs_no_padding already shifts
+                # labels when need_roll=(k == "label") is True (see model_forward.py line 134
+                # and util.py line 256-260). Shifting here would cause DOUBLE SHIFT.
+                label = input_ids.clone()
             else:
                 raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
