@@ -262,8 +262,12 @@ class SessionManager:
 
         if model_path.startswith("file://"):
             return model_path[7:]  # Strip file:// prefix
+        elif model_path.startswith("tinker://"):
+            # tinker://{model_id}/{checkpoint_name}
+            path_part = model_path[len("tinker://"):]
+            return os.path.join(checkpoint_dir, path_part)
         elif model_path.startswith("mint://"):
-            # Local mint:// format: mint://{model_id}/{checkpoint_name}
+            # Legacy mint://{model_id}/{checkpoint_name}
             path_part = model_path[len("mint://"):]
             return os.path.join(checkpoint_dir, path_part)
         else:

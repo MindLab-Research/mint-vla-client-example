@@ -2386,6 +2386,7 @@ class MegatronWorkerGroup:
             "bias": "none",
             "task_type": "CAUSAL_LM",
             "peft_type": "LORA",
+            "base_model_name_or_path": self.base_model,
         }
 
     def get_tokenizer_info(self) -> dict:

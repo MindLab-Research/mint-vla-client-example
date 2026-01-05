@@ -261,6 +261,7 @@ class TrainingWorker:
                           Set to 0 to disable auto-termination.
         """
         self.device = torch.device("cuda")
+        self._base_model = base_model  # Store for get_lora_config()
 
         # Idle timeout tracking
         self._last_activity = time.time()
@@ -926,6 +927,7 @@ class TrainingWorker:
             "bias": peft_config.bias,
             "task_type": peft_config.task_type.value if peft_config.task_type else None,
             "peft_type": "LORA",
+            "base_model_name_or_path": self._base_model,
         }
 
     def save_lora_weights(self, save_path: str) -> str:
