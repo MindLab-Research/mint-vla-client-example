@@ -15,7 +15,7 @@ import os
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from safetensors.torch import load_file
 
@@ -254,39 +254,63 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # =============================================================================
 
 
+def _require_admin(request: Request) -> None:
+    """Raise 403 if not admin user."""
+    user_data = getattr(request.state, "user_data", None)
+    if not user_data or user_data.get("user_id") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
+class KillVllmRequest(BaseModel):
+    """Request to kill vLLM actor(s)."""
+
+    model_name: str | None = None  # Kill specific model's actor, or all if None
+
+
 @router.post("/kill_vllm")
-async def kill_vllm() -> dict:
-    """Kill the persistent vLLM actor.
+async def kill_vllm(request: Request, body: KillVllmRequest | None = None) -> dict:
+    """Kill vLLM inference actor(s). Admin only.
+
+    Args:
+        model_name: If provided, kill actor for this specific model.
+                   If None/omitted, kill ALL vLLM actors.
 
     Use this to force a full restart of the vLLM engine.
     The next request that needs vLLM will create a new actor (~80s init).
-
-    This is useful when:
-    - You need to reload the base model
-    - vLLM is in a bad state
-    - You want to free GPU memory
     """
+    _require_admin(request)
     from ..backend.multi_lora_engine import kill_persistent_vllm_actor
 
-    killed = kill_persistent_vllm_actor()
-    return {"killed": killed, "message": "vLLM actor killed" if killed else "No vLLM actor found"}
+    model_name = body.model_name if body else None
+    killed = kill_persistent_vllm_actor(model_name)
+
+    if model_name:
+        msg = f"Killed vLLM actor for {model_name}" if killed else f"No vLLM actor found for {model_name}"
+    else:
+        msg = "All vLLM actors killed" if killed else "No vLLM actors found"
+
+    return {"killed": killed, "message": msg}
 
 
 @router.get("/vllm_status")
-async def vllm_status() -> dict:
-    """Check if persistent vLLM actor exists.
+async def vllm_status(request: Request, model_name: str | None = None) -> dict:
+    """Check if vLLM actor(s) exist. Admin only.
+
+    Args:
+        model_name: If provided, check for this specific model's actor.
+                   If None, check for ANY running vLLM actor.
 
     Returns:
-        alive: True if actor exists and is alive
-        actor_name: The well-known actor name
+        alive: True if matching actor exists and is alive
+        actors: List of running vLLM actors from resource pool
     """
-    from ..backend.multi_lora_engine import (
-        PERSISTENT_VLLM_ACTOR_NAME,
-        check_persistent_vllm_actor,
-    )
+    _require_admin(request)
+    from ..backend.multi_lora_engine import check_persistent_vllm_actor, list_vllm_actors
 
-    alive = check_persistent_vllm_actor()
-    return {"alive": alive, "actor_name": PERSISTENT_VLLM_ACTOR_NAME}
+    alive = check_persistent_vllm_actor(model_name)
+    actors = list_vllm_actors()
+
+    return {"alive": alive, "actors": actors, "query_model_name": model_name}
 
 
 class KillMegatronRequest(BaseModel):
@@ -296,8 +320,8 @@ class KillMegatronRequest(BaseModel):
 
 
 @router.post("/kill_megatron")
-async def kill_megatron(request: KillMegatronRequest | None = None) -> dict:
-    """Kill Megatron training actor(s).
+async def kill_megatron(request: Request, body: KillMegatronRequest | None = None) -> dict:
+    """Kill Megatron training actor(s). Admin only.
 
     Args:
         base_model: If provided, kill actor for this specific model.
@@ -306,9 +330,10 @@ async def kill_megatron(request: KillMegatronRequest | None = None) -> dict:
     Use this to force a full restart of the Megatron worker group.
     The next training request will create a new actor.
     """
+    _require_admin(request)
     from ..backend.megatron_distributed import kill_megatron_actor
 
-    base_model = request.base_model if request else None
+    base_model = body.base_model if body else None
     killed = kill_megatron_actor(base_model)
 
     if base_model:
@@ -321,8 +346,8 @@ async def kill_megatron(request: KillMegatronRequest | None = None) -> dict:
 
 
 @router.get("/megatron_status")
-async def megatron_status(base_model: str | None = None) -> dict:
-    """Check if Megatron actor(s) exist.
+async def megatron_status(request: Request, base_model: str | None = None) -> dict:
+    """Check if Megatron actor(s) exist. Admin only.
 
     Args:
         base_model: If provided, check for this specific model's actor.
@@ -332,8 +357,9 @@ async def megatron_status(base_model: str | None = None) -> dict:
         alive: True if matching actor exists and is alive
         actors: List of running Megatron actors from resource pool
     """
+    _require_admin(request)
     from ..backend.megatron_distributed import is_megatron_actor_running
-    from ..backend.resource_pool import get_resource_pool, ActorType
+    from ..backend.resource_pool import ActorType, get_resource_pool
 
     alive = is_megatron_actor_running(base_model)
 
@@ -349,14 +375,15 @@ async def megatron_status(base_model: str | None = None) -> dict:
 
 
 @router.get("/resource_pool")
-async def resource_pool_status() -> dict:
-    """Get unified resource pool status.
+async def resource_pool_status(request: Request) -> dict:
+    """Get unified resource pool status. Admin only.
 
     Returns:
         actors: List of all tracked actors with LRU info
         total_gpus: Total GPUs used
         min_actor_age: Minimum actor age before eviction eligible
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()
@@ -368,12 +395,13 @@ async def resource_pool_status() -> dict:
 
 
 @router.post("/clear_resource_pool")
-async def clear_resource_pool() -> dict:
-    """Clear all entries from the resource pool.
+async def clear_resource_pool(request: Request) -> dict:
+    """Clear all entries from the resource pool. Admin only.
 
     Used for debugging when pool has stale entries after actors are killed externally.
     Does NOT kill actors - just clears the tracking entries.
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()
