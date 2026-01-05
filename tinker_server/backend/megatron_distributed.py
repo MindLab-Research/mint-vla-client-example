@@ -1530,10 +1530,11 @@ class MegatronRankWorker:
                             gate_tensor = tensor.clone()
                             up_tensor = tensor.clone()
                         elif '.lora_B.' in peft_name:
-                            # lora_B is split in half
-                            half_size = tensor.shape[-1] // 2
-                            gate_tensor = tensor[..., :half_size].clone()
-                            up_tensor = tensor[..., half_size:].clone()
+                            # lora_B is split in half along OUTPUT dim (dim 0)
+                            # Shape is (2*intermediate_size, rank), NOT (rank, 2*intermediate)
+                            half_size = tensor.shape[0] // 2
+                            gate_tensor = tensor[:half_size, :].clone()
+                            up_tensor = tensor[half_size:, :].clone()
                         else:
                             logger.warning(f"[Rank 0] Unknown lora type for fused MoE: {peft_name}")
                             continue
@@ -1572,12 +1573,12 @@ class MegatronRankWorker:
                     lora_state_dict[up_peft_name] = tensor.clone()
                     logger.info(f"[Rank 0] Split fused lora_A: {gate_peft_name}, {up_peft_name}")
                 elif '.lora_B.' in peft_name:
-                    # lora_B must be split in half:
-                    # Shape is (rank, 2*intermediate_size)
+                    # lora_B must be split in half along OUTPUT dim (dim 0):
+                    # Shape is (2*intermediate_size, rank), NOT (rank, 2*intermediate)
                     # First half → gate_proj, Second half → up_proj
-                    half_size = tensor.shape[-1] // 2
-                    gate_tensor = tensor[..., :half_size].clone()
-                    up_tensor = tensor[..., half_size:].clone()
+                    half_size = tensor.shape[0] // 2
+                    gate_tensor = tensor[:half_size, :].clone()
+                    up_tensor = tensor[half_size:, :].clone()
                     lora_state_dict[gate_peft_name] = gate_tensor
                     lora_state_dict[up_peft_name] = up_tensor
                     logger.info(f"[Rank 0] Split fused lora_B: {gate_peft_name} shape {gate_tensor.shape}, {up_peft_name} shape {up_tensor.shape}")
