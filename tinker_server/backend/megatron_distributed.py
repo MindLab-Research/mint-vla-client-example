@@ -1310,7 +1310,51 @@ class MegatronRankWorker:
             # ETP not available, assume 1 (no expert tensor parallelism)
             etp_size = 1
 
-        # ========== End TP Gathering Helpers ==========
+        # Get EP (Expert Parallelism) group, size, and rank
+        # CRITICAL: With EP=8, each rank holds different experts (64/8 = 8 experts per rank)
+        # We must gather expert LoRAs from ALL EP ranks to export complete state
+        try:
+            from megatron.core import parallel_state as mpu
+            ep_group = mpu.get_expert_model_parallel_group()
+            ep_size = mpu.get_expert_model_parallel_world_size()
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            logger.info(f"[Rank {self.rank}] EP size: {ep_size}, EP rank: {ep_rank}")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not get EP group: {e}, assuming EP=1")
+            ep_group = None
+            ep_size = 1
+            ep_rank = 0
+
+        def _gather_expert_lora_across_ep(tensor, ep_group, ep_size: int):
+            """Gather expert LoRA tensor from all EP ranks.
+
+            Each EP rank holds a shard of experts. We gather all shards to
+            get complete expert weights.
+
+            Args:
+                tensor: Local expert LoRA tensor
+                ep_group: Expert parallel process group
+                ep_size: Number of EP ranks
+
+            Returns:
+                List of tensors, one per EP rank (indexed by ep_rank)
+            """
+            import torch
+            import torch.distributed as dist
+
+            if ep_size == 1:
+                return [tensor]
+
+            # Ensure tensor is on GPU for NCCL
+            device = torch.cuda.current_device()
+            tensor = tensor.to(device) if not tensor.is_cuda else tensor
+
+            # Gather from all EP ranks
+            gathered_list = [torch.empty_like(tensor) for _ in range(ep_size)]
+            dist.all_gather(gathered_list, tensor.contiguous(), group=ep_group)
+            return gathered_list
+
+        # ========== End TP/EP Gathering Helpers ==========
 
         adapter_state = {}
 
@@ -1358,14 +1402,29 @@ class MegatronRankWorker:
                                 # Log shape change due to gathering
                                 logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(cloned.shape)} (dim={split_dim})")
                         else:
-                            # No gathering needed - just clone
+                            # No TP gathering needed - just clone
                             cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
                             if self.rank == 0:
                                 logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(cloned.shape)}")
 
-                        # Only rank 0 keeps the result
-                        if self.rank == 0:
-                            adapter_state[name] = cloned
+                        # CRITICAL FIX: EP gathering for routed expert LoRAs
+                        # With EP=8, each rank holds different experts (64/8 = 8 per rank)
+                        # We must gather from ALL EP ranks to export complete expert weights
+                        is_routed_expert = '.mlp.experts.' in name and '.mlp.shared_experts.' not in name
+                        if is_routed_expert and ep_group is not None and ep_size > 1:
+                            # ALL ranks participate in EP allgather
+                            ep_gathered = _gather_expert_lora_across_ep(cloned, ep_group, ep_size)
+                            if self.rank == 0:
+                                logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
+                                # Store with EP rank index for later expansion
+                                # Key format: original_name::EP_RANK::{i}
+                                for i, tensor in enumerate(ep_gathered):
+                                    ep_key = f"{name}::EP_RANK::{i}"
+                                    adapter_state[ep_key] = tensor.cpu() if tensor.is_cuda else tensor
+                        else:
+                            # Non-expert param or EP=1: store normally (only rank 0)
+                            if self.rank == 0:
+                                adapter_state[name] = cloned
 
                 logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
 
@@ -1377,7 +1436,7 @@ class MegatronRankWorker:
                             f.write(f"\n=== {datetime.datetime.now()} (named_parameters within eval_mode) ===\n")
                             f.write(f"Total params: {len(all_param_names)}\n")
                             f.write(f"LoRA params found: {len(lora_param_names)}\n")
-                            f.write(f"TP size: {tp_size}, ETP size: {etp_size}\n")
+                            f.write(f"TP size: {tp_size}, ETP size: {etp_size}, EP size: {ep_size}\n")
                             f.write(f"LoRA params with shapes:\n")
                             for n in lora_param_names[:50]:
                                 if n in adapter_state:
@@ -1470,7 +1529,7 @@ class MegatronRankWorker:
         def _is_mlp_module(param_name: str) -> bool:
             """Check if parameter is from MLP/expert layer."""
             mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
-                           'gate_proj', 'up_proj', 'down_proj']
+                           'gate_proj', 'up_proj', 'down_proj', 'shared_expert']
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
 
@@ -1500,8 +1559,107 @@ class MegatronRankWorker:
         lora_state_dict = {}
         mlp_filtered_count = 0
         mlp_expanded_count = 0
-        logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
+
+        # Calculate experts per EP rank (for EP-indexed expansion)
+        experts_per_ep_rank = num_experts // ep_size if ep_size > 1 and num_experts > 0 else num_experts
+
+        logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state (ep_size={ep_size}, experts_per_ep_rank={experts_per_ep_rank})")
+
+        # First pass: group EP-indexed keys by base name
+        ep_grouped_params = {}  # base_name -> {ep_rank: tensor}
+        regular_params = {}  # name -> tensor
         for name, tensor in adapter_state.items():
+            if '::EP_RANK::' in name:
+                # Parse EP-indexed key: base_name::EP_RANK::X
+                base_name, _, ep_rank_str = name.rpartition('::EP_RANK::')
+                ep_rank_idx = int(ep_rank_str)
+                if base_name not in ep_grouped_params:
+                    ep_grouped_params[base_name] = {}
+                ep_grouped_params[base_name][ep_rank_idx] = tensor
+            else:
+                regular_params[name] = tensor
+
+        logger.info(f"[Rank 0] Found {len(ep_grouped_params)} EP-grouped params, {len(regular_params)} regular params")
+
+        # Process EP-grouped params with correct expert assignment
+        for base_name, ep_tensors in ep_grouped_params.items():
+            # Convert base name to PEFT format
+            peft_name = self._convert_megatron_to_peft(base_name)
+            if peft_name is None:
+                logger.warning(f"Could not convert to PEFT: {base_name}")
+                continue
+
+            # Handle MoE MLP/expert modules with EP-aware expansion
+            if model_is_moe and _is_mlp_module(peft_name):
+                is_shared_expert = '.shared_expert.' in peft_name
+
+                if use_per_expert_lora and num_experts > 0 and not is_shared_expert:
+                    # Split fused gate_up_proj if needed, then expand with EP-aware indexing
+                    if '.gate_up_proj_fused.' in peft_name:
+                        import torch
+                        gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
+                        up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
+
+                        # Expand with correct EP rank -> expert index mapping
+                        for ep_rank_idx, tensor in ep_tensors.items():
+                            # Calculate expert range for this EP rank
+                            expert_start = ep_rank_idx * experts_per_ep_rank
+                            expert_end = min(expert_start + experts_per_ep_rank, num_experts)
+
+                            if '.lora_A.' in peft_name:
+                                gate_tensor = tensor
+                                up_tensor = tensor
+                            elif '.lora_B.' in peft_name:
+                                half_size = tensor.shape[0] // 2
+                                gate_tensor = tensor[:half_size, :]
+                                up_tensor = tensor[half_size:, :]
+                            else:
+                                continue
+
+                            # Assign to specific expert indices
+                            for expert_idx in range(expert_start, expert_end):
+                                gate_expert_name = gate_peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
+                                up_expert_name = up_peft_name.replace('.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.')
+                                lora_state_dict[gate_expert_name] = gate_tensor.clone()
+                                lora_state_dict[up_expert_name] = up_tensor.clone()
+                                mlp_expanded_count += 2
+
+                        logger.info(f"[Rank 0] EP-expanded fused MLP LoRA to {len(ep_tensors) * experts_per_ep_rank * 2} per-expert weights")
+                    else:
+                        # Non-fused modules with EP-aware expansion
+                        for ep_rank_idx, tensor in ep_tensors.items():
+                            expert_start = ep_rank_idx * experts_per_ep_rank
+                            expert_end = min(expert_start + experts_per_ep_rank, num_experts)
+
+                            for expert_idx in range(expert_start, expert_end):
+                                # Insert expert index into path
+                                if '.mlp.gate_proj.' in peft_name:
+                                    expert_peft_name = peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
+                                elif '.mlp.up_proj.' in peft_name:
+                                    expert_peft_name = peft_name.replace('.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.')
+                                elif '.mlp.down_proj.' in peft_name:
+                                    expert_peft_name = peft_name.replace('.mlp.down_proj.', f'.mlp.experts.{expert_idx}.down_proj.')
+                                else:
+                                    expert_peft_name = peft_name.replace('.mlp.', f'.mlp.experts.{expert_idx}.')
+                                lora_state_dict[expert_peft_name] = tensor.clone()
+                                mlp_expanded_count += 1
+
+                        logger.info(f"[Rank 0] EP-expanded MLP LoRA: {base_name} -> {num_experts} experts")
+                elif is_shared_expert:
+                    # Shared expert (EP rank 0 only for shared experts)
+                    if 0 in ep_tensors:
+                        lora_state_dict[peft_name] = ep_tensors[0]
+                        logger.info(f"[Rank 0] Added shared_expert MLP LoRA from EP rank 0: {peft_name}")
+                else:
+                    mlp_filtered_count += len(ep_tensors)
+                continue
+
+            # Non-MLP EP-grouped params (shouldn't happen, but handle gracefully)
+            if 0 in ep_tensors:
+                lora_state_dict[peft_name] = ep_tensors[0]
+
+        # Process regular (non-EP-indexed) params
+        for name, tensor in regular_params.items():
             # Add PEFT prefix if not already present
             if name.startswith("model."):
                 peft_name = f"base_model.model.{name}"
@@ -1515,9 +1673,11 @@ class MegatronRankWorker:
                     continue
 
             # Handle MoE MLP/expert modules
+            # IMPORTANT: shared_expert modules should NOT be expanded to per-expert format
             if model_is_moe and _is_mlp_module(peft_name):
+                is_shared_expert = '.shared_expert.' in peft_name
+
                 if use_per_expert_lora and num_experts > 0:
-                    # Expand shared LoRA to per-expert format
                     # First check if this is a fused gate_up_proj that needs splitting
                     if '.gate_up_proj_fused.' in peft_name:
                         import torch
@@ -1539,19 +1699,31 @@ class MegatronRankWorker:
                             logger.warning(f"[Rank 0] Unknown lora type for fused MoE: {peft_name}")
                             continue
 
-                        # Expand both gate and up to per-expert format
-                        for proj_name, proj_tensor in [(gate_peft_name, gate_tensor), (up_peft_name, up_tensor)]:
-                            expanded_names = self._expand_shared_to_per_expert(proj_name, num_experts)
-                            for expanded_name in expanded_names:
-                                lora_state_dict[expanded_name] = proj_tensor.clone()
-                                mlp_expanded_count += 1
-                        logger.info(f"[Rank 0] Split and expanded fused MLP LoRA to {len(expanded_names)*2} per-expert weights")
+                        if is_shared_expert:
+                            # Shared expert: add directly without per-expert expansion
+                            lora_state_dict[gate_peft_name] = gate_tensor
+                            lora_state_dict[up_peft_name] = up_tensor
+                            logger.info(f"[Rank 0] Split shared_expert fused MLP LoRA: {gate_peft_name}, {up_peft_name}")
+                        else:
+                            # Routed experts: expand both gate and up to per-expert format
+                            for proj_name, proj_tensor in [(gate_peft_name, gate_tensor), (up_peft_name, up_tensor)]:
+                                expanded_names = self._expand_shared_to_per_expert(proj_name, num_experts)
+                                for expanded_name in expanded_names:
+                                    lora_state_dict[expanded_name] = proj_tensor.clone()
+                                    mlp_expanded_count += 1
+                            logger.info(f"[Rank 0] Split and expanded fused MLP LoRA to {len(expanded_names)*2} per-expert weights")
                     else:
-                        # Non-fused modules: just expand to per-expert
-                        expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
-                        for expanded_name in expanded_names:
-                            lora_state_dict[expanded_name] = tensor.clone()
-                            mlp_expanded_count += 1
+                        # Non-fused modules
+                        if is_shared_expert:
+                            # Shared expert: add directly without expansion
+                            lora_state_dict[peft_name] = tensor
+                            logger.info(f"[Rank 0] Added shared_expert MLP LoRA: {peft_name}")
+                        else:
+                            # Routed experts: expand to per-expert
+                            expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
+                            for expanded_name in expanded_names:
+                                lora_state_dict[expanded_name] = tensor.clone()
+                                mlp_expanded_count += 1
                 else:
                     # Filter out MLP modules when not using per-expert expansion
                     mlp_filtered_count += 1
@@ -1705,15 +1877,26 @@ class MegatronRankWorker:
         elif 'self_attention.linear_proj' in name:
             target = 'self_attn.o_proj'
         # MLP/Expert projections
+        # IMPORTANT: Distinguish shared_experts from routed experts
+        # shared_experts: single expert, always active (different intermediate size)
+        # experts: routed experts, need per-expert expansion
         elif 'linear_fc1' in name:
-            # MLP gate/up fused projection - map to gate_up_proj
-            # For vLLM MergedColumnParallelLinear, we need separate gate_proj and up_proj
-            # This is handled specially in get_lora_state_dict to split the B matrix
-            # Here we mark it as gate_up_proj_fused to trigger special handling
-            target = 'mlp.gate_up_proj_fused'
+            if '.shared_experts.' in name:
+                # Shared expert MLP - use separate namespace to avoid overwriting routed experts
+                target = 'mlp.shared_expert.gate_up_proj_fused'
+            else:
+                # Routed expert MLP gate/up fused projection - map to gate_up_proj
+                # For vLLM MergedColumnParallelLinear, we need separate gate_proj and up_proj
+                # This is handled specially in get_lora_state_dict to split the B matrix
+                # Here we mark it as gate_up_proj_fused to trigger special handling
+                target = 'mlp.gate_up_proj_fused'
         elif 'linear_fc2' in name:
-            # MLP down projection
-            target = 'mlp.down_proj'
+            if '.shared_experts.' in name:
+                # Shared expert down projection
+                target = 'mlp.shared_expert.down_proj'
+            else:
+                # Routed expert down projection
+                target = 'mlp.down_proj'
 
         if target is None:
             logger.warning(f"Unknown module pattern: {name}")
