@@ -226,6 +226,12 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         else:
             log_probs_flat = log_probs
 
+        # CRITICAL FIX: Position alignment
+        # verl computes log_probs[i] = log P(input_ids[i] | logits[i])
+        # But logits[i] predicts position i+1, not i.
+        # Left-shift to align with standard next-token prediction.
+        log_probs_flat = torch.roll(log_probs_flat, shifts=-1, dims=0)
+
         # Get loss_mask to identify which tokens contribute to loss
         loss_mask = data.get("loss_mask")
         if loss_mask is not None and hasattr(loss_mask, 'values'):
@@ -319,9 +325,27 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
 
         loss_mask = loss_mask.float()
 
-        # Note: No shift needed for RL training
-        # Client sends aligned old_log_probs and loss_mask for response tokens
-        # verl's new_log_probs are already aligned with old_log_probs
+        # CRITICAL FIX: Position alignment between Megatron and vLLM log_probs
+        #
+        # verl computes log_probs with label = input_ids.clone() (no shift), so:
+        #   new_log_probs[i] = log P(input_ids[i] | logits[i])
+        # But logits[i] predicts the NEXT token (position i+1), not position i.
+        #
+        # vLLM's old_log_probs are computed correctly:
+        #   old_log_probs[i] = log P(target_tokens[i] | context)
+        # where target_tokens[i] = input_ids[i+1] (left-shifted).
+        #
+        # So new_log_probs[i] refers to token at position i, but
+        # old_log_probs[i] refers to token at position i+1.
+        # They're off by one!
+        #
+        # Fix: Left-shift new_log_probs by 1 to align with old_log_probs.
+        # After shift: new_log_probs_shifted[i] = new_log_probs[i+1] = P(input_ids[i+1])
+        # This matches old_log_probs[i] = P(input_ids[i+1]).
+        #
+        # Note: The last element wraps around (from position 0), but it's masked out
+        # because loss_mask is 0 for prompt tokens at the start.
+        new_log_probs = torch.roll(new_log_probs, shifts=-1, dims=0)
 
         # Importance ratio
         log_ratio = new_log_probs - old_log_probs
@@ -409,6 +433,12 @@ def create_logprob_extractor_fn() -> Callable:
         # Handle NestedTensor format from verl (NO_PADDING mode)
         if hasattr(log_probs, 'values'):
             log_probs = log_probs.values()
+
+        # CRITICAL FIX: Position alignment (same as PPO loss)
+        # verl computes log_probs[i] = log P(input_ids[i] | logits[i])
+        # But logits[i] predicts position i+1, not i.
+        # Left-shift to align with standard next-token prediction.
+        log_probs = torch.roll(log_probs, shifts=-1, dims=0)
 
         # Get loss_mask to identify response tokens
         loss_mask = data.get("loss_mask")
