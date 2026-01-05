@@ -38,20 +38,22 @@ def _apply_label_shift_patch():
     """
     try:
         import torch
+        from functools import partial
+        from typing import Iterator
+        from tensordict import TensorDict
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
+        from verl.utils import tensordict_utils as tu
+        from verl.utils.dataset.dataset_utils import DatasetPadMode
+        from verl.utils.device import get_device_id
+        from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits, vocab_parallel_entropy
+        from verl.models.mcore import get_mcore_forward_no_padding_fn
 
         original_forward_step = MegatronEngineWithLMHead.forward_step
 
         @wraps(original_forward_step)
-        def patched_forward_step(self, model, batch_iter, loss_function, forward_only):
+        def patched_forward_step(self, batch_iter: Iterator[TensorDict], model, postprocess_micro_batch_func):
             """Patched forward_step that shifts labels for correct log_prob alignment."""
-            import verl.workers.engine.megatron.tensordict_utils as tu
-            from verl.workers.engine.megatron.transformer_impl import DatasetPadMode, get_device_id
-            from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits, vocab_parallel_entropy
-            from functools import partial
-
-            # Get batch and model inputs (same as original)
-            batch = next(batch_iter)
+            batch: TensorDict = next(batch_iter)
             batch = batch.to(get_device_id())
             use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
             calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
@@ -69,8 +71,6 @@ def _apply_label_shift_patch():
             else:
                 raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
-            from verl.models.mcore import get_mcore_forward_no_padding_fn
-
             if use_fused_kernels:
                 raise NotImplementedError("Fused kernels are not supported for megatron engine")
 
@@ -83,7 +83,7 @@ def _apply_label_shift_patch():
                 if calculate_entropy:
                     logits_bak = logits.clone()
                     if torch.distributed.get_rank() == 0:
-                        logger.warning_once(
+                        logger.warning(
                             "For memory-efficient computation, enable fused kernels via "
                             "`actor_rollout_ref.model.use_fused_kernels=True`. "
                             "The current `clone()` operation ensures correctness but increases memory usage."
@@ -107,7 +107,7 @@ def _apply_label_shift_patch():
                 logits_processor_args=logits_processor_args,
             )
 
-            return output, partial(self.postprocess_micro_batch_func, data=batch)
+            return output, partial(postprocess_micro_batch_func, data=batch)
 
         MegatronEngineWithLMHead.forward_step = patched_forward_step
         logger.info("[verl_patches] Applied label shift patch to MegatronEngineWithLMHead.forward_step")
