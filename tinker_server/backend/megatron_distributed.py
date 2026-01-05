@@ -500,6 +500,14 @@ class MegatronRankWorker:
         except Exception as e:
             logger.warning(f"[Rank {self.rank}] Could not apply MLA patch: {e}")
 
+        # Apply label shift patch to fix log_prob alignment
+        # Must be applied BEFORE importing MegatronEngineWithLMHead
+        try:
+            from tinker_server.backend.verl_patches import apply_verl_patches
+            apply_verl_patches()
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
+
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
         from verl.trainer.config import CheckpointConfig
@@ -1178,13 +1186,18 @@ class MegatronRankWorker:
         # - linear_fc1 (fused gate+up): lora_B sharded on dim 1 (special case)
         # - linear_kv_down_proj: lora_B sharded on dim 0 (for mcore < 0.14)
 
-        def _get_lora_tp_split_dim(param_name: str) -> int | None:
+        def _get_lora_tp_split_dim(param_name: str, etp_size: int = 1) -> int | None:
             """Determine TP split dimension for a LoRA parameter.
 
             Returns None if parameter is not TP-sharded.
             Returns 0 for column-parallel (output sharded).
             Returns 1 for row-parallel (input sharded) or fused linear_fc1.
+
+            CRITICAL: For MoE models with ETP=1, expert MLP LoRAs are NOT tensor-parallelized.
+            Only attention LoRAs use TP sharding. Expert MLP LoRAs use ETP sharding.
             """
+            import re
+
             # Identify lora_A vs lora_B
             is_lora_a = '.adapter.linear_in.' in param_name or '.lora_a.' in param_name.lower()
             is_lora_b = '.adapter.linear_out.' in param_name or '.lora_b.' in param_name.lower()
@@ -1192,33 +1205,48 @@ class MegatronRankWorker:
             if not (is_lora_a or is_lora_b):
                 return None
 
-            # RowParallel layers: linear_proj, linear_fc2
+            # Check if this is an expert MLP layer (MoE)
+            # Expert layers have patterns like: mlp.experts.*, mlp.shared_experts.*
+            # These use ETP (Expert Tensor Parallel) instead of TP
+            # Note: Dense MLP layers (e.g., layer 0's .mlp.linear_fc1 without .experts.)
+            # still use TP sharding and should be gathered
+            is_expert_layer = '.mlp.experts.' in param_name or '.mlp.shared_experts.' in param_name
+
+            if is_expert_layer:
+                # For expert layers, sharding depends on ETP, not TP
+                # With ETP=1 (no expert tensor parallelism), these are NOT sharded
+                if etp_size <= 1:
+                    return None
+                # With ETP > 1, would need ETP-based gathering (not implemented)
+                # For now, return None and log warning
+                logger.warning(f"ETP={etp_size} > 1 not yet supported for LoRA gathering")
+                return None
+
+            # RowParallel layers (attention output projection, MLP down projection):
             # - lora_A is sharded on dim 1 (input dimension)
             row_parallel_keys = {'linear_proj', 'linear_fc2'}
 
-            # ColumnParallel layers: linear_qkv, linear_q_proj, linear_kv_up_proj, linear_kv_down_proj
+            # ColumnParallel layers (attention QKV, MLA projections, MLP up/gate):
+            # - lora_A is sharded on dim 0 (rank dimension)
             # - lora_B is sharded on dim 0 (output dimension)
-            col_parallel_keys = {'linear_qkv', 'linear_q_proj', 'linear_kv_up_proj', 'linear_kv_down_proj'}
+            col_parallel_keys = {'linear_qkv', 'linear_q_proj', 'linear_kv_up_proj', 'linear_kv_down_proj', 'linear_fc1'}
 
-            # Extract base layer name (e.g., "linear_fc1" from "decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight")
-            # Find the layer name before ".adapter." or ".lora_"
-            import re
+            # Extract base layer name (e.g., "linear_proj" from "decoder.layers.0.self_attn.linear_proj.adapter.linear_in.weight")
             match = re.search(r'(linear_\w+)\.(?:adapter|lora)', param_name)
             if not match:
                 return None
             base_layer = match.group(1)
 
             if is_lora_a:
-                # lora_A is sharded if base layer is RowParallel
+                # lora_A is sharded if base layer is RowParallel (dim 1) or ColumnParallel (dim 0)
                 if base_layer in row_parallel_keys:
-                    return 1
+                    return 1  # RowParallel: lora_A sharded on input dim
+                elif base_layer in col_parallel_keys:
+                    return 0  # ColumnParallel: lora_A sharded on rank dim
             elif is_lora_b:
                 # lora_B sharding depends on base layer type
                 if base_layer in col_parallel_keys:
-                    return 0
-                elif base_layer == 'linear_fc1':
-                    # Special case: fused gate+up projection
-                    return 1
+                    return 0  # ColumnParallel: lora_B sharded on output dim
 
             return None
 
@@ -1271,6 +1299,15 @@ class MegatronRankWorker:
             tp_group = None
             tp_size = 1
 
+        # Get ETP size for MoE expert layers
+        try:
+            from megatron.core import parallel_state as mpu
+            etp_size = mpu.get_expert_tensor_parallel_world_size()
+            logger.info(f"[Rank {self.rank}] ETP size: {etp_size}")
+        except Exception as e:
+            # ETP not available, assume 1 (no expert tensor parallelism)
+            etp_size = 1
+
         # ========== End TP Gathering Helpers ==========
 
         adapter_state = {}
@@ -1298,18 +1335,31 @@ class MegatronRankWorker:
                     name_lower = name.lower()
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
+                        original_shape = list(param.data.shape)
+                        # DEBUG: Log original tensor shape with more detail
+                        if self.rank == 0:
+                            is_lora_a = '.adapter.linear_in.' in name or '.lora_a.' in name_lower
+                            lora_type = "lora_A" if is_lora_a else "lora_B"
+                            logger.info(f"[Rank 0] Megatron {lora_type} {name}: shape={original_shape}")
                         # CRITICAL: ALL ranks must participate in gathering to avoid NCCL deadlock!
                         # Check if this parameter needs TP gathering
-                        split_dim = _get_lora_tp_split_dim(name)
+                        split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
+                        if self.rank == 0:
+                            # Detailed logging for shape debugging
+                            is_expert = '.mlp.experts.' in name or '.mlp.shared_experts.' in name or '.mlp.linear_fc' in name
+                            logger.info(f"[Rank 0] {name}: split_dim={split_dim}, is_expert={is_expert}, etp_size={etp_size}, tp_size={tp_size}")
                         if split_dim is not None and tp_group is not None and tp_size > 1:
                             # Gather across TP ranks, then clone to CPU
                             gathered = _gather_tensor_across_tp(param.data, tp_group, split_dim)
                             cloned = gathered.cpu()
                             if self.rank == 0:
-                                logger.debug(f"[Rank 0] Gathered {name}: {param.data.shape} -> {cloned.shape} (dim={split_dim})")
+                                # Log shape change due to gathering
+                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(cloned.shape)} (dim={split_dim})")
                         else:
                             # No gathering needed - just clone
                             cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
+                            if self.rank == 0:
+                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(cloned.shape)}")
 
                         # Only rank 0 keeps the result
                         if self.rank == 0:
@@ -1318,20 +1368,19 @@ class MegatronRankWorker:
                 logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
 
                 if self.rank == 0:
-                    # Write diagnostic info
+                    # Write diagnostic info with shapes
                     try:
                         import datetime
                         with open(debug_file, "a") as f:
                             f.write(f"\n=== {datetime.datetime.now()} (named_parameters within eval_mode) ===\n")
                             f.write(f"Total params: {len(all_param_names)}\n")
                             f.write(f"LoRA params found: {len(lora_param_names)}\n")
-                            f.write(f"Sample all params (first 20):\n")
-                            for n in all_param_names[:20]:
-                                f.write(f"  {n}\n")
-                            if lora_param_names:
-                                f.write(f"LoRA params:\n")
-                                for n in lora_param_names[:30]:
-                                    f.write(f"  {n}\n")
+                            f.write(f"TP size: {tp_size}, ETP size: {etp_size}\n")
+                            f.write(f"LoRA params with shapes:\n")
+                            for n in lora_param_names[:50]:
+                                if n in adapter_state:
+                                    shape = list(adapter_state[n].shape)
+                                    f.write(f"  {n}: shape={shape}\n")
                             f.write(f"===\n")
                     except Exception as e:
                         logger.warning(f"Failed to write debug file: {e}")
@@ -1388,7 +1437,7 @@ class MegatronRankWorker:
                     logger.info(f"[Rank {self.rank}] get_adapter_state_dict returned {len(raw_state)} params")
                     for name, tensor in raw_state.items():
                         # ALL ranks must participate in gathering
-                        split_dim = _get_lora_tp_split_dim(name)
+                        split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
                         if split_dim is not None and tp_group is not None and tp_size > 1:
                             gathered = _gather_tensor_across_tp(tensor, tp_group, split_dim)
                             cloned = gathered.cpu()
@@ -1554,6 +1603,10 @@ class MegatronRankWorker:
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:5]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
+            # Log shapes for debugging vLLM compatibility
+            for key in list(lora_state_dict.keys())[:10]:
+                tensor = lora_state_dict[key]
+                logger.info(f"[Rank 0] FINAL PEFT {key}: shape={list(tensor.shape)}")
 
         return lora_state_dict
 
@@ -1908,7 +1961,7 @@ class MegatronRankWorker:
 
         return info
 
-    def save_checkpoint(self, save_path: str, step_count: int = 0) -> dict:
+    def save_checkpoint(self, save_path: str, step_count: int = 0, actual_rank: int | None = None) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
         Only rank 0 saves the checkpoint.
@@ -1916,6 +1969,8 @@ class MegatronRankWorker:
         Args:
             save_path: Directory path to save checkpoint files.
             step_count: Current training step (passed from MegatronWorkerGroup).
+            actual_rank: Actual LoRA rank for current session (Phase 7).
+                         If None, falls back to self.lora_rank (max_lora_rank).
 
         Returns:
             Dict with training metadata.
@@ -1935,10 +1990,12 @@ class MegatronRankWorker:
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
+        # Use actual session rank (Phase 7) or fall back to max_lora_rank
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
         # Include all possible module types for both standard and MLA models
         config = {
-            "r": self.lora_rank,
-            "lora_alpha": self.lora_rank * 2,
+            "r": effective_rank,
+            "lora_alpha": effective_rank * 2,
             "target_modules": [
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
@@ -2471,9 +2528,11 @@ class MegatronWorkerGroup:
             "gate_proj", "up_proj", "down_proj"
         ]
 
+        # Use actual session rank (Phase 7) or fall back to max_lora_rank
+        effective_rank = self._actual_rank or self.lora_rank
         return {
-            "r": self.lora_rank,
-            "lora_alpha": self.lora_rank * 2,
+            "r": effective_rank,
+            "lora_alpha": effective_rank * 2,
             "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
@@ -2496,7 +2555,7 @@ class MegatronWorkerGroup:
             "pad_token_id": tokenizer.pad_token_id,
         }
 
-    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+    def reinit_lora_weights(self, learning_rate: float | None = None, actual_rank: int | None = None) -> dict:
         """Reinitialize LoRA weights to fresh random state on all workers.
 
         This must be called when reusing an actor for a new session to ensure
@@ -2505,11 +2564,13 @@ class MegatronWorkerGroup:
         Args:
             learning_rate: New learning rate for the session. If provided,
                 updates all optimizer param_groups on all workers.
+            actual_rank: Actual LoRA rank for the new session (Phase 7).
+                If provided, updates _actual_rank for save_checkpoint.
 
         Returns:
             dict with status and total count of reinitialized parameters.
         """
-        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate})")
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate}, actual_rank={actual_rank})")
 
         # Call reinit on all workers (required for distributed sync)
         futures = [w.reinit_lora_weights.remote(learning_rate) for w in self.workers]
@@ -2527,8 +2588,12 @@ class MegatronWorkerGroup:
         if learning_rate is not None:
             self.learning_rate = learning_rate
 
-        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}")
-        return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate}
+        # Update actual_rank for save_checkpoint (Phase 7)
+        if actual_rank is not None:
+            self._actual_rank = actual_rank
+
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}")
+        return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate, "actual_rank": self._actual_rank}
 
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
         """Load checkpoint from path.
@@ -2558,8 +2623,8 @@ class MegatronWorkerGroup:
         Returns:
             Dict with training metadata.
         """
-        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path}")
-        result = ray.get(self.workers[0].save_checkpoint.remote(save_path, self._step_count))
+        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path} (actual_rank={self._actual_rank})")
+        result = ray.get(self.workers[0].save_checkpoint.remote(save_path, self._step_count, self._actual_rank))
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
 
@@ -3248,10 +3313,10 @@ def get_or_create_megatron_worker_group(
         )
         # Existing actor is already ready
         resource_pool.mark_ready(actor_name)
-        # Reinitialize LoRA weights for fresh session
-        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate})...")
-        result = ray.get(actor.reinit_lora_weights.remote(learning_rate))
-        logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
+        # Reinitialize LoRA weights for fresh session with actual_rank
+        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate}, actual_rank={lora_rank})...")
+        result = ray.get(actor.reinit_lora_weights.remote(learning_rate, lora_rank))
+        logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}, actual_rank={result.get('actual_rank')}")
         return actor
     except ValueError:
         # Actor doesn't exist, create new one

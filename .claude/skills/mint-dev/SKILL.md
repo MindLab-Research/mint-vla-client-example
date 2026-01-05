@@ -28,6 +28,15 @@ description: |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 
+> **CRITICAL: RESTART SERVER AFTER CODE CHANGES**
+>
+> Python servers do NOT hot-reload. After ANY code change:
+> 1. Verify code synced: `ssh volcano 'grep "your_change" /path/to/file'`
+> 2. **RESTART SERVER** (see section 2 below)
+> 3. Verify new process: `ssh volcano 'ps aux | grep run_server'`
+>
+> **Server running old code = your fix does not exist.** This has wasted hours of debugging.
+
 ---
 
 ## NEVER Do These (Production Belongs to mint-prod)

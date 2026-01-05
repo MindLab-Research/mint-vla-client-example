@@ -1764,6 +1764,20 @@ class VerlTrainingEngine:
         state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
 
+        # Phase 7: Truncate weights to match actual_rank if using unified rank training
+        # Actor's max_lora_rank may be > session's actual_rank
+        # Config has r=actual_rank, but state_dict has max_rank dimensions
+        # Truncate to ensure vLLM sees consistent rank
+        from .lora_utils import truncate_lora_state_dict, get_lora_rank_from_state_dict
+
+        actual_rank = config.get("r")
+        max_rank = get_lora_rank_from_state_dict(state_dict)
+        if actual_rank and max_rank and actual_rank < max_rank:
+            logger.info(
+                f"[{model_id}] Truncating LoRA weights from max_rank={max_rank} to actual_rank={actual_rank}"
+            )
+            state_dict = truncate_lora_state_dict(state_dict, max_rank, actual_rank)
+
         # Save locally on API server
         save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)
         os.makedirs(save_path, exist_ok=True)
