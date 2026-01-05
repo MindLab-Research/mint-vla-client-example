@@ -261,6 +261,7 @@ class TrainingWorker:
                           Set to 0 to disable auto-termination.
         """
         self.device = torch.device("cuda")
+        self._base_model = base_model  # Store for get_lora_config()
 
         # Idle timeout tracking
         self._last_activity = time.time()
@@ -926,6 +927,7 @@ class TrainingWorker:
             "bias": peft_config.bias,
             "task_type": peft_config.task_type.value if peft_config.task_type else None,
             "peft_type": "LORA",
+            "base_model_name_or_path": self._base_model,
         }
 
     def save_lora_weights(self, save_path: str) -> str:
@@ -1738,6 +1740,9 @@ class VerlTrainingEngine:
 
         state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
+
+        # Override base_model_name_or_path with user-provided model name (not resolved path)
+        config["base_model_name_or_path"] = session.base_model
 
         # Save locally on API server
         save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)

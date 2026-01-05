@@ -107,7 +107,10 @@ def _resolve_mint_path(mint_uri: str) -> str:
         # Not found - return as-is (will fail later)
         return mint_uri
 
-    # Legacy format: mint://{model_id}/checkpoint-100
+    # tinker:// or mint:// format: {scheme}://{model_id}/checkpoint-100
+    if mint_uri.startswith("tinker://"):
+        path_part = mint_uri[len("tinker://"):]
+        return os.path.join(CHECKPOINTS_DIR, path_part)
     if mint_uri.startswith("mint://"):
         path_part = mint_uri[len("mint://"):]
         return os.path.join(CHECKPOINTS_DIR, path_part)
