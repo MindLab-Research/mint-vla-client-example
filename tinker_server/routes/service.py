@@ -15,7 +15,7 @@ import os
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from safetensors.torch import load_file
 
@@ -254,6 +254,13 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # =============================================================================
 
 
+def _require_admin(request: Request) -> None:
+    """Raise 403 if not admin user."""
+    user_data = getattr(request.state, "user_data", None)
+    if not user_data or user_data.get("user_id") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
 class KillVllmRequest(BaseModel):
     """Request to kill vLLM actor(s)."""
 
@@ -261,8 +268,8 @@ class KillVllmRequest(BaseModel):
 
 
 @router.post("/kill_vllm")
-async def kill_vllm(request: KillVllmRequest | None = None) -> dict:
-    """Kill vLLM inference actor(s).
+async def kill_vllm(request: Request, body: KillVllmRequest | None = None) -> dict:
+    """Kill vLLM inference actor(s). Admin only.
 
     Args:
         model_name: If provided, kill actor for this specific model.
@@ -271,9 +278,10 @@ async def kill_vllm(request: KillVllmRequest | None = None) -> dict:
     Use this to force a full restart of the vLLM engine.
     The next request that needs vLLM will create a new actor (~80s init).
     """
+    _require_admin(request)
     from ..backend.multi_lora_engine import kill_persistent_vllm_actor
 
-    model_name = request.model_name if request else None
+    model_name = body.model_name if body else None
     killed = kill_persistent_vllm_actor(model_name)
 
     if model_name:
@@ -311,8 +319,8 @@ class KillMegatronRequest(BaseModel):
 
 
 @router.post("/kill_megatron")
-async def kill_megatron(request: KillMegatronRequest | None = None) -> dict:
-    """Kill Megatron training actor(s).
+async def kill_megatron(request: Request, body: KillMegatronRequest | None = None) -> dict:
+    """Kill Megatron training actor(s). Admin only.
 
     Args:
         base_model: If provided, kill actor for this specific model.
@@ -321,9 +329,10 @@ async def kill_megatron(request: KillMegatronRequest | None = None) -> dict:
     Use this to force a full restart of the Megatron worker group.
     The next training request will create a new actor.
     """
+    _require_admin(request)
     from ..backend.megatron_distributed import kill_megatron_actor
 
-    base_model = request.base_model if request else None
+    base_model = body.base_model if body else None
     killed = kill_megatron_actor(base_model)
 
     if base_model:
@@ -383,12 +392,13 @@ async def resource_pool_status() -> dict:
 
 
 @router.post("/clear_resource_pool")
-async def clear_resource_pool() -> dict:
-    """Clear all entries from the resource pool.
+async def clear_resource_pool(request: Request) -> dict:
+    """Clear all entries from the resource pool. Admin only.
 
     Used for debugging when pool has stale entries after actors are killed externally.
     Does NOT kill actors - just clears the tracking entries.
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()
