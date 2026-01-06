@@ -86,21 +86,23 @@ You can use basic arithmetic operations (+, -, *, /) and each number can only be
     ), f"sampled_logprobs length {len(sampled_logprobs)} != sampled_tokens length {len(sampled_tokens)}"
 
     full_logprobs = [0.0] * len(prompt_tokens) + sampled_logprobs
-    input_tokens = full_sequence_tokens[:-1]
-    target_tokens = full_sequence_tokens[1:]
-    target_logprobs = full_logprobs[1:]
+    # CRITICAL FIX: Pass full sequence to Megatron (including last token)
+    # This shifts the "garbage rolled position" from N-1 to N
+    # After roll: labels = [t₁, ..., t_N, t₀] where t_N is now CORRECT at position N-1
+    # The garbage t₀ is at position N, which we mask out
+    input_tokens = full_sequence_tokens  # Include last token
+    target_tokens = full_sequence_tokens[1:] + [full_sequence_tokens[0]]  # Shifted, dummy at end
+    target_logprobs = full_logprobs[1:] + [0.0]  # Shifted, dummy at end
 
     assert len(input_tokens) == len(target_tokens) == len(
         target_logprobs
     ), f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(target_logprobs)}"
 
     advantages = [0.0] * len(prompt_tokens) + [1.0] * len(sampled_tokens)
-    advantages = advantages[1:]
+    # Advantages also needs dummy at end to match length
+    advantages = advantages[1:] + [0.0]
     mask = [0.0] * len(prompt_tokens) + [1.0] * len(sampled_tokens)
-    mask = mask[1:]
-    # CRITICAL: Exclude last position - Megatron's label[last] is garbage due to roll wraparound
-    # vLLM logprob[last] = P(last_token | context), but Megatron logprob[last] = P(first_token | context)
-    mask[-1] = 0.0
+    mask = mask[1:] + [0.0]  # Dummy position masked out
 
     datum = tinker.Datum(
         model_input=ModelInput.from_ints(input_tokens),
