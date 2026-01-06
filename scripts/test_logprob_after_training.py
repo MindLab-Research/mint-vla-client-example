@@ -68,27 +68,27 @@ What is 2 + 3?<|im_end|>
     full_input = tinker.ModelInput.from_ints(full_tokens)
     vllm_compute_logprobs = await sampling_client.compute_logprobs_async(full_input)
 
-    # Create Datum for Megatron forward using full-sequence format
-    # Input: [t0, ..., tN], Target: [t1, ..., tN, dummy], Mask: shifted with last=0
+    # Create Datum for Megatron forward using SFT format
+    # Input: [t0, ..., t_{N-1}], Target: [t1, ..., t_N] (last token not in input!)
     prompt_len = len(prompt_tokens)
 
-    # Full-sequence format: target shifted left by 1, dummy at end
-    input_tokens = full_tokens
-    target_tokens = full_tokens[1:] + [full_tokens[0]]  # Shifted, dummy at end
+    # SFT format: input excludes last token, target is shifted by 1
+    input_tokens = full_tokens[:-1]  # [t0, ..., t_{N-1}]
+    target_tokens = full_tokens[1:]  # [t1, ..., t_N] - includes last token!
 
-    # Base mask: 0 for prompt, 1 for response
-    base_mask = [0.0] * prompt_len + [1.0] * len(generated_tokens)
-    # Shifted mask: last position (dummy) masked out
-    mask = base_mask[1:] + [0.0]
+    # Mask: 0 for prompt (excluding last prompt token), 1 for response tokens
+    # Position i in input predicts target[i] = full[i+1]
+    # Prompt ends at position prompt_len-1 in input, which predicts full[prompt_len] = first response token
+    mask = [0.0] * (prompt_len - 1) + [1.0] * (len(input_tokens) - prompt_len + 1)
 
-    # Pad vllm logprobs and shift similarly
-    vllm_logprobs_padded = [0.0] * prompt_len + vllm_sample_logprobs
-    if len(vllm_logprobs_padded) < len(full_tokens):
-        vllm_logprobs_padded.extend([0.0] * (len(full_tokens) - len(vllm_logprobs_padded)))
-    elif len(vllm_logprobs_padded) > len(full_tokens):
-        vllm_logprobs_padded = vllm_logprobs_padded[:len(full_tokens)]
-    # Shift logprobs to match target format
-    logprobs_shifted = vllm_logprobs_padded[1:] + [0.0]
+    # Pad vllm logprobs to match input array
+    # vLLM logprobs[j] is for generated token j, which is at full position prompt_len + j
+    # In SFT format, position (prompt_len + j - 1) in input predicts full[prompt_len + j]
+    vllm_logprobs_padded = [0.0] * len(input_tokens)
+    for j, lp in enumerate(vllm_sample_logprobs):
+        megatron_pos = prompt_len + j - 1
+        if 0 <= megatron_pos < len(vllm_logprobs_padded):
+            vllm_logprobs_padded[megatron_pos] = lp
 
     datum = tinker.Datum(
         model_input=tinker.ModelInput.from_ints(input_tokens),
@@ -96,7 +96,7 @@ What is 2 + 3?<|im_end|>
             "mask": tinker.TensorData.from_torch(torch.tensor(mask, dtype=torch.float32)),
             "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens, dtype=torch.long)),
             "advantages": tinker.TensorData.from_torch(torch.zeros(len(input_tokens), dtype=torch.float32)),
-            "logprobs": tinker.TensorData.from_torch(torch.tensor(logprobs_shifted, dtype=torch.float32)),
+            "logprobs": tinker.TensorData.from_torch(torch.tensor(vllm_logprobs_padded, dtype=torch.float32)),
         }
     )
 
@@ -184,12 +184,12 @@ What is 2 + 3?<|im_end|>
 
 
 async def do_training_step(training_client: tinker.TrainingClient, tokenizer, prompt: str, response: str):
-    """Do a single training step.
+    """Do a single training step using SFT format.
 
-    Uses the full-sequence format to avoid last-token logprob mismatch:
-    - input_tokens: full sequence [t0, ..., tN]
-    - target_tokens: shifted left by 1, dummy at end [t1, ..., tN, t0]
-    - mask: shifted left by 1, dummy (last position) masked out
+    SFT format:
+    - input_tokens: full sequence excluding last token [t0, ..., t_{N-1}]
+    - target_tokens: shifted by 1 [t1, ..., t_N] - includes last token not in input!
+    - mask: 0 for prompt, 1 for response tokens
     """
 
     full_text = prompt + response
@@ -198,24 +198,18 @@ async def do_training_step(training_client: tinker.TrainingClient, tokenizer, pr
 
     prompt_len = len(prompt_tokens)
 
-    # CRITICAL FIX: Full-sequence format
-    # Input: full sequence [t0, ..., tN]
-    # Target: shifted left by 1, dummy at end [t1, ..., tN, t0]
-    # Mask: shifted left by 1, dummy position masked out
-    input_tokens = tokens  # Full sequence
-    target_tokens = tokens[1:] + [tokens[0]]  # Shifted, dummy at end
+    # SFT format
+    input_tokens = tokens[:-1]  # Exclude last token
+    target_tokens = tokens[1:]  # Shift by 1, includes last token
 
-    # Base mask: 0 for prompt, 1 for response
-    base_mask = [0.0] * prompt_len + [1.0] * (len(tokens) - prompt_len)
-    # Shifted mask: shifted left by 1, dummy (last position) masked out
-    mask = base_mask[1:] + [0.0]  # Dummy position masked out
+    # Mask: 0 for prompt (up to prompt_len-1), 1 for response
+    mask = [0.0] * (prompt_len - 1) + [1.0] * (len(input_tokens) - prompt_len + 1)
 
-    # Advantages and logprobs also need to be shifted
-    base_advantages = [0.0] * prompt_len + [1.0] * (len(tokens) - prompt_len)
-    advantages = base_advantages[1:] + [0.0]  # Dummy position has 0 advantage
+    # Advantages: 1 for response tokens (for SFT, uniform weight)
+    advantages = [0.0] * (prompt_len - 1) + [1.0] * (len(input_tokens) - prompt_len + 1)
 
-    base_logprobs = [0.0] * len(tokens)
-    logprobs = base_logprobs[1:] + [0.0]  # Dummy position has 0 logprob
+    # Logprobs: dummy zeros (will be computed by forward pass)
+    logprobs = [0.0] * len(input_tokens)
 
     datum = tinker.Datum(
         model_input=tinker.ModelInput.from_ints(input_tokens),
