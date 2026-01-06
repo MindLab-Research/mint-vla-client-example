@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateModelFromStateRequest,
     CreateModelFromStateResponse,
@@ -97,6 +98,14 @@ async def create_model(
     """Create a new training model with LoRA."""
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    # Check model access permissions
+    user_data = _get_user_data(http_request)
+    if not can_access_model(request.base_model, user_data):
+        raise HTTPException(
+            status_code=403,
+            detail=get_access_denied_error(request.base_model)
+        )
 
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
@@ -228,6 +237,7 @@ def _resolve_state_path(state_uri: str) -> str:
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a training model and load existing checkpoint.
 
@@ -236,6 +246,14 @@ async def create_model_from_state(
     """
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    # Check model access permissions
+    user_data = _get_user_data(http_request)
+    if not can_access_model(request.base_model, user_data):
+        raise HTTPException(
+            status_code=403,
+            detail=get_access_denied_error(request.base_model)
+        )
 
     request_id = future_store.create()
     background_tasks.add_task(_do_create_model_from_state, request_id, request)
