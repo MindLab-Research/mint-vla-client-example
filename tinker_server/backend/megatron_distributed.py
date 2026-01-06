@@ -2150,7 +2150,8 @@ class MegatronRankWorker:
     def save_checkpoint(self, save_path: str, step_count: int = 0, actual_rank: int | None = None) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
-        Only rank 0 saves the checkpoint.
+        IMPORTANT: ALL ranks must call this method because get_lora_state_dict()
+        uses NCCL collectives. Only rank 0 saves to disk.
 
         Args:
             save_path: Directory path to save checkpoint files.
@@ -2159,20 +2160,24 @@ class MegatronRankWorker:
                          If None, falls back to self.lora_rank (max_lora_rank).
 
         Returns:
-            Dict with training metadata.
+            Dict with training metadata (rank 0 only, others return empty).
         """
         import json
         import os
 
         from safetensors.torch import save_file
 
+        # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
+        # Only rank 0 gets actual data, others get empty dict
+        state_dict = self.get_lora_state_dict()
+
+        # Only rank 0 saves to disk
         if self.rank != 0:
             return {}
 
         os.makedirs(save_path, exist_ok=True)
 
         # 1. LoRA weights (PEFT format)
-        state_dict = self.get_lora_state_dict()
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
@@ -2805,16 +2810,24 @@ class MegatronWorkerGroup:
 
 
     def save_checkpoint(self, save_path: str) -> dict:
-        """Save checkpoint using rank 0 worker.
+        """Save checkpoint using all workers (rank 0 saves, others participate in NCCL).
+
+        IMPORTANT: Must call ALL workers because MegatronRankWorker.save_checkpoint
+        calls get_lora_state_dict() which uses NCCL collectives internally.
+        Calling only rank 0 would deadlock waiting for other ranks.
 
         Args:
             save_path: Directory path to save checkpoint files.
 
         Returns:
-            Dict with training metadata.
+            Dict with training metadata (from rank 0).
         """
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path} (actual_rank={self._actual_rank})")
-        result = ray.get(self.workers[0].save_checkpoint.remote(save_path, self._step_count, self._actual_rank))
+        # Call ALL workers - get_lora_state_dict uses NCCL allgather
+        # Rank 0 saves to disk, other ranks participate in collectives then return empty
+        futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank) for w in self.workers]
+        results = ray.get(futures, timeout=300)
+        result = results[0]  # Only rank 0 returns actual data
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
 
