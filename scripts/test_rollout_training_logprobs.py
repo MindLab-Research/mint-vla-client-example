@@ -123,48 +123,45 @@ You can use basic arithmetic operations (+, -, *, /) and each number can only be
     fwd_bwd_result = await fwd_bwd_future.result_async()
 
     training_logprobs = fwd_bwd_result.loss_fn_outputs[0]["logprobs"].to_torch()
-    # print(f"ForwardBackwardOutput.loss_fn_outputs.: len={len(training_logprobs)}")
 
-    mask_tensor = torch.tensor(mask, dtype=torch.float32)
-    sampled_logprobs_tensor = torch.tensor(target_logprobs, dtype=torch.float32)
+    # Only compare logprobs on generated tokens (not prompt tokens)
+    # After the full-sequence fix:
+    # - input_tokens has len(prompt) + len(sampled) tokens
+    # - training_logprobs has same length
+    # - We only have vLLM logprobs for sampled tokens (positions len(prompt) to len(prompt)+len(sampled)-1)
+    # Note: position indices are BEFORE the [1:] shift that was applied to mask/target_logprobs
 
-    mask_bool = mask_tensor > 0.5
-    sampled_logprobs_masked = sampled_logprobs_tensor[mask_bool]
-    training_logprobs_masked = training_logprobs[mask_bool]
+    # Extract logprobs for generated token positions only
+    # The shift means: original position i corresponds to shifted position i-1
+    # Generated tokens start at original position len(prompt_tokens), which is shifted position len(prompt_tokens)-1
+    gen_start = len(prompt_tokens) - 1  # First generated token position after shift
+    gen_end = gen_start + len(sampled_tokens)  # One past last generated token
 
-    # Exclude the last token from comparison
-    if exclude_last_token:
-        sampled_logprobs_masked = sampled_logprobs_masked[:-1]
-        training_logprobs_masked = training_logprobs_masked[:-1]
+    # Get vLLM logprobs (already shifted in target_logprobs)
+    vllm_logprobs = torch.tensor(target_logprobs[gen_start:gen_end], dtype=torch.float32)
+    megatron_logprobs = training_logprobs[gen_start:gen_end]
 
-    # print(f"Mask=1 positions: {mask_bool.sum().item()}")
-    # print(f"Sampled logprobs (masked): {sampled_logprobs_masked.tolist()}")
-    # print(f"Training logprobs (masked): {training_logprobs_masked.tolist()}")
+    # Sanity check
+    assert len(vllm_logprobs) == len(sampled_tokens), f"vLLM logprobs length mismatch: {len(vllm_logprobs)} vs {len(sampled_tokens)}"
+    assert len(megatron_logprobs) == len(sampled_tokens), f"Megatron logprobs length mismatch: {len(megatron_logprobs)} vs {len(sampled_tokens)}"
 
-    diff = sampled_logprobs_masked - training_logprobs_masked
+    diff = vllm_logprobs - megatron_logprobs
 
     max_diff = torch.abs(diff).max().item()
     mean_diff = torch.abs(diff).mean().item()
     mse = (diff ** 2).mean().item()
-    relative_diff = torch.abs(diff / (sampled_logprobs_masked.abs() + 1e-8))
+    relative_diff = torch.abs(diff / (vllm_logprobs.abs() + 1e-8))
     max_relative_diff = relative_diff.max().item()
 
-    print("\nDetailed comparison (all tokens in mask):")
-    masked_indices = torch.where(mask_bool)[0]
-    if exclude_last_token:
-        masked_indices = masked_indices[:-1]
-    for i, idx in enumerate(masked_indices):
-        token_idx = int(idx.item())
-        token = target_tokens[token_idx]
+    print(f"\nDetailed comparison (generated tokens only, {len(sampled_tokens)} tokens):")
+    for i in range(len(sampled_tokens)):
+        token = sampled_tokens[i]
         token_str = tokenizer.decode([token])
-        sampled_lp = sampled_logprobs_tensor[token_idx].item()
-        training_lp = training_logprobs[token_idx].item()
-        diff_val = diff[i].item()
-        rel_diff_val = relative_diff[i].item()
-        print(
-            f"  {token_idx} Token {token}: '{token_str}' "
-            f"| sampled={sampled_lp:.6f}, training={training_lp:.6f}, diff={diff_val:.6f}, rel_diff={rel_diff_val:.2f}"
-        )
+        vllm_lp = vllm_logprobs[i].item()
+        meg_lp = megatron_logprobs[i].item()
+        d = diff[i].item()
+        rel = relative_diff[i].item()
+        print(f"  {i} Token {token}: {repr(token_str)} | vllm={vllm_lp:.6f}, megatron={meg_lp:.6f}, diff={d:.6f}, rel_diff={rel:.2f}")
 
     print("=" * 60)
     print("Comparison results:")
