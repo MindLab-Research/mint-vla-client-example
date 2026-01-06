@@ -1173,6 +1173,30 @@ class MegatronRankWorker:
         """
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
 
+        # ========== Try HollowMan Megatron-Bridge export_adapter_weights API ==========
+        # This is enabled via USE_MBRIDGE_LORA_EXPORT=true environment variable which
+        # prepends HollowMan fork to PYTHONPATH
+        bridge = getattr(self.engine, 'bridge', None)
+        if bridge is not None and hasattr(bridge, 'export_adapter_weights'):
+            logger.info(f"[Rank {self.rank}] Using Megatron-Bridge export_adapter_weights API")
+            adapter_state = {}
+
+            with self.engine.eval_mode():
+                for name, tensor in bridge.export_adapter_weights(self.engine.module, cpu=True, show_progress=False):
+                    if self.rank == 0:
+                        adapter_state[name] = tensor.clone()
+
+            # Non-rank-0 workers return empty dict
+            if self.rank != 0:
+                logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
+                return {}
+
+            logger.info(f"[Rank 0] export_adapter_weights returned {len(adapter_state)} params")
+            return adapter_state
+
+        # ========== Fall back to custom implementation ==========
+        logger.info(f"[Rank {self.rank}] Using custom LoRA extraction (export_adapter_weights not available)")
+
         # Write diagnostic output to shared PFS for debugging
         debug_file = "/vePFS-Mindverse/share/code/tinker-server/debug_lora_export.log"
 

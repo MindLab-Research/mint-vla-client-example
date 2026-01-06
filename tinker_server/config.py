@@ -17,12 +17,23 @@ PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
 # Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
 PFS_MEGATRON_BRIDGE_PATH = "/vePFS-Mindverse/share/code/megatron-bridge/src"
 
+# HollowMan fork with export_adapter_weights API for LoRA export
+# Clone from: https://github.com/HollowMan6/Megatron-Bridge.git branch merged
+PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
+
+# Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
+USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").lower() in ("true", "1", "yes")
+
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
 PFS_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
 
 # PYTHONPATH for Ray actors - megatron-bridge first (ETP fix), then verl, tinker-server, HF modules
-PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+# When USE_MBRIDGE_LORA_EXPORT is enabled, use HollowMan fork instead of current megatron-bridge
+if USE_MBRIDGE_LORA_EXPORT:
+    PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+else:
+    PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
 
 
 @dataclass
