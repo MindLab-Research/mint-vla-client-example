@@ -2554,8 +2554,9 @@ class MegatronWorkerGroup:
         }
 
         # Add PPO metrics if present (now pre-extracted as scalars)
+        # importance_sampling uses PPO loss with epsilon=inf, so include it here
         n_ppo = rank0_result.get("n_ppo_results", 0)
-        if loss_fn == "ppo" and n_ppo > 0:
+        if loss_fn in ("ppo", "importance_sampling") and n_ppo > 0:
             clip_frac_sum = rank0_result.get("clip_frac_sum", 0.0)
             ratio_mean_sum = rank0_result.get("ratio_mean_sum", 0.0)
             metrics["clipfrac:mean"] = float(clip_frac_sum / n_ppo)
