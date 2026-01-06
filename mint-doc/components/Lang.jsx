@@ -7,6 +7,8 @@ const LanguageContext = createContext({ lang: 'en', toggle: () => {} })
 // 侧边栏翻译映射
 const sidebarTranslations = {
   "Introduction": "简介",
+  "Demo": "示例",
+  "Quickstart": "快速上手",
   "Getting Started": "快速开始",
   "Using the API": "使用指南",
   "API Reference": "API 参考",
