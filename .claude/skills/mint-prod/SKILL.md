@@ -165,6 +165,7 @@ export PYTHONPATH=/root/tinker_project/tinker-server-auth:$PYTHONPATH
 export TINKER_API_KEY=$TINKER_API_KEY          # from .secrets.env
 export TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY  # from .secrets.env
 export TINKER_PORT=18000
+export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
 ```
 
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
@@ -187,6 +188,7 @@ ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
   TINKER_API_KEY=$TINKER_API_KEY \
   TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
   TINKER_PORT=18000 \
+  TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints \
   python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
 ```
 
@@ -271,6 +273,7 @@ ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
   TINKER_API_KEY=$TINKER_API_KEY \
   TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
   TINKER_PORT=18000 \
+  TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints \
   python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
 ```
 
@@ -293,6 +296,7 @@ ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
   TINKER_API_KEY=$TINKER_API_KEY \
   TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
   TINKER_PORT=18000 \
+  TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints \
   python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
 
 # Wait for vLLM init (~80s)
