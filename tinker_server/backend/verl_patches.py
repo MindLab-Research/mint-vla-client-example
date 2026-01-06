@@ -47,13 +47,146 @@ def _is_mla_model(hf_config) -> bool:
     return False
 
 
+def _apply_external_label_patch():
+    """Patch MegatronEngineWithLMHead.forward_step to use external labels when provided.
+
+    Problem: verl's forward_step creates labels from input_ids.clone(), then rolls them:
+        label = input_ids.clone()  # [t0, t1, ..., t_{N-1}]
+        # After roll in model_forward.py: [t1, t2, ..., t_{N-1}, t0]
+        # Position N-1 gets label t0 (WRONG - should be t_N)
+
+    This causes wrong logprob at the last position when using standard SFT format:
+        input = full_sequence[:-1]   # [t0, ..., t_{N-1}]
+        target = full_sequence[1:]   # [t1, ..., t_N]
+
+    The key insight: external labels ALREADY contain the correct target t_N at position N-1.
+    We must NOT roll them - they're already correctly aligned.
+
+    Solution: When external labels are provided, use key "external_label" instead of "label".
+    model_forward.py only rolls when key == "label", so external labels won't be rolled.
+    Update logits_processor to accept the label via **kwargs to handle both keys.
+    """
+    import torch
+
+    try:
+        from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
+    except ImportError:
+        logger.warning("MegatronEngineWithLMHead not found, skipping external label patch")
+        return
+
+    original_forward_step = MegatronEngineWithLMHead.forward_step
+
+    def patched_forward_step(self, batch_iter, model, postprocess_micro_batch_func):
+        """Patched forward_step that uses external labels when provided."""
+        from functools import partial
+        from tensordict import TensorDict
+        from verl.utils.megatron_utils import get_device_id
+        from verl.workers.engine.megatron.transformer_impl import tu, DatasetPadMode, extract_multi_modal_inputs
+        import verl.utils.torch_functional as verl_F
+        from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy
+        from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+        batch: TensorDict = next(batch_iter)
+        batch = batch.to(get_device_id())
+        use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
+        calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        temperature = batch["temperature"]
+        model_inputs = self.prepare_model_inputs(batch)
+        input_ids = model_inputs["input_ids"]
+        multi_modal_inputs = model_inputs["multi_modal_inputs"]
+
+        if not isinstance(temperature, torch.Tensor):
+            temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
+
+        assert temperature.shape[0] == input_ids.shape[0]
+        temperature = verl_F.expand_as_nested(temperature, input_ids)
+
+        # PATCH: Check for external labels (key "target")
+        # External labels are already correctly shifted: target[i] = full_sequence[i+1]
+        # Critically: target[N-1] = t_N (the LAST token, not in input_ids!)
+        external_label = batch.get("target", None)
+        use_external_label = tu.get_non_tensor_data(batch, key="use_external_label", default=False)
+
+        if external_label is not None and use_external_label:
+            # Use external labels - already correctly shifted, must NOT be rolled
+            label = external_label
+            label_key = "external_label"  # Key != "label" so model_forward.py won't roll
+            print(f"[VERL_PATCH] Using external labels (no roll)", flush=True)
+        else:
+            # Original behavior: clone input_ids, will be rolled by model_forward.py
+            if pad_mode == DatasetPadMode.NO_PADDING:
+                label = input_ids.clone()
+            else:
+                raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
+            label_key = "label"  # Will trigger roll in model_forward.py
+
+        from verl.models.mcore import get_mcore_forward_no_padding_fn
+
+        if use_fused_kernels:
+            raise NotImplementedError("Fused kernels are not supported for megatron engine")
+
+        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
+
+        def logits_processor(logits, temperature, **label_kwargs):
+            """Process logits to compute log_probs.
+
+            Accepts label via **kwargs to handle both "label" and "external_label" keys.
+            model_forward.py passes logits_processor_args as **kwargs, so the key name
+            determines the parameter name.
+            """
+            # Get label from either key
+            label = label_kwargs.get("label") or label_kwargs.get("external_label")
+            if label is None:
+                raise ValueError(f"No label found in kwargs: {label_kwargs.keys()}")
+
+            assert logits.shape[:2] == label.shape[:2], f"Shape mismatch: logits={logits.shape}, label={label.shape}"
+            temperature[temperature <= 0] = 1e-8
+            assert torch.all(temperature > 0).item(), f"temperature must be positive. Got {temperature}"
+            logits.div_(temperature.unsqueeze(dim=-1))
+            ret = {}
+            if calculate_entropy:
+                logits_bak = logits.clone()
+                entropy = vocab_parallel_entropy(logits)
+                ret["entropy"] = entropy
+            else:
+                logits_bak = logits
+
+            log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+            ret["log_probs"] = log_probs
+            return ret
+
+        # PATCH: Use dynamic key for label
+        logits_processor_args = {label_key: label, "temperature": temperature}
+
+        output = forward_fn(
+            model,
+            input_ids,
+            multi_modal_inputs,
+            logits_processor=logits_processor,
+            logits_processor_args=logits_processor_args,
+            vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+            pad_token_id=self.model_config.tokenizer.pad_token_id,
+            data_format="thd" if self.engine_config.use_remove_padding else "bshd",
+        )
+
+        return output, partial(postprocess_micro_batch_func, data=batch)
+
+    MegatronEngineWithLMHead.forward_step = patched_forward_step
+    print("[VERL_PATCH] Applied external label patch for MegatronEngineWithLMHead.forward_step")
+    logger.info("Applied external label patch (fixes last-token logprob issue)")
+
+
 def apply_verl_patches():
-    """Apply monkey-patches to verl for MLA attention backend fix."""
+    """Apply monkey-patches to verl for MLA attention backend fix and external labels support."""
     try:
         from verl.workers.engine.megatron.transformer_impl import MegatronEngine
     except ImportError:
         logger.warning("verl.workers.engine.megatron.transformer_impl not found, skipping patches")
         return
+
+    # Apply external label patch first (fixes last-token logprob issue)
+    _apply_external_label_patch()
 
     # Store original method
     original_build_tf_config = MegatronEngine._build_tf_config

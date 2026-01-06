@@ -416,3 +416,21 @@ def get_kv_cache_dtype(model_name: str) -> str | None:
     """
     config = get_model_config(model_name)
     return config.kv_cache_dtype
+
+
+def get_gradient_checkpointing(model_name: str) -> bool:
+    """Check if model should use gradient checkpointing during training.
+
+    Gradient checkpointing trades compute for memory by recomputing
+    activations during backward pass instead of storing them.
+    Recommended for large dense models (4B+) with long sequences.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        True if gradient checkpointing should be enabled
+    """
+    # k2-support branch doesn't have gradient_checkpointing field in ModelConfig yet
+    # Just return False for now to unblock testing
+    return False

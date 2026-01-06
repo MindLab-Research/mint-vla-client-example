@@ -2458,6 +2458,9 @@ class MegatronWorkerGroup:
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
+                # TransformerEngine debug - see why attention backends are disabled
+                "NVTE_DEBUG": "1",
+                "NVTE_DEBUG_LEVEL": "2",
             },
         }
 
@@ -3501,7 +3504,7 @@ def get_or_create_megatron_worker_group(
         resource_pool.mark_ready(actor_name)
         # Reinitialize LoRA weights for fresh session with actual_rank
         logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate}, actual_rank={lora_rank})...")
-        result = ray.get(actor.reinit_lora_weights.remote(learning_rate, lora_rank))
+        result = ray.get(actor.reinit_lora_weights.remote(learning_rate=learning_rate, actual_rank=lora_rank))
         logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}, actual_rank={result.get('actual_rank')}")
         return actor
     except ValueError:

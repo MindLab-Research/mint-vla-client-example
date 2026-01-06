@@ -1483,9 +1483,9 @@ class VerlTrainingEngine:
             # Reinitialize LoRA weights for fresh session (statelessness)
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
-            logger.info(f"[{model_id}] Reinitializing Megatron LoRA weights for new session (lr={session.learning_rate}, rank={lora_rank})...")
+            logger.info(f"[{model_id}] Reinitializing Megatron LoRA weights for new session (lr={session.learning_rate})...")
             import ray
-            result = ray.get(worker.reinit_lora_weights.remote(learning_rate=session.learning_rate, actual_rank=lora_rank))
+            result = ray.get(worker.reinit_lora_weights.remote(session.learning_rate, lora_rank))
             logger.info(f"[{model_id}] Megatron LoRA weights reinitialized: {result.get('total_params', 0)} params")
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse

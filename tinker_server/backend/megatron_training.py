@@ -98,9 +98,11 @@ def tinker_to_tensordict(
     loss_mask_list = []
     old_log_probs_list = []
     advantages_list = []
+    target_tokens_list = []  # External labels (correctly shifted, with true last token)
 
     max_len = 0
     has_rl_inputs = False
+    has_external_labels = False
 
     # First pass: collect data and find max length
     for item in data_items:
@@ -136,6 +138,14 @@ def tinker_to_tensordict(
             old_log_probs_list.append(logprobs_data["data"])
         if advantages_data.get("data"):
             advantages_list.append(advantages_data["data"])
+
+        # External labels (target_tokens) - correctly shifted with true last token
+        # This solves the verl roll bug where last position gets wrapped first token
+        target_tokens_data = loss_fn_inputs.get("target_tokens", {})
+        if target_tokens_data.get("data"):
+            has_external_labels = True
+            target_tokens_list.append(target_tokens_data["data"])
+            print(f"[tinker_to_tensordict] Extracted target_tokens, len={len(target_tokens_data['data'])}", flush=True)
 
     if not input_ids_list:
         raise ValueError("No valid data items found")
@@ -173,6 +183,15 @@ def tinker_to_tensordict(
     if advantages_list:
         advantages_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in advantages_list]
         td["advantages"] = torch.nested.as_nested_tensor(advantages_tensors, layout=torch.jagged)
+
+    # Add external labels if present (target_tokens with correct last token)
+    # Key MUST NOT be "label" - verl applies torch.roll when key == "label"
+    # Using "target" bypasses roll since need_roll=(k == "label") in model_forward.py
+    if has_external_labels and target_tokens_list:
+        target_tokens_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in target_tokens_list]
+        td["target"] = torch.nested.as_nested_tensor(target_tokens_tensors, layout=torch.jagged)
+        td.set_non_tensor("use_external_label", True)
+        print(f"[tinker_to_tensordict] Added external labels (key='target', no roll), batch_size={len(target_tokens_list)}", flush=True)
 
     # Add non-tensor metadata for verl's prepare_micro_batches
     # use_dynamic_bsz=True is REQUIRED for NestedTensor compatibility with verl's forward
