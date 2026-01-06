@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from safetensors.torch import load_file
 
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateSamplingSessionRequest,
     CreateSamplingSessionResponse,
@@ -41,6 +42,11 @@ sampling_sessions: dict[str, str] = {}  # sampling_session_id -> base_model
 
 # Global session manager reference (set by app lifespan)
 session_manager: SessionManager | None = None
+
+
+def _get_user_data(request: Request) -> dict | None:
+    """Extract full user_data from request state (set by auth middleware)."""
+    return getattr(request.state, "user_data", None)
 
 
 @router.get("/healthz")
@@ -77,6 +83,7 @@ async def create_session(request: CreateSessionRequest) -> CreateSessionResponse
 @router.post("/create_sampling_session")
 async def create_sampling_session(
     request: CreateSamplingSessionRequest,
+    http_request: Request,
 ) -> CreateSamplingSessionResponse:
     """Create a sampling session using the shared multi-LoRA engine.
 
@@ -103,6 +110,14 @@ async def create_sampling_session(
         raise HTTPException(
             status_code=422,
             detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
+        )
+
+    # Check model access permissions
+    user_data = _get_user_data(http_request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(
+            status_code=403,
+            detail=get_access_denied_error(base_model)
         )
 
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
