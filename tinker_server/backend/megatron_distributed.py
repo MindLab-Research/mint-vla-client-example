@@ -1314,6 +1314,45 @@ class MegatronRankWorker:
                 dist.all_gather(gathered_list, tensor.contiguous(), group=tp_group)
                 return torch.cat(gathered_list, dim=split_dim)
 
+        def _split_fused_gate_up_lora_b(tensor, tp_size_for_split: int):
+            """Split fused gate+up lora_B tensor with TP-aware interleaved layout.
+
+            When TP > 1, lora_B for fused gate+up is interleaved:
+            Layout: [gate_shard0, up_shard0, gate_shard1, up_shard1, ...]
+
+            M-Bridge reference: peft_bridge.py:282-311
+
+            Args:
+                tensor: Fused lora_B tensor of shape (2*intermediate_size, rank)
+                tp_size_for_split: TP size (use ETP for expert layers, TP for dense)
+
+            Returns:
+                (gate_tensor, up_tensor) each of shape (intermediate_size, rank)
+            """
+            import torch
+
+            if tp_size_for_split <= 1:
+                # Simple contiguous split
+                half_size = tensor.shape[0] // 2
+                return tensor[:half_size, :].clone(), tensor[half_size:, :].clone()
+
+            # TP > 1: Deinterleave the shards
+            shard_size = tensor.shape[0] // tp_size_for_split
+            if shard_size * tp_size_for_split != tensor.shape[0] or shard_size % 2 != 0:
+                # Fallback if dimensions don't match expected interleaved layout
+                logger.warning(f"Unexpected tensor shape for TP-aware split: {tensor.shape}, tp_size={tp_size_for_split}")
+                half_size = tensor.shape[0] // 2
+                return tensor[:half_size, :].clone(), tensor[half_size:, :].clone()
+
+            shards = torch.split(tensor, shard_size, dim=0)
+            gate_parts = []
+            up_parts = []
+            for shard in shards:
+                gate_shard, up_shard = torch.chunk(shard, 2, dim=0)
+                gate_parts.append(gate_shard)
+                up_parts.append(up_shard)
+            return torch.cat(gate_parts, dim=0), torch.cat(up_parts, dim=0)
+
         # Get TP group and size for gathering
         try:
             from megatron.core import parallel_state as mpu
@@ -1634,9 +1673,9 @@ class MegatronRankWorker:
                                 gate_tensor = tensor
                                 up_tensor = tensor
                             elif '.lora_B.' in peft_name:
-                                half_size = tensor.shape[0] // 2
-                                gate_tensor = tensor[:half_size, :]
-                                up_tensor = tensor[half_size:, :]
+                                # Use TP-aware split for interleaved gate+up layout
+                                # For MoE experts, use etp_size; if ETP=1, fallback to simple split
+                                gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, etp_size)
                             else:
                                 continue
 
@@ -1714,11 +1753,9 @@ class MegatronRankWorker:
                             gate_tensor = tensor.clone()
                             up_tensor = tensor.clone()
                         elif '.lora_B.' in peft_name:
-                            # lora_B is split in half along OUTPUT dim (dim 0)
-                            # Shape is (2*intermediate_size, rank), NOT (rank, 2*intermediate)
-                            half_size = tensor.shape[0] // 2
-                            gate_tensor = tensor[:half_size, :].clone()
-                            up_tensor = tensor[half_size:, :].clone()
+                            # lora_B uses TP-aware split for interleaved gate+up layout
+                            # For MoE/shared experts, use etp_size
+                            gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, etp_size)
                         else:
                             logger.warning(f"[Rank 0] Unknown lora type for fused MoE: {peft_name}")
                             continue
@@ -1769,12 +1806,9 @@ class MegatronRankWorker:
                     lora_state_dict[up_peft_name] = tensor.clone()
                     logger.info(f"[Rank 0] Split fused lora_A: {gate_peft_name}, {up_peft_name}")
                 elif '.lora_B.' in peft_name:
-                    # lora_B must be split in half along OUTPUT dim (dim 0):
-                    # Shape is (2*intermediate_size, rank), NOT (rank, 2*intermediate)
-                    # First half → gate_proj, Second half → up_proj
-                    half_size = tensor.shape[0] // 2
-                    gate_tensor = tensor[:half_size, :].clone()
-                    up_tensor = tensor[half_size:, :].clone()
+                    # lora_B uses TP-aware split for interleaved gate+up layout
+                    # For dense layers (non-MoE), use tp_size
+                    gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, tp_size)
                     lora_state_dict[gate_peft_name] = gate_tensor
                     lora_state_dict[up_peft_name] = up_tensor
                     logger.info(f"[Rank 0] Split fused lora_B: {gate_peft_name} shape {gate_tensor.shape}, {up_peft_name} shape {up_tensor.shape}")
