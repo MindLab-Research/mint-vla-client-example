@@ -22,7 +22,8 @@ PFS_MEGATRON_BRIDGE_PATH = "/vePFS-Mindverse/share/code/megatron-bridge/src"
 PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
 
 # Toggle to use HollowMan fork of Megatron-Bridge (affects training forward pass)
-USE_HOLLOWMAN_MBRIDGE = os.environ.get("USE_HOLLOWMAN_MBRIDGE", "false").lower() in ("true", "1", "yes")
+# Default: true - HollowMan fork fixes train-inference KL divergence (verified 2026-01-07)
+USE_HOLLOWMAN_MBRIDGE = os.environ.get("USE_HOLLOWMAN_MBRIDGE", "true").lower() in ("true", "1", "yes")
 
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
 USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").lower() in ("true", "1", "yes")
