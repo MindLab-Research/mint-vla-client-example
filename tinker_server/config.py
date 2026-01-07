@@ -21,6 +21,9 @@ PFS_MEGATRON_BRIDGE_PATH = "/vePFS-Mindverse/share/code/megatron-bridge/src"
 # Clone from: https://github.com/HollowMan6/Megatron-Bridge.git branch merged
 PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
 
+# Toggle to use HollowMan fork of Megatron-Bridge (affects training forward pass)
+USE_HOLLOWMAN_MBRIDGE = os.environ.get("USE_HOLLOWMAN_MBRIDGE", "false").lower() in ("true", "1", "yes")
+
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
 USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").lower() in ("true", "1", "yes")
 
@@ -29,8 +32,8 @@ USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").low
 PFS_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
 
 # PYTHONPATH for Ray actors - megatron-bridge first (ETP fix), then verl, tinker-server, HF modules
-# When USE_MBRIDGE_LORA_EXPORT is enabled, use HollowMan fork instead of current megatron-bridge
-if USE_MBRIDGE_LORA_EXPORT:
+# USE_HOLLOWMAN_MBRIDGE controls which megatron-bridge version is used
+if USE_HOLLOWMAN_MBRIDGE:
     PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
 else:
     PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
