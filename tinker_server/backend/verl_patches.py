@@ -88,6 +88,7 @@ def _apply_external_label_patch():
 
         batch: TensorDict = next(batch_iter)
         batch = batch.to(get_device_id())
+
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -112,7 +113,6 @@ def _apply_external_label_patch():
             # Use external labels - already correctly shifted, must NOT be rolled
             label = external_label
             label_key = "external_label"  # Key != "label" so model_forward.py won't roll
-            print(f"[VERL_PATCH] Using external labels (no roll)", flush=True)
         else:
             # Original behavior: clone input_ids, will be rolled by model_forward.py
             if pad_mode == DatasetPadMode.NO_PADDING:
@@ -128,12 +128,19 @@ def _apply_external_label_patch():
 
         forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
+        # Capture actual sequence lengths from input_ids (nested tensor) for padding mask
+        # input_ids.offsets() gives cumulative lengths, diff() gives per-sequence lengths
+        actual_seq_lens = input_ids.offsets().diff().tolist()
+
         def logits_processor(logits, temperature, **label_kwargs):
             """Process logits to compute log_probs.
 
             Accepts label via **kwargs to handle both "label" and "external_label" keys.
             model_forward.py passes logits_processor_args as **kwargs, so the key name
             determines the parameter name.
+
+            CRITICAL FIX: Mask padded positions to avoid garbage logits corrupting log_probs.
+            Padded positions have uninitialized/garbage logits that produce -2.2B log_probs.
             """
             # Get label from either key
             label = label_kwargs.get("label") or label_kwargs.get("external_label")
@@ -152,7 +159,48 @@ def _apply_external_label_patch():
             else:
                 logits_bak = logits
 
+            # Compute log_probs via cross-entropy
             log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+
+            # CRITICAL FIX: Mask padded positions
+            # Padded positions have garbage logits (uninitialized GPU memory) that produce
+            # catastrophic log_probs like -2.2 billion. Set them to 0.0 (neutral value).
+            #
+            # The data flow is:
+            # 1. preprocess_thd_no_padding pads sequence to align_size (TP * CP * 2)
+            # 2. Model forward produces logits for ALL positions (valid + padding)
+            # 3. Logits at padding positions are garbage (not computed by model)
+            # 4. Cross-entropy on garbage produces garbage log_probs
+            # 5. postprocess_thd_no_padding extracts only valid positions AFTER damage is done
+            #
+            # Fix: Zero out log_probs at padded positions before they propagate further.
+
+            from megatron.core import parallel_state as mpu
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            cp_size = mpu.get_context_parallel_world_size()
+            align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+
+            # Build valid position mask based on actual vs padded lengths
+            # log_probs shape: [1, padded_total_len] in THD format
+            padded_total_len = log_probs.shape[1]
+            valid_mask = torch.zeros(padded_total_len, dtype=torch.bool, device=log_probs.device)
+
+            # Calculate cumulative padded offsets
+            cu_padded = 0
+            for i, actual_len in enumerate(actual_seq_lens):
+                pad_size = (align_size - actual_len % align_size) % align_size
+                padded_len = actual_len + pad_size
+                # Mark valid positions (actual_len positions starting at cu_padded)
+                valid_mask[cu_padded : cu_padded + actual_len] = True
+                cu_padded += padded_len // cp_size  # Account for CP splitting
+
+            # Count how many positions we're masking
+            n_valid = valid_mask.sum().item()
+            n_padded = padded_total_len - n_valid
+            if n_padded > 0:
+                # Zero out padded positions (they have garbage log_probs)
+                log_probs[0, ~valid_mask] = 0.0
+
             ret["log_probs"] = log_probs
             return ret
 
