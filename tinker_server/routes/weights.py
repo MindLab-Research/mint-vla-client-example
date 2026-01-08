@@ -397,15 +397,17 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     for name in os.listdir(checkpoints_path):
         ckpt_path = os.path.join(checkpoints_path, name)
         if os.path.isdir(ckpt_path):
-            # Check ownership via metadata.json (admin can access all)
+            # Check ownership via metadata.json (admin can access all, others only their own)
             if user_id != "admin":
                 metadata_path = os.path.join(ckpt_path, "metadata.json")
                 if os.path.exists(metadata_path):
                     import json
                     with open(metadata_path) as f:
                         metadata = json.load(f)
-                    if metadata.get("owner_id") not in (user_id, "admin", None):
-                        continue  # Skip checkpoints owned by other users
+                    if metadata.get("owner_id") != user_id:
+                        continue  # Skip checkpoints not owned by user
+                else:
+                    continue  # Skip checkpoints without metadata (legacy)
 
             # Try to parse step from directory name
             step = None
@@ -453,15 +455,18 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    # Check ownership (admin can delete all)
+    # Check ownership (admin can delete all, others only their own)
     if user_id != "admin":
         metadata_path = os.path.join(ckpt_path, "metadata.json")
         if os.path.exists(metadata_path):
             import json
             with open(metadata_path) as f:
                 metadata = json.load(f)
-            if metadata.get("owner_id") not in (user_id, "admin", None):
+            if metadata.get("owner_id") != user_id:
                 raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            # No metadata.json = legacy checkpoint = deny access for non-admin
+            raise HTTPException(status_code=403, detail="Access denied")
 
     shutil.rmtree(ckpt_path)
 
@@ -491,15 +496,18 @@ async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request
     if not os.path.exists(ckpt_path):
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    # Check ownership (admin can download all)
+    # Check ownership (admin can download all, others only their own)
     if user_id != "admin":
         metadata_path = os.path.join(ckpt_path, "metadata.json")
         if os.path.exists(metadata_path):
             import json
             with open(metadata_path) as f:
                 metadata = json.load(f)
-            if metadata.get("owner_id") not in (user_id, "admin", None):
+            if metadata.get("owner_id") != user_id:
                 raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            # No metadata.json = legacy checkpoint = deny access for non-admin
+            raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
