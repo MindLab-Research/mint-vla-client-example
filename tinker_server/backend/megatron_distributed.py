@@ -800,17 +800,73 @@ class MegatronRankWorker:
             import traceback
             logger.warning(f"[Rank {self.rank}] Warmup traceback: {traceback.format_exc()}")
 
+    def reset_expert_bias(self) -> dict:
+        """Reset expert_bias buffers to zero in all MoE router modules.
+
+        The expert_bias buffer accumulates during training (via finalize_model_grads)
+        to balance token distribution across experts. However, this buffer is NOT
+        exported with LoRA weights, causing train-inference mismatch:
+        - Megatron (trained): has accumulated expert_bias != 0
+        - vLLM (loaded LoRA): has expert_bias = 0
+
+        This causes different routing decisions and thus different logprobs even
+        with identical LoRA weights.
+
+        Call this before computing logprobs to ensure consistent behavior with vLLM.
+
+        Returns:
+            dict with reset counts (only from rank 0)
+        """
+        import torch
+
+        reset_count = 0
+        bias_values_before = []
+
+        # self.engine.module is a list (one per pipeline stage)
+        for model_chunk in self.engine.module:
+            # Iterate through all submodules
+            for name, module in model_chunk.named_modules():
+                if hasattr(module, 'expert_bias') and module.expert_bias is not None:
+                    bias_before = module.expert_bias.clone()
+                    if torch.any(bias_before != 0):
+                        bias_values_before.append((name, bias_before.cpu().tolist()))
+                    module.expert_bias.zero_()
+                    reset_count += 1
+
+                # Also reset local_tokens_per_expert if present
+                if hasattr(module, 'local_tokens_per_expert') and module.local_tokens_per_expert is not None:
+                    module.local_tokens_per_expert.zero_()
+
+        if self.rank == 0:
+            logger.info(f"[Rank {self.rank}] Reset {reset_count} expert_bias buffers to zero")
+            if bias_values_before:
+                logger.info(f"[Rank {self.rank}] Non-zero expert_bias found before reset: {len(bias_values_before)} modules")
+                for name, vals in bias_values_before[:3]:  # Log first 3
+                    logger.info(f"[Rank {self.rank}]   {name}: {vals[:5]}...")  # First 5 values
+
+        return {"reset_count": reset_count} if self.rank == 0 else {}
+
     def forward_backward(
         self,
         data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
         session_id: str | None = None,
+        reset_bias: bool = True,
     ) -> dict:
         """Run forward and backward pass on this rank's shard.
 
         Gradients are synchronized via NCCL allreduce.
         Returns metrics from rank 0 only, including per-sample loss_fn_outputs.
+
+        Args:
+            data_items: List of Tinker Datum dicts.
+            loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
+            loss_fn_config: Config for loss function (e.g., {"epsilon": 0.2} for PPO).
+            session_id: Optional session ID for gradient isolation.
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                This ensures logprobs match vLLM (which always has bias=0).
+                Default True for correct KL divergence calculation in RL.
 
         Note: TensorDict with nested tensors is created locally to avoid Ray
         serialization issues that cause CUDA memory corruption.
@@ -819,6 +875,12 @@ class MegatronRankWorker:
         from tinker_server.backend.megatron_training import (
             create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
         )
+
+        # Reset expert_bias for train-inference consistency
+        # expert_bias accumulates during training but isn't exported to vLLM
+        # Reset ensures Megatron routing matches vLLM routing for correct KL calculation
+        if reset_bias:
+            self.reset_expert_bias()
 
         # Session state swap moved inside train_mode() - see below
 
@@ -972,6 +1034,7 @@ class MegatronRankWorker:
     def forward(
         self,
         data_items: list[dict],
+        reset_bias: bool = True,
     ) -> dict:
         """Run forward pass only (no backward). Returns per-token logprobs.
 
@@ -984,9 +1047,21 @@ class MegatronRankWorker:
 
         Note: TensorDict with nested tensors is created locally to avoid Ray
         serialization issues that cause CUDA memory corruption.
+
+        Args:
+            data_items: List of data items with model_input and loss_fn_inputs.
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                This ensures logprobs match vLLM (which always has bias=0).
+                Default True for train-inference consistency.
         """
         import torch
         from tinker_server.backend.megatron_training import tinker_to_tensordict
+
+        # Reset expert_bias for train-inference consistency
+        # expert_bias accumulates during training but isn't exported to vLLM
+        # Reset ensures Megatron routing matches vLLM routing
+        if reset_bias:
+            self.reset_expert_bias()
 
         # Get sequence lengths from raw data (before tensor creation)
         seq_lengths = []
@@ -1500,12 +1575,28 @@ class MegatronRankWorker:
                             f.write(f"Total params: {len(all_param_names)}\n")
                             f.write(f"LoRA params found: {len(lora_param_names)}\n")
                             f.write(f"TP size: {tp_size}, ETP size: {etp_size}, EP size: {ep_size}\n")
-                            f.write(f"LoRA params with shapes:\n")
+                            f.write(f"LoRA params with shapes and norms:\n")
+                            total_norm = 0.0
+                            nonzero_count = 0
                             for n in lora_param_names[:50]:
                                 if n in adapter_state:
-                                    shape = list(adapter_state[n].shape)
-                                    f.write(f"  {n}: shape={shape}\n")
+                                    t = adapter_state[n]
+                                    shape = list(t.shape)
+                                    norm = float(t.norm().item())
+                                    max_val = float(t.abs().max().item())
+                                    total_norm += norm
+                                    if norm > 1e-8:
+                                        nonzero_count += 1
+                                    f.write(f"  {n}: shape={shape}, norm={norm:.6f}, max={max_val:.6f}\n")
+                            f.write(f"\nSummary: {nonzero_count}/{len(lora_param_names[:50])} tensors non-zero, total_norm={total_norm:.6f}\n")
                             f.write(f"===\n")
+                        # ALSO LOG TO STDOUT for visibility in server logs
+                        logger.info(f"[Rank 0] LoRA TENSOR NORMS: {nonzero_count}/{len(lora_param_names[:50])} non-zero, total_norm={total_norm:.6f}")
+                        for n in lora_param_names[:5]:
+                            if n in adapter_state:
+                                t = adapter_state[n]
+                                norm = float(t.norm().item())
+                                logger.info(f"[Rank 0] TENSOR {n}: norm={norm:.6f}")
                     except Exception as e:
                         logger.warning(f"Failed to write debug file: {e}")
 
@@ -2580,6 +2671,7 @@ class MegatronWorkerGroup:
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
         session_id: str | None = None,
+        reset_bias: bool = True,
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -2588,6 +2680,9 @@ class MegatronWorkerGroup:
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
             session_id: Session ID for multi-tenant gradient isolation.
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                This ensures logprobs match vLLM (which always has bias=0).
+                Default True for correct KL divergence calculation in RL.
 
         Returns:
             Dict with loss_fn_outputs and metrics.
@@ -2600,7 +2695,7 @@ class MegatronWorkerGroup:
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
         futures = [
-            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id)
+            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id, reset_bias)
             for w in self.workers
         ]
         results = ray.get(futures)
@@ -2637,6 +2732,7 @@ class MegatronWorkerGroup:
         self,
         data_items: list[dict],
         session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+        reset_bias: bool = True,
     ) -> dict:
         """Run forward pass only on all workers. Returns per-token logprobs.
 
@@ -2646,13 +2742,16 @@ class MegatronWorkerGroup:
         Args:
             data_items: List of Tinker Datum dicts.
             session_id: Unused - session management handled via swap_session().
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                This ensures logprobs match vLLM (which always has bias=0).
+                Default True for train-inference consistency.
 
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
-        futures = [w.forward.remote(data_items) for w in self.workers]
+        futures = [w.forward.remote(data_items, reset_bias) for w in self.workers]
         results = ray.get(futures)
 
         # Rank 0 result has metrics, loss_fn_outputs, and log_probs
@@ -2761,6 +2860,36 @@ class MegatronWorkerGroup:
         except ray.exceptions.RayActorError as e:
             logger.error(f"[MegatronWorkerGroup] get_lora_state_dict failed - worker died: {e}")
             raise RuntimeError(f"get_lora_state_dict failed - worker died: {e}")
+
+    def reset_expert_bias(self) -> dict:
+        """Reset expert_bias buffers to zero in all MoE router modules across all workers.
+
+        The expert_bias buffer accumulates during training to balance token distribution
+        across experts. However, this buffer is NOT exported with LoRA weights, causing
+        train-inference mismatch when comparing Megatron logprobs with vLLM.
+
+        Call this before computing logprobs to ensure consistent behavior with vLLM.
+
+        Returns:
+            dict with reset count from rank 0
+        """
+        logger.info("[MegatronWorkerGroup] reset_expert_bias: ENTRY")
+
+        try:
+            # Call ALL workers to ensure distributed consistency
+            futures = [w.reset_expert_bias.remote() for w in self.workers]
+            results = ray.get(futures, timeout=60)
+
+            # Rank 0's result has the count
+            result = results[0]
+            logger.info(f"[MegatronWorkerGroup] reset_expert_bias: reset {result.get('reset_count', 0)} buffers")
+            return result
+        except ray.exceptions.GetTimeoutError:
+            logger.error("[MegatronWorkerGroup] reset_expert_bias timed out")
+            raise RuntimeError("reset_expert_bias timed out")
+        except ray.exceptions.RayActorError as e:
+            logger.error(f"[MegatronWorkerGroup] reset_expert_bias failed: {e}")
+            raise RuntimeError(f"reset_expert_bias failed: {e}")
 
     def get_lora_config(self) -> dict:
         """Get LoRA configuration as dictionary.
