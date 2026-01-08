@@ -551,6 +551,31 @@ class TrainingWorker:
             outputs = self.model(input_ids=input_ids_t)
             logits = outputs.logits  # [1, seq_len, vocab_size]
 
+            # DEBUG: Inspect raw logits for anomalies
+            logits_for_debug = logits.squeeze(0)  # [seq_len, vocab]
+            max_logit = logits_for_debug.max().item()
+            min_logit = logits_for_debug.min().item()
+            has_nan = torch.isnan(logits_for_debug).any().item()
+            has_inf = torch.isinf(logits_for_debug).any().item()
+            # Get logits at target positions
+            target_logits = logits_for_debug[torch.arange(len(target_tokens)), target_ids_t.squeeze(0)]
+            target_max = target_logits.max().item()
+            target_min = target_logits.min().item()
+            # Store debug info for return
+            _debug_logits_info = {
+                "max_logit": max_logit,
+                "min_logit": min_logit,
+                "has_nan": has_nan,
+                "has_inf": has_inf,
+                "target_max": target_max,
+                "target_min": target_min,
+            }
+            # Check for extreme logits (> 50 or < -50)
+            extreme_mask = (logits_for_debug.abs() > 50).any(dim=-1)
+            if extreme_mask.any():
+                extreme_positions = extreme_mask.nonzero().squeeze(-1).tolist()
+                _debug_logits_info["extreme_positions"] = extreme_positions[:10]
+
             # Flatten for loss computation
             logits_flat = logits.squeeze(0)  # [seq_len, vocab]
             targets_flat = target_ids_t.squeeze(0)  # [seq_len]
@@ -693,6 +718,12 @@ class TrainingWorker:
             "num_samples:sum": float(len(data_items)),
             "num_tokens:sum": float(total_tokens),
         }
+
+        # Add debug logits info if available (from last item processed)
+        try:
+            metrics["_debug_logits"] = _debug_logits_info
+        except NameError:
+            pass
 
         # Add RL-specific metrics
         if num_rl_samples > 0:
@@ -1451,6 +1482,8 @@ class VerlTrainingEngine:
         else:
             base_model = requested_model
 
+        print(f"[DEBUG create_training_session] use_megatron={use_megatron}, base_model={base_model}", flush=True)
+
         if use_megatron:
             # MoE models need tensor/expert parallelism from model registry
             from .model_registry import get_training_parallelism, requires_fp8
@@ -1483,9 +1516,11 @@ class VerlTrainingEngine:
             # Reinitialize LoRA weights for fresh session (statelessness)
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
+            print(f"[DEBUG] About to call reinit_lora_weights for {model_id}, lr={session.learning_rate}, rank={lora_rank}", flush=True)
             logger.info(f"[{model_id}] Reinitializing Megatron LoRA weights for new session (lr={session.learning_rate}, rank={lora_rank})...")
             import ray
             result = ray.get(worker.reinit_lora_weights.remote(learning_rate=session.learning_rate, actual_rank=lora_rank))
+            print(f"[DEBUG] reinit_lora_weights result: {result}", flush=True)
             logger.info(f"[{model_id}] Megatron LoRA weights reinitialized: {result.get('total_params', 0)} params")
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse
@@ -1771,6 +1806,18 @@ class VerlTrainingEngine:
 
         state_dict, config = await loop.run_in_executor(None, get_with_timeout)
         logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
+
+        # DEBUG: Print tensor norms to trace LoRA values
+        print(f"[DEBUG save_weights] state_dict has {len(state_dict)} keys", flush=True)
+        total_norm = 0.0
+        nonzero_count = 0
+        for k, v in list(state_dict.items())[:10]:
+            norm = float(v.norm().item())
+            total_norm += norm
+            if norm > 1e-8:
+                nonzero_count += 1
+            print(f"[DEBUG save_weights] {k}: shape={list(v.shape)}, norm={norm:.6f}", flush=True)
+        print(f"[DEBUG save_weights] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}", flush=True)
 
         # Phase 7: Truncate weights to match actual_rank if using unified rank training
         # Actor's max_lora_rank may be > session's actual_rank

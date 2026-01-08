@@ -143,7 +143,10 @@ def _apply_external_label_patch():
             Padded positions have uninitialized/garbage logits that produce -2.2B log_probs.
             """
             # Get label from either key
-            label = label_kwargs.get("label") or label_kwargs.get("external_label")
+            # NOTE: Can't use `or` here because tensors don't support boolean evaluation
+            label = label_kwargs.get("label")
+            if label is None:
+                label = label_kwargs.get("external_label")
             if label is None:
                 raise ValueError(f"No label found in kwargs: {label_kwargs.keys()}")
 
@@ -225,8 +228,71 @@ def _apply_external_label_patch():
     logger.info("Applied external label patch (fixes last-token logprob issue)")
 
 
+def _enable_megatron_determinism(seed: int = 42):
+    """Enable full determinism for Megatron/TransformerEngine.
+
+    This fixes non-deterministic forward passes that cause train-inference logprob mismatch.
+    Without this, consecutive forward passes with identical inputs can differ by ~0.46 nats.
+
+    Must be called BEFORE any Megatron/TE code is initialized.
+    """
+    import os
+    import random
+    import numpy as np
+    import torch
+    import socket
+
+    # Set environment variables for deterministic execution
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # Required for CUDA determinism
+    os.environ["NCCL_DETERMINISTIC"] = "1"
+    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"  # Critical for FlashAttention
+
+    # Set random seeds
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Enable PyTorch deterministic algorithms
+    # warn_only=True because some ops (like cumsum) don't have deterministic implementations
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # Disable cuDNN benchmark for determinism (benchmark mode tests multiple algorithms)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Verify the settings were applied
+    is_deterministic = torch.are_deterministic_algorithms_enabled()
+    hostname = socket.gethostname()
+    pid = os.getpid()
+
+    # Write status to a file for verification
+    status_file = f"/tmp/determinism_status_{hostname}_{pid}.txt"
+    with open(status_file, "w") as f:
+        f.write(f"hostname={hostname}\n")
+        f.write(f"pid={pid}\n")
+        f.write(f"are_deterministic_algorithms_enabled={is_deterministic}\n")
+        f.write(f"cudnn.deterministic={torch.backends.cudnn.deterministic}\n")
+        f.write(f"cudnn.benchmark={torch.backends.cudnn.benchmark}\n")
+        f.write(f"FLASH_ATTENTION_DETERMINISTIC={os.environ.get('FLASH_ATTENTION_DETERMINISTIC')}\n")
+        f.write(f"CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG')}\n")
+        f.write(f"NCCL_DETERMINISTIC={os.environ.get('NCCL_DETERMINISTIC')}\n")
+
+    print(f"[VERL_PATCH] Enabled full determinism mode (seed={seed}) on {hostname}")
+    print(f"[VERL_PATCH]   torch.are_deterministic_algorithms_enabled() = {is_deterministic}")
+    print(f"[VERL_PATCH]   torch.backends.cudnn.deterministic = {torch.backends.cudnn.deterministic}")
+    print(f"[VERL_PATCH]   FLASH_ATTENTION_DETERMINISTIC = {os.environ.get('FLASH_ATTENTION_DETERMINISTIC')}")
+    print(f"[VERL_PATCH]   Status written to {status_file}")
+    logger.info(f"Enabled full determinism mode (FLASH_ATTENTION_DETERMINISTIC=1, cudnn.deterministic=True)")
+
+
 def apply_verl_patches():
     """Apply monkey-patches to verl for MLA attention backend fix and external labels support."""
+    # Note: _enable_megatron_determinism() is now called separately BEFORE this,
+    # in megatron_distributed.py, to ensure it runs before any Megatron imports.
+
     try:
         from verl.workers.engine.megatron.transformer_impl import MegatronEngine
     except ImportError:

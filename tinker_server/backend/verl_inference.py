@@ -243,10 +243,24 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             temp_dir = tempfile.mkdtemp(prefix=f"tinker_lora_{lora_int_id}_")
             adapter_path = temp_dir
 
+            # DEBUG: Print tensor norms to trace LoRA values on vLLM side
+            print(f"[DEBUG vLLM add_lora_with_id] lora_int_id={lora_int_id}, state_dict has {len(state_dict)} keys", flush=True)
+            total_norm = 0.0
+            nonzero_count = 0
+            for k, v in list(state_dict.items())[:10]:
+                import torch
+                norm = float(v.norm().item()) if isinstance(v, torch.Tensor) else 0.0
+                total_norm += norm
+                if norm > 1e-8:
+                    nonzero_count += 1
+                print(f"[DEBUG vLLM add_lora_with_id] {k}: norm={norm:.6f}", flush=True)
+            print(f"[DEBUG vLLM add_lora_with_id] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}", flush=True)
+
             # Save adapter files locally on worker node
             save_file(state_dict, os.path.join(adapter_path, "adapter_model.safetensors"))
             with open(os.path.join(adapter_path, "adapter_config.json"), "w") as f:
                 json.dump(peft_config, f, indent=2)
+            print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
 
             # Track path for this lora_int_id (needed for GPU/CPU swap in generate)
             self._lora_paths[lora_int_id] = adapter_path
@@ -668,6 +682,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             lora_path = self._lora_paths.get(lora_int_id)
             if lora_path is None:
                 raise ValueError(f"No path found for lora_int_id={lora_int_id}")
+
+            # DEBUG: Log which LoRA is being used
+            print(f"[DEBUG vLLM compute_logprobs] Using lora_int_id={lora_int_id}, path={lora_path}", flush=True)
 
             lora_request = LoRARequest(
                 lora_name=str(lora_int_id),

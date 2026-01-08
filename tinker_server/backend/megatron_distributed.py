@@ -490,6 +490,12 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+        # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
+        # This must happen before FlashAttention code is loaded to take effect
+        # Without this, consecutive forward passes differ by ~0.46 nats
+        from tinker_server.backend.verl_patches import _enable_megatron_determinism
+        _enable_megatron_determinism(seed=42)
+
         # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
         # These patches enable Flash Attention 2 with MLA by padding value tensors
         # Must be applied before MLASelfAttention class is imported/instantiated
@@ -818,6 +824,11 @@ class MegatronRankWorker:
             dict with reset counts (only from rank 0)
         """
         import torch
+        import sys
+        import time
+
+        # DEBUG: Write to stderr (should appear in Ray logs)
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] reset_expert_bias ENTRY, rank={self.rank}", file=sys.stderr, flush=True)
 
         reset_count = 0
         bias_values_before = []
@@ -837,6 +848,9 @@ class MegatronRankWorker:
                 if hasattr(module, 'local_tokens_per_expert') and module.local_tokens_per_expert is not None:
                     module.local_tokens_per_expert.zero_()
 
+        # DEBUG: Write results to stderr
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] reset_count={reset_count}, non_zero_before={len(bias_values_before)}, rank={self.rank}", file=sys.stderr, flush=True)
+
         if self.rank == 0:
             logger.info(f"[Rank {self.rank}] Reset {reset_count} expert_bias buffers to zero")
             if bias_values_before:
@@ -845,6 +859,37 @@ class MegatronRankWorker:
                     logger.info(f"[Rank {self.rank}]   {name}: {vals[:5]}...")  # First 5 values
 
         return {"reset_count": reset_count} if self.rank == 0 else {}
+
+    def check_determinism_status(self) -> dict:
+        """Check determinism settings on this worker.
+
+        Returns:
+            dict with determinism status info (only from rank 0)
+        """
+        import torch
+        import os
+        import socket
+        import glob
+
+        status = {
+            "rank": self.rank,
+            "hostname": socket.gethostname(),
+            "are_deterministic_algorithms_enabled": torch.are_deterministic_algorithms_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "FLASH_ATTENTION_DETERMINISTIC": os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "NOT SET"),
+            "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG", "NOT SET"),
+            "NCCL_DETERMINISTIC": os.environ.get("NCCL_DETERMINISTIC", "NOT SET"),
+        }
+
+        # Check for status files
+        status_files = glob.glob("/tmp/determinism_status_*.txt")
+        status["status_files"] = status_files
+
+        if self.rank == 0:
+            logger.info(f"[Rank 0] Determinism status: {status}")
+
+        return status if self.rank == 0 else {}
 
     def forward_backward(
         self,
@@ -2860,6 +2905,30 @@ class MegatronWorkerGroup:
         except ray.exceptions.RayActorError as e:
             logger.error(f"[MegatronWorkerGroup] get_lora_state_dict failed - worker died: {e}")
             raise RuntimeError(f"get_lora_state_dict failed - worker died: {e}")
+
+    def check_determinism_status(self) -> dict:
+        """Check determinism settings on all workers.
+
+        Returns:
+            dict with determinism status from rank 0
+        """
+        logger.info("[MegatronWorkerGroup] check_determinism_status: ENTRY")
+
+        try:
+            # Call ALL workers to get status
+            futures = [w.check_determinism_status.remote() for w in self.workers]
+            results = ray.get(futures, timeout=60)
+
+            # Rank 0's result has the status
+            result = results[0]
+            logger.info(f"[MegatronWorkerGroup] check_determinism_status: {result}")
+            return result
+        except ray.exceptions.GetTimeoutError:
+            logger.error("[MegatronWorkerGroup] check_determinism_status timed out")
+            raise RuntimeError("check_determinism_status timed out")
+        except ray.exceptions.RayActorError as e:
+            logger.error(f"[MegatronWorkerGroup] check_determinism_status failed: {e}")
+            raise RuntimeError(f"check_determinism_status failed: {e}")
 
     def reset_expert_bias(self) -> dict:
         """Reset expert_bias buffers to zero in all MoE router modules across all workers.
