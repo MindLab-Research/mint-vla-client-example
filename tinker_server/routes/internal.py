@@ -176,32 +176,38 @@ def _get_dir_size(path: str) -> int:
 def _scan_checkpoints(user_id: str | None) -> list[CheckpointInfo]:
     """Scan checkpoint directories and return those owned by user.
 
-    Supports two storage schemas:
-    1. New: /checkpoints/{user_id}/{checkpoint_id}/ (spec-compliant)
-    2. Legacy: /checkpoints/{model_id}/{checkpoint_name}/ (backward compat)
+    Storage schema: /checkpoints/{user_id}/{checkpoint_id}/
 
-    Filters by owner_id in metadata.json. Admin sees all.
+    Admin sees all checkpoints, regular users only see their own directory.
     """
     checkpoints = []
 
     if not os.path.exists(CHECKPOINTS_DIR):
         return checkpoints
 
-    for top_level in os.listdir(CHECKPOINTS_DIR):
-        top_path = os.path.join(CHECKPOINTS_DIR, top_level)
-        if not os.path.isdir(top_path):
-            continue
+    # Determine which directories to scan
+    if user_id == "admin":
+        # Admin sees all - scan all top-level directories
+        top_level_dirs = [
+            d for d in os.listdir(CHECKPOINTS_DIR)
+            if os.path.isdir(os.path.join(CHECKPOINTS_DIR, d))
+        ]
+    else:
+        # Regular user - only scan their own directory
+        user_dir = os.path.join(CHECKPOINTS_DIR, user_id)
+        if not os.path.exists(user_dir):
+            return checkpoints
+        top_level_dirs = [user_id]
 
-        # Check if this is a user directory (new schema) or model directory (legacy)
-        # User directories contain checkpoint subdirs with metadata.json at top level
-        # Model directories contain checkpoint subdirs
+    for top_level in top_level_dirs:
+        top_path = os.path.join(CHECKPOINTS_DIR, top_level)
 
         for sub_dir in os.listdir(top_path):
             sub_path = os.path.join(top_path, sub_dir)
             if not os.path.isdir(sub_path):
                 continue
 
-            # Read metadata.json for ownership check
+            # Read metadata.json
             metadata_path = os.path.join(sub_path, "metadata.json")
             metadata = {}
             if os.path.exists(metadata_path):
@@ -211,20 +217,8 @@ def _scan_checkpoints(user_id: str | None) -> list[CheckpointInfo]:
                 except (json.JSONDecodeError, OSError):
                     pass
 
-            # Check ownership (admin can see all, None owner = legacy)
-            owner_id = metadata.get("owner_id")
-            if user_id != "admin" and owner_id not in (user_id, "admin", None):
-                continue
-
-            # Determine checkpoint_id based on schema
-            # New schema: top_level is user_id, sub_dir is checkpoint_id
-            # Legacy: top_level is model_id, sub_dir is checkpoint_name
-            if metadata.get("checkpoint_id"):
-                # New schema - checkpoint_id stored in metadata
-                checkpoint_id = metadata["checkpoint_id"]
-            else:
-                # Legacy schema - construct from path
-                checkpoint_id = f"{top_level}_{sub_dir}"
+            # Get checkpoint_id from metadata or construct from path
+            checkpoint_id = metadata.get("checkpoint_id", f"{top_level}_{sub_dir}")
 
             # Get model_name from metadata or infer from adapter_config.json
             model_name = metadata.get("model_name")
@@ -341,7 +335,7 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
     if ckpt_path is None:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
-    # Check ownership via metadata.json
+    # Check ownership via metadata.json (admin can access all, others only their own)
     if user_id != "admin":
         metadata_path = os.path.join(ckpt_path, "metadata.json")
         if os.path.exists(metadata_path):
@@ -349,10 +343,14 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
                 with open(metadata_path) as f:
                     metadata = json.load(f)
                 owner_id = metadata.get("owner_id")
-                if owner_id not in (user_id, "admin", None):
+                if owner_id != user_id:
                     raise HTTPException(status_code=403, detail="Access denied")
             except (json.JSONDecodeError, OSError):
-                pass
+                # No valid metadata = no owner = deny access for non-admin
+                raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            # No metadata.json = legacy checkpoint = deny access for non-admin
+            raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
