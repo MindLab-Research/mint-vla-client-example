@@ -645,6 +645,93 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return logprobs
 
+        async def compute_prompt_topk(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            k: int = 10,
+        ) -> list[dict[int, float]]:
+            """Get top-K tokens and logprobs at each prompt position.
+
+            Returns topk[i] = dict of {token_id: logprob} for top-K tokens
+            at position i (predicting token i+1 given tokens 0..i).
+            Output length is len(prompt_ids) - 1.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                k: Number of top tokens to return (default 10).
+
+            Returns:
+                List of dicts, each mapping token_id to logprob.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            from verl.workers.rollout.vllm_rollout.utils import (
+                VLLM_LORA_INT_ID,
+                VLLM_LORA_NAME,
+                VLLM_LORA_PATH,
+            )
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=k,  # Get top-K at each position
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Add lora request if enabled
+            lora_request = None
+            loaded_loras = await self.engine.list_loras()
+            print(f"[compute_prompt_topk] lora_rank={self.model_config.lora_rank}, loaded_loras={loaded_loras}", flush=True)
+            if self.model_config.lora_rank > 0 and loaded_loras:
+                # Use the first loaded LoRA (multi-LoRA uses dynamic IDs starting from 1)
+                lora_id = list(loaded_loras)[0]
+                lora_path = self._lora_paths.get(lora_id, VLLM_LORA_PATH)
+                print(f"[compute_prompt_topk] Using lora_id={lora_id}, path={lora_path}", flush=True)
+                lora_request = LoRARequest(
+                    lora_name=f"lora_{lora_id}",
+                    lora_int_id=lora_id,
+                    lora_path=lora_path,
+                )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            result = []
+            # prompt_logprobs[i] contains logprob info for token[i] given tokens[0:i]
+            # Skip position 0 (no prior context)
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    result.append({})
+                    continue
+                # Convert to dict of token_id -> logprob
+                pos_dict = {}
+                for token_id, logprob_obj in prompt_logprobs[i].items():
+                    pos_dict[token_id] = logprob_obj.logprob
+                result.append(pos_dict)
+
+            return result
+
         async def compute_prompt_logprobs_with_lora(
             self,
             prompt_ids: list[int],
@@ -722,6 +809,82 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return logprobs
 
+        async def compute_prompt_topk_with_lora(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            lora_int_id: int,
+            k: int = 10,
+        ) -> list[dict[int, float]]:
+            """Get top-K tokens with specific LoRA adapter.
+
+            Returns topk[i] = dict of {token_id: logprob} for position i.
+            Output length is len(prompt_ids) - 1.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                lora_int_id: The LoRA adapter ID to use.
+                k: Number of top tokens to return.
+
+            Returns:
+                List of dicts mapping token_id to logprob.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=k,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            lora_path = self._lora_paths.get(lora_int_id)
+            if lora_path is None:
+                raise ValueError(f"No path found for lora_int_id={lora_int_id}")
+
+            print(f"[compute_prompt_topk_with_lora] Using lora_int_id={lora_int_id}, path={lora_path}", flush=True)
+
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            result = []
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    result.append({})
+                    continue
+                pos_dict = {}
+                for token_id, logprob_obj in prompt_logprobs[i].items():
+                    pos_dict[token_id] = logprob_obj.logprob
+                result.append(pos_dict)
+
+            return result
+
         async def compute_prompt_logprobs_base(
             self,
             prompt_ids: list[int],
@@ -782,6 +945,67 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     logprobs.append(-100.0)
 
             return logprobs
+
+        async def compute_prompt_topk_base(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            k: int = 10,
+        ) -> list[dict[int, float]]:
+            """Get top-K tokens using base model without any LoRA adapter.
+
+            For multi-LoRA engine: computes top-K with base model weights only.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                k: Number of top tokens to return.
+
+            Returns:
+                List of dicts mapping token_id to logprob.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=k,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Generate WITHOUT LoRA request (base model)
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=None,  # No LoRA = base model
+            )
+
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            result = []
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    result.append({})
+                    continue
+                pos_dict = {}
+                for token_id, logprob_obj in prompt_logprobs[i].items():
+                    pos_dict[token_id] = logprob_obj.logprob
+                result.append(pos_dict)
+
+            return result
 
     return ExtendedVLLMHttpServer
 

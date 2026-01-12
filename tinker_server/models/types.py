@@ -83,6 +83,7 @@ class SampleResponse(BaseModel):
 
     sequences: list[SampledSequence]
     prompt_logprobs: list[float] | None = None
+    topk_prompt_logprobs: list[dict[int, float]] | None = None
     type: Literal["sample"] = "sample"
 
 
@@ -288,6 +289,25 @@ class OptimStepResponse(BaseModel):
 
     metrics: dict[str, float] | None = None
     type: Literal["optim_step"] = "optim_step"
+
+
+class ResetExpertBiasRequest(BaseModel):
+    """Request to reset expert_bias buffers in MoE router modules.
+
+    This is needed to ensure consistent behavior between Megatron (training)
+    and vLLM (inference), as expert_bias accumulates during training but
+    is not exported with LoRA weights.
+    """
+
+    model_id: str
+
+
+class ResetExpertBiasResponse(BaseModel):
+    """Response from reset_expert_bias."""
+
+    model_id: str
+    modules_reset: int = 0
+    status: Literal["success", "not_applicable"] = "success"
 
 
 class TelemetryRequest(BaseModel):

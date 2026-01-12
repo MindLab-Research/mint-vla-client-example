@@ -279,6 +279,18 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         if return_logprobs:
             metrics["log_probs"] = log_probs_cpu
 
+        # Extract top-K if available (computed by logits_processor in verl_patches.py)
+        topk_indices = model_output.get("topk_indices")
+        topk_logits = model_output.get("topk_logits")
+        if topk_indices is not None:
+            # Handle NestedTensor format
+            if hasattr(topk_indices, 'values'):
+                topk_indices = topk_indices.values()
+            if hasattr(topk_logits, 'values'):
+                topk_logits = topk_logits.values()
+            metrics["topk_indices"] = topk_indices.cpu()
+            metrics["topk_logits"] = topk_logits.cpu()
+
         return nll, metrics
 
     return sft_loss_with_logprobs
@@ -316,6 +328,9 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         Returns:
             Tuple of (loss_tensor, metrics_dict)
         """
+        import sys
+        print("[PPO-ENTRY] ppo_loss_fn called!", file=sys.stderr, flush=True)
+        print(f"[PPO-ENTRY] model_output keys: {model_output.keys()}", file=sys.stderr, flush=True)
         # Extract log_probs from model output (verl provides this, not raw logits)
         new_log_probs = model_output["log_probs"]
 
@@ -347,6 +362,12 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
         pg_loss = torch.maximum(pg_loss1, pg_loss2)
+
+        # DIAGNOSTIC: Print PPO loss components
+        print(f"[PPO-DIAG] ENTRY: new_lp.shape={new_log_probs.shape}, old_lp.shape={old_log_probs.shape}, adv.shape={advantages.shape}")
+        if len(new_log_probs) > 7 and len(old_log_probs) > 7:
+            print(f"[PPO-DIAG] pos=7: new_lp={new_log_probs[7].item():.4f}, old_lp={old_log_probs[7].item():.4f}, "
+                  f"ratio={ratio[7].item():.4f}, adv={advantages[7].item():.2f}, pg_loss={pg_loss[7].item():.4f}")
 
         # Weighted average
         masked_loss = pg_loss * loss_mask
@@ -387,6 +408,19 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
             "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, 'item') else float(ratio_mean),
             "log_probs": new_log_probs_cpu,  # For loss_fn_outputs in MegatronDistributedWorker
         }
+
+        # Extract top-K if available (computed by logits_processor in verl_patches.py)
+        topk_indices = model_output.get("topk_indices")
+        topk_logits = model_output.get("topk_logits")
+        if topk_indices is not None:
+            # Handle NestedTensor format
+            if hasattr(topk_indices, 'values'):
+                topk_indices = topk_indices.values()
+            if hasattr(topk_logits, 'values'):
+                topk_logits = topk_logits.values()
+            metrics["topk_indices"] = topk_indices.cpu()
+            metrics["topk_logits"] = topk_logits.cpu()
+
         return loss, metrics
 
     return ppo_loss_fn
@@ -403,6 +437,11 @@ def create_logprob_extractor_fn() -> Callable:
         - Zero loss (no training signal)
         - Metrics dict containing per-token log_probs
     """
+    # Debug: log when extractor is created
+    debug_file = "/vePFS-Mindverse/share/code/logprob_extractor_debug.log"
+    with open(debug_file, "a") as f:
+        f.write(f"[create_logprob_extractor_fn] Creating extractor\n")
+
     def logprob_extractor(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """Extract per-token log_probs from model_output.
 
@@ -450,6 +489,29 @@ def create_logprob_extractor_fn() -> Callable:
             "num_tokens": int(num_tokens),
             "log_probs": log_probs_cpu,  # Per-token log probabilities tensor
         }
+
+        # Extract top-K if available
+        topk_indices = model_output.get("topk_indices")
+        topk_logits = model_output.get("topk_logits")
+
+        # Debug logging to shared file
+        import os
+        debug_file = "/vePFS-Mindverse/share/code/logprob_extractor_debug.log"
+        with open(debug_file, "a") as f:
+            f.write(f"[logprob_extractor] model_output keys: {list(model_output.keys())}\n")
+            f.write(f"[logprob_extractor] topk_indices: {topk_indices is not None}, topk_logits: {topk_logits is not None}\n")
+
+        if topk_indices is not None:
+            # Handle NestedTensor format
+            if hasattr(topk_indices, 'values'):
+                topk_indices = topk_indices.values()
+            if hasattr(topk_logits, 'values'):
+                topk_logits = topk_logits.values()
+            metrics["topk_indices"] = topk_indices.cpu() if hasattr(topk_indices, 'cpu') else topk_indices
+            metrics["topk_logits"] = topk_logits.cpu() if hasattr(topk_logits, 'cpu') else topk_logits
+            with open(debug_file, "a") as f:
+                f.write(f"[logprob_extractor] Added topk to metrics, shapes: {metrics['topk_indices'].shape}, {metrics['topk_logits'].shape}\n")
+
         return nll, metrics
 
     return logprob_extractor

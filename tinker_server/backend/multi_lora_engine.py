@@ -751,6 +751,55 @@ class MultiLoRAInferenceEngine:
 
         return list(result)
 
+    async def compute_topk(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        k: int = 10,
+    ) -> list[dict[int, float]]:
+        """Compute top-K tokens using session-specific LoRA or base model.
+
+        If sampling_session_id is None or has no registered LoRA, uses base model.
+
+        Returns topk[i] = dict of {token_id: logprob} for position i.
+        Output length is len(prompt_ids) - 1.
+
+        Args:
+            sampling_session_id: The sampling session to use, or None for base model.
+            prompt_ids: Input token IDs.
+            request_id: Unique request identifier.
+            k: Number of top tokens to return.
+
+        Returns:
+            List of dicts mapping token_id to logprob.
+        """
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        # Look up LoRA ID for this session (None = base model)
+        lora_id = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+
+        if lora_id is not None:
+            # Compute top-K with session-specific LoRA
+            result = await self.server.compute_prompt_topk_with_lora.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                k=k,
+            )
+        else:
+            # Compute top-K with base model (no LoRA)
+            result = await self.server.compute_prompt_topk_base.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                k=k,
+            )
+
+        return list(result)
+
     async def remove_session(self, sampling_session_id: str) -> bool:
         """Remove a sampling session and its LoRA.
 

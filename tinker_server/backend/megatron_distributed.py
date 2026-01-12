@@ -721,6 +721,38 @@ class MegatronRankWorker:
         self.engine.initialize()
         logger.info(f"[Rank {self.rank}] MegatronEngineWithLMHead initialized")
 
+        # Diagnostic: Print attention module structure to verify MLA vs fused QKV
+        # Using print() with flush=True for reliable output (logger may not show in server log)
+        if self.rank == 0:
+            try:
+                model = self.engine.module
+                if isinstance(model, list):
+                    model = model[0]
+                # Check first decoder layer's attention structure
+                decoder = getattr(model, 'decoder', model)
+                if hasattr(decoder, 'layers'):
+                    first_layer = decoder.layers[0]
+                    if hasattr(first_layer, 'self_attention'):
+                        attn = first_layer.self_attention
+                        attn_modules = [name for name, _ in attn.named_modules() if name]
+                        print("[Rank 0] ATTENTION STRUCTURE DIAGNOSTIC:", flush=True)
+                        print(f"  Attention class: {type(attn).__name__}", flush=True)
+                        print(f"  Has linear_qkv: {hasattr(attn, 'linear_qkv')}", flush=True)
+                        print(f"  Has linear_q_proj: {hasattr(attn, 'linear_q_proj')}", flush=True)
+                        print(f"  Has linear_kv_down_proj: {hasattr(attn, 'linear_kv_down_proj')}", flush=True)
+                        print(f"  Has linear_kv_up_proj: {hasattr(attn, 'linear_kv_up_proj')}", flush=True)
+                        print(f"  Submodules: {attn_modules[:20]}", flush=True)
+                        # Also logger for redundancy
+                        logger.info(f"[Rank 0] ATTENTION STRUCTURE: class={type(attn).__name__}, has_linear_qkv={hasattr(attn, 'linear_qkv')}")
+                        # Check TransformerConfig
+                        if hasattr(self.engine, 'tf_config'):
+                            tf_cfg = self.engine.tf_config
+                            mla_val = getattr(tf_cfg, 'multi_latent_attention', 'N/A')
+                            print(f"  TransformerConfig.multi_latent_attention: {mla_val}", flush=True)
+            except Exception as e:
+                print(f"[Rank 0] Attention structure diagnostic failed: {e}", flush=True)
+                logger.warning(f"[Rank 0] Attention structure diagnostic failed: {e}")
+
         # CUDA sync and test to detect corruption early
         import torch
         torch.cuda.synchronize()
@@ -1051,6 +1083,10 @@ class MegatronRankWorker:
                         rm = rm.item()
                     ratio_mean_sum += float(rm)
 
+                # Extract top-K if available (computed by logits_processor, passed through loss_fn)
+                topk_indices_list = metrics.get("topk_indices", [])
+                topk_logits_list = metrics.get("topk_logits", [])
+
             # Concatenate and split log_probs into per-sample tensors for loss_fn_outputs
             if all_log_probs and seq_lengths:
                 combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
@@ -1065,6 +1101,26 @@ class MegatronRankWorker:
                         "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
+            # Concatenate top-K if available
+            combined_topk_indices = None
+            combined_topk_logits = None
+            if topk_indices_list:
+                all_topk_indices = []
+                all_topk_logits = []
+                for topk_idx in topk_indices_list:
+                    if topk_idx is not None:
+                        if hasattr(topk_idx, "cpu"):
+                            topk_idx = topk_idx.cpu()
+                        all_topk_indices.append(topk_idx)
+                for topk_lg in topk_logits_list:
+                    if topk_lg is not None:
+                        if hasattr(topk_lg, "cpu"):
+                            topk_lg = topk_lg.cpu()
+                        all_topk_logits.append(topk_lg)
+                if all_topk_indices:
+                    combined_topk_indices = torch.cat(all_topk_indices, dim=0) if len(all_topk_indices) > 1 else all_topk_indices[0]
+                    combined_topk_logits = torch.cat(all_topk_logits, dim=0) if len(all_topk_logits) > 1 else all_topk_logits[0]
+
             # Return CPU-safe scalars and loss_fn_outputs
             return {
                 "loss_value": float(loss_value),
@@ -1073,6 +1129,8 @@ class MegatronRankWorker:
                 "ratio_mean_sum": float(ratio_mean_sum),
                 "n_ppo_results": int(n_ppo_results),
                 "loss_fn_outputs": loss_fn_outputs,
+                "topk_indices": combined_topk_indices,
+                "topk_logits": combined_topk_logits,
             }
         return {}
 
@@ -1099,6 +1157,11 @@ class MegatronRankWorker:
                 This ensures logprobs match vLLM (which always has bias=0).
                 Default True for train-inference consistency.
         """
+        # Debug logging
+        debug_file = "/vePFS-Mindverse/share/code/logprob_extractor_debug.log"
+        with open(debug_file, "a") as f:
+            f.write(f"[MegatronRankWorker.forward] rank={self.rank}, n_items={len(data_items)}\n")
+
         import torch
         from tinker_server.backend.megatron_training import tinker_to_tensordict
 
@@ -1178,11 +1241,35 @@ class MegatronRankWorker:
                             log_probs = log_probs.cpu()
                         all_log_probs.append(log_probs)
 
+                # Extract top-K indices and logits from metrics
+                all_topk_indices = []
+                all_topk_logits = []
+                topk_indices_list = metrics.get("topk_indices", [])
+                topk_logits_list = metrics.get("topk_logits", [])
+                for topk_idx in topk_indices_list:
+                    if topk_idx is not None:
+                        if hasattr(topk_idx, "cpu"):
+                            topk_idx = topk_idx.cpu()
+                        all_topk_indices.append(topk_idx)
+                for topk_lg in topk_logits_list:
+                    if topk_lg is not None:
+                        if hasattr(topk_lg, "cpu"):
+                            topk_lg = topk_lg.cpu()
+                        all_topk_logits.append(topk_lg)
+
                 # Concatenate all micro-batch log_probs into a single tensor
                 if all_log_probs:
                     combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
                 else:
                     combined_log_probs = None
+
+                # Concatenate all micro-batch top-K into single tensors
+                if all_topk_indices:
+                    combined_topk_indices = torch.cat(all_topk_indices, dim=0) if len(all_topk_indices) > 1 else all_topk_indices[0]
+                    combined_topk_logits = torch.cat(all_topk_logits, dim=0) if len(all_topk_logits) > 1 else all_topk_logits[0]
+                else:
+                    combined_topk_indices = None
+                    combined_topk_logits = None
 
                 # Split combined log_probs back into per-sample tensors using seq_lengths
                 # This is critical for cookbook compatibility - it expects one loss_fn_outputs per sample
@@ -1210,6 +1297,8 @@ class MegatronRankWorker:
                 "num_tokens": int(num_tokens),
                 "loss_fn_outputs": loss_fn_outputs,
                 "log_probs": combined_log_probs,  # Combined per-token log_probs tensor (for backward compat)
+                "topk_indices": combined_topk_indices,  # (seq_len, k) global token IDs
+                "topk_logits": combined_topk_logits,    # (seq_len, k) logit values
             }
         return {}
 
@@ -1254,6 +1343,26 @@ class MegatronRankWorker:
                 "step": "completed",
             }
         return {}
+
+    def get_live_lora_weights(self) -> dict:
+        """Get raw LoRA weights from model.named_parameters() for debugging.
+
+        Returns dict mapping name -> (shape, norm, first5_values) for rank 0.
+        Other ranks return empty dict.
+        """
+        if self.rank != 0:
+            return {}
+
+        result = {}
+        for name, param in self.engine.module[0].named_parameters():
+            if 'lora' in name.lower() or 'adapter' in name.lower():
+                tensor = param.data.float()
+                result[name] = (
+                    list(tensor.shape),
+                    tensor.norm().item(),
+                    tensor.flatten()[:5].tolist(),
+                )
+        return result
 
     def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict:
         """Get LoRA state dict in PEFT format (rank 0 gathers from all ranks).
@@ -2347,6 +2456,10 @@ class MegatronRankWorker:
         IMPORTANT: ALL ranks must call this method because get_lora_state_dict()
         uses NCCL collectives. Only rank 0 saves to disk.
 
+        Saves BOTH formats:
+        - PEFT format (adapter_model.safetensors) for vLLM inference
+        - Megatron format (mp_rank_XX_adapter.pt) for Megatron training reload
+
         Args:
             save_path: Directory path to save checkpoint files.
             step_count: Current training step (passed from MegatronWorkerGroup).
@@ -2359,19 +2472,32 @@ class MegatronRankWorker:
         import json
         import os
 
+        import torch
         from safetensors.torch import save_file
 
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path, get_adapter_state_dict
+
+        os.makedirs(save_path, exist_ok=True)
+
+        # === Save Megatron format (ALL ranks save their portion) ===
+        # This enables load_adapter_state to reload the checkpoint
+        with self.engine.train_mode():
+            adapter_state = get_adapter_state_dict(self.engine.module)
+            rank_path = _get_rank_checkpoint_path(save_path)
+            adapter_file = rank_path + "_adapter.pt"
+            torch.save({"adapter_state_dict": adapter_state}, adapter_file)
+            logger.info(f"[Rank {self.rank}] Saved Megatron format to {adapter_file}")
+
+        # === Save PEFT format (rank 0 only, after NCCL collective) ===
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
         # Only rank 0 gets actual data, others get empty dict
         state_dict = self.get_lora_state_dict()
 
-        # Only rank 0 saves to disk
+        # Only rank 0 saves PEFT format to disk
         if self.rank != 0:
             return {}
 
-        os.makedirs(save_path, exist_ok=True)
-
-        # 1. LoRA weights (PEFT format)
+        # 1. LoRA weights (PEFT format for vLLM)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
@@ -2434,6 +2560,11 @@ class MegatronRankWorker:
         Returns:
             Dict with status info (rank 0 only returns meaningful data).
         """
+        # ENTRY POINT DEBUG
+        with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+            dbg.write(f"[MegatronRankWorker.load_adapter_state] ENTRY: rank={getattr(self, 'rank', 'unknown')}, path={checkpoint_path}\n")
+            dbg.flush()
+
         import os
 
         import torch
@@ -2447,6 +2578,11 @@ class MegatronRankWorker:
             # Get rank-specific checkpoint path
             rank_path = _get_rank_checkpoint_path(checkpoint_path)
             adapter_file = rank_path + "_adapter.pt"
+
+            # DEBUG: Log which file each rank is loading
+            with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+                dbg.write(f"[Rank {self.rank}] Loading checkpoint: {adapter_file}\n")
+                dbg.flush()
 
             if not os.path.isfile(adapter_file):
                 raise FileNotFoundError(f"Adapter checkpoint not found: {adapter_file}")
@@ -2469,7 +2605,82 @@ class MegatronRankWorker:
             if isinstance(unwrapped, list):
                 unwrapped = unwrapped[0]
 
-            _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
+            # DEBUG: Compare checkpoint keys vs model keys before loading
+            if self.rank == 0:
+                model_state = unwrapped.state_dict()
+                model_keys = set(model_state.keys())
+                ckpt_keys = set(adapter_state.keys())
+
+                # Find keys with 'lora' or 'adapter' in them
+                model_lora_keys = {k for k in model_keys if 'lora' in k.lower() or 'adapter' in k.lower()}
+                ckpt_lora_keys = {k for k in ckpt_keys if 'lora' in k.lower() or 'adapter' in k.lower()}
+
+                matched_keys = model_keys & ckpt_keys
+
+                # Write to file for reliable capture
+                with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+                    import time
+                    dbg.write(f"\n{'='*70}\n")
+                    dbg.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] load_adapter_state debug\n")
+                    dbg.write(f"Checkpoint has {len(adapter_state)} keys\n")
+                    dbg.write(f"Model has {len(model_state)} keys\n")
+                    dbg.write(f"Model LoRA/adapter keys: {len(model_lora_keys)}\n")
+                    dbg.write(f"Checkpoint LoRA/adapter keys: {len(ckpt_lora_keys)}\n")
+                    dbg.write(f"Matched keys (exact): {len(matched_keys)}\n")
+
+                    # Show first few checkpoint keys
+                    dbg.write(f"First 5 checkpoint keys:\n")
+                    for k in list(ckpt_keys)[:5]:
+                        dbg.write(f"  - {k}\n")
+
+                    # Show first few model LoRA keys
+                    dbg.write(f"First 5 model LoRA keys:\n")
+                    for k in list(model_lora_keys)[:5]:
+                        dbg.write(f"  - {k}\n")
+
+                    # Check if ANY checkpoint keys match ANY model keys
+                    if len(matched_keys) == 0:
+                        dbg.write(f"WARNING: NO KEYS MATCHED!\n")
+                        # Show key format difference
+                        if ckpt_keys and model_keys:
+                            sample_ckpt = list(ckpt_keys)[0]
+                            sample_model = list(model_lora_keys)[0] if model_lora_keys else list(model_keys)[0]
+                            dbg.write(f"Sample ckpt key: {sample_ckpt}\n")
+                            dbg.write(f"Sample model key: {sample_model}\n")
+                    dbg.flush()
+
+            missing_keys, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
+            if self.rank == 0:
+                with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+                    dbg.write(f"After load_state_dict:\n")
+                    dbg.write(f"  Missing keys (in model, not in ckpt): {len(missing_keys)}\n")
+                    dbg.write(f"  Unexpected keys (in ckpt, not in model): {len(unexpected)}\n")
+                    dbg.flush()  # Force flush immediately
+                    if missing_keys:
+                        dbg.write(f"  First 5 missing: {missing_keys[:5]}\n")
+                        dbg.flush()
+                    if unexpected:
+                        dbg.write(f"  First 5 unexpected: {unexpected[:5]}\n")
+                        dbg.flush()
+
+                    # Simple trace to verify execution continues
+                    dbg.write(f"DEBUG: About to print checkpoint summary\n")
+                    dbg.flush()
+
+                    # VERIFY: Check checkpoint values vs what they were before load
+                    # NOTE: Can't call state_dict() here as it may use NCCL collectives
+                    dbg.write(f"\nCheckpoint values summary (what we tried to load):\n")
+                    dbg.flush()
+                    for key in list(adapter_state.keys())[:3]:  # Check first 3 keys
+                        ckpt_val = adapter_state[key]
+                        ckpt_norm = ckpt_val.float().norm().item()
+                        ckpt_first3 = ckpt_val.flatten()[:3].tolist()
+                        dbg.write(f"  {key}:\n")
+                        dbg.write(f"    shape={list(ckpt_val.shape)}, norm={ckpt_norm:.6f}\n")
+                        dbg.write(f"    first3={ckpt_first3}\n")
+                        dbg.flush()
+                    dbg.write(f"Load completed (state_dict called with strict=False)\n")
+                    dbg.flush()
             if unexpected:
                 logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
 
@@ -2767,10 +2978,34 @@ class MegatronWorkerGroup:
 
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
+        # Extract top-K from rank 0 result
+        topk_indices = rank0_result.get("topk_indices")
+        topk_logits = rank0_result.get("topk_logits")
+
+        # Serialize top-K tensors for API response
+        topk_indices_data = None
+        topk_logits_data = None
+        if topk_indices is not None:
+            import torch
+            if isinstance(topk_indices, torch.Tensor):
+                topk_indices_data = {
+                    "data": topk_indices.tolist(),
+                    "shape": list(topk_indices.shape),
+                    "dtype": str(topk_indices.dtype),
+                }
+            if isinstance(topk_logits, torch.Tensor):
+                topk_logits_data = {
+                    "data": topk_logits.tolist(),
+                    "shape": list(topk_logits.shape),
+                    "dtype": str(topk_logits.dtype),
+                }
+
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
             "loss_fn_outputs": rank0_result.get("loss_fn_outputs", []),
             "metrics": metrics,
+            "topk_indices": topk_indices_data,
+            "topk_logits": topk_logits_data,
         }
 
     def forward(
@@ -2805,6 +3040,8 @@ class MegatronWorkerGroup:
         num_tokens = rank0_result.get("num_tokens", 0)
         loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
         log_probs = rank0_result.get("log_probs")  # Per-token log_probs tensor
+        topk_indices = rank0_result.get("topk_indices")  # (seq_len, k) global token IDs
+        topk_logits = rank0_result.get("topk_logits")    # (seq_len, k) logit values
 
         metrics = {
             "loss:mean": float(loss_value),
@@ -2823,13 +3060,33 @@ class MegatronWorkerGroup:
                     "dtype": str(log_probs.dtype),
                 }
 
-        logger.info(f"[MegatronWorkerGroup] forward: loss={loss_value:.4f}, log_probs={'present' if log_probs_data else 'none'}")
+        # Convert top-K tensors to serializable format if present
+        topk_indices_data = None
+        topk_logits_data = None
+        if topk_indices is not None:
+            import torch
+            if isinstance(topk_indices, torch.Tensor):
+                topk_indices_data = {
+                    "data": topk_indices.tolist(),
+                    "shape": list(topk_indices.shape),
+                    "dtype": str(topk_indices.dtype),
+                }
+            if isinstance(topk_logits, torch.Tensor):
+                topk_logits_data = {
+                    "data": topk_logits.tolist(),
+                    "shape": list(topk_logits.shape),
+                    "dtype": str(topk_logits.dtype),
+                }
+
+        logger.info(f"[MegatronWorkerGroup] forward: loss={loss_value:.4f}, log_probs={'present' if log_probs_data else 'none'}, topk={'present' if topk_indices_data else 'none'}")
 
         return {
             "loss_fn_output_type": "logprob_extractor",
             "loss_fn_outputs": loss_fn_outputs,
             "metrics": metrics,
             "log_probs": log_probs_data,  # Per-token log probabilities
+            "topk_indices": topk_indices_data,  # Top-K token IDs per position
+            "topk_logits": topk_logits_data,    # Top-K logit values per position
         }
 
     def optim_step(
@@ -3049,20 +3306,39 @@ class MegatronWorkerGroup:
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
         """Load checkpoint from path.
 
-        Note: Megatron distributed checkpoints use verl's checkpoint format.
-        This is a placeholder - actual implementation needs verl engine integration.
+        Uses Megatron format (mp_rank_XX_adapter.pt) files saved by save_checkpoint.
 
         Args:
             load_path: Path to checkpoint directory.
-            load_optimizer: Whether to restore optimizer state.
+            load_optimizer: Whether to restore optimizer state (not yet implemented).
 
         Returns:
             Dict with load metadata.
         """
-        logger.warning(f"[MegatronWorkerGroup] load_checkpoint not fully implemented: {load_path}")
-        # For now, return empty metadata - full implementation requires
-        # coordinated loading across all workers
-        return {"status": "not_implemented", "path": load_path}
+        # DEBUG: Log entry
+        with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+            dbg.write(f"[MegatronWorkerGroup.load_checkpoint] ENTRY: path={load_path}\n")
+            dbg.flush()
+
+        import json
+        import os
+
+        logger.info(f"[MegatronWorkerGroup] load_checkpoint: {load_path}")
+
+        # Load training metadata if available
+        meta_path = os.path.join(load_path, "training_meta.json")
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            logger.info(f"[MegatronWorkerGroup] Loaded training metadata: step={meta.get('current_step', 'unknown')}")
+
+        # Use load_adapter_state which loads Megatron format files
+        result = self.load_adapter_state(load_path, actual_rank=None)
+
+        # Merge metadata
+        result.update(meta)
+        return result
 
 
     def save_checkpoint(self, save_path: str) -> dict:
@@ -3123,6 +3399,11 @@ class MegatronWorkerGroup:
         Returns:
             Dict with status info from rank 0.
         """
+        # DEBUG: Log entry at group level
+        with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+            dbg.write(f"[MegatronWorkerGroup.load_adapter_state] ENTRY: path={checkpoint_path}, actual_rank={actual_rank}\n")
+            dbg.flush()
+
         logger.info(
             f"[MegatronWorkerGroup] Loading adapter state from {checkpoint_path} "
             f"(actual_rank={actual_rank}, trainer_rank={self.lora_rank})"

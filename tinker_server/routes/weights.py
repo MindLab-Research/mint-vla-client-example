@@ -42,7 +42,8 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+# Must be absolute path on vePFS for all Ray workers to access
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
 
 
 def _resolve_tinker_path(tinker_uri: str) -> str:
@@ -132,19 +133,24 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
     Also registers the model for sampling via multi-LoRA engine, enabling
     subsequent asample calls with the same model_id.
     """
+    print(f"[DEBUG _do_save_state] ENTRY: request_id={request_id}, session={session}, request.path={request.path}", flush=True)
     try:
+        print(f"[DEBUG _do_save_state] training_engine is None: {training_engine is None}", flush=True)
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
         # Build save path
         checkpoint_name = request.path or f"checkpoint-{session.current_step}"
         save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
+        print(f"[DEBUG _do_save_state] Built save_path: {save_path}", flush=True)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Call training engine to save full checkpoint
         # Returns dict with path, state_dict, and peft_config
+        print(f"[DEBUG _do_save_state] About to call training_engine.save_weights", flush=True)
         result = await training_engine.save_weights(session, save_path)
+        print(f"[DEBUG _do_save_state] save_weights returned: {result.keys()}", flush=True)
 
         # Register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
         # This allows asample to work with model_id after save_weights
@@ -218,6 +224,7 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
 
 
 @router.post("/load_state", response_model=UntypedAPIFuture)
+@router.post("/load_weights", response_model=UntypedAPIFuture)  # SDK alias
 async def load_state(
     request: LoadStateRequest,
     background_tasks: BackgroundTasks,
@@ -237,6 +244,11 @@ async def load_state(
 
 async def _do_load_state(request_id: str, session, request: LoadStateRequest) -> None:
     """Background task to load state."""
+    # DEBUG: Log entry
+    with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+        dbg.write(f"[_do_load_state] ENTRY: request_id={request_id}, model_id={session.model_id}, path={request.path}\n")
+        dbg.flush()
+
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")

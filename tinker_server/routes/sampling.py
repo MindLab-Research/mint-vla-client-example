@@ -147,6 +147,27 @@ async def _do_sample(request_id: str, request: SampleRequest) -> None:
             # Prepend 0.0 for first token (no log probability for unconditional token)
             response.prompt_logprobs = [0.0] + computed_logprobs
 
+        # Handle top-K prompt logprobs if requested
+        if request.topk_prompt_logprobs > 0:
+            if is_multi_lora:
+                engine_for_topk = await session_manager.get_engine_for_session(session_id)
+                if engine_for_topk is None:
+                    raise RuntimeError(f"No engine found for session {session_id}")
+                computed_topk = await engine_for_topk.compute_topk(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=f"{request_id}_topk",
+                    k=request.topk_prompt_logprobs,
+                )
+            else:
+                computed_topk = await engine.server.compute_prompt_topk.remote(
+                    prompt_ids=token_ids,
+                    request_id=f"{request_id}_topk",
+                    k=request.topk_prompt_logprobs,
+                )
+            # Prepend empty dict for first token (no prior context)
+            response.topk_prompt_logprobs = [{}] + list(computed_topk)
+
         future_store.resolve(request_id, response.model_dump())
         logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
 

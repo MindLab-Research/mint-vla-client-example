@@ -35,6 +35,8 @@ from ..models.types import (
     GetInfoResponse,
     ModelData,
     OptimStepRequest,
+    ResetExpertBiasRequest,
+    ResetExpertBiasResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
     UntypedAPIFuture,
@@ -362,6 +364,44 @@ async def _do_optim_step(request_id: str, session, request: OptimStepRequest) ->
     except Exception as e:
         logger.exception(f"[optim_step] Failed: {e}")
         future_store.fail(request_id, str(e))
+
+
+# =============================================================================
+# reset_expert_bias - sync (fast operation)
+# =============================================================================
+
+
+@router.post("/reset_expert_bias", response_model=ResetExpertBiasResponse)
+async def reset_expert_bias(
+    request: ResetExpertBiasRequest,
+) -> ResetExpertBiasResponse:
+    """Reset expert_bias buffers in MoE router modules.
+
+    This ensures consistent behavior between Megatron (training) and vLLM
+    (inference), as expert_bias accumulates during training but is not
+    exported with LoRA weights.
+
+    Call this before computing logprobs to ensure consistent routing with vLLM.
+    """
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
+
+    try:
+        result = await training_engine.reset_expert_bias(session)
+        return ResetExpertBiasResponse(
+            model_id=request.model_id,
+            modules_reset=result.get("modules_reset", 0),
+            status="success" if result.get("modules_reset", 0) > 0 else "not_applicable",
+        )
+    except Exception as e:
+        logger.exception(f"[reset_expert_bias] Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================

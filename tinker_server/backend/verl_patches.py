@@ -15,8 +15,60 @@ Then unpad output from 192→128 after attention.
 """
 
 import logging
+import torch
 
 logger = logging.getLogger(__name__)
+
+
+def vocab_parallel_topk(logits: torch.Tensor, k: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute top-K across vocab-parallel sharded logits.
+
+    Args:
+        logits: Tensor of shape (batch, seq_len, vocab_shard_size) - sharded across TP ranks
+        k: Number of top tokens to return
+
+    Returns:
+        Tuple of (top_k_indices, top_k_logits) both of shape (batch, seq_len, k)
+        Indices are global token IDs (accounting for vocab sharding)
+    """
+    from megatron.core import parallel_state as mpu
+    import torch.distributed as dist
+
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    tp_group = mpu.get_tensor_model_parallel_group()
+
+    batch_size, seq_len, vocab_shard_size = logits.shape
+
+    # Step 1: Find local top-K on this rank
+    local_topk_logits, local_topk_indices = torch.topk(logits, k=k, dim=-1)  # (batch, seq, k)
+
+    # Convert local indices to global token IDs
+    global_topk_indices = local_topk_indices + tp_rank * vocab_shard_size
+
+    if tp_size == 1:
+        return global_topk_indices, local_topk_logits
+
+    # Step 2: Gather all local top-Ks to all ranks
+    # Each rank sends its top-K logits and indices
+    gathered_logits = [torch.zeros_like(local_topk_logits) for _ in range(tp_size)]
+    gathered_indices = [torch.zeros_like(global_topk_indices) for _ in range(tp_size)]
+
+    dist.all_gather(gathered_logits, local_topk_logits, group=tp_group)
+    dist.all_gather(gathered_indices, global_topk_indices, group=tp_group)
+
+    # Step 3: Concatenate and find global top-K
+    # Shape: (batch, seq, tp_size * k)
+    all_logits = torch.cat(gathered_logits, dim=-1)
+    all_indices = torch.cat(gathered_indices, dim=-1)
+
+    # Find top-K among all candidates
+    final_topk_logits, merge_indices = torch.topk(all_logits, k=k, dim=-1)
+
+    # Gather corresponding global token indices
+    final_topk_indices = torch.gather(all_indices, dim=-1, index=merge_indices)
+
+    return final_topk_indices, final_topk_logits
 
 
 def _is_mla_model(hf_config) -> bool:
@@ -132,6 +184,14 @@ def _apply_external_label_patch():
         # input_ids.offsets() gives cumulative lengths, diff() gives per-sequence lengths
         actual_seq_lens = input_ids.offsets().diff().tolist()
 
+        # DIAGNOSTIC: Print input_ids details before forward
+        from megatron.core import parallel_state as mpu
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        if tp_rank == 0:
+            input_flat = input_ids.values().tolist() if hasattr(input_ids, 'values') else []
+            print(f"[PRE-FORWARD] input_ids nested tensor: shape={input_ids.shape}, actual_seq_lens={actual_seq_lens}")
+            print(f"[PRE-FORWARD] input_ids.values() len={len(input_flat)}")
+
         def logits_processor(logits, temperature, **label_kwargs):
             """Process logits to compute log_probs.
 
@@ -151,8 +211,68 @@ def _apply_external_label_patch():
                 raise ValueError(f"No label found in kwargs: {label_kwargs.keys()}")
 
             assert logits.shape[:2] == label.shape[:2], f"Shape mismatch: logits={logits.shape}, label={label.shape}"
+
+            # DIAGNOSTIC: Print input_ids vs target alignment and logits analysis
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                # input_ids is captured from outer scope (NestedTensor in THD format)
+                # For THD format with batch=1, values() gives the flattened token sequence
+                input_flat = input_ids.values().tolist() if hasattr(input_ids, 'values') else input_ids[0].tolist()
+                label_flat = label[0].tolist() if label.dim() > 1 else label.tolist()
+
+                n_print = min(30, len(input_flat), len(label_flat))
+                print(f"[INPUT-TARGET-ALIGN] input_ids len={len(input_flat)}, label len={len(label_flat)}, logits shape={logits.shape}")
+
+                # Check actual logits argmax at each position to understand model predictions
+                vocab_size = logits.shape[-1]
+                print(f"[LOGITS-ARGMAX] Showing argmax predictions at key positions:")
+                for pos in [5, 7, 8, 14, 21, 23, 32, 34]:
+                    if pos < logits.shape[1]:
+                        local_argmax = logits[0, pos, :].argmax().item()
+                        local_max = logits[0, pos, :].max().item()
+                        target_tok = label_flat[pos] if pos < len(label_flat) else -1
+                        # Check if target is in this TP shard
+                        target_local_idx = target_tok if target_tok < vocab_size else -1
+                        target_logit = logits[0, pos, target_local_idx].item() if target_local_idx >= 0 else float('nan')
+                        print(f"  pos={pos}: argmax={local_argmax} (max={local_max:.2f}), target={target_tok} (logit={target_logit:.2f})")
+
+                # Print actual token sequence for debugging
+                print(f"[TOKEN-SEQ] First 40 tokens: {input_flat[:40]}")
+                print(f"[TOKEN-SEQ] Last 15 tokens: {input_flat[-15:]}")
+
+            # DIAGNOSTIC: Print overall logit range and check for abnormally small values
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            overall_min = logits.min().item()
+            overall_max = logits.max().item()
+            # Print for positions 7 and 23 if they exist
+            diag_parts = [f"tp={tp_rank}, overall=[{overall_min:.2f}, {overall_max:.2f}]"]
+            for pos in [7, 23]:
+                if logits.shape[1] > pos:
+                    pos_min = logits[0, pos, :].min().item()
+                    pos_max = logits[0, pos, :].max().item()
+                    diag_parts.append(f"pos{pos}=[{pos_min:.2f}, {pos_max:.2f}]")
+            print(f"[DIAG] {', '.join(diag_parts)}")
+            # Alert if range is abnormally small (< 1.0)
+            if overall_max - overall_min < 1.0:
+                print(f"[DIAG-ALERT] ABNORMAL: logit range {overall_max - overall_min:.4f} < 1.0!")
+
+            # DIAGNOSTIC: Print logits BEFORE temperature scaling for padded positions
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                # Check a few positions around the padding boundary (seq_len=51, padded to 56)
+                for pos in [50, 51, 52, 53]:
+                    if logits.shape[1] > pos:
+                        raw_min = logits[0, pos, :].min().item()
+                        raw_max = logits[0, pos, :].max().item()
+                        temp_val = temperature[0, pos].item() if temperature.dim() > 1 else temperature[pos].item()
+                        print(f"[DIAG-RAW] pos={pos}, raw_logits=[{raw_min:.4f}, {raw_max:.4f}], temp={temp_val:.6f}")
+
             temperature[temperature <= 0] = 1e-8
             assert torch.all(temperature > 0).item(), f"temperature must be positive. Got {temperature}"
+
             logits.div_(temperature.unsqueeze(dim=-1))
             ret = {}
             if calculate_entropy:
@@ -162,10 +282,83 @@ def _apply_external_label_patch():
             else:
                 logits_bak = logits
 
+            # DIAGNOSTIC: Write RAW logits to file for clean capture
+            import time
+            import os
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            ep_rank = mpu.get_expert_model_parallel_rank() if hasattr(mpu, 'get_expert_model_parallel_rank') else 0
+            vocab_size = logits_bak.shape[-1]
+            call_id = f"{time.time():.6f}"
+
+            # Log multiple positions to see pattern - show ALL tp_rank data
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            with open("/vePFS-Mindverse/share/code/raw_logit_diag.log", "a") as f:
+                for pos in [7, 8, 23]:
+                    if pos < min(logits_bak.shape[1], label.shape[1]):
+                        target_tok = label[0, pos].item()
+                        local_max = logits_bak[0, pos, :].max().item()
+                        local_argmax = logits_bak[0, pos, :].argmax().item()
+                        # Convert local argmax to global token id
+                        global_argmax = local_argmax + tp_rank * vocab_size
+                        # Get target logit if target is in this TP rank's shard
+                        shard_start = tp_rank * vocab_size
+                        shard_end = shard_start + vocab_size
+                        if shard_start <= target_tok < shard_end:
+                            target_local_idx = target_tok - shard_start
+                            target_logit = logits_bak[0, pos, target_local_idx].item()
+                            f.write(f"[LOGIT] tp={tp_rank}, pos={pos}, target={target_tok}, TARGET_LOGIT={target_logit:.2f}, local_max={local_max:.2f}, local_argmax={local_argmax}, global_argmax={global_argmax}\n")
+                        else:
+                            f.write(f"[LOGIT] tp={tp_rank}, pos={pos}, target={target_tok}, local_max={local_max:.2f}, local_argmax={local_argmax}, global_argmax={global_argmax}\n")
+
             # Compute log_probs via cross-entropy
             log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
-            # CRITICAL FIX: Mask padded positions
+            # DIAGNOSTIC: Print logits AFTER cross-entropy to see if softmax was applied in-place
+            if tp_rank == 0 and logits_bak.shape[1] > 7 and label.shape[1] > 7:
+                target7 = label[0, 7].item()
+                if target7 < vocab_size:
+                    post_logit7 = logits_bak[0, 7, target7].item()
+                    post_min7 = logits_bak[0, 7, :].min().item()
+                    post_max7 = logits_bak[0, 7, :].max().item()
+                    lp7 = log_probs[0, 7].item()
+                    print(f"[RAW-LOGIT-POST] id={call_id}, ep={ep_rank}, pos=7, logit={post_logit7:.4f}, range=[{post_min7:.2f},{post_max7:.2f}], lp={lp7:.4f}")
+
+            # Also catch any lp < -10
+            if tp_rank == 0:
+                for pos in range(min(log_probs.shape[1], label.shape[1], 60)):
+                    lp = log_probs[0, pos].item()
+                    if lp < -10:
+                        target_token = label[0, pos].item()
+                        if target_token < vocab_size:
+                            raw_logit = logits_bak[0, pos, target_token].item()
+                            raw_max = logits_bak[0, pos, :].max().item()
+                            print(f"[BAD-LP] pos={pos}, target={target_token}, logit={raw_logit:.2f}, max={raw_max:.2f}, lp={lp:.4f}")
+
+            # DIAGNOSTIC: Print RAW LOGIT values for target tokens at BAD positions
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            vocab_size = logits_bak.shape[-1]  # This is the SHARD size
+
+            # Find positions with extremely negative log_probs (the -2.2B issue)
+            for pos in range(min(log_probs.shape[1], 60)):
+                lp_val = log_probs[0, pos].item()
+                if lp_val < -1e6:  # Catastrophic logprob
+                    target_token = label[0, pos].item() if pos < label.shape[1] else -1
+                    shard_start = tp_rank * vocab_size
+                    shard_end = shard_start + vocab_size
+
+                    if shard_start <= target_token < shard_end:
+                        local_idx = target_token - shard_start
+                        target_logit = logits_bak[0, pos, local_idx].item()
+                        logit_min = logits_bak[0, pos, :].min().item()
+                        logit_max = logits_bak[0, pos, :].max().item()
+                        print(f"[DIAG-BAD] pos={pos}, target={target_token}, logit={target_logit:.6f}, range=[{logit_min:.2f}, {logit_max:.2f}], lp={lp_val:.2e}")
+
+            # CRITICAL FIX: Mask padded positions FIRST
             # Padded positions have garbage logits (uninitialized GPU memory) that produce
             # catastrophic log_probs like -2.2 billion. Set them to 0.0 (neutral value).
             #
@@ -200,11 +393,40 @@ def _apply_external_label_patch():
             # Count how many positions we're masking
             n_valid = valid_mask.sum().item()
             n_padded = padded_total_len - n_valid
+
+            # DIAGNOSTIC: Print range BEFORE masking
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            if tp_rank == 0 and n_padded > 0:
+                pre_mask_min = log_probs.min().item()
+                pre_mask_max = log_probs.max().item()
+                print(f"[DIAG-MASK] BEFORE: n_valid={n_valid}, n_padded={n_padded}, range=[{pre_mask_min:.2e}, {pre_mask_max:.4f}]")
+
             if n_padded > 0:
                 # Zero out padded positions (they have garbage log_probs)
                 log_probs[0, ~valid_mask] = 0.0
 
+                # DIAGNOSTIC: Print range AFTER masking
+                if tp_rank == 0:
+                    post_mask_min = log_probs[0, valid_mask].min().item() if valid_mask.sum() > 0 else 0.0
+                    post_mask_max = log_probs[0, valid_mask].max().item() if valid_mask.sum() > 0 else 0.0
+                    print(f"[DIAG-MASK] AFTER: valid_range=[{post_mask_min:.4f}, {post_mask_max:.4f}]")
+
+            # DIAGNOSTIC: Check for catastrophic logprobs at valid positions
+            valid_log_probs = log_probs[0, valid_mask]
+            min_valid_lp = valid_log_probs.min().item() if valid_log_probs.numel() > 0 else 0.0
+
+            if min_valid_lp < -1e9:
+                print(f"[DIAG-PADDING] PADDING MASK FAILED! min_valid_lp={min_valid_lp:.2e}, n_valid={n_valid}, n_padded={n_padded}")
+
             ret["log_probs"] = log_probs
+
+            # Compute top-K tokens across vocab-parallel shards
+            # Use logits_bak (post temperature scaling) - ranking is invariant to temperature
+            topk_indices, topk_logits = vocab_parallel_topk(logits_bak, k=10)
+            ret["topk_indices"] = topk_indices.cpu()  # (batch, seq_len, k)
+            ret["topk_logits"] = topk_logits.cpu()    # (batch, seq_len, k)
+
             return ret
 
         # PATCH: Use dynamic key for label
@@ -404,6 +626,45 @@ def apply_verl_patches():
 
     # Apply MLA value padding patch (enables FlashAttention 2 by making head_dim_qk == head_dim_v)
     _apply_mla_value_padding_patch()
+
+    # Apply prepare_model_outputs patch to pass through all keys (including topk)
+    _apply_prepare_model_outputs_patch()
+
+
+def _apply_prepare_model_outputs_patch():
+    """Patch MegatronEngineWithLMHead.prepare_model_outputs to pass through all keys.
+
+    Original only extracts 'log_probs' and 'entropy', ignoring other keys like
+    'topk_indices' and 'topk_logits' computed by logits_processor.
+    """
+    try:
+        from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
+    except ImportError:
+        logger.warning("MegatronEngineWithLMHead not found, skipping prepare_model_outputs patch")
+        return
+
+    original_prepare_model_outputs = MegatronEngineWithLMHead.prepare_model_outputs
+
+    def patched_prepare_model_outputs(self, output: dict, data):
+        """Patched to pass through all keys from logits_processor output."""
+        # Start with log_probs (required)
+        log_prob = output.get("log_probs")
+        if log_prob is None:
+            # Fall back to original method
+            return original_prepare_model_outputs(self, output, data)
+
+        model_output = {"log_probs": log_prob}
+
+        # Pass through ALL other keys (including topk_indices, topk_logits, entropy, etc.)
+        for key, value in output.items():
+            if key != "log_probs":  # Already added
+                model_output[key] = value
+
+        return model_output
+
+    MegatronEngineWithLMHead.prepare_model_outputs = patched_prepare_model_outputs
+    print("[VERL_PATCH] Applied prepare_model_outputs patch (passes through all keys including topk)")
+    logger.info("Applied prepare_model_outputs patch (passes through all keys)")
 
 
 def _apply_mla_value_padding_patch():

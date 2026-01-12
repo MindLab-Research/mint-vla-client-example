@@ -1743,6 +1743,52 @@ class VerlTrainingEngine:
         logger.info(f"[{model_id}] train_step: step={session.current_step}")
         return result
 
+    async def reset_expert_bias(self, session: TrainingSession) -> dict:
+        """Reset expert_bias buffers in MoE router modules.
+
+        The expert_bias buffer accumulates during training (via finalize_model_grads)
+        to balance token distribution across experts. However, this buffer is NOT
+        exported with LoRA weights, causing train-inference mismatch:
+        - Megatron (trained): has accumulated expert_bias != 0
+        - vLLM (loaded LoRA): has expert_bias = 0
+
+        This causes different routing decisions and thus different logprobs even
+        with identical LoRA weights.
+
+        Call this before computing logprobs to ensure consistent behavior with vLLM.
+
+        Args:
+            session: Training session with model.
+
+        Returns:
+            dict with modules_reset count.
+        """
+        import asyncio
+        import ray
+
+        model_id = session.model_id
+        worker = self._workers.get(model_id)
+        if worker is None:
+            logger.warning(f"[{model_id}] reset_expert_bias: No worker found")
+            return {"modules_reset": 0}
+
+        # Mark actor as recently used
+        self._touch_actor(session)
+
+        logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
+
+        loop = asyncio.get_running_loop()
+        try:
+            result_ref = worker.reset_expert_bias.remote()
+            result = await loop.run_in_executor(None, ray.get, result_ref)
+            # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
+            modules_reset = result.get("reset_count", result.get("modules_reset", 0))
+            logger.info(f"[{model_id}] reset_expert_bias: reset {modules_reset} modules")
+            return {"modules_reset": modules_reset}
+        except Exception as e:
+            logger.exception(f"[{model_id}] reset_expert_bias failed: {e}")
+            return {"modules_reset": 0, "error": str(e)}
+
     async def save_weights_for_sampler(
         self,
         session: TrainingSession,
