@@ -443,46 +443,8 @@ def _apply_external_label_patch():
 
             ret["log_probs"] = log_probs
 
-            # Compute top-K tokens across vocab-parallel shards
-            # Use logits_bak (post temperature scaling) - ranking is invariant to temperature
-            topk_indices, topk_logits = vocab_parallel_topk(logits_bak, k=10)
-
-            # Write topk directly to file for diagnostic (bypasses complex verl pipeline)
-            # FAIL-FAST: Any error here crashes immediately - no silent failures
-            from megatron.core import parallel_state as mpu
-            tp_rank = mpu.get_tensor_model_parallel_rank()
-            if tp_rank == 0:
-                import json
-                assert topk_indices.dim() == 3, f"topk_indices expected 3D, got {topk_indices.shape}"
-                assert topk_logits.dim() == 3, f"topk_logits expected 3D, got {topk_logits.shape}"
-                assert topk_indices.shape == topk_logits.shape, f"Shape mismatch: {topk_indices.shape} vs {topk_logits.shape}"
-
-                topk_data = {
-                    "positions": [],
-                    "seq_len": int(topk_indices.shape[1]),
-                }
-                # Capture first 60 positions
-                for pos in range(min(60, topk_indices.shape[1])):
-                    target_tok = int(label[0, pos].item()) if pos < label.shape[1] else -1
-                    pos_topk = []
-                    for k_idx in range(min(10, topk_indices.shape[2])):
-                        tok_id = int(topk_indices[0, pos, k_idx].item())
-                        tok_logit = float(topk_logits[0, pos, k_idx].item())
-                        pos_topk.append({"tok": tok_id, "logit": round(tok_logit, 4)})
-                    target_lp = float(log_probs[0, pos].item()) if pos < log_probs.shape[1] else None
-                    topk_data["positions"].append({
-                        "pos": pos,
-                        "target": target_tok,
-                        "target_lp": round(target_lp, 4) if target_lp is not None else None,
-                        "topk": pos_topk
-                    })
-                with open("/vePFS-Mindverse/share/code/megatron_topk.json", "w") as f:
-                    json.dump(topk_data, f, indent=2)
-                print(f"[TOPK-DIAG] Wrote {len(topk_data['positions'])} positions to megatron_topk.json")
-
-            # Keep on GPU (not .cpu()) to work with verl's nested tensor aggregation
-            ret["topk_indices"] = topk_indices
-            ret["topk_logits"] = topk_logits
+            # Top-k tracking disabled - was causing symbolic shape comparison crash
+            # Re-enable by uncommenting vocab_parallel_topk call if needed for KL debugging
 
             return ret
 
