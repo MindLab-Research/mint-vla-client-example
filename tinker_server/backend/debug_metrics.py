@@ -197,10 +197,13 @@ def calculate_debug_metrics(batch: dict) -> dict:
             "training/rollout_actor_probs_pearson_corr": 0.0,
         }
 
+    # std requires at least 2 elements, otherwise returns nan
+    std_value = torch.std(rollout_probs_diff).detach().item() if rollout_probs_diff.numel() > 1 else 0.0
+
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
-        "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
+        "training/rollout_probs_diff_std": std_value,
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
     }

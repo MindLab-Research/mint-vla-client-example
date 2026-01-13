@@ -1142,8 +1142,9 @@ class MegatronRankWorker:
                     if model_topk_indices is not None and model_topk_logits is not None:
                         # Check if THD format (batch=1, concatenated sequences)
                         if model_topk_indices.dim() == 3 and model_topk_indices.shape[0] == 1:
-                            total_tokens = model_topk_indices.shape[1]
-                            k = model_topk_indices.shape[2]
+                            # Convert to int to avoid symbolic shape comparison issues
+                            total_tokens = int(model_topk_indices.shape[1])
+                            k = int(model_topk_indices.shape[2])
                             if topk_offset + seq_len <= total_tokens:
                                 # TensorData.data must be flattened (per tinker schema)
                                 topk_idx = model_topk_indices[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
@@ -1212,8 +1213,13 @@ class MegatronRankWorker:
                         if isinstance(values, list) and values:
                             # Average debug metrics across micro-batches
                             if isinstance(values[0], (int, float)):
-                                # Add :mean suffix for tinker SDK compatibility
-                                debug_metrics[f"{key}:mean"] = sum(values) / len(values)
+                                # Filter out nan values before averaging
+                                import math
+                                valid_values = [v for v in values if not (isinstance(v, float) and math.isnan(v))]
+                                if valid_values:
+                                    debug_metrics[f"{key}:mean"] = sum(valid_values) / len(valid_values)
+                                else:
+                                    debug_metrics[f"{key}:mean"] = 0.0
                             else:
                                 # If not numeric, just take the last value
                                 debug_metrics[f"{key}:mean"] = values[-1]
