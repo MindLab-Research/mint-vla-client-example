@@ -1798,114 +1798,41 @@ class VerlTrainingEngine:
     ) -> str:
         """Save LoRA weights for inference use.
 
-        Fetches weights from remote Ray worker via object store, then saves
-        locally on API server. This handles distributed deployments where
-        training worker and API server are on different machines.
+        Delegates to save_weights with constructed path.
 
         Args:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
             use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
-                If None (default), auto-detect based on model type: True for MoE models.
 
         Returns:
             Absolute path to saved checkpoint directory.
         """
-        import json
         import os
 
-        from safetensors.torch import save_file
-
-        model_id = session.model_id
-        worker = self._workers[model_id]
-
-        # Auto-detect use_per_expert_lora for MoE models
-        # MoE models train MLP LoRA that must be exported to vLLM for train-inference consistency
-        if use_per_expert_lora is None:
-            from ..backend.model_registry import is_moe_model
-            try:
-                use_per_expert_lora = is_moe_model(session.base_model)
-                if use_per_expert_lora:
-                    logger.info(f"[{model_id}] Auto-enabled use_per_expert_lora for MoE model {session.base_model}")
-            except ValueError:
-                use_per_expert_lora = False
-
-        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY (use_per_expert_lora={use_per_expert_lora})")
-        logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
-
-        # Fetch weights and config from remote worker via Ray object store
-        # Use ray.get() with timeout in thread executor for reliable async handling
-        logger.info(f"[{model_id}] save_weights_for_sampler: calling get_lora_state_dict.remote()...")
-        import ray
-        loop = asyncio.get_running_loop()
-
-        # Schedule remote calls
-        state_dict_ref = worker.get_lora_state_dict.remote(use_per_expert_lora)
-        config_ref = worker.get_lora_config.remote()
-        logger.info(f"[{model_id}] save_weights_for_sampler: remote calls scheduled, waiting for results...")
-
-        # Use ray.get() with timeout in executor to avoid blocking event loop
-        # Increased timeout for large models with many LoRA params (MoE + MLA = 428 params)
-        def get_with_timeout():
-            return ray.get([state_dict_ref, config_ref], timeout=300)
-
-        state_dict, config = await loop.run_in_executor(None, get_with_timeout)
-        logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
-
-        # DEBUG: Print tensor norms to trace LoRA values
-        print(f"[DEBUG save_weights] state_dict has {len(state_dict)} keys", flush=True)
-        total_norm = 0.0
-        nonzero_count = 0
-        for k, v in list(state_dict.items())[:10]:
-            norm = float(v.norm().item())
-            total_norm += norm
-            if norm > 1e-8:
-                nonzero_count += 1
-            print(f"[DEBUG save_weights] {k}: shape={list(v.shape)}, norm={norm:.6f}", flush=True)
-        print(f"[DEBUG save_weights] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}", flush=True)
-
-        # Phase 7: Truncate weights to match actual_rank if using unified rank training
-        # Actor's max_lora_rank may be > session's actual_rank
-        # Config has r=actual_rank, but state_dict has max_rank dimensions
-        # Truncate to ensure vLLM sees consistent rank
-        from .lora_utils import truncate_lora_state_dict, get_lora_rank_from_state_dict
-
-        actual_rank = config.get("r")
-        max_rank = get_lora_rank_from_state_dict(state_dict)
-        if actual_rank and max_rank and actual_rank < max_rank:
-            logger.info(
-                f"[{model_id}] Truncating LoRA weights from max_rank={max_rank} to actual_rank={actual_rank}"
-            )
-            state_dict = truncate_lora_state_dict(state_dict, max_rank, actual_rank)
-
-        # Save locally on API server
-        save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)
-        os.makedirs(save_path, exist_ok=True)
-
-        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
-        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-
-        abs_path = os.path.abspath(save_path)
-        logger.info(f"[{model_id}] Saved weights for sampler to {abs_path}")
-        return abs_path
+        save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        return await self.save_weights(session, save_path, use_per_expert_lora)
 
     async def save_weights(
         self,
         session: TrainingSession,
         save_path: str,
-    ) -> dict:
-        """Save full checkpoint via Ray actor.
+        use_per_expert_lora: bool | None = None,
+    ) -> str:
+        """Save checkpoint via Ray actor.
 
-        Saves LoRA weights, optimizer state, and training metadata.
+        Saves LoRA weights directly on worker to shared filesystem.
+        Returns path for path-based vLLM loading.
 
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
+                If None (default), auto-detect based on model type.
 
         Returns:
-            Dict with path, state_dict, and peft_config for multi-LoRA registration.
+            Absolute path to saved checkpoint directory.
         """
         import asyncio
         import os
@@ -1915,24 +1842,26 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers[model_id]
 
-        # Remote call to save checkpoint - returns meta with state_dict and peft_config
-        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
-        loop = asyncio.get_running_loop()
-        meta_ref = worker.save_checkpoint.remote(save_path)
-        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
-
-        # Update session state from worker metadata
-        session.current_step = meta.get("current_step", session.current_step)
+        # Auto-detect use_per_expert_lora for MoE models
+        if use_per_expert_lora is None:
+            from ..backend.model_registry import is_moe_model
+            try:
+                use_per_expert_lora = is_moe_model(session.base_model)
+            except ValueError:
+                use_per_expert_lora = False
 
         abs_path = os.path.abspath(save_path)
-        logger.info(f"[{model_id}] save_weights: {abs_path}")
 
-        # Return dict with path and weights for registration
-        return {
-            "path": abs_path,
-            "state_dict": meta.get("state_dict"),
-            "peft_config": meta.get("peft_config"),
-        }
+        # Save on worker - returns metadata
+        loop = asyncio.get_running_loop()
+        meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=300))
+
+        # Update session state
+        session.current_step = meta.get("current_step", session.current_step)
+
+        logger.info(f"[{model_id}] save_weights: {abs_path}")
+        return abs_path
 
     async def load_weights(
         self,

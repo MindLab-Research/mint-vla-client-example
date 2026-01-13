@@ -133,83 +133,53 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
     Also registers the model for sampling via multi-LoRA engine, enabling
     subsequent asample calls with the same model_id.
     """
-    print(f"[DEBUG _do_save_state] ENTRY: request_id={request_id}, session={session}, request.path={request.path}", flush=True)
     try:
-        print(f"[DEBUG _do_save_state] training_engine is None: {training_engine is None}", flush=True)
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
         # Build save path
         checkpoint_name = request.path or f"checkpoint-{session.current_step}"
         save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
-        print(f"[DEBUG _do_save_state] Built save_path: {save_path}", flush=True)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
-        # Call training engine to save full checkpoint
-        # Returns dict with path, state_dict, and peft_config
-        print(f"[DEBUG _do_save_state] About to call training_engine.save_weights", flush=True)
-        result = await training_engine.save_weights(session, save_path)
-        print(f"[DEBUG _do_save_state] save_weights returned: {result.keys()}", flush=True)
+        # Save checkpoint on worker, returns path
+        abs_path = await training_engine.save_weights(session, save_path)
 
-        # Register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
-        # This allows asample to work with model_id after save_weights
-        state_dict = result.get("state_dict")
-        peft_config = result.get("peft_config")
-
-        # Try to register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
-        # This allows asample to work with model_id after save_weights
-        # Note: Registration may fail if resources unavailable (e.g., MoE needs separate GPUs)
+        # Register for sampling via path-based loading (avoids tensor transfer OOM)
         sampling_registered = False
-        if inference_manager is not None and state_dict is not None and peft_config is not None:
-            base_model = session.base_model
-            if base_model is None:
-                logger.warning(f"[{session.model_id}] Cannot register for sampling: base_model not set")
-            else:
+        base_model = session.base_model
+        if inference_manager is not None and base_model is not None:
+            try:
+                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+
+                # Remove existing registration if any
+                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
+                if existing_lora_id is not None:
+                    await multi_lora_engine.remove_session(session.model_id)
+
+                # Path-based loading - vLLM loads directly from shared filesystem
+                await multi_lora_engine.add_lora_for_session_from_path(
+                    sampling_session_id=session.model_id,
+                    lora_path=abs_path,
+                )
                 try:
-                    # Get or create engine for this model (dynamically creates vLLM actor if needed)
-                    multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-
-                    # Check if already registered (update existing)
-                    existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                    if existing_lora_id is not None:
-                        await multi_lora_engine.remove_session(session.model_id)
-
-                    # Register with model_id as session_id for SDK compatibility
-                    await multi_lora_engine.add_lora_for_session(
-                        sampling_session_id=session.model_id,
-                        state_dict=state_dict,
-                        peft_config=peft_config,
+                    inference_manager.register_multi_lora_session(
+                        session.model_id, base_model=base_model
                     )
-                    try:
-                        inference_manager.register_multi_lora_session(
-                            session.model_id, base_model=base_model
-                        )
-                    except ValueError:
-                        pass  # Session already registered
-                    sampling_registered = True
-                    logger.info(f"[{session.model_id}] Registered for multi-LoRA sampling (model={base_model})")
-                except Exception as reg_err:
-                    # Log but don't fail save_weights - sampling registration is optional
-                    logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
-        else:
-            logger.warning(f"[{session.model_id}] Cannot register for sampling: "
-                          f"inference_manager={inference_manager is not None}, "
-                          f"state_dict={state_dict is not None}, "
-                          f"peft_config={peft_config is not None}")
+                except ValueError:
+                    pass  # Already registered
+                sampling_registered = True
+                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
+            except Exception as reg_err:
+                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
         # Build tinker:// path for response
         tinker_path = _to_tinker_path(session.model_id, checkpoint_name)
 
-        # Include state_dict metadata in response for verification (e.g., checking MLP modules)
-        # Keys are JSON-serializable, tensors are not
-        state_dict_keys = list(state_dict.keys()) if state_dict else []
-
         future_store.resolve(request_id, {
             "path": tinker_path,
             "type": "save_weights",
-            "state_dict_keys": state_dict_keys,  # List of parameter names for verification
-            "peft_config": peft_config,
             "sampling_registered": sampling_registered,
         })
 
