@@ -615,14 +615,18 @@ class MultiLoRAInferenceEngine:
         # Worker creates file-based LoRARequest for GPU/CPU swap support.
         # Auto-restart vLLM if actor died (e.g. killed for GPU allocation).
         start_time = time.time()
+        print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
+            print(f"[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
             await self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
                 peft_config=peft_config,
             )
+            print(f"[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            print(f"[DEBUG add_lora_for_session] RayActorError/GetTimeoutError: {e}", flush=True)
             self._initialized = False
             self.server = None
             await self.initialize()
@@ -632,10 +636,85 @@ class MultiLoRAInferenceEngine:
                 state_dict=state_dict,
                 peft_config=peft_config,
             )
+        except Exception as e:
+            print(f"[DEBUG add_lora_for_session] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
         load_time = time.time() - start_time
 
         logger.info(
             f"Added LoRA for session {sampling_session_id} "
+            f"(lora_int_id={lora_id}, load_time={load_time:.3f}s)"
+        )
+        return lora_id
+
+    async def add_lora_for_session_from_path(
+        self,
+        sampling_session_id: str,
+        lora_path: str,
+    ) -> int:
+        """Add frozen LoRA weights for a sampling session from filesystem path.
+
+        More efficient than add_lora_for_session for large MoE models:
+        - Avoids transferring 30k+ tensors through Ray object store
+        - vLLM worker loads directly from shared filesystem (PFS)
+
+        Requires shared filesystem access between API server and vLLM worker.
+
+        Args:
+            sampling_session_id: Unique identifier for the sampling session.
+            lora_path: Path to saved LoRA adapter directory (must be accessible to vLLM worker).
+
+        Returns:
+            The allocated lora_int_id for this session.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Allocate unique ID for this session
+        lora_id = await self.registry.allocate(sampling_session_id)
+
+        # Check if we need to evict from GPU
+        current_count = await self.registry.count()
+        if current_count > self.max_loras:
+            logger.debug(
+                f"GPU slots full ({self.max_loras}), "
+                f"vLLM will manage CPU cache for overflow"
+            )
+
+        # Load directly from shared filesystem path
+        # Much faster than Ray tensor transfer for large MoE models
+        start_time = time.time()
+        print(f"[DEBUG add_lora_for_session_from_path] Loading from path: {lora_path}", flush=True)
+        try:
+            await self.server.add_lora_from_path.remote(
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                lora_name=sampling_session_id,
+            )
+            print(f"[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
+            self._initialized = False
+            self.server = None
+            await self.initialize()
+            # Retry after restart
+            await self.server.add_lora_from_path.remote(
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                lora_name=sampling_session_id,
+            )
+        except Exception as e:
+            print(f"[DEBUG add_lora_for_session_from_path] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        load_time = time.time() - start_time
+
+        logger.info(
+            f"Added LoRA for session {sampling_session_id} from path "
             f"(lora_int_id={lora_id}, load_time={load_time:.3f}s)"
         )
         return lora_id

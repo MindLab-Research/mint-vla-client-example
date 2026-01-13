@@ -440,6 +440,7 @@ async def _do_save_weights_for_sampler(
     - Named (path is not None): Save to persistent location, return path
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
+    print(f"[DEBUG _do_save_weights_for_sampler] ENTRY request_id={request_id}", flush=True)
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
@@ -458,12 +459,14 @@ async def _do_save_weights_for_sampler(
             # Ephemeral save - generate unique temp name
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
 
+        print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
             checkpoint_base_dir=checkpoint_dir,
         )
+        print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
         # Use tinker:// URI format for SDK compatibility
         # Format: tinker://localhost/<absolute_path>
@@ -471,6 +474,7 @@ async def _do_save_weights_for_sampler(
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately
+            print(f"[DEBUG _do_save_weights_for_sampler] Named flow", flush=True)
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
@@ -479,6 +483,7 @@ async def _do_save_weights_for_sampler(
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
             # Each sampling session gets unique lora_int_id with frozen weights.
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
+            print(f"[DEBUG _do_save_weights_for_sampler] Ephemeral flow", flush=True)
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
 
@@ -490,32 +495,27 @@ async def _do_save_weights_for_sampler(
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
             base_model = session.base_model
+            print(f"[DEBUG _do_save_weights_for_sampler] base_model={base_model}", flush=True)
 
             # Get or create engine for this model (dynamically creates vLLM actor if needed)
+            print(f"[DEBUG _do_save_weights_for_sampler] getting engine for model", flush=True)
             multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+            print(f"[DEBUG _do_save_weights_for_sampler] got engine: {multi_lora_engine is not None}", flush=True)
 
             if multi_lora_engine is not None:
                 # Multi-LoRA mode: Each sampling session gets frozen weights
-                # Transfer tensors via Ray to support distributed deployments
-                # where API server and worker have different filesystems.
-                # Worker saves locally and creates file-based LoRARequest,
-                # which supports vLLM's GPU/CPU swapping.
+                # Use path-based loading for MoE models (avoids 30k+ tensor Ray transfer)
+                # vLLM worker loads directly from shared PFS
                 start_time = time.time()
 
-                # Load tensors from saved checkpoint on API server
-                weights_path = os.path.join(save_path, "adapter_model.safetensors")
-                config_path = os.path.join(save_path, "adapter_config.json")
-                state_dict = load_file(weights_path)
-                with open(config_path, "r") as f:
-                    peft_config = json.load(f)
-
-                # Add LoRA with unique ID for this sampling session
-                # Tensors transferred via Ray, worker saves locally
-                lora_id = await multi_lora_engine.add_lora_for_session(
+                # Add LoRA from path - vLLM worker loads directly from PFS
+                # This avoids serializing 37k+ tensors through Ray object store
+                print(f"[DEBUG _do_save_weights_for_sampler] calling add_lora_for_session_from_path with {save_path}", flush=True)
+                lora_id = await multi_lora_engine.add_lora_for_session_from_path(
                     sampling_session_id=sampling_session_id,
-                    state_dict=state_dict,
-                    peft_config=peft_config,
+                    lora_path=save_path,
                 )
+                print(f"[DEBUG _do_save_weights_for_sampler] add_lora_for_session_from_path returned lora_id={lora_id}", flush=True)
 
                 # Register in session manager with base_model for multi-model routing
                 inference_manager.register_multi_lora_session(
@@ -523,6 +523,7 @@ async def _do_save_weights_for_sampler(
                     base_model=base_model,
                     lora_rank=lora_rank,
                 )
+                print(f"[DEBUG _do_save_weights_for_sampler] registered session", flush=True)
 
                 load_time = time.time() - start_time
                 logger.info(
