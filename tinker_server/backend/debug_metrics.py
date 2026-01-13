@@ -89,8 +89,17 @@ def pearson_correlation_coefficient(
     mt2 = torch.masked_select(tensor2, mask)
 
     # Calculate correlation
+    # Handle edge case: if either tensor is constant, corrcoef returns NaN
+    if mt1.numel() < 2 or mt2.numel() < 2:
+        return 0.0
+
     result = torch.corrcoef(torch.stack([mt1, mt2], dim=0))
-    return result[0][1].detach().item()
+    corr_value = result[0][1].detach().item()
+
+    # Handle NaN (constant tensors have variance 0)
+    if corr_value != corr_value:  # NaN check
+        return 0.0
+    return corr_value
 
 
 def calculate_log_prob_diff(

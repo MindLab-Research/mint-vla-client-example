@@ -2573,7 +2573,7 @@ class MegatronRankWorker:
 
         return info
 
-    def save_checkpoint(self, save_path: str, step_count: int = 0, actual_rank: int | None = None) -> dict:
+    def save_checkpoint(self, save_path: str, step_count: int = 0, actual_rank: int | None = None, use_per_expert_lora: bool = False) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
         IMPORTANT: ALL ranks must call this method because get_lora_state_dict()
@@ -2584,6 +2584,7 @@ class MegatronRankWorker:
             step_count: Current training step (passed from MegatronWorkerGroup).
             actual_rank: Actual LoRA rank for current session (Phase 7).
                          If None, falls back to self.lora_rank (max_lora_rank).
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
             Dict with training metadata (rank 0 only, others return empty).
@@ -2595,7 +2596,7 @@ class MegatronRankWorker:
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
         # Only rank 0 gets actual data, others get empty dict
-        state_dict = self.get_lora_state_dict()
+        state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
 
         # Only rank 0 saves to disk
         if self.rank != 0:
@@ -2638,9 +2639,8 @@ class MegatronRankWorker:
         abs_path = os.path.abspath(save_path)
         logger.info(f"[MegatronRankWorker] Saved checkpoint to {abs_path} (step={step_count})")
 
-        # Return state_dict and peft_config for vLLM multi-LoRA registration
-        meta["state_dict"] = state_dict
-        meta["peft_config"] = config
+        # Note: state_dict NOT included in return value to avoid OOM on API server
+        # when transferring 37k+ MoE LoRA tensors through Ray. vLLM loads from path.
         return meta
 
 
@@ -3350,7 +3350,7 @@ class MegatronWorkerGroup:
         return {"status": "no_adapter_files", "path": load_path}
 
 
-    def save_checkpoint(self, save_path: str) -> dict:
+    def save_checkpoint(self, save_path: str, use_per_expert_lora: bool = False) -> dict:
         """Save checkpoint using all workers (rank 0 saves, others participate in NCCL).
 
         IMPORTANT: Must call ALL workers because MegatronRankWorker.save_checkpoint
@@ -3359,14 +3359,15 @@ class MegatronWorkerGroup:
 
         Args:
             save_path: Directory path to save checkpoint files.
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
             Dict with training metadata (from rank 0).
         """
-        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path} (actual_rank={self._actual_rank})")
+        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path} (actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})")
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
-        futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank) for w in self.workers]
+        futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora) for w in self.workers]
         results = ray.get(futures, timeout=300)
         result = results[0]  # Only rank 0 returns actual data
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")

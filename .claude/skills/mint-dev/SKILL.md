@@ -426,6 +426,59 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbo
 
 ---
 
+## 9. Ray Actor Status and Logs
+
+> **CRITICAL: NEVER assume actor state without verifying.**
+>
+> A failed `ray.get_actor()` lookup could mean: wrong name, wrong namespace, or actor actually dead.
+> **ALWAYS list actors first** to see what exists before concluding anything.
+
+### List All Actors (DO THIS FIRST)
+
+```bash
+# List all actors - this shows actual names and states
+ssh volcano 'ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
+
+# Or list with full details
+ssh volcano 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
+```
+
+### Check Specific Actor Status
+
+```bash
+# WRONG: Guessing actor name and concluding "DEAD" if not found
+# RIGHT: List first, then check with exact name from list
+
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+
+# List actors first to get exact names
+actors = ray.util.list_named_actors(all_namespaces=True)
+print(\"Named actors:\")
+for a in actors:
+    print(f\"  {a}\")
+"'
+```
+
+### Get Actor Logs
+
+```bash
+# Get actor ID from ray list actors output, then:
+ssh volcano 'ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
+
+# Example with actual ID:
+ssh volcano 'ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
+```
+
+### List Dead Actors (for crash investigation)
+
+```bash
+ssh volcano 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
+```
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -438,3 +491,4 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbo
 | Pending placement groups | Not enough GPUs. Kill stale actors (see section 6) |
 | MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
 | Tokenizer download fails | Run test script locally, not on server (server has no internet) |
+| Actor lookup fails | **LIST actors first** (`ray list actors`), don't assume dead |

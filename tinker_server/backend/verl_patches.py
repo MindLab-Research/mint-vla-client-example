@@ -193,15 +193,20 @@ def _apply_external_label_patch():
             print(f"[PRE-FORWARD] input_ids.values() len={len(input_flat)}")
 
         def logits_processor(logits, temperature, **label_kwargs):
-            """Process logits to compute log_probs.
+            """Process logits to compute log_probs."""
+            import torch
+            # DEBUG: Dump EVERYTHING
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                torch.save({
+                    "logits": logits.cpu(),
+                    "temperature": temperature.cpu() if hasattr(temperature, 'cpu') else temperature,
+                    "label_kwargs_keys": list(label_kwargs.keys()),
+                    "external_label": label_kwargs.get("external_label").cpu() if label_kwargs.get("external_label") is not None else None,
+                    "label": label_kwargs.get("label").cpu() if label_kwargs.get("label") is not None else None,
+                }, "/vePFS-Mindverse/share/code/logits_processor_input.pt")
 
-            Accepts label via **kwargs to handle both "label" and "external_label" keys.
-            model_forward.py passes logits_processor_args as **kwargs, so the key name
-            determines the parameter name.
-
-            CRITICAL FIX: Mask padded positions to avoid garbage logits corrupting log_probs.
-            Padded positions have uninitialized/garbage logits that produce -2.2B log_probs.
-            """
             # Get label from either key
             # NOTE: Can't use `or` here because tensors don't support boolean evaluation
             label = label_kwargs.get("label")
@@ -211,6 +216,23 @@ def _apply_external_label_patch():
                 raise ValueError(f"No label found in kwargs: {label_kwargs.keys()}")
 
             assert logits.shape[:2] == label.shape[:2], f"Shape mismatch: logits={logits.shape}, label={label.shape}"
+
+            # DEBUG: Log label AFTER THD preprocessing (this is what model_forward.py produced)
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                import json
+                label_flat = label[0].tolist() if label.dim() > 1 else label.tolist()
+                debug_post = {
+                    "logits_shape": str(logits.shape),
+                    "label_shape_post_thd": str(label.shape),
+                    "label_first_20_post_thd": label_flat[:20],
+                    "label_last_10_post_thd": label_flat[-10:],
+                    "label_len_post_thd": len(label_flat),
+                }
+                with open("/vePFS-Mindverse/share/code/model_forward_post_thd.json", "w") as f:
+                    json.dump(debug_post, f, indent=2)
+                print(f"[DEBUG-POST-THD] label_shape={label.shape}, logits_shape={logits.shape}")
 
             # DIAGNOSTIC: Print input_ids vs target alignment and logits analysis
             from megatron.core import parallel_state as mpu
@@ -424,13 +446,71 @@ def _apply_external_label_patch():
             # Compute top-K tokens across vocab-parallel shards
             # Use logits_bak (post temperature scaling) - ranking is invariant to temperature
             topk_indices, topk_logits = vocab_parallel_topk(logits_bak, k=10)
-            ret["topk_indices"] = topk_indices.cpu()  # (batch, seq_len, k)
-            ret["topk_logits"] = topk_logits.cpu()    # (batch, seq_len, k)
+
+            # Write topk directly to file for diagnostic (bypasses complex verl pipeline)
+            # FAIL-FAST: Any error here crashes immediately - no silent failures
+            from megatron.core import parallel_state as mpu
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            if tp_rank == 0:
+                import json
+                assert topk_indices.dim() == 3, f"topk_indices expected 3D, got {topk_indices.shape}"
+                assert topk_logits.dim() == 3, f"topk_logits expected 3D, got {topk_logits.shape}"
+                assert topk_indices.shape == topk_logits.shape, f"Shape mismatch: {topk_indices.shape} vs {topk_logits.shape}"
+
+                topk_data = {
+                    "positions": [],
+                    "seq_len": int(topk_indices.shape[1]),
+                }
+                # Capture first 60 positions
+                for pos in range(min(60, topk_indices.shape[1])):
+                    target_tok = int(label[0, pos].item()) if pos < label.shape[1] else -1
+                    pos_topk = []
+                    for k_idx in range(min(10, topk_indices.shape[2])):
+                        tok_id = int(topk_indices[0, pos, k_idx].item())
+                        tok_logit = float(topk_logits[0, pos, k_idx].item())
+                        pos_topk.append({"tok": tok_id, "logit": round(tok_logit, 4)})
+                    target_lp = float(log_probs[0, pos].item()) if pos < log_probs.shape[1] else None
+                    topk_data["positions"].append({
+                        "pos": pos,
+                        "target": target_tok,
+                        "target_lp": round(target_lp, 4) if target_lp is not None else None,
+                        "topk": pos_topk
+                    })
+                with open("/vePFS-Mindverse/share/code/megatron_topk.json", "w") as f:
+                    json.dump(topk_data, f, indent=2)
+                print(f"[TOPK-DIAG] Wrote {len(topk_data['positions'])} positions to megatron_topk.json")
+
+            # Keep on GPU (not .cpu()) to work with verl's nested tensor aggregation
+            ret["topk_indices"] = topk_indices
+            ret["topk_logits"] = topk_logits
 
             return ret
 
         # PATCH: Use dynamic key for label
         logits_processor_args = {label_key: label, "temperature": temperature}
+
+        # DEBUG: Log actual inputs before model forward
+        from megatron.core import parallel_state as mpu
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        if tp_rank == 0:
+            import json
+            # Extract values from NestedTensor
+            input_vals = input_ids.values().tolist() if hasattr(input_ids, 'values') else input_ids[0].tolist()
+            label_vals = label.values().tolist() if hasattr(label, 'values') else label[0].tolist()
+            debug_data = {
+                "input_ids_shape": str(input_ids.shape),
+                "label_shape": str(label.shape),
+                "input_ids_first_20": input_vals[:20],
+                "input_ids_last_10": input_vals[-10:],
+                "label_first_20": label_vals[:20],
+                "label_last_10": label_vals[-10:],
+                "label_key": label_key,
+                "input_len": len(input_vals),
+                "label_len": len(label_vals),
+            }
+            with open("/vePFS-Mindverse/share/code/model_forward_input.json", "w") as f:
+                json.dump(debug_data, f, indent=2)
+            print(f"[DEBUG-FORWARD] Wrote input debug to model_forward_input.json")
 
         output = forward_fn(
             model,
@@ -647,10 +727,17 @@ def _apply_prepare_model_outputs_patch():
 
     def patched_prepare_model_outputs(self, output: dict, data):
         """Patched to pass through all keys from logits_processor output."""
+        # DEBUG: Verify this patched version is being called - write to PFS shared log
+        import time
+        with open("/vePFS-Mindverse/share/code/raw_logit_diag.log", "a") as f:
+            f.write(f"[PATCHED_PREPARE_MODEL_OUTPUTS] Called with output keys: {list(output.keys()) if isinstance(output, dict) else type(output)}\n")
+
         # Start with log_probs (required)
         log_prob = output.get("log_probs")
         if log_prob is None:
             # Fall back to original method
+            with open("/vePFS-Mindverse/share/code/raw_logit_diag.log", "a") as f:
+                f.write("[PATCHED_PREPARE_MODEL_OUTPUTS] log_probs is None, falling back to original\n")
             return original_prepare_model_outputs(self, output, data)
 
         model_output = {"log_probs": log_prob}
@@ -659,7 +746,12 @@ def _apply_prepare_model_outputs_patch():
         for key, value in output.items():
             if key != "log_probs":  # Already added
                 model_output[key] = value
+                if key in ("topk_indices", "topk_logits"):
+                    with open("/vePFS-Mindverse/share/code/raw_logit_diag.log", "a") as f:
+                        f.write(f"[PATCHED_PREPARE_MODEL_OUTPUTS] Added {key}: shape={value.shape if hasattr(value, 'shape') else 'N/A'}\n")
 
+        with open("/vePFS-Mindverse/share/code/raw_logit_diag.log", "a") as f:
+            f.write(f"[PATCHED_PREPARE_MODEL_OUTPUTS] Returning model_output with keys: {list(model_output.keys())}\n")
         return model_output
 
     MegatronEngineWithLMHead.prepare_model_outputs = patched_prepare_model_outputs

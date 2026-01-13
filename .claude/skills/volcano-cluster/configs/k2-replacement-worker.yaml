@@ -15,7 +15,7 @@ Entrypoint: |
   # Connect to Ray head with 8 GPUs
   ray start --address='192.168.32.139:6379' --num-gpus=8 && sleep infinity
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:5"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 

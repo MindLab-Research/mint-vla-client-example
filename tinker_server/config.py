@@ -13,6 +13,9 @@ PFS_TINKER_PATH = "/vePFS-Mindverse/share/code/tinker-server"
 # PFS verl path with _mutable_fields patch for LoRA config assignment
 PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
 
+# PFS vLLM 0.13.0 with raw logits dump instrumentation
+PFS_VLLM_PATH = "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg"
+
 # PFS megatron-bridge path for MoE LoRA ETP fix (PR #1380)
 # Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
 PFS_MEGATRON_BRIDGE_PATH = "/vePFS-Mindverse/share/code/megatron-bridge/src"
@@ -32,12 +35,12 @@ USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").low
 # Custom model code is cached here when models are first loaded
 PFS_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
 
-# PYTHONPATH for Ray actors - megatron-bridge first (ETP fix), then verl, tinker-server, HF modules
+# PYTHONPATH for Ray actors - vLLM first (for instrumentation), then megatron-bridge, verl, tinker-server, HF modules
 # USE_HOLLOWMAN_MBRIDGE controls which megatron-bridge version is used
 if USE_HOLLOWMAN_MBRIDGE:
-    PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+    PFS_PYTHONPATH = f"{PFS_VLLM_PATH}:{PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
 else:
-    PFS_PYTHONPATH = f"{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+    PFS_PYTHONPATH = f"{PFS_VLLM_PATH}:{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
 
 
 @dataclass

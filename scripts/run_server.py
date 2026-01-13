@@ -17,11 +17,25 @@ Parallelism is auto-detected from the model registry when engines are created.
 """
 
 import logging
+import sys
+import traceback
 
 import uvicorn
 
 from tinker_server.app import app
 from tinker_server.config import config
+
+
+def crash_handler(exc_type, exc_value, exc_tb):
+    """Log uncaught exceptions before crash."""
+    print(f"\n{'='*60}", flush=True)
+    print("UNCAUGHT EXCEPTION - SERVER CRASHING", flush=True)
+    print(f"{'='*60}", flush=True)
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    print(f"{'='*60}\n", flush=True)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = crash_handler
 
 
 class PollingLogFilter(logging.Filter):
