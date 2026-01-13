@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
-from tinker_server.backend.model_registry import is_moe_model, is_mla_model
+from tinker_server.backend.model_registry import get_model_config
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
@@ -538,7 +538,7 @@ class MegatronRankWorker:
 
         num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
         try:
-            model_uses_mla = is_mla_model(self.base_model)
+            model_uses_mla = get_model_config(self.base_model).is_mla
         except ValueError:
             # Unknown model, check HF config for MLA-specific attributes
             model_uses_mla = hasattr(hf_config, 'qk_nope_head_dim') and hasattr(hf_config, 'kv_lora_rank')
@@ -639,6 +639,21 @@ class MegatronRankWorker:
             override_tf_config["use_cpu_initialization"] = True
             logger.info(f"[Rank {self.rank}] FP8 enabled (format: e4m3, fp8_param=True, cpu_init=True) for memory-efficient training")
 
+        # Activation recomputation (gradient checkpointing) for memory-constrained training
+        # Required for long context training on large models (e.g., 40K tokens on 30B)
+        try:
+            use_gradient_checkpointing = get_model_config(self.base_model).gradient_checkpointing
+        except ValueError:
+            use_gradient_checkpointing = False
+        if use_gradient_checkpointing:
+            # Use FULL recomputation for maximum memory savings
+            # For 40K context on 30B MoE, "selective" isn't enough - need full recompute
+            # This recomputes ALL activations during backward pass, trading compute for memory
+            override_tf_config["recompute_granularity"] = "full"
+            override_tf_config["recompute_method"] = "uniform"
+            override_tf_config["recompute_num_layers"] = 1
+            logger.info(f"[Rank {self.rank}] Activation recomputation enabled (full: all layers)")
+
         # MLA attention (Multi-Latent Attention) detection for DeepSeekV3/K2/Moonlight models
         # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
         # MLA has head_dim_qk=192 (qk_nope=128 + qk_rope=64) and head_dim_v=128
@@ -669,7 +684,8 @@ class MegatronRankWorker:
         # - "shared_experts": recompute shared experts
         # - "core_attn": recompute core attention
         # - "layernorm": recompute layernorms
-        if num_experts is not None:
+        # Only use selective recompute if full recompute wasn't enabled via model_registry
+        if num_experts is not None and not use_gradient_checkpointing:
             override_tf_config["recompute_granularity"] = "selective"
             # Aggressive recompute for maximum memory savings:
             # - moe: MoE FFN activations (~40% of memory)
@@ -789,9 +805,8 @@ class MegatronRankWorker:
         )
 
         # Add non-tensor metadata for verl's prepare_micro_batches
-        dummy_data["use_dynamic_bsz"] = NonTensorData(False)  # Disabled to allow micro_batch_size_per_gpu settings
-        dummy_data["max_token_len_per_gpu"] = NonTensorData(32768)  # Support up to 32K context
-        dummy_data["micro_batch_size_per_gpu"] = NonTensorData(1)  # Process one sample at a time
+        dummy_data["use_dynamic_bsz"] = NonTensorData(True)
+        dummy_data["max_token_len_per_gpu"] = NonTensorData(get_model_config(self.base_model).max_model_len)
         dummy_data.set_non_tensor("dp_size", 1)
         dummy_data.set_non_tensor("batch_num_tokens", seq_len)
         dummy_data.set_non_tensor("temperature", 1.0)
@@ -1004,7 +1019,8 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
-        data = tinker_to_tensordict(valid_items, device=f"cuda:{device}")
+        max_token_len = get_model_config(self.base_model).max_model_len
+        data = tinker_to_tensordict(valid_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Log memory before forward-backward
         self.log_memory_breakdown("before_forward_backward")
@@ -1319,7 +1335,8 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
-        data = tinker_to_tensordict(valid_items, device=f"cuda:{device}")
+        max_token_len = get_model_config(self.base_model).max_model_len
+        data = tinker_to_tensordict(valid_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn
@@ -1892,6 +1909,9 @@ class MegatronRankWorker:
                 import traceback
                 logger.error(traceback.format_exc())
 
+            # Log before exiting eval_mode to detect if exit is blocked
+            logger.info(f"[Rank {self.rank}] get_lora_state_dict: extraction complete, about to exit eval_mode (adapter_state has {len(adapter_state)} keys)")
+
             # SECOND: If direct extraction failed, try bridge.export_hf_weights()
             # NOTE: Modern Megatron-Bridge uses export_hf_weights(), not the old export_weights() API.
             # export_weights() merges LoRA into base weights, which is not what we want.
@@ -1972,7 +1992,7 @@ class MegatronRankWorker:
 
         # Check if model is MoE
         try:
-            model_is_moe = is_moe_model(self.base_model)
+            model_is_moe = get_model_config(self.base_model).is_moe
         except ValueError:
             model_is_moe = False
 
@@ -2263,9 +2283,9 @@ class MegatronRankWorker:
             lora_type = 'lora_A'
         elif 'adapter.linear_out' in name:
             lora_type = 'lora_B'
-        elif 'lora_A' in name.lower():
+        elif 'lora_a' in name.lower():
             lora_type = 'lora_A'
-        elif 'lora_B' in name.lower():
+        elif 'lora_b' in name.lower():
             lora_type = 'lora_B'
         else:
             logger.warning(f"Could not determine LoRA type from: {name}")
@@ -2281,7 +2301,7 @@ class MegatronRankWorker:
         # Also check model registry for MLA flag (fallback)
         if not model_is_mla:
             try:
-                model_is_mla = is_mla_model(self.base_model)
+                model_is_mla = get_model_config(self.base_model).is_mla
             except (ValueError, AttributeError):
                 pass
 
@@ -2616,9 +2636,13 @@ class MegatronRankWorker:
         # 2. LoRA config
         # Use actual session rank (Phase 7) or fall back to max_lora_rank
         effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        try:
+            model_is_mla = get_model_config(self.base_model).is_mla
+        except ValueError:
+            model_is_mla = False
         target_modules = [
             "q_proj", "k_proj", "v_proj", "o_proj",
-        ] if not is_mla_model(self.base_model) else [
+        ] if not model_is_mla else [
             "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
         ]
         target_modules += ["gate_proj", "up_proj", "down_proj"]
@@ -3177,7 +3201,7 @@ class MegatronWorkerGroup:
             logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: returning {len(result)} params from rank 0")
             return result
         except ray.exceptions.GetTimeoutError:
-            logger.error("[MegatronWorkerGroup] get_lora_state_dict timed out after 120s")
+            logger.error("[MegatronWorkerGroup] get_lora_state_dict timed out after 300s")
             raise RuntimeError("get_lora_state_dict timed out - workers not responding (possible NCCL deadlock)")
         except ray.exceptions.RayActorError as e:
             logger.error(f"[MegatronWorkerGroup] get_lora_state_dict failed - worker died: {e}")
@@ -3245,9 +3269,13 @@ class MegatronWorkerGroup:
 
         MLP modules are excluded by default for MoE models unless explicitly enabled.
         """
+        try:
+            model_is_mla = get_model_config(self.base_model).is_mla
+        except ValueError:
+            model_is_mla = False
         target_modules = [
             "q_proj", "k_proj", "v_proj", "o_proj",
-        ] if not is_mla_model(self.base_model) else [
+        ] if not model_is_mla else [
             "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
         ]
         target_modules += ["gate_proj", "up_proj", "down_proj"]

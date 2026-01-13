@@ -34,7 +34,7 @@ description: |
 
 - **NEVER** `ssh volcano` - that's development
 - **NEVER** use port `8000` - that's development
-- **NEVER** use `volcano-tinker` unison profile (without `-auth`) - that's development
+- **NEVER** use unison for production sync - use rsync (unidirectional)
 - **NEVER** use `mint-dev-*.yaml` Ray configs - that's development
 - **NEVER** use `tinker-server` directory (without `-auth`) - that's development
 - **NEVER** use `pkill -f "run_server"` - may kill dev server; use `fuser -k 18000/tcp`
@@ -54,7 +54,6 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 | External URL | `https://mint-alpha.macaron.im` |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
-| Unison Profile | `volcano-tinker-auth` |
 | Ray Configs | `mint-prod-head.yaml`, `mint-prod-worker.yaml` |
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
@@ -106,24 +105,38 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 
 ## 1. Code Synchronization
 
-> **CRITICAL: ALWAYS USE DAEMON MODE (`-repeat watch`)**
+> **CRITICAL: USE RSYNC FOR PRODUCTION DEPLOYMENT**
 >
-> **NEVER** run one-off `unison volcano-tinker-auth -batch` commands. This causes stale code on workers.
+> Production uses **unidirectional rsync** from local to server. This ensures:
+> - Local code is the source of truth
+> - No accidental overwrites from server
+> - Explicit deployment step (not background sync)
 
 ```bash
-# Start daemon (run first, keep running)
-unison volcano-tinker-auth -repeat watch
+# From the tinker-server-prod directory:
 
-# Check if running
-pgrep -af "unison.*volcano-tinker-auth"
+# Sync local code to production server (dry-run first)
+rsync -avz --dry-run --delete \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.claude' \
+  ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
 
-# Stop daemon
-pkill -f "unison.*volcano-tinker-auth"
+# Execute sync (remove --dry-run)
+rsync -avz --delete \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.claude' \
+  ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
 ```
 
-**First-time setup:**
+**Verify sync succeeded:**
 ```bash
-cp .claude/skills/mint-prod/configs/volcano-tinker-auth.prf ~/.unison/
+# Compare specific file
+ssh mint-prod "head -5 /vePFS-Mindverse/share/code/tinker-server-auth/tinker_server/backend/model_registry.py"
+
+# Check git commit on server
+ssh mint-prod "cd /vePFS-Mindverse/share/code/tinker-server-auth && git log -1 --oneline"
 ```
 
 **SSH server symlink setup** (one-time):
@@ -342,7 +355,7 @@ ssh mint-prod "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.log | tail
 
 | Symptom | Fix |
 |---------|-----|
-| Unison not running | `pgrep -af "unison.*volcano-tinker-auth"` then restart daemon |
+| Code out of sync | Run rsync from local to server (see Code Synchronization) |
 | Symlink broken | Re-run symlink setup command |
 | Server won't start | Check logs: `tail -100 /tmp/tinker_server_auth.log` |
 | Auth bypass | Verify `PYTHONPATH` prioritizes `tinker-server-auth` |

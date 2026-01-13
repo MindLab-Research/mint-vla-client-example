@@ -17,7 +17,7 @@ import shutil
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
 from ..models.types import (
@@ -27,6 +27,7 @@ from ..models.types import (
     SaveStateRequest,
     UntypedAPIFuture,
 )
+from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -44,6 +45,27 @@ inference_manager: SessionManager | None = None  # For multi-LoRA sampling regis
 # Checkpoint directory (shared filesystem required for distributed deployments)
 # Must be absolute path on vePFS for all Ray workers to access
 CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
+
+
+def _get_user_data(request: Request) -> dict | None:
+    """Extract full user_data from request state."""
+    return getattr(request.state, "user_data", None)
+
+
+def _get_user_id(request: Request) -> str | None:
+    """Extract user_id from request state."""
+    user_data = _get_user_data(request)
+    if user_data:
+        return user_data.get("user_id")
+    return None
+
+
+def _get_webhook_url(request: Request) -> str | None:
+    """Extract webhook_url from request state."""
+    user_data = _get_user_data(request)
+    if user_data:
+        return user_data.get("webhook_url")
+    return None
 
 
 def _resolve_tinker_path(tinker_uri: str) -> str:
@@ -81,6 +103,7 @@ def _to_tinker_path(model_id: str, checkpoint_name: str) -> str:
 async def save_weights(
     request: SaveStateRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Save LoRA weights for sampling.
 
@@ -95,8 +118,10 @@ async def save_weights(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     request_id = future_store.create()
+    user_id = _get_user_id(http_request)
+    webhook_url = _get_webhook_url(http_request)
     # Reuse _do_save_state - both endpoints save weights and register for sampling
-    background_tasks.add_task(_do_save_state, request_id, session, request)
+    background_tasks.add_task(_do_save_state, request_id, session, request, user_id, webhook_url)
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -109,6 +134,7 @@ async def save_weights(
 async def save_state(
     request: SaveStateRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Save full model state to checkpoint (LoRA + optimizer + metadata).
 
@@ -123,11 +149,19 @@ async def save_state(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_save_state, request_id, session, request)
+    user_id = _get_user_id(http_request)
+    webhook_url = _get_webhook_url(http_request)
+    background_tasks.add_task(_do_save_state, request_id, session, request, user_id, webhook_url)
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_save_state(request_id: str, session, request: SaveStateRequest) -> None:
+async def _do_save_state(
+    request_id: str,
+    session,
+    request: SaveStateRequest,
+    user_id: str | None = None,
+    webhook_url: str | None = None,
+) -> None:
     """Background task to save state.
 
     Also registers the model for sampling via multi-LoRA engine, enabling
@@ -183,9 +217,35 @@ async def _do_save_state(request_id: str, session, request: SaveStateRequest) ->
             "sampling_registered": sampling_registered,
         })
 
+        # 发送 completed 状态 - 训练完成（权重已保存）
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_COMPLETED,
+                user_id=user_id,
+                session_id=session.model_id,
+                task_name=f"Training {session.base_model}",
+                task_type="training",
+                model_name=session.base_model,
+                result={"checkpoint_path": tinker_path, "step": session.current_step},
+            )
+
     except Exception as e:
         logger.error(f"[save_state] Failed: {e}", exc_info=True)
         future_store.fail(request_id, str(e))
+
+        # 发送 failed 状态
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_FAILED,
+                user_id=user_id,
+                session_id=session.model_id,
+                task_name=f"Training {session.base_model}",
+                task_type="training",
+                model_name=session.base_model,
+                error=str(e),
+            )
 
 
 # =============================================================================

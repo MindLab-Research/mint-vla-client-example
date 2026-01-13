@@ -27,6 +27,8 @@ from verl.utils import tensordict_utils as tu
 if TYPE_CHECKING:
     pass
 
+from tinker_server.backend.model_registry import get_model_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -1270,23 +1272,45 @@ class MegatronTrainingWorker:
             "type": "optim_step",
         }
 
-    def get_lora_state_dict(self) -> dict[str, torch.Tensor]:
+    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights in PEFT format.
 
-        Uses bridge.export_weights() and filters for LoRA parameters.
+        NOTE: This class is DEPRECATED. Use MegatronWorkerGroup from megatron_distributed.py instead.
+        This method uses the legacy single-actor approach and may not work with modern Megatron-Bridge.
+
+        Uses bridge.export_hf_weights() and filters for LoRA parameters.
         Converts mbridge HuggingFace names to PEFT format for vLLM compatibility.
 
         mbridge format: layers.0.self_attn.q_proj.lora_A.weight
         PEFT format:    base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
 
+        Args:
+            use_per_expert_lora: Ignored for legacy actor. Only applies to
+                MegatronWorkerGroup for MoE models.
+
         Returns:
             Dict mapping LoRA parameter names (PEFT format) to CPU tensors.
         """
+        import warnings
+        warnings.warn(
+            "MegatronTrainingWorker is deprecated. Use MegatronWorkerGroup from megatron_distributed.py instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
         if self.bridge is None:
             raise RuntimeError("Bridge not initialized - cannot export weights")
 
-        # Export all weights via bridge
-        full_state_dict = dict(self.bridge.export_weights(self.engine.module))
+        # Export all weights via bridge - requires export_hf_weights() API
+        # The old export_weights() API merges LoRA into base weights, which is unusable
+        # for multi-LoRA inference. We must have separate lora_A/lora_B matrices.
+        if not hasattr(self.bridge, 'export_hf_weights'):
+            raise RuntimeError(
+                "Bridge lacks export_hf_weights() method. "
+                "The old export_weights() API merges LoRA into base weights, "
+                "which cannot be used for vLLM multi-LoRA inference."
+            )
+        full_state_dict = dict(self.bridge.export_hf_weights(self.engine.module))
 
         # Filter for LoRA parameters and convert to PEFT format
         lora_state_dict = {}
@@ -1390,8 +1414,6 @@ class MegatronTrainingWorker:
 def is_moe_model(model_name: str) -> bool:
     """Check if a model is an MoE model requiring Megatron training.
 
-    Delegates to model_registry for centralized model configuration.
-
     Args:
         model_name: Model name (e.g., "Qwen/Qwen3-30B-A3B").
 
@@ -1401,5 +1423,5 @@ def is_moe_model(model_name: str) -> bool:
     Raises:
         ValueError: If model is not in the supported list.
     """
-    from .model_registry import is_moe_model as registry_is_moe
-    return registry_is_moe(model_name)
+    from .model_registry import get_model_config
+    return get_model_config(model_name).is_moe

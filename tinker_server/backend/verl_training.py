@@ -1794,7 +1794,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        use_per_expert_lora: bool | None = None,
+        use_per_expert_lora: bool = True,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -1818,7 +1818,7 @@ class VerlTrainingEngine:
         self,
         session: TrainingSession,
         save_path: str,
-        use_per_expert_lora: bool | None = None,
+        use_per_expert_lora: bool = True,
     ) -> str:
         """Save checkpoint via Ray actor.
 
@@ -1844,9 +1844,9 @@ class VerlTrainingEngine:
 
         # Auto-detect use_per_expert_lora for MoE models
         if use_per_expert_lora is None:
-            from ..backend.model_registry import is_moe_model
+            from ..backend.model_registry import get_model_config
             try:
-                use_per_expert_lora = is_moe_model(session.base_model)
+                use_per_expert_lora = get_model_config(session.base_model).is_moe
             except ValueError:
                 use_per_expert_lora = False
 

@@ -1,5 +1,11 @@
 # Training and Sampling
 
+MinT uses **LoRA (Low-Rank Adaptation)** for efficient fine-tuning. Instead of updating all model weights, LoRA trains small adapter matrices that are added to the frozen base model:
+
+![LoRA Diagram](/images/lora-diagram.png)
+
+The output becomes *h = Wx + BAx*, where *W* is frozen and only the low-rank matrices *A* and *B* are trained. This dramatically reduces memory and compute requirements.
+
 ## Creating a Training Client
 
 ```python

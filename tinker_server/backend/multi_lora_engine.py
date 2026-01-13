@@ -34,6 +34,9 @@ PERSISTENT_NAMESPACE = "tinker"
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
 
+# Import model registry
+from tinker_server.backend.model_registry import get_model_config
+
 
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
     """Get the node_id where an actor is running.
@@ -354,6 +357,20 @@ class MultiLoRAInferenceEngine:
                 }
                 logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
 
+            # Determine effective context limit for vLLM
+            model_cfg = get_model_config(self.model_path)
+            # Use model registry's max_model_len (single source of truth)
+            max_model_len = model_cfg.max_model_len
+            # verl calculates max_model_len = prompt_length + response_length
+            # We split evenly, but this does NOT restrict actual prompt/response sizes:
+            # - The split only affects verl's default max_new_tokens (response_length)
+            # - Our generate() computes actual limit dynamically: max_model_len - len(prompt)
+            # - A 32K model can do 25K prompt + 7K response, or 5K prompt + 27K response
+            # The sum (total context window) is what matters, not the individual values.
+            prompt_length = max_model_len // 2
+            response_length = max_model_len - prompt_length
+            logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
+
             # Configure rollout with multi-LoRA support
             # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
             # Expert parallelism is enabled via engine_kwargs instead
@@ -361,8 +378,8 @@ class MultiLoRAInferenceEngine:
                 name="vllm",
                 tensor_model_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
-                prompt_length=2048,
-                response_length=2048,
+                prompt_length=prompt_length,
+                response_length=response_length,
                 max_num_seqs=256,
                 dtype="auto",
                 load_format="auto",
@@ -379,8 +396,6 @@ class MultiLoRAInferenceEngine:
                 engine_kwargs=engine_kwargs,
                 quantization=self.quantization,  # "fp8" for FP8 models like K2
             )
-            if self.max_model_len is not None:
-                rollout_config.max_model_len = self.max_model_len
             if self.quantization:
                 logger.info(f"vLLM quantization enabled: {self.quantization}")
 
@@ -1043,8 +1058,7 @@ class MultiModelInferenceManager:
             quantization = config.quantization
 
             # Determine max_loras: per-model override > MoE default (1) > global default
-            from .model_registry import get_max_loras
-            model_max_loras_override = get_max_loras(model_name)
+            model_max_loras_override = config.max_loras
             if model_max_loras_override is not None:
                 model_max_loras = model_max_loras_override
             elif config.is_moe:
@@ -1056,36 +1070,32 @@ class MultiModelInferenceManager:
 
             # Use per-model max_lora_rank override if specified (K2 needs rank 8 to fit).
             # Large MoE models have huge LoRA buffers: 384 experts × rank × hidden_size.
-            from .model_registry import get_max_lora_rank
-            model_max_lora_rank = get_max_lora_rank(model_name) or self.max_lora_rank
+            model_max_lora_rank = config.max_lora_rank or self.max_lora_rank
 
             # Use per-model gpu_memory_utilization if specified (K2 needs lower for LoRA headroom)
             model_gpu_util = config.gpu_memory_utilization or self.gpu_memory_utilization
 
             # Use per-model max_model_len if specified (K2 needs 128K, default 262K exceeds KV cache)
-            from .model_registry import get_max_model_len
-            model_max_model_len = get_max_model_len(model_name) or self.max_model_len
+            model_max_model_len = config.max_model_len or self.max_model_len
 
             # Use per-model max_num_seqs if specified (K2 needs reduced value for KV cache)
-            from .model_registry import get_max_num_seqs
-            model_max_num_seqs = get_max_num_seqs(model_name) or 256  # Default: 256
+            model_max_num_seqs = config.max_num_seqs or 256  # Default: 256
 
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
-            from .model_registry import get_kv_cache_dtype
-            model_kv_cache_dtype = get_kv_cache_dtype(model_name)
+            model_kv_cache_dtype = config.kv_cache_dtype
 
             # Check if model needs multi-node (TP > 8)
             # K2 requires TP=16 across 2 nodes for LoRA support
-            needs_multinode = config.recommended_tp > 8
+            needs_multinode = config.inference_tp > 8
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
                 from .multinode_inference import MultiNodeInferenceEngine
 
-                total_gpus = config.recommended_tp  # TP=16 for K2
+                total_gpus = config.inference_tp  # TP=16 for K2
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
-                    f"actor={actor_name}, TP={config.recommended_tp}, total_gpus={total_gpus}, "
+                    f"actor={actor_name}, TP={config.inference_tp}, total_gpus={total_gpus}, "
                     f"gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
                     f"max_model_len={model_max_model_len}, max_num_seqs={model_max_num_seqs}, "
@@ -1104,7 +1114,7 @@ class MultiModelInferenceManager:
 
                 engine = MultiNodeInferenceEngine(
                     model_path=model_path,
-                    tensor_parallel_size=config.recommended_tp,
+                    tensor_parallel_size=config.inference_tp,
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
                     max_loras=model_max_loras,
@@ -1118,14 +1128,14 @@ class MultiModelInferenceManager:
                 # Use standard MultiLoRAInferenceEngine for single-node models
                 logger.info(
                     f"Creating vLLM engine for model {model_name}: "
-                    f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}, "
+                    f"actor={actor_name}, TP={config.inference_tp}, DP={config.inference_dp}, "
                     f"quant={quantization}, max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}"
                 )
 
                 engine = MultiLoRAInferenceEngine(
                     model_path=model_path,
-                    tensor_parallel_size=config.recommended_tp,
-                    data_parallel_size=config.recommended_dp,
+                    tensor_parallel_size=config.inference_tp,
+                    data_parallel_size=config.inference_dp,
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
                     max_loras=model_max_loras,

@@ -14,7 +14,8 @@ from .backend.session_manager import SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
-from .routes import futures, sampling, service, training, weights
+from .routes import futures, internal, sampling, service, training, weights
+from .token_encryptor import TokenEncryptor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -242,14 +243,32 @@ UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/", "/docs", "/doc
 # Path prefixes that don't require authentication
 UNAUTHENTICATED_PREFIXES = ("/doc/", "/doc")
 
+# Token encryptor for sk- token validation (initialized lazily)
+_token_encryptor: TokenEncryptor | None = None
+
+
+def get_token_encryptor() -> TokenEncryptor | None:
+    """Get or create token encryptor if secret key is configured."""
+    global _token_encryptor
+    if _token_encryptor is None and config.token_secret_key:
+        _token_encryptor = TokenEncryptor(config.token_secret_key)
+    return _token_encryptor
+
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
-    """Validate API key from X-API-Key or Authorization: Bearer header."""
+    """Validate API key or sk- token from X-API-Key or Authorization header.
+
+    Supports two authentication methods (checked in order):
+    1. Hardcoded API key (TINKER_API_KEY) - direct string comparison
+    2. Encrypted sk- tokens (TINKER_TOKEN_SECRET_KEY) - AES decryption
+
+    If neither is configured, auth is disabled (dev mode).
+    """
     path = request.url.path
 
-    # Skip auth if no API key configured (dev mode)
-    if not config.api_key:
+    # Skip auth if no authentication configured (dev mode)
+    if not config.auth_enabled:
         return await call_next(request)
 
     # Skip auth for specific paths
@@ -260,20 +279,42 @@ async def api_key_auth_middleware(request: Request, call_next):
     if path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
 
-    # Try X-API-Key header first, then Authorization: Bearer
+    # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")
     if not api_key:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             api_key = auth_header[7:]
+        elif auth_header.startswith("sk-"):
+            # Support direct Authorization: sk-xxx format
+            api_key = auth_header
 
-    if not config.validate_api_key(api_key):
+    if not api_key:
         return JSONResponse(
             status_code=401,
-            content={"error": "Invalid or missing API key"},
+            content={"error": "Missing API key"},
         )
 
-    return await call_next(request)
+    # Method 1: Check hardcoded API key (legacy)
+    if config.validate_api_key(api_key):
+        # Hardcoded key valid - no user_data available
+        request.state.user_data = None
+        return await call_next(request)
+
+    # Method 2: Try sk- token decryption
+    if api_key.startswith("sk-") and config.token_secret_key:
+        encryptor = get_token_encryptor()
+        if encryptor:
+            user_data = encryptor.decrypt_token(api_key)
+            if user_data is not None:
+                request.state.user_data = user_data
+                return await call_next(request)
+
+    # Neither method succeeded
+    return JSONResponse(
+        status_code=401,
+        content={"error": "Invalid API key or token"},
+    )
 
 
 # Register routes with API prefix
@@ -282,6 +323,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
 # Redirects to documentation (must be defined BEFORE mount)
 @app.get("/")
