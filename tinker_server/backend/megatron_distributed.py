@@ -1107,7 +1107,15 @@ class MegatronRankWorker:
                     ratio_mean_sum += float(rm)
 
                 model_output = result.get("model_output", {})
+                logger.info(f"[Rank {self.rank}] model_output keys: {list(model_output.keys())}")
                 model_log_probs = model_output.get("log_probs")
+                # Extract top-k tensors if present (from verl_patches.py)
+                model_topk_indices = model_output.get("topk_indices")  # (batch, seq_len, k)
+                model_topk_logits = model_output.get("topk_logits")    # (batch, seq_len, k)
+                if model_topk_indices is not None:
+                    logger.info(f"[Rank {self.rank}] Got topk_indices shape={model_topk_indices.shape}")
+                else:
+                    logger.info(f"[Rank {self.rank}] topk_indices is None")
                 if model_log_probs is not None:
                     if hasattr(model_log_probs, "unbind"):
                         per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
@@ -1118,14 +1126,40 @@ class MegatronRankWorker:
                             per_sample_log_probs.append(row[:seq_len].detach().cpu())
 
             # Concatenate and split log_probs into per-sample tensors for loss_fn_outputs
+            # Also split topk tensors which are in THD format (1, total_tokens, k)
+            topk_offset = 0  # Track offset into concatenated topk tensor
             if per_sample_log_probs:
                 avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
-                for sample_log_probs in per_sample_log_probs:
+                for sample_idx, sample_log_probs in enumerate(per_sample_log_probs):
                     logprobs_list = sample_log_probs.tolist()
-                    loss_fn_outputs.append({
+                    seq_len = len(logprobs_list)
+                    output_entry = {
                         "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                    })
+                        "logprobs": {"data": logprobs_list, "shape": [seq_len], "dtype": "float32"},
+                    }
+                    # Add top-k if available
+                    # topk tensors have shape (1, total_tokens, k) - all sequences concatenated
+                    if model_topk_indices is not None and model_topk_logits is not None:
+                        # Check if THD format (batch=1, concatenated sequences)
+                        if model_topk_indices.dim() == 3 and model_topk_indices.shape[0] == 1:
+                            total_tokens = model_topk_indices.shape[1]
+                            k = model_topk_indices.shape[2]
+                            if topk_offset + seq_len <= total_tokens:
+                                # TensorData.data must be flattened (per tinker schema)
+                                topk_idx = model_topk_indices[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
+                                topk_lp = model_topk_logits[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
+                                output_entry["topk_indices"] = {"data": topk_idx, "shape": [seq_len, k], "dtype": "int64"}
+                                output_entry["topk_logits"] = {"data": topk_lp, "shape": [seq_len, k], "dtype": "float32"}
+                                topk_offset += seq_len
+                        elif sample_idx < model_topk_indices.shape[0]:
+                            # Per-sample format: (num_samples, seq_len, k)
+                            k = model_topk_indices.shape[2]
+                            # TensorData.data must be flattened (per tinker schema)
+                            topk_idx = model_topk_indices[sample_idx, :seq_len, :].flatten().tolist()
+                            topk_lp = model_topk_logits[sample_idx, :seq_len, :].flatten().tolist()
+                            output_entry["topk_indices"] = {"data": topk_idx, "shape": [seq_len, k], "dtype": "int64"}
+                            output_entry["topk_logits"] = {"data": topk_lp, "shape": [seq_len, k], "dtype": "float32"}
+                    loss_fn_outputs.append(output_entry)
             elif loss_fn == "cross_entropy" and all_log_probs and seq_lengths:
                 combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
                 offset = 0
@@ -1184,7 +1218,9 @@ class MegatronRankWorker:
                                 # If not numeric, just take the last value
                                 debug_metrics[f"{key}:mean"] = values[-1]
                         else:
-                            debug_metrics[f"{key}:mean"] = values
+                            # Skip if values is None, empty list, or non-numeric
+                            if values is not None and isinstance(values, (int, float)):
+                                debug_metrics[f"{key}:mean"] = float(values)
                     else:
                         print(f"[Rank {self.rank} DEBUG] Key {key} NOT found in metrics", flush=True)
 
@@ -2969,8 +3005,11 @@ class MegatronWorkerGroup:
         # Add debug metrics if present (precision difference between rollout and training)
         debug_metrics = rank0_result.get("debug_metrics", {})
         if debug_metrics:
-            metrics.update(debug_metrics)
-            logger.info(f"[MegatronWorkerGroup] Debug metrics: {debug_metrics}")
+            # Filter out None values to avoid pydantic validation errors
+            filtered_debug_metrics = {k: v for k, v in debug_metrics.items() if v is not None and isinstance(v, (int, float))}
+            if filtered_debug_metrics:
+                metrics.update(filtered_debug_metrics)
+                logger.info(f"[MegatronWorkerGroup] Debug metrics: {filtered_debug_metrics}")
 
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
@@ -3277,8 +3316,7 @@ class MegatronWorkerGroup:
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
         """Load checkpoint from path.
 
-        Note: Megatron distributed checkpoints use verl's checkpoint format.
-        This is a placeholder - actual implementation needs verl engine integration.
+        Delegates to load_adapter_state which handles distributed loading.
 
         Args:
             load_path: Path to checkpoint directory.
@@ -3287,10 +3325,29 @@ class MegatronWorkerGroup:
         Returns:
             Dict with load metadata.
         """
-        logger.warning(f"[MegatronWorkerGroup] load_checkpoint not fully implemented: {load_path}")
-        # For now, return empty metadata - full implementation requires
-        # coordinated loading across all workers
-        return {"status": "not_implemented", "path": load_path}
+        import os
+
+        logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
+
+        # Check what files exist in checkpoint directory
+        if os.path.isdir(load_path):
+            files = os.listdir(load_path)
+            logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(files)} files: {files[:10]}")
+
+            # Look for adapter checkpoint files (mp_rank_*_adapter.pt pattern)
+            adapter_files = [f for f in files if f.endswith("_adapter.pt")]
+            if adapter_files:
+                logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
+                # Delegate to load_adapter_state
+                result = self.load_adapter_state(load_path, actual_rank=self._actual_rank or self.lora_rank)
+                result["load_method"] = "load_adapter_state"
+                return result
+            else:
+                logger.warning(f"[MegatronWorkerGroup] load_checkpoint: no adapter files found in {load_path}")
+        else:
+            logger.error(f"[MegatronWorkerGroup] load_checkpoint: path does not exist or is not a directory: {load_path}")
+
+        return {"status": "no_adapter_files", "path": load_path}
 
 
     def save_checkpoint(self, save_path: str) -> dict:
