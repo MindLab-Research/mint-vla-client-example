@@ -94,17 +94,22 @@ MODEL_CONFIGS = {
     # MoE models - Qwen3 30B variants
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
+    # max_model_len=16384: Default 256K causes OOM during KV cache allocation
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_model_len=16384,  # Limit context to prevent KV cache OOM
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_model_len=16384,
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_model_len=16384,
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
-        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1
+        is_moe=True, recommended_tp=4, recommended_dp=1, train_tp=4, train_ep=1,
+        max_model_len=16384,
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
