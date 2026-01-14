@@ -1146,14 +1146,14 @@ class MegatronRankWorker:
             # Also split topk tensors which are in THD format (1, total_tokens, k)
             topk_offset = 0  # Track offset into concatenated topk tensor
 
-            # NaN guard: detect and report NaN in loss_value before it propagates to JSON
+            # NaN guard: detect and report NaN/Inf in loss_value before it propagates to JSON
             # (orjson converts NaN to null, which causes pydantic validation failures on client)
             if math.isnan(loss_value) or math.isinf(loss_value):
                 logger.error(f"[Rank {self.rank}] NaN/Inf detected in loss_value={loss_value}. "
                              f"num_tokens={num_tokens}, loss_fn={loss_fn}. "
                              "This will cause client-side validation failures.")
                 # Set to a large but valid number to allow training to continue with a warning
-                loss_value = 1e6 if math.isnan(loss_value) else loss_value
+                loss_value = 1e6
 
             if per_sample_log_probs:
                 avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
