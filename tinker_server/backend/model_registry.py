@@ -98,7 +98,7 @@ MODEL_CONFIGS = {
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
-        max_model_len=262144,  # 256K context
+        max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     # MoE models - Qwen3 30B variants (40K context per model config)

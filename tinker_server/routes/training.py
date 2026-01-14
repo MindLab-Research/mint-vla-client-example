@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateModelFromStateRequest,
     CreateModelFromStateResponse,
@@ -99,6 +100,14 @@ async def create_model(
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
+    # Check model access permissions
+    user_data = _get_user_data(http_request)
+    if not can_access_model(request.base_model, user_data):
+        raise HTTPException(
+            status_code=403,
+            detail=get_access_denied_error(request.base_model)
+        )
+
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
@@ -114,7 +123,7 @@ async def create_model(
             task_name=f"Training {request.base_model}",
             task_type="training",
             model_name=request.base_model,
-            config={"lora_rank": request.lora_config.get("r") if request.lora_config else None},
+            config={"lora_rank": request.lora_config.rank if request.lora_config else None},
         )
 
     background_tasks.add_task(_do_create_model, request_id, request, user_id, webhook_url)
@@ -204,22 +213,22 @@ CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
 
 
 def _resolve_state_path(state_uri: str) -> str:
-    """Convert tinker://local/model_id/name or file:// to filesystem path.
+    """Convert mint://{model_id}/name or file:// to filesystem path.
 
     Args:
-        state_uri: URI like tinker://local/..., tinker://localhost/...,
-                   file://..., or absolute path.
+        state_uri: URI like tinker://{uuid}/..., mint://{uuid}/..., file://..., or absolute path.
 
     Returns:
         Filesystem path.
     """
-    if state_uri.startswith("tinker://local/"):
-        # tinker://local/model_id/checkpoint-100 -> ./checkpoints/model_id/checkpoint-100
-        path_part = state_uri[len("tinker://local/"):]
+    if state_uri.startswith("tinker://"):
+        # tinker://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
+        path_part = state_uri[len("tinker://"):]
         return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif state_uri.startswith("tinker://localhost"):
-        # tinker://localhost/abs/path -> /abs/path
-        return state_uri[len("tinker://localhost"):]
+    elif state_uri.startswith("mint://"):
+        # Legacy mint://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
+        path_part = state_uri[len("mint://"):]
+        return os.path.join(CHECKPOINTS_DIR, path_part)
     elif state_uri.startswith("file://"):
         return state_uri[7:]
     return state_uri
@@ -229,6 +238,7 @@ def _resolve_state_path(state_uri: str) -> str:
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a training model and load existing checkpoint.
 
@@ -237,6 +247,14 @@ async def create_model_from_state(
     """
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    # Check model access permissions
+    user_data = _get_user_data(http_request)
+    if not can_access_model(request.base_model, user_data):
+        raise HTTPException(
+            status_code=403,
+            detail=get_access_denied_error(request.base_model)
+        )
 
     request_id = future_store.create()
     background_tasks.add_task(_do_create_model_from_state, request_id, request)
@@ -352,7 +370,7 @@ async def _do_forward_backward(
         if user_id:
             # Count tokens in the batch
             token_count = sum(
-                len(item.input_ids) for item in request.forward_backward_input
+                len(datum.model_input.to_token_ids()) for datum in request.forward_backward_input.data
             )
             get_usage_logger().log(
                 user_id=user_id,
@@ -555,9 +573,9 @@ async def _do_save_weights_for_sampler(
         )
         print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
-        # Use tinker:// URI format for SDK compatibility
-        # Format: tinker://localhost/<absolute_path>
-        path_uri = f"tinker://localhost{save_path}"
+        # Use tinker:// URI format (matches client SDK expectation)
+        # Format: tinker://{model_id}/{checkpoint_name}
+        path_uri = f"tinker://{session.model_id}/{checkpoint_name}"
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately

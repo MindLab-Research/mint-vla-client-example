@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Model Lineup
 
 MinT supports a comprehensive lineup of state-of-the-art models across multiple tiers.
@@ -31,7 +35,7 @@ MinT supports a comprehensive lineup of state-of-the-art models across multiple 
 |------------|---------------|--------------|------|
 | Qwen/Qwen3-VL-30B-A3B-Instruct | Vision | MoE | Medium |
 | Qwen/Qwen3-VL-235B-A22B-Instruct | Vision | MoE | Large |
-| Pi0 | Robotics | Dense | Small |
+| π0 | Robotics | Dense | Small |
 
 ## Model Selection Recommendations
 
@@ -39,7 +43,7 @@ MinT supports a comprehensive lineup of state-of-the-art models across multiple 
 - **Intelligence-focused:** Use Hybrid or Reasoning models (chain-of-thought support)
 - **Custom tasks:** Fine-tune Base models for your specific use case
 - **Multimodal needs:** Use Vision models (T2) for image understanding
-- **Robotics applications:** Use Pi0 (T2) for embodied AI tasks
+- **Robotics applications:** Use π0 (T2) for embodied AI tasks
 
 ## Model Categories
 
@@ -64,3 +68,76 @@ MinT supports a comprehensive lineup of state-of-the-art models across multiple 
 ## Cost Efficiency
 
 MoE models offer superior cost-efficiency: pricing scales with **active parameters**, not total model size. For example, a 235B MoE model with 22B active parameters costs the same as a 22B dense model.
+
+</En>
+
+<Zh>
+
+# 模型列表
+
+MinT 支持多层级的主流模型。
+
+## Tier 0 (T0) - 现已可用
+
+| 模型名称 | 训练类型 | 架构 | 规模 |
+|----------|----------|------|------|
+| Qwen/Qwen3-0.6B | Hybrid | Dense | Small |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | Medium |
+| Qwen/Qwen3-30B-A3B | Hybrid | MoE | Medium |
+| Qwen/Qwen3-30B-A3B-Base | Base | MoE | Medium |
+| moonshotai/Kimi-K2-Thinking* | Reasoning | MoE | Large |
+
+*Kimi-K2 访问权限请联系销售
+
+## Tier 1 (T1) - 1.15 前可用
+
+| 模型名称 | 训练类型 | 架构 | 规模 |
+|----------|----------|------|------|
+| Qwen/Qwen3-4B-Instruct-2507 | Instruction | Dense | Compact |
+| Qwen/Qwen3-8B | Hybrid | Dense | Small |
+| Qwen/Qwen3-8B-Base | Base | Dense | Small |
+| Qwen/Qwen3-235B-A22B-Instruct-2507 | Instruction | MoE | Large |
+| deepseek-ai/DeepSeek-V3.1 | Hybrid | MoE | Large |
+| deepseek-ai/DeepSeek-V3.1-Base | Base | MoE | Large |
+
+## Tier 2 (T2) - 2.15 前可用
+
+| 模型名称 | 训练类型 | 架构 | 规模 |
+|----------|----------|------|------|
+| Qwen/Qwen3-VL-30B-A3B-Instruct | Vision | MoE | Medium |
+| Qwen/Qwen3-VL-235B-A22B-Instruct | Vision | MoE | Large |
+| π0 | Robotics | Dense | Small |
+
+## 选型建议
+
+- **低延迟场景**：Instruction 模型
+- **高智能场景**：Hybrid 或 Reasoning 模型（支持 chain-of-thought）
+- **定制任务**：在 Base 模型上 fine-tune
+- **多模态需求**：Vision 模型（T2）
+- **机器人应用**：π0（T2）
+
+## 模型分类
+
+### 按训练类型
+- **Base**：预训练基座模型
+- **Instruction**：针对指令遵循 fine-tune
+- **Reasoning**：针对 chain-of-thought 推理优化
+- **Hybrid**：综合能力
+- **Vision**：多模态（文本 + 图像）
+- **Robotics**：具身智能和机器人任务
+
+### 按架构
+- **Dense**：传统 Transformer 架构
+- **MoE（Mixture of Experts）**：稀疏激活，更高效
+
+### 按规模
+- **Compact**：1-4B 参数
+- **Small**：8B 参数
+- **Medium**：30B 参数
+- **Large**：70B+ 参数
+
+## 成本效率
+
+MoE 模型成本更优：定价按**激活参数**计算，而非总参数。例如 235B MoE 模型（22B 激活参数）与 22B Dense 模型成本相同。
+
+</Zh>

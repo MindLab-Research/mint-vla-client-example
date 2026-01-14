@@ -1,0 +1,1259 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
+# Code Reinforcement Learning
+
+This tutorial demonstrates reinforcement learning (RL) training for code generation problems using MinT.
+
+## What You'll Learn
+
+1. Configure different code environments (simple functions to competitive programming)
+2. Implement grading logic with sandbox code execution
+3. Run the RL training loop with group-based advantages
+4. Evaluate and visualize model improvement
+
+## Supported Environments
+
+| Environment | Dataset | Problems | Difficulty | Use Case |
+|-------------|---------|----------|------------|----------|
+| `simple` | Generated | Simple function problems (add, reverse, etc.) | Easy | Debug pipeline |
+| `deepcoder` | DeepCoder-Preview | Competitive programming | Hard | Production training |
+
+## Code RL vs Math RL
+
+| Aspect | Math RL | Code RL |
+|--------|---------|---------|
+| **Verification** | Symbolic equivalence (sympy) | Sandbox execution |
+| **Output format** | `\boxed{}` with number/expression | Markdown code block |
+| **Failure mode** | Wrong answer | Syntax error, runtime error, wrong output |
+| **Context length** | Short (numbers) | Long (full functions) |
+
+Code RL is more challenging because:
+1. Code must be syntactically correct to execute
+2. A single character error leads to complete failure
+3. Requires longer context (complete functions vs short answers)
+
+---
+
+## Dataset Details
+
+### 1. Simple (Generated)
+
+**Source**: Dynamically generated | **Size**: Unlimited
+
+Simple function problems like `add(a, b)`, `reverse_string(s)`, `max_of_two(a, b)`.
+Perfect for debugging the RL pipeline before scaling to harder problems.
+
+```
+Q: Write a function `add(a, b)` that returns the sum of two integers.
+A: def add(a, b):
+       return a + b
+```
+
+### 2. DeepCoder-Preview
+
+**Source**: agentica-org (2024) | **Size**: ~100K problems
+
+Competitive programming problems from various sources including LiveCodeBench, TACO, and Codeforces.
+Each problem includes multiple test cases for robust evaluation.
+
+```
+Q: Given an array of integers, return the two numbers that add up to a target.
+A: def two_sum(nums, target):
+       seen = {}
+       for i, n in enumerate(nums):
+           if target - n in seen:
+               return [seen[target - n], i]
+           seen[n] = i
+```
+
+**Links**: [HuggingFace](https://huggingface.co/datasets/agentica-org/DeepCoder-Preview-Dataset)
+
+### Recommended Progression
+
+| Stage | Dataset | Purpose |
+|-------|---------|---------|
+| 1. Debug | `simple` | Verify RL pipeline works |
+| 2. Production | `deepcoder` | Train on competitive programming |
+
+---
+
+## Step 0: Setup
+
+Install required packages:
+
+```bash
+pip install -q datasets aiohttp nest_asyncio mint
+```
+
+### Sandbox Configuration
+
+Code RL requires a sandbox to safely execute generated code. We use [Sandbox Fusion](https://bytedance.github.io/SandboxFusion/).
+
+Start a local sandbox with Docker:
+
+```bash
+docker run -d -p 8080:8080 \
+    -v ${TINKER_COOKBOOK_ROOT}/tinker_cookbook/recipes/code_rl/sandbox_config/local.yaml:/root/sandbox/sandbox/configs/local.yaml \
+    volcengine/sandbox-fusion:server-20250609
+```
+
+Set the sandbox URL:
+
+```bash
+export SANDBOX_URL=http://localhost:8080/run_code
+```
+
+### Why Sandbox?
+
+Running arbitrary code is dangerous - it could delete files, run infinite loops, or access network resources. A sandbox provides:
+- **Isolation**: Code runs in a container, isolated from the host
+- **Timeout control**: Kills processes that run too long
+- **Resource limits**: Prevents memory/CPU abuse
+
+### Load API Key
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+if os.environ.get('MINT_API_KEY'):
+    print("API key loaded")
+else:
+    print("WARNING: MINT_API_KEY not found!")
+```
+
+### Connect to MinT
+
+```python
+import mint
+from mint import types
+
+service_client = mint.ServiceClient()
+print("Connected to MinT")
+```
+
+---
+
+## Step 1: Configuration
+
+Configure your training run:
+
+```python
+# ========== CONFIGURATION ==========
+
+# Environment: "simple" or "deepcoder"
+ENV = "simple"
+
+# Model
+BASE_MODEL = "Qwen/Qwen3-0.6B"
+LORA_RANK = 16
+
+# Training
+NUM_STEPS = 50 if ENV == "simple" else 100
+BATCH_SIZE = 32 if ENV == "simple" else 16
+GROUP_SIZE = 4
+LEARNING_RATE = 1e-4 if ENV == "simple" else 1e-5
+
+# Generation
+MAX_TOKENS = 256 if ENV == "simple" else 1024
+TEMPERATURE = 1.0
+
+# Sandbox configuration
+SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://localhost:8080/run_code")
+SANDBOX_TIMEOUT = 6  # seconds per test case
+
+print(f"Environment: {ENV}")
+print(f"Model: {BASE_MODEL}")
+print(f"Steps: {NUM_STEPS}, Batch: {BATCH_SIZE}, Group: {GROUP_SIZE}")
+print(f"Max tokens: {MAX_TOKENS}")
+print(f"Sandbox URL: {SANDBOX_URL}")
+```
+
+**Parameter choices:**
+- `GROUP_SIZE`: Number of responses sampled per problem. More samples = better advantage estimates, slower training
+- `TEMPERATURE=1.0`: High temperature encourages exploration during RL
+- `MAX_TOKENS`: Short for simple (just a function), long for competitive programming (complex algorithms)
+
+---
+
+## Step 2: Code Extraction & Grading
+
+### Extract Code from Response
+
+Models typically return code in markdown format. We extract the content between ``` markers:
+
+```python
+import re
+
+def extract_code_from_model(response: str) -> str | None:
+    """
+    Extract code block from model response.
+
+    Models typically return:
+    ```python
+    def add(a, b):
+        return a + b
+    ```
+
+    If multiple code blocks exist, take the last one
+    (model may show wrong examples first, then correct answer).
+    """
+    pattern = r"```(?:\w+)?\n(.*?)```"
+    matches = re.findall(pattern, response, re.DOTALL)
+
+    if not matches:
+        # Fallback: look for function definitions
+        if "def " in response:
+            idx = response.find("def ")
+            return response[idx:].strip()
+        return None
+
+    return matches[-1].strip()
+```
+
+### Execute in Sandbox
+
+```python
+import json
+import asyncio
+import aiohttp
+
+async def run_code_in_sandbox(
+    code: str,
+    test_cases: list[dict],
+    timeout: int = 6
+) -> tuple[bool, str]:
+    """Execute code in Sandbox and verify against test cases."""
+    test_script = f'''
+import sys
+
+# User code
+{code}
+
+# Test cases
+test_cases = {json.dumps(test_cases)}
+
+# Run tests
+failed = []
+for i, tc in enumerate(test_cases):
+    try:
+        result = eval(tc["input"])
+        expected = eval(tc["output"]) if isinstance(tc["output"], str) else tc["output"]
+        if result != expected:
+            failed.append(f"Test {{i}}: got {{result}}, expected {{expected}}")
+    except Exception as e:
+        failed.append(f"Test {{i}}: {{e}}")
+
+if failed:
+    print("FAILED:", "; ".join(failed))
+    sys.exit(1)
+else:
+    print("ALL PASSED")
+    sys.exit(0)
+'''
+
+    payload = {
+        "code": test_script,
+        "language": "python",
+        "timeout": timeout * len(test_cases) + 5,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(SANDBOX_URL, json=payload, timeout=30) as resp:
+                result = await resp.json()
+                passed = result.get("exit_code") == 0
+                output = result.get("stdout", "") + result.get("stderr", "")
+                return passed, output
+        except Exception as e:
+            return False, f"Sandbox error: {e}"
+```
+
+### Grading Function
+
+```python
+async def grade_code_response(
+    response: str,
+    test_cases: list[dict]
+) -> tuple[float, dict]:
+    """
+    Grade code response by extracting code and running in sandbox.
+
+    Returns:
+        (reward, info): 1.0 if all tests pass, 0.0 otherwise
+    """
+    code = extract_code_from_model(response)
+    if code is None:
+        return 0.0, {"error": "no_code_block"}
+
+    passed, output = await run_code_in_sandbox(code, test_cases)
+
+    reward = 1.0 if passed else 0.0
+    info = {"code": code[:500], "passed": passed, "output": output[:200]}
+    return reward, info
+```
+
+---
+
+## Step 3: Problem Environment
+
+Define the problem structure:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class CodeProblem:
+    """Represents a coding problem for RL training."""
+    question: str                    # Problem description
+    test_cases: list[dict]          # [{"input": "func(args)", "output": "expected"}]
+    starter_code: str | None = None  # Optional starter code
+```
+
+### Few-shot Prompt
+
+```python
+CODE_FEWSHOT = """Q: Write a function `double(x)` that returns x multiplied by 2.
+
+A: ```python
+def double(x):
+    return x * 2
+```
+
+"""
+```
+
+### Simple Problem Templates
+
+```python
+SIMPLE_PROBLEMS = [
+    {
+        "name": "add",
+        "question": "Write a function `add(a, b)` that returns the sum of two integers.",
+        "test_cases": [
+            {"input": "add(1, 2)", "output": "3"},
+            {"input": "add(-1, 1)", "output": "0"},
+            {"input": "add(100, 200)", "output": "300"},
+        ]
+    },
+    {
+        "name": "multiply",
+        "question": "Write a function `multiply(a, b)` that returns the product of two integers.",
+        "test_cases": [
+            {"input": "multiply(3, 4)", "output": "12"},
+            {"input": "multiply(-2, 5)", "output": "-10"},
+            {"input": "multiply(0, 100)", "output": "0"},
+        ]
+    },
+    # ... more problems
+]
+
+def generate_simple_problem() -> CodeProblem:
+    """Generate a random simple problem."""
+    import random
+    template = random.choice(SIMPLE_PROBLEMS)
+    return CodeProblem(
+        question=template["question"],
+        test_cases=template["test_cases"],
+    )
+```
+
+---
+
+## Step 4: Dataset Loading
+
+```python
+from datasets import load_dataset
+import random
+
+class CodeDatasetLoader:
+    """Load and iterate through code datasets."""
+
+    def __init__(self, env: str, seed: int = 42):
+        self.env = env
+        random.seed(seed)
+
+        if env == "simple":
+            self.data = None  # Generated on the fly
+        elif env == "deepcoder":
+            ds = load_dataset(
+                "agentica-org/DeepCoder-Preview-Dataset",
+                "lcbv5",
+                split="train"
+            )
+            self.data = ds.shuffle(seed=seed)
+            print(f"Loaded {len(self.data)} problems from DeepCoder")
+
+    def get_batch(self, batch_size: int) -> list[CodeProblem]:
+        """Get a batch of problems."""
+        if self.env == "simple":
+            return [generate_simple_problem() for _ in range(batch_size)]
+        # For deepcoder, parse rows into CodeProblem objects
+        # ...
+```
+
+---
+
+## Step 5: Create Training Client
+
+```python
+training_client = service_client.create_lora_training_client(
+    base_model=BASE_MODEL,
+    rank=LORA_RANK,
+    train_mlp=True,
+    train_attn=True,
+    train_unembed=True,
+)
+print(f"Training client created: {BASE_MODEL}")
+
+tokenizer = training_client.get_tokenizer()
+print(f"Vocab size: {tokenizer.vocab_size:,}")
+```
+
+---
+
+## Step 6: RL Training Loop
+
+The training loop follows these steps:
+
+1. Save current weights for sampling
+2. Get batch of coding problems
+3. For each problem, sample `GROUP_SIZE` responses
+4. Grade each response by executing in sandbox
+5. Compute advantages (reward - group_mean)
+6. Create training Datums with `importance_sampling` loss
+7. Run `forward_backward` + `optim_step`
+
+```python
+import torch
+
+metrics_history = []
+
+for step in range(NUM_STEPS):
+    # Save weights for sampling
+    sampler_path = training_client.save_weights_for_sampler(
+        name=f"code-{ENV}-step-{step}"
+    ).result().path
+
+    sampling_client = service_client.create_sampling_client(
+        model_path=sampler_path,
+        base_model=BASE_MODEL
+    )
+
+    # Get problems
+    problems = dataset.get_batch(BATCH_SIZE)
+
+    training_datums = []
+    all_rewards = []
+
+    for problem in problems:
+        # Build prompt
+        prompt_text = CODE_FEWSHOT + f"Q: {problem.question}\n\nA:"
+        prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
+        prompt_input = types.ModelInput.from_ints(prompt_tokens)
+
+        # Sample responses
+        sample_result = sampling_client.sample(
+            prompt=prompt_input,
+            num_samples=GROUP_SIZE,
+            sampling_params=types.SamplingParams(
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                stop_token_ids=[tokenizer.eos_token_id]
+            )
+        ).result()
+
+        # Grade responses
+        group_rewards = []
+        group_responses = []
+        group_logprobs = []
+
+        for seq in sample_result.sequences:
+            response_text = tokenizer.decode(seq.tokens)
+            reward, info = asyncio.get_event_loop().run_until_complete(
+                grade_code_response(response_text, problem.test_cases)
+            )
+            group_rewards.append(reward)
+            group_responses.append(list(seq.tokens))
+            group_logprobs.append(list(seq.logprobs) if seq.logprobs else [0.0] * len(seq.tokens))
+
+        all_rewards.extend(group_rewards)
+
+        # Compute advantages (reward - mean)
+        mean_reward = sum(group_rewards) / len(group_rewards)
+        advantages = [r - mean_reward for r in group_rewards]
+
+        # Skip if no variance
+        if all(a == 0 for a in advantages):
+            continue
+
+        # Create training datums
+        for response_tokens, logprobs, adv in zip(group_responses, group_logprobs, advantages):
+            if len(response_tokens) == 0:
+                continue
+
+            full_tokens = prompt_tokens + response_tokens
+            input_tokens = full_tokens[:-1]
+            target_tokens = full_tokens[1:]
+
+            weights = [0.0] * (len(prompt_tokens) - 1) + [1.0] * len(response_tokens)
+            full_logprobs = [0.0] * (len(prompt_tokens) - 1) + logprobs
+            full_advantages = [0.0] * (len(prompt_tokens) - 1) + [adv] * len(response_tokens)
+
+            datum = types.Datum(
+                model_input=types.ModelInput.from_ints(tokens=input_tokens),
+                loss_fn_inputs={
+                    "target_tokens": mint.TensorData.from_torch(torch.tensor(target_tokens, dtype=torch.int64)),
+                    "weights": mint.TensorData.from_torch(torch.tensor(weights, dtype=torch.float32)),
+                    "logprobs": mint.TensorData.from_torch(torch.tensor(full_logprobs, dtype=torch.float32)),
+                    "advantages": mint.TensorData.from_torch(torch.tensor(full_advantages, dtype=torch.float32)),
+                },
+            )
+            training_datums.append(datum)
+
+    # Train
+    if training_datums:
+        training_client.forward_backward(training_datums, loss_fn="importance_sampling").result()
+        training_client.optim_step(types.AdamParams(learning_rate=LEARNING_RATE)).result()
+
+    # Log metrics
+    accuracy = sum(1 for r in all_rewards if r > 0) / len(all_rewards) if all_rewards else 0.0
+    metrics_history.append({'step': step, 'accuracy': accuracy})
+
+    if step % 10 == 0:
+        print(f"Step {step}: acc={accuracy:.1%}")
+
+print(f"Initial: {metrics_history[0]['accuracy']:.1%}")
+print(f"Final: {metrics_history[-1]['accuracy']:.1%}")
+```
+
+---
+
+## Step 7: Evaluate
+
+Test the trained model on new problems:
+
+```python
+final_path = training_client.save_weights_for_sampler(name=f"{ENV}-final").result().path
+final_client = service_client.create_sampling_client(
+    model_path=final_path,
+    base_model=BASE_MODEL
+)
+
+test_problems = dataset.get_batch(5)
+correct = 0
+
+for problem in test_problems:
+    prompt = CODE_FEWSHOT + f"Q: {problem.question}\n\nA:"
+    prompt_input = types.ModelInput.from_ints(tokenizer.encode(prompt))
+
+    result = final_client.sample(
+        prompt=prompt_input,
+        num_samples=1,
+        sampling_params=types.SamplingParams(
+            max_tokens=MAX_TOKENS,
+            temperature=0.0,  # Greedy decoding for eval
+            stop_token_ids=[tokenizer.eos_token_id]
+        )
+    ).result()
+
+    response = tokenizer.decode(result.sequences[0].tokens)
+    reward, info = asyncio.get_event_loop().run_until_complete(
+        grade_code_response(response, problem.test_cases)
+    )
+
+    if reward > 0:
+        correct += 1
+
+    status = "PASS" if reward > 0 else "FAIL"
+    print(f"Q: {problem.question[:50]}... [{status}]")
+
+print(f"\nTest accuracy: {correct}/{len(test_problems)}")
+```
+
+---
+
+## Step 8: Visualize
+
+```python
+import matplotlib.pyplot as plt
+
+steps = [m['step'] for m in metrics_history]
+accuracies = [m['accuracy'] for m in metrics_history]
+
+plt.figure(figsize=(10, 5))
+plt.plot(steps, accuracies, 'b-', linewidth=2)
+plt.xlabel('Step')
+plt.ylabel('Accuracy')
+plt.title(f'{ENV.upper()} Code RL Training')
+plt.ylim(0, 1.05)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{ENV}_code_rl_training.png', dpi=150)
+plt.show()
+```
+
+---
+
+## Step 9: Save Checkpoint
+
+```python
+checkpoint = training_client.save_state(name=f"{ENV}-code-rl-final").result()
+print(f"Checkpoint: {checkpoint.path}")
+```
+
+---
+
+## Summary
+
+| Component | Implementation |
+|-----------|----------------|
+| Environment | `simple` (generated) or `deepcoder` (competitive programming) |
+| Code Extraction | Regex to extract last markdown code block |
+| Grading | Sandbox execution with test case verification |
+| Training | `importance_sampling` loss with group advantages |
+| Checkpointing | `save_state()` for weights + optimizer |
+
+### Key Differences from Math RL
+
+| Aspect | Math RL | Code RL |
+|--------|---------|---------|
+| Verification | Symbolic equivalence (sympy) | Code execution (sandbox) |
+| Output format | `\boxed{}` with number/expression | Markdown code block |
+| Failure mode | Wrong answer | Syntax error, runtime error, wrong output |
+| Context length | Short (numbers) | Long (full functions) |
+
+</En>
+
+<Zh>
+
+# 代码强化学习
+
+本教程演示如何使用 MinT 进行代码生成问题的强化学习（RL）训练。
+
+## 本教程内容
+
+1. 配置不同难度的代码环境（从简单函数到竞赛编程）
+2. 实现 grading 逻辑，支持 sandbox 代码执行
+3. 运行基于 group advantage 的 RL 训练循环
+4. 评估和可视化模型提升
+
+## 支持的环境
+
+| 环境 | 数据集 | 问题类型 | 难度 | 用途 |
+|------|--------|----------|------|------|
+| `simple` | 生成 | 简单函数（add、reverse 等） | 简单 | 调试 pipeline |
+| `deepcoder` | DeepCoder-Preview | 竞赛编程 | 困难 | 生产训练 |
+
+## Code RL vs Math RL
+
+| 方面 | Math RL | Code RL |
+|------|---------|---------|
+| **验证方式** | 符号等价性（sympy） | Sandbox 执行 |
+| **输出格式** | `\boxed{}` 包裹数字/表达式 | Markdown code block |
+| **失败模式** | 错误答案 | 语法错误、运行时错误、输出错误 |
+| **Context 长度** | 短（数字） | 长（完整函数） |
+
+Code RL 更具挑战性：
+1. 代码必须语法正确才能执行
+2. 单个字符错误会导致完全失败
+3. 需要更长的 context（完整函数 vs 简短答案）
+
+---
+
+## 数据集详情
+
+### 1. Simple（生成）
+
+**来源**：动态生成 | **规模**：无限
+
+简单函数问题，如 `add(a, b)`、`reverse_string(s)`、`max_of_two(a, b)`。
+适合在扩展到更难问题前调试 RL pipeline。
+
+```
+Q: Write a function `add(a, b)` that returns the sum of two integers.
+A: def add(a, b):
+       return a + b
+```
+
+### 2. DeepCoder-Preview
+
+**来源**：agentica-org（2024）| **规模**：约 100K 问题
+
+来自 LiveCodeBench、TACO 和 Codeforces 等多个来源的竞赛编程问题。
+每道题包含多个测试用例用于稳健评估。
+
+```
+Q: Given an array of integers, return the two numbers that add up to a target.
+A: def two_sum(nums, target):
+       seen = {}
+       for i, n in enumerate(nums):
+           if target - n in seen:
+               return [seen[target - n], i]
+           seen[n] = i
+```
+
+**链接**：[HuggingFace](https://huggingface.co/datasets/agentica-org/DeepCoder-Preview-Dataset)
+
+### 推荐进阶路径
+
+| 阶段 | 数据集 | 目的 |
+|------|--------|------|
+| 1. 调试 | `simple` | 验证 RL pipeline 正常工作 |
+| 2. 生产 | `deepcoder` | 训练竞赛编程能力 |
+
+---
+
+## Step 0：环境配置
+
+安装依赖包：
+
+```bash
+pip install -q datasets aiohttp nest_asyncio mint
+```
+
+### Sandbox 配置
+
+Code RL 需要 sandbox 来安全执行生成的代码。我们使用 [Sandbox Fusion](https://bytedance.github.io/SandboxFusion/)。
+
+使用 Docker 启动本地 sandbox：
+
+```bash
+docker run -d -p 8080:8080 \
+    -v ${TINKER_COOKBOOK_ROOT}/tinker_cookbook/recipes/code_rl/sandbox_config/local.yaml:/root/sandbox/sandbox/configs/local.yaml \
+    volcengine/sandbox-fusion:server-20250609
+```
+
+设置 sandbox URL：
+
+```bash
+export SANDBOX_URL=http://localhost:8080/run_code
+```
+
+### 为什么需要 Sandbox？
+
+执行任意代码是危险的——可能删除文件、运行无限循环或访问网络资源。Sandbox 提供：
+- **隔离**：代码在容器中运行，与宿主机隔离
+- **超时控制**：终止运行时间过长的进程
+- **资源限制**：防止内存/CPU 滥用
+
+### 加载 API Key
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+if os.environ.get('MINT_API_KEY'):
+    print("API key loaded")
+else:
+    print("WARNING: MINT_API_KEY not found!")
+```
+
+### 连接 MinT
+
+```python
+import mint
+from mint import types
+
+service_client = mint.ServiceClient()
+print("Connected to MinT")
+```
+
+---
+
+## Step 1：配置参数
+
+配置训练运行参数：
+
+```python
+# ========== CONFIGURATION ==========
+
+# Environment: "simple" or "deepcoder"
+ENV = "simple"
+
+# Model
+BASE_MODEL = "Qwen/Qwen3-0.6B"
+LORA_RANK = 16
+
+# Training
+NUM_STEPS = 50 if ENV == "simple" else 100
+BATCH_SIZE = 32 if ENV == "simple" else 16
+GROUP_SIZE = 4
+LEARNING_RATE = 1e-4 if ENV == "simple" else 1e-5
+
+# Generation
+MAX_TOKENS = 256 if ENV == "simple" else 1024
+TEMPERATURE = 1.0
+
+# Sandbox configuration
+SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://localhost:8080/run_code")
+SANDBOX_TIMEOUT = 6  # seconds per test case
+
+print(f"Environment: {ENV}")
+print(f"Model: {BASE_MODEL}")
+print(f"Steps: {NUM_STEPS}, Batch: {BATCH_SIZE}, Group: {GROUP_SIZE}")
+print(f"Max tokens: {MAX_TOKENS}")
+print(f"Sandbox URL: {SANDBOX_URL}")
+```
+
+**参数选择说明：**
+- `GROUP_SIZE`：每个问题采样的 response 数量。采样越多 advantage 估计越准，训练越慢
+- `TEMPERATURE=1.0`：高温度鼓励 RL 中的探索
+- `MAX_TOKENS`：simple 环境较短（仅函数），竞赛编程较长（复杂算法）
+
+---
+
+## Step 2：代码提取与评分
+
+### 从 Response 提取代码
+
+模型通常以 markdown 格式返回代码。我们提取 ``` 标记之间的内容：
+
+```python
+import re
+
+def extract_code_from_model(response: str) -> str | None:
+    """
+    从模型 response 中提取代码块。
+
+    模型通常返回：
+    ```python
+    def add(a, b):
+        return a + b
+    ```
+
+    如果存在多个代码块，取最后一个
+    （模型可能先展示错误示例，再给出正确答案）。
+    """
+    pattern = r"```(?:\w+)?\n(.*?)```"
+    matches = re.findall(pattern, response, re.DOTALL)
+
+    if not matches:
+        # 回退：查找函数定义
+        if "def " in response:
+            idx = response.find("def ")
+            return response[idx:].strip()
+        return None
+
+    return matches[-1].strip()
+```
+
+### 在 Sandbox 中执行
+
+```python
+import json
+import asyncio
+import aiohttp
+
+async def run_code_in_sandbox(
+    code: str,
+    test_cases: list[dict],
+    timeout: int = 6
+) -> tuple[bool, str]:
+    """在 Sandbox 中执行代码并验证测试用例。"""
+    test_script = f'''
+import sys
+
+# User code
+{code}
+
+# Test cases
+test_cases = {json.dumps(test_cases)}
+
+# Run tests
+failed = []
+for i, tc in enumerate(test_cases):
+    try:
+        result = eval(tc["input"])
+        expected = eval(tc["output"]) if isinstance(tc["output"], str) else tc["output"]
+        if result != expected:
+            failed.append(f"Test {{i}}: got {{result}}, expected {{expected}}")
+    except Exception as e:
+        failed.append(f"Test {{i}}: {{e}}")
+
+if failed:
+    print("FAILED:", "; ".join(failed))
+    sys.exit(1)
+else:
+    print("ALL PASSED")
+    sys.exit(0)
+'''
+
+    payload = {
+        "code": test_script,
+        "language": "python",
+        "timeout": timeout * len(test_cases) + 5,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(SANDBOX_URL, json=payload, timeout=30) as resp:
+                result = await resp.json()
+                passed = result.get("exit_code") == 0
+                output = result.get("stdout", "") + result.get("stderr", "")
+                return passed, output
+        except Exception as e:
+            return False, f"Sandbox error: {e}"
+```
+
+### Grading 函数
+
+```python
+async def grade_code_response(
+    response: str,
+    test_cases: list[dict]
+) -> tuple[float, dict]:
+    """
+    通过提取代码并在 sandbox 中运行来评分。
+
+    Returns:
+        (reward, info): 所有测试通过返回 1.0，否则返回 0.0
+    """
+    code = extract_code_from_model(response)
+    if code is None:
+        return 0.0, {"error": "no_code_block"}
+
+    passed, output = await run_code_in_sandbox(code, test_cases)
+
+    reward = 1.0 if passed else 0.0
+    info = {"code": code[:500], "passed": passed, "output": output[:200]}
+    return reward, info
+```
+
+---
+
+## Step 3：问题环境
+
+定义问题结构：
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class CodeProblem:
+    """表示用于 RL 训练的编程问题。"""
+    question: str                    # 问题描述
+    test_cases: list[dict]          # [{"input": "func(args)", "output": "expected"}]
+    starter_code: str | None = None  # 可选的起始代码
+```
+
+### Few-shot Prompt
+
+```python
+CODE_FEWSHOT = """Q: Write a function `double(x)` that returns x multiplied by 2.
+
+A: ```python
+def double(x):
+    return x * 2
+```
+
+"""
+```
+
+### 简单问题模板
+
+```python
+SIMPLE_PROBLEMS = [
+    {
+        "name": "add",
+        "question": "Write a function `add(a, b)` that returns the sum of two integers.",
+        "test_cases": [
+            {"input": "add(1, 2)", "output": "3"},
+            {"input": "add(-1, 1)", "output": "0"},
+            {"input": "add(100, 200)", "output": "300"},
+        ]
+    },
+    {
+        "name": "multiply",
+        "question": "Write a function `multiply(a, b)` that returns the product of two integers.",
+        "test_cases": [
+            {"input": "multiply(3, 4)", "output": "12"},
+            {"input": "multiply(-2, 5)", "output": "-10"},
+            {"input": "multiply(0, 100)", "output": "0"},
+        ]
+    },
+    # ... 更多问题
+]
+
+def generate_simple_problem() -> CodeProblem:
+    """生成随机简单问题。"""
+    import random
+    template = random.choice(SIMPLE_PROBLEMS)
+    return CodeProblem(
+        question=template["question"],
+        test_cases=template["test_cases"],
+    )
+```
+
+---
+
+## Step 4：数据集加载
+
+```python
+from datasets import load_dataset
+import random
+
+class CodeDatasetLoader:
+    """加载和遍历代码数据集。"""
+
+    def __init__(self, env: str, seed: int = 42):
+        self.env = env
+        random.seed(seed)
+
+        if env == "simple":
+            self.data = None  # 动态生成
+        elif env == "deepcoder":
+            ds = load_dataset(
+                "agentica-org/DeepCoder-Preview-Dataset",
+                "lcbv5",
+                split="train"
+            )
+            self.data = ds.shuffle(seed=seed)
+            print(f"Loaded {len(self.data)} problems from DeepCoder")
+
+    def get_batch(self, batch_size: int) -> list[CodeProblem]:
+        """获取一批问题。"""
+        if self.env == "simple":
+            return [generate_simple_problem() for _ in range(batch_size)]
+        # 对于 deepcoder，将行解析为 CodeProblem 对象
+        # ...
+```
+
+---
+
+## Step 5：创建训练客户端
+
+```python
+training_client = service_client.create_lora_training_client(
+    base_model=BASE_MODEL,
+    rank=LORA_RANK,
+    train_mlp=True,
+    train_attn=True,
+    train_unembed=True,
+)
+print(f"Training client created: {BASE_MODEL}")
+
+tokenizer = training_client.get_tokenizer()
+print(f"Vocab size: {tokenizer.vocab_size:,}")
+```
+
+---
+
+## Step 6：RL 训练循环
+
+训练循环步骤：
+
+1. 保存当前 weight 用于采样
+2. 获取一批编程问题
+3. 对每个问题采样 `GROUP_SIZE` 个 response
+4. 通过 sandbox 执行评分每个 response
+5. 计算 advantage（reward - group_mean）
+6. 创建训练 Datum，使用 `importance_sampling` loss
+7. 运行 `forward_backward` + `optim_step`
+
+```python
+import torch
+
+metrics_history = []
+
+for step in range(NUM_STEPS):
+    # 保存 weight 用于采样
+    sampler_path = training_client.save_weights_for_sampler(
+        name=f"code-{ENV}-step-{step}"
+    ).result().path
+
+    sampling_client = service_client.create_sampling_client(
+        model_path=sampler_path,
+        base_model=BASE_MODEL
+    )
+
+    # 获取问题
+    problems = dataset.get_batch(BATCH_SIZE)
+
+    training_datums = []
+    all_rewards = []
+
+    for problem in problems:
+        # 构建 prompt
+        prompt_text = CODE_FEWSHOT + f"Q: {problem.question}\n\nA:"
+        prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
+        prompt_input = types.ModelInput.from_ints(prompt_tokens)
+
+        # 采样 response
+        sample_result = sampling_client.sample(
+            prompt=prompt_input,
+            num_samples=GROUP_SIZE,
+            sampling_params=types.SamplingParams(
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                stop_token_ids=[tokenizer.eos_token_id]
+            )
+        ).result()
+
+        # 评分 response
+        group_rewards = []
+        group_responses = []
+        group_logprobs = []
+
+        for seq in sample_result.sequences:
+            response_text = tokenizer.decode(seq.tokens)
+            reward, info = asyncio.get_event_loop().run_until_complete(
+                grade_code_response(response_text, problem.test_cases)
+            )
+            group_rewards.append(reward)
+            group_responses.append(list(seq.tokens))
+            group_logprobs.append(list(seq.logprobs) if seq.logprobs else [0.0] * len(seq.tokens))
+
+        all_rewards.extend(group_rewards)
+
+        # 计算 advantage（reward - mean）
+        mean_reward = sum(group_rewards) / len(group_rewards)
+        advantages = [r - mean_reward for r in group_rewards]
+
+        # 无方差则跳过
+        if all(a == 0 for a in advantages):
+            continue
+
+        # 创建训练 datum
+        for response_tokens, logprobs, adv in zip(group_responses, group_logprobs, advantages):
+            if len(response_tokens) == 0:
+                continue
+
+            full_tokens = prompt_tokens + response_tokens
+            input_tokens = full_tokens[:-1]
+            target_tokens = full_tokens[1:]
+
+            weights = [0.0] * (len(prompt_tokens) - 1) + [1.0] * len(response_tokens)
+            full_logprobs = [0.0] * (len(prompt_tokens) - 1) + logprobs
+            full_advantages = [0.0] * (len(prompt_tokens) - 1) + [adv] * len(response_tokens)
+
+            datum = types.Datum(
+                model_input=types.ModelInput.from_ints(tokens=input_tokens),
+                loss_fn_inputs={
+                    "target_tokens": mint.TensorData.from_torch(torch.tensor(target_tokens, dtype=torch.int64)),
+                    "weights": mint.TensorData.from_torch(torch.tensor(weights, dtype=torch.float32)),
+                    "logprobs": mint.TensorData.from_torch(torch.tensor(full_logprobs, dtype=torch.float32)),
+                    "advantages": mint.TensorData.from_torch(torch.tensor(full_advantages, dtype=torch.float32)),
+                },
+            )
+            training_datums.append(datum)
+
+    # 训练
+    if training_datums:
+        training_client.forward_backward(training_datums, loss_fn="importance_sampling").result()
+        training_client.optim_step(types.AdamParams(learning_rate=LEARNING_RATE)).result()
+
+    # 记录指标
+    accuracy = sum(1 for r in all_rewards if r > 0) / len(all_rewards) if all_rewards else 0.0
+    metrics_history.append({'step': step, 'accuracy': accuracy})
+
+    if step % 10 == 0:
+        print(f"Step {step}: acc={accuracy:.1%}")
+
+print(f"Initial: {metrics_history[0]['accuracy']:.1%}")
+print(f"Final: {metrics_history[-1]['accuracy']:.1%}")
+```
+
+---
+
+## Step 7：评估
+
+在新问题上测试训练后的模型：
+
+```python
+final_path = training_client.save_weights_for_sampler(name=f"{ENV}-final").result().path
+final_client = service_client.create_sampling_client(
+    model_path=final_path,
+    base_model=BASE_MODEL
+)
+
+test_problems = dataset.get_batch(5)
+correct = 0
+
+for problem in test_problems:
+    prompt = CODE_FEWSHOT + f"Q: {problem.question}\n\nA:"
+    prompt_input = types.ModelInput.from_ints(tokenizer.encode(prompt))
+
+    result = final_client.sample(
+        prompt=prompt_input,
+        num_samples=1,
+        sampling_params=types.SamplingParams(
+            max_tokens=MAX_TOKENS,
+            temperature=0.0,  # 评估时使用贪婪解码
+            stop_token_ids=[tokenizer.eos_token_id]
+        )
+    ).result()
+
+    response = tokenizer.decode(result.sequences[0].tokens)
+    reward, info = asyncio.get_event_loop().run_until_complete(
+        grade_code_response(response, problem.test_cases)
+    )
+
+    if reward > 0:
+        correct += 1
+
+    status = "PASS" if reward > 0 else "FAIL"
+    print(f"Q: {problem.question[:50]}... [{status}]")
+
+print(f"\nTest accuracy: {correct}/{len(test_problems)}")
+```
+
+---
+
+## Step 8：可视化
+
+```python
+import matplotlib.pyplot as plt
+
+steps = [m['step'] for m in metrics_history]
+accuracies = [m['accuracy'] for m in metrics_history]
+
+plt.figure(figsize=(10, 5))
+plt.plot(steps, accuracies, 'b-', linewidth=2)
+plt.xlabel('Step')
+plt.ylabel('Accuracy')
+plt.title(f'{ENV.upper()} Code RL Training')
+plt.ylim(0, 1.05)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{ENV}_code_rl_training.png', dpi=150)
+plt.show()
+```
+
+---
+
+## Step 9：保存 Checkpoint
+
+```python
+checkpoint = training_client.save_state(name=f"{ENV}-code-rl-final").result()
+print(f"Checkpoint: {checkpoint.path}")
+```
+
+---
+
+## 总结
+
+| 组件 | 实现方式 |
+|------|----------|
+| 环境 | `simple`（生成）或 `deepcoder`（竞赛编程） |
+| 代码提取 | 正则提取最后一个 markdown code block |
+| 评分 | Sandbox 执行 + 测试用例验证 |
+| 训练 | `importance_sampling` loss + group advantage |
+| Checkpoint | `save_state()` 保存 weight + optimizer |
+
+### 与 Math RL 的关键区别
+
+| 方面 | Math RL | Code RL |
+|------|---------|---------|
+| 验证方式 | 符号等价性（sympy） | 代码执行（sandbox） |
+| 输出格式 | `\boxed{}` 包裹数字/表达式 | Markdown code block |
+| 失败模式 | 错误答案 | 语法错误、运行时错误、输出错误 |
+| Context 长度 | 短（数字） | 长（完整函数） |
+
+</Zh>

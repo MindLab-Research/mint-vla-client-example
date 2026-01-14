@@ -963,7 +963,7 @@ def _resolve_model_path(model_name: str) -> str:
         # Dense models
         "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
-        "Qwen/Qwen3-4B-Instruct-2507": "/vePFS-Mindverse/share/modelscope/models/Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen/Qwen3-4B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/main",
         # MoE models (all share same architecture, different checkpoints)
         "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
@@ -1171,52 +1171,108 @@ class MultiModelInferenceManager:
         return list(self._engines.keys())
 
 
-def kill_persistent_vllm_actor() -> bool:
-    """Kill the persistent vLLM actor if it exists.
+def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
+    """Kill persistent vLLM actor(s).
 
-    Use this to force a full restart of the vLLM engine (e.g., after model changes).
-    After calling this, the next server startup will create a new actor (~80s init).
+    Args:
+        model_name: If provided, kill actor for this specific model.
+                   If None, kill ALL vLLM actors.
 
     Returns:
-        True if actor was killed, False if not found.
+        True if any actor was killed, False if none found.
     """
-    from tinker_server.backend.resource_pool import get_resource_pool
+    from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
-    try:
-        actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        ray.kill(actor)
-        logger.info(f"Killed persistent vLLM actor: {PERSISTENT_VLLM_ACTOR_NAME}")
+    resource_pool = get_resource_pool()
 
-        # Unregister from resource pool
+    if model_name:
+        # Kill specific model's actor
+        actor_name = _model_to_actor_name(model_name)
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            ray.kill(actor)
+            logger.info(f"Killed vLLM actor: {actor_name}")
+            resource_pool.unregister(actor_name)
+            return True
+        except ValueError:
+            logger.info(f"No vLLM actor found: {actor_name}")
+            return False
+    else:
+        # Kill ALL vLLM actors via resource pool
+        killed_any = False
+        for entry in resource_pool.iter_entries():
+            if entry.actor_type == ActorType.VLLM:
+                try:
+                    actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
+                    ray.kill(actor)
+                    logger.info(f"Killed vLLM actor: {entry.actor_name}")
+                    resource_pool.unregister(entry.actor_name)
+                    killed_any = True
+                except ValueError:
+                    logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
+                    resource_pool.unregister(entry.actor_name)
+                except Exception as e:
+                    logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
+        if not killed_any:
+            logger.info("No vLLM actors found in resource pool")
+        return killed_any
+
+
+def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
+    """Check if vLLM actor(s) exist and are alive.
+
+    Args:
+        model_name: If provided, check for this specific model's actor.
+                   If None, check for ANY running vLLM actor.
+
+    Returns:
+        True if matching actor exists and is alive.
+    """
+    from tinker_server.backend.resource_pool import ActorType, get_resource_pool
+
+    if not ray.is_initialized():
+        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    if model_name:
+        # Check specific model's actor
+        actor_name = _model_to_actor_name(model_name)
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            ray.get(actor.__ray_ready__.remote(), timeout=5)
+            return True
+        except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+            return False
+    else:
+        # Check for ANY vLLM actor via resource pool
         resource_pool = get_resource_pool()
-        resource_pool.unregister(PERSISTENT_VLLM_ACTOR_NAME)
-
-        return True
-    except ValueError:
-        logger.info(f"No persistent vLLM actor found: {PERSISTENT_VLLM_ACTOR_NAME}")
+        for entry in resource_pool.iter_entries():
+            if entry.actor_type == ActorType.VLLM:
+                try:
+                    actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
+                    ray.get(actor.__ray_ready__.remote(), timeout=5)
+                    return True
+                except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    continue
         return False
 
 
-def check_persistent_vllm_actor() -> bool:
-    """Check if persistent vLLM actor exists and is alive.
+def list_vllm_actors() -> list[dict]:
+    """List all vLLM actors from resource pool.
 
     Returns:
-        True if actor exists and is alive, False otherwise.
+        List of actor info dicts with name, gpus, base_model.
     """
-    if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+    from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
-    try:
-        actor = ray.get_actor(PERSISTENT_VLLM_ACTOR_NAME, namespace=PERSISTENT_NAMESPACE)
-        # ray.get_actor succeeds even for dead actors (name still registered)
-        # Verify actor is alive by calling a method on it
-        ray.get(actor.__ray_ready__.remote(), timeout=5)
-        return True
-    except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-        return False
+    resource_pool = get_resource_pool()
+    return [
+        {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
+        for e in resource_pool.iter_entries()
+        if e.actor_type == ActorType.VLLM
+    ]
 
 
 # Global instance (initialized in app lifespan)

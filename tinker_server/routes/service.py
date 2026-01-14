@@ -15,10 +15,11 @@ import os
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from safetensors.torch import load_file
 
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateSamplingSessionRequest,
     CreateSamplingSessionResponse,
@@ -41,6 +42,11 @@ sampling_sessions: dict[str, str] = {}  # sampling_session_id -> base_model
 
 # Global session manager reference (set by app lifespan)
 session_manager: SessionManager | None = None
+
+
+def _get_user_data(request: Request) -> dict | None:
+    """Extract full user_data from request state (set by auth middleware)."""
+    return getattr(request.state, "user_data", None)
 
 
 @router.get("/healthz")
@@ -77,6 +83,7 @@ async def create_session(request: CreateSessionRequest) -> CreateSessionResponse
 @router.post("/create_sampling_session")
 async def create_sampling_session(
     request: CreateSamplingSessionRequest,
+    http_request: Request,
 ) -> CreateSamplingSessionResponse:
     """Create a sampling session using the shared multi-LoRA engine.
 
@@ -103,6 +110,14 @@ async def create_sampling_session(
         raise HTTPException(
             status_code=422,
             detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
+        )
+
+    # Check model access permissions
+    user_data = _get_user_data(http_request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(
+            status_code=403,
+            detail=get_access_denied_error(base_model)
         )
 
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
@@ -141,22 +156,27 @@ def _resolve_model_path(model_path: str) -> str:
     """Resolve model_path URI to filesystem path.
 
     Args:
-        model_path: URI like file:///path, tinker://localhost/path, or absolute path.
+        model_path: URI like file:///path, mint://{uuid}/..., or absolute path.
 
     Returns:
         Absolute filesystem path to adapter directory.
     """
+    # Get checkpoint base directory
+    checkpoint_dir = os.environ.get(
+        "TINKER_CHECKPOINT_DIR",
+        os.path.join(os.getcwd(), "checkpoints")
+    )
+
     if model_path.startswith("file://"):
         return model_path[7:]  # Strip file:// prefix
-    elif model_path.startswith("tinker://localhost"):
-        # Local server tinker:// format: tinker://localhost/<absolute_path>
-        return model_path[len("tinker://localhost"):]
     elif model_path.startswith("tinker://"):
-        # Cloud tinker:// paths not supported locally
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cloud tinker:// paths not supported locally: {model_path}",
-        )
+        # tinker://{model_id}/{checkpoint_name}
+        path_part = model_path[len("tinker://"):]
+        return os.path.join(checkpoint_dir, path_part)
+    elif model_path.startswith("mint://"):
+        # Legacy mint://{model_id}/{checkpoint_name}
+        path_part = model_path[len("mint://"):]
+        return os.path.join(checkpoint_dir, path_part)
     else:
         # Assume absolute path
         return model_path
@@ -249,20 +269,138 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # =============================================================================
 
 
-# NOTE: kill_vllm, vllm_status, kill_megatron, megatron_status endpoints have been
-# removed. They were broken and caused issues. Use Ray dashboard or direct Ray
-# commands to manage actors if needed.
+
+def _require_admin(request: Request) -> None:
+    """Raise 403 if not admin user."""
+    user_data = getattr(request.state, "user_data", None)
+    if not user_data or user_data.get("user_id") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
+class KillVllmRequest(BaseModel):
+    """Request to kill vLLM actor(s)."""
+
+    model_name: str | None = None  # Kill specific model's actor, or all if None
+
+
+@router.post("/kill_vllm")
+async def kill_vllm(request: Request, body: KillVllmRequest | None = None) -> dict:
+    """Kill vLLM inference actor(s). Admin only.
+
+    Args:
+        model_name: If provided, kill actor for this specific model.
+                   If None/omitted, kill ALL vLLM actors.
+
+    Use this to force a full restart of the vLLM engine.
+    The next request that needs vLLM will create a new actor (~80s init).
+    """
+    _require_admin(request)
+    from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+
+    model_name = body.model_name if body else None
+    killed = kill_persistent_vllm_actor(model_name)
+
+    if model_name:
+        msg = f"Killed vLLM actor for {model_name}" if killed else f"No vLLM actor found for {model_name}"
+    else:
+        msg = "All vLLM actors killed" if killed else "No vLLM actors found"
+
+    return {"killed": killed, "message": msg}
+
+
+@router.get("/vllm_status")
+async def vllm_status(request: Request, model_name: str | None = None) -> dict:
+    """Check if vLLM actor(s) exist. Admin only.
+
+    Args:
+        model_name: If provided, check for this specific model's actor.
+                   If None, check for ANY running vLLM actor.
+
+    Returns:
+        alive: True if matching actor exists and is alive
+        actors: List of running vLLM actors from resource pool
+    """
+    _require_admin(request)
+    from ..backend.multi_lora_engine import check_persistent_vllm_actor, list_vllm_actors
+
+    alive = check_persistent_vllm_actor(model_name)
+    actors = list_vllm_actors()
+
+    return {"alive": alive, "actors": actors, "query_model_name": model_name}
+
+
+class KillMegatronRequest(BaseModel):
+    """Request to kill Megatron actor(s)."""
+
+    base_model: str | None = None  # Kill specific model's actor, or all if None
+
+
+@router.post("/kill_megatron")
+async def kill_megatron(request: Request, body: KillMegatronRequest | None = None) -> dict:
+    """Kill Megatron training actor(s). Admin only.
+
+    Args:
+        base_model: If provided, kill actor for this specific model.
+                   If None/omitted, kill ALL Megatron actors.
+
+    Use this to force a full restart of the Megatron worker group.
+    The next training request will create a new actor.
+    """
+    _require_admin(request)
+    from ..backend.megatron_distributed import kill_megatron_actor
+
+    base_model = body.base_model if body else None
+    killed = kill_megatron_actor(base_model)
+
+    if base_model:
+        msg = f"Killed Megatron actor for {base_model}" if killed else f"No Megatron actor found for {base_model}"
+    else:
+        msg = "All Megatron actors killed" if killed else "No Megatron actors found"
+
+    return {"killed": killed, "message": msg}
+
+
+
+@router.get("/megatron_status")
+async def megatron_status(request: Request, base_model: str | None = None) -> dict:
+    """Check if Megatron actor(s) exist. Admin only.
+
+    Args:
+        base_model: If provided, check for this specific model's actor.
+                   If None, check for ANY running Megatron actor.
+
+    Returns:
+        alive: True if matching actor exists and is alive
+        actors: List of running Megatron actors from resource pool
+    """
+    _require_admin(request)
+    from ..backend.megatron_distributed import is_megatron_actor_running
+    from ..backend.resource_pool import ActorType, get_resource_pool
+
+    alive = is_megatron_actor_running(base_model)
+
+    # Get list of all Megatron actors
+    resource_pool = get_resource_pool()
+    actors = [
+        {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
+        for e in resource_pool.list_actors()
+        if e.actor_type == ActorType.MEGATRON
+    ]
+
+    return {"alive": alive, "actors": actors, "query_base_model": base_model}
+
 
 
 @router.get("/resource_pool")
-async def resource_pool_status() -> dict:
-    """Get unified resource pool status.
+async def resource_pool_status(request: Request) -> dict:
+    """Get unified resource pool status. Admin only.
 
     Returns:
         actors: List of all tracked actors with LRU info
         total_gpus: Total GPUs used
         min_actor_age: Minimum actor age before eviction eligible
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()
@@ -274,12 +412,13 @@ async def resource_pool_status() -> dict:
 
 
 @router.post("/clear_resource_pool")
-async def clear_resource_pool() -> dict:
-    """Clear all entries from the resource pool.
+async def clear_resource_pool(request: Request) -> dict:
+    """Clear all entries from the resource pool. Admin only.
 
     Used for debugging when pool has stale entries after actors are killed externally.
     Does NOT kill actors - just clears the tracking entries.
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()

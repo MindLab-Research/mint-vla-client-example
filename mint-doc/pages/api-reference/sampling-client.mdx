@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # SamplingClient
 
 **Interface for generating text from trained models**
@@ -75,3 +79,87 @@ result = future.result()
 future = await sampling_client.sample_async(prompt, params, num_samples=1)
 result = await future
 ```
+
+</En>
+
+<Zh>
+
+# SamplingClient
+
+**从训练后的模型生成文本的接口**
+
+## 主要方法
+
+### Sample
+
+```python
+sample(
+    prompt,
+    num_samples,
+    sampling_params,
+    include_prompt_logprobs=False,
+    topk_prompt_logprobs=None
+)
+sample_async(...)
+```
+
+从 prompt 生成文本 completion。
+
+**参数**：
+- `prompt`：包含 token 的 ModelInput
+- `num_samples`：生成数量
+- `sampling_params`：控制生成的 SamplingParams
+- `include_prompt_logprobs`：返回 prompt token 的 logprobs
+- `topk_prompt_logprobs`：返回每个位置的 top-k 候选 token
+
+**返回**：包含生成 token 和可选 logprobs 的 Future。
+
+### 计算 Logprobs
+
+```python
+compute_logprobs(prompt)
+compute_logprobs_async(prompt)
+```
+
+计算 prompt 中 token 的 logprobs，不生成新文本。
+
+## 使用示例
+
+```python
+import mint
+from mint import types
+
+service_client = mint.ServiceClient()
+sampling_client = service_client.create_sampling_client(
+    base_model="Qwen/Qwen3-8B"
+)
+
+# 准备 prompt
+tokenizer = ...  # 获取 tokenizer
+prompt = types.ModelInput.from_ints(
+    tokenizer.encode("The weather today is")
+)
+
+# 配置 sampling
+params = types.SamplingParams(
+    max_tokens=20,
+    temperature=0.7
+)
+
+# 生成
+future = sampling_client.sample(
+    prompt=prompt,
+    sampling_params=params,
+    num_samples=1
+)
+result = future.result()
+```
+
+## 异步使用
+
+```python
+future = await sampling_client.sample_async(prompt, params, num_samples=1)
+result = await future
+```
+
+</Zh>

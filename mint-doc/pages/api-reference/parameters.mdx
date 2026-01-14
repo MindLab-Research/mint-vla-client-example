@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Parameters and Types
 
 **Core data types used throughout the MinT API**
@@ -83,3 +87,95 @@ Metadata about a training session.
 - `corrupted` - Whether run encountered errors
 - `checkpoints` - List of saved checkpoints
 - `created_at` - Timestamp
+
+</En>
+
+<Zh>
+
+# 参数和类型
+
+**MinT API 中使用的核心数据类型**
+
+## AdamParams
+
+Adam optimizer 配置。
+
+**字段**：
+- `learning_rate`：参数更新步长
+- `beta1`：一阶矩估计的指数衰减率
+- `beta2`：二阶矩估计的指数衰减率
+- `eps`：数值稳定性常数
+- `weight_decay`：L2 正则化系数
+- `gradient_clip_norm`：gradient 裁剪的最大范数
+
+## ModelInput
+
+表示 tokenize 后的模型输入。
+
+**方法**：
+- `from_ints(tokens)`：从 token ID 列表创建
+- `to_ints()`：转换为 token ID 列表
+- `context_length()`：获取总 token 数
+- `append_tokens(tokens)`：末尾添加 token
+- `append_chunks(chunks)`：添加文本/图像 chunk
+
+**支持**：
+- 纯文本（token ID 列表）
+- 多模态（混合 `EncodedTextChunk` 和 `ImageChunk`）
+
+## SamplingParams
+
+控制文本生成行为。
+
+**字段**：
+- `max_tokens`：最大生成 token 数
+- `temperature`：随机性（0.0 = 确定性，越高越随机）
+- `top_k`：仅考虑 top-k 个 token
+- `top_p`：nucleus sampling 阈值
+- `seed`：随机种子，用于可复现
+- `stop_sequences`：停止生成的字符串
+
+## LoraConfig
+
+LoRA 配置。
+
+**字段**：
+- `rank`：低秩矩阵的 rank 维度
+- `seed`：初始化种子
+- `train_unembed`：训练 unembedding 层
+- `train_mlp`：训练 MLP 层
+- `train_attn`：训练 attention 层
+
+## Checkpoint
+
+表示已保存的模型 checkpoint。
+
+**字段**：
+- `id`：唯一标识符
+- `type`："training" 或 "sampler"
+- `timestamp`：创建时间
+- `size`：文件大小（字节）
+- `public`：是否公开
+
+## TensorData
+
+带转换工具的 tensor 数据包装器。
+
+**方法**：
+- `to_numpy()`：转换为 NumPy 数组
+- `to_torch()`：转换为 PyTorch tensor
+- `shape`：获取 tensor 维度
+
+## TrainingRun
+
+Training session 的元数据。
+
+**字段**：
+- `id`：唯一标识符
+- `base_model`：使用的基座模型
+- `owner`：创建者
+- `corrupted`：是否遇到错误
+- `checkpoints`：已保存的 checkpoint 列表
+- `created_at`：时间戳
+
+</Zh>

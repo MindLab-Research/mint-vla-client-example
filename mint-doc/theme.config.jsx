@@ -1,3 +1,5 @@
+import { LanguageSwitcher } from './components/Lang'
+
 export default {
   logo: <span>Mind Lab Toolkit (MinT)</span>,
   project: {
@@ -25,5 +27,8 @@ export default {
     return {
       titleTemplate: '%s – MinT'
     }
+  },
+  navbar: {
+    extraContent: <LanguageSwitcher />
   }
 }

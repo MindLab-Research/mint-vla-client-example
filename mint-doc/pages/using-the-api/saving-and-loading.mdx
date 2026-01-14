@@ -1,3 +1,7 @@
+import { En, Zh } from '../../components/Lang'
+
+<En>
+
 # Saving and Loading
 
 MinT provides flexible methods for saving and loading model weights and optimizer states.
@@ -46,3 +50,58 @@ training_client.load_state(resume_path)
 - **Hyperparameter adjustments** - Resume from a checkpoint with new settings
 - **Failure recovery** - Restore training after interruptions
 - **Optimizer state preservation** - Maintain training momentum across sessions
+
+</En>
+
+<Zh>
+
+# 保存与加载
+
+MinT 提供灵活的 weight 和 optimizer 状态保存/加载方法。
+
+## 保存方法
+
+### 保存 Weight 用于 Sampling
+
+存储为 inference 优化的 weight（更快）：
+
+```python
+sampling_path = training_client.save_weights_for_sampler(name="0000").result().path
+```
+
+### 保存完整状态
+
+保留 weight 和 optimizer 状态，用于恢复训练：
+
+```python
+resume_path = training_client.save_state(name="0010").result().path
+```
+
+## 创建 Sampling Client
+
+```python
+import mint
+service_client = mint.ServiceClient()
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.2-1B", rank=32
+)
+
+sampling_path = training_client.save_weights_for_sampler(name="0000").result().path
+sampling_client = service_client.create_sampling_client(model_path=sampling_path)
+```
+
+## 恢复训练
+
+```python
+resume_path = training_client.save_state(name="0010").result().path
+training_client.load_state(resume_path)
+```
+
+## 使用场景
+
+- **多阶段工作流**：保存中间 checkpoint
+- **超参调整**：从 checkpoint 恢复并修改配置
+- **故障恢复**：中断后继续训练
+- **Optimizer 状态保留**：跨 session 保持训练状态
+
+</Zh>
