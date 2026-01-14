@@ -29,7 +29,6 @@ from .conftest import (
     create_session,
     forward_backward,
     optim_step,
-    train_step,
 )
 
 # Pre-load tokenizers to avoid concurrent import race conditions
@@ -233,15 +232,16 @@ def run_moe_sft_client(client_id: int, rank: int, num_iterations: int = 3) -> di
             },
         }]
 
-        # Training loop - use train_step for MoE
+        # Training loop
         for i in range(num_iterations):
-            result = train_step(model_id, api_data, lr=1e-4, loss_fn="cross_entropy")
+            result = forward_backward(model_id, api_data, loss_fn="cross_entropy")
             if "error" in result:
                 results["errors"].append(f"iter {i}: {result['error']}")
                 continue
 
             loss = result.get("metrics", {}).get("loss:mean", 0)
             results["losses"].append(loss)
+            optim_step(model_id, lr=1e-4)
             safe_print(f"[Client {client_id}] Iteration {i+1}: loss={loss:.4f}")
 
         results["status"] = "completed"

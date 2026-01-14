@@ -13,7 +13,8 @@ import pytest
 from .conftest import (
     MOE_MODEL,
     create_session,
-    train_step,
+    forward_backward,
+    optim_step,
     save_weights,
     sample,
 )
@@ -104,7 +105,7 @@ def generate_rollouts(tokenizer, model_id: str, problems: list) -> list[dict]:
 
 
 def compute_rl_metrics(result: dict, rollouts: list) -> dict:
-    """Extract RL metrics from train_step result."""
+    """Extract RL metrics from forward_backward result."""
     metrics = result.get("metrics", {})
 
     # Calculate average reward from rollouts
@@ -164,11 +165,10 @@ class TestMoERL:
                 "loss_fn_inputs": r["loss_fn_inputs"],
             } for r in rollouts]
 
-            # MoE uses train_step (combined forward_backward + optim)
-            result = train_step(
+            # Use forward_backward + optim_step
+            result = forward_backward(
                 model_id,
                 train_data,
-                lr=lr,
                 loss_fn="importance_sampling",
             )
 
@@ -179,7 +179,9 @@ class TestMoERL:
             metrics["accuracies"].append(rl_metrics["accuracy"])
             metrics["ratios"].append(rl_metrics["ratio_mean"])
 
-            grad_norm = result.get("metrics", {}).get("grad_norm", 0)
+            # Run optimizer step
+            optim_result = optim_step(model_id, lr=lr)
+            grad_norm = optim_result.get("metrics", {}).get("grad_norm", 0)
 
             # Save weights for next iteration sampling
             save_weights(model_id, name=f"moe_rl_iter_{i+1}")

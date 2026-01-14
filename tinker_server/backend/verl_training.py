@@ -298,9 +298,9 @@ class TrainingWorker:
 
         # Enable gradient checkpointing for large dense models (trades compute for memory)
         # Must be done before PEFT wrapping to properly set up the model
-        from .model_registry import get_gradient_checkpointing
+        from .model_registry import get_model_config
         try:
-            use_grad_ckpt = get_gradient_checkpointing(base_model)
+            use_grad_ckpt = get_model_config(base_model).gradient_checkpointing
         except ValueError:
             # Model not in registry, default to no checkpointing
             use_grad_ckpt = False
@@ -1796,7 +1796,6 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        use_per_expert_lora: bool = True,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -1806,7 +1805,6 @@ class VerlTrainingEngine:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1814,13 +1812,12 @@ class VerlTrainingEngine:
         import os
 
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
-        return await self.save_weights(session, save_path, use_per_expert_lora)
+        return await self.save_weights(session, save_path)
 
     async def save_weights(
         self,
         session: TrainingSession,
         save_path: str,
-        use_per_expert_lora: bool = True,
     ) -> str:
         """Save checkpoint via Ray actor.
 
@@ -1830,8 +1827,6 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
-                If None (default), auto-detect based on model type.
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1843,20 +1838,11 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = self._workers[model_id]
-
-        # Auto-detect use_per_expert_lora for MoE models
-        if use_per_expert_lora is None:
-            from ..backend.model_registry import get_model_config
-            try:
-                use_per_expert_lora = get_model_config(session.base_model).is_moe
-            except ValueError:
-                use_per_expert_lora = False
-
         abs_path = os.path.abspath(save_path)
 
         # Save on worker - returns metadata
         loop = asyncio.get_running_loop()
-        meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora)
+        meta_ref = worker.save_checkpoint.remote(abs_path)
         meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=300))
 
         # Update session state

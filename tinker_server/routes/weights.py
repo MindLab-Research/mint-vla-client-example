@@ -267,7 +267,7 @@ async def _do_save_state(
                 logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
         # Build mint:// path for response
-        mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        mint_path = _to_mint_path(session.model_id, checkpoint_id)
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not

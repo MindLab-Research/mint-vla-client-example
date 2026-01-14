@@ -96,33 +96,42 @@ MODEL_CONFIGS = {
         max_model_len=40960,  # 40K context
         # Small model: no gradient checkpointing needed
     ),
+    "Qwen/Qwen3-4B": ModelConfig(
+        is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
+        max_model_len=40960,  # 40K context
+        gradient_checkpointing=True,
+    ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
+    "Qwen/Qwen3-8B": ModelConfig(
+        is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
+        max_model_len=40960,  # 40K context
+        gradient_checkpointing=True,
+    ),
     # MoE models - Qwen3 30B variants (40K context per model config)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
-    # max_model_len=16384: Default 256K causes OOM during KV cache allocation
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=16384,  # Limited from 40K to prevent KV cache OOM
+        max_model_len=40960,  # 40K context - full model capability
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=16384,
+        max_model_len=40960,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=16384,
+        max_model_len=40960,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=16384,
+        max_model_len=40960,
         gradient_checkpointing=True,
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)

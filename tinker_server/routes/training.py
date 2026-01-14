@@ -569,7 +569,6 @@ async def _do_save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
             checkpoint_base_dir=checkpoint_dir,
-            use_per_expert_lora=request.use_per_expert_lora,
         )
         print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 

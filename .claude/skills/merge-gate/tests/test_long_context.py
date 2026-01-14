@@ -4,13 +4,14 @@ Tests issue #9 fix: vLLM should use model's max_position_embeddings
 instead of hardcoded defaults.
 
 Tests:
-- Dense model (Qwen2.5-7B): 32K context
-- MoE model (Qwen3-30B-A3B): 40K context (vLLM limit, model supports 262K)
+- Dense model (Qwen3-0.6B): 32K context
+- MoE model (Qwen3-30B-A3B): Maximum supported context (both inference AND training)
 - Prompt near context limit should succeed
 - Prompt exceeding context limit should give clear error
 
 Pass criteria:
 - Near-limit prompts generate output without error
+- Long context training completes without OOM
 - Exceed-limit prompts return clear error message (not cryptic vLLM error)
 """
 
@@ -22,12 +23,14 @@ from .conftest import (
     create_session,
     save_weights,
     sample,
+    train_step,
+    make_sft_datum,
 )
 
 
-# Context limits (vLLM operational limits)
-DENSE_CONTEXT = 32768   # Qwen2.5-7B-Instruct
-MOE_CONTEXT = 40960     # Qwen3-30B-A3B-Instruct-2507 (vLLM limit; model supports 262K)
+# Context limits (from model_registry.py max_model_len)
+DENSE_CONTEXT = 40960   # Qwen3-0.6B
+MOE_CONTEXT = 40960     # Qwen3-30B-A3B-Instruct-2507 (40K context)
 
 
 def generate_tokens(tokenizer, target_length: int) -> list[int]:
@@ -167,3 +170,48 @@ class TestMoELongContext:
             f"Error message not clear: {error_msg[:200]}"
 
         print(f"MoE exceed-limit ({prompt_size:,} tokens): Got expected clear error")
+
+    @pytest.mark.slow
+    def test_long_context_training(self, moe_tokenizer):
+        """Test MoE training with long context (near 40K limit).
+
+        CRITICAL: 30B MoE must support maximum context for both inference AND training.
+        This test verifies training does not OOM on long sequences.
+
+        Marked slow - memory intensive.
+        Skip with: pytest -m "not slow"
+        """
+        # Near-limit training: 38K tokens (near 40K limit)
+        context_size = 38000
+        tokens = generate_tokens(moe_tokenizer, context_size)
+
+        session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=1e-4)
+
+        # Create training datum with long context
+        # input_tokens: all tokens except last
+        # target_tokens: all tokens (shifted by 1 internally)
+        # loss_mask: 1.0 for all positions
+        input_tokens = tokens[:-1]
+        target_tokens = tokens[1:]
+        loss_mask = [1.0] * len(target_tokens)
+
+        datum = make_sft_datum(input_tokens, target_tokens, loss_mask)
+
+        # Run one training step - should not OOM
+        result = train_step(model_id, [datum], lr=1e-5, loss_fn="cross_entropy")
+
+        assert "error" not in result, f"Long context training failed: {result.get('error')}"
+        assert "loss" in result, "No loss returned from training"
+
+        loss = result["loss"]
+        assert loss > 0, f"Invalid loss: {loss}"
+        assert loss < 100, f"Loss suspiciously high: {loss}"
+
+        print(f"MoE long context training ({context_size:,} tokens): loss={loss:.4f}")
+
+        # Verify we can still sample after training
+        save_weights(model_id, name="moe_long_train_test")
+        sample_result = sample(model_id, tokens[:100], max_tokens=10, temperature=0.0)
+        assert "error" not in sample_result, f"Sampling after long training failed: {sample_result.get('error')}"
+
+        print(f"MoE long context training PASS: trained and sampled successfully")
