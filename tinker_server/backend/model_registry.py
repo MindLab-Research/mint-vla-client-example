@@ -37,6 +37,7 @@ class ModelConfig:
     is_moe: bool
     inference_tp: int  # vLLM inference TP
     inference_dp: int  # vLLM inference DP
+    max_model_len: int  # vLLM context limit (required - no fallback)
     train_tp: int = 1  # Megatron training TP (attention/shared layers)
     train_ep: int = 1  # Megatron training EP (MoE expert distribution, 1 for dense)
     train_cp: int = 1  # Megatron training CP (context parallelism for long sequences)
@@ -246,5 +247,31 @@ def get_model_config(model_name: str) -> ModelConfig:
     # Normalize path to model name
     normalized = normalize_model_name(model_name)
     return MODEL_CONFIGS[normalized]
+
+
+def get_training_parallelism(model_name: str) -> tuple[int, int, int, int]:
+    """Get Megatron training parallelism settings for a model.
+
+    Args:
+        model_name: HuggingFace model name (e.g., "Qwen/Qwen3-0.6B") or full path
+
+    Returns:
+        Tuple of (train_tp, train_ep, train_cp, train_etp)
+    """
+    config = get_model_config(model_name)
+    return (config.train_tp, config.train_ep, config.train_cp, config.train_etp)
+
+
+def requires_fp8(model_name: str) -> bool:
+    """Check if a model requires FP8 inference.
+
+    Args:
+        model_name: HuggingFace model name or full path
+
+    Returns:
+        True if the model requires FP8 inference
+    """
+    config = get_model_config(model_name)
+    return config.quantization == "fp8"
 
 

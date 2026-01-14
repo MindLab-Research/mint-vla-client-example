@@ -10,6 +10,7 @@ verl/workers/megatron_workers.py.
 from __future__ import annotations  # Allow forward references in type hints
 
 import os
+import math
 import socket
 import logging
 from dataclasses import dataclass
@@ -1144,6 +1145,16 @@ class MegatronRankWorker:
             # Concatenate and split log_probs into per-sample tensors for loss_fn_outputs
             # Also split topk tensors which are in THD format (1, total_tokens, k)
             topk_offset = 0  # Track offset into concatenated topk tensor
+
+            # NaN guard: detect and report NaN in loss_value before it propagates to JSON
+            # (orjson converts NaN to null, which causes pydantic validation failures on client)
+            if math.isnan(loss_value) or math.isinf(loss_value):
+                logger.error(f"[Rank {self.rank}] NaN/Inf detected in loss_value={loss_value}. "
+                             f"num_tokens={num_tokens}, loss_fn={loss_fn}. "
+                             "This will cause client-side validation failures.")
+                # Set to a large but valid number to allow training to continue with a warning
+                loss_value = 1e6 if math.isnan(loss_value) else loss_value
+
             if per_sample_log_probs:
                 avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
                 for sample_idx, sample_log_probs in enumerate(per_sample_log_probs):
@@ -3017,6 +3028,11 @@ class MegatronWorkerGroup:
         if valid_count is None:
             valid_count = len(data_items)
 
+        # NaN guard: check for NaN/Inf in loss_value
+        if math.isnan(loss_value) or math.isinf(loss_value):
+            logger.warning(f"[MegatronWorkerGroup] NaN/Inf in loss_value={loss_value}, replacing with 0.0")
+            loss_value = 0.0
+
         metrics = {
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
@@ -3035,8 +3051,12 @@ class MegatronWorkerGroup:
         # Add debug metrics if present (precision difference between rollout and training)
         debug_metrics = rank0_result.get("debug_metrics", {})
         if debug_metrics:
-            # Filter out None values to avoid pydantic validation errors
-            filtered_debug_metrics = {k: v for k, v in debug_metrics.items() if v is not None and isinstance(v, (int, float))}
+            # Filter out None and NaN values to avoid pydantic validation errors
+            # (orjson converts NaN to null, which causes pydantic failures)
+            filtered_debug_metrics = {
+                k: v for k, v in debug_metrics.items()
+                if v is not None and isinstance(v, (int, float)) and not math.isnan(v) and not math.isinf(v)
+            }
             if filtered_debug_metrics:
                 metrics.update(filtered_debug_metrics)
                 logger.info(f"[MegatronWorkerGroup] Debug metrics: {filtered_debug_metrics}")
@@ -3044,12 +3064,31 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
         loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
+
+        # NaN guard for individual loss_fn_outputs entries
+        # orjson converts NaN/Inf to null, causing pydantic validation failures
+        avg_loss_fallback = loss_value / max(valid_count, 1) if valid_count > 0 else 0.0
+        if math.isnan(avg_loss_fallback) or math.isinf(avg_loss_fallback):
+            avg_loss_fallback = 0.0
+
+        nan_count = 0
+        for output in loss_fn_outputs:
+            if isinstance(output, dict) and "loss" in output:
+                loss_data = output["loss"].get("data", [])
+                if loss_data:
+                    val = loss_data[0]
+                    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                        output["loss"]["data"] = [avg_loss_fallback]
+                        nan_count += 1
+        if nan_count > 0:
+            logger.warning(f"[MegatronWorkerGroup] Replaced {nan_count} NaN/Inf/None loss values with {avg_loss_fallback}")
+
         if len(loss_fn_outputs) < len(data_items):
-            avg_loss_per_sample = loss_value / max(valid_count, 1)
+            # Use avg_loss_fallback (already NaN-guarded) for padding entries
             loss_fn_outputs = list(loss_fn_outputs)
             loss_fn_outputs.extend(
                 {
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "loss": {"data": [avg_loss_fallback], "shape": [1], "dtype": "float32"},
                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
                 }
                 for _ in range(len(data_items) - len(loss_fn_outputs))
@@ -3094,13 +3133,36 @@ class MegatronWorkerGroup:
         valid_count = rank0_result.get("valid_count")
         if valid_count is None:
             valid_count = len(data_items)
+
+        # NaN guard for loss_value
+        if math.isnan(loss_value) or math.isinf(loss_value):
+            logger.warning(f"[MegatronWorkerGroup.forward] NaN/Inf in loss_value={loss_value}, replacing with 0.0")
+            loss_value = 0.0
+
         loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
+
+        # NaN guard for individual loss_fn_outputs entries
+        avg_loss_fallback = loss_value / max(valid_count, 1) if valid_count > 0 else 0.0
+        if math.isnan(avg_loss_fallback) or math.isinf(avg_loss_fallback):
+            avg_loss_fallback = 0.0
+
+        nan_count = 0
+        for output in loss_fn_outputs:
+            if isinstance(output, dict) and "loss" in output:
+                loss_data = output["loss"].get("data", [])
+                if loss_data:
+                    val = loss_data[0]
+                    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                        output["loss"]["data"] = [avg_loss_fallback]
+                        nan_count += 1
+        if nan_count > 0:
+            logger.warning(f"[MegatronWorkerGroup.forward] Replaced {nan_count} NaN/Inf/None loss values with {avg_loss_fallback}")
+
         if len(loss_fn_outputs) < len(data_items):
-            avg_loss_per_sample = loss_value / max(valid_count, 1)
             loss_fn_outputs = list(loss_fn_outputs)
             loss_fn_outputs.extend(
                 {
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "loss": {"data": [avg_loss_fallback], "shape": [1], "dtype": "float32"},
                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
                 }
                 for _ in range(len(data_items) - len(loss_fn_outputs))
