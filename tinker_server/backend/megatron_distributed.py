@@ -1240,8 +1240,7 @@ class MegatronRankWorker:
                         if isinstance(values, list) and values:
                             # Average debug metrics across micro-batches
                             if isinstance(values[0], (int, float)):
-                                # Filter out nan values before averaging
-                                import math
+                                # Filter out nan values before averaging (math imported at module level)
                                 valid_values = [v for v in values if not (isinstance(v, float) and math.isnan(v))]
                                 if valid_values:
                                     debug_metrics[f"{key}:mean"] = sum(valid_values) / len(valid_values)
