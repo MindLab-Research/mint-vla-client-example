@@ -298,9 +298,9 @@ class TrainingWorker:
 
         # Enable gradient checkpointing for large dense models (trades compute for memory)
         # Must be done before PEFT wrapping to properly set up the model
-        from .model_registry import get_gradient_checkpointing
+        from .model_registry import get_model_config
         try:
-            use_grad_ckpt = get_gradient_checkpointing(base_model)
+            use_grad_ckpt = get_model_config(base_model).gradient_checkpointing
         except ValueError:
             # Model not in registry, default to no checkpointing
             use_grad_ckpt = False
@@ -552,6 +552,31 @@ class TrainingWorker:
             outputs = self.model(input_ids=input_ids_t)
             logits = outputs.logits  # [1, seq_len, vocab_size]
 
+            # DEBUG: Inspect raw logits for anomalies
+            logits_for_debug = logits.squeeze(0)  # [seq_len, vocab]
+            max_logit = logits_for_debug.max().item()
+            min_logit = logits_for_debug.min().item()
+            has_nan = torch.isnan(logits_for_debug).any().item()
+            has_inf = torch.isinf(logits_for_debug).any().item()
+            # Get logits at target positions
+            target_logits = logits_for_debug[torch.arange(len(target_tokens)), target_ids_t.squeeze(0)]
+            target_max = target_logits.max().item()
+            target_min = target_logits.min().item()
+            # Store debug info for return
+            _debug_logits_info = {
+                "max_logit": max_logit,
+                "min_logit": min_logit,
+                "has_nan": has_nan,
+                "has_inf": has_inf,
+                "target_max": target_max,
+                "target_min": target_min,
+            }
+            # Check for extreme logits (> 50 or < -50)
+            extreme_mask = (logits_for_debug.abs() > 50).any(dim=-1)
+            if extreme_mask.any():
+                extreme_positions = extreme_mask.nonzero().squeeze(-1).tolist()
+                _debug_logits_info["extreme_positions"] = extreme_positions[:10]
+
             # Flatten for loss computation
             logits_flat = logits.squeeze(0)  # [seq_len, vocab]
             targets_flat = target_ids_t.squeeze(0)  # [seq_len]
@@ -694,6 +719,12 @@ class TrainingWorker:
             "num_samples:sum": float(len(data_items)),
             "num_tokens:sum": float(total_tokens),
         }
+
+        # Add debug logits info if available (from last item processed)
+        try:
+            metrics["_debug_logits"] = _debug_logits_info
+        except NameError:
+            pass
 
         # Add RL-specific metrics
         if num_rl_samples > 0:
@@ -1385,6 +1416,17 @@ class VerlTrainingEngine:
         import os
         from pathlib import Path
 
+        # Explicit path overrides for models with non-standard cache locations
+        MODEL_PATH_OVERRIDES = {
+            "moonshotai/Kimi-K2-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--unsloth--Kimi-K2-Instruct-0905-BF16/snapshots/fbaf30b3baf5fdc2b2170ae04f4ff4948b0487cb",
+            "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
+        }
+
+        if hf_model_id in MODEL_PATH_OVERRIDES:
+            override_path = MODEL_PATH_OVERRIDES[hf_model_id]
+            logger.info(f"Using path override for {hf_model_id} -> {override_path}")
+            return override_path
+
         hf_home = os.environ.get("HF_HOME", "/vePFS-Mindverse/share/huggingface")
         # Convert "org/model" to "models--org--model"
         cache_name = "models--" + hf_model_id.replace("/", "--")
@@ -1442,19 +1484,23 @@ class VerlTrainingEngine:
         else:
             base_model = requested_model
 
+        print(f"[DEBUG create_training_session] use_megatron={use_megatron}, base_model={base_model}", flush=True)
+
         if use_megatron:
             # MoE models need tensor/expert parallelism from model registry
             from .model_registry import get_training_parallelism, requires_fp8
 
             # Get model-specific parallelism and FP8 config from registry
-            train_tp, train_ep = get_training_parallelism(requested_model or "")
+            train_tp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or "")
             use_fp8 = requires_fp8(requested_model or "")
             distributed_config = DistributedConfig(
                 tensor_parallel_size=train_tp,
                 expert_parallel_size=train_ep,
+                context_parallel_size=train_cp,
+                expert_tensor_parallel_size=train_etp,
                 use_fp8=use_fp8,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, world_size={train_tp * train_ep}, fp8={use_fp8})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -1468,6 +1514,16 @@ class VerlTrainingEngine:
             session.backend = "megatron"
             # Associate session with actor in resource pool immediately
             self._touch_actor(session)
+
+            # Reinitialize LoRA weights for fresh session (statelessness)
+            # This ensures each new session starts with fresh random weights
+            # instead of inheriting trained weights from previous session
+            print(f"[DEBUG] About to call reinit_lora_weights for {model_id}, lr={session.learning_rate}, rank={lora_rank}", flush=True)
+            logger.info(f"[{model_id}] Reinitializing Megatron LoRA weights for new session (lr={session.learning_rate}, rank={lora_rank})...")
+            import ray
+            result = ray.get(worker.reinit_lora_weights.remote(learning_rate=session.learning_rate, actual_rank=lora_rank))
+            print(f"[DEBUG] reinit_lora_weights result: {result}", flush=True)
+            logger.info(f"[{model_id}] Megatron LoRA weights reinitialized: {result.get('total_params', 0)} params")
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
@@ -1689,88 +1745,91 @@ class VerlTrainingEngine:
         logger.info(f"[{model_id}] train_step: step={session.current_step}")
         return result
 
+    async def reset_expert_bias(self, session: TrainingSession) -> dict:
+        """Reset expert_bias buffers in MoE router modules.
+
+        The expert_bias buffer accumulates during training (via finalize_model_grads)
+        to balance token distribution across experts. However, this buffer is NOT
+        exported with LoRA weights, causing train-inference mismatch:
+        - Megatron (trained): has accumulated expert_bias != 0
+        - vLLM (loaded LoRA): has expert_bias = 0
+
+        This causes different routing decisions and thus different logprobs even
+        with identical LoRA weights.
+
+        Call this before computing logprobs to ensure consistent behavior with vLLM.
+
+        Args:
+            session: Training session with model.
+
+        Returns:
+            dict with modules_reset count.
+        """
+        import asyncio
+        import ray
+
+        model_id = session.model_id
+        worker = self._workers.get(model_id)
+        if worker is None:
+            logger.warning(f"[{model_id}] reset_expert_bias: No worker found")
+            return {"modules_reset": 0}
+
+        # Mark actor as recently used
+        self._touch_actor(session)
+
+        logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
+
+        loop = asyncio.get_running_loop()
+        try:
+            result_ref = worker.reset_expert_bias.remote()
+            result = await loop.run_in_executor(None, ray.get, result_ref)
+            # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
+            modules_reset = result.get("reset_count", result.get("modules_reset", 0))
+            logger.info(f"[{model_id}] reset_expert_bias: reset {modules_reset} modules")
+            return {"modules_reset": modules_reset}
+        except Exception as e:
+            logger.exception(f"[{model_id}] reset_expert_bias failed: {e}")
+            return {"modules_reset": 0, "error": str(e)}
+
     async def save_weights_for_sampler(
         self,
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
-        use_per_expert_lora: bool = False,
     ) -> str:
         """Save LoRA weights for inference use.
 
-        Fetches weights from remote Ray worker via object store, then saves
-        locally on API server. This handles distributed deployments where
-        training worker and API server are on different machines.
+        Delegates to save_weights with constructed path.
 
         Args:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
-            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
             Absolute path to saved checkpoint directory.
         """
-        import json
         import os
 
-        from safetensors.torch import save_file
-
-        model_id = session.model_id
-        worker = self._workers[model_id]
-
-        logger.info(f"[{model_id}] save_weights_for_sampler: ENTRY (use_per_expert_lora={use_per_expert_lora})")
-        logger.info(f"[{model_id}] save_weights_for_sampler: worker type = {type(worker)}")
-
-        # Fetch weights and config from remote worker via Ray object store
-        # Use ray.get() with timeout in thread executor for reliable async handling
-        logger.info(f"[{model_id}] save_weights_for_sampler: calling get_lora_state_dict.remote()...")
-        import ray
-        loop = asyncio.get_running_loop()
-
-        # Schedule remote calls
-        state_dict_ref = worker.get_lora_state_dict.remote(use_per_expert_lora)
-        config_ref = worker.get_lora_config.remote()
-        logger.info(f"[{model_id}] save_weights_for_sampler: remote calls scheduled, waiting for results...")
-
-        # Use ray.get() with timeout in executor to avoid blocking event loop
-        # Increased timeout for large models with many LoRA params (MoE + MLA = 428 params)
-        def get_with_timeout():
-            return ray.get([state_dict_ref, config_ref], timeout=300)
-
-        state_dict, config = await loop.run_in_executor(None, get_with_timeout)
-        logger.info(f"[{model_id}] save_weights_for_sampler: got {len(state_dict)} state_dict keys")
-
-        # Override base_model_name_or_path with user-provided model name (not resolved path)
-        config["base_model_name_or_path"] = session.base_model
-
-        # Save locally on API server
-        save_path = os.path.join(checkpoint_base_dir, model_id, checkpoint_name)
-        os.makedirs(save_path, exist_ok=True)
-
-        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
-        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-
-        abs_path = os.path.abspath(save_path)
-        logger.info(f"[{model_id}] Saved weights for sampler to {abs_path}")
-        return abs_path
+        save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        return await self.save_weights(session, save_path)
 
     async def save_weights(
         self,
         session: TrainingSession,
         save_path: str,
-    ) -> dict:
-        """Save full checkpoint via Ray actor.
+    ) -> str:
+        """Save checkpoint via Ray actor.
 
-        Saves LoRA weights, optimizer state, and training metadata.
+        Saves LoRA weights directly on worker to shared filesystem.
+        Returns path for path-based vLLM loading.
 
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
 
         Returns:
-            Dict with path, state_dict, and peft_config for multi-LoRA registration.
+            Absolute path to saved checkpoint directory.
         """
         import asyncio
         import os
@@ -1779,25 +1838,18 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = self._workers[model_id]
+        abs_path = os.path.abspath(save_path)
 
-        # Remote call to save checkpoint - returns meta with state_dict and peft_config
-        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
+        # Save on worker - returns metadata
         loop = asyncio.get_running_loop()
-        meta_ref = worker.save_checkpoint.remote(save_path)
-        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
+        meta_ref = worker.save_checkpoint.remote(abs_path)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=300))
 
-        # Update session state from worker metadata
+        # Update session state
         session.current_step = meta.get("current_step", session.current_step)
 
-        abs_path = os.path.abspath(save_path)
         logger.info(f"[{model_id}] save_weights: {abs_path}")
-
-        # Return dict with path and weights for registration
-        return {
-            "path": abs_path,
-            "state_dict": meta.get("state_dict"),
-            "peft_config": meta.get("peft_config"),
-        }
+        return abs_path
 
     async def load_weights(
         self,

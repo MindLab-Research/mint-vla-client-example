@@ -22,10 +22,12 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 
+from verl.utils import tensordict_utils as tu
+
 if TYPE_CHECKING:
     pass
 
-from tinker_server.backend.model_registry import get_max_position_embeddings
+from tinker_server.backend.model_registry import get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +59,9 @@ class MegatronTrainingConfig:
 
 def tinker_to_tensordict(
     data_items: list[dict],
-    max_token_len_per_gpu: int = 8192,
+    max_token_len_per_gpu: int = 10240,  # Single sample max: prompt (~2K) + max_tokens (8K)
     device: str | torch.device | None = None,
+    dp_size: int | None = None,
 ) -> TensorDict:
     """Convert Tinker Datum format to verl TensorDict.
 
@@ -67,7 +70,7 @@ def tinker_to_tensordict(
             "model_input": {"chunks": [{"tokens": [...]}]},
             "loss_fn_inputs": {
                 "target_tokens": {"data": [...]},
-                "weights": {"data": [...]},
+                "weights": {"data": [...]},       # or "loss_mask"/"mask" used in some test cases examples
                 "logprobs": {"data": [...]},      # for RL
                 "advantages": {"data": [...]}     # for RL
             }
@@ -76,14 +79,19 @@ def tinker_to_tensordict(
     verl TensorDict format:
         TensorDict({
             "input_ids": tensor [batch, seq_len],
-            "attention_mask": tensor [batch, seq_len],
+            "attention_mask": tensor [batch, seq_len],  # 1 for real tokens, 0 for padding
             "loss_mask": tensor [batch, seq_len],
+            "attention_mask": tensor [batch, seq_len],
             "position_ids": tensor [batch, seq_len],  # 0 to seq_len-1
             "temperature": tensor [batch, 1],         # logits scaling (1.0 = no scaling)
-            "old_log_probs": tensor [batch, seq_len],  # for RL
-            "advantages": tensor [batch, seq_len],     # for RL
+            "old_log_probs": tensor [batch, response_len],  # for RL
+            "advantages": tensor [batch, response_len],     # for RL
+            "prompts": tensor [batch, prompt_len],  # derived from loss_mask
+            "responses": tensor [batch, response_len],  # derived from loss_mask
+            "response_mask": tensor [batch, response_len],
             # Non-tensor metadata for verl's prepare_micro_batches:
-            "use_dynamic_bsz": NonTensorData(True),
+            "use_dynamic_bsz": NonTensorData(False),  # Disabled for micro_batch control
+            "micro_batch_size_per_gpu": NonTensorData(1),  # Gradient accumulation
             "max_token_len_per_gpu": NonTensorData(int),
         })
 
@@ -93,18 +101,44 @@ def tinker_to_tensordict(
             Used by verl's prepare_micro_batches when use_dynamic_bsz=True.
         device: Target device for tensors. If None, uses CPU.
             Creating tensors directly on GPU avoids CPU-to-GPU copy issues with nested tensors.
+        dp_size: Optional data-parallel size override for loss normalization.
     """
+    def _extract_list(field_name: str, field: dict | None, item_index: int) -> list | None:
+        if field is None:
+            return None
+        if not isinstance(field, dict):
+            raise ValueError(f"Item {item_index}: {field_name} must be a dict with 'data'")
+        if "data" not in field:
+            return None
+        data = field["data"]
+        if data is None:
+            raise ValueError(f"Item {item_index}: {field_name}.data is None")
+        if not isinstance(data, list):
+            raise ValueError(f"Item {item_index}: {field_name}.data must be a list")
+        return data
+
+    def _ensure_len(field_name: str, data: list, tokens_len: int, item_index: int) -> None:
+        if len(data) != tokens_len:
+            raise ValueError(
+                f"Item {item_index}: {field_name} length {len(data)} != tokens length {tokens_len}"
+            )
+
     input_ids_list = []
-    attention_mask_list = []
     loss_mask_list = []
-    old_log_probs_list = []
-    advantages_list = []
+    prompt_ids_list = []
+    response_ids_list = []
+    response_mask_list = []
+    response_log_probs_list = []
+    response_advantages_list = []
+    response_lens = []
+    target_tokens_list = []  # External labels (correctly shifted, with true last token)
 
     max_len = 0
-    has_rl_inputs = False
+    has_external_labels = False
+    has_full_external_labels = True
 
     # First pass: collect data and find max length
-    for item in data_items:
+    for item_index, item in enumerate(data_items):
         model_input = item.get("model_input", {})
         loss_fn_inputs = item.get("loss_fn_inputs", {})
 
@@ -115,28 +149,84 @@ def tinker_to_tensordict(
         else:
             continue
 
-        max_len = max(max_len, len(tokens))
+        tokens_len = len(tokens)
+        max_len = max(max_len, tokens_len)
         input_ids_list.append(tokens)
 
+        # RL inputs (optional)
+        logprobs = _extract_list("logprobs", loss_fn_inputs.get("logprobs"), item_index)
+        if logprobs is not None:
+            _ensure_len("logprobs", logprobs, tokens_len, item_index)
+
+        advantages = _extract_list("advantages", loss_fn_inputs.get("advantages"), item_index)
+        if advantages is not None:
+            _ensure_len("advantages", advantages, tokens_len, item_index)
+
         # Extract weights (loss mask)
-        # Try "weights" first, then "mask"; if neither has data, default to all 1s
-        weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("mask")
-        if weights_data and weights_data.get("data"):
-            weights = weights_data["data"]
+        # Prefer "loss_mask"/"mask"; fallback to "weights".
+        # If missing and advantages provided, derive mask from advantages (non-zero = 1).
+        weights_data = None
+        weights_key = None
+        for key in ("loss_mask", "mask", "weights"):
+            candidate = _extract_list(key, loss_fn_inputs.get(key), item_index)
+            if candidate is not None:
+                weights_data = candidate
+                weights_key = key
+                break
+        if weights_data is not None:
+            _ensure_len(weights_key, weights_data, tokens_len, item_index)
+            weights = weights_data
+        elif advantages is not None:
+            weights = [1.0 if a != 0 else 0.0 for a in advantages]
         else:
             # Default: all tokens contribute to loss
-            weights = [1.0] * len(tokens)
+            weights = [1.0] * tokens_len
         loss_mask_list.append(weights)
 
-        # RL inputs (optional)
-        logprobs_data = loss_fn_inputs.get("logprobs", {})
-        advantages_data = loss_fn_inputs.get("advantages", {})
+        # Derive prompt/response split from loss_mask (response assumed to be suffix).
+        # loss_mask aligns to target tokens (shifted); use non-zero span to handle gaps/negative weights.
+        nonzero_indices = [i for i, w in enumerate(weights) if w != 0]
+        if not nonzero_indices:
+            prompt_len = tokens_len
+            response_len = 0
+            first_response_idx = None
+        else:
+            first_response_idx = nonzero_indices[0]
+            last_response_idx = nonzero_indices[-1]
+            prompt_len = min(first_response_idx + 1, tokens_len)
+            max_response_len = max(tokens_len - prompt_len, 0)
+            response_len = min(last_response_idx - first_response_idx + 1, max_response_len)
+        response_lens.append(response_len)
+        prompt_ids_list.append(tokens[:prompt_len])
+        response_ids_list.append(tokens[prompt_len : prompt_len + response_len])
+        if response_len > 0:
+            slice_start = max(prompt_len - 1, 0)
+            slice_end = min(slice_start + response_len, tokens_len)
+            response_mask_list.append([1.0 if w != 0 else 0.0 for w in weights[slice_start:slice_end]])
+            if logprobs is not None:
+                response_log_probs_list.append(logprobs[slice_start:slice_end])
+            else:
+                response_log_probs_list.append(None)
+            if advantages is not None:
+                response_advantages_list.append(advantages[slice_start:slice_end])
+            else:
+                response_advantages_list.append(None)
+        else:
+            response_mask_list.append([])
+            response_log_probs_list.append([] if logprobs is not None else None)
+            response_advantages_list.append([] if advantages is not None else None)
 
-        if logprobs_data.get("data"):
-            has_rl_inputs = True
-            old_log_probs_list.append(logprobs_data["data"])
-        if advantages_data.get("data"):
-            advantages_list.append(advantages_data["data"])
+        # External labels (target_tokens) - correctly shifted with true last token
+        # This solves the verl roll bug where last position gets wrapped first token
+        target_tokens = _extract_list("target_tokens", loss_fn_inputs.get("target_tokens"), item_index)
+        if target_tokens is not None:
+            _ensure_len("target_tokens", target_tokens, tokens_len, item_index)
+            has_external_labels = True
+            target_tokens_list.append(target_tokens)
+            print(f"[tinker_to_tensordict] Extracted target_tokens, len={len(target_tokens)}", flush=True)
+        else:
+            has_full_external_labels = False
+            target_tokens_list.append(None)
 
     if not input_ids_list:
         raise ValueError("No valid data items found")
@@ -144,18 +234,17 @@ def tinker_to_tensordict(
     batch_size = len(input_ids_list)
 
     # verl expects nested/jagged tensors for variable-length sequences
-    # Create tensors directly on target device (GPU) to avoid .to() issues
-    # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
+    # This is required for gptmodel_forward_no_padding which calls input_ids.offsets()
     input_ids_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in input_ids_list]
     loss_mask_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in loss_mask_list]
     position_ids_tensors = [torch.arange(len(seq), dtype=torch.long, device=device) for seq in input_ids_list]
 
-    # Create nested tensors with jagged layout
+    # Create NestedTensors with jagged layout (variable-length sequences)
     input_ids = torch.nested.as_nested_tensor(input_ids_tensors, layout=torch.jagged)
     loss_mask = torch.nested.as_nested_tensor(loss_mask_tensors, layout=torch.jagged)
     position_ids = torch.nested.as_nested_tensor(position_ids_tensors, layout=torch.jagged)
 
-    # TensorDict (don't pass device= as it triggers .to() on nested tensors)
+    # TensorDict with NestedTensors
     td = TensorDict({
         "input_ids": input_ids,
         "loss_mask": loss_mask,
@@ -168,25 +257,132 @@ def tinker_to_tensordict(
     # Using set_non_tensor with float prevents batching/slicing by prepare_micro_batches
     td.set_non_tensor("temperature", 1.0)
 
-    # Add RL inputs if present (also as nested tensors on target device)
-    if has_rl_inputs and old_log_probs_list:
-        old_log_probs_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in old_log_probs_list]
-        td["old_log_probs"] = torch.nested.as_nested_tensor(old_log_probs_tensors, layout=torch.jagged)
-    if advantages_list:
-        advantages_tensors = [torch.tensor(seq, dtype=torch.float, device=device) for seq in advantages_list]
-        td["advantages"] = torch.nested.as_nested_tensor(advantages_tensors, layout=torch.jagged)
+    # Add prompt/response splits for verl's PPO loss (slicing log_probs by response length).
+    max_prompt_len = max((len(seq) for seq in prompt_ids_list), default=0)
+    max_response_len = max(response_lens) if response_lens else 0
+    prompt_tensor = torch.zeros((batch_size, max_prompt_len), dtype=torch.long, device=device)
+    response_tensor = torch.zeros((batch_size, max_response_len), dtype=torch.long, device=device)
+    for idx, (prompt_seq, response_seq) in enumerate(
+        zip(prompt_ids_list, response_ids_list, strict=True)
+    ):
+        if prompt_seq:
+            prompt_tensor[idx, :len(prompt_seq)] = torch.tensor(prompt_seq, dtype=torch.long, device=device)
+        if response_seq:
+            response_tensor[idx, :len(response_seq)] = torch.tensor(response_seq, dtype=torch.long, device=device)
+    td["prompts"] = prompt_tensor
+    td["responses"] = response_tensor
+
+    response_mask = torch.zeros((batch_size, max_response_len), dtype=torch.float, device=device)
+    for idx, mask_seq in enumerate(response_mask_list):
+        if mask_seq:
+            response_mask[idx, :len(mask_seq)] = torch.tensor(mask_seq, dtype=torch.float, device=device)
+    td["response_mask"] = response_mask
+
+    # Dense attention_mask for verl's response slicing (prompt padded to max_prompt_len).
+    attention_mask = torch.zeros(
+        (batch_size, max_prompt_len + max_response_len), dtype=torch.long, device=device
+    )
+    for idx, (prompt_len, response_len) in enumerate(zip(
+        [len(seq) for seq in prompt_ids_list], response_lens, strict=True
+    )):
+        if prompt_len:
+            attention_mask[idx, :prompt_len] = 1
+        if response_len:
+            attention_mask[idx, max_prompt_len : max_prompt_len + response_len] = 1
+    td["attention_mask"] = attention_mask
+
+    # Add RL inputs if present (response-aligned dense tensors).
+    has_full_rl_inputs = all(lp is not None for lp in response_log_probs_list) and all(
+        adv is not None for adv in response_advantages_list
+    )
+    if has_full_rl_inputs:
+        old_log_probs = torch.zeros((batch_size, max_response_len), dtype=torch.float, device=device)
+        advantages = torch.zeros((batch_size, max_response_len), dtype=torch.float, device=device)
+        for idx, (lp_seq, adv_seq) in enumerate(
+            zip(response_log_probs_list, response_advantages_list, strict=True)
+        ):
+            if lp_seq:
+                old_log_probs[idx, :len(lp_seq)] = torch.tensor(lp_seq, dtype=torch.float, device=device)
+            if adv_seq:
+                advantages[idx, :len(adv_seq)] = torch.tensor(adv_seq, dtype=torch.float, device=device)
+        td["old_log_probs"] = old_log_probs
+        td["advantages"] = advantages
+
+    # Add external labels if present (target_tokens with correct last token)
+    # Key MUST NOT be "label" - verl applies torch.roll when key == "label"
+    # Using "target" bypasses roll since need_roll=(k == "label") in model_forward.py
+    if has_external_labels and target_tokens_list:
+        if has_full_external_labels and all(seq is not None for seq in target_tokens_list):
+            target_tokens_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in target_tokens_list]
+            td["target"] = torch.nested.as_nested_tensor(target_tokens_tensors, layout=torch.jagged)
+            td.set_non_tensor("use_external_label", True)
+            print(
+                f"[tinker_to_tensordict] Added external labels (key='target', no roll), "
+                f"batch_size={len(target_tokens_list)}",
+                flush=True,
+            )
+        else:
+            logger.warning(
+                "[tinker_to_tensordict] Mixed target_tokens presence in batch; "
+                "skipping external labels to avoid TensorDict shape mismatch."
+            )
 
     # Add non-tensor metadata for verl's prepare_micro_batches
-    # These control how verl splits the batch into micro-batches
+    # use_dynamic_bsz=True is REQUIRED for NestedTensor compatibility with verl's forward
+    # verl's rearrange_micro_batches handles dynamic batching based on token count
     td["use_dynamic_bsz"] = NonTensorData(True)
     td["max_token_len_per_gpu"] = NonTensorData(max_token_len_per_gpu)
+    td.set_non_tensor("sp_size", 1)  # Sequence parallel size (default 1)
 
     # Add fields required by verl's sft_loss
     # Compute total tokens in batch for loss normalization
     # Use set_non_tensor to avoid batch dimension validation (these are scalar values)
-    total_tokens = sum(len(seq) for seq in input_ids_list)
-    td.set_non_tensor("dp_size", 1)  # Single data parallel group
-    td.set_non_tensor("batch_num_tokens", total_tokens)
+    if has_full_rl_inputs and response_mask_list:
+        local_total_tokens = sum(float(sum(seq)) for seq in response_mask_list)
+    else:
+        local_total_tokens = sum(float(sum(seq)) for seq in loss_mask_list)
+
+    dp_group = None
+    if dp_size is None:
+        if torch.distributed.is_initialized():
+            try:
+                from megatron.core import mpu
+
+                dp_size = int(mpu.get_data_parallel_world_size())
+                dp_group = mpu.get_data_parallel_group()
+            except Exception:
+                dp_size = int(torch.distributed.get_world_size())
+        else:
+            dp_size = 1
+
+    global_total_tokens = local_total_tokens
+    global_batch_size = batch_size
+    if dp_size > 1 and torch.distributed.is_initialized():
+        reduce_device = device
+        if reduce_device is None:
+            try:
+                backend = torch.distributed.get_backend(dp_group)
+            except Exception:
+                backend = None
+            if backend == "nccl" and torch.cuda.is_available():
+                reduce_device = torch.device("cuda")
+            else:
+                reduce_device = torch.device("cpu")
+        reduce_tensor = torch.tensor(
+            [local_total_tokens, float(batch_size)],
+            dtype=torch.float64,
+            device=reduce_device,
+        )
+        torch.distributed.all_reduce(reduce_tensor, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+        global_total_tokens = float(reduce_tensor[0].item())
+        global_batch_size = int(reduce_tensor[1].item())
+    elif dp_size > 1:
+        global_total_tokens = local_total_tokens * dp_size
+        global_batch_size = batch_size * dp_size
+
+    td.set_non_tensor("dp_size", int(dp_size))
+    td.set_non_tensor("batch_num_tokens", global_total_tokens)
+    td.set_non_tensor("global_batch_size", int(global_batch_size))
 
     return td
 
@@ -236,6 +432,11 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
             # Default: all tokens contribute
             loss_mask_flat = torch.ones_like(log_probs_flat, dtype=torch.bool)
 
+        use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
+        if not use_external_label:
+            # Align mask with rolled labels when external labels are not used.
+            loss_mask_flat = torch.roll(loss_mask_flat, shifts=-1, dims=0)
+
         # Ensure types are compatible
         loss_mask_float = loss_mask_flat.float()
 
@@ -244,8 +445,18 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         weighted_log_probs = log_probs_flat * loss_mask_float
         num_tokens = loss_mask_float.sum()
 
-        if num_tokens > 0:
-            nll = -weighted_log_probs.sum() / num_tokens
+        dp_size = tu.get_non_tensor_data(data, key="dp_size", default=1)
+        batch_num_tokens = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
+        if batch_num_tokens is None:
+            batch_num_tokens = num_tokens
+
+        if hasattr(batch_num_tokens, "item"):
+            batch_num_tokens_value = batch_num_tokens.item()
+        else:
+            batch_num_tokens_value = float(batch_num_tokens)
+
+        if batch_num_tokens_value > 0:
+            nll = -weighted_log_probs.sum() / batch_num_tokens_value * dp_size
         else:
             nll = -weighted_log_probs.sum()
 
@@ -274,104 +485,136 @@ def create_loss_fn() -> Callable:
 
 
 def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
-    """Create PPO loss function compatible with verl's model_output format.
+    """Create PPO loss function by reusing verl's ppo_loss/agg_loss path."""
+    import math
+    import torch.nn.functional as F
+    from verl.workers.config import ActorConfig
+    from verl.workers.utils.losses import ppo_loss as verl_ppo_loss, _slice_response_from_unpad_output
 
-    verl's postprocess_micro_batch_func calls:
-        loss, metrics = loss_function(model_output=..., data=..., dp_group=...)
+    clip_ratio = float(epsilon)
+    clip_ratio_c = 1e6 if math.isinf(clip_ratio) else 3.0
+    actor_config = ActorConfig(
+        strategy="tinker",
+        rollout_n=1,
+        use_dynamic_bsz=True,
+        clip_ratio=clip_ratio,
+        clip_ratio_low=clip_ratio,
+        clip_ratio_high=clip_ratio,
+        clip_ratio_c=clip_ratio_c,
+    )
 
-    verl's model_output is a dict with:
-        - "log_probs": log probabilities from model forward (already computed)
-        - "entropy": (optional) entropy values
-
-    Args:
-        epsilon: Clipping parameter for PPO.
-    """
     def ppo_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
-        """PPO clipped objective loss.
-
-        Args:
-            model_output: dict with "log_probs" key containing log probabilities
-            data: TensorDict with input_ids, loss_mask, old_log_probs, advantages
-            dp_group: data parallel group (may be used for normalization)
+        """PPO clipped objective loss via verl's implementation.
 
         Returns:
             Tuple of (loss_tensor, metrics_dict)
         """
-        # Extract log_probs from model output (verl provides this, not raw logits)
-        new_log_probs = model_output["log_probs"]
+        response_log_probs = _slice_response_from_unpad_output(model_output["log_probs"], data)
+        target_len = response_log_probs.shape[1] if response_log_probs.dim() > 1 else response_log_probs.numel()
 
-        # Handle nested tensor format from verl (NO_PADDING mode)
-        if hasattr(new_log_probs, 'values'):
-            new_log_probs = new_log_probs.values()
-
-        # Get old log probs and advantages from data
         old_log_probs = data["old_log_probs"]
         advantages = data["advantages"]
-        loss_mask = data["loss_mask"]
+        response_mask = data["response_mask"].float()
 
-        # Handle nested tensors (verl NO_PADDING mode)
-        if hasattr(old_log_probs, 'values'):
-            old_log_probs = old_log_probs.values()
-        if hasattr(advantages, 'values'):
-            advantages = advantages.values()
-        if hasattr(loss_mask, 'values'):
-            loss_mask = loss_mask.values()
+        def _pad_or_trunc(tensor: torch.Tensor, length: int, pad_value: float = 0.0) -> torch.Tensor:
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            current = tensor.shape[1]
+            if current == length:
+                return tensor
+            if current > length:
+                return tensor[:, :length]
+            pad_size = length - current
+            return F.pad(tensor, (0, pad_size), value=pad_value)
 
-        loss_mask = loss_mask.float()
+        old_log_probs = _pad_or_trunc(old_log_probs, target_len, pad_value=0.0)
+        advantages = _pad_or_trunc(advantages, target_len, pad_value=0.0)
+        response_mask = _pad_or_trunc(response_mask, target_len, pad_value=0.0)
 
-        # Note: No shift needed for RL training
-        # Client sends aligned old_log_probs and loss_mask for response tokens
-        # verl's new_log_probs are already aligned with old_log_probs
+        data["old_log_probs"] = old_log_probs
+        data["advantages"] = advantages
+        data["response_mask"] = response_mask
 
-        # Importance ratio
-        log_ratio = new_log_probs - old_log_probs
+        loss, _ = verl_ppo_loss(actor_config, model_output, data, dp_group=dp_group)
+
+        response_mask_bool = response_mask.to(bool)
+        response_mask_float = response_mask_bool.float()
+
+        log_ratio = response_log_probs - old_log_probs
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
         ratio = torch.exp(log_ratio)
 
-        # PPO clipped objective
-        pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-        pg_loss = torch.maximum(pg_loss1, pg_loss2)
-
-        # Weighted average
-        masked_loss = pg_loss * loss_mask
-        num_tokens = loss_mask.sum()
-
-        # Get dp_size and batch_num_tokens for proper normalization
-        # TensorDict.get() may return NonTensorData wrappers, extract .data attribute
-        dp_size = data.get("dp_size", 1)
-        if hasattr(dp_size, 'data'):
-            dp_size = dp_size.data
-        batch_num_tokens = data.get("batch_num_tokens", num_tokens)
-        if hasattr(batch_num_tokens, 'data'):
-            batch_num_tokens = batch_num_tokens.data
-
-        # Convert to Python scalar for comparison
-        if hasattr(batch_num_tokens, 'item'):
-            batch_num_tokens_scalar = batch_num_tokens.item()
-        else:
-            batch_num_tokens_scalar = float(batch_num_tokens)
-
-        if batch_num_tokens_scalar > 0:
-            loss = masked_loss.sum() / batch_num_tokens * dp_size
-        else:
-            loss = masked_loss.sum()
-
-        # Clip fraction metric
-        clipped = ((ratio < 1 - epsilon) | (ratio > 1 + epsilon)).float()
-        clip_frac = (clipped * loss_mask).sum() / max(num_tokens, 1)
-        ratio_mean = (ratio * loss_mask).sum() / max(num_tokens, 1)
-
-        # Return new_log_probs in metrics for loss_fn_outputs (like SFT does)
-        new_log_probs_cpu = new_log_probs.detach().cpu()
+        num_tokens = response_mask_float.sum()
+        denom = num_tokens.clamp(min=1) if hasattr(num_tokens, "clamp") else max(num_tokens, 1)
+        clipped = ((ratio < 1 - clip_ratio) | (ratio > 1 + clip_ratio)).float()
+        clip_frac = (clipped * response_mask_float).sum() / denom
+        ratio_mean = (ratio * response_mask_float).sum() / denom
 
         metrics = {
-            "loss": loss.detach().item(),
-            "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
-            "clip_frac": clip_frac.detach().item() if hasattr(clip_frac, 'item') else float(clip_frac),
-            "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, 'item') else float(ratio_mean),
-            "log_probs": new_log_probs_cpu,  # For loss_fn_outputs in MegatronDistributedWorker
+            "loss": loss.detach().item() if hasattr(loss, "item") else float(loss),
+            "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
+            "clip_frac": clip_frac.detach().item() if hasattr(clip_frac, "item") else float(clip_frac),
+            "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, "item") else float(ratio_mean),
+            "log_probs": response_log_probs.detach().cpu(),
         }
+
+        # Calculate precision difference metrics if we have rollout log_probs
+        from tinker_server.backend.debug_metrics import calculate_debug_metrics
+
+        # Build a batch dict compatible with calculate_debug_metrics
+        # IMPORTANT: Naming convention:
+        #   - data["old_log_probs"] = rollout log probs from vLLM (generated during rollout phase)
+        #   - response_log_probs = actor log probs from current forward pass (Megatron)
+        # calculate_debug_metrics expects:
+        #   - batch["log_probs"] = rollout log probs (from vLLM generation)
+        #   - batch["old_log_probs"] = actor log probs (from current training forward)
+        batch_for_metrics = {
+            "log_probs": old_log_probs,  # Rollout log probs (from vLLM, stored in data["old_log_probs"])
+            "old_log_probs": response_log_probs,  # Actor log probs (current forward pass)
+            "response_mask": response_mask.bool(),  # Mask for valid positions
+            "responses": data.get("responses"),  # For computing response_length
+        }
+        print(f"[PPO_LOSS DEBUG] Shapes: rollout={batch_for_metrics['log_probs'].shape}, "
+              f"actor={batch_for_metrics['old_log_probs'].shape}, "
+              f"mask={batch_for_metrics['response_mask'].shape}", flush=True)
+        debug_metrics = calculate_debug_metrics(batch_for_metrics)
+        print(f"[PPO_LOSS DEBUG] Got debug_metrics: {debug_metrics}", flush=True)
+        if debug_metrics:
+            metrics.update(debug_metrics)
+            print(f"[PPO_LOSS DEBUG] Updated metrics, keys now: {list(metrics.keys())}", flush=True)
+
+        # DEBUG: Print tokens with very negative logprobs
+        # Note: response_log_probs and old_log_probs may be 2D [batch, seq] or 1D [total_tokens]
+        diff = (response_log_probs - old_log_probs).abs() * response_mask.float()
+        if diff.numel() > 0 and diff.max() > 10.0:  # Large difference threshold
+            import torch.distributed as dist
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                max_idx = diff.argmax()
+
+                # Handle both 2D [batch, seq] and 1D [total_tokens] tensors
+                if diff.dim() == 2:
+                    # 2D tensor: convert flat index to (batch_idx, seq_idx)
+                    batch_idx = max_idx // diff.shape[1]
+                    seq_idx = max_idx % diff.shape[1]
+                    position = (batch_idx.item(), seq_idx.item())
+
+                    print(f"[PPO_LOSS DEBUG] Large logprob diff detected:")
+                    print(f"  Position (batch, seq): {position}")
+                    print(f"  Rollout logprob: {old_log_probs[batch_idx, seq_idx].item():.4f}")
+                    print(f"  Training logprob: {response_log_probs[batch_idx, seq_idx].item():.4f}")
+                    print(f"  Diff: {diff[batch_idx, seq_idx].item():.4f}")
+                else:
+                    # 1D tensor: use position directly
+                    position = max_idx.item() if hasattr(max_idx, 'item') else int(max_idx)
+
+                    print(f"[PPO_LOSS DEBUG] Large logprob diff detected:")
+                    print(f"  Position in sequence: {position}")
+                    print(f"  Rollout logprob: {old_log_probs[position].item():.4f}")
+                    print(f"  Training logprob: {response_log_probs[position].item():.4f}")
+                    print(f"  Diff: {diff[position].item():.4f}")
+
+                print(flush=True)
+
         return loss, metrics
 
     return ppo_loss_fn
@@ -420,11 +663,22 @@ def create_logprob_extractor_fn() -> Callable:
 
         # Compute aggregate loss for compatibility (NLL)
         if loss_mask is not None:
-            loss_mask_float = loss_mask.float() if loss_mask is not None else torch.ones_like(log_probs)
+            loss_mask_float = loss_mask.float()
+            use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
+            if not use_external_label:
+                loss_mask_float = torch.roll(loss_mask_float, shifts=-1, dims=0)
             nll = -(log_probs * loss_mask_float).sum()
-            num_tokens = loss_mask_float.sum().item()
-            if num_tokens > 0:
-                nll = nll / num_tokens
+            num_tokens = loss_mask_float.sum()
+            dp_size = tu.get_non_tensor_data(data, key="dp_size", default=1)
+            batch_num_tokens = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
+            if batch_num_tokens is None:
+                batch_num_tokens = num_tokens
+            if hasattr(batch_num_tokens, "item"):
+                batch_num_tokens_value = batch_num_tokens.item()
+            else:
+                batch_num_tokens_value = float(batch_num_tokens)
+            if batch_num_tokens_value > 0:
+                nll = nll / batch_num_tokens_value * dp_size
         else:
             nll = -log_probs.mean()
             num_tokens = log_probs.numel()
@@ -432,7 +686,7 @@ def create_logprob_extractor_fn() -> Callable:
         # Return log_probs in metrics
         metrics = {
             "loss": nll.detach().item() if hasattr(nll, 'item') else float(nll),
-            "num_tokens": int(num_tokens),
+            "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
             "log_probs": log_probs_cpu,  # Per-token log probabilities tensor
         }
         return nll, metrics
@@ -607,11 +861,41 @@ class MegatronTrainingWorker:
         """
         loss_fn_config = loss_fn_config or {}
 
-        # Convert data to TensorDict with model-specific max token length
-        max_token_len = get_max_position_embeddings(self.base_model)
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len)
-        device = f"cuda:{torch.distributed.get_rank() % 8}"
-        data = data.to(device)
+        # Filter valid items and collect sequence lengths.
+        valid_items: list[dict] = []
+        valid_indices: list[int] = []
+        seq_lengths: list[int] = []
+        for item_index, item in enumerate(data_items):
+            model_input = item.get("model_input", {})
+            chunks = model_input.get("chunks", [])
+            if chunks and "tokens" in chunks[0]:
+                tokens = chunks[0]["tokens"]
+                valid_items.append(item)
+                valid_indices.append(item_index)
+                seq_lengths.append(len(tokens))
+            else:
+                logger.warning(f"[MegatronTrainingWorker] Missing tokens in item {item_index}, skipping")
+
+        if not valid_items:
+            empty_outputs = [
+                {
+                    "loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
+                }
+                for _ in data_items
+            ]
+            return {
+                "loss_fn_output_type": f"{loss_fn}_loss",
+                "loss_fn_outputs": empty_outputs,
+                "metrics": {"loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
+            }
+
+        # Create TensorDict directly on device to avoid NestedTensor .to() issues.
+        if torch.cuda.is_available():
+            device = f"cuda:{torch.cuda.current_device()}"
+        else:
+            device = "cpu"
+        data = tinker_to_tensordict(valid_items, device=device)
 
         # Select loss function
         if loss_fn == "cross_entropy":
@@ -635,41 +919,140 @@ class MegatronTrainingWorker:
             forward_only=False,
         )
 
-        # Extract metrics from result
-        # Result structure depends on verl internals
+        # Extract metrics from result (verl returns a single dict).
         loss_value = 0.0
         num_tokens = 0
-        if result and len(result) > 0:
-            # Aggregate losses from micro batches
-            for micro_result in result:
-                if isinstance(micro_result, dict):
-                    loss_value += micro_result.get("loss", 0.0)
-                    num_tokens += micro_result.get("num_tokens", 0)
+        clip_frac_sum = 0.0
+        ratio_mean_sum = 0.0
+        n_ppo_results = 0
+        all_log_probs = []
+        loss_fn_outputs = []
+        per_sample_log_probs = None
+        if result and isinstance(result, dict):
+            result_metrics = result.get("metrics", {})
+            losses = result.get("loss", [])
+
+            for loss in losses:
+                if hasattr(loss, "item"):
+                    loss = loss.item()
+                loss_value += float(loss)
+
+            num_tokens_list = result_metrics.get("num_tokens", [])
+            for tokens in num_tokens_list:
+                if hasattr(tokens, "item"):
+                    tokens = tokens.item()
+                num_tokens += int(tokens)
+
+            log_probs_list = result_metrics.get("log_probs", [])
+            for log_probs in log_probs_list:
+                if log_probs is not None:
+                    if hasattr(log_probs, "cpu"):
+                        log_probs = log_probs.cpu()
+                    all_log_probs.append(log_probs)
+
+            clip_frac_list = result_metrics.get("clip_frac", [])
+            for clip_frac in clip_frac_list:
+                if hasattr(clip_frac, "item"):
+                    clip_frac = clip_frac.item()
+                clip_frac_sum += float(clip_frac)
+                n_ppo_results += 1
+
+            ratio_mean_list = result_metrics.get("ratio_mean", [])
+            for ratio_mean in ratio_mean_list:
+                if hasattr(ratio_mean, "item"):
+                    ratio_mean = ratio_mean.item()
+                ratio_mean_sum += float(ratio_mean)
+
+            model_output = result.get("model_output", {})
+            model_log_probs = model_output.get("log_probs")
+            if model_log_probs is not None:
+                if hasattr(model_log_probs, "unbind"):
+                    per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
+                elif seq_lengths and hasattr(model_log_probs, "dim") and model_log_probs.dim() >= 2:
+                    per_sample_log_probs = []
+                    for idx, row in enumerate(model_log_probs):
+                        seq_len = seq_lengths[idx] if idx < len(seq_lengths) else row.shape[0]
+                        per_sample_log_probs.append(row[:seq_len].detach().cpu())
+
+        if per_sample_log_probs:
+            avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
+            for sample_log_probs in per_sample_log_probs:
+                logprobs_list = sample_log_probs.tolist()
+                loss_fn_outputs.append({
+                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
+                })
+        elif loss_fn == "cross_entropy" and all_log_probs and seq_lengths:
+            combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+            offset = 0
+            avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
+            for seq_len in seq_lengths:
+                sample_log_probs = combined_log_probs[offset:offset + seq_len]
+                offset += seq_len
+                logprobs_list = sample_log_probs.tolist()
+                loss_fn_outputs.append({
+                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
+                })
+
+        valid_count = len(seq_lengths)
+        expected_outputs = valid_count
+        if expected_outputs and len(loss_fn_outputs) < expected_outputs:
+            avg_loss_per_sample = loss_value / max(expected_outputs, 1)
+            for _ in range(expected_outputs - len(loss_fn_outputs)):
+                loss_fn_outputs.append({
+                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
+                })
+
+        if valid_indices:
+            avg_loss_per_sample = loss_value / max(valid_count, 1)
+            full_outputs = [
+                {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                 "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
+                for _ in data_items
+            ]
+            for output, item_index in zip(loss_fn_outputs, valid_indices):
+                full_outputs[item_index] = output
+            loss_fn_outputs = full_outputs
 
         metrics = {
             "loss:mean": float(loss_value),
-            "num_samples:sum": float(len(data_items)),
+            "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
 
-        # Add PPO-specific metrics
-        if loss_fn == "ppo" and result:
-            clip_frac = sum(r.get("clip_frac", 0) for r in result if isinstance(r, dict))
-            ratio_mean = sum(r.get("ratio_mean", 1) for r in result if isinstance(r, dict))
-            n = len([r for r in result if isinstance(r, dict)]) or 1
-            metrics["clipfrac:mean"] = float(clip_frac / n)
-            metrics["ratio:mean"] = float(ratio_mean / n)
+        if loss_fn in ("ppo", "importance_sampling") and n_ppo_results > 0:
+            metrics["clipfrac:mean"] = float(clip_frac_sum / n_ppo_results)
+            metrics["ratio:mean"] = float(ratio_mean_sum / n_ppo_results)
+
+        debug_metric_keys = [
+            "training/rollout_probs_diff_valid",
+            "training/rollout_probs_diff_mean",
+            "training/rollout_probs_diff_max",
+            "training/rollout_probs_diff_std",
+            "training/rollout_actor_probs_pearson_corr",
+        ]
+        for debug_key in debug_metric_keys:
+            values = result_metrics.get(debug_key)
+            if values is None:
+                continue
+            if isinstance(values, list):
+                numeric_values = []
+                for value in values:
+                    if hasattr(value, "item"):
+                        value = value.item()
+                    if isinstance(value, (int, float)):
+                        numeric_values.append(float(value))
+                if numeric_values:
+                    metrics[f"{debug_key}:mean"] = float(sum(numeric_values) / len(numeric_values))
+            else:
+                if hasattr(values, "item"):
+                    values = values.item()
+                if isinstance(values, (int, float)):
+                    metrics[f"{debug_key}:mean"] = float(values)
 
         logger.info(f"[MegatronTrainingWorker] forward_backward ({loss_fn}): loss={loss_value:.4f}")
-
-        # Return placeholder loss_fn_outputs - one per data item
-        # The tinker SDK uses len(loss_fn_outputs) as weights for metrics aggregation
-        # Without this, the SDK's _metrics_reduction() fails with "Weights sum to zero"
-        # Note: logprobs must be a plain list, not dict {data, shape, dtype}
-        loss_fn_outputs = [
-            {"logprobs": []}
-            for _ in data_items
-        ]
 
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
@@ -686,10 +1069,40 @@ class MegatronTrainingWorker:
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
-        max_token_len = get_max_position_embeddings(self.base_model)
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len)
-        device = f"cuda:{torch.distributed.get_rank() % 8}"
-        data = data.to(device)
+        valid_items: list[dict] = []
+        valid_indices: list[int] = []
+        seq_lengths: list[int] = []
+        for item_index, item in enumerate(data_items):
+            model_input = item.get("model_input", {})
+            chunks = model_input.get("chunks", [])
+            if chunks and "tokens" in chunks[0]:
+                tokens = chunks[0]["tokens"]
+                valid_items.append(item)
+                valid_indices.append(item_index)
+                seq_lengths.append(len(tokens))
+            else:
+                logger.warning(f"[MegatronTrainingWorker] Missing tokens in item {item_index}, skipping")
+
+        if not valid_items:
+            empty_outputs = [
+                {
+                    "loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
+                    "logprobs": [],
+                }
+                for _ in data_items
+            ]
+            return {
+                "loss_fn_output_type": "logprob_extractor",
+                "loss_fn_outputs": empty_outputs,
+                "metrics": {"loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
+                "log_probs": None,
+            }
+
+        if torch.cuda.is_available():
+            device = f"cuda:{torch.cuda.current_device()}"
+        else:
+            device = "cpu"
+        data = tinker_to_tensordict(valid_items, device=device)
 
         # Use logprob extractor to get per-token log probabilities
         loss_function = create_logprob_extractor_fn()
@@ -702,56 +1115,128 @@ class MegatronTrainingWorker:
                 forward_only=True,
             )
 
-        # Extract per-token log_probs from result
+        # Extract per-token log_probs from result (verl returns a dict).
         loss_value = 0.0
         num_tokens = 0
         all_log_probs = []
         loss_fn_outputs = []
+        per_sample_log_probs = None
+        combined_log_probs = None
+        result_metrics: dict[str, Any] = {}
 
-        if result and len(result) > 0:
-            for micro_result in result:
-                if isinstance(micro_result, dict):
-                    loss = micro_result.get("loss", 0.0)
-                    if hasattr(loss, "item"):
-                        loss = loss.item()
-                    loss_value += float(loss)
+        if result and isinstance(result, dict):
+            result_metrics = result.get("metrics", {})
+            losses = result.get("loss", [])
 
-                    tokens = micro_result.get("num_tokens", 0)
-                    if hasattr(tokens, "item"):
-                        tokens = tokens.item()
-                    num_tokens += int(tokens)
+            for loss in losses:
+                if hasattr(loss, "item"):
+                    loss = loss.item()
+                loss_value += float(loss)
 
-                    log_probs = micro_result.get("log_probs")
-                    if log_probs is not None:
-                        if hasattr(log_probs, "cpu"):
-                            log_probs = log_probs.cpu()
-                        all_log_probs.append(log_probs)
-                        # Note: use "logprobs" (no underscore) for cookbook NLL evaluator compatibility
-                        loss_fn_outputs.append({
-                            "loss": {"data": [float(loss)], "shape": [1], "dtype": "float32"},
-                            "logprobs": log_probs.tolist() if hasattr(log_probs, "tolist") else list(log_probs),
-                        })
+            num_tokens_list = result_metrics.get("num_tokens", [])
+            for tokens in num_tokens_list:
+                if hasattr(tokens, "item"):
+                    tokens = tokens.item()
+                num_tokens += int(tokens)
 
-        # Combine log_probs if multiple micro-batches
+            log_probs_list = result_metrics.get("log_probs", [])
+            for log_probs in log_probs_list:
+                if log_probs is not None:
+                    if hasattr(log_probs, "cpu"):
+                        log_probs = log_probs.cpu()
+                    all_log_probs.append(log_probs)
+
+            model_output = result.get("model_output", {})
+            model_log_probs = model_output.get("log_probs")
+            if model_log_probs is not None:
+                if hasattr(model_log_probs, "unbind"):
+                    per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
+                elif seq_lengths and hasattr(model_log_probs, "dim") and model_log_probs.dim() >= 2:
+                    per_sample_log_probs = []
+                    for idx, row in enumerate(model_log_probs):
+                        seq_len = seq_lengths[idx] if idx < len(seq_lengths) else row.shape[0]
+                        per_sample_log_probs.append(row[:seq_len].detach().cpu())
+
+        if per_sample_log_probs:
+            combined_log_probs = (
+                torch.cat(per_sample_log_probs, dim=0)
+                if len(per_sample_log_probs) > 1
+                else per_sample_log_probs[0]
+            )
+            avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
+            for sample_log_probs in per_sample_log_probs:
+                logprobs_list = sample_log_probs.tolist()
+                loss_fn_outputs.append({
+                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "logprobs": logprobs_list,
+                })
+        else:
+            if all_log_probs:
+                combined_log_probs = (
+                    torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+                )
+            if combined_log_probs is not None and seq_lengths:
+                offset = 0
+                avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
+                for seq_len in seq_lengths:
+                    sample_log_probs = combined_log_probs[offset:offset + seq_len]
+                    offset += seq_len
+                    logprobs_list = sample_log_probs.tolist()
+                    loss_fn_outputs.append({
+                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                        "logprobs": logprobs_list,
+                    })
+            elif combined_log_probs is not None:
+                logprobs_list = combined_log_probs.tolist()
+                loss_fn_outputs.append({
+                    "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
+                    "logprobs": logprobs_list,
+                })
+
+        valid_count = len(seq_lengths)
+        expected_outputs = valid_count
+        if expected_outputs and len(loss_fn_outputs) < expected_outputs:
+            avg_loss_per_sample = loss_value / max(expected_outputs, 1)
+            for _ in range(expected_outputs - len(loss_fn_outputs)):
+                loss_fn_outputs.append({
+                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                    "logprobs": [],
+                })
+
+        if valid_indices:
+            avg_loss_per_sample = loss_value / max(valid_count, 1)
+            full_outputs = [
+                {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                 "logprobs": []}
+                for _ in data_items
+            ]
+            for output, item_index in zip(loss_fn_outputs, valid_indices):
+                full_outputs[item_index] = output
+            loss_fn_outputs = full_outputs
+
         log_probs_data = None
-        if all_log_probs:
-            combined = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+        if combined_log_probs is not None:
             log_probs_data = {
-                "data": combined.tolist(),
-                "shape": list(combined.shape),
-                "dtype": str(combined.dtype),
+                "data": combined_log_probs.tolist(),
+                "shape": list(combined_log_probs.shape),
+                "dtype": str(combined_log_probs.dtype),
             }
 
-        logger.info(f"[MegatronTrainingWorker] forward: loss={loss_value:.4f}, log_probs={'present' if log_probs_data else 'none'}")
+        metrics = {
+            "loss:mean": float(loss_value),
+            "num_samples:sum": float(valid_count),
+            "num_tokens:sum": float(num_tokens),
+        }
+
+        logger.info(
+            f"[MegatronTrainingWorker] forward: loss={loss_value:.4f}, "
+            f"log_probs={'present' if log_probs_data else 'none'}"
+        )
 
         return {
             "loss_fn_output_type": "logprob_extractor",
             "loss_fn_outputs": loss_fn_outputs,
-            "metrics": {
-                "loss:mean": float(loss_value),
-                "num_samples:sum": float(len(data_items)),
-                "num_tokens:sum": float(num_tokens),
-            },
+            "metrics": metrics,
             "log_probs": log_probs_data,
         }
 
@@ -930,8 +1415,6 @@ class MegatronTrainingWorker:
 def is_moe_model(model_name: str) -> bool:
     """Check if a model is an MoE model requiring Megatron training.
 
-    Delegates to model_registry for centralized model configuration.
-
     Args:
         model_name: Model name (e.g., "Qwen/Qwen3-30B-A3B").
 
@@ -941,5 +1424,5 @@ def is_moe_model(model_name: str) -> bool:
     Raises:
         ValueError: If model is not in the supported list.
     """
-    from .model_registry import is_moe_model as registry_is_moe
-    return registry_is_moe(model_name)
+    from .model_registry import get_model_config
+    return get_model_config(model_name).is_moe

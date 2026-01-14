@@ -45,7 +45,8 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+# Must be absolute path on vePFS for all Ray workers to access
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -216,9 +217,8 @@ async def _do_save_state(
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
-        # Call training engine to save full checkpoint
-        # Returns dict with path, state_dict, and peft_config
-        result = await training_engine.save_weights(session, save_path)
+        # Save checkpoint on worker, returns path
+        abs_path = await training_engine.save_weights(session, save_path)
 
         # Save ownership metadata (for user-scoped checkpoint API)
         # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
@@ -238,62 +238,45 @@ async def _do_save_state(
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
-        # Register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
-        # This allows asample to work with model_id after save_weights
-        state_dict = result.get("state_dict")
-        peft_config = result.get("peft_config")
-
-        # Try to register model for sampling via multi-LoRA engine (Tinker SDK compatibility)
-        # This allows asample to work with model_id after save_weights
-        # Note: Registration may fail if resources unavailable (e.g., MoE needs separate GPUs)
+        # Register for sampling via path-based loading (avoids tensor transfer OOM)
         sampling_registered = False
-        if inference_manager is not None and state_dict is not None and peft_config is not None:
-            base_model = session.base_model
-            if base_model is None:
-                logger.warning(f"[{session.model_id}] Cannot register for sampling: base_model not set")
-            else:
+        base_model = session.base_model
+        if inference_manager is not None and base_model is not None:
+            try:
+                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+
+                # Remove existing registration if any
+                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
+                if existing_lora_id is not None:
+                    await multi_lora_engine.remove_session(session.model_id)
+
+                # Path-based loading - vLLM loads directly from shared filesystem
+                await multi_lora_engine.add_lora_for_session_from_path(
+                    sampling_session_id=session.model_id,
+                    lora_path=abs_path,
+                )
                 try:
-                    # Get or create engine for this model (dynamically creates vLLM actor if needed)
-                    multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-
-                    # Check if already registered (update existing)
-                    existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                    if existing_lora_id is not None:
-                        await multi_lora_engine.remove_session(session.model_id)
-
-                    # Register with model_id as session_id for SDK compatibility
-                    await multi_lora_engine.add_lora_for_session(
-                        sampling_session_id=session.model_id,
-                        state_dict=state_dict,
-                        peft_config=peft_config,
+                    inference_manager.register_multi_lora_session(
+                        session.model_id, base_model=base_model
                     )
-                    try:
-                        inference_manager.register_multi_lora_session(
-                            session.model_id, base_model=base_model
-                        )
-                    except ValueError:
-                        pass  # Session already registered
-                    sampling_registered = True
-                    logger.info(f"[{session.model_id}] Registered for multi-LoRA sampling (model={base_model})")
-                except Exception as reg_err:
-                    # Log but don't fail save_weights - sampling registration is optional
-                    logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
-        else:
-            logger.warning(f"[{session.model_id}] Cannot register for sampling: "
-                          f"inference_manager={inference_manager is not None}, "
-                          f"state_dict={state_dict is not None}, "
-                          f"peft_config={peft_config is not None}")
+                except ValueError:
+                    pass  # Already registered
+                sampling_registered = True
+                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
+            except Exception as reg_err:
+                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
+
+        # Build mint:// path for response
+        mint_path = _to_mint_path(session.model_id, checkpoint_id)
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
-        state_dict_keys = list(state_dict.keys()) if state_dict else []
+        state_dict_keys = []  # state_dict not available in path-based flow
 
         future_store.resolve(request_id, {
             "checkpoint_id": checkpoint_id,
             "path": save_path,  # Filesystem path for debugging
             "type": "save_weights",
-            "state_dict_keys": state_dict_keys,  # List of parameter names for verification
-            "peft_config": peft_config,
             "sampling_registered": sampling_registered,
         })
 
@@ -334,6 +317,7 @@ async def _do_save_state(
 
 
 @router.post("/load_state", response_model=UntypedAPIFuture)
+@router.post("/load_weights", response_model=UntypedAPIFuture)  # SDK alias
 async def load_state(
     request: LoadStateRequest,
     background_tasks: BackgroundTasks,
@@ -353,6 +337,11 @@ async def load_state(
 
 async def _do_load_state(request_id: str, session, request: LoadStateRequest) -> None:
     """Background task to load state."""
+    # DEBUG: Log entry
+    with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
+        dbg.write(f"[_do_load_state] ENTRY: request_id={request_id}, model_id={session.model_id}, path={request.path}\n")
+        dbg.flush()
+
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")

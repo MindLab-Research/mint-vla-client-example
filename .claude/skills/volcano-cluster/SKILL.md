@@ -36,11 +36,21 @@ http://<RAY_HEAD_IP>:8265
 
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
-| `ml.pni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training |
-| `ml.pni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training |
-| `ml.pni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE |
+| `ml.g2a.xlarge` | 0 (CPU only) | - | Ray head node |
+| `ml.hpcpni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training (RDMA) |
+| `ml.hpcpni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training (RDMA) |
+| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE (RDMA) |
 
 Update both `Flavor` and `--num-gpus=N` in YAML config when changing.
+
+## 1.1 Resource Queues
+
+| Queue ID | Type | Use Case |
+|----------|------|----------|
+| `q-20251225183621-m2297` | CPU | Ray head node (CPU-only instances) |
+| `q-20251126180002-26lwz` | GPU | GPU workers (A800 instances) |
+
+**IMPORTANT:** CPU-only instances (ml.g2a.xlarge) MUST use the CPU queue. GPU instances MUST use the GPU queue.
 
 ---
 
@@ -201,10 +211,12 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 
 ### Actor Names Reference
 
-| Actor | Name | Namespace |
-|-------|------|-----------|
-| Megatron | `persistent_megatron_worker_group_v2` | `tinker` |
-| vLLM | `tinker_vllm_server` | `tinker` |
+| Actor | Name Pattern | Namespace |
+|-------|--------------|-----------|
+| Megatron | `megatron_{model_name}` (e.g., `megatron_kimi_k2_thinking`) | `tinker` |
+| vLLM | `vllm_{model_name}` (e.g., `vllm_kimi_k2_thinking`) | `tinker` |
+
+Model name is derived from HuggingFace model ID: lowercase, replace `-` and `.` with `_`, take last component.
 
 ### Nuclear Option
 

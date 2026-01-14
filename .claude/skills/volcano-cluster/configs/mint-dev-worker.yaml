@@ -5,13 +5,13 @@
 #   1. Look up the Ray head IP from task logs: volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 #   2. Replace <RAY_HEAD_IP> with the actual IP address
 #   3. Adjust Flavor and --num-gpus as needed:
-#      - ml.pni2l.7xlarge  = 2 GPUs
-#      - ml.pni2l.14xlarge = 4 GPUs
-#      - ml.pni2l.28xlarge = 8 GPUs
+#      - ml.hpcpni2l.7xlarge  = 2 GPUs (RDMA)
+#      - ml.hpcpni2l.14xlarge = 4 GPUs (RDMA)
+#      - ml.hpcpni2l.28xlarge = 8 GPUs (RDMA)
 #
 # Submit with: volc ml_task submit -c ray_worker.yaml --output json
 
-TaskName: "ray-worker"
+TaskName: "ray-worker-2d"
 Description: "Ray GPU worker - A800, joins head cluster"
 
 Entrypoint: |
@@ -25,7 +25,7 @@ Entrypoint: |
   ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
 
   # Connect to Ray head
-  ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=8 && sleep infinity
+  ray start --address='192.168.32.208:6379' --num-gpus=8 && sleep infinity
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
 ResourceQueueID: "q-20251126180002-26lwz"
@@ -33,11 +33,11 @@ Framework: "Custom"
 
 TaskRoleSpecs:
     - RoleName: "worker"
-      RoleReplicas: 1
-      Flavor: "ml.pni2l.28xlarge"  # 8x A800 80GB
+      RoleReplicas: 2  # 2 × 8 GPUs = 16 GPUs
+      Flavor: "ml.hpcpni2l.28xlarge"  # 8x A800 80GB (RDMA)
 
-# Ephemeral: 12 hours default
-ActiveDeadlineSeconds: 43200
+# No timeout (0 = unlimited)
+ActiveDeadlineSeconds: 0
 DelayExitTimeSeconds: 0
 AccessType: "Private"
 

@@ -1,8 +1,6 @@
-"""MoE SFT Test: Supervised Fine-tuning with train_step.
+"""MoE SFT Test: Supervised Fine-tuning.
 
-Tests MoE model (Qwen3-30B-A3B) SFT using the train_step endpoint.
-train_step combines forward_backward + optim_step in a single train_mode context,
-required for MoE models with offloading.
+Tests MoE model (Qwen3-30B-A3B) SFT using forward_backward + optim_step.
 
 Pass criteria: Loss decreases >30% over 10 iterations.
 
@@ -15,7 +13,8 @@ import pytest
 from .conftest import (
     MOE_MODEL,
     create_session,
-    train_step,
+    forward_backward,
+    optim_step,
     save_weights,
     sample,
 )
@@ -83,13 +82,10 @@ class TestMoESFT:
     """MoE model SFT training tests."""
 
     def test_moe_sft_training(self, moe_tokenizer):
-        """Test MoE SFT training with train_step endpoint.
+        """Test MoE SFT training.
 
         Expected: Loss decreases >30% over 10 iterations.
         Saves training curve for visual inspection.
-
-        NOTE: Uses train_step (combined forward_backward + optim_step)
-        which is required for MoE models with expert offloading.
         """
         num_iterations = 10
         min_reduction = 0.30
@@ -114,11 +110,10 @@ class TestMoESFT:
         for i in range(num_iterations):
             t0 = time.time()
 
-            # Use train_step for MoE (combined forward_backward + optim_step)
-            result = train_step(
+            # Use forward_backward + optim_step for MoE
+            result = forward_backward(
                 model_id,
                 api_data,
-                lr=lr,
                 loss_fn="cross_entropy"
             )
 
@@ -130,8 +125,11 @@ class TestMoESFT:
             loss = compute_weighted_loss(result, all_weights)
             metrics["losses"].append(loss)
 
-            # Get grad norm from result
-            grad_norm = result.get("metrics", {}).get("grad_norm", 0)
+            # Run optimizer step
+            optim_result = optim_step(model_id, lr=lr)
+
+            # Get grad norm from optim result
+            grad_norm = optim_result.get("metrics", {}).get("grad_norm", 0)
             metrics["grad_norms"].append(grad_norm)
 
             iteration_time = time.time() - t0
@@ -209,8 +207,9 @@ class TestMoESFT:
         api_data, _ = prepare_moe_sft_data(moe_tokenizer)
 
         for i in range(3):
-            result = train_step(model_id, api_data, lr=lr, loss_fn="cross_entropy")
+            result = forward_backward(model_id, api_data, loss_fn="cross_entropy")
             loss = result.get("metrics", {}).get("loss:mean", 0)
+            optim_step(model_id, lr=lr)
             print(f"Iteration {i+1}: loss={loss:.4f}")
 
         # Save weights for sampling

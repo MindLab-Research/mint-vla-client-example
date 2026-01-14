@@ -42,7 +42,7 @@ Framework: "Custom"
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.pni2l.14xlarge"  # 4x A800 80GB
+      Flavor: "ml.hpcpni2l.14xlarge"  # 4x A800 80GB (RDMA)
 
 # No time limit - runs indefinitely
 ActiveDeadlineSeconds: 0

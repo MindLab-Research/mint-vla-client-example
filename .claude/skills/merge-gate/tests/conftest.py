@@ -15,8 +15,9 @@ import requests
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 
-DENSE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-DENSE_SMALL_MODEL = "Qwen/Qwen3-0.6B"
+DENSE_MODEL = "Qwen/Qwen3-0.6B"  # Primary dense test model (Phase 1)
+DENSE_MEDIUM_MODEL = "Qwen/Qwen3-4B"  # Medium dense model (Phase 3 stress tests)
+DENSE_LARGE_MODEL = "Qwen/Qwen3-8B"  # Large dense model (Phase 3 stress tests)
 MOE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 MOONLIGHT_MODEL = "moonshotai/Moonlight-16B-A3B-Instruct"  # DeepseekV3 MLA architecture
 
@@ -153,7 +154,7 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    """Get tokenizer for Dense model."""
+    """Get tokenizer for Dense model (Qwen3-0.6B)."""
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True)
 
@@ -173,10 +174,17 @@ def moonlight_tokenizer():
 
 
 @pytest.fixture(scope="module")
-def small_tokenizer():
-    """Get tokenizer for small Dense model (Qwen3-0.6B)."""
+def medium_tokenizer():
+    """Get tokenizer for medium Dense model (Qwen3-4B)."""
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(DENSE_MEDIUM_MODEL, trust_remote_code=True)
+
+
+@pytest.fixture(scope="module")
+def large_tokenizer():
+    """Get tokenizer for large Dense model (Qwen3-8B)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(DENSE_LARGE_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture

@@ -28,6 +28,15 @@ description: |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 
+> **CRITICAL: RESTART SERVER AFTER CODE CHANGES**
+>
+> Python servers do NOT hot-reload. After ANY code change:
+> 1. Verify code synced: `ssh volcano 'grep "your_change" /path/to/file'`
+> 2. **RESTART SERVER** (see section 2 below)
+> 3. Verify new process: `ssh volcano 'ps aux | grep run_server'`
+>
+> **Server running old code = your fix does not exist.** This has wasted hours of debugging.
+
 ---
 
 ## NEVER Do These (Production Belongs to mint-prod)
@@ -200,16 +209,52 @@ ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.p
 | Routes, middleware only | Any | Restart server only |
 | Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
 
-### Kill Scripts
+### Kill Actors
+
+> **Actor naming convention:**
+> - vLLM: `tinker_vllm_{model_name}` (e.g., `tinker_vllm_kimi-k2-thinking`)
+> - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi-k2-thinking`)
+> - Namespace: `tinker`
+>
+> **When to kill actors:**
+> - Implementation code changed (actors cache old code)
+> - OOM or stuck state
+> - Switching to different model
 
 ```bash
-# Kill Megatron (frees 8 GPUs for MoE)
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+# Kill vLLM actor for K2
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+try:
+    actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=\"tinker\")
+    ray.kill(actor)
+    print(\"Killed vLLM actor\")
+except ValueError as e:
+    print(f\"Actor not found: {e}\")
+"'
 
-# Kill vLLM (frees 1-4 GPUs depending on model)
-curl -X POST http://localhost:8000/api/v1/kill_vllm
-# OR if server is down:
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.py'
+# Kill Megatron actor for K2
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+try:
+    actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=\"tinker\")
+    ray.kill(actor)
+    print(\"Killed Megatron actor\")
+except ValueError as e:
+    print(f\"Actor not found: {e}\")
+"'
+
+# List all actors in tinker namespace (to find actor names)
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+actors = ray.util.list_named_actors(all_namespaces=True)
+for a in actors:
+    if \"tinker\" in str(a):
+        print(a)
+"'
 ```
 
 ### Legacy Reference (do not use these names directly)
@@ -326,11 +371,8 @@ ssh volcano "ray status 2>/dev/null | grep -A5 'Pending Demands'"
 If placement groups are pending (blocking GPUs):
 
 ```bash
-# Kill all Megatron actors
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
-
-# Kill vLLM actor
-curl -X POST http://localhost:8000/api/v1/kill_vllm
+# Kill Megatron actor (see "Kill Actors" section above for commands)
+# Kill vLLM actor (see "Kill Actors" section above for commands)
 
 # Verify resources freed
 ssh volcano "ray status 2>/dev/null | head -20"
@@ -372,10 +414,67 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 ssh -f -N -L 8000:localhost:8000 volcano
 
 # Run test script LOCALLY (downloads tokenizer from HuggingFace)
-TINKER_BASE_URL=http://localhost:8000 python scripts/test_client.py
+# CRITICAL: Always set TINKER_TELEMETRY=0 to prevent log flooding
+TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python scripts/test_client.py
 
 # Run merge gate tests LOCALLY
-TINKER_BASE_URL=http://localhost:8000 python -m pytest .claude/skills/merge-gate/tests/ -v
+TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m pytest .claude/skills/merge-gate/tests/ -v
+
+# For training scripts (e.g., tinker_cookbook)
+TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbook.recipes.math_rl.train ...
+```
+
+---
+
+## 9. Ray Actor Status and Logs
+
+> **CRITICAL: NEVER assume actor state without verifying.**
+>
+> A failed `ray.get_actor()` lookup could mean: wrong name, wrong namespace, or actor actually dead.
+> **ALWAYS list actors first** to see what exists before concluding anything.
+
+### List All Actors (DO THIS FIRST)
+
+```bash
+# List all actors - this shows actual names and states
+ssh volcano 'ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
+
+# Or list with full details
+ssh volcano 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
+```
+
+### Check Specific Actor Status
+
+```bash
+# WRONG: Guessing actor name and concluding "DEAD" if not found
+# RIGHT: List first, then check with exact name from list
+
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+
+# List actors first to get exact names
+actors = ray.util.list_named_actors(all_namespaces=True)
+print(\"Named actors:\")
+for a in actors:
+    print(f\"  {a}\")
+"'
+```
+
+### Get Actor Logs
+
+```bash
+# Get actor ID from ray list actors output, then:
+ssh volcano 'ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
+
+# Example with actual ID:
+ssh volcano 'ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
+```
+
+### List Dead Actors (for crash investigation)
+
+```bash
+ssh volcano 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
 ```
 
 ---
@@ -392,3 +491,4 @@ TINKER_BASE_URL=http://localhost:8000 python -m pytest .claude/skills/merge-gate
 | Pending placement groups | Not enough GPUs. Kill stale actors (see section 6) |
 | MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
 | Tokenizer download fails | Run test script locally, not on server (server has no internet) |
+| Actor lookup fails | **LIST actors first** (`ray list actors`), don't assume dead |

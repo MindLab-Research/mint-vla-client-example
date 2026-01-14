@@ -83,6 +83,7 @@ class SampleResponse(BaseModel):
 
     sequences: list[SampledSequence]
     prompt_logprobs: list[float] | None = None
+    topk_prompt_logprobs: list[dict[int, float]] | None = None
     type: Literal["sample"] = "sample"
 
 
@@ -290,20 +291,23 @@ class OptimStepResponse(BaseModel):
     type: Literal["optim_step"] = "optim_step"
 
 
-class TrainStepRequest(BaseModel):
-    """Request to perform combined forward-backward + optimizer step.
+class ResetExpertBiasRequest(BaseModel):
+    """Request to reset expert_bias buffers in MoE router modules.
 
-    This is the recommended way to train MoE models with param_offload=True.
-    Keeping both operations in a single request ensures gradients survive
-    for the optimizer step.
+    This is needed to ensure consistent behavior between Megatron (training)
+    and vLLM (inference), as expert_bias accumulates during training but
+    is not exported with LoRA weights.
     """
 
-    model_config = ConfigDict(protected_namespaces=())
-
-    forward_backward_input: ForwardBackwardInput
-    adam_params: AdamParams
     model_id: str
-    seq_id: int | None = None
+
+
+class ResetExpertBiasResponse(BaseModel):
+    """Response from reset_expert_bias."""
+
+    model_id: str
+    modules_reset: int = 0
+    status: Literal["success", "not_applicable"] = "success"
 
 
 class TelemetryRequest(BaseModel):

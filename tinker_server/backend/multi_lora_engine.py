@@ -34,8 +34,8 @@ PERSISTENT_NAMESPACE = "tinker"
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
 
-# Import model registry for max_position_embeddings
-from tinker_server.backend.model_registry import get_max_position_embeddings
+# Import model registry
+from tinker_server.backend.model_registry import get_model_config
 
 
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
@@ -357,10 +357,10 @@ class MultiLoRAInferenceEngine:
                 }
                 logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
 
-            # Use model's max_position_embeddings if max_model_len not explicitly set
-            # This fixes issue #9: vLLM default max_model_len (4096) is too small for
-            # models like Qwen2.5-7B-Instruct (32K context)
-            max_model_len = self.max_model_len or get_max_position_embeddings(self.model_path)
+            # Determine effective context limit for vLLM
+            model_cfg = get_model_config(self.model_path)
+            # Use model registry's max_model_len (single source of truth)
+            max_model_len = model_cfg.max_model_len
             # verl calculates max_model_len = prompt_length + response_length
             # We split evenly, but this does NOT restrict actual prompt/response sizes:
             # - The split only affects verl's default max_new_tokens (response_length)
@@ -530,31 +530,37 @@ class MultiLoRAInferenceEngine:
             )
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
-            # MoE models need longer timeout due to larger weights and torch.compile cold starts.
-            from tinker_server.backend.model_registry import is_moe_model
-            try:
-                is_moe = is_moe_model(self.model_path)
-            except ValueError:
-                is_moe = False  # Unknown model, use default timeout
-            launch_timeout = 600 if is_moe else 300  # 10 min for MoE, 5 min for dense
-
+            # This allows the server to remain responsive during vLLM initialization.
+            # Timeout scales with model size:
+            # - Small models (1-2 GPUs): 300s (5 min)
+            # - Medium models (4 GPUs): 600s (10 min)
+            # - Large models (8+ GPUs, e.g., K2): 1800s (30 min)
             import asyncio
             loop = asyncio.get_event_loop()
-            logger.info(f"Launching vLLM server (non-blocking, timeout={launch_timeout}s)...")
+
+            # Compute timeout based on model size (proxy: number of GPUs)
+            if total_gpus >= 8:
+                init_timeout = 1800  # 30 min for K2 and similar large models
+            elif total_gpus >= 4:
+                init_timeout = 600   # 10 min for medium MoE models
+            else:
+                init_timeout = 300   # 5 min for small models
+
+            logger.info(f"Launching vLLM server (timeout={init_timeout}s for {total_gpus} GPUs)...")
             try:
                 await loop.run_in_executor(
                     None,  # Use default thread pool
-                    lambda: ray.get(self.server.launch_server.remote(), timeout=launch_timeout)
+                    lambda: ray.get(self.server.launch_server.remote(), timeout=init_timeout)
                 )
             except ray.exceptions.GetTimeoutError:
-                logger.error(f"vLLM launch timed out after {launch_timeout}s for {self.actor_name}")
+                logger.error(f"vLLM launch timed out after {init_timeout}s for {self.actor_name}")
                 # Kill the stuck actor
                 try:
                     ray.kill(self.server, no_restart=True)
                 except Exception:
                     pass
                 self.server = None
-                raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out")
+                raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out after {init_timeout}s")
 
             self._initialized = True
             logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
@@ -624,14 +630,18 @@ class MultiLoRAInferenceEngine:
         # Worker creates file-based LoRARequest for GPU/CPU swap support.
         # Auto-restart vLLM if actor died (e.g. killed for GPU allocation).
         start_time = time.time()
+        print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
+            print(f"[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
             await self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
                 peft_config=peft_config,
             )
+            print(f"[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            print(f"[DEBUG add_lora_for_session] RayActorError/GetTimeoutError: {e}", flush=True)
             self._initialized = False
             self.server = None
             await self.initialize()
@@ -641,10 +651,85 @@ class MultiLoRAInferenceEngine:
                 state_dict=state_dict,
                 peft_config=peft_config,
             )
+        except Exception as e:
+            print(f"[DEBUG add_lora_for_session] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
         load_time = time.time() - start_time
 
         logger.info(
             f"Added LoRA for session {sampling_session_id} "
+            f"(lora_int_id={lora_id}, load_time={load_time:.3f}s)"
+        )
+        return lora_id
+
+    async def add_lora_for_session_from_path(
+        self,
+        sampling_session_id: str,
+        lora_path: str,
+    ) -> int:
+        """Add frozen LoRA weights for a sampling session from filesystem path.
+
+        More efficient than add_lora_for_session for large MoE models:
+        - Avoids transferring 30k+ tensors through Ray object store
+        - vLLM worker loads directly from shared filesystem (PFS)
+
+        Requires shared filesystem access between API server and vLLM worker.
+
+        Args:
+            sampling_session_id: Unique identifier for the sampling session.
+            lora_path: Path to saved LoRA adapter directory (must be accessible to vLLM worker).
+
+        Returns:
+            The allocated lora_int_id for this session.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Allocate unique ID for this session
+        lora_id = await self.registry.allocate(sampling_session_id)
+
+        # Check if we need to evict from GPU
+        current_count = await self.registry.count()
+        if current_count > self.max_loras:
+            logger.debug(
+                f"GPU slots full ({self.max_loras}), "
+                f"vLLM will manage CPU cache for overflow"
+            )
+
+        # Load directly from shared filesystem path
+        # Much faster than Ray tensor transfer for large MoE models
+        start_time = time.time()
+        print(f"[DEBUG add_lora_for_session_from_path] Loading from path: {lora_path}", flush=True)
+        try:
+            await self.server.add_lora_from_path.remote(
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                lora_name=sampling_session_id,
+            )
+            print(f"[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
+            self._initialized = False
+            self.server = None
+            await self.initialize()
+            # Retry after restart
+            await self.server.add_lora_from_path.remote(
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                lora_name=sampling_session_id,
+            )
+        except Exception as e:
+            print(f"[DEBUG add_lora_for_session_from_path] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        load_time = time.time() - start_time
+
+        logger.info(
+            f"Added LoRA for session {sampling_session_id} from path "
             f"(lora_int_id={lora_id}, load_time={load_time:.3f}s)"
         )
         return lora_id
@@ -760,6 +845,55 @@ class MultiLoRAInferenceEngine:
 
         return list(result)
 
+    async def compute_topk(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        k: int = 10,
+    ) -> list[dict[int, float]]:
+        """Compute top-K tokens using session-specific LoRA or base model.
+
+        If sampling_session_id is None or has no registered LoRA, uses base model.
+
+        Returns topk[i] = dict of {token_id: logprob} for position i.
+        Output length is len(prompt_ids) - 1.
+
+        Args:
+            sampling_session_id: The sampling session to use, or None for base model.
+            prompt_ids: Input token IDs.
+            request_id: Unique request identifier.
+            k: Number of top tokens to return.
+
+        Returns:
+            List of dicts mapping token_id to logprob.
+        """
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        # Look up LoRA ID for this session (None = base model)
+        lora_id = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+
+        if lora_id is not None:
+            # Compute top-K with session-specific LoRA
+            result = await self.server.compute_prompt_topk_with_lora.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                k=k,
+            )
+        else:
+            # Compute top-K with base model (no LoRA)
+            result = await self.server.compute_prompt_topk_base.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                k=k,
+            )
+
+        return list(result)
+
     async def remove_session(self, sampling_session_id: str) -> bool:
         """Remove a sampling session and its LoRA.
 
@@ -836,6 +970,7 @@ def _resolve_model_path(model_name: str) -> str:
         "Qwen/Qwen3-30B-A3B-Base": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/main",
         "Qwen/Qwen3-30B-A3B-Thinking-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Thinking-2507/snapshots/main",
         # K2 models (1T params MoE, requires FP8)
+        "moonshotai/Kimi-K2-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--unsloth--Kimi-K2-Instruct-0905-BF16/snapshots/fbaf30b3baf5fdc2b2170ae04f4ff4948b0487cb",
         "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
     }
 
@@ -877,19 +1012,28 @@ class MultiModelInferenceManager:
         If cached engine exists, verifies actor is alive before returning.
         If actor is dead, removes from cache and creates new engine.
 
+        For models requiring TP > 8 (multi-node), uses MultiNodeInferenceEngine
+        which leverages vLLM's native Ray distributed backend.
+
         Args:
             model_name: HuggingFace model name (e.g., "Qwen/Qwen2.5-7B-Instruct")
 
         Returns:
-            Initialized MultiLoRAInferenceEngine for the model.
+            Initialized inference engine for the model.
         """
         async with self._init_lock:
             if model_name in self._engines:
                 engine = self._engines[model_name]
                 # Check if actor is still alive before returning cached engine
-                if engine.server is not None:
+                # Handle both MultiLoRAInferenceEngine and MultiNodeInferenceEngine
+                actor_handle = getattr(engine, 'server', None) or getattr(engine, 'engine', None)
+                if actor_handle is not None:
                     try:
-                        ray.get(engine.server.__ray_ready__.remote(), timeout=5)
+                        # MultiNodeInferenceEngine uses is_ready, MultiLoRAInferenceEngine uses __ray_ready__
+                        if hasattr(engine, 'server'):
+                            ray.get(actor_handle.__ray_ready__.remote(), timeout=5)
+                        else:
+                            ray.get(actor_handle.is_ready.remote(), timeout=5)
                         # Actor alive, return cached engine
                         return engine
                     except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
@@ -899,7 +1043,7 @@ class MultiModelInferenceManager:
                         )
                         del self._engines[model_name]
                 else:
-                    # Engine has no server handle, remove stale entry
+                    # Engine has no actor handle, remove stale entry
                     del self._engines[model_name]
 
             # Get model config for parallelism settings
@@ -913,31 +1057,94 @@ class MultiModelInferenceManager:
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
 
-            # For MoE models, use max_loras=1 to reduce memory usage.
-            # vLLM pre-allocates LoRA buffers for all experts, which is huge:
-            # max_loras × num_experts × lora_rank × hidden_size per layer.
-            # With default max_loras=64, 128 experts, this exceeds GPU memory.
-            model_max_loras = 1 if config.is_moe else self.max_loras
-            model_max_cpu_loras = 0 if config.is_moe else self.max_cpu_loras
+            # Determine max_loras: per-model override > MoE default (1) > global default
+            model_max_loras_override = config.max_loras
+            if model_max_loras_override is not None:
+                model_max_loras = model_max_loras_override
+            elif config.is_moe:
+                model_max_loras = 1  # Default for MoE: minimal LoRA support
+            else:
+                model_max_loras = self.max_loras
+            # Disable CPU LoRA cache if LoRA is disabled or MoE model
+            model_max_cpu_loras = 0 if model_max_loras == 0 or config.is_moe else self.max_cpu_loras
 
-            logger.info(
-                f"Creating vLLM engine for model {model_name}: "
-                f"actor={actor_name}, TP={config.recommended_tp}, DP={config.recommended_dp}, "
-                f"quant={quantization}, max_loras={model_max_loras}"
-            )
+            # Use per-model max_lora_rank override if specified (K2 needs rank 8 to fit).
+            # Large MoE models have huge LoRA buffers: 384 experts × rank × hidden_size.
+            model_max_lora_rank = config.max_lora_rank or self.max_lora_rank
 
-            engine = MultiLoRAInferenceEngine(
-                model_path=model_path,
-                tensor_parallel_size=config.recommended_tp,
-                data_parallel_size=config.recommended_dp,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                max_model_len=self.max_model_len,
-                max_loras=model_max_loras,
-                max_cpu_loras=model_max_cpu_loras,
-                max_lora_rank=self.max_lora_rank,
-                actor_name=actor_name,
-                quantization=quantization,
-            )
+            # Use per-model gpu_memory_utilization if specified (K2 needs lower for LoRA headroom)
+            model_gpu_util = config.gpu_memory_utilization or self.gpu_memory_utilization
+
+            # Use per-model max_model_len if specified (K2 needs 128K, default 262K exceeds KV cache)
+            model_max_model_len = config.max_model_len or self.max_model_len
+
+            # Use per-model max_num_seqs if specified (K2 needs reduced value for KV cache)
+            model_max_num_seqs = config.max_num_seqs or 256  # Default: 256
+
+            # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
+            model_kv_cache_dtype = config.kv_cache_dtype
+
+            # Check if model needs multi-node (TP > 8)
+            # K2 requires TP=16 across 2 nodes for LoRA support
+            needs_multinode = config.inference_tp > 8
+
+            if needs_multinode:
+                # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
+                from .multinode_inference import MultiNodeInferenceEngine
+
+                total_gpus = config.inference_tp  # TP=16 for K2
+                logger.info(
+                    f"Creating multi-node vLLM engine for model {model_name}: "
+                    f"actor={actor_name}, TP={config.inference_tp}, total_gpus={total_gpus}, "
+                    f"gpu_util={model_gpu_util}, quant={quantization}, "
+                    f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
+                    f"max_model_len={model_max_model_len}, max_num_seqs={model_max_num_seqs}, "
+                    f"kv_cache_dtype={model_kv_cache_dtype}"
+                )
+
+                # Ensure GPUs available, evicting idle actors if needed (LRU)
+                # This waits up to 10 minutes for resources to become available
+                from tinker_server.backend.resource_pool import get_resource_pool
+                resource_pool = get_resource_pool()
+                try:
+                    resource_pool.ensure_gpus_available(total_gpus)
+                except ValueError as e:
+                    logger.error(f"Cannot create multi-node vLLM actor: {e}")
+                    raise
+
+                engine = MultiNodeInferenceEngine(
+                    model_path=model_path,
+                    tensor_parallel_size=config.inference_tp,
+                    gpu_memory_utilization=model_gpu_util,
+                    max_model_len=model_max_model_len,
+                    max_loras=model_max_loras,
+                    max_lora_rank=model_max_lora_rank,
+                    max_num_seqs=model_max_num_seqs,
+                    quantization=quantization,
+                    kv_cache_dtype=model_kv_cache_dtype,
+                    actor_name=actor_name,
+                )
+            else:
+                # Use standard MultiLoRAInferenceEngine for single-node models
+                logger.info(
+                    f"Creating vLLM engine for model {model_name}: "
+                    f"actor={actor_name}, TP={config.inference_tp}, DP={config.inference_dp}, "
+                    f"quant={quantization}, max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}"
+                )
+
+                engine = MultiLoRAInferenceEngine(
+                    model_path=model_path,
+                    tensor_parallel_size=config.inference_tp,
+                    data_parallel_size=config.inference_dp,
+                    gpu_memory_utilization=model_gpu_util,
+                    max_model_len=model_max_model_len,
+                    max_loras=model_max_loras,
+                    max_cpu_loras=model_max_cpu_loras,
+                    max_lora_rank=model_max_lora_rank,
+                    actor_name=actor_name,
+                    quantization=quantization,
+                )
+
             await engine.initialize()
 
             self._engines[model_name] = engine

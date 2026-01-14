@@ -10,6 +10,7 @@ verl/workers/megatron_workers.py.
 from __future__ import annotations  # Allow forward references in type hints
 
 import os
+import math
 import socket
 import logging
 from dataclasses import dataclass
@@ -27,10 +28,17 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
-from tinker_server.backend.model_registry import is_moe_model, is_mla_model, get_max_position_embeddings
+from tinker_server.backend.model_registry import get_model_config
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _make_megatron_actor_name(base_model: str) -> str:
@@ -66,25 +74,59 @@ class DistributedConfig:
 
     Defaults configured for 1-GPU setup (GPU 0 has leaked memory).
     For multi-GPU: tensor_parallel_size=2 (2-GPU) or TP=2,PP=2,EP=2 (8-GPU)
+
+    MoE Parallel Folding cases:
+    1. EP > TP with ETP < TP: world_size = EP
+       (TP is a subgroup for attention within EP dimension)
+    2. CP > 1 and EP > 1: world_size = TP * PP * max(EP, CP)
+       (CP and EP share GPU ranks)
+    3. Traditional: world_size = TP * PP * EP * CP
     """
 
     tensor_parallel_size: int = 1  # Single GPU - GPU 0 has corrupted memory
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
+    expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
 
     @property
     def world_size(self) -> int:
-        """Total number of processes needed."""
-        # For MoE models: world_size = TP * PP * EP * CP
-        # Each rank handles one shard of tensor/pipeline/expert parallelism
-        return (
-            self.tensor_parallel_size
-            * self.pipeline_parallel_size
-            * self.expert_parallel_size
-            * self.context_parallel_size
-        )
+        """Total number of processes needed.
+
+        MoE Parallel Folding cases:
+        1. EP > TP with ETP < TP: world_size = EP
+           (TP is a subgroup for attention within EP dimension)
+        2. CP > 1 and EP > 1: world_size = TP * PP * max(EP, CP)
+           (CP and EP share GPU ranks)
+        3. Traditional: world_size = TP * PP * EP * CP
+        """
+        etp = self.expert_tensor_parallel_size
+        if etp is None:
+            etp = self.tensor_parallel_size
+
+        if self.expert_parallel_size > self.tensor_parallel_size and etp < self.tensor_parallel_size:
+            # MoE Parallel Folding with ETP: TP is subgroup within EP
+            return (
+                self.expert_parallel_size
+                * self.pipeline_parallel_size
+                * self.context_parallel_size
+            )
+        elif self.expert_parallel_size > 1 and self.context_parallel_size > 1:
+            # CP/EP Folding: CP and EP share GPU ranks
+            return (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * max(self.expert_parallel_size, self.context_parallel_size)
+            )
+        else:
+            # Traditional: all dimensions are orthogonal
+            return (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * self.expert_parallel_size
+                * self.context_parallel_size
+            )
 
 
 @ray.remote(num_gpus=0)
@@ -146,6 +188,52 @@ class MegatronRankWorker:
         self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
+
+    def log_memory_breakdown(self, phase: str) -> dict:
+        """Log detailed GPU memory breakdown for profiling.
+
+        Args:
+            phase: Description of current phase (e.g., "after_init", "after_forward")
+
+        Returns:
+            Dict with memory stats in GiB for analysis.
+        """
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+
+        # Get memory stats
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # GiB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # GiB
+        max_allocated = torch.cuda.max_memory_allocated() / (1024**3)  # GiB
+        max_reserved = torch.cuda.max_memory_reserved() / (1024**3)  # GiB
+
+        # Get detailed stats
+        stats = torch.cuda.memory_stats()
+        active_bytes = stats.get("active_bytes.all.current", 0) / (1024**3)
+        inactive_bytes = stats.get("inactive_split_bytes.all.current", 0) / (1024**3)
+
+        memory_info = {
+            "phase": phase,
+            "allocated_gib": round(allocated, 3),
+            "reserved_gib": round(reserved, 3),
+            "max_allocated_gib": round(max_allocated, 3),
+            "max_reserved_gib": round(max_reserved, 3),
+            "active_gib": round(active_bytes, 3),
+            "inactive_gib": round(inactive_bytes, 3),
+            "fragmentation_gib": round(reserved - allocated, 3),
+        }
+
+        # Only rank 0 logs to avoid spam
+        if self.rank == 0:
+            logger.info(
+                f"[MEMORY] {phase}: "
+                f"allocated={allocated:.2f}GiB, reserved={reserved:.2f}GiB, "
+                f"peak={max_allocated:.2f}GiB, fragmentation={reserved-allocated:.2f}GiB"
+            )
+
+        return memory_info
 
     def _capture_gradients(self) -> list[torch.Tensor]:
         """Capture all gradient buffers from DDP modules to CPU.
@@ -373,6 +461,9 @@ class MegatronRankWorker:
         self._initialize_distributed()
         self._initialize_megatron()
 
+        # Log memory after initialization
+        self.log_memory_breakdown("after_init")
+
         logger.info(f"[Rank {self.rank}] initialize() complete")
 
     def _initialize_distributed(self):
@@ -407,6 +498,11 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+        # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
+        # This must happen before FlashAttention code is loaded to take effect
+        # Without this, consecutive forward passes differ by ~0.46 nats
+        from tinker_server.backend.verl_patches import _enable_megatron_determinism
+        _enable_megatron_determinism(seed=42)
 
         # Apply MLA patches for DeepseekV3/K2/Moonlight models BEFORE importing Megatron
         # These patches enable Flash Attention 2 with MLA by padding value tensors
@@ -417,6 +513,14 @@ class MegatronRankWorker:
             logger.info(f"[Rank {self.rank}] Applied MLA patches from verl.models.mcore.patch_v012")
         except Exception as e:
             logger.warning(f"[Rank {self.rank}] Could not apply MLA patch: {e}")
+
+        # Apply label shift patch to fix log_prob alignment
+        # Must be applied BEFORE importing MegatronEngineWithLMHead
+        try:
+            from tinker_server.backend.verl_patches import apply_verl_patches
+            apply_verl_patches()
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
@@ -432,6 +536,13 @@ class MegatronRankWorker:
         hf_config = AutoConfig.from_pretrained(
             local_path, trust_remote_code=True, local_files_only=True
         )
+
+        num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
+        try:
+            model_uses_mla = get_model_config(self.base_model).is_mla
+        except ValueError:
+            # Unknown model, check HF config for MLA-specific attributes
+            model_uses_mla = hasattr(hf_config, 'qk_nope_head_dim') and hasattr(hf_config, 'kv_lora_rank')
 
         # Build lora sub-config for get_peft_config() compatibility
         # verl's get_peft_config expects model_config.lora with both .get() and .rank access
@@ -449,30 +560,25 @@ class MegatronRankWorker:
 
             # Determine target modules based on model architecture
             # MLA models (DeepSeek V3 / Moonlight / K2) use different attention projections
-            try:
-                model_uses_mla = is_mla_model(self.base_model)
-            except ValueError:
-                # Unknown model, check HF config for MLA-specific attributes
-                model_uses_mla = hasattr(hf_config, 'qk_nope_head_dim') and hasattr(hf_config, 'kv_lora_rank')
-
             if model_uses_mla:
                 # MLA attention projections (DeepSeek V3 / Moonlight / K2)
-                # Actual Megatron module names (from named_parameters inspection):
-                # - linear_q_proj: Q projection (single, not split into down/up)
+                # Megatron module names (from named_parameters):
+                # - linear_q_proj: Q projection
                 # - linear_kv_down_proj: KV down projection
                 # - linear_kv_up_proj: KV up projection
                 # - linear_proj: output projection
-                target_modules = [
+                attention_modules = [
                     "linear_q_proj",
                     "linear_kv_down_proj", "linear_kv_up_proj",
                     "linear_proj",
-                    "linear_fc1", "linear_fc2"  # MLP/Expert modules
                 ]
                 logger.info(f"[Rank {self.rank}] MLA model detected - using MLA target modules")
             else:
                 # Standard attention projections
                 # Megatron uses: linear_qkv (fused QKV), linear_proj (output)
-                target_modules = ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]
+                attention_modules = ["linear_qkv", "linear_proj"]
+
+            target_modules = attention_modules + ["linear_fc1", "linear_fc2"]
 
             lora_config = LoraConfigDict(
                 rank=self.lora_rank,
@@ -500,7 +606,6 @@ class MegatronRankWorker:
         # - Qwen3-MoE: num_experts
         # - DeepseekV3/Moonlight: n_routed_experts
         override_tf_config = {}
-        num_experts = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
         if num_experts is not None:
             # MoE model - pass expert parameters to TransformerConfig
             override_tf_config["num_moe_experts"] = num_experts
@@ -537,9 +642,8 @@ class MegatronRankWorker:
 
         # Activation recomputation (gradient checkpointing) for memory-constrained training
         # Required for long context training on large models (e.g., 40K tokens on 30B)
-        from .model_registry import get_gradient_checkpointing
         try:
-            use_gradient_checkpointing = get_gradient_checkpointing(self.base_model)
+            use_gradient_checkpointing = get_model_config(self.base_model).gradient_checkpointing
         except ValueError:
             use_gradient_checkpointing = False
         if use_gradient_checkpointing:
@@ -547,11 +651,11 @@ class MegatronRankWorker:
             # For 40K context on 30B MoE, "selective" isn't enough - need full recompute
             # This recomputes ALL activations during backward pass, trading compute for memory
             override_tf_config["recompute_granularity"] = "full"
-            override_tf_config["recompute_method"] = "uniform"  # Uniform distribution across layers
-            override_tf_config["recompute_num_layers"] = 1  # Recompute every layer
+            override_tf_config["recompute_method"] = "uniform"
+            override_tf_config["recompute_num_layers"] = 1
             logger.info(f"[Rank {self.rank}] Activation recomputation enabled (full: all layers)")
 
-        # MLA attention (Multi-Latent Attention) for DeepSeekV3/K2/Moonlight models
+        # MLA attention (Multi-Latent Attention) detection for DeepSeekV3/K2/Moonlight models
         # These models have qk_nope_head_dim + qk_rope_head_dim = head_dim_qk
         # MLA has head_dim_qk=192 (qk_nope=128 + qk_rope=64) and head_dim_v=128
         # Flash Attention 2 requires head_dim_qk == head_dim_v
@@ -563,11 +667,37 @@ class MegatronRankWorker:
         qk_nope = getattr(hf_config, "qk_nope_head_dim", 0)
         qk_rope = getattr(hf_config, "qk_rope_head_dim", 0)
         head_dim_qk = qk_nope + qk_rope
-        if head_dim_qk > 0:
+        has_mla_attention = head_dim_qk > 0
+        if has_mla_attention:
             logger.info(
                 f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
                 f"(qk_nope={qk_nope} + qk_rope={qk_rope}). Using FA2 with value padding."
             )
+
+        # Activation checkpointing for memory-efficient training
+        # When enabled, activations are checkpointed and recomputed during backward pass
+        # This trades ~30-40% extra compute for significant memory savings on long sequences
+        # Essential for K2 (1.04T params) with variable-length thinking outputs
+        #
+        # Available modules for selective recompute:
+        # - "moe": recompute MoE layer (biggest saver for MoE models)
+        # - "mla_up_proj": recompute MLA up projection and RoPE (important for K2)
+        # - "shared_experts": recompute shared experts
+        # - "core_attn": recompute core attention
+        # - "layernorm": recompute layernorms
+        # Only use selective recompute if full recompute wasn't enabled via model_registry
+        if num_experts is not None and not use_gradient_checkpointing:
+            override_tf_config["recompute_granularity"] = "selective"
+            # Aggressive recompute for maximum memory savings:
+            # - moe: MoE FFN activations (~40% of memory)
+            # - mla_up_proj: MLA up projections for K2/DeepSeekV3 (~15% of memory)
+            # NOTE: shared_experts conflicts with moe-shared-expert-overlap (enabled by default in new megatron-bridge)
+            recompute_modules = ["moe"]
+            # Add MLA-specific recompute for MLA models
+            if has_mla_attention:
+                recompute_modules.append("mla_up_proj")
+            override_tf_config["recompute_modules"] = recompute_modules
+            logger.info(f"[Rank {self.rank}] Selective recompute enabled: {recompute_modules}")
 
         logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
 
@@ -575,6 +705,7 @@ class MegatronRankWorker:
             tensor_model_parallel_size=self.config.tensor_parallel_size,
             pipeline_model_parallel_size=self.config.pipeline_parallel_size,
             expert_model_parallel_size=self.config.expert_parallel_size,
+            expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
             context_parallel_size=self.config.context_parallel_size,
             param_offload=True,
             optimizer_offload=True,
@@ -584,6 +715,12 @@ class MegatronRankWorker:
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
             override_transformer_config=override_tf_config,
+        )
+        print(
+            f"[Rank {self.rank}] McoreEngineConfig: TP={engine_config.tensor_model_parallel_size}, "
+            f"EP={engine_config.expert_model_parallel_size}, ETP={engine_config.expert_tensor_parallel_size}, "
+            f"CP={engine_config.context_parallel_size}, PP={engine_config.pipeline_model_parallel_size}",
+            flush=True
         )
 
         optimizer_config = McoreOptimizerConfig(
@@ -670,7 +807,7 @@ class MegatronRankWorker:
 
         # Add non-tensor metadata for verl's prepare_micro_batches
         dummy_data["use_dynamic_bsz"] = NonTensorData(True)
-        dummy_data["max_token_len_per_gpu"] = NonTensorData(get_max_position_embeddings(self.base_model))
+        dummy_data["max_token_len_per_gpu"] = NonTensorData(get_model_config(self.base_model).max_model_len)
         dummy_data.set_non_tensor("dp_size", 1)
         dummy_data.set_non_tensor("batch_num_tokens", seq_len)
         dummy_data.set_non_tensor("temperature", 1.0)
@@ -693,17 +830,130 @@ class MegatronRankWorker:
             import traceback
             logger.warning(f"[Rank {self.rank}] Warmup traceback: {traceback.format_exc()}")
 
+    def reset_expert_bias(self) -> dict:
+        """Reset expert_bias buffers to zero in all MoE router modules.
+
+        The expert_bias buffer accumulates during training (via finalize_model_grads)
+        to balance token distribution across experts. However, this buffer is NOT
+        exported with LoRA weights, causing train-inference mismatch:
+        - Megatron (trained): has accumulated expert_bias != 0
+        - vLLM (loaded LoRA): has expert_bias = 0
+
+        This causes different routing decisions and thus different logprobs even
+        with identical LoRA weights.
+
+        Call this before computing logprobs to ensure consistent behavior with vLLM.
+
+        Returns:
+            dict with reset counts (only from rank 0)
+        """
+        import torch
+        import sys
+        import time
+
+        # DEBUG: Write to stderr (should appear in Ray logs)
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] reset_expert_bias ENTRY, rank={self.rank}", file=sys.stderr, flush=True)
+
+        reset_count = 0
+        bias_values_before = []
+
+        # self.engine.module is a list (one per pipeline stage)
+        for model_chunk in self.engine.module:
+            # Iterate through all submodules
+            for name, module in model_chunk.named_modules():
+                if hasattr(module, 'expert_bias') and module.expert_bias is not None:
+                    bias_before = module.expert_bias.clone()
+                    if torch.any(bias_before != 0):
+                        bias_values_before.append((name, bias_before.cpu().tolist()))
+                    module.expert_bias.zero_()
+                    reset_count += 1
+
+                # Also reset local_tokens_per_expert if present
+                if hasattr(module, 'local_tokens_per_expert') and module.local_tokens_per_expert is not None:
+                    module.local_tokens_per_expert.zero_()
+
+        # DEBUG: Write results to stderr
+        print(f"[DEBUG {time.strftime('%H:%M:%S')}] reset_count={reset_count}, non_zero_before={len(bias_values_before)}, rank={self.rank}", file=sys.stderr, flush=True)
+
+        if self.rank == 0:
+            logger.info(f"[Rank {self.rank}] Reset {reset_count} expert_bias buffers to zero")
+            if bias_values_before:
+                logger.info(f"[Rank {self.rank}] Non-zero expert_bias found before reset: {len(bias_values_before)} modules")
+                for name, vals in bias_values_before[:3]:  # Log first 3
+                    logger.info(f"[Rank {self.rank}]   {name}: {vals[:5]}...")  # First 5 values
+
+        return {"reset_count": reset_count} if self.rank == 0 else {}
+
+    def _resolve_reset_bias(self, reset_bias: bool | None, default: bool) -> bool:
+        if reset_bias is not None:
+            return reset_bias
+        return _env_flag("MINT_RESET_EXPERT_BIAS", default=default)
+
+    def _is_output_rank(self) -> bool:
+        """Return True if this rank should emit metrics/logprobs."""
+        try:
+            from megatron.core import mpu
+
+            return (
+                mpu.is_pipeline_last_stage(ignore_virtual=True)
+                and mpu.get_data_parallel_rank() == 0
+                and mpu.get_tensor_model_parallel_rank() == 0
+            )
+        except Exception:
+            return self.rank == 0
+
+    def check_determinism_status(self) -> dict:
+        """Check determinism settings on this worker.
+
+        Returns:
+            dict with determinism status info (only from rank 0)
+        """
+        import torch
+        import os
+        import socket
+        import glob
+
+        status = {
+            "rank": self.rank,
+            "hostname": socket.gethostname(),
+            "are_deterministic_algorithms_enabled": torch.are_deterministic_algorithms_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "FLASH_ATTENTION_DETERMINISTIC": os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "NOT SET"),
+            "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG", "NOT SET"),
+            "NCCL_DETERMINISTIC": os.environ.get("NCCL_DETERMINISTIC", "NOT SET"),
+        }
+
+        # Check for status files
+        status_files = glob.glob("/tmp/determinism_status_*.txt")
+        status["status_files"] = status_files
+
+        if self.rank == 0:
+            logger.info(f"[Rank 0] Determinism status: {status}")
+
+        return status if self.rank == 0 else {}
+
     def forward_backward(
         self,
         data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
         session_id: str | None = None,
+        reset_bias: bool | None = None,
     ) -> dict:
         """Run forward and backward pass on this rank's shard.
 
         Gradients are synchronized via NCCL allreduce.
         Returns metrics from rank 0 only, including per-sample loss_fn_outputs.
+
+        Args:
+            data_items: List of Tinker Datum dicts.
+            loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
+            loss_fn_config: Config for loss function (e.g., {"epsilon": 0.2} for PPO).
+            session_id: Optional session ID for gradient isolation.
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
+                This ensures logprobs match vLLM (which always has bias=0).
 
         Note: TensorDict with nested tensors is created locally to avoid Ray
         serialization issues that cause CUDA memory corruption.
@@ -713,15 +963,49 @@ class MegatronRankWorker:
             create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
         )
 
+        reset_bias = self._resolve_reset_bias(reset_bias, default=False)
+        output_rank = self._is_output_rank()
+
+        # Reset expert_bias for train-inference consistency
+        # expert_bias accumulates during training but isn't exported to vLLM
+        # Reset ensures Megatron routing matches vLLM routing for correct KL calculation
+        if reset_bias:
+            self.reset_expert_bias()
+
         # Session state swap moved inside train_mode() - see below
 
-        # Get sequence lengths from raw data (before tensor creation)
-        seq_lengths = []
-        for item in data_items:
+        # Get sequence lengths from raw data (before tensor creation) and filter valid items.
+        valid_items: list[dict] = []
+        valid_indices: list[int] = []
+        seq_lengths: list[int] = []
+        for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             chunks = model_input.get("chunks", [])
             if chunks and "tokens" in chunks[0]:
-                seq_lengths.append(len(chunks[0]["tokens"]))
+                tokens = chunks[0]["tokens"]
+                valid_items.append(item)
+                valid_indices.append(item_index)
+                seq_lengths.append(len(tokens))
+            else:
+                logger.warning(f"[Rank {self.rank}] Missing tokens in item {item_index}, skipping")
+
+        if not valid_items:
+            if output_rank:
+                empty_outputs = [
+                    {"loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
+                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
+                    for _ in data_items
+                ]
+                return {
+                    "loss_value": 0.0,
+                    "num_tokens": 0,
+                    "clip_frac_sum": 0.0,
+                    "ratio_mean_sum": 0.0,
+                    "n_ppo_results": 0,
+                    "valid_count": 0,
+                    "loss_fn_outputs": empty_outputs,
+                }
+            return {}
 
         # Test CUDA context before creating TensorDict
         device = torch.cuda.current_device()
@@ -736,8 +1020,11 @@ class MegatronRankWorker:
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
-        max_token_len = get_max_position_embeddings(self.base_model)
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        max_token_len = get_model_config(self.base_model).max_model_len
+        data = tinker_to_tensordict(valid_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+
+        # Log memory before forward-backward
+        self.log_memory_breakdown("before_forward_backward")
 
         # Select loss function (SFT returns log_probs in metrics for train_nll)
         if loss_fn == "cross_entropy":
@@ -768,13 +1055,16 @@ class MegatronRankWorker:
                 forward_only=False,
             )
 
+            # Log memory after forward-backward (peak usage during training)
+            self.log_memory_breakdown("after_forward_backward")
+
             # 3. Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
             if session_id is not None:
                 self._session_gradients[session_id] = self._capture_gradients()
                 logger.debug(f"[Rank {self.rank}] Captured gradients for session {session_id}")
 
-        # Only rank 0 returns metrics
-        if self.rank == 0:
+        # Only one output rank returns metrics
+        if output_rank:
             loss_value = 0.0
             num_tokens = 0
             clip_frac_sum = 0.0
@@ -782,6 +1072,7 @@ class MegatronRankWorker:
             n_ppo_results = 0
             all_log_probs = []
             loss_fn_outputs = []
+            per_sample_log_probs = None
 
             # verl's forward_backward_batch returns a single dict:
             # {
@@ -832,8 +1123,72 @@ class MegatronRankWorker:
                         rm = rm.item()
                     ratio_mean_sum += float(rm)
 
+                model_output = result.get("model_output", {})
+                logger.info(f"[Rank {self.rank}] model_output keys: {list(model_output.keys())}")
+                model_log_probs = model_output.get("log_probs")
+                # Extract top-k tensors if present (from verl_patches.py)
+                model_topk_indices = model_output.get("topk_indices")  # (batch, seq_len, k)
+                model_topk_logits = model_output.get("topk_logits")    # (batch, seq_len, k)
+                if model_topk_indices is not None:
+                    logger.info(f"[Rank {self.rank}] Got topk_indices shape={model_topk_indices.shape}")
+                else:
+                    logger.info(f"[Rank {self.rank}] topk_indices is None")
+                if model_log_probs is not None:
+                    if hasattr(model_log_probs, "unbind"):
+                        per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
+                    elif seq_lengths and hasattr(model_log_probs, "dim") and model_log_probs.dim() >= 2:
+                        per_sample_log_probs = []
+                        for idx, row in enumerate(model_log_probs):
+                            seq_len = seq_lengths[idx] if idx < len(seq_lengths) else row.shape[0]
+                            per_sample_log_probs.append(row[:seq_len].detach().cpu())
+
             # Concatenate and split log_probs into per-sample tensors for loss_fn_outputs
-            if all_log_probs and seq_lengths:
+            # Also split topk tensors which are in THD format (1, total_tokens, k)
+            topk_offset = 0  # Track offset into concatenated topk tensor
+
+            # NaN guard: detect and report NaN/Inf in loss_value before it propagates to JSON
+            # (orjson converts NaN to null, which causes pydantic validation failures on client)
+            if math.isnan(loss_value) or math.isinf(loss_value):
+                logger.error(f"[Rank {self.rank}] NaN/Inf detected in loss_value={loss_value}. "
+                             f"num_tokens={num_tokens}, loss_fn={loss_fn}. "
+                             "This will cause client-side validation failures.")
+                # Set to a large but valid number to allow training to continue with a warning
+                loss_value = 1e6
+
+            if per_sample_log_probs:
+                avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
+                for sample_idx, sample_log_probs in enumerate(per_sample_log_probs):
+                    logprobs_list = sample_log_probs.tolist()
+                    seq_len = len(logprobs_list)
+                    output_entry = {
+                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                        "logprobs": {"data": logprobs_list, "shape": [seq_len], "dtype": "float32"},
+                    }
+                    # Add top-k if available
+                    # topk tensors have shape (1, total_tokens, k) - all sequences concatenated
+                    if model_topk_indices is not None and model_topk_logits is not None:
+                        # Check if THD format (batch=1, concatenated sequences)
+                        if model_topk_indices.dim() == 3 and model_topk_indices.shape[0] == 1:
+                            # Convert to int to avoid symbolic shape comparison issues
+                            total_tokens = int(model_topk_indices.shape[1])
+                            k = int(model_topk_indices.shape[2])
+                            if topk_offset + seq_len <= total_tokens:
+                                # TensorData.data must be flattened (per tinker schema)
+                                topk_idx = model_topk_indices[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
+                                topk_lp = model_topk_logits[0, topk_offset:topk_offset + seq_len, :].flatten().tolist()
+                                output_entry["topk_indices"] = {"data": topk_idx, "shape": [seq_len, k], "dtype": "int64"}
+                                output_entry["topk_logits"] = {"data": topk_lp, "shape": [seq_len, k], "dtype": "float32"}
+                                topk_offset += seq_len
+                        elif sample_idx < model_topk_indices.shape[0]:
+                            # Per-sample format: (num_samples, seq_len, k)
+                            k = model_topk_indices.shape[2]
+                            # TensorData.data must be flattened (per tinker schema)
+                            topk_idx = model_topk_indices[sample_idx, :seq_len, :].flatten().tolist()
+                            topk_lp = model_topk_logits[sample_idx, :seq_len, :].flatten().tolist()
+                            output_entry["topk_indices"] = {"data": topk_idx, "shape": [seq_len, k], "dtype": "int64"}
+                            output_entry["topk_logits"] = {"data": topk_lp, "shape": [seq_len, k], "dtype": "float32"}
+                    loss_fn_outputs.append(output_entry)
+            elif loss_fn == "cross_entropy" and all_log_probs and seq_lengths:
                 combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
                 offset = 0
                 avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
@@ -846,20 +1201,86 @@ class MegatronRankWorker:
                         "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                     })
 
+            valid_count = len(seq_lengths)
+            expected_outputs = valid_count
+            if expected_outputs and len(loss_fn_outputs) < expected_outputs:
+                avg_loss_per_sample = loss_value / max(expected_outputs, 1)
+                for _ in range(expected_outputs - len(loss_fn_outputs)):
+                    loss_fn_outputs.append({
+                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                        "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
+                    })
+
+            if valid_indices:
+                avg_loss_per_sample = loss_value / max(valid_count, 1)
+                full_outputs = [
+                    {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
+                    for _ in data_items
+                ]
+                for output, item_index in zip(loss_fn_outputs, valid_indices):
+                    full_outputs[item_index] = output
+                loss_fn_outputs = full_outputs
+
+            # Calculate precision difference metrics if log_probs present
+            debug_metrics = {}
+            if result and isinstance(result, dict):
+                metrics = result.get("metrics", {})
+                print(f"[Rank {self.rank} DEBUG] Available metric keys: {list(metrics.keys())}", flush=True)
+
+                # Debug metrics are stored as lists (one per micro-batch)
+                # Take the last value from each list (most recent micro-batch)
+                for key in ["training/rollout_probs_diff_valid", "training/rollout_probs_diff_mean",
+                           "training/rollout_probs_diff_max", "training/rollout_probs_diff_std",
+                           "training/rollout_actor_probs_pearson_corr"]:
+                    if key in metrics:
+                        values = metrics[key]
+                        print(f"[Rank {self.rank} DEBUG] Found {key}: {values}", flush=True)
+                        # metrics[key] is a list, take the last (or average)
+                        if isinstance(values, list) and values:
+                            # Average debug metrics across micro-batches
+                            if isinstance(values[0], (int, float)):
+                                # Filter out nan values before averaging (math imported at module level)
+                                valid_values = [v for v in values if not (isinstance(v, float) and math.isnan(v))]
+                                if valid_values:
+                                    debug_metrics[f"{key}:mean"] = sum(valid_values) / len(valid_values)
+                                else:
+                                    debug_metrics[f"{key}:mean"] = 0.0
+                            else:
+                                # If not numeric, just take the last value
+                                debug_metrics[f"{key}:mean"] = values[-1]
+                        else:
+                            # Skip if values is None, empty list, or non-numeric
+                            if values is not None and isinstance(values, (int, float)):
+                                debug_metrics[f"{key}:mean"] = float(values)
+                    else:
+                        print(f"[Rank {self.rank} DEBUG] Key {key} NOT found in metrics", flush=True)
+
+            print(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}", flush=True)
+
             # Return CPU-safe scalars and loss_fn_outputs
-            return {
+            result_dict = {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
                 "clip_frac_sum": float(clip_frac_sum),
                 "ratio_mean_sum": float(ratio_mean_sum),
                 "n_ppo_results": int(n_ppo_results),
+                "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
             }
+            # Add debug metrics if present
+            if debug_metrics:
+                result_dict["debug_metrics"] = debug_metrics
+                print(f"[Rank {self.rank}] Debug metrics: {debug_metrics}", flush=True)
+            else:
+                print(f"[Rank {self.rank} DEBUG] No debug metrics to add!", flush=True)
+            return result_dict
         return {}
 
     def forward(
         self,
         data_items: list[dict],
+        reset_bias: bool | None = None,
     ) -> dict:
         """Run forward pass only (no backward). Returns per-token logprobs.
 
@@ -872,22 +1293,60 @@ class MegatronRankWorker:
 
         Note: TensorDict with nested tensors is created locally to avoid Ray
         serialization issues that cause CUDA memory corruption.
+
+        Args:
+            data_items: List of data items with model_input and loss_fn_inputs.
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                If None, uses MINT_RESET_EXPERT_BIAS (default True for logprob-only).
+                This ensures logprobs match vLLM (which always has bias=0).
         """
         import torch
         from tinker_server.backend.megatron_training import tinker_to_tensordict
 
-        # Get sequence lengths from raw data (before tensor creation)
-        seq_lengths = []
-        for item in data_items:
+        reset_bias = self._resolve_reset_bias(reset_bias, default=True)
+        output_rank = self._is_output_rank()
+
+        # Reset expert_bias for train-inference consistency
+        # expert_bias accumulates during training but isn't exported to vLLM
+        # Reset ensures Megatron routing matches vLLM routing
+        if reset_bias:
+            self.reset_expert_bias()
+
+        # Get sequence lengths from raw data (before tensor creation) and filter valid items.
+        valid_items: list[dict] = []
+        valid_indices: list[int] = []
+        seq_lengths: list[int] = []
+        for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             chunks = model_input.get("chunks", [])
             if chunks and "tokens" in chunks[0]:
-                seq_lengths.append(len(chunks[0]["tokens"]))
+                tokens = chunks[0]["tokens"]
+                valid_items.append(item)
+                valid_indices.append(item_index)
+                seq_lengths.append(len(tokens))
+            else:
+                logger.warning(f"[Rank {self.rank}] Missing tokens in item {item_index}, skipping")
+
+        if not valid_items:
+            if output_rank:
+                empty_outputs = [
+                    {"loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
+                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
+                    for _ in data_items
+                ]
+                return {
+                    "loss_value": 0.0,
+                    "num_tokens": 0,
+                    "valid_count": 0,
+                    "loss_fn_outputs": empty_outputs,
+                    "log_probs": None,
+                }
+            return {}
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
-        max_token_len = get_max_position_embeddings(self.base_model)
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        max_token_len = get_model_config(self.base_model).max_model_len
+        data = tinker_to_tensordict(valid_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn
@@ -904,12 +1363,14 @@ class MegatronRankWorker:
                     forward_only=True,
                 )
 
-        # Only rank 0 returns metrics
-        if self.rank == 0:
+        # Only one output rank returns metrics
+        if output_rank:
             loss_value = 0.0
             num_tokens = 0
             all_log_probs = []
             loss_fn_outputs = []
+            per_sample_log_probs = None
+            combined_log_probs = None
 
             # verl's forward_backward_batch returns a single dict (not a list):
             # {
@@ -947,36 +1408,71 @@ class MegatronRankWorker:
                             log_probs = log_probs.cpu()
                         all_log_probs.append(log_probs)
 
-                # Concatenate all micro-batch log_probs into a single tensor
-                if all_log_probs:
-                    combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
-                else:
-                    combined_log_probs = None
+                model_output = result.get("model_output", {})
+                model_log_probs = model_output.get("log_probs")
+                if model_log_probs is not None:
+                    if hasattr(model_log_probs, "unbind"):
+                        per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
+                    elif seq_lengths and hasattr(model_log_probs, "dim") and model_log_probs.dim() >= 2:
+                        per_sample_log_probs = []
+                        for idx, row in enumerate(model_log_probs):
+                            seq_len = seq_lengths[idx] if idx < len(seq_lengths) else row.shape[0]
+                            per_sample_log_probs.append(row[:seq_len].detach().cpu())
 
-                # Split combined log_probs back into per-sample tensors using seq_lengths
-                # This is critical for cookbook compatibility - it expects one loss_fn_outputs per sample
-                if combined_log_probs is not None and seq_lengths:
-                    offset = 0
-                    avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
-                    for seq_len in seq_lengths:
-                        sample_log_probs = combined_log_probs[offset:offset + seq_len]
-                        offset += seq_len
+                if per_sample_log_probs:
+                    combined_log_probs = (
+                        torch.cat(per_sample_log_probs, dim=0)
+                        if len(per_sample_log_probs) > 1
+                        else per_sample_log_probs[0]
+                    )
+                    avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
+                    for sample_log_probs in per_sample_log_probs:
                         logprobs_list = sample_log_probs.tolist()
                         loss_fn_outputs.append({
                             "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
                             "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                         })
-                elif combined_log_probs is not None:
-                    # Fallback: single entry with all log_probs (legacy behavior)
-                    logprobs_list = combined_log_probs.tolist()
-                    loss_fn_outputs.append({
-                        "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
-                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                    })
+                else:
+                    # Fallback to metrics order (may be shuffled under dynamic bsz)
+                    if all_log_probs:
+                        combined_log_probs = (
+                            torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
+                        )
+                    if combined_log_probs is not None and seq_lengths:
+                        offset = 0
+                        avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
+                        for seq_len in seq_lengths:
+                            sample_log_probs = combined_log_probs[offset:offset + seq_len]
+                            offset += seq_len
+                            logprobs_list = sample_log_probs.tolist()
+                            loss_fn_outputs.append({
+                                "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                                "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
+                            })
+                    elif combined_log_probs is not None:
+                        # Fallback: single entry with all log_probs (legacy behavior)
+                        logprobs_list = combined_log_probs.tolist()
+                        loss_fn_outputs.append({
+                            "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
+                            "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
+                        })
+
+                valid_count = len(seq_lengths)
+                if valid_indices:
+                    avg_loss_per_sample = loss_value / max(valid_count, 1)
+                    full_outputs = [
+                        {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
+                         "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
+                        for _ in data_items
+                    ]
+                    for output, item_index in zip(loss_fn_outputs, valid_indices):
+                        full_outputs[item_index] = output
+                    loss_fn_outputs = full_outputs
 
             return {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
+                "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
                 "log_probs": combined_log_probs,  # Combined per-token log_probs tensor (for backward compat)
             }
@@ -1001,6 +1497,9 @@ class MegatronRankWorker:
             grad_norm = self.engine.optimizer_step()
             current_lr = self.engine.lr_scheduler_step()
 
+            # Log memory after optimizer step
+            self.log_memory_breakdown("after_optim_step")
+
             # 3. Clear cache - gradients have been consumed
             if session_id is not None and session_id in self._session_gradients:
                 del self._session_gradients[session_id]
@@ -1012,158 +1511,12 @@ class MegatronRankWorker:
                 lr_value = current_lr[0] if isinstance(current_lr, (list, tuple)) else current_lr
             else:
                 lr_value = learning_rate
+            print(f"[Rank {self.rank}] optim_step: grad_norm={grad_norm}, lr={lr_value}, session={session_id}", flush=True)
             # Return CPU-safe scalars only
             return {
                 "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
                 "lr": float(lr_value),
                 "step": "completed",
-            }
-        return {}
-
-    def train_step(
-        self,
-        data_items: list[dict],
-        loss_fn: str,
-        loss_fn_config: dict,
-        learning_rate: float,
-    ) -> dict:
-        """Run forward, backward, and optimizer step in a single train_mode context.
-
-        This is the correct way to train with param_offload=True. When train_mode exits,
-        gradients are offloaded to CPU. A subsequent train_mode entry zeros the gradients.
-        By keeping everything in one context, gradients persist for the optimizer step.
-
-        Args:
-            data_items: List of Tinker Datum dicts.
-            loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
-            loss_fn_config: Loss function config (e.g., {"epsilon": 0.2} for PPO).
-            learning_rate: Learning rate (passed for compatibility, verl handles scheduling).
-
-        Returns:
-            Dict with loss metrics and optimizer results (from rank 0 only).
-        """
-        import torch
-        from tinker_server.backend.megatron_training import (
-            create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
-        )
-
-        # Get sequence lengths from raw data (before tensor creation)
-        seq_lengths = []
-        for item in data_items:
-            model_input = item.get("model_input", {})
-            chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                seq_lengths.append(len(chunks[0]["tokens"]))
-
-        # Create TensorDict directly on GPU
-        device = torch.cuda.current_device()
-        max_token_len = get_max_position_embeddings(self.base_model)
-        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
-
-        # Select loss function
-        if loss_fn == "cross_entropy":
-            loss_function = create_sft_loss_fn(return_logprobs=True)
-        elif loss_fn == "ppo":
-            epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(epsilon)
-        elif loss_fn == "importance_sampling":
-            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
-        else:
-            raise ValueError(f"Unknown loss_fn: {loss_fn}")
-
-        # CRITICAL: All operations in single train_mode context
-        # This ensures gradients survive for optimizer step
-        with self.engine.train_mode():
-            # Zero gradients
-            self.engine.optimizer_zero_grad()
-
-            # Forward-backward (computes gradients)
-            result = self.engine.forward_backward_batch(
-                data=data,
-                loss_function=loss_function,
-                forward_only=False,
-            )
-
-            # Optimizer step (uses gradients computed above)
-            grad_norm = self.engine.optimizer_step()
-            current_lr = self.engine.lr_scheduler_step()
-
-        # Only rank 0 returns metrics
-        if self.rank == 0:
-            loss_value = 0.0
-            num_tokens = 0
-            clip_frac_sum = 0.0
-            ratio_mean_sum = 0.0
-            n_ppo_results = 0
-            all_log_probs = []
-            loss_fn_outputs = []
-
-            if result and isinstance(result, dict):
-                metrics = result.get("metrics", {})
-                losses = result.get("loss", [])
-
-                for loss in losses:
-                    if hasattr(loss, "item"):
-                        loss = loss.item()
-                    loss_value += float(loss)
-
-                num_tokens_list = metrics.get("num_tokens", [])
-                for tokens in num_tokens_list:
-                    if hasattr(tokens, "item"):
-                        tokens = tokens.item()
-                    num_tokens += int(tokens)
-
-                log_probs_list = metrics.get("log_probs", [])
-                for log_probs in log_probs_list:
-                    if log_probs is not None:
-                        if hasattr(log_probs, "cpu"):
-                            log_probs = log_probs.cpu()
-                        all_log_probs.append(log_probs)
-
-                clip_frac_list = metrics.get("clip_frac", [])
-                for cf in clip_frac_list:
-                    if hasattr(cf, "item"):
-                        cf = cf.item()
-                    clip_frac_sum += float(cf)
-                    n_ppo_results += 1
-
-                ratio_mean_list = metrics.get("ratio_mean", [])
-                for rm in ratio_mean_list:
-                    if hasattr(rm, "item"):
-                        rm = rm.item()
-                    ratio_mean_sum += float(rm)
-
-            # Build loss_fn_outputs
-            if all_log_probs and seq_lengths:
-                combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
-                offset = 0
-                avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
-                for seq_len in seq_lengths:
-                    sample_log_probs = combined_log_probs[offset:offset + seq_len]
-                    offset += seq_len
-                    logprobs_list = sample_log_probs.tolist()
-                    loss_fn_outputs.append({
-                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                    })
-
-            # Handle learning rate
-            if current_lr is not None:
-                lr_value = current_lr[0] if isinstance(current_lr, (list, tuple)) else current_lr
-            else:
-                lr_value = learning_rate
-
-            logger.info(f"[Rank {self.rank}] train_step: loss={loss_value:.4f}, grad_norm={grad_norm:.4f}")
-
-            return {
-                "loss_value": float(loss_value),
-                "num_tokens": int(num_tokens),
-                "clip_frac_sum": float(clip_frac_sum),
-                "ratio_mean_sum": float(ratio_mean_sum),
-                "n_ppo_results": int(n_ppo_results),
-                "loss_fn_outputs": loss_fn_outputs,
-                "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
-                "lr": float(lr_value),
             }
         return {}
 
@@ -1205,8 +1558,251 @@ class MegatronRankWorker:
         """
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
 
+        # ========== Try HollowMan Megatron-Bridge export_adapter_weights API ==========
+        # This is enabled via USE_MBRIDGE_LORA_EXPORT=true environment variable which
+        # prepends HollowMan fork to PYTHONPATH
+        bridge = getattr(self.engine, 'bridge', None)
+        if bridge is not None and hasattr(bridge, 'export_adapter_weights'):
+            logger.info(f"[Rank {self.rank}] Using Megatron-Bridge export_adapter_weights API")
+            adapter_state = {}
+
+            with self.engine.eval_mode():
+                for name, tensor in bridge.export_adapter_weights(self.engine.module, cpu=True, show_progress=False):
+                    if self.rank == 0:
+                        adapter_state[name] = tensor.clone()
+
+            # Non-rank-0 workers return empty dict
+            if self.rank != 0:
+                logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
+                return {}
+
+            logger.info(f"[Rank 0] export_adapter_weights returned {len(adapter_state)} params")
+            return adapter_state
+
+        # ========== Fall back to custom implementation ==========
+        logger.info(f"[Rank {self.rank}] Using custom LoRA extraction (export_adapter_weights not available)")
+
         # Write diagnostic output to shared PFS for debugging
         debug_file = "/vePFS-Mindverse/share/code/tinker-server/debug_lora_export.log"
+
+        # ========== TP Gathering Helpers ==========
+        # LoRA weights are sharded across TP ranks. We must gather before export.
+        # Based on Megatron-Bridge gpt_bridge.py _get_tp_split_dim() logic.
+        #
+        # Sharding rules for LoRA:
+        # - linear_proj, linear_fc2 (RowParallel): lora_A sharded on dim 1
+        # - linear_q_proj, linear_kv_up_proj (ColumnParallel): lora_B sharded on dim 0
+        # - linear_fc1 (fused gate+up): lora_B sharded on dim 1 (special case)
+        # - linear_kv_down_proj: lora_B sharded on dim 0 (for mcore < 0.14)
+
+        def _get_lora_tp_split_dim(param_name: str, etp_size: int = 1) -> int | None:
+            """Determine TP split dimension for a LoRA parameter.
+
+            Returns None if parameter is not TP-sharded.
+            Returns 0 for column-parallel (output sharded).
+            Returns 1 for row-parallel (input sharded) or fused linear_fc1.
+
+            CRITICAL: For MoE models with ETP=1, expert MLP LoRAs are NOT tensor-parallelized.
+            Only attention LoRAs use TP sharding. Expert MLP LoRAs use ETP sharding.
+            """
+            import re
+
+            # Identify lora_A vs lora_B
+            is_lora_a = '.adapter.linear_in.' in param_name or '.lora_a.' in param_name.lower()
+            is_lora_b = '.adapter.linear_out.' in param_name or '.lora_b.' in param_name.lower()
+
+            if not (is_lora_a or is_lora_b):
+                return None
+
+            # Check if this is an expert MLP layer (MoE)
+            # Expert layers have patterns like: mlp.experts.*, mlp.shared_experts.*
+            # These use ETP (Expert Tensor Parallel) instead of TP
+            # Note: Dense MLP layers (e.g., layer 0's .mlp.linear_fc1 without .experts.)
+            # still use TP sharding and should be gathered
+            is_expert_layer = '.mlp.experts.' in param_name or '.mlp.shared_experts.' in param_name
+
+            if is_expert_layer:
+                # For expert layers, sharding depends on ETP, not TP
+                # With ETP=1 (no expert tensor parallelism), these are NOT sharded
+                if etp_size <= 1:
+                    return None
+                # With ETP > 1, would need ETP-based gathering (not implemented)
+                # For now, return None and log warning
+                logger.warning(f"ETP={etp_size} > 1 not yet supported for LoRA gathering")
+                return None
+
+            # RowParallel layers (attention output projection, MLP down projection):
+            # - lora_A is sharded on dim 1 (input dimension)
+            row_parallel_keys = {'linear_proj', 'linear_fc2'}
+
+            # ColumnParallel layers (attention QKV, MLA projections, MLP up/gate):
+            # - lora_A is sharded on dim 0 (rank dimension)
+            # - lora_B is sharded on dim 0 (output dimension)
+            col_parallel_keys = {'linear_qkv', 'linear_q_proj', 'linear_kv_up_proj', 'linear_kv_down_proj', 'linear_fc1'}
+
+            # Extract base layer name (e.g., "linear_proj" from "decoder.layers.0.self_attn.linear_proj.adapter.linear_in.weight")
+            match = re.search(r'(linear_\w+)\.(?:adapter|lora)', param_name)
+            if not match:
+                return None
+            base_layer = match.group(1)
+
+            if is_lora_a:
+                # lora_A is sharded if base layer is RowParallel (dim 1) or ColumnParallel (dim 0)
+                if base_layer in row_parallel_keys:
+                    return 1  # RowParallel: lora_A sharded on input dim
+                elif base_layer in col_parallel_keys:
+                    return 0  # ColumnParallel: lora_A sharded on rank dim
+            elif is_lora_b:
+                # CRITICAL: linear_out in ParallelLinearAdapter is ALWAYS ColumnParallelLinear
+                # regardless of whether base layer is RowParallel or ColumnParallel.
+                # So lora_B is ALWAYS sharded on dim 0 (output dimension).
+                if base_layer in col_parallel_keys or base_layer in row_parallel_keys:
+                    return 0  # lora_B always sharded on output dim
+
+            return None
+
+        def _gather_tensor_across_tp(tensor, tp_group, split_dim: int):
+            """Gather tensor across TP ranks along the specified dimension.
+
+            Args:
+                tensor: Local shard of the tensor
+                tp_group: Tensor parallel process group
+                split_dim: Dimension along which tensor is sharded (0 or 1)
+
+            Returns:
+                Gathered tensor (full tensor on all ranks)
+            """
+            import torch
+            import torch.distributed as dist
+
+            tp_size = dist.get_world_size(tp_group)
+            if tp_size == 1:
+                return tensor
+
+            # Ensure tensor is on GPU for NCCL
+            device = torch.cuda.current_device()
+            tensor = tensor.to(device) if not tensor.is_cuda else tensor
+
+            if split_dim == 0:
+                # Gather along first dimension (ColumnParallel lora_B)
+                # Output shape: [tp_size * local_size, ...]
+                local_shape = list(tensor.shape)
+                gathered_shape = local_shape.copy()
+                gathered_shape[0] *= tp_size
+                output = torch.empty(gathered_shape, dtype=tensor.dtype, device=device)
+                dist.all_gather_into_tensor(output, tensor.contiguous(), group=tp_group)
+                return output
+            else:
+                # Gather along other dimension (RowParallel lora_A, fused lora_B)
+                # Need to use all_gather then cat
+                gathered_list = [torch.empty_like(tensor) for _ in range(tp_size)]
+                dist.all_gather(gathered_list, tensor.contiguous(), group=tp_group)
+                return torch.cat(gathered_list, dim=split_dim)
+
+        def _split_fused_gate_up_lora_b(tensor, tp_size_for_split: int):
+            """Split fused gate+up lora_B tensor with TP-aware interleaved layout.
+
+            When TP > 1, lora_B for fused gate+up is interleaved:
+            Layout: [gate_shard0, up_shard0, gate_shard1, up_shard1, ...]
+
+            M-Bridge reference: peft_bridge.py:282-311
+
+            Args:
+                tensor: Fused lora_B tensor of shape (2*intermediate_size, rank)
+                tp_size_for_split: TP size (use ETP for expert layers, TP for dense)
+
+            Returns:
+                (gate_tensor, up_tensor) each of shape (intermediate_size, rank)
+            """
+            import torch
+
+            if tp_size_for_split <= 1:
+                # Simple contiguous split
+                half_size = tensor.shape[0] // 2
+                return tensor[:half_size, :].clone(), tensor[half_size:, :].clone()
+
+            # TP > 1: Deinterleave the shards
+            shard_size = tensor.shape[0] // tp_size_for_split
+            if shard_size * tp_size_for_split != tensor.shape[0] or shard_size % 2 != 0:
+                # Fallback if dimensions don't match expected interleaved layout
+                logger.warning(f"Unexpected tensor shape for TP-aware split: {tensor.shape}, tp_size={tp_size_for_split}")
+                half_size = tensor.shape[0] // 2
+                return tensor[:half_size, :].clone(), tensor[half_size:, :].clone()
+
+            shards = torch.split(tensor, shard_size, dim=0)
+            gate_parts = []
+            up_parts = []
+            for shard in shards:
+                gate_shard, up_shard = torch.chunk(shard, 2, dim=0)
+                gate_parts.append(gate_shard)
+                up_parts.append(up_shard)
+            return torch.cat(gate_parts, dim=0), torch.cat(up_parts, dim=0)
+
+        # Get TP group and size for gathering
+        try:
+            from megatron.core import parallel_state as mpu
+            tp_group = mpu.get_tensor_model_parallel_group()
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            logger.info(f"[Rank {self.rank}] TP size: {tp_size}")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not get TP group: {e}, assuming TP=1")
+            tp_group = None
+            tp_size = 1
+
+        # Get ETP size for MoE expert layers
+        try:
+            from megatron.core import parallel_state as mpu
+            etp_size = mpu.get_expert_tensor_parallel_world_size()
+            logger.info(f"[Rank {self.rank}] ETP size: {etp_size}")
+        except Exception as e:
+            # ETP not available, assume 1 (no expert tensor parallelism)
+            etp_size = 1
+
+        # Get EP (Expert Parallelism) group, size, and rank
+        # CRITICAL: With EP=8, each rank holds different experts (64/8 = 8 experts per rank)
+        # We must gather expert LoRAs from ALL EP ranks to export complete state
+        try:
+            from megatron.core import parallel_state as mpu
+            ep_group = mpu.get_expert_model_parallel_group()
+            ep_size = mpu.get_expert_model_parallel_world_size()
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            logger.info(f"[Rank {self.rank}] EP size: {ep_size}, EP rank: {ep_rank}")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Could not get EP group: {e}, assuming EP=1")
+            ep_group = None
+            ep_size = 1
+            ep_rank = 0
+
+        def _gather_expert_lora_across_ep(tensor, ep_group, ep_size: int):
+            """Gather expert LoRA tensor from all EP ranks.
+
+            Each EP rank holds a shard of experts. We gather all shards to
+            get complete expert weights.
+
+            Args:
+                tensor: Local expert LoRA tensor
+                ep_group: Expert parallel process group
+                ep_size: Number of EP ranks
+
+            Returns:
+                List of tensors, one per EP rank (indexed by ep_rank)
+            """
+            import torch
+            import torch.distributed as dist
+
+            if ep_size == 1:
+                return [tensor]
+
+            # Ensure tensor is on GPU for NCCL
+            device = torch.cuda.current_device()
+            tensor = tensor.to(device) if not tensor.is_cuda else tensor
+
+            # Gather from all EP ranks
+            gathered_list = [torch.empty_like(tensor) for _ in range(ep_size)]
+            dist.all_gather(gathered_list, tensor.contiguous(), group=ep_group)
+            return gathered_list
+
+        # ========== End TP/EP Gathering Helpers ==========
 
         adapter_state = {}
 
@@ -1233,32 +1829,84 @@ class MegatronRankWorker:
                     name_lower = name.lower()
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
-                        # CRITICAL: ALL ranks must do the same work to avoid NCCL deadlock!
-                        # eval_mode().__exit__ has a barrier - if rank 0 is slower (due to CPU copies),
-                        # other ranks wait at barrier indefinitely.
-                        # Fix: all ranks clone to CPU, only rank 0 keeps the result.
-                        cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
+                        original_shape = list(param.data.shape)
+                        # DEBUG: Log original tensor shape with more detail
                         if self.rank == 0:
-                            adapter_state[name] = cloned
+                            is_lora_a = '.adapter.linear_in.' in name or '.lora_a.' in name_lower
+                            lora_type = "lora_A" if is_lora_a else "lora_B"
+                            logger.info(f"[Rank 0] Megatron {lora_type} {name}: shape={original_shape}")
+                        # CRITICAL: ALL ranks must participate in gathering to avoid NCCL deadlock!
+                        # Check if this parameter needs TP gathering
+                        split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
+                        if self.rank == 0:
+                            # Detailed logging for shape debugging
+                            is_expert = '.mlp.experts.' in name or '.mlp.shared_experts.' in name or '.mlp.linear_fc' in name
+                            logger.info(f"[Rank 0] {name}: split_dim={split_dim}, is_expert={is_expert}, etp_size={etp_size}, tp_size={tp_size}")
+                        if split_dim is not None and tp_group is not None and tp_size > 1:
+                            # Gather across TP ranks, then clone to CPU
+                            gathered = _gather_tensor_across_tp(param.data, tp_group, split_dim)
+                            cloned = gathered.cpu()
+                            if self.rank == 0:
+                                # Log shape change due to gathering
+                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(cloned.shape)} (dim={split_dim})")
+                        else:
+                            # No TP gathering needed - just clone
+                            cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
+                            if self.rank == 0:
+                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(cloned.shape)}")
+
+                        # CRITICAL FIX: EP gathering for routed expert LoRAs
+                        # With EP=8, each rank holds different experts (64/8 = 8 per rank)
+                        # We must gather from ALL EP ranks to export complete expert weights
+                        is_routed_expert = '.mlp.experts.' in name and '.mlp.shared_experts.' not in name
+                        if is_routed_expert and ep_group is not None and ep_size > 1:
+                            # ALL ranks participate in EP allgather
+                            ep_gathered = _gather_expert_lora_across_ep(cloned, ep_group, ep_size)
+                            if self.rank == 0:
+                                logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
+                                # Store with EP rank index for later expansion
+                                # Key format: original_name::EP_RANK::{i}
+                                for i, tensor in enumerate(ep_gathered):
+                                    ep_key = f"{name}::EP_RANK::{i}"
+                                    adapter_state[ep_key] = tensor.cpu() if tensor.is_cuda else tensor
+                        else:
+                            # Non-expert param or EP=1: store normally (only rank 0)
+                            if self.rank == 0:
+                                adapter_state[name] = cloned
 
                 logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
 
                 if self.rank == 0:
-                    # Write diagnostic info
+                    # Write diagnostic info with shapes
                     try:
                         import datetime
                         with open(debug_file, "a") as f:
                             f.write(f"\n=== {datetime.datetime.now()} (named_parameters within eval_mode) ===\n")
                             f.write(f"Total params: {len(all_param_names)}\n")
                             f.write(f"LoRA params found: {len(lora_param_names)}\n")
-                            f.write(f"Sample all params (first 20):\n")
-                            for n in all_param_names[:20]:
-                                f.write(f"  {n}\n")
-                            if lora_param_names:
-                                f.write(f"LoRA params:\n")
-                                for n in lora_param_names[:30]:
-                                    f.write(f"  {n}\n")
+                            f.write(f"TP size: {tp_size}, ETP size: {etp_size}, EP size: {ep_size}\n")
+                            f.write(f"LoRA params with shapes and norms:\n")
+                            total_norm = 0.0
+                            nonzero_count = 0
+                            for n in lora_param_names[:50]:
+                                if n in adapter_state:
+                                    t = adapter_state[n]
+                                    shape = list(t.shape)
+                                    norm = float(t.norm().item())
+                                    max_val = float(t.abs().max().item())
+                                    total_norm += norm
+                                    if norm > 1e-8:
+                                        nonzero_count += 1
+                                    f.write(f"  {n}: shape={shape}, norm={norm:.6f}, max={max_val:.6f}\n")
+                            f.write(f"\nSummary: {nonzero_count}/{len(lora_param_names[:50])} tensors non-zero, total_norm={total_norm:.6f}\n")
                             f.write(f"===\n")
+                        # ALSO LOG TO STDOUT for visibility in server logs
+                        logger.info(f"[Rank 0] LoRA TENSOR NORMS: {nonzero_count}/{len(lora_param_names[:50])} non-zero, total_norm={total_norm:.6f}")
+                        for n in lora_param_names[:5]:
+                            if n in adapter_state:
+                                t = adapter_state[n]
+                                norm = float(t.norm().item())
+                                logger.info(f"[Rank 0] TENSOR {n}: norm={norm:.6f}")
                     except Exception as e:
                         logger.warning(f"Failed to write debug file: {e}")
 
@@ -1316,8 +1964,13 @@ class MegatronRankWorker:
                     raw_state = get_adapter_state_dict(self.engine.module)
                     logger.info(f"[Rank {self.rank}] get_adapter_state_dict returned {len(raw_state)} params")
                     for name, tensor in raw_state.items():
-                        # ALL ranks do the work, only rank 0 stores result
-                        cloned = tensor.cpu() if tensor.is_cuda else tensor.clone()
+                        # ALL ranks must participate in gathering
+                        split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
+                        if split_dim is not None and tp_group is not None and tp_size > 1:
+                            gathered = _gather_tensor_across_tp(tensor, tp_group, split_dim)
+                            cloned = gathered.cpu()
+                        else:
+                            cloned = tensor.cpu() if tensor.is_cuda else tensor.clone()
                         if self.rank == 0:
                             adapter_state[name] = cloned
                     if self.rank == 0 and adapter_state:
@@ -1343,13 +1996,13 @@ class MegatronRankWorker:
         def _is_mlp_module(param_name: str) -> bool:
             """Check if parameter is from MLP/expert layer."""
             mlp_patterns = ['.mlp.', '.experts.', 'linear_fc1', 'linear_fc2',
-                           'gate_proj', 'up_proj', 'down_proj']
+                           'gate_proj', 'up_proj', 'down_proj', 'shared_expert']
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
 
         # Check if model is MoE
         try:
-            model_is_moe = is_moe_model(self.base_model)
+            model_is_moe = get_model_config(self.base_model).is_moe
         except ValueError:
             model_is_moe = False
 
@@ -1373,8 +2026,107 @@ class MegatronRankWorker:
         lora_state_dict = {}
         mlp_filtered_count = 0
         mlp_expanded_count = 0
-        logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state")
+
+        # Calculate experts per EP rank (for EP-indexed expansion)
+        experts_per_ep_rank = num_experts // ep_size if ep_size > 1 and num_experts > 0 else num_experts
+
+        logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state (ep_size={ep_size}, experts_per_ep_rank={experts_per_ep_rank})")
+
+        # First pass: group EP-indexed keys by base name
+        ep_grouped_params = {}  # base_name -> {ep_rank: tensor}
+        regular_params = {}  # name -> tensor
         for name, tensor in adapter_state.items():
+            if '::EP_RANK::' in name:
+                # Parse EP-indexed key: base_name::EP_RANK::X
+                base_name, _, ep_rank_str = name.rpartition('::EP_RANK::')
+                ep_rank_idx = int(ep_rank_str)
+                if base_name not in ep_grouped_params:
+                    ep_grouped_params[base_name] = {}
+                ep_grouped_params[base_name][ep_rank_idx] = tensor
+            else:
+                regular_params[name] = tensor
+
+        logger.info(f"[Rank 0] Found {len(ep_grouped_params)} EP-grouped params, {len(regular_params)} regular params")
+
+        # Process EP-grouped params with correct expert assignment
+        for base_name, ep_tensors in ep_grouped_params.items():
+            # Convert base name to PEFT format
+            peft_name = self._convert_megatron_to_peft(base_name)
+            if peft_name is None:
+                logger.warning(f"Could not convert to PEFT: {base_name}")
+                continue
+
+            # Handle MoE MLP/expert modules with EP-aware expansion
+            if model_is_moe and _is_mlp_module(peft_name):
+                is_shared_expert = '.shared_expert.' in peft_name
+
+                if use_per_expert_lora and num_experts > 0 and not is_shared_expert:
+                    # Split fused gate_up_proj if needed, then expand with EP-aware indexing
+                    if '.gate_up_proj_fused.' in peft_name:
+                        import torch
+                        gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
+                        up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
+
+                        # Expand with correct EP rank -> expert index mapping
+                        for ep_rank_idx, tensor in ep_tensors.items():
+                            # Calculate expert range for this EP rank
+                            expert_start = ep_rank_idx * experts_per_ep_rank
+                            expert_end = min(expert_start + experts_per_ep_rank, num_experts)
+
+                            if '.lora_A.' in peft_name:
+                                gate_tensor = tensor
+                                up_tensor = tensor
+                            elif '.lora_B.' in peft_name:
+                                # Use TP-aware split for interleaved gate+up layout
+                                # For MoE experts, use etp_size; if ETP=1, fallback to simple split
+                                gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, etp_size)
+                            else:
+                                continue
+
+                            # Assign to specific expert indices
+                            for expert_idx in range(expert_start, expert_end):
+                                gate_expert_name = gate_peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
+                                up_expert_name = up_peft_name.replace('.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.')
+                                lora_state_dict[gate_expert_name] = gate_tensor.clone()
+                                lora_state_dict[up_expert_name] = up_tensor.clone()
+                                mlp_expanded_count += 2
+
+                        logger.info(f"[Rank 0] EP-expanded fused MLP LoRA to {len(ep_tensors) * experts_per_ep_rank * 2} per-expert weights")
+                    else:
+                        # Non-fused modules with EP-aware expansion
+                        for ep_rank_idx, tensor in ep_tensors.items():
+                            expert_start = ep_rank_idx * experts_per_ep_rank
+                            expert_end = min(expert_start + experts_per_ep_rank, num_experts)
+
+                            for expert_idx in range(expert_start, expert_end):
+                                # Insert expert index into path
+                                if '.mlp.gate_proj.' in peft_name:
+                                    expert_peft_name = peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
+                                elif '.mlp.up_proj.' in peft_name:
+                                    expert_peft_name = peft_name.replace('.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.')
+                                elif '.mlp.down_proj.' in peft_name:
+                                    expert_peft_name = peft_name.replace('.mlp.down_proj.', f'.mlp.experts.{expert_idx}.down_proj.')
+                                else:
+                                    expert_peft_name = peft_name.replace('.mlp.', f'.mlp.experts.{expert_idx}.')
+                                lora_state_dict[expert_peft_name] = tensor.clone()
+                                mlp_expanded_count += 1
+
+                        logger.info(f"[Rank 0] EP-expanded MLP LoRA: {base_name} -> {num_experts} experts")
+                elif is_shared_expert:
+                    # Shared expert (EP rank 0 only for shared experts)
+                    if 0 in ep_tensors:
+                        lora_state_dict[peft_name] = ep_tensors[0]
+                        logger.info(f"[Rank 0] Added shared_expert MLP LoRA from EP rank 0: {peft_name}")
+                else:
+                    mlp_filtered_count += len(ep_tensors)
+                continue
+
+            # Non-MLP EP-grouped params (shouldn't happen, but handle gracefully)
+            if 0 in ep_tensors:
+                lora_state_dict[peft_name] = ep_tensors[0]
+
+        # Process regular (non-EP-indexed) params
+        for name, tensor in regular_params.items():
             # Add PEFT prefix if not already present
             if name.startswith("model."):
                 peft_name = f"base_model.model.{name}"
@@ -1388,34 +2140,87 @@ class MegatronRankWorker:
                     continue
 
             # Handle MoE MLP/expert modules
+            # IMPORTANT: shared_expert modules should NOT be expanded to per-expert format
             if model_is_moe and _is_mlp_module(peft_name):
-                if use_per_expert_lora and num_experts > 0:
-                    # Expand shared LoRA to per-expert format
-                    # Shared: base_model.model.model.layers.X.mlp.gate_proj.lora_A.weight
-                    # Per-expert: base_model.model.model.layers.X.mlp.experts.{i}.gate_proj.lora_A.weight
-                    expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
-                    for expanded_name in expanded_names:
-                        lora_state_dict[expanded_name] = tensor.clone()
-                        mlp_expanded_count += 1
+                is_shared_expert = '.shared_expert.' in peft_name
 
-                    # vLLM pack_moe requires gate_proj, up_proj, down_proj (all 3)
-                    # Megatron only has linear_fc1 (gate_proj) and linear_fc2 (down_proj)
-                    # Create dummy zero up_proj weights when expanding gate_proj
-                    if '.gate_proj.' in peft_name:
+                if use_per_expert_lora and num_experts > 0:
+                    # First check if this is a fused gate_up_proj that needs splitting
+                    if '.gate_up_proj_fused.' in peft_name:
                         import torch
-                        up_proj_peft_name = peft_name.replace('.gate_proj.', '.up_proj.')
-                        up_proj_expanded = self._expand_shared_to_per_expert(up_proj_peft_name, num_experts)
-                        for expanded_name in up_proj_expanded:
-                            # Create zero tensor with same shape as gate_proj
-                            lora_state_dict[expanded_name] = torch.zeros_like(tensor)
-                            mlp_expanded_count += 1
-                        logger.info(f"[Rank 0] Created {len(up_proj_expanded)} dummy up_proj weights for vLLM compatibility")
+                        # Split the fused projection before expanding to per-expert
+                        gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
+                        up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
+
+                        if '.lora_A.' in peft_name:
+                            # lora_A is shared - duplicate for both gate and up
+                            gate_tensor = tensor.clone()
+                            up_tensor = tensor.clone()
+                        elif '.lora_B.' in peft_name:
+                            # lora_B uses TP-aware split for interleaved gate+up layout
+                            # For MoE/shared experts, use etp_size
+                            gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, etp_size)
+                        else:
+                            logger.warning(f"[Rank 0] Unknown lora type for fused MoE: {peft_name}")
+                            continue
+
+                        if is_shared_expert:
+                            # Shared expert: add directly without per-expert expansion
+                            lora_state_dict[gate_peft_name] = gate_tensor
+                            lora_state_dict[up_peft_name] = up_tensor
+                            logger.info(f"[Rank 0] Split shared_expert fused MLP LoRA: {gate_peft_name}, {up_peft_name}")
+                        else:
+                            # Routed experts: expand both gate and up to per-expert format
+                            for proj_name, proj_tensor in [(gate_peft_name, gate_tensor), (up_peft_name, up_tensor)]:
+                                expanded_names = self._expand_shared_to_per_expert(proj_name, num_experts)
+                                for expanded_name in expanded_names:
+                                    lora_state_dict[expanded_name] = proj_tensor.clone()
+                                    mlp_expanded_count += 1
+                            logger.info(f"[Rank 0] Split and expanded fused MLP LoRA to {len(expanded_names)*2} per-expert weights")
+                    else:
+                        # Non-fused modules
+                        if is_shared_expert:
+                            # Shared expert: add directly without expansion
+                            lora_state_dict[peft_name] = tensor
+                            logger.info(f"[Rank 0] Added shared_expert MLP LoRA: {peft_name}")
+                        else:
+                            # Routed experts: expand to per-expert
+                            expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
+                            for expanded_name in expanded_names:
+                                lora_state_dict[expanded_name] = tensor.clone()
+                                mlp_expanded_count += 1
                 else:
                     # Filter out MLP modules when not using per-expert expansion
                     mlp_filtered_count += 1
                 continue
 
             lora_state_dict[peft_name] = tensor
+
+            # Special handling for fused gate+up projection (linear_fc1)
+            # vLLM's MergedColumnParallelLinearWithLoRA expects separate gate_proj and up_proj
+            # lora_A is duplicated, lora_B is split in half
+            if '.gate_up_proj_fused.' in peft_name:
+                import torch
+                gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
+                up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
+
+                if '.lora_A.' in peft_name:
+                    # lora_A is shared between gate and up projections
+                    lora_state_dict[gate_peft_name] = tensor.clone()
+                    lora_state_dict[up_peft_name] = tensor.clone()
+                    logger.info(f"[Rank 0] Split fused lora_A: {gate_peft_name}, {up_peft_name}")
+                elif '.lora_B.' in peft_name:
+                    # lora_B uses TP-aware split for interleaved gate+up layout
+                    # For dense layers (non-MoE), use tp_size
+                    gate_tensor, up_tensor = _split_fused_gate_up_lora_b(tensor, tp_size)
+                    lora_state_dict[gate_peft_name] = gate_tensor
+                    lora_state_dict[up_peft_name] = up_tensor
+                    logger.info(f"[Rank 0] Split fused lora_B: {gate_peft_name} shape {gate_tensor.shape}, {up_peft_name} shape {up_tensor.shape}")
+                else:
+                    logger.warning(f"[Rank 0] Unknown lora type for fused projection: {peft_name}")
+
+                # Remove the placeholder entry
+                del lora_state_dict[peft_name]
 
         if model_is_moe:
             if use_per_expert_lora:
@@ -1435,6 +2240,10 @@ class MegatronRankWorker:
         if lora_state_dict:
             sample_peft_keys = list(lora_state_dict.keys())[:5]
             logger.info(f"[Rank 0] Sample PEFT keys: {sample_peft_keys}")
+            # Log shapes for debugging vLLM compatibility
+            for key in list(lora_state_dict.keys())[:10]:
+                tensor = lora_state_dict[key]
+                logger.info(f"[Rank 0] FINAL PEFT {key}: shape={list(tensor.shape)}")
 
         return lora_state_dict
 
@@ -1502,7 +2311,7 @@ class MegatronRankWorker:
         # Also check model registry for MLA flag (fallback)
         if not model_is_mla:
             try:
-                model_is_mla = is_mla_model(self.base_model)
+                model_is_mla = get_model_config(self.base_model).is_mla
             except (ValueError, AttributeError):
                 pass
 
@@ -1530,13 +2339,26 @@ class MegatronRankWorker:
         elif 'self_attention.linear_proj' in name:
             target = 'self_attn.o_proj'
         # MLP/Expert projections
+        # IMPORTANT: Distinguish shared_experts from routed experts
+        # shared_experts: single expert, always active (different intermediate size)
+        # experts: routed experts, need per-expert expansion
         elif 'linear_fc1' in name:
-            # MLP gate/up projection - map to gate_proj
-            # For MoE, this is the expert's first linear layer
-            target = 'mlp.gate_proj'
+            if '.shared_experts.' in name:
+                # Shared expert MLP - use separate namespace to avoid overwriting routed experts
+                target = 'mlp.shared_expert.gate_up_proj_fused'
+            else:
+                # Routed expert MLP gate/up fused projection - map to gate_up_proj
+                # For vLLM MergedColumnParallelLinear, we need separate gate_proj and up_proj
+                # This is handled specially in get_lora_state_dict to split the B matrix
+                # Here we mark it as gate_up_proj_fused to trigger special handling
+                target = 'mlp.gate_up_proj_fused'
         elif 'linear_fc2' in name:
-            # MLP down projection
-            target = 'mlp.down_proj'
+            if '.shared_experts.' in name:
+                # Shared expert down projection
+                target = 'mlp.shared_expert.down_proj'
+            else:
+                # Routed expert down projection
+                target = 'mlp.down_proj'
 
         if target is None:
             logger.warning(f"Unknown module pattern: {name}")
@@ -1787,37 +2609,58 @@ class MegatronRankWorker:
 
         return info
 
-    def save_checkpoint(self, save_path: str, step_count: int = 0) -> dict:
+    def save_checkpoint(self, save_path: str, step_count: int = 0, actual_rank: int | None = None, use_per_expert_lora: bool = False) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
-        Only rank 0 saves the checkpoint.
+        IMPORTANT: ALL ranks must call this method because get_lora_state_dict()
+        uses NCCL collectives. Only rank 0 saves to disk.
 
         Args:
             save_path: Directory path to save checkpoint files.
             step_count: Current training step (passed from MegatronWorkerGroup).
+            actual_rank: Actual LoRA rank for current session (Phase 7).
+                         If None, falls back to self.lora_rank (max_lora_rank).
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
-            Dict with training metadata.
+            Dict with training metadata (rank 0 only, others return empty).
         """
         import json
         import os
 
         from safetensors.torch import save_file
 
+        # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
+        # Only rank 0 gets actual data, others get empty dict
+        state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
+
+        # Only rank 0 saves to disk
         if self.rank != 0:
             return {}
 
         os.makedirs(save_path, exist_ok=True)
 
         # 1. LoRA weights (PEFT format)
-        state_dict = self.get_lora_state_dict()
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
+        # Use actual session rank (Phase 7) or fall back to max_lora_rank
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        try:
+            model_is_mla = get_model_config(self.base_model).is_mla
+        except ValueError:
+            model_is_mla = False
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+        ] if not model_is_mla else [
+            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
+        ]
+        target_modules += ["gate_proj", "up_proj", "down_proj"]
+        # Include attention modules; add MLP modules only when trained
         config = {
-            "r": self.lora_rank,
-            "lora_alpha": self.lora_rank,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "r": effective_rank,
+            "lora_alpha": effective_rank * 2,
+            "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
             "base_model_name_or_path": self.base_model,
@@ -1836,9 +2679,8 @@ class MegatronRankWorker:
         abs_path = os.path.abspath(save_path)
         logger.info(f"[MegatronRankWorker] Saved checkpoint to {abs_path} (step={step_count})")
 
-        # Return state_dict and peft_config for vLLM multi-LoRA registration
-        meta["state_dict"] = state_dict
-        meta["peft_config"] = config
+        # Note: state_dict NOT included in return value to avoid OOM on API server
+        # when transferring 37k+ MoE LoRA tensors through Ray. vLLM loads from path.
         return meta
 
 
@@ -2088,6 +2930,10 @@ class MegatronWorkerGroup:
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
+                # TransformerEngine debug - see why attention backends are disabled
+                "NVTE_DEBUG": "1",
+                "NVTE_DEBUG_LEVEL": "2",
             },
         }
 
@@ -2144,6 +2990,7 @@ class MegatronWorkerGroup:
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
         session_id: str | None = None,
+        reset_bias: bool | None = None,
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -2152,6 +2999,9 @@ class MegatronWorkerGroup:
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
             session_id: Session ID for multi-tenant gradient isolation.
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
+                This ensures logprobs match vLLM (which always has bias=0).
 
         Returns:
             Dict with loss_fn_outputs and metrics.
@@ -2164,35 +3014,88 @@ class MegatronWorkerGroup:
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
         futures = [
-            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id)
+            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id, reset_bias)
             for w in self.workers
         ]
         results = ray.get(futures)
 
-        # Rank 0 result has metrics
-        rank0_result = results[0]
+        # Pick the first non-empty result (pipeline last stage).
+        rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
         loss_value = rank0_result.get("loss_value", 0.0)
         num_tokens = rank0_result.get("num_tokens", 0)
+        valid_count = rank0_result.get("valid_count")
+        if valid_count is None:
+            valid_count = len(data_items)
+
+        # NaN guard: check for NaN/Inf in loss_value
+        if math.isnan(loss_value) or math.isinf(loss_value):
+            logger.warning(f"[MegatronWorkerGroup] NaN/Inf in loss_value={loss_value}, replacing with 0.0")
+            loss_value = 0.0
 
         metrics = {
             "loss:mean": float(loss_value),
-            "num_samples:sum": float(len(data_items)),
+            "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
 
         # Add PPO metrics if present (now pre-extracted as scalars)
+        # importance_sampling uses PPO loss with epsilon=inf, so include it here
         n_ppo = rank0_result.get("n_ppo_results", 0)
-        if loss_fn == "ppo" and n_ppo > 0:
+        if loss_fn in ("ppo", "importance_sampling") and n_ppo > 0:
             clip_frac_sum = rank0_result.get("clip_frac_sum", 0.0)
             ratio_mean_sum = rank0_result.get("ratio_mean_sum", 0.0)
             metrics["clipfrac:mean"] = float(clip_frac_sum / n_ppo)
             metrics["ratio:mean"] = float(ratio_mean_sum / n_ppo)
 
+        # Add debug metrics if present (precision difference between rollout and training)
+        debug_metrics = rank0_result.get("debug_metrics", {})
+        if debug_metrics:
+            # Filter out None and NaN values to avoid pydantic validation errors
+            # (orjson converts NaN to null, which causes pydantic failures)
+            filtered_debug_metrics = {
+                k: v for k, v in debug_metrics.items()
+                if v is not None and isinstance(v, (int, float)) and not math.isnan(v) and not math.isinf(v)
+            }
+            if filtered_debug_metrics:
+                metrics.update(filtered_debug_metrics)
+                logger.info(f"[MegatronWorkerGroup] Debug metrics: {filtered_debug_metrics}")
+
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
+
+        loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
+
+        # NaN guard for individual loss_fn_outputs entries
+        # orjson converts NaN/Inf to null, causing pydantic validation failures
+        avg_loss_fallback = loss_value / max(valid_count, 1) if valid_count > 0 else 0.0
+        if math.isnan(avg_loss_fallback) or math.isinf(avg_loss_fallback):
+            avg_loss_fallback = 0.0
+
+        nan_count = 0
+        for output in loss_fn_outputs:
+            if isinstance(output, dict) and "loss" in output:
+                loss_data = output["loss"].get("data", [])
+                if loss_data:
+                    val = loss_data[0]
+                    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                        output["loss"]["data"] = [avg_loss_fallback]
+                        nan_count += 1
+        if nan_count > 0:
+            logger.warning(f"[MegatronWorkerGroup] Replaced {nan_count} NaN/Inf/None loss values with {avg_loss_fallback}")
+
+        if len(loss_fn_outputs) < len(data_items):
+            # Use avg_loss_fallback (already NaN-guarded) for padding entries
+            loss_fn_outputs = list(loss_fn_outputs)
+            loss_fn_outputs.extend(
+                {
+                    "loss": {"data": [avg_loss_fallback], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
+                }
+                for _ in range(len(data_items) - len(loss_fn_outputs))
+            )
 
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
-            "loss_fn_outputs": rank0_result.get("loss_fn_outputs", []),
+            "loss_fn_outputs": loss_fn_outputs,
             "metrics": metrics,
         }
 
@@ -2200,6 +3103,7 @@ class MegatronWorkerGroup:
         self,
         data_items: list[dict],
         session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
+        reset_bias: bool | None = None,
     ) -> dict:
         """Run forward pass only on all workers. Returns per-token logprobs.
 
@@ -2209,25 +3113,64 @@ class MegatronWorkerGroup:
         Args:
             data_items: List of Tinker Datum dicts.
             session_id: Unused - session management handled via swap_session().
+            reset_bias: If True, reset expert_bias to zero before forward pass.
+                If None, uses MINT_RESET_EXPERT_BIAS (default True for logprob-only).
+                This ensures logprobs match vLLM (which always has bias=0).
 
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
-        futures = [w.forward.remote(data_items) for w in self.workers]
+        futures = [w.forward.remote(data_items, reset_bias) for w in self.workers]
         results = ray.get(futures)
 
-        # Rank 0 result has metrics, loss_fn_outputs, and log_probs
-        rank0_result = results[0]
+        # Pick the first non-empty result (pipeline last stage).
+        rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
         loss_value = rank0_result.get("loss_value", 0.0)
         num_tokens = rank0_result.get("num_tokens", 0)
+        valid_count = rank0_result.get("valid_count")
+        if valid_count is None:
+            valid_count = len(data_items)
+
+        # NaN guard for loss_value
+        if math.isnan(loss_value) or math.isinf(loss_value):
+            logger.warning(f"[MegatronWorkerGroup.forward] NaN/Inf in loss_value={loss_value}, replacing with 0.0")
+            loss_value = 0.0
+
         loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
+
+        # NaN guard for individual loss_fn_outputs entries
+        avg_loss_fallback = loss_value / max(valid_count, 1) if valid_count > 0 else 0.0
+        if math.isnan(avg_loss_fallback) or math.isinf(avg_loss_fallback):
+            avg_loss_fallback = 0.0
+
+        nan_count = 0
+        for output in loss_fn_outputs:
+            if isinstance(output, dict) and "loss" in output:
+                loss_data = output["loss"].get("data", [])
+                if loss_data:
+                    val = loss_data[0]
+                    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                        output["loss"]["data"] = [avg_loss_fallback]
+                        nan_count += 1
+        if nan_count > 0:
+            logger.warning(f"[MegatronWorkerGroup.forward] Replaced {nan_count} NaN/Inf/None loss values with {avg_loss_fallback}")
+
+        if len(loss_fn_outputs) < len(data_items):
+            loss_fn_outputs = list(loss_fn_outputs)
+            loss_fn_outputs.extend(
+                {
+                    "loss": {"data": [avg_loss_fallback], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
+                }
+                for _ in range(len(data_items) - len(loss_fn_outputs))
+            )
         log_probs = rank0_result.get("log_probs")  # Per-token log_probs tensor
 
         metrics = {
             "loss:mean": float(loss_value),
-            "num_samples:sum": float(len(data_items)),
+            "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
 
@@ -2264,81 +3207,35 @@ class MegatronWorkerGroup:
         Args:
             learning_rate: Learning rate for this step.
             session_id: Session ID for multi-tenant gradient isolation.
+
+        Returns:
+            Dict with metrics including grad_norm from rank 0.
         """
         # Use current session if session_id not provided
         effective_session_id = session_id or self._current_session
 
         futures = [w.optim_step.remote(learning_rate, effective_session_id) for w in self.workers]
-        ray.get(futures)
-
-        self._step_count += 1
-        return {"metrics": {"step": self._step_count}}
-
-    def train_step(
-        self,
-        data_items: list[dict],
-        loss_fn: str,
-        loss_fn_config: dict,
-        learning_rate: float,
-    ) -> dict:
-        """Run forward, backward, and optimizer step in a single train_mode context.
-
-        This is the correct way to train with param_offload=True. Keeps all operations
-        in one train_mode context so gradients survive for optimizer step.
-
-        Args:
-            data_items: List of Tinker Datum dicts.
-            loss_fn: Loss function type.
-            loss_fn_config: Loss function config.
-            learning_rate: Learning rate.
-
-        Returns:
-            Dict with loss metrics and optimizer results.
-        """
-        # Call all workers in parallel
-        futures = [
-            w.train_step.remote(data_items, loss_fn, loss_fn_config, learning_rate)
-            for w in self.workers
-        ]
         results = ray.get(futures)
 
-        # Rank 0 returns the actual result
+        # Rank 0 returns the actual result with grad_norm
         rank0_result = results[0]
-
-        self._step_count += 1
-
-        # Extract metrics from rank 0 result
-        loss_value = rank0_result.get("loss_value", 0.0)
-        num_tokens = rank0_result.get("num_tokens", 0)
-        clip_frac_sum = rank0_result.get("clip_frac_sum", 0.0)
-        ratio_mean_sum = rank0_result.get("ratio_mean_sum", 0.0)
-        n_ppo_results = rank0_result.get("n_ppo_results", 0)
         grad_norm = rank0_result.get("grad_norm", 0.0)
         lr = rank0_result.get("lr", learning_rate)
 
-        n_samples = len(data_items) or 1
+        self._step_count += 1
 
-        metrics = {
-            "loss:mean": loss_value / n_samples if n_samples > 0 else loss_value,
-            "num_samples:sum": float(n_samples),
-            "num_tokens:sum": float(num_tokens),
-            "grad_norm": grad_norm,
-            "lr": lr,
-            "step": self._step_count,
-        }
-        if n_ppo_results > 0:
-            metrics["clipfrac:mean"] = clip_frac_sum / n_ppo_results
-            metrics["ratio:mean"] = ratio_mean_sum / n_ppo_results
-
-        logger.info(
-            f"[MegatronWorkerGroup] train_step: loss={loss_value:.4f}, "
-            f"grad_norm={grad_norm:.4f}, step={self._step_count}"
+        print(
+            f"[MegatronWorkerGroup] optim_step: grad_norm={grad_norm:.4f}, "
+            f"lr={lr}, step={self._step_count}",
+            flush=True
         )
 
         return {
-            "loss_fn_output_type": f"{loss_fn}_loss",
-            "loss_fn_outputs": rank0_result.get("loss_fn_outputs", []),
-            "metrics": metrics,
+            "metrics": {
+                "step": self._step_count,
+                "grad_norm": grad_norm,
+                "lr": lr,
+            }
         }
 
     def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict:
@@ -2349,8 +3246,7 @@ class MegatronWorkerGroup:
 
         Args:
             use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format
-                for vLLM FusedMoEWithLoRA compatibility. If False (default), filter out
-                MLP/expert modules for MoE models to avoid weight format mismatch.
+                for vLLM FusedMoEWithLoRA compatibility.
         """
         logger.info(f"[MegatronWorkerGroup] get_lora_state_dict: ENTRY (use_per_expert_lora={use_per_expert_lora})")
         logger.info(f"[MegatronWorkerGroup] Calling get_lora_state_dict.remote() on all {len(self.workers)} workers...")
@@ -2359,7 +3255,7 @@ class MegatronWorkerGroup:
             # Call ALL workers - bridge.export_weights() may use NCCL allgather
             # Rank 0 returns actual data, other ranks return empty dict
             futures = [w.get_lora_state_dict.remote(use_per_expert_lora) for w in self.workers]
-            results = ray.get(futures, timeout=300)
+            results = ray.get(futures, timeout=300)  # Increased timeout for large MoE models
 
             # Rank 0's result has the actual data
             result = results[0]
@@ -2372,17 +3268,86 @@ class MegatronWorkerGroup:
             logger.error(f"[MegatronWorkerGroup] get_lora_state_dict failed - worker died: {e}")
             raise RuntimeError(f"get_lora_state_dict failed - worker died: {e}")
 
+    def check_determinism_status(self) -> dict:
+        """Check determinism settings on all workers.
+
+        Returns:
+            dict with determinism status from rank 0
+        """
+        logger.info("[MegatronWorkerGroup] check_determinism_status: ENTRY")
+
+        try:
+            # Call ALL workers to get status
+            futures = [w.check_determinism_status.remote() for w in self.workers]
+            results = ray.get(futures, timeout=60)
+
+            # Rank 0's result has the status
+            result = results[0]
+            logger.info(f"[MegatronWorkerGroup] check_determinism_status: {result}")
+            return result
+        except ray.exceptions.GetTimeoutError:
+            logger.error("[MegatronWorkerGroup] check_determinism_status timed out")
+            raise RuntimeError("check_determinism_status timed out")
+        except ray.exceptions.RayActorError as e:
+            logger.error(f"[MegatronWorkerGroup] check_determinism_status failed: {e}")
+            raise RuntimeError(f"check_determinism_status failed: {e}")
+
+    def reset_expert_bias(self) -> dict:
+        """Reset expert_bias buffers to zero in all MoE router modules across all workers.
+
+        The expert_bias buffer accumulates during training to balance token distribution
+        across experts. However, this buffer is NOT exported with LoRA weights, causing
+        train-inference mismatch when comparing Megatron logprobs with vLLM.
+
+        Call this before computing logprobs to ensure consistent behavior with vLLM.
+
+        Returns:
+            dict with reset count from rank 0
+        """
+        logger.info("[MegatronWorkerGroup] reset_expert_bias: ENTRY")
+
+        try:
+            # Call ALL workers to ensure distributed consistency
+            futures = [w.reset_expert_bias.remote() for w in self.workers]
+            results = ray.get(futures, timeout=60)
+
+            # Rank 0's result has the count
+            result = results[0]
+            logger.info(f"[MegatronWorkerGroup] reset_expert_bias: reset {result.get('reset_count', 0)} buffers")
+            return result
+        except ray.exceptions.GetTimeoutError:
+            logger.error("[MegatronWorkerGroup] reset_expert_bias timed out")
+            raise RuntimeError("reset_expert_bias timed out")
+        except ray.exceptions.RayActorError as e:
+            logger.error(f"[MegatronWorkerGroup] reset_expert_bias failed: {e}")
+            raise RuntimeError(f"reset_expert_bias failed: {e}")
+
     def get_lora_config(self) -> dict:
         """Get LoRA configuration as dictionary.
-        
+
         Returns:
             PEFT config dict compatible with vLLM's PEFTHelper.
+
+        MLP modules are excluded by default for MoE models unless explicitly enabled.
         """
+        try:
+            model_is_mla = get_model_config(self.base_model).is_mla
+        except ValueError:
+            model_is_mla = False
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+        ] if not model_is_mla else [
+            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
+        ]
+        target_modules += ["gate_proj", "up_proj", "down_proj"]
+
+        # Use actual session rank (Phase 7) or fall back to max_lora_rank
+        effective_rank = self._actual_rank or self.lora_rank
         return {
-            "r": self.lora_rank,
-            "lora_alpha": self.lora_rank * 2,
+            "r": effective_rank,
+            "lora_alpha": effective_rank * 2,
             "lora_dropout": 0.0,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
             "peft_type": "LORA",
@@ -2404,7 +3369,7 @@ class MegatronWorkerGroup:
             "pad_token_id": tokenizer.pad_token_id,
         }
 
-    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+    def reinit_lora_weights(self, learning_rate: float | None = None, actual_rank: int | None = None) -> dict:
         """Reinitialize LoRA weights to fresh random state on all workers.
 
         This must be called when reusing an actor for a new session to ensure
@@ -2413,11 +3378,13 @@ class MegatronWorkerGroup:
         Args:
             learning_rate: New learning rate for the session. If provided,
                 updates all optimizer param_groups on all workers.
+            actual_rank: Actual LoRA rank for the new session (Phase 7).
+                If provided, updates _actual_rank for save_checkpoint.
 
         Returns:
             dict with status and total count of reinitialized parameters.
         """
-        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate})")
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate}, actual_rank={actual_rank})")
 
         # Call reinit on all workers (required for distributed sync)
         futures = [w.reinit_lora_weights.remote(learning_rate) for w in self.workers]
@@ -2435,14 +3402,17 @@ class MegatronWorkerGroup:
         if learning_rate is not None:
             self.learning_rate = learning_rate
 
-        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}")
-        return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate}
+        # Update actual_rank for save_checkpoint (Phase 7)
+        if actual_rank is not None:
+            self._actual_rank = actual_rank
+
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}")
+        return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate, "actual_rank": self._actual_rank}
 
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
         """Load checkpoint from path.
 
-        Note: Megatron distributed checkpoints use verl's checkpoint format.
-        This is a placeholder - actual implementation needs verl engine integration.
+        Delegates to load_adapter_state which handles distributed loading.
 
         Args:
             load_path: Path to checkpoint directory.
@@ -2451,23 +3421,51 @@ class MegatronWorkerGroup:
         Returns:
             Dict with load metadata.
         """
-        logger.warning(f"[MegatronWorkerGroup] load_checkpoint not fully implemented: {load_path}")
-        # For now, return empty metadata - full implementation requires
-        # coordinated loading across all workers
-        return {"status": "not_implemented", "path": load_path}
+        import os
+
+        logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
+
+        # Check what files exist in checkpoint directory
+        if os.path.isdir(load_path):
+            files = os.listdir(load_path)
+            logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(files)} files: {files[:10]}")
+
+            # Look for adapter checkpoint files (mp_rank_*_adapter.pt pattern)
+            adapter_files = [f for f in files if f.endswith("_adapter.pt")]
+            if adapter_files:
+                logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
+                # Delegate to load_adapter_state
+                result = self.load_adapter_state(load_path, actual_rank=self._actual_rank or self.lora_rank)
+                result["load_method"] = "load_adapter_state"
+                return result
+            else:
+                logger.warning(f"[MegatronWorkerGroup] load_checkpoint: no adapter files found in {load_path}")
+        else:
+            logger.error(f"[MegatronWorkerGroup] load_checkpoint: path does not exist or is not a directory: {load_path}")
+
+        return {"status": "no_adapter_files", "path": load_path}
 
 
-    def save_checkpoint(self, save_path: str) -> dict:
-        """Save checkpoint using rank 0 worker.
+    def save_checkpoint(self, save_path: str, use_per_expert_lora: bool = False) -> dict:
+        """Save checkpoint using all workers (rank 0 saves, others participate in NCCL).
+
+        IMPORTANT: Must call ALL workers because MegatronRankWorker.save_checkpoint
+        calls get_lora_state_dict() which uses NCCL collectives internally.
+        Calling only rank 0 would deadlock waiting for other ranks.
 
         Args:
             save_path: Directory path to save checkpoint files.
+            use_per_expert_lora: If True, expand shared MLP LoRA to per-expert format for MoE.
 
         Returns:
-            Dict with training metadata.
+            Dict with training metadata (from rank 0).
         """
-        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path}")
-        result = ray.get(self.workers[0].save_checkpoint.remote(save_path, self._step_count))
+        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path} (actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})")
+        # Call ALL workers - get_lora_state_dict uses NCCL allgather
+        # Rank 0 saves to disk, other ranks participate in collectives then return empty
+        futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora) for w in self.workers]
+        results = ray.get(futures, timeout=300)
+        result = results[0]  # Only rank 0 returns actual data
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
 
@@ -2897,7 +3895,7 @@ class MegatronActorPool:
                 self.DEFAULT_MAX_LORA_RANK,
             )
             actor_name = self._make_actor_name(base_model, effective_max_rank)
-            num_gpus = config.tensor_parallel_size * config.expert_parallel_size
+            num_gpus = config.world_size  # Use world_size which accounts for MoE Parallel Folding
 
             logger.info(
                 f"[MegatronActorPool] Creating new actor: {actor_name} for {base_model}, "
@@ -2939,6 +3937,7 @@ class MegatronActorPool:
                         "HF_HUB_OFFLINE": "1",
                         "TRANSFORMERS_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     }
                 }
 
@@ -3155,10 +4154,10 @@ def get_or_create_megatron_worker_group(
         )
         # Existing actor is already ready
         resource_pool.mark_ready(actor_name)
-        # Reinitialize LoRA weights for fresh session
-        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate})...")
-        result = ray.get(actor.reinit_lora_weights.remote(learning_rate))
-        logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
+        # Reinitialize LoRA weights for fresh session with actual_rank
+        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate}, actual_rank={lora_rank})...")
+        result = ray.get(actor.reinit_lora_weights.remote(learning_rate=learning_rate, actual_rank=lora_rank))
+        logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}, actual_rank={result.get('actual_rank')}")
         return actor
     except ValueError:
         # Actor doesn't exist, create new one
@@ -3180,6 +4179,7 @@ def get_or_create_megatron_worker_group(
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
             }
         }
 

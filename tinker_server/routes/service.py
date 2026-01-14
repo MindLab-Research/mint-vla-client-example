@@ -269,6 +269,7 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # =============================================================================
 
 
+
 def _require_admin(request: Request) -> None:
     """Raise 403 if not admin user."""
     user_data = getattr(request.state, "user_data", None)
@@ -389,6 +390,7 @@ async def megatron_status(request: Request, base_model: str | None = None) -> di
     return {"alive": alive, "actors": actors, "query_base_model": base_model}
 
 
+
 @router.get("/resource_pool")
 async def resource_pool_status(request: Request) -> dict:
     """Get unified resource pool status. Admin only.
@@ -422,3 +424,16 @@ async def clear_resource_pool(request: Request) -> dict:
     pool = get_resource_pool()
     count = pool.clear(kill_actors=False)
     return {"cleared": count, "message": f"Cleared {count} entries from resource pool"}
+
+
+@router.post("/kill_all_actors")
+async def kill_all_actors() -> dict:
+    """Kill all actors and clear the resource pool.
+
+    Use this to free all GPUs when actors are stuck or not being evicted properly.
+    """
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    count = pool.clear(kill_actors=True)
+    return {"killed": count, "message": f"Killed {count} actors and freed GPUs"}

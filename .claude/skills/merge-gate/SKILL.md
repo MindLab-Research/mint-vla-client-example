@@ -27,7 +27,7 @@ The merge gate validates that code on `develop` is ready to merge to `main`. It 
 
 | Model | vLLM GPUs | Megatron GPUs | Total |
 |-------|-----------|---------------|-------|
-| Qwen2.5-7B (Dense) | 1 | 1 | 2 |
+| Qwen3-0.6B (Dense) | 1 | 1 | 2 |
 | Qwen3-0.6B (Dense) | 1 | 1 | 2 |
 | Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4) | 8 |
 | Moonlight-16B-A3B (MLA) | 4 (TP=4) | 8 (TP=2,EP=4) | 12 |
@@ -126,7 +126,7 @@ curl -s http://localhost:8000/api/v1/healthz
 
 ## Test Suite
 
-### Phase 1: Dense Model Tests (Qwen2.5-7B-Instruct)
+### Phase 1: Dense Model Tests (Qwen3-0.6B)
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|
@@ -153,7 +153,7 @@ curl -s http://localhost:8000/api/v1/healthz
 | **moonlight_lora_transfer** | Train → Extract → vLLM Load → Generate | Full pipeline succeeds | 3 min |
 | **moonlight_rl** | Full RL loop: sample → reward → train | Policy ratio 0.5-2.0, gradients flow | 3 min |
 
-### Phase 3: Stress & Multi-Tenant Tests
+### Phase 3: Stress, Multi-Tenant, and Long Context Tests
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|
@@ -161,6 +161,8 @@ curl -s http://localhost:8000/api/v1/healthz
 | **interleaved_sessions** | A → B → A session switching | Loss continuity preserved | 3 min |
 | **rapid_session_creation** | 5 sessions in quick succession | All create successfully | 1 min |
 | **mixed_model_lru_eviction** | Dense → MoE → Dense | Graceful actor replacement | 5 min |
+| **moe_long_context_inference** | MoE inference at 38K tokens (near 40K limit) | Generates output without OOM | 5 min |
+| **moe_long_context_training** | MoE training at 38K tokens (near 40K limit) | Loss computed without OOM | 8 min |
 
 ### Supported Model Variants
 
@@ -168,8 +170,9 @@ The system supports multiple model variants. All variants of the same base model
 
 | Model | Type | GPUs | Backend | Status |
 |-------|------|------|---------|--------|
-| `Qwen/Qwen2.5-7B-Instruct` | Dense | 1 | PEFT/vLLM | Primary test target |
-| `Qwen/Qwen3-0.6B` | Dense | 1 | PEFT/vLLM | Small model for quick tests |
+| `Qwen/Qwen3-0.6B` | Dense | 1 | PEFT/vLLM | Primary test target (Phase 1) |
+| `Qwen/Qwen3-4B` | Dense | 1 | PEFT/vLLM | Medium dense model |
+| `Qwen/Qwen3-8B` | Dense | 1 | PEFT/vLLM | Large dense model |
 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | MoE | 4 (TP=4) | Megatron/vLLM | Primary MoE test target |
 | `Qwen/Qwen3-30B-A3B` | MoE | 4 (TP=4) | Megatron/vLLM | Base model variant |
 | `Qwen/Qwen3-30B-A3B-Base` | MoE | 4 (TP=4) | Megatron/vLLM | Pre-training base |
@@ -182,12 +185,12 @@ TINKER_BASE_URL=http://localhost:8000 \
 python scripts/test_qwen3_06b.py
 ```
 
-Stress test configurations:
-- Client 1: Dense model, SFT, rank=16
-- Client 2: Dense model, RL, rank=32
-- Client 3: Dense model, SFT, rank=64
-- Client 4: Dense model, DPO, rank=32
-- Client 5: Dense model, SFT, rank=16
+Stress test configurations (using Qwen3 models):
+- Client 1: Qwen3-0.6B, SFT, rank=16
+- Client 2: Qwen3-0.6B, RL, rank=32
+- Client 3: Qwen3-4B, SFT, rank=64
+- Client 4: Qwen3-8B, DPO, rank=32
+- Client 5: Qwen3-0.6B, SFT, rank=16
 
 ---
 
@@ -596,17 +599,3 @@ a pattern worth reviewing, but analysis shows implementation is correct.
 - Timeout on operation that normally succeeds (timeout too short)
 - Anomaly flagged but pattern matches expected behavior
 
----
-
-## Known Limitations
-
-### MoE LoRA Inference
-
-vLLM 0.12.0 does NOT support MoE expert (MLP) LoRA inference. The FusedMoEWithLoRA class exists but is disabled:
-
-- Module validation rejects MLP modules for MoE models
-- EP assertion blocks even with TP-only config
-
-**Current approach**: Filter out MLP modules in `get_lora_state_dict()`, export only attention LoRA (q_proj, k_proj, v_proj, o_proj). Training still uses full MLP+attention LoRA via Megatron, but inference is attention-only.
-
-**Impact**: Slightly reduced LoRA effectiveness for MoE models during inference. Training quality is unaffected.

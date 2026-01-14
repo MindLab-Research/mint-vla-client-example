@@ -18,7 +18,8 @@ import pytest
 from .conftest import (
     MOE_MODEL,
     create_session,
-    train_step,
+    forward_backward,
+    optim_step,
     save_weights,
     sample,
 )
@@ -133,12 +134,13 @@ class TestMoEAPI:
             },
         }]
 
-        # Train for a few iterations (MoE uses train_step)
+        # Train for a few iterations
         losses = []
         for i in range(3):
-            result = train_step(model_id, api_data, lr=1e-4, loss_fn="cross_entropy")
+            result = forward_backward(model_id, api_data, loss_fn="cross_entropy")
             loss = result.get("metrics", {}).get("loss:mean", 0)
             losses.append(loss)
+            optim_step(model_id, lr=1e-4)
             print(f"Iteration {i+1}: loss={loss:.4f}")
 
         # Save and sample

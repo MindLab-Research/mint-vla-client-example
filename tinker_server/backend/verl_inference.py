@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH
 
-# Import model registry for max_position_embeddings
-from tinker_server.backend.model_registry import get_max_position_embeddings
+# Import model registry
+from tinker_server.backend.model_registry import get_model_config
 
 # Apply verl's hijack for TensorLoRARequest support
 # Must be done before engine initialization
@@ -73,6 +73,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
         def __init__(self, *args, **kwargs):
             """Initialize with VLLMHijack applied first."""
+            # Set PYTHONPATH in OS environment so vLLM's TP workers inherit it
+            # Ray's runtime_env only sets it for this process, not multiprocessing children
+            # NOTE: Hardcode path since we can't import config before setting up path
+            import os
+            import sys
+            pfs_pythonpath = "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/huggingface/modules"
+            os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
+            for p in reversed(pfs_pythonpath.split(":")):
+                if p and p not in sys.path:
+                    sys.path.insert(0, p)
+            print(f"[ExtendedVLLMHttpServer] Set PYTHONPATH, vLLM path: {sys.path[0]}", flush=True)
+
             # Apply hijack BEFORE engine creation (in parent __init__)
             # This runs inside the Ray actor process on GPU node
             try:
@@ -246,10 +258,24 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             temp_dir = tempfile.mkdtemp(prefix=f"tinker_lora_{lora_int_id}_")
             adapter_path = temp_dir
 
+            # DEBUG: Print tensor norms to trace LoRA values on vLLM side
+            print(f"[DEBUG vLLM add_lora_with_id] lora_int_id={lora_int_id}, state_dict has {len(state_dict)} keys", flush=True)
+            total_norm = 0.0
+            nonzero_count = 0
+            for k, v in list(state_dict.items())[:10]:
+                import torch
+                norm = float(v.norm().item()) if isinstance(v, torch.Tensor) else 0.0
+                total_norm += norm
+                if norm > 1e-8:
+                    nonzero_count += 1
+                print(f"[DEBUG vLLM add_lora_with_id] {k}: norm={norm:.6f}", flush=True)
+            print(f"[DEBUG vLLM add_lora_with_id] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}", flush=True)
+
             # Save adapter files locally on worker node
             save_file(state_dict, os.path.join(adapter_path, "adapter_model.safetensors"))
             with open(os.path.join(adapter_path, "adapter_config.json"), "w") as f:
                 json.dump(peft_config, f, indent=2)
+            print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
 
             # Track path for this lora_int_id (needed for GPU/CPU swap in generate)
             self._lora_paths[lora_int_id] = adapter_path
@@ -284,6 +310,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             """
             from vllm.lora.request import LoRARequest
 
+            print(f"[DEBUG add_lora_from_path] lora_int_id={lora_int_id}, lora_path={lora_path}", flush=True)
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,
@@ -291,6 +318,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             await self.engine.add_lora(lora_request)
+
+            # Track path for generate_with_lora (needed for GPU/CPU swap)
+            self._lora_paths[lora_int_id] = lora_path
+            print(f"[DEBUG add_lora_from_path] Stored path for lora_int_id={lora_int_id}", flush=True)
 
         async def generate_with_lora(
             self,
@@ -655,6 +686,93 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return logprobs
 
+        async def compute_prompt_topk(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            k: int = 10,
+        ) -> list[dict[int, float]]:
+            """Get top-K tokens and logprobs at each prompt position.
+
+            Returns topk[i] = dict of {token_id: logprob} for top-K tokens
+            at position i (predicting token i+1 given tokens 0..i).
+            Output length is len(prompt_ids) - 1.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                k: Number of top tokens to return (default 10).
+
+            Returns:
+                List of dicts, each mapping token_id to logprob.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            from verl.workers.rollout.vllm_rollout.utils import (
+                VLLM_LORA_INT_ID,
+                VLLM_LORA_NAME,
+                VLLM_LORA_PATH,
+            )
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=k,  # Get top-K at each position
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Add lora request if enabled
+            lora_request = None
+            loaded_loras = await self.engine.list_loras()
+            print(f"[compute_prompt_topk] lora_rank={self.model_config.lora_rank}, loaded_loras={loaded_loras}", flush=True)
+            if self.model_config.lora_rank > 0 and loaded_loras:
+                # Use the first loaded LoRA (multi-LoRA uses dynamic IDs starting from 1)
+                lora_id = list(loaded_loras)[0]
+                lora_path = self._lora_paths.get(lora_id, VLLM_LORA_PATH)
+                print(f"[compute_prompt_topk] Using lora_id={lora_id}, path={lora_path}", flush=True)
+                lora_request = LoRARequest(
+                    lora_name=f"lora_{lora_id}",
+                    lora_int_id=lora_id,
+                    lora_path=lora_path,
+                )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            result = []
+            # prompt_logprobs[i] contains logprob info for token[i] given tokens[0:i]
+            # Skip position 0 (no prior context)
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    result.append({})
+                    continue
+                # Convert to dict of token_id -> logprob
+                pos_dict = {}
+                for token_id, logprob_obj in prompt_logprobs[i].items():
+                    pos_dict[token_id] = logprob_obj.logprob
+                result.append(pos_dict)
+
+            return result
+
         async def compute_prompt_logprobs_with_lora(
             self,
             prompt_ids: list[int],
@@ -693,6 +811,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if lora_path is None:
                 raise ValueError(f"No path found for lora_int_id={lora_int_id}")
 
+            # DEBUG: Log which LoRA is being used
+            print(f"[DEBUG vLLM compute_logprobs] Using lora_int_id={lora_int_id}, path={lora_path}", flush=True)
+
             lora_request = LoRARequest(
                 lora_name=str(lora_int_id),
                 lora_int_id=lora_int_id,
@@ -728,6 +849,82 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     logprobs.append(-100.0)
 
             return logprobs
+
+        async def compute_prompt_topk_with_lora(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            lora_int_id: int,
+            k: int = 10,
+        ) -> list[dict[int, float]]:
+            """Get top-K tokens with specific LoRA adapter.
+
+            Returns topk[i] = dict of {token_id: logprob} for position i.
+            Output length is len(prompt_ids) - 1.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                lora_int_id: The LoRA adapter ID to use.
+                k: Number of top tokens to return.
+
+            Returns:
+                List of dicts mapping token_id to logprob.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=k,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            lora_path = self._lora_paths.get(lora_int_id)
+            if lora_path is None:
+                raise ValueError(f"No path found for lora_int_id={lora_int_id}")
+
+            print(f"[compute_prompt_topk_with_lora] Using lora_int_id={lora_int_id}, path={lora_path}", flush=True)
+
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            )
+
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            result = []
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    result.append({})
+                    continue
+                pos_dict = {}
+                for token_id, logprob_obj in prompt_logprobs[i].items():
+                    pos_dict[token_id] = logprob_obj.logprob
+                result.append(pos_dict)
+
+            return result
 
         async def compute_prompt_logprobs_base(
             self,
@@ -789,6 +986,224 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     logprobs.append(-100.0)
 
             return logprobs
+
+        async def compute_prompt_topk_base(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            k: int = 10,
+        ) -> list[dict[int, float]]:
+            """Get top-K tokens using base model without any LoRA adapter.
+
+            For multi-LoRA engine: computes top-K with base model weights only.
+
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                k: Number of top tokens to return.
+
+            Returns:
+                List of dicts mapping token_id to logprob.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+
+            if len(prompt_ids) < 2:
+                return []
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=k,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            # Generate WITHOUT LoRA request (base model)
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=None,  # No LoRA = base model
+            )
+
+            final_res = None
+            async for output in generator:
+                final_res = output
+            assert final_res is not None
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return []
+
+            result = []
+            for i in range(1, len(prompt_logprobs)):
+                if prompt_logprobs[i] is None:
+                    result.append({})
+                    continue
+                pos_dict = {}
+                for token_id, logprob_obj in prompt_logprobs[i].items():
+                    pos_dict[token_id] = logprob_obj.logprob
+                result.append(pos_dict)
+
+            return result
+
+
+        async def get_debug_env_info(self) -> dict:
+            """Return environment info for debugging PYTHONPATH issues."""
+            import os
+            import sys
+            import vllm
+            return {
+                "pythonpath": os.environ.get("PYTHONPATH", "NOT SET")[:500],
+                "vllm_file": vllm.__file__,
+                "sys_path_first_5": sys.path[:5],
+            }
+
+
+        async def test_mp_spawn_from_actor(self) -> dict:
+            """Test multiprocessing spawn from within actor to debug PYTHONPATH."""
+            import os
+            import subprocess
+            
+            # Run the test script
+            result = subprocess.run(
+                ["python3", "/vePFS-Mindverse/share/code/test_mp_spawn.py"],
+                capture_output=True, text=True, timeout=120
+            )
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode
+            }
+
+
+        async def test_vllm_spawn_direct(self) -> dict:
+            """Test vLLM's spawn mechanism directly from within actor."""
+            import os
+            import sys
+            from vllm.utils.system_utils import get_mp_context
+            
+            result_file = "/vePFS-Mindverse/share/code/vllm_direct_spawn_result.txt"
+            if os.path.exists(result_file):
+                os.remove(result_file)
+            
+            # Get vLLM's multiprocessing context
+            context = get_mp_context()
+            
+            # Worker function must be defined at module level for pickling
+            # So we use a simple script approach
+            worker_code = '''
+import os, sys
+import vllm
+result_file = "/vePFS-Mindverse/share/code/vllm_direct_spawn_result.txt"
+with open(result_file, "w") as f:
+    f.write(f"vllm.__file__: {vllm.__file__}\\n")
+    f.write(f"PYTHONPATH: {os.environ.get('PYTHONPATH', 'NOT SET')[:200]}\\n")
+    f.write(f"sys.path[:3]: {sys.path[:3]}\\n")
+'''
+            import subprocess
+            proc = context.Process(
+                target=subprocess.run,
+                args=(["python3", "-c", worker_code],),
+                daemon=True,
+            )
+            proc.start()
+            proc.join(timeout=30)
+            
+            if os.path.exists(result_file):
+                with open(result_file) as f:
+                    content = f.read()
+                return {
+                    "context_method": context._name,
+                    "parent_pythonpath": os.environ.get("PYTHONPATH", "NOT SET")[:100],
+                    "parent_vllm": sys.modules.get("vllm", {}).__file__ if "vllm" in sys.modules else "not imported",
+                    "worker_result": content,
+                }
+            return {"error": "Worker did not create result file"}
+
+
+        async def test_actual_worker_spawn(self) -> dict:
+            """Test spawning with module-level function (like vLLM does)."""
+            import os
+            import sys
+            from vllm.utils.system_utils import get_mp_context
+            from tinker_server.spawn_worker_test import spawn_worker_check, RESULT_FILE
+            
+            if os.path.exists(RESULT_FILE):
+                os.remove(RESULT_FILE)
+            
+            context = get_mp_context()
+            proc = context.Process(target=spawn_worker_check, daemon=True)
+            proc.start()
+            proc.join(timeout=30)
+            
+            if os.path.exists(RESULT_FILE):
+                with open(RESULT_FILE) as f:
+                    content = f.read()
+                return {
+                    "context_method": context._name,
+                    "parent_pythonpath": os.environ.get("PYTHONPATH", "NOT SET")[:100],
+                    "worker_result": content,
+                }
+            return {"error": "Worker did not create result file"}
+
+
+        async def dump_raw_logits(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            dump_path: str = "/vePFS-Mindverse/share/code/vllm_raw_logits.pt",
+        ) -> str:
+            """Dump raw logits from vLLM forward pass using LogitsProcessor.
+            
+            Args:
+                prompt_ids: Input token IDs.
+                request_id: Unique request identifier.
+                dump_path: Where to save the logits.
+                
+            Returns:
+                Path to dumped file or error message.
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            import torch
+            
+            # Storage for captured logits
+            captured_logits = []
+            
+            def capture_logits(past_tokens: list[int], logits: torch.Tensor) -> torch.Tensor:
+                """LogitsProcessor that captures raw logits."""
+                captured_logits.append({
+                    "past_tokens": list(past_tokens),
+                    "logits": logits.detach().cpu().clone(),
+                    "shape": list(logits.shape),
+                })
+                return logits  # Return unchanged
+            
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=1,  # Need this to trigger logits computation for prompt
+                temperature=1.0,
+                logits_processors=[capture_logits],
+            )
+            
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+            
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+            )
+            
+            async for output in generator:
+                pass  # Consume the generator
+            
+            if captured_logits:
+                torch.save(captured_logits, dump_path)
+                return f"Saved {len(captured_logits)} logit tensors to {dump_path}"
+            else:
+                return "No logits captured"
 
     return ExtendedVLLMHttpServer
 
@@ -862,10 +1277,8 @@ class VerlInferenceEngine:
             }
             logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
 
-        # Use model's max_position_embeddings if max_model_len not explicitly set
-        # This fixes issue #9: vLLM default max_model_len (4096) is too small for
-        # models like Qwen2.5-7B-Instruct (32K context)
-        max_model_len = self.max_model_len or get_max_position_embeddings(self.model_path)
+        # Use model registry's max_model_len (single source of truth)
+        max_model_len = get_model_config(self.model_path).max_model_len
         # verl calculates max_model_len = prompt_length + response_length
         # We split evenly, but this does NOT restrict actual prompt/response sizes:
         # - The split only affects verl's default max_new_tokens (response_length)
