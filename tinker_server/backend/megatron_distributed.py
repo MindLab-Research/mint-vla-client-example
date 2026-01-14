@@ -2876,6 +2876,71 @@ class MegatronRankWorker:
             torch.distributed.destroy_process_group()
 
 
+
+class MegatronSessionStateManager:
+    """Manages session state (LoRA checkpoint paths) for MegatronWorkerGroup.
+
+    Enables multiple sessions to share a single Megatron trainer by tracking
+    checkpoint paths per session. When sessions switch, the manager provides
+    paths for saving outgoing session state and loading incoming session state.
+
+    Storage layout:
+        {base_path}/{session_id}_checkpoint/
+            (LoRA weights saved via MegatronWorkerGroup.save_adapter_state)
+    """
+
+    def __init__(self, base_path: str = "/vePFS-Mindverse/share/code/tinker-server/checkpoints/megatron_sessions"):
+        """Initialize the session state manager.
+
+        Args:
+            base_path: Root directory for all session checkpoints.
+        """
+        self.base_path = base_path
+        os.makedirs(base_path, exist_ok=True)
+        self._session_metadata: dict[str, dict] = {}  # session_id -> {step, lr, actual_rank}
+        logger.info(f"[MegatronSessionStateManager] Initialized with base_path={base_path}")
+
+    def get_session_path(self, session_id: str) -> str:
+        """Get checkpoint directory path for a session."""
+        return os.path.join(self.base_path, f"{session_id}_checkpoint")
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session has saved state."""
+        session_path = self.get_session_path(session_id)
+        # Check for mp_rank_*_adapter.pt files (Megatron distributed save format)
+        # The save creates files like: mp_rank_00_000_000_adapter.pt
+        import glob
+        adapter_files = glob.glob(os.path.join(session_path, "mp_rank_*_adapter.pt"))
+        return len(adapter_files) > 0
+
+    def save_metadata(self, session_id: str, step: int, lr: float, actual_rank: int | None = None):
+        """Save session metadata (step count, learning rate, actual rank)."""
+        self._session_metadata[session_id] = {
+            "step": step,
+            "lr": lr,
+            "actual_rank": actual_rank,
+        }
+
+    def get_metadata(self, session_id: str) -> dict | None:
+        """Get session metadata if exists."""
+        return self._session_metadata.get(session_id)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete session checkpoint and metadata."""
+        import shutil
+        session_path = self.get_session_path(session_id)
+        deleted = False
+        if os.path.exists(session_path):
+            shutil.rmtree(session_path)
+            deleted = True
+        if session_id in self._session_metadata:
+            del self._session_metadata[session_id]
+            deleted = True
+        if deleted:
+            logger.info(f"[MegatronSessionStateManager] Deleted session {session_id}")
+        return deleted
+
+
 @ray.remote(num_gpus=0)
 class MegatronWorkerGroup:
     """Manages N distributed MegatronRankWorkers.
@@ -2903,6 +2968,7 @@ class MegatronWorkerGroup:
         self._step_count = 0
         self._current_session: str | None = None  # Phase 6: session tracking
         self._actual_rank: int | None = None  # Phase 7: actual LoRA rank for current session
+        self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
 
         self._initialize()
 
@@ -2984,6 +3050,67 @@ class MegatronWorkerGroup:
 
         logger.info(f"[MegatronWorkerGroup] All {world_size} workers initialized and ready")
 
+    def _ensure_session_loaded(self, session_id: str | None) -> None:
+        """Ensure the specified session's LoRA weights are loaded.
+
+        If a different session is currently loaded, this saves its state first,
+        then loads the requested session's state.
+
+        This is the MegatronWorkerGroup equivalent of TrainingWorker._ensure_session_loaded().
+        Fixes Issue #44: LoRA weights now properly save/load on session switch.
+
+        Args:
+            session_id: Session ID to load state for. If None, no-op.
+        """
+        # DEBUG: Print to understand session matching
+        print(f"[DEBUG _ensure_session_loaded] ENTRY: session_id={session_id!r}, _current_session={self._current_session!r}, match={self._current_session == session_id}", flush=True)
+
+        if session_id is None:
+            return
+
+        if self._current_session == session_id:
+            # Already loaded
+            logger.debug(f"[MegatronWorkerGroup] Session {session_id} already loaded")
+            return
+
+        logger.info(
+            f"[MegatronWorkerGroup] Session switch: {self._current_session} -> {session_id}"
+        )
+
+        # Save outgoing session's state
+        if self._current_session is not None:
+            old_path = self._session_manager.get_session_path(self._current_session)
+            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
+            self.save_adapter_state(old_path)
+            # Save metadata (step count, learning rate, actual rank)
+            self._session_manager.save_metadata(
+                self._current_session,
+                self._step_count,
+                self.learning_rate,
+                self._actual_rank,
+            )
+
+        # Load new session's state or reset
+        if self._session_manager.session_exists(session_id):
+            new_path = self._session_manager.get_session_path(session_id)
+            meta = self._session_manager.get_metadata(session_id)
+            actual_rank = meta.get("actual_rank") if meta else None
+            logger.info(f"[MegatronWorkerGroup] Loading session {session_id} from {new_path}")
+            self.load_adapter_state(new_path, actual_rank=actual_rank)
+            # Restore metadata
+            if meta:
+                self._step_count = meta.get("step", 0)
+                self.learning_rate = meta.get("lr", self.learning_rate)
+                self._actual_rank = meta.get("actual_rank", self.lora_rank)
+        else:
+            # New session: reinitialize LoRA weights
+            logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
+            self.reinit_lora_weights()
+            self._step_count = 0
+            self._actual_rank = self.lora_rank
+
+        self._current_session = session_id
+
     def forward_backward(
         self,
         data_items: list[dict],
@@ -3008,8 +3135,10 @@ class MegatronWorkerGroup:
         """
         loss_fn_config = loss_fn_config or {}
 
-        # Use current session if session_id not provided
+        # Issue #44: Ensure correct session's LoRA weights are loaded before training
+        # This saves outgoing session state and loads incoming session state
         effective_session_id = session_id or self._current_session
+        self._ensure_session_loaded(effective_session_id)
 
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
@@ -3112,7 +3241,7 @@ class MegatronWorkerGroup:
 
         Args:
             data_items: List of Tinker Datum dicts.
-            session_id: Unused - session management handled via swap_session().
+            session_id: Session ID for loading correct LoRA weights (Issue #44).
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default True for logprob-only).
                 This ensures logprobs match vLLM (which always has bias=0).
@@ -3120,6 +3249,10 @@ class MegatronWorkerGroup:
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
+        # Issue #44: Ensure correct session's LoRA weights are loaded before forward
+        effective_session_id = session_id or self._current_session
+        self._ensure_session_loaded(effective_session_id)
+
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
         futures = [w.forward.remote(data_items, reset_bias) for w in self.workers]
@@ -3211,8 +3344,9 @@ class MegatronWorkerGroup:
         Returns:
             Dict with metrics including grad_norm from rank 0.
         """
-        # Use current session if session_id not provided
+        # Issue #44: Ensure correct session's LoRA weights are loaded before optim step
         effective_session_id = session_id or self._current_session
+        self._ensure_session_loaded(effective_session_id)
 
         futures = [w.optim_step.remote(learning_rate, effective_session_id) for w in self.workers]
         results = ray.get(futures)
@@ -3369,21 +3503,41 @@ class MegatronWorkerGroup:
             "pad_token_id": tokenizer.pad_token_id,
         }
 
-    def reinit_lora_weights(self, learning_rate: float | None = None, actual_rank: int | None = None) -> dict:
+    def reinit_lora_weights(self, learning_rate: float | None = None, actual_rank: int | None = None, new_session_id: str | None = None) -> dict:
         """Reinitialize LoRA weights to fresh random state on all workers.
 
         This must be called when reusing an actor for a new session to ensure
         fresh weights instead of inheriting trained weights from previous session.
+
+        Issue #44 fix: Automatically saves the current session's weights before
+        reinitializing, so they can be restored later.
 
         Args:
             learning_rate: New learning rate for the session. If provided,
                 updates all optimizer param_groups on all workers.
             actual_rank: Actual LoRA rank for the new session (Phase 7).
                 If provided, updates _actual_rank for save_checkpoint.
+            new_session_id: Session ID for the new session. If provided,
+                saves current session's weights before reinit.
 
         Returns:
             dict with status and total count of reinitialized parameters.
         """
+        # Issue #44: Save current session's weights before reinitializing
+        if self._current_session is not None and new_session_id is not None:
+            old_path = self._session_manager.get_session_path(self._current_session)
+            logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: saving current session {self._current_session} to {old_path}")
+            try:
+                self.save_adapter_state(old_path)
+                self._session_manager.save_metadata(
+                    self._current_session,
+                    step=self._step_count,
+                    lr=self.learning_rate,
+                    actual_rank=self._actual_rank,
+                )
+            except Exception as e:
+                logger.warning(f"[MegatronWorkerGroup] reinit_lora_weights: failed to save session {self._current_session}: {e}")
+
         logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate}, actual_rank={actual_rank})")
 
         # Call reinit on all workers (required for distributed sync)
@@ -3406,7 +3560,11 @@ class MegatronWorkerGroup:
         if actual_rank is not None:
             self._actual_rank = actual_rank
 
-        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}")
+        # Issue #44: Update current session to the new session
+        if new_session_id is not None:
+            self._current_session = new_session_id
+
+        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}, new_session={new_session_id}")
         return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate, "actual_rank": self._actual_rank}
 
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
@@ -4100,6 +4258,7 @@ def get_or_create_megatron_worker_group(
     lora_rank: int,
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
+    session_id: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Get existing or create new persistent MegatronWorkerGroup for this model.
 
@@ -4111,6 +4270,7 @@ def get_or_create_megatron_worker_group(
         lora_rank: LoRA rank.
         learning_rate: Initial learning rate.
         distributed_config: Parallelism config. Defaults to single-GPU.
+        session_id: Session ID for Issue #44 session state management.
 
     Returns:
         Ray actor handle to MegatronWorkerGroup.
@@ -4155,8 +4315,9 @@ def get_or_create_megatron_worker_group(
         # Existing actor is already ready
         resource_pool.mark_ready(actor_name)
         # Reinitialize LoRA weights for fresh session with actual_rank
-        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate}, actual_rank={lora_rank})...")
-        result = ray.get(actor.reinit_lora_weights.remote(learning_rate=learning_rate, actual_rank=lora_rank))
+        # Issue #44: Pass session_id to save current session's weights before reinit
+        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate}, actual_rank={lora_rank}, session_id={session_id})...")
+        result = ray.get(actor.reinit_lora_weights.remote(learning_rate=learning_rate, actual_rank=lora_rank, new_session_id=session_id))
         logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}, actual_rank={result.get('actual_rank')}")
         return actor
     except ValueError:
@@ -4223,6 +4384,7 @@ async def async_get_or_create_megatron_worker_group(
     lora_rank: int,
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
+    session_id: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Async version of get_or_create_megatron_worker_group.
 
@@ -4234,6 +4396,7 @@ async def async_get_or_create_megatron_worker_group(
         lora_rank: LoRA rank.
         learning_rate: Initial learning rate.
         distributed_config: Parallelism config. Defaults to single-GPU.
+        session_id: Session ID for Issue #44 session state management.
 
     Returns:
         Ray actor handle to MegatronWorkerGroup.
@@ -4246,6 +4409,7 @@ async def async_get_or_create_megatron_worker_group(
         lora_rank,
         learning_rate,
         distributed_config,
+        session_id,
     )
 
 

@@ -1505,25 +1505,19 @@ class VerlTrainingEngine:
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
             # Use async version to avoid blocking uvicorn event loop
+            # Issue #44: Pass session_id for automatic session state management
             worker = await async_get_or_create_megatron_worker_group(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,
                 distributed_config=distributed_config,
+                session_id=session.session_id,
             )
             session.backend = "megatron"
             # Associate session with actor in resource pool immediately
             self._touch_actor(session)
-
-            # Reinitialize LoRA weights for fresh session (statelessness)
-            # This ensures each new session starts with fresh random weights
-            # instead of inheriting trained weights from previous session
-            print(f"[DEBUG] About to call reinit_lora_weights for {model_id}, lr={session.learning_rate}, rank={lora_rank}", flush=True)
-            logger.info(f"[{model_id}] Reinitializing Megatron LoRA weights for new session (lr={session.learning_rate}, rank={lora_rank})...")
-            import ray
-            result = ray.get(worker.reinit_lora_weights.remote(learning_rate=session.learning_rate, actual_rank=lora_rank))
-            print(f"[DEBUG] reinit_lora_weights result: {result}", flush=True)
-            logger.info(f"[{model_id}] Megatron LoRA weights reinitialized: {result.get('total_params', 0)} params")
+            # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
+            # with session_id for proper session state management (Issue #44)
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
