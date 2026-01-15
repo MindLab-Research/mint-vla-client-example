@@ -284,3 +284,8 @@ def requires_fp8(model_name: str) -> bool:
     return config.quantization == "fp8"
 
 
+def list_supported_models() -> list[str]:
+    """Return list of supported model names."""
+    return list(MODEL_CONFIGS.keys())
+
+
