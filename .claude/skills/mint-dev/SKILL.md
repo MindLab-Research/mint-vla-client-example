@@ -350,12 +350,12 @@ t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
 gpu_total = t.get("GPU", 0)
 print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
-for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
-    try:
-        ray.get_actor(name, namespace="tinker")
+# List actors by prefix (vLLM actors are named tinker_vllm_{model_name})
+actors = ray.util.list_named_actors(all_namespaces=True)
+for a in actors:
+    name = a["name"]
+    if name.startswith("tinker_vllm_") or name.startswith("megatron_"):
         print(f"{name}: ALIVE")
-    except ValueError:
-        print(f"{name}: not running")
 PYEOF'
 
 # Check pending placement groups (should be empty)
