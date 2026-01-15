@@ -298,6 +298,16 @@ sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 
 ## 5. Ray Cluster
 
+**Find Ray head task (if task ID unknown):**
+```bash
+volc ml_task list --output json | jq '.[] | select(.Name | startswith("ray-head")) | {Id, Name, Status}'
+```
+
+**Get Ray head IP from task logs:**
+```bash
+volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
+```
+
 **Connect SSH server to cluster:**
 ```bash
 ssh volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
