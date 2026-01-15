@@ -218,11 +218,18 @@ ssh mint-prod "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API (requires auth)
+# Via API (requires auth, preferred)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
-# Via script (if server down)
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_vllm.py'
+# Via Ray (if server down) - find actor name first with ray list actors
+ssh mint-prod 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+for a in ray.util.list_named_actors(all_namespaces=True):
+    if \"vllm\" in a[\"name\"]:
+        print(f\"Killing {a}\")
+        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
+"'
 ```
 
 ---
@@ -238,16 +245,21 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill
 | Routes, middleware only | Any | Restart server only |
 | Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
 
-### Kill Scripts
+### Kill Actors
 
 ```bash
 # Kill Megatron (frees 8 GPUs for MoE)
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_megatron.py'
+ssh mint-prod 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+for a in ray.util.list_named_actors(all_namespaces=True):
+    if \"megatron\" in a[\"name\"]:
+        print(f\"Killing {a}\")
+        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
+"'
 
 # Kill vLLM (frees 1-4 GPUs depending on model) - requires auth
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
-# OR if server down:
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_vllm.py'
 ```
 
 ### Legacy Reference
@@ -395,3 +407,21 @@ ssh mint-prod "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.log | tail
 2. **Missing `PYTHONPATH` override** - causes auth bypass (loads pip-installed `tinker-server` without auth)
 3. **Forgetting `X-API-Key` header** - all endpoints except healthz require auth
 4. **Wrong port** - prod uses 18000, not 8000
+
+---
+
+## 8. Scripts Directory Structure
+
+```
+scripts/
+├── run_server.py      # Server entry point (core)
+├── tools/             # Reusable debug utilities (tracked in git)
+└── wip/               # Work-in-progress investigations (gitignored)
+```
+
+**Workflow:**
+- Active investigation scripts → `scripts/wip/` (not tracked)
+- Scripts worth sharing/collaborating → promote to `scripts/tools/`
+- Throwaway scripts → delete after use
+
+**Do NOT** accumulate investigation scripts in `scripts/` root.

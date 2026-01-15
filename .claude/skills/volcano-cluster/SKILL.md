@@ -199,10 +199,16 @@ PYEOF'
 
 ```bash
 # Kill Megatron (dev)
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+for a in ray.util.list_named_actors(all_namespaces=True):
+    if \"megatron\" in a[\"name\"]:
+        print(f\"Killing {a}\")
+        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
+"'
 
-# Kill Megatron (prod)
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_megatron.py'
+# Kill Megatron (prod) - same pattern with ssh mint-prod
 
 # Kill vLLM (dev)
 curl -X POST http://localhost:8000/api/v1/kill_vllm

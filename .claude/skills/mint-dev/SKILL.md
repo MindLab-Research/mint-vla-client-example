@@ -189,11 +189,19 @@ ssh volcano "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API
+# Via API (preferred)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
-# Via script (if server down)
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.py'
+# Via Ray (if server down) - find actor name first with ray list actors
+ssh volcano 'python3 -c "
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+# List actors to find exact name
+for a in ray.util.list_named_actors(all_namespaces=True):
+    if \"vllm\" in a[\"name\"]:
+        print(f\"Killing {a}\")
+        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
+"'
 ```
 
 ---
@@ -502,3 +510,21 @@ ssh volcano 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
 | MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
 | Tokenizer download fails | Run test script locally, not on server (server has no internet) |
 | Actor lookup fails | **LIST actors first** (`ray list actors`), don't assume dead |
+
+---
+
+## 10. Scripts Directory Structure
+
+```
+scripts/
+├── run_server.py      # Server entry point (core)
+├── tools/             # Reusable debug utilities (tracked in git)
+└── wip/               # Work-in-progress investigations (gitignored)
+```
+
+**Workflow:**
+- Active investigation scripts → `scripts/wip/` (not tracked)
+- Scripts worth sharing/collaborating → promote to `scripts/tools/`
+- Throwaway scripts → delete after use
+
+**Do NOT** accumulate investigation scripts in `scripts/` root.
