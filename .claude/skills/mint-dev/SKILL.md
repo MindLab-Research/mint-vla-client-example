@@ -332,8 +332,8 @@ Dev-specific values:
 
 | Model | vLLM (Inference) | Megatron (Training) | Total (Simultaneous) |
 |-------|------------------|---------------------|----------------------|
-| **Qwen3-30B-A3B** | TP=1, DP=4 → **4 GPUs** | TP=4, EP=2 → **8 GPUs** | **12 GPUs** |
-| **Qwen3-235B-A22B** | TP=2, DP=4 → **8 GPUs** | Not tested | **8+ GPUs** |
+| **Qwen3-30B-A3B** | TP=4 → **4 GPUs** | TP=4, EP=1 → **4 GPUs** | **8 GPUs** |
+| **Moonlight-16B-A3B** | TP=8 → **8 GPUs** | TP=8, EP=8 → **8 GPUs** | **16 GPUs** |
 | Dense models (7B-14B) | **1 GPU** | **1 GPU** | **2 GPUs** |
 
 ### Pre-flight Check (MANDATORY)
@@ -362,7 +362,7 @@ PYEOF'
 ssh volcano "ray status 2>/dev/null | grep -A5 'Pending Demands'"
 ```
 
-**Required for Qwen3-30B-A3B tests:** At least 12 available GPUs and no pending placement groups.
+**Required for Qwen3-30B-A3B tests:** At least 8 available GPUs and no pending placement groups.
 
 ### Parallelism Configuration
 
