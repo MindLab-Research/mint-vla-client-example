@@ -134,6 +134,19 @@ MODEL_CONFIGS = {
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
+    # Qwen3 235B MoE variants (235B total, 22B active)
+    # Inference: TP=8 (8x A800)
+    # Training: TP=16 (16x A800)
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
+        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
+        max_model_len=40960,
+        gradient_checkpointing=True,
+    ),
+    "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
+        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
+        max_model_len=40960,
+        gradient_checkpointing=True,
+    ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
     # Uses MLA (Multi-Latent Attention) from DeepSeek V3 architecture
