@@ -218,18 +218,37 @@ ssh mint-prod "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API (requires auth, preferred)
+# Via API (requires auth)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
-# Via Ray (if server down) - find actor name first with ray list actors
-ssh mint-prod 'python3 -c "
-import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
-for a in ray.util.list_named_actors(all_namespaces=True):
-    if \"vllm\" in a[\"name\"]:
-        print(f\"Killing {a}\")
-        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
-"'
+# Kill specific model's vLLM actor
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:18000/api/v1/kill_vllm
+```
+
+### Kill Megatron Actor
+
+```bash
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
+
+# Kill specific model's Megatron actor
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:18000/api/v1/kill_megatron
+```
+
+### Check Actor Status
+
+```bash
+# vLLM status
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status | jq
+
+# Megatron status
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/megatron_status | jq
+
+# Kill all actors (nuclear option)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_all_actors
 ```
 
 ---
@@ -247,18 +266,11 @@ for a in ray.util.list_named_actors(all_namespaces=True):
 
 ### Kill Actors
 
-```bash
-# Kill Megatron (frees 8 GPUs for MoE)
-ssh mint-prod 'python3 -c "
-import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
-for a in ray.util.list_named_actors(all_namespaces=True):
-    if \"megatron\" in a[\"name\"]:
-        print(f\"Killing {a}\")
-        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
-"'
+See "Kill vLLM Actor" and "Kill Megatron Actor" sections above for API commands.
 
-# Kill vLLM (frees 1-4 GPUs depending on model) - requires auth
+```bash
+# Quick reference (requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 ```
 

@@ -199,22 +199,23 @@ PYEOF'
 
 ```bash
 # Kill Megatron (dev)
-ssh volcano 'python3 -c "
-import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
-for a in ray.util.list_named_actors(all_namespaces=True):
-    if \"megatron\" in a[\"name\"]:
-        print(f\"Killing {a}\")
-        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
-"'
+curl -X POST http://localhost:8000/api/v1/kill_megatron
 
-# Kill Megatron (prod) - same pattern with ssh mint-prod
+# Kill Megatron (prod - requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
 
 # Kill vLLM (dev)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Kill vLLM (prod - requires auth)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+
+# Kill all actors (dev)
+curl -X POST http://localhost:8000/api/v1/kill_all_actors
+
+# Check status
+curl -s http://localhost:8000/api/v1/megatron_status | jq
+curl -s http://localhost:8000/api/v1/vllm_status | jq
 ```
 
 ### Actor Names Reference

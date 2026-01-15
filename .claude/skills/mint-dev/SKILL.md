@@ -192,16 +192,34 @@ ssh volcano "ps aux | grep run_server | grep -v grep"
 # Via API (preferred)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
-# Via Ray (if server down) - find actor name first with ray list actors
-ssh volcano 'python3 -c "
-import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
-# List actors to find exact name
-for a in ray.util.list_named_actors(all_namespaces=True):
-    if \"vllm\" in a[\"name\"]:
-        print(f\"Killing {a}\")
-        ray.kill(ray.get_actor(a[\"name\"], namespace=a.get(\"namespace\")))
-"'
+# Kill specific model's vLLM actor
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:8000/api/v1/kill_vllm
+```
+
+### Kill Megatron Actor
+
+```bash
+curl -X POST http://localhost:8000/api/v1/kill_megatron
+
+# Kill specific model's Megatron actor
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:8000/api/v1/kill_megatron
+```
+
+### Check Actor Status
+
+```bash
+# vLLM status
+curl -s http://localhost:8000/api/v1/vllm_status | jq
+
+# Megatron status
+curl -s http://localhost:8000/api/v1/megatron_status | jq
+
+# Kill all actors (nuclear option)
+curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ```
 
 ---
