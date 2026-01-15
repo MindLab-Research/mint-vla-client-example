@@ -130,11 +130,12 @@ def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
 
 
 # =============================================================================
-# POST /save_weights - async (for sampling, Tinker SDK: save_weights_for_sampler)
+# POST /save_weights, /save_weights_for_sampler - async (SDK compatibility)
 # =============================================================================
 
 
 @router.post("/save_weights", response_model=UntypedAPIFuture)
+@router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)  # SDK alias
 async def save_weights(
     request: SaveStateRequest,
     background_tasks: BackgroundTasks,
@@ -142,8 +143,15 @@ async def save_weights(
 ) -> UntypedAPIFuture:
     """Save LoRA weights for sampling.
 
-    This endpoint saves weights and registers them for multi-LoRA sampling.
-    Maps to Tinker SDK: save_weights_for_sampler() / save_weights_and_get_sampling_client()
+    Saves LoRA weights and registers them for multi-LoRA sampling.
+
+    SDK compatibility:
+    - /save_weights: Called by SDK save_state() - should save optimizer but doesn't (TODO)
+    - /save_weights_for_sampler: Called by SDK save_weights_for_sampler()
+
+    TEMPORARY WORKAROUND: Both endpoints currently save only LoRA weights, not optimizer
+    state. True training resume with preserved optimizer momentum is not supported.
+    See GitHub issue #67 for optimizer state saving implementation.
     """
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
@@ -161,7 +169,7 @@ async def save_weights(
 
 
 # =============================================================================
-# POST /save_state - async (full checkpoint for training resume)
+# POST /save_state - async (full checkpoint - optimizer saving NOT IMPLEMENTED)
 # =============================================================================
 
 
@@ -171,10 +179,12 @@ async def save_state(
     background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
-    """Save full model state to checkpoint (LoRA + optimizer + metadata).
+    """Save model state to checkpoint.
 
-    This endpoint saves weights AND optimizer state for resuming training.
-    Maps to Tinker SDK: save_state()
+    CURRENT BEHAVIOR: Saves LoRA weights only (same as /save_weights).
+
+    INTENDED BEHAVIOR (not implemented): Should save weights + optimizer state
+    for true training resume with preserved momentum. See GitHub issue #67.
     """
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
