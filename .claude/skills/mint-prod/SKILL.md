@@ -51,14 +51,14 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 |----------|-------|
 | SSH Host | `mint-prod` |
 | Port | 18000 |
-| External URL | `https://mint-alpha.macaron.im` |
+| External URL | `https://mint.macaron.im` |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
 | Ray Configs | `mint-prod-head.yaml`, `mint-prod-worker.yaml` |
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
-**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint-alpha.macaron.im`. No additional setup required.
+**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint.macaron.im`. No additional setup required.
 
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
 

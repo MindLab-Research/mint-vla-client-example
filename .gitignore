@@ -216,3 +216,8 @@ PROMPT.md
 .PROMPT.md
 LOG.md
 results/
+
+# Generated files
+ray_head_ip.txt
+*.pem
+*.key
