@@ -720,11 +720,8 @@ class TrainingWorker:
             "num_tokens:sum": float(total_tokens),
         }
 
-        # Add debug logits info if available (from last item processed)
-        try:
-            metrics["_debug_logits"] = _debug_logits_info
-        except NameError:
-            pass
+        # Debug logits info removed - was causing type mismatch with client
+        # (client expects Dict[str, float], not nested dicts)
 
         # Add RL-specific metrics
         if num_rl_samples > 0:
@@ -922,7 +919,7 @@ class TrainingWorker:
         logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
         return {
-            "metrics": {"grad_norm": float(grad_norm)},
+            "metrics": {"grad_norm:last": float(grad_norm)},
             "type": "optim_step",
         }
 
