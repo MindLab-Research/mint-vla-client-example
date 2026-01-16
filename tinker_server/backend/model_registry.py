@@ -94,7 +94,7 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-0.6B": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
-        # Small model: no gradient checkpointing needed
+        gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
@@ -306,5 +306,4 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-0.6B",
     ]
     return [m for m in MODEL_CONFIGS.keys() if m in allowed]
-
 
