@@ -352,10 +352,22 @@ class MegatronRankWorker:
         for i, _opt in enumerate(iter_optimizers(optimizer)):
             if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
                 inner_opt = _opt.optimizer
-                
+
                 # CRITICAL: Always clear existing state first to prevent session contamination
                 # Without this, optimizer momentum from previous session persists
-                inner_opt.state.clear()
+                state = inner_opt.state
+                if hasattr(state, '_inner_dicts'):
+                    # ProxyDict from ChainedOptimizer
+                    for inner_dict in state._inner_dicts:
+                        inner_dict.clear()
+                elif hasattr(state, 'clear'):
+                    # Regular dict
+                    state.clear()
+                else:
+                    # Unknown type - try to clear via iteration
+                    keys = list(state.keys()) if hasattr(state, 'keys') else []
+                    for key in keys:
+                        del state[key]
                 
                 # If no state to restore, we're done (state is now clean)
                 key = f"optimizer_{i}"
@@ -403,6 +415,7 @@ class MegatronRankWorker:
 
         optimizer = self.engine.optimizer
         if optimizer is None:
+            print(f"[Rank {self.rank}] _reset_optimizer_state: optimizer is None, skipping", flush=True)
             return
 
         def iter_optimizers(opt):
@@ -411,15 +424,89 @@ class MegatronRankWorker:
             return [opt]
 
         reset_count = 0
-        for _opt in iter_optimizers(optimizer):
+        for i, _opt in enumerate(iter_optimizers(optimizer)):
             if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
                 inner_opt = _opt.optimizer
-                # Clear optimizer state for all parameters
-                # This removes momentum, variance, and step counts
-                inner_opt.state.clear()
+                state = inner_opt.state
+                state_size_before = len(state) if hasattr(state, '__len__') else 'unknown'
+                print(f"[Rank {self.rank}] _reset_optimizer_state: opt[{i}] state size BEFORE clear = {state_size_before}", flush=True)
+                # Handle ProxyDict from ChainedOptimizer - it wraps multiple optimizer
+                # states and doesn't have .clear(). Access underlying dicts directly.
+                if hasattr(state, '_inner_dicts'):
+                    # ProxyDict from ChainedOptimizer
+                    for inner_dict in state._inner_dicts:
+                        inner_dict.clear()
+                    logger.debug(f"[Rank {self.rank}] Cleared ProxyDict optimizer state ({len(state._inner_dicts)} inner dicts)")
+                    print(f"[Rank {self.rank}] _reset_optimizer_state: Cleared ProxyDict ({len(state._inner_dicts)} inner dicts)", flush=True)
+                elif hasattr(state, 'clear'):
+                    # Regular dict
+                    state.clear()
+                    logger.debug(f"[Rank {self.rank}] Cleared optimizer state dict")
+                    print(f"[Rank {self.rank}] _reset_optimizer_state: Cleared state dict", flush=True)
+                else:
+                    # Unknown type - try to clear via iteration
+                    keys = list(state.keys()) if hasattr(state, 'keys') else []
+                    for key in keys:
+                        del state[key]
+                    logger.debug(f"[Rank {self.rank}] Cleared optimizer state via key deletion ({len(keys)} entries)")
+                    print(f"[Rank {self.rank}] _reset_optimizer_state: Cleared via key deletion ({len(keys)} keys)", flush=True)
+                state_size_after = len(state) if hasattr(state, '__len__') else 'unknown'
+                print(f"[Rank {self.rank}] _reset_optimizer_state: opt[{i}] state size AFTER clear = {state_size_after}", flush=True)
                 reset_count += 1
 
         logger.debug(f"[Rank {self.rank}] Reset optimizer state for {reset_count} optimizers")
+        print(f"[Rank {self.rank}] _reset_optimizer_state: Reset {reset_count} optimizers total", flush=True)
+
+        # Reset LR scheduler so new sessions start with fresh schedule
+        self._reset_lr_scheduler()
+
+        # Rebuild optimizer + scheduler to clear any hidden state
+        self._rebuild_optimizer_and_scheduler()
+
+    def _reset_lr_scheduler(self) -> None:
+        """Reset LR scheduler for a fresh session."""
+        lr_scheduler = getattr(self.engine, "lr_scheduler", None)
+        if lr_scheduler is None:
+            return
+
+        # Rebuild scheduler if engine supports it
+        if hasattr(self.engine, "_build_lr_scheduler"):
+            try:
+                self.engine.lr_scheduler = self.engine._build_lr_scheduler()
+                # Keep checkpoint manager in sync if present
+                for attr_name in ("checkpoint_mananager", "checkpoint_manager"):
+                    manager = getattr(self.engine, attr_name, None)
+                    if manager is not None and hasattr(manager, "optimizer_scheduler"):
+                        manager.optimizer_scheduler = self.engine.lr_scheduler
+                logger.info(f"[Rank {self.rank}] Reset lr_scheduler via _build_lr_scheduler")
+                return
+            except Exception as e:
+                logger.warning(f"[Rank {self.rank}] Failed to rebuild lr_scheduler: {e}")
+
+        # Fallback: try to reset state_dict if supported
+        try:
+            lr_scheduler.load_state_dict({})
+            logger.info(f"[Rank {self.rank}] Reset lr_scheduler via empty state_dict")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Failed to reset lr_scheduler: {e}")
+
+    def _rebuild_optimizer_and_scheduler(self) -> None:
+        """Rebuild optimizer and LR scheduler to ensure a clean state."""
+        try:
+            if hasattr(self.engine, "_build_optimizer") and hasattr(self.engine, "_build_lr_scheduler"):
+                self.engine.optimizer = self.engine._build_optimizer()
+                self.engine.lr_scheduler = self.engine._build_lr_scheduler()
+                # Keep checkpoint manager in sync if present
+                for attr_name in ("checkpoint_mananager", "checkpoint_manager"):
+                    manager = getattr(self.engine, attr_name, None)
+                    if manager is not None:
+                        if hasattr(manager, "optimizer"):
+                            manager.optimizer = self.engine.optimizer
+                        if hasattr(manager, "optimizer_scheduler"):
+                            manager.optimizer_scheduler = self.engine.lr_scheduler
+                logger.info(f"[Rank {self.rank}] Rebuilt optimizer and lr_scheduler")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Failed to rebuild optimizer/lr_scheduler: {e}")
 
     def swap_session_state(self, new_session_id: str) -> None:
         """Swap session state: save outgoing session's gradients/optimizer, load incoming.
@@ -489,10 +576,12 @@ class MegatronRankWorker:
             # Restore incoming session's optimizer state (or reset for new session)
             if new_session_id in self._session_optimizer_states:
                 self._restore_optimizer_state(self._session_optimizer_states[new_session_id])
+                print(f"[Rank {self.rank}] RESTORED optimizer state for session {new_session_id}", flush=True)
                 logger.debug(f"[Rank {self.rank}] Restored optimizer state for session {new_session_id}")
             else:
                 # New session - reset optimizer state (clear momentum/variance)
                 self._reset_optimizer_state()
+                print(f"[Rank {self.rank}] RESET optimizer state for NEW session {new_session_id}", flush=True)
                 logger.info(f"[Rank {self.rank}] New session {new_session_id} - reset optimizer state")
 
         self._current_session_id = new_session_id
@@ -1602,6 +1691,28 @@ class MegatronRankWorker:
         # IMPORTANT: verl zeros gradients on train_mode entry.
         # We must restore cached gradients before optimizer_step.
         with self.engine.train_mode():
+            # DEBUG: Check optimizer state size BEFORE step
+            if self.rank == 0:
+                from megatron.core.optimizer import ChainedOptimizer
+                optimizer = self.engine.optimizer
+                if optimizer is not None:
+                    def iter_optimizers(opt):
+                        if isinstance(opt, ChainedOptimizer):
+                            return opt.chained_optimizers
+                        return [opt]
+                    for i, _opt in enumerate(iter_optimizers(optimizer)):
+                        if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
+                            inner_opt = _opt.optimizer
+                            state = inner_opt.state
+                            state_size = len(state) if hasattr(state, '__len__') else 'unknown'
+                            # Check first param's state if any
+                            first_state = None
+                            if state:
+                                first_param = next(iter(state), None)
+                                if first_param is not None:
+                                    first_state = {k: v.shape if hasattr(v, 'shape') else v for k, v in state[first_param].items()}
+                            print(f"[Rank {self.rank}] optim_step BEFORE: opt[{i}] state size = {state_size}, first_state_keys = {first_state}", flush=True)
+
             # 1. Restore this session's cached gradients (if not None/consumed)
             cached_grads = self._session_gradients.get(session_id) if session_id else None
             if cached_grads is not None:
@@ -2554,6 +2665,145 @@ class MegatronRankWorker:
             print(f"[Rank {self.rank}] LoRA weight norm: {total_norm:.6f} ({param_count} params)", flush=True)
             return total_norm
 
+    def get_lora_weight_checksum(self) -> dict:
+        """Compute checksum stats for LoRA weights (rank 0 only)."""
+        import torch
+        with self.engine.train_mode():
+            from verl.utils.megatron_utils import unwrap_model
+            model = unwrap_model(self.engine.module)
+            while isinstance(model, list):
+                model = model[0]
+            total_sum = 0.0
+            total_abs_sum = 0.0
+            param_count = 0
+            for name, param in model.named_parameters():
+                name_lower = name.lower()
+                if 'lora' not in name_lower and 'adapter' not in name_lower:
+                    continue
+                if not param.requires_grad:
+                    continue
+                total_sum += float(param.data.sum().item())
+                total_abs_sum += float(param.data.abs().sum().item())
+                param_count += 1
+            return {
+                "sum": total_sum,
+                "abs_sum": total_abs_sum,
+                "count": param_count,
+            }
+
+    def get_base_weight_checksum(self, max_params: int = 5) -> dict:
+        """Compute checksum stats for a small sample of non-LoRA params (rank 0 only)."""
+        import torch
+        with self.engine.train_mode():
+            from verl.utils.megatron_utils import unwrap_model
+            model = unwrap_model(self.engine.module)
+            while isinstance(model, list):
+                model = model[0]
+            entries = []
+            for name, param in model.named_parameters():
+                name_lower = name.lower()
+                if 'lora' in name_lower or 'adapter' in name_lower:
+                    continue
+                entries.append((name, param))
+            entries.sort(key=lambda x: x[0])
+            sample = entries[:max_params]
+            total_sum = 0.0
+            total_abs_sum = 0.0
+            param_count = 0
+            sampled_names = []
+            for name, param in sample:
+                total_sum += float(param.data.sum().item())
+                total_abs_sum += float(param.data.abs().sum().item())
+                param_count += 1
+                sampled_names.append(name)
+            return {
+                "sum": total_sum,
+                "abs_sum": total_abs_sum,
+                "count": param_count,
+                "names": sampled_names,
+            }
+
+    def get_buffer_checksum(self, max_buffers: int = 5) -> dict:
+        """Compute checksum stats for a small sample of non-LoRA buffers."""
+        with self.engine.train_mode():
+            from verl.utils.megatron_utils import unwrap_model
+            model = unwrap_model(self.engine.module)
+            while isinstance(model, list):
+                model = model[0]
+            entries = []
+            for name, buf in model.named_buffers():
+                name_lower = name.lower()
+                if 'lora' in name_lower or 'adapter' in name_lower:
+                    continue
+                entries.append((name, buf))
+            entries.sort(key=lambda x: x[0])
+            sample = entries[:max_buffers]
+            total_sum = 0.0
+            total_abs_sum = 0.0
+            buf_count = 0
+            sampled_names = []
+            for name, buf in sample:
+                if buf is None:
+                    continue
+                total_sum += float(buf.float().sum().item())
+                total_abs_sum += float(buf.float().abs().sum().item())
+                buf_count += 1
+                sampled_names.append(name)
+            return {
+                "sum": total_sum,
+                "abs_sum": total_abs_sum,
+                "count": buf_count,
+                "names": sampled_names,
+            }
+
+    def get_optimizer_param_counts(self) -> dict:
+        """Count LoRA vs non-LoRA params referenced by optimizer param_groups."""
+        optimizer = getattr(self.engine, "optimizer", None)
+        if optimizer is None:
+            return {"has_optimizer": False}
+
+        # Build id -> name map for current model params (raw + unwrapped)
+        from verl.utils.megatron_utils import unwrap_model
+        id_to_name: dict[int, str] = {}
+
+        modules = self.engine.module if isinstance(self.engine.module, list) else [self.engine.module]
+        for mod in modules:
+            for n, p in mod.named_parameters():
+                id_to_name[id(p)] = n
+
+        unwrapped = unwrap_model(self.engine.module)
+        while isinstance(unwrapped, list):
+            unwrapped = unwrapped[0]
+        for n, p in unwrapped.named_parameters():
+            id_to_name.setdefault(id(p), n)
+        lora = 0
+        non_lora = 0
+        unknown = 0
+        non_lora_names = []
+
+        for group in optimizer.param_groups:
+            params = group.get("params", [])
+            for p in params:
+                name = id_to_name.get(id(p))
+                if name is None:
+                    unknown += 1
+                    continue
+                name_lower = name.lower()
+                if "lora" in name_lower or "adapter" in name_lower:
+                    lora += 1
+                else:
+                    non_lora += 1
+                    if len(non_lora_names) < 5:
+                        non_lora_names.append(name)
+
+        return {
+            "has_optimizer": True,
+            "lora": lora,
+            "non_lora": non_lora,
+            "unknown": unknown,
+            "non_lora_names": non_lora_names,
+        }
+
     def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.
 
@@ -2598,6 +2848,7 @@ class MegatronRankWorker:
                 model = model[0]
 
             # Find and reinitialize all LoRA parameters
+            skipped = []
             for name, param in model.named_parameters():
                 name_lower = name.lower()
                 if 'lora' not in name_lower and 'adapter' not in name_lower:
@@ -2618,6 +2869,11 @@ class MegatronRankWorker:
                     # zeros for lora_B
                     init.zeros_(param.data)
                     reinit_count += 1
+                else:
+                    skipped.append(name)
+
+            # Ensure only LoRA parameters are trainable
+            self._freeze_non_lora_params(model)
 
             # Zero gradients
             if hasattr(self.engine, 'optimizer') and self.engine.optimizer is not None:
@@ -2688,12 +2944,48 @@ class MegatronRankWorker:
                     else:
                         logger.warning(f"[Rank {self.rank}] Optimizer {i} has no inner optimizer or it's None")
 
+            # Reset LR scheduler so fresh sessions start from step 0
+            self._reset_lr_scheduler()
+
+            # Rebuild optimizer and scheduler AFTER reinit to sync master params
+            # with newly initialized LoRA weights. This prevents old master
+            # params from overwriting fresh weights on the first step.
+            self._rebuild_optimizer_and_scheduler()
+
         # Update instance learning_rate for future reference
         if learning_rate is not None:
             self.learning_rate = learning_rate
+            # Ensure optimizer param_groups reflect requested LR after rebuild
+            opt = getattr(self.engine, "optimizer", None)
+            if opt is not None and hasattr(opt, "param_groups"):
+                for pg in opt.param_groups:
+                    pg["lr"] = learning_rate
 
         logger.info(f"[Rank {self.rank}] Reinitialized {reinit_count} LoRA params, reset {opt_state_reset_count} optimizer states, lr_updated={lr_updated}")
+        if self.rank == 0:
+            print(
+                f"[Rank 0] reinit_lora_weights: reinit_count={reinit_count}, skipped={len(skipped)} "
+                f"sample_skipped={skipped[:10]}",
+                flush=True,
+            )
         return {"status": "ok", "reinit_count": reinit_count, "opt_state_reset": opt_state_reset_count, "lr_updated": lr_updated, "learning_rate": learning_rate}
+
+    def _freeze_non_lora_params(self, model) -> None:
+        """Ensure only LoRA/adapter parameters are trainable."""
+        trainable = 0
+        non_lora_trainable = 0
+        for name, param in model.named_parameters():
+            name_lower = name.lower()
+            if 'lora' in name_lower or 'adapter' in name_lower:
+                param.requires_grad_(True)
+                if param.requires_grad:
+                    trainable += 1
+            else:
+                param.requires_grad_(False)
+                if param.requires_grad:
+                    non_lora_trainable += 1
+        if self.rank == 0:
+            print(f"[Rank {self.rank}] _freeze_non_lora_params: trainable={trainable}, non_lora_trainable={non_lora_trainable}", flush=True)
 
     def get_optimizer_info(self) -> dict:
         """Return detailed info about optimizer structure for debugging."""
@@ -2885,6 +3177,9 @@ class MegatronRankWorker:
             _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
             if unexpected:
                 logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
+
+            # Ensure only LoRA parameters are trainable after load
+            self._freeze_non_lora_params(unwrapped)
 
         logger.info(f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path}")
 
@@ -3198,6 +3493,42 @@ class MegatronWorkerGroup:
             logger.warning(f"[MegatronWorkerGroup] Failed to get LoRA norm: {e}")
             return -1.0
 
+    def _get_lora_weight_checksum(self) -> dict:
+        """Get LoRA checksum stats from rank 0 for debugging."""
+        try:
+            result = ray.get(self.workers[0].get_lora_weight_checksum.remote())
+            return result
+        except Exception as e:
+            logger.warning(f"[MegatronWorkerGroup] Failed to get LoRA checksum: {e}")
+            return {"sum": 0.0, "abs_sum": 0.0, "count": 0}
+
+    def _get_base_weight_checksum(self) -> dict:
+        """Get base weight checksum stats from rank 0 for debugging."""
+        try:
+            result = ray.get(self.workers[0].get_base_weight_checksum.remote())
+            return result
+        except Exception as e:
+            logger.warning(f"[MegatronWorkerGroup] Failed to get base checksum: {e}")
+            return {"sum": 0.0, "abs_sum": 0.0, "count": 0, "names": []}
+
+    def _get_buffer_checksum(self) -> dict:
+        """Get buffer checksum stats from rank 0 for debugging."""
+        try:
+            result = ray.get(self.workers[0].get_buffer_checksum.remote())
+            return result
+        except Exception as e:
+            logger.warning(f"[MegatronWorkerGroup] Failed to get buffer checksum: {e}")
+            return {"sum": 0.0, "abs_sum": 0.0, "count": 0, "names": []}
+
+    def _get_optimizer_param_counts(self) -> dict:
+        """Get optimizer param composition from rank 0 for debugging."""
+        try:
+            result = ray.get(self.workers[0].get_optimizer_param_counts.remote())
+            return result
+        except Exception as e:
+            logger.warning(f"[MegatronWorkerGroup] Failed to get optimizer param counts: {e}")
+            return {"has_optimizer": False}
+
     def _swap_session_on_workers(self, new_session_id: str) -> None:
         """Swap session state (gradients + optimizer) on all workers.
 
@@ -3244,9 +3575,19 @@ class MegatronWorkerGroup:
             f"[MegatronWorkerGroup] Session switch: {self._current_session} -> {session_id}"
         )
 
-        # DEBUG: Log LoRA norm before switch
+        # DEBUG: Log LoRA norm/checksum before switch
         norm_before = self._get_lora_weight_norm()
-        print(f"[DEBUG] Session switch {self._current_session} -> {session_id}: LoRA norm BEFORE = {norm_before:.6f}", flush=True)
+        checksum_before = self._get_lora_weight_checksum()
+        base_checksum_before = self._get_base_weight_checksum()
+        buffer_checksum_before = self._get_buffer_checksum()
+        optim_param_counts = self._get_optimizer_param_counts()
+        print(
+            f"[DEBUG] Session switch {self._current_session} -> {session_id}: "
+            f"LoRA norm BEFORE = {norm_before:.6f}, checksum={checksum_before}, "
+            f"base_checksum={base_checksum_before}, buffer_checksum={buffer_checksum_before}, "
+            f"optim_params={optim_param_counts}",
+            flush=True,
+        )
 
         # Save outgoing session's LoRA weights to disk
         if self._current_session is not None:
@@ -3267,7 +3608,9 @@ class MegatronWorkerGroup:
         self._swap_session_on_workers(session_id)
 
         # Load new session's LoRA weights from disk (or reset for new session)
-        if self._session_manager.session_exists(session_id):
+        session_exists = self._session_manager.session_exists(session_id)
+        logger.info(f"[MegatronWorkerGroup] session_exists({session_id}) = {session_exists}")
+        if session_exists:
             new_path = self._session_manager.get_session_path(session_id)
             meta = self._session_manager.get_metadata(session_id)
             actual_rank = meta.get("actual_rank") if meta else None
@@ -3285,9 +3628,24 @@ class MegatronWorkerGroup:
             self._step_count = 0
             self._actual_rank = self.lora_rank
 
-        # DEBUG: Log LoRA norm after switch
+        # Reset expert_bias on every session switch to avoid cross-session leakage.
+        # expert_bias is not saved/restored with LoRA checkpoints.
+        try:
+            self.reset_expert_bias()
+        except Exception as e:
+            logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for {session_id}: {e}")
+
+        # DEBUG: Log LoRA norm/checksum after switch
         norm_after = self._get_lora_weight_norm()
-        print(f"[DEBUG] Session switch {self._current_session} -> {session_id}: LoRA norm AFTER = {norm_after:.6f}", flush=True)
+        checksum_after = self._get_lora_weight_checksum()
+        base_checksum_after = self._get_base_weight_checksum()
+        buffer_checksum_after = self._get_buffer_checksum()
+        print(
+            f"[DEBUG] Session switch {self._current_session} -> {session_id}: "
+            f"LoRA norm AFTER = {norm_after:.6f}, checksum={checksum_after}, "
+            f"base_checksum={base_checksum_after}, buffer_checksum={buffer_checksum_after}",
+            flush=True,
+        )
 
         self._current_session = session_id
 
@@ -3740,9 +4098,11 @@ class MegatronWorkerGroup:
         if actual_rank is not None:
             self._actual_rank = actual_rank
 
-        # Issue #44: Update current session to the new session
-        if new_session_id is not None:
-            self._current_session = new_session_id
+        # NOTE: Do NOT set _current_session here!
+        # Session switching must go through _ensure_session_loaded() which calls
+        # _swap_session_on_workers() to properly save/restore optimizer state and gradients.
+        # Setting _current_session here would make _ensure_session_loaded() think the
+        # session is already loaded and skip the critical state swap.
 
         logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}, new_session={new_session_id}")
         return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate, "actual_rank": self._actual_rank}
@@ -4494,11 +4854,9 @@ def get_or_create_megatron_worker_group(
         )
         # Existing actor is already ready
         resource_pool.mark_ready(actor_name)
-        # Reinitialize LoRA weights for fresh session with actual_rank
-        # Issue #44: Pass session_id to save current session's weights before reinit
-        logger.info(f"Reinitializing LoRA weights for new session (lr={learning_rate}, actual_rank={lora_rank}, session_id={session_id})...")
-        result = ray.get(actor.reinit_lora_weights.remote(learning_rate=learning_rate, actual_rank=lora_rank, new_session_id=session_id))
-        logger.info(f"LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}, actual_rank={result.get('actual_rank')}")
+        # NOTE: Do NOT reinit weights here for existing actors.
+        # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
+        # to avoid clobbering active sessions during create_model.
         return actor
     except ValueError:
         # Actor doesn't exist, create new one

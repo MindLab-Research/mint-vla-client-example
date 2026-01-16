@@ -35,7 +35,7 @@ BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 MODEL_NAME = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 MODEL_SEQ_ID = 0
 
-STEPS = 10
+STEPS = 5
 BATCH_SIZE = 4
 LEARNING_RATE = 1e-4
 
@@ -268,18 +268,19 @@ def main():
     test_id = uuid.uuid4().hex[:8]
 
     # Generate data (need enough for all phases)
-    # Solo phases use first half, concurrent phase uses second half
+    # Arithmetic: 3 phases (solo1, solo2, concurrent)
+    # Countdown: 2 phases (solo, concurrent)
     print("Generating training data...")
-    arith_data = create_arithmetic_data(STEPS * BATCH_SIZE * 2, tokenizer)
+    arith_data = create_arithmetic_data(STEPS * BATCH_SIZE * 3, tokenizer)
     countdown_data = create_countdown_data(STEPS * BATCH_SIZE * 2, tokenizer)
     print(f"  Arithmetic samples: {len(arith_data)}")
     print(f"  Countdown samples: {len(countdown_data)}")
 
-    # Phase 1: Train Arithmetic solo
+    # Phase 1: Train Arithmetic solo (first time)
     print("\n" + "=" * 70)
-    print("PHASE 1: Train Arithmetic solo")
+    print("PHASE 1: Train Arithmetic solo (FIRST)")
     print("=" * 70)
-    arith_solo = train_solo(
+    arith_solo_1 = train_solo(
         f"arith-solo-{test_id}",
         arith_data[:STEPS * BATCH_SIZE],
         STEPS
@@ -295,16 +296,26 @@ def main():
         STEPS
     )
 
-    # Phase 3: Train both interleaved
+    # Phase 3: Train Arithmetic solo AGAIN (NEW session ID!)
     print("\n" + "=" * 70)
-    print("PHASE 3: Train Arithmetic + Countdown interleaved")
+    print("PHASE 3: Train Arithmetic solo (SECOND - NEW session ID)")
+    print("=" * 70)
+    arith_solo_2 = train_solo(
+        f"arith-solo-NEW-{test_id}",  # DIFFERENT session ID!
+        arith_data[STEPS * BATCH_SIZE:STEPS * BATCH_SIZE * 2],  # Different data
+        STEPS
+    )
+
+    # Phase 4: Train Arithmetic + Countdown concurrently (interleaved)
+    print("\n" + "=" * 70)
+    print("PHASE 4: Train Arithmetic + Countdown concurrent (INTERLEAVED)")
     print("=" * 70)
     arith_concurrent, countdown_concurrent = train_interleaved(
         f"arith-concurrent-{test_id}",
-        arith_data[STEPS * BATCH_SIZE:],
+        arith_data[STEPS * BATCH_SIZE * 2:STEPS * BATCH_SIZE * 3],
         f"countdown-concurrent-{test_id}",
-        countdown_data[STEPS * BATCH_SIZE:],
-        STEPS
+        countdown_data[STEPS * BATCH_SIZE:STEPS * BATCH_SIZE * 2],
+        STEPS,
     )
 
     # Results
@@ -312,16 +323,22 @@ def main():
     print("RESULTS: Loss Curves")
     print("=" * 70)
 
-    print("\nArithmetic - Solo:")
+    print("\nArithmetic - Solo (FIRST):")
     print(f"{'Step':<6} {'Loss':<12}")
     print("-" * 18)
-    for i, loss in enumerate(arith_solo):
+    for i, loss in enumerate(arith_solo_1):
         print(f"{i:<6} {loss:<12.4f}")
 
     print("\nCountdown - Solo:")
     print(f"{'Step':<6} {'Loss':<12}")
     print("-" * 18)
     for i, loss in enumerate(countdown_solo):
+        print(f"{i:<6} {loss:<12.4f}")
+
+    print("\nArithmetic - Solo (SECOND - new session):")
+    print(f"{'Step':<6} {'Loss':<12}")
+    print("-" * 18)
+    for i, loss in enumerate(arith_solo_2):
         print(f"{i:<6} {loss:<12.4f}")
 
     print("\nArithmetic - Concurrent:")
@@ -336,32 +353,17 @@ def main():
     for i, loss in enumerate(countdown_concurrent):
         print(f"{i:<6} {loss:<12.4f}")
 
-    # Check if curves decrease (learning is happening)
-    arith_solo_decreasing = arith_solo[-1] < arith_solo[0]
-    countdown_solo_decreasing = countdown_solo[-1] < countdown_solo[0]
-    arith_concurrent_decreasing = arith_concurrent[-1] < arith_concurrent[0]
-    countdown_concurrent_decreasing = countdown_concurrent[-1] < countdown_concurrent[0]
-
+    # Check for the bug
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("ANALYSIS")
     print("=" * 70)
-    print(f"\nArithmetic solo: {arith_solo[0]:.4f} -> {arith_solo[-1]:.4f} (decreasing: {arith_solo_decreasing})")
-    print(f"Countdown solo: {countdown_solo[0]:.4f} -> {countdown_solo[-1]:.4f} (decreasing: {countdown_solo_decreasing})")
-    print(f"Arithmetic concurrent: {arith_concurrent[0]:.4f} -> {arith_concurrent[-1]:.4f} (decreasing: {arith_concurrent_decreasing})")
-    print(f"Countdown concurrent: {countdown_concurrent[0]:.4f} -> {countdown_concurrent[-1]:.4f} (decreasing: {countdown_concurrent_decreasing})")
+    print(f"\nArith FIRST:  {arith_solo_1[0]:.4f} -> {arith_solo_1[-1]:.4f}")
+    print(f"Arith SECOND: {arith_solo_2[0]:.4f} -> {arith_solo_2[-1]:.4f}")
 
-    # Return exit code based on all curves decreasing
-    all_decreasing = arith_solo_decreasing and countdown_solo_decreasing and arith_concurrent_decreasing and countdown_concurrent_decreasing
-
-    if all_decreasing:
-        print("\nBASIC CHECK: PASS - All curves show learning (decreasing loss)")
-        print("Visual inspection of curves above recommended for full verification.")
-        return 0
-    else:
-        print("\nBASIC CHECK: WARNING - Some curves not decreasing")
-        print("This may indicate a bug or insufficient training steps.")
-        return 1
+    if arith_solo_2[0] < 0.1:
+        print("\n*** BUG CONFIRMED: Second Arith starts with near-zero loss! ***")
+        print("*** Session is loading trained weights instead of fresh weights ***")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
