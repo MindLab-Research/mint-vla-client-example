@@ -189,11 +189,37 @@ ssh volcano "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API
+# Via API (preferred)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
-# Via script (if server down)
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_vllm.py'
+# Kill specific model's vLLM actor
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:8000/api/v1/kill_vllm
+```
+
+### Kill Megatron Actor
+
+```bash
+curl -X POST http://localhost:8000/api/v1/kill_megatron
+
+# Kill specific model's Megatron actor
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:8000/api/v1/kill_megatron
+```
+
+### Check Actor Status
+
+```bash
+# vLLM status
+curl -s http://localhost:8000/api/v1/vllm_status | jq
+
+# Megatron status
+curl -s http://localhost:8000/api/v1/megatron_status | jq
+
+# Kill all actors (nuclear option)
+curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ```
 
 ---
@@ -298,6 +324,16 @@ sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 
 ## 5. Ray Cluster
 
+**Find Ray head task (if task ID unknown):**
+```bash
+volc ml_task list --output json | jq '.[] | select(.Name | startswith("ray-head")) | {Id, Name, Status}'
+```
+
+**Get Ray head IP from task logs:**
+```bash
+volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
+```
+
 **Connect SSH server to cluster:**
 ```bash
 ssh volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
@@ -322,8 +358,8 @@ Dev-specific values:
 
 | Model | vLLM (Inference) | Megatron (Training) | Total (Simultaneous) |
 |-------|------------------|---------------------|----------------------|
-| **Qwen3-30B-A3B** | TP=1, DP=4 → **4 GPUs** | TP=4, EP=2 → **8 GPUs** | **12 GPUs** |
-| **Qwen3-235B-A22B** | TP=2, DP=4 → **8 GPUs** | Not tested | **8+ GPUs** |
+| **Qwen3-30B-A3B** | TP=4 → **4 GPUs** | TP=4, EP=1 → **4 GPUs** | **8 GPUs** |
+| **Moonlight-16B-A3B** | TP=8 → **8 GPUs** | TP=8, EP=8 → **8 GPUs** | **16 GPUs** |
 | Dense models (7B-14B) | **1 GPU** | **1 GPU** | **2 GPUs** |
 
 ### Pre-flight Check (MANDATORY)
@@ -340,19 +376,19 @@ t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
 gpu_total = t.get("GPU", 0)
 print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
-for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
-    try:
-        ray.get_actor(name, namespace="tinker")
+# List actors by prefix (vLLM actors are named tinker_vllm_{model_name})
+actors = ray.util.list_named_actors(all_namespaces=True)
+for a in actors:
+    name = a["name"]
+    if name.startswith("tinker_vllm_") or name.startswith("megatron_"):
         print(f"{name}: ALIVE")
-    except ValueError:
-        print(f"{name}: not running")
 PYEOF'
 
 # Check pending placement groups (should be empty)
 ssh volcano "ray status 2>/dev/null | grep -A5 'Pending Demands'"
 ```
 
-**Required for Qwen3-30B-A3B tests:** At least 12 available GPUs and no pending placement groups.
+**Required for Qwen3-30B-A3B tests:** At least 8 available GPUs and no pending placement groups.
 
 ### Parallelism Configuration
 
@@ -492,3 +528,21 @@ ssh volcano 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
 | MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
 | Tokenizer download fails | Run test script locally, not on server (server has no internet) |
 | Actor lookup fails | **LIST actors first** (`ray list actors`), don't assume dead |
+
+---
+
+## 10. Scripts Directory Structure
+
+```
+scripts/
+├── run_server.py      # Server entry point (core)
+├── tools/             # Reusable debug utilities (tracked in git)
+└── wip/               # Work-in-progress investigations (gitignored)
+```
+
+**Workflow:**
+- Active investigation scripts → `scripts/wip/` (not tracked)
+- Scripts worth sharing/collaborating → promote to `scripts/tools/`
+- Throwaway scripts → delete after use
+
+**Do NOT** accumulate investigation scripts in `scripts/` root.

@@ -217,3 +217,18 @@ PROMPT.md
 LOG.md
 transcript.txt
 results/
+
+# Generated files
+ray_head_ip.txt
+*.pem
+*.key
+
+# Work-in-progress investigation scripts
+scripts/wip/
+
+# Experiment outputs in root
+*_training_curves.png
+*_comparison.png
+*_ANALYSIS.md
+*_REPORT.md
+REFLECTION_*.md

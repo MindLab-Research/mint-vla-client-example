@@ -51,14 +51,14 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 |----------|-------|
 | SSH Host | `mint-prod` |
 | Port | 18000 |
-| External URL | `https://mint-alpha.macaron.im` |
+| External URL | `https://mint.macaron.im` |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
 | Ray Configs | `mint-prod-head.yaml`, `mint-prod-worker.yaml` |
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
-**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint-alpha.macaron.im`. No additional setup required.
+**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint.macaron.im`. No additional setup required.
 
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
 
@@ -221,8 +221,34 @@ ssh mint-prod "ps aux | grep run_server | grep -v grep"
 # Via API (requires auth)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
-# Via script (if server down)
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_vllm.py'
+# Kill specific model's vLLM actor
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:18000/api/v1/kill_vllm
+```
+
+### Kill Megatron Actor
+
+```bash
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
+
+# Kill specific model's Megatron actor
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"}' \
+  http://localhost:18000/api/v1/kill_megatron
+```
+
+### Check Actor Status
+
+```bash
+# vLLM status
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status | jq
+
+# Megatron status
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/megatron_status | jq
+
+# Kill all actors (nuclear option)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_all_actors
 ```
 
 ---
@@ -238,16 +264,14 @@ ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill
 | Routes, middleware only | Any | Restart server only |
 | Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
 
-### Kill Scripts
+### Kill Actors
+
+See "Kill vLLM Actor" and "Kill Megatron Actor" sections above for API commands.
 
 ```bash
-# Kill Megatron (frees 8 GPUs for MoE)
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_megatron.py'
-
-# Kill vLLM (frees 1-4 GPUs depending on model) - requires auth
+# Quick reference (requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
-# OR if server down:
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_vllm.py'
 ```
 
 ### Legacy Reference
@@ -334,8 +358,8 @@ Prod-specific values:
 
 | Model | vLLM (Inference) | Megatron (Training) | Total (Simultaneous) |
 |-------|------------------|---------------------|----------------------|
-| **Qwen3-30B-A3B** | TP=1, DP=4 → **4 GPUs** | TP=4, EP=2 → **8 GPUs** | **12 GPUs** |
-| **Qwen3-235B-A22B** | TP=2, DP=4 → **8 GPUs** | Not tested | **8+ GPUs** |
+| **Qwen3-30B-A3B** | TP=4 → **4 GPUs** | TP=4, EP=1 → **4 GPUs** | **8 GPUs** |
+| **Moonlight-16B-A3B** | TP=8 → **8 GPUs** | TP=8, EP=8 → **8 GPUs** | **16 GPUs** |
 | Dense models (7B-14B) | **1 GPU** | **1 GPU** | **2 GPUs** |
 
 ### Pre-flight Check (MANDATORY)
@@ -350,12 +374,12 @@ t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
 gpu_total = t.get("GPU", 0)
 print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
-for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
-    try:
-        ray.get_actor(name, namespace="tinker")
+# List actors by prefix (vLLM actors are named tinker_vllm_{model_name})
+actors = ray.util.list_named_actors(all_namespaces=True)
+for a in actors:
+    name = a["name"]
+    if name.startswith("tinker_vllm_") or name.startswith("megatron_"):
         print(f"{name}: ALIVE")
-    except ValueError:
-        print(f"{name}: not running")
 PYEOF'
 ```
 
@@ -395,3 +419,21 @@ ssh mint-prod "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.log | tail
 2. **Missing `PYTHONPATH` override** - causes auth bypass (loads pip-installed `tinker-server` without auth)
 3. **Forgetting `X-API-Key` header** - all endpoints except healthz require auth
 4. **Wrong port** - prod uses 18000, not 8000
+
+---
+
+## 8. Scripts Directory Structure
+
+```
+scripts/
+├── run_server.py      # Server entry point (core)
+├── tools/             # Reusable debug utilities (tracked in git)
+└── wip/               # Work-in-progress investigations (gitignored)
+```
+
+**Workflow:**
+- Active investigation scripts → `scripts/wip/` (not tracked)
+- Scripts worth sharing/collaborating → promote to `scripts/tools/`
+- Throwaway scripts → delete after use
+
+**Do NOT** accumulate investigation scripts in `scripts/` root.

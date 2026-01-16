@@ -8,44 +8,53 @@ description: |
   Triggers: "fix issue", "reproduce bug", "test bugfix", "issue #X"
 
   **CRITICAL: Production server is READ-ONLY. Never restart, modify, or touch prod server.**
-  **CRITICAL: Dev server symlink is READ-ONLY. Never modify shared dev configuration.**
 ---
 
 # Bugfix Workflow
 
-> **ABSOLUTE RULES - VIOLATION IS UNACCEPTABLE**
+> **ABSOLUTE RULES**
 >
 > 1. **PRODUCTION IS READ-ONLY**: You may only READ logs. NEVER restart, kill, or modify prod server.
-> 2. **DEV SYMLINK IS READ-ONLY**: NEVER touch `/root/tinker_project/tinker-server` symlink on volcano.
-> 3. **NEVER SUBSTITUTE REQUIREMENTS**: If an issue is complex, solve it. Don't simplify the problem.
-> 4. **VERIFY WITH REPRODUCTION SCRIPT**: A fix is not complete until the reproduction script passes.
+> 2. **NEVER SUBSTITUTE REQUIREMENTS**: If an issue is complex, solve it. Don't simplify the problem.
+> 3. **VERIFY WITH REPRODUCTION SCRIPT**: A fix is not complete until the reproduction script passes.
 
 ---
 
-## Phase 1: Reproduce Issue on Production
+## Phase 1: Understand the Issue
 
-### 1.1 Create Reproduction Script
+### 1.1 Create Environment-Agnostic Reproduction Script
 
-Write a script that reliably reproduces the issue using the production API.
+Write a script that can run against either production or development:
 
-```bash
-# Location: scripts/reproduce_issue_<NUMBER>.py
-# Example for issue #7:
-scripts/reproduce_issue_7.py
+```python
+# scripts/reproduce_issue_<NUMBER>.py
+import os
+
+BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
+API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+
+# ... reproduction logic using BASE_URL and API_KEY
 ```
 
 **Script requirements:**
-- Uses production API: `https://mint-alpha.macaron.im`
-- Uses production API key (from issue instructions)
+- Uses environment variables for URL and API key
 - Clearly prints success/failure
 - Defines issue scope (what fails, what works)
 
-### 1.2 Run Reproduction Script Locally
+### 1.2 Reproduce on Production (Optional)
+
+If the bug was reported from production, verify it exists:
 
 ```bash
-# Run from LOCAL machine (has internet for tokenizers)
+# Use admin API key to see full server-side errors
+TINKER_BASE_URL=https://mint.macaron.im \
+TINKER_API_KEY=<admin_key> \
 python scripts/reproduce_issue_<NUMBER>.py
 ```
+
+> **Admin API Key Benefit**: When using the admin API key, server-side error details
+> are included in the response. Regular users only see generic error messages.
+> This makes reproduction more targeted.
 
 ### 1.3 Check Production Logs (READ-ONLY)
 
@@ -68,173 +77,67 @@ Before proceeding, clearly document:
 
 ---
 
-## Phase 2: Set Up Bugfix Environment
+## Phase 2: Fix and Test on Development
 
-### 2.1 Directory Structure
-
-Local and remote directories MUST have `bugfix` suffix:
-
-| Location | Path |
-|----------|------|
-| Local | `/home/yiwen/tinker_project/tinker-server-bugfix` |
-| Remote (PFS) | `/vePFS-Mindverse/share/code/tinker-server-bugfix` |
-| Remote symlink | `/root/tinker_project/tinker-server-bugfix` (NEW, separate from dev) |
-
-### 2.2 Create Remote Directory and Symlink
+### 2.1 Ensure Dev Environment is Ready
 
 ```bash
-# Create PFS directory (if not exists)
-ssh volcano "mkdir -p /vePFS-Mindverse/share/code/tinker-server-bugfix"
+# Verify unison is syncing
+pgrep -af "unison.*volcano-tinker"
 
-# Create SEPARATE symlink for bugfix (NOT the shared dev symlink)
-ssh volcano "ln -sf /vePFS-Mindverse/share/code/tinker-server-bugfix /root/tinker_project/tinker-server-bugfix"
-
-# Verify
-ssh volcano "ls -la /root/tinker_project/ | grep tinker"
+# Check dev server is running
+curl http://localhost:8000/api/v1/healthz
 ```
 
-**Expected output shows TWO symlinks:**
-```
-tinker-server -> /vePFS-Mindverse/share/code/tinker-server          # DEV - DO NOT TOUCH
-tinker-server-bugfix -> /vePFS-Mindverse/share/code/tinker-server-bugfix  # BUGFIX - yours
-```
+If dev server is not running, use the `mint-dev` skill to start it.
 
-### 2.3 Set Up SSH Tunnel
+### 2.2 Reproduce on Development
 
 ```bash
-# Bugfix server uses port 8001 (different from dev port 8000)
-ssh -f -N -L 8001:localhost:8001 volcano
-
-# Verify tunnel
-lsof -i :8001
+# Default environment uses dev server
+python scripts/reproduce_issue_<NUMBER>.py
 ```
 
-### 2.4 Set Up Unison Profile
-
-Create `~/.unison/volcano-tinker-bugfix.prf`:
-
-```
-root = /home/yiwen/tinker_project/tinker-server-bugfix
-root = ssh://volcano//vePFS-Mindverse/share/code/tinker-server-bugfix
-
-auto = true
-batch = true
-prefer = newer
-times = true
-
-ignore = Name {*.pyc}
-ignore = Name {__pycache__}
-ignore = Name {*.swp}
-ignore = Name {*.swo}
-ignore = Name {.DS_Store}
-ignore = Name {.venv}
-ignore = Name {.mypy_cache}
-ignore = Name {.pytest_cache}
-ignore = Name {*.egg-info}
-
-servercmd = /usr/local/bin/unison
-```
-
-Start unison daemon:
+Or explicitly:
 ```bash
-# Check if already running
-pgrep -af "unison.*volcano-tinker-bugfix"
-
-# Start daemon
-nohup unison volcano-tinker-bugfix -repeat watch > /tmp/unison-bugfix.log 2>&1 &
-
-# Verify sync
-tail -20 /tmp/unison-bugfix.log
+TINKER_BASE_URL=http://localhost:8000 \
+TINKER_API_KEY=dummy \
+python scripts/reproduce_issue_<NUMBER>.py
 ```
+
+### 2.3 Implement Fix
+
+1. Identify root cause from reproduction
+2. Make code changes
+3. **Restart dev server** (code changes require server restart):
+   ```bash
+   ssh volcano 'pkill -f "tinker-server.*run_server"'
+   # Then start server using mint-dev skill
+   ```
+
+### 2.4 Verify Fix
+
+```bash
+# Run reproduction script - should now pass
+python scripts/reproduce_issue_<NUMBER>.py
+```
+
+### 2.5 Check for Regressions
+
+Run related tests to ensure fix doesn't break existing functionality.
 
 ---
 
-## Phase 3: Test on Dev Cluster
+## Phase 3: Validate
 
-### 3.1 Resource Sharing Notice
-
-The bugfix server shares the mint-dev Ray cluster with feature development due to resource constraints.
-
-**Rules:**
-- Bugfix uses port **8001**, dev uses port **8000**
-- Bugfix log: `/tmp/tinker_server_bugfix.log`
-- Dev log: `/tmp/tinker_server.log`
-- Code paths are separate (different symlinks)
-- **Do NOT run both servers concurrently** - if dev server is running, notify user
-
-### 3.2 Check for Concurrent Server
-
-Before starting bugfix server:
-
-```bash
-# Check if dev server is running
-ssh volcano "ps aux | grep 'run_server' | grep -v grep"
-
-# If output shows a running server, STOP and notify user:
-# "Dev server is currently running on port 8000. Cannot start bugfix server concurrently.
-#  Please coordinate with dev team or wait for dev server to stop."
-```
-
-### 3.3 Start Bugfix Server
-
-```bash
-ssh volcano 'cd /root/tinker_project/tinker-server-bugfix && nohup bash -c \
-  "PYTHONPATH=/root/tinker_project/tinker-server-bugfix:\$PYTHONPATH \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   TINKER_PORT=8001 \
-   python scripts/run_server.py" > /tmp/tinker_server_bugfix.log 2>&1 &'
-```
-
-### 3.4 Health Check
-
-```bash
-# Via tunnel (port 8001)
-curl http://localhost:8001/api/v1/healthz
-```
-
-### 3.5 Run Reproduction Script Against Bugfix Server
-
-Modify reproduction script to use bugfix server:
-
-```python
-# Change from:
-API_URL = "https://mint-alpha.macaron.im"
-# To:
-API_URL = "http://localhost:8001"
-API_KEY = "dummy"  # Auth disabled on dev cluster
-```
-
-Or use environment variables:
-```bash
-TINKER_BASE_URL=http://localhost:8001 TINKER_API_KEY=dummy python scripts/reproduce_issue_<NUMBER>.py
-```
-
-### 3.6 Check Bugfix Server Logs
-
-```bash
-ssh volcano "tail -50 /tmp/tinker_server_bugfix.log"
-ssh volcano "grep -i 'error\|exception' /tmp/tinker_server_bugfix.log | tail -20"
-```
-
-### 3.7 Stop Bugfix Server
-
-```bash
-ssh volcano 'pkill -f "tinker-server-bugfix.*run_server"'
-```
-
----
-
-## Phase 4: Validate Fix
-
-### 4.1 Success Criteria
+### 3.1 Success Criteria
 
 A fix is ONLY complete when:
 1. Reproduction script passes (no errors)
 2. Original functionality still works (no regressions)
 3. Edge cases are handled
 
-### 4.2 Never Substitute Requirements
+### 3.2 Never Substitute Requirements
 
 **FORBIDDEN responses:**
 - "The issue is complex, let's take a simpler approach"
@@ -253,23 +156,19 @@ A fix is ONLY complete when:
 
 | Task | Command |
 |------|---------|
-| SSH tunnel (bugfix) | `ssh -f -N -L 8001:localhost:8001 volcano` |
-| Start unison | `unison volcano-tinker-bugfix -repeat watch` |
-| Check dev server | `ssh volcano "ps aux \| grep run_server \| grep -v grep"` |
-| Start bugfix server | See section 3.3 |
-| Health check | `curl http://localhost:8001/api/v1/healthz` |
-| Bugfix logs | `ssh volcano "tail -50 /tmp/tinker_server_bugfix.log"` |
-| Stop bugfix server | `ssh volcano 'pkill -f "tinker-server-bugfix.*run_server"'` |
+| Reproduce on prod | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/reproduce_issue_X.py` |
+| Reproduce on dev | `python scripts/reproduce_issue_X.py` |
 | Prod logs (READ-ONLY) | `ssh mint-prod "tail -100 /tmp/tinker_server_auth.log"` |
+| Dev logs | `ssh volcano "tail -100 /tmp/tinker_server.log"` |
+| Health check | `curl http://localhost:8000/api/v1/healthz` |
 
 ---
 
-## Troubleshooting
+## API Key Behavior
 
-| Problem | Solution |
-|---------|----------|
-| Port 8001 in use | Check for stale bugfix server, kill it |
-| Unison not syncing | Check `tail /tmp/unison-bugfix.log` |
-| Dev server running | Notify user, wait for coordination |
-| Fix doesn't work | Re-check reproduction, don't substitute requirements |
-| Prod logs stale | Verify correct log file path on mint-prod |
+| API Key Type | Error Details | Use Case |
+|--------------|---------------|----------|
+| Admin key | Full server-side errors exposed | Debugging, reproduction |
+| Regular key (`sk-*`) | Generic "Operation failed" message | Production users |
+
+Admin keys are identified by `user_id == "admin"` in the auth system. When reproducing issues, always use an admin key to see the actual error.

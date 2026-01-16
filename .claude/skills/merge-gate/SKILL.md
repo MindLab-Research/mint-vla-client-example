@@ -28,11 +28,10 @@ The merge gate validates that code on `develop` is ready to merge to `main`. It 
 | Model | vLLM GPUs | Megatron GPUs | Total |
 |-------|-----------|---------------|-------|
 | Qwen3-0.6B (Dense) | 1 | 1 | 2 |
-| Qwen3-0.6B (Dense) | 1 | 1 | 2 |
-| Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4) | 8 |
-| Moonlight-16B-A3B (MLA) | 4 (TP=4) | 8 (TP=2,EP=4) | 12 |
+| Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4, EP=1) | 8 |
+| Moonlight-16B-A3B (MLA) | 8 (TP=8) | 8 (TP=8, EP=8) | 16 |
 
-**Note**: MoE uses TP=4 for both vLLM and Megatron. Moonlight uses DeepseekV3 MLA architecture requiring EP=4 for training.
+**Note**: Qwen3-30B uses TP=4 for both vLLM and Megatron. Moonlight uses DeepseekV3 MLA architecture with TP=8, EP=8.
 
 ### Full Merge Gate Procedure
 
@@ -75,13 +74,12 @@ gpu_avail = r.get("GPU", 0)
 gpu_total = t.get("GPU", 0)
 print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
 
-# Check for stale actors
-for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
-    try:
-        ray.get_actor(name, namespace="tinker")
+# Check for stale actors (vLLM actors are named tinker_vllm_{model_name})
+actors = ray.util.list_named_actors(all_namespaces=True)
+for a in actors:
+    name = a["name"]
+    if name.startswith("tinker_vllm_") or name.startswith("megatron_"):
         print(f"{name}: ALIVE (may need to kill)")
-    except ValueError:
-        print(f"{name}: not running")
 
 # Warning if insufficient
 if gpu_total < 8:
@@ -110,10 +108,17 @@ See **volcano-cluster** skill for detailed worker management commands.
 
 ```bash
 # Kill Megatron (frees 8 GPUs)
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+curl -X POST http://localhost:8000/api/v1/kill_megatron
 
 # Kill vLLM (frees 1-4 GPUs)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
+
+# Kill all actors
+curl -X POST http://localhost:8000/api/v1/kill_all_actors
+
+# Check status
+curl -s http://localhost:8000/api/v1/megatron_status | jq
+curl -s http://localhost:8000/api/v1/vllm_status | jq
 ```
 
 ### 5. Verify Server Health
@@ -145,7 +150,7 @@ curl -s http://localhost:8000/api/v1/healthz
 
 ### Phase 2.5: Moonlight Tests (moonshotai/Moonlight-16B-A3B-Instruct)
 
-**Requires 12 GPUs.** Tests DeepseekV3 MLA (Multi-Latent Attention) architecture.
+**Requires 16 GPUs (8 vLLM + 8 Megatron).** Tests DeepseekV3 MLA (Multi-Latent Attention) architecture.
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|

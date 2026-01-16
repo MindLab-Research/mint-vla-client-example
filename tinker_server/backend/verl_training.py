@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -280,6 +281,8 @@ class TrainingWorker:
 
         logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
 
+        self._configure_attention_backends()
+
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             base_model, trust_remote_code=True, local_files_only=True
@@ -299,14 +302,20 @@ class TrainingWorker:
         # Enable gradient checkpointing for large dense models (trades compute for memory)
         # Must be done before PEFT wrapping to properly set up the model
         from .model_registry import get_model_config
+        force_grad_ckpt = os.getenv("TINKER_FORCE_GRAD_CHECKPOINTING", "1") == "1"
         try:
-            use_grad_ckpt = get_model_config(base_model).gradient_checkpointing
+            use_grad_ckpt = get_model_config(base_model).gradient_checkpointing or force_grad_ckpt
         except ValueError:
-            # Model not in registry, default to no checkpointing
-            use_grad_ckpt = False
+            use_grad_ckpt = force_grad_ckpt
+
+        # Disable KV cache for training to reduce memory
+        if hasattr(self.model, "config") and getattr(self.model.config, "use_cache", None):
+            self.model.config.use_cache = False
 
         if use_grad_ckpt:
             self.model.gradient_checkpointing_enable()
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
             logger.info(f"[TrainingWorker] Gradient checkpointing enabled for {base_model}")
 
         # Apply LoRA
@@ -339,6 +348,22 @@ class TrainingWorker:
         self._current_session_id: str | None = None
 
         logger.info("[TrainingWorker] Ready")
+
+    @staticmethod
+    def _configure_attention_backends() -> None:
+        """Enable memory-efficient SDP where available."""
+        if os.getenv("TINKER_ENABLE_SDP", "1") != "1":
+            return
+        try:
+            if hasattr(torch.backends, "cuda"):
+                if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                    torch.backends.cuda.enable_flash_sdp(True)
+                if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                    torch.backends.cuda.enable_mem_efficient_sdp(True)
+                if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                    torch.backends.cuda.enable_math_sdp(True)
+        except Exception as e:
+            logger.warning(f"[TrainingWorker] Failed to configure SDP backends: {e}")
 
     def _touch(self) -> None:
         """Update last activity timestamp. Call at start of every method."""
@@ -720,11 +745,8 @@ class TrainingWorker:
             "num_tokens:sum": float(total_tokens),
         }
 
-        # Add debug logits info if available (from last item processed)
-        try:
-            metrics["_debug_logits"] = _debug_logits_info
-        except NameError:
-            pass
+        # Debug logits info removed - was causing type mismatch with client
+        # (client expects Dict[str, float], not nested dicts)
 
         # Add RL-specific metrics
         if num_rl_samples > 0:
@@ -922,7 +944,7 @@ class TrainingWorker:
         logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
 
         return {
-            "metrics": {"grad_norm": float(grad_norm)},
+            "metrics": {"grad_norm:last": float(grad_norm)},
             "type": "optim_step",
         }
 
@@ -2174,6 +2196,7 @@ class DenseTrainerPool:
                         "HF_HUB_OFFLINE": "1",
                         "TRANSFORMERS_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                     }
                 }
 

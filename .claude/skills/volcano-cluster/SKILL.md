@@ -37,11 +37,9 @@ http://<RAY_HEAD_IP>:8265
 | Flavor | GPUs | Memory | Use Case |
 |--------|------|--------|----------|
 | `ml.g2a.xlarge` | 0 (CPU only) | - | Ray head node |
-| `ml.hpcpni2l.7xlarge` | 2x A800 80GB | 490 GiB | Small training (RDMA) |
-| `ml.hpcpni2l.14xlarge` | 4x A800 80GB | 980 GiB | Medium training (RDMA) |
-| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | Large training/MoE (RDMA) |
+| `ml.hpcpni2l.28xlarge` | 8x A800 80GB | 1960 GiB | GPU workers (RDMA) |
 
-Update both `Flavor` and `--num-gpus=N` in YAML config when changing.
+**Worker scaling:** Adjust `RoleReplicas` in worker YAML. N replicas = 8N GPUs = 640N GB GPU memory.
 
 ## 1.1 Resource Queues
 
@@ -92,11 +90,15 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
    volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
    ```
 
-3. **Edit `.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml`** with head IP
-
-4. **Submit worker:**
+3. **Copy template and fill in head IP:**
    ```bash
-   volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml --output json
+   cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
+   sed -i "s/<RAY_HEAD_IP>/<actual_ip>/g" /tmp/mint-dev-worker.yaml
+   ```
+
+4. **Submit worker from temp file:**
+   ```bash
+   volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json
    ```
 
 5. **Connect SSH server to cluster:**
@@ -197,16 +199,23 @@ PYEOF'
 
 ```bash
 # Kill Megatron (dev)
-ssh volcano 'cd /root/tinker_project/tinker-server && python scripts/kill_megatron.py'
+curl -X POST http://localhost:8000/api/v1/kill_megatron
 
-# Kill Megatron (prod)
-ssh mint-prod 'cd /root/tinker_project/tinker-server-auth && python scripts/kill_megatron.py'
+# Kill Megatron (prod - requires auth)
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
 
 # Kill vLLM (dev)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Kill vLLM (prod - requires auth)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
+
+# Kill all actors (dev)
+curl -X POST http://localhost:8000/api/v1/kill_all_actors
+
+# Check status
+curl -s http://localhost:8000/api/v1/megatron_status | jq
+curl -s http://localhost:8000/api/v1/vllm_status | jq
 ```
 
 ### Actor Names Reference
@@ -293,12 +302,12 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 
 ## 9. Common YAML Parameters
 
-| Parameter | Description |
-|-----------|-------------|
-| `ActiveDeadlineSeconds` | Max runtime in seconds (432000 = 5 days) |
-| `DelayExitTimeSeconds` | Keep instance alive after completion |
-| `ResourceQueueID` | Queue for resource allocation |
-| `Flavor` | Instance type (GPU count) |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `ActiveDeadlineSeconds` | Max runtime (0 = unlimited) | 0 |
+| `DelayExitTimeSeconds` | Keep instance alive after completion | 0 |
+| `ResourceQueueID` | CPU queue for heads, GPU queue for workers | See configs |
+| `RoleReplicas` | Number of instances (workers: N = 8N GPUs) | 1 |
 
 ---
 
@@ -320,4 +329,4 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 | Dev | `mint-dev-head.yaml` | `mint-dev-worker.yaml` |
 | Prod | `mint-prod-head.yaml` | `mint-prod-worker.yaml` |
 
-All configs located in `.claude/skills/volcano-cluster/configs/`
+All configs in `.claude/skills/volcano-cluster/configs/`

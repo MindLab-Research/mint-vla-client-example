@@ -94,7 +94,7 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-0.6B": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
-        # Small model: no gradient checkpointing needed
+        gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
@@ -131,6 +131,19 @@ MODEL_CONFIGS = {
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
+        max_model_len=40960,
+        gradient_checkpointing=True,
+    ),
+    # Qwen3 235B MoE variants (235B total, 22B active)
+    # Inference: TP=8 (8x A800)
+    # Training: TP=16 (16x A800)
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
+        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
+        max_model_len=40960,
+        gradient_checkpointing=True,
+    ),
+    "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
+        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
@@ -283,4 +296,14 @@ def requires_fp8(model_name: str) -> bool:
     config = get_model_config(model_name)
     return config.quantization == "fp8"
 
+
+def list_supported_models() -> list[str]:
+    """Return list of supported model names."""
+    allowed = [
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen/Qwen3-0.6B",
+    ]
+    return [m for m in MODEL_CONFIGS.keys() if m in allowed]
 
