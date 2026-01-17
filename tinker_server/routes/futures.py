@@ -16,6 +16,9 @@ GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persis
 
 def _is_privileged(request: Request) -> bool:
     """Check if request is from privileged user (admin API key)."""
+    from ..config import config as server_config
+    if not server_config.auth_enabled:
+        return True
     user_data = getattr(request.state, "user_data", None)
     return user_data is not None and user_data.get("user_id") == "admin"
 

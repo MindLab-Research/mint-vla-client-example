@@ -969,6 +969,8 @@ def _resolve_model_path(model_name: str) -> str:
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
         "Qwen/Qwen3-30B-A3B-Base": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/main",
         "Qwen/Qwen3-30B-A3B-Thinking-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Thinking-2507/snapshots/main",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-235B-A22B-Instruct-2507/snapshots/ac9c66cc9b46af7306746a9250f23d47083d689e",
+        "Qwen/Qwen3-235B-A22B-Thinking-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-235B-A22B-Thinking-2507/snapshots/6cbffae6d8e28b986a6b17bd36f42f9fa0f1f0a5",
         # K2 models (1T params MoE, requires FP8)
         "moonshotai/Kimi-K2-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--unsloth--Kimi-K2-Instruct-0905-BF16/snapshots/fbaf30b3baf5fdc2b2170ae04f4ff4948b0487cb",
         "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
@@ -1084,37 +1086,36 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-            # Check if model needs multi-node (TP > 8)
-            # K2 requires TP=16 across 2 nodes for LoRA support
-            needs_multinode = config.inference_tp > 8
+            # Multi-node required if total GPUs exceed a single 8xA800 node.
+            # Examples:
+            # - K2: TP=32 => 32 GPUs
+            # - Qwen3-235B: TP=4, DP=4 (expert-parallel) => 16 GPUs
+            needs_multinode = config.total_gpus > 8
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
                 from .multinode_inference import MultiNodeInferenceEngine
 
-                total_gpus = config.inference_tp  # TP=16 for K2
+                total_gpus = config.total_gpus
+                enable_expert_parallel = config.is_moe and config.inference_dp > 1
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
-                    f"actor={actor_name}, TP={config.inference_tp}, total_gpus={total_gpus}, "
+                    f"actor={actor_name}, TP={config.inference_tp}, DP={config.inference_dp}, "
+                    f"expert_parallel={enable_expert_parallel}, total_gpus={total_gpus}, "
                     f"gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
                     f"max_model_len={model_max_model_len}, max_num_seqs={model_max_num_seqs}, "
                     f"kv_cache_dtype={model_kv_cache_dtype}"
                 )
 
-                # Ensure GPUs available, evicting idle actors if needed (LRU)
-                # This waits up to 10 minutes for resources to become available
-                from tinker_server.backend.resource_pool import get_resource_pool
-                resource_pool = get_resource_pool()
-                try:
-                    resource_pool.ensure_gpus_available(total_gpus)
-                except ValueError as e:
-                    logger.error(f"Cannot create multi-node vLLM actor: {e}")
-                    raise
-
+                # MultiNodeInferenceEngine.initialize() handles:
+                # - reconnecting to existing detached actor (no extra GPUs needed)
+                # - creating a new actor (includes its own GPU availability checks)
                 engine = MultiNodeInferenceEngine(
                     model_path=model_path,
                     tensor_parallel_size=config.inference_tp,
+                    data_parallel_size=config.inference_dp,
+                    enable_expert_parallel=enable_expert_parallel,
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
                     max_loras=model_max_loras,

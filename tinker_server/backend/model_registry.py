@@ -135,16 +135,28 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
-    # Inference: TP=8 (8x A800)
-    # Training: TP=16 (16x A800)
+    # Model config: num_attention_heads=64, num_key_value_heads=4 (GQA)
+    # vLLM DP placement requires DP ranks colocated on one node (8 GPUs/node),
+    # so DP=4 is not feasible. Use multi-node TP=16 instead (16 GPUs total).
+    # Training: TP=4, EP=8 => 32 GPUs total
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
-        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
-        max_model_len=40960,
+        is_moe=True,
+        inference_tp=16,
+        inference_dp=1,
+        train_tp=4,
+        train_ep=8,
+        max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
+        max_model_len=10240,  # Cookbook uses max_tokens=8192; keep prompt headroom while limiting KV
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
-        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
-        max_model_len=40960,
+        is_moe=True,
+        inference_tp=16,
+        inference_dp=1,
+        train_tp=4,
+        train_ep=8,
+        max_lora_rank=16,
+        max_model_len=10240,
         gradient_checkpointing=True,
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
@@ -306,4 +318,3 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-0.6B",
     ]
     return [m for m in MODEL_CONFIGS.keys() if m in allowed]
-
