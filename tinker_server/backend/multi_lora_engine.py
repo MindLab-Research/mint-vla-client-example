@@ -1089,7 +1089,7 @@ class MultiModelInferenceManager:
             # Multi-node required if total GPUs exceed a single 8xA800 node.
             # Examples:
             # - K2: TP=32 => 32 GPUs
-            # - Qwen3-235B: TP=4, DP=4 (expert-parallel) => 16 GPUs
+            # - Qwen3-235B: TP=16 => 16 GPUs
             needs_multinode = config.total_gpus > 8
 
             if needs_multinode:

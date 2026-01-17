@@ -146,7 +146,7 @@ MODEL_CONFIGS = {
         train_tp=4,
         train_ep=8,
         max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
-        max_model_len=10240,  # Cookbook uses max_tokens=8192; keep prompt headroom while limiting KV
+        max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
@@ -156,7 +156,7 @@ MODEL_CONFIGS = {
         train_tp=4,
         train_ep=8,
         max_lora_rank=16,
-        max_model_len=10240,
+        max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
