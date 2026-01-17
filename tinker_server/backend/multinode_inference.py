@@ -131,6 +131,9 @@ def _create_multinode_vllm_actor(
             self,
             model_path: str,
             tensor_parallel_size: int,
+            pipeline_parallel_size: int = 1,
+            data_parallel_size: int = 1,
+            enable_expert_parallel: bool = False,
             gpu_memory_utilization: float = 0.80,
             max_model_len: int | None = None,
             quantization: str | None = None,
@@ -139,6 +142,9 @@ def _create_multinode_vllm_actor(
         ):
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
+            self.pipeline_parallel_size = pipeline_parallel_size
+            self.data_parallel_size = data_parallel_size
+            self.enable_expert_parallel = enable_expert_parallel
             self.gpu_memory_utilization = gpu_memory_utilization
             self.max_model_len = max_model_len
             self.quantization = quantization
@@ -168,6 +174,10 @@ def _create_multinode_vllm_actor(
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                data_parallel_size=self.data_parallel_size,
+                data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
+                enable_expert_parallel=self.enable_expert_parallel,
                 distributed_executor_backend="ray",  # Key: use Ray for multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 dtype="auto",
@@ -188,9 +198,10 @@ def _create_multinode_vllm_actor(
             )
 
             logger.info(
-                f"Creating AsyncLLMEngine: TP={self.tensor_parallel_size}, "
-                f"backend=ray, enable_lora={self.enable_lora}, "
-                f"gpu_memory_utilization={self.gpu_memory_utilization}"
+                f"Creating AsyncLLMEngine: "
+                f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
+                f"backend=ray, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}"
             )
 
             # Create engine - vLLM will spawn Ray workers across nodes
@@ -402,7 +413,7 @@ class MultiNodeInferenceEngine:
     """Multi-node inference engine for large MoE models.
 
     Uses vLLM's native Ray distributed backend for TP across multiple nodes.
-    Designed for K2 (1T params) which needs TP=16 for LoRA support.
+    Designed for large models that need >8 GPUs (multi-node) due to weight + KV + LoRA memory.
 
     Key differences from MultiLoRAInferenceEngine:
     - Uses vLLM's Ray backend instead of verl's single-node ZMQ pattern
@@ -414,6 +425,9 @@ class MultiNodeInferenceEngine:
         self,
         model_path: str,
         tensor_parallel_size: int = 16,
+        pipeline_parallel_size: int = 1,
+        data_parallel_size: int = 1,
+        enable_expert_parallel: bool = False,
         gpu_memory_utilization: float = 0.80,
         max_model_len: int | None = None,
         max_loras: int = 1,
@@ -426,6 +440,9 @@ class MultiNodeInferenceEngine:
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.data_parallel_size = data_parallel_size
+        self.enable_expert_parallel = enable_expert_parallel
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
@@ -490,8 +507,17 @@ class MultiNodeInferenceEngine:
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
             from tinker_server.backend.resource_pool import get_resource_pool
             resource_pool = get_resource_pool()
-            logger.info(f"Ensuring {self.tensor_parallel_size} GPUs available for vLLM")
-            resource_pool.ensure_gpus_available(self.tensor_parallel_size, timeout=300)
+            total_required_gpus = (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * self.data_parallel_size
+            )
+            logger.info(
+                f"Ensuring {total_required_gpus} GPUs available for vLLM "
+                f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel})"
+            )
+            resource_pool.ensure_gpus_available(total_required_gpus, timeout=300)
 
             # Step 2: Find nodes with AVAILABLE GPUs
             # Available = Total - PG_used - Actor_used (same logic as multi_lora_engine.py)
@@ -524,16 +550,16 @@ class MultiNodeInferenceEngine:
                     continue
                 node_id = node["NodeID"]
                 node_ip = node["NodeManagerAddress"]
-                total_gpus = node.get("Resources", {}).get("GPU", 0)
-                if total_gpus == 0:
+                node_total_gpus = node.get("Resources", {}).get("GPU", 0)
+                if node_total_gpus == 0:
                     continue
 
                 pg_gpus = gpus_used_by_pg.get(node_id, 0)
                 actor_gpus = gpus_used_by_actors.get(node_id, 0)
-                available_gpus = int(total_gpus - pg_gpus - actor_gpus)
+                available_gpus = int(node_total_gpus - pg_gpus - actor_gpus)
 
                 logger.debug(
-                    f"Node {node_id[:8]} ({node_ip}): total={total_gpus}, "
+                    f"Node {node_id[:8]} ({node_ip}): total={node_total_gpus}, "
                     f"pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpus}"
                 )
 
@@ -587,6 +613,9 @@ class MultiNodeInferenceEngine:
             ).remote(
                 model_path=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                data_parallel_size=self.data_parallel_size,
+                enable_expert_parallel=self.enable_expert_parallel,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
                 quantization=self.quantization,
@@ -595,10 +624,19 @@ class MultiNodeInferenceEngine:
             )
 
             # Initialize engine (this spawns vLLM's Ray workers)
-            logger.info(f"Initializing MultiNodeVLLMEngine with TP={self.tensor_parallel_size}")
-            # K2 (TP=16): ~30 min shard loading + post-init (CUDA graphs, KV cache)
-            # Need 3600s (1h) to be safe; 1800s times out at edge cases
-            init_timeout = 3600 if self.tensor_parallel_size >= 16 else (1800 if self.tensor_parallel_size >= 8 else 600)
+            logger.info(
+                f"Initializing MultiNodeVLLMEngine: "
+                f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
+                f"total_gpus={total_required_gpus}"
+            )
+            # Large models can spend 10-30+ minutes loading shards across many GPUs.
+            if total_required_gpus >= 16:
+                init_timeout = 3600
+            elif total_required_gpus >= 8:
+                init_timeout = 1800
+            else:
+                init_timeout = 600
 
             loop = asyncio.get_event_loop()
             try:
@@ -622,14 +660,16 @@ class MultiNodeInferenceEngine:
             resource_pool.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
-                num_gpus=self.tensor_parallel_size,  # TP=16 for K2
+                num_gpus=total_required_gpus,
                 actor_handle=self.engine,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
             )
             # Mark as ready since initialization completed
             resource_pool.mark_ready(self.actor_name)
-            logger.info(f"Registered {self.actor_name} with ResourcePool ({self.tensor_parallel_size} GPUs)")
+            logger.info(
+                f"Registered {self.actor_name} with ResourcePool ({total_required_gpus} GPUs)"
+            )
 
     async def add_lora_for_session(
         self,
@@ -681,6 +721,36 @@ class MultiNodeInferenceEngine:
         logger.info(
             f"Added LoRA for session {sampling_session_id} "
             f"(lora_int_id={lora_id}, path={adapter_dir}, load_time={load_time:.3f}s)"
+        )
+        return lora_id
+
+    async def add_lora_for_session_from_path(
+        self,
+        sampling_session_id: str,
+        lora_path: str,
+    ) -> int:
+        """Add frozen LoRA weights for a sampling session from filesystem path.
+
+        Used by the ephemeral sampling flow (save_weights_and_get_sampling_client),
+        where training workers save adapters to shared filesystem and vLLM loads
+        directly from that path.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        lora_id = await self.registry.allocate(sampling_session_id, lora_path)
+
+        start_time = time.time()
+        await self.engine.add_lora.remote(
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            lora_name=sampling_session_id,
+        )
+        load_time = time.time() - start_time
+
+        logger.info(
+            f"Added LoRA for session {sampling_session_id} from path "
+            f"(lora_int_id={lora_id}, path={lora_path}, load_time={load_time:.3f}s)"
         )
         return lora_id
 

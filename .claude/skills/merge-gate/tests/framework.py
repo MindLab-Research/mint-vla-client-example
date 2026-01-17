@@ -580,8 +580,16 @@ def print_report_summary(report: TestReport):
 
     elif isinstance(data, GradientIsolationData):
         print(f"  Pattern: {data.interleave_pattern}")
-        print(f"  Session A: {data.session_a.loss_reduction_pct:.1f}% reduction")
-        print(f"  Session B: {data.session_b.loss_reduction_pct:.1f}% reduction")
+        red_a = data.session_a.loss_reduction_pct
+        red_b = data.session_b.loss_reduction_pct
+        if red_a is None:
+            print("  Session A: n/a reduction")
+        else:
+            print(f"  Session A: {red_a:.1f}% reduction")
+        if red_b is None:
+            print("  Session B: n/a reduction")
+        else:
+            print(f"  Session B: {red_b:.1f}% reduction")
         print(f"  Correlation: {data.compute_correlation():.3f}")
 
     elif isinstance(data, GradientAccumulationData):

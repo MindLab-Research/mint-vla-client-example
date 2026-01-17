@@ -1422,7 +1422,7 @@ class VerlTrainingEngine:
                 resource_pool = get_resource_pool()
                 resource_pool.touch(actor_name)
                 # Associate session with actor to prevent idle eviction
-                resource_pool.set_session(actor_name, session.session_id)
+                resource_pool.set_session(actor_name, session.model_id)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -1527,25 +1527,19 @@ class VerlTrainingEngine:
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
             # Use async version to avoid blocking uvicorn event loop
+            # Issue #44: Pass model_id for unique session state isolation
             worker = await async_get_or_create_megatron_worker_group(
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,
                 distributed_config=distributed_config,
+                session_id=session.model_id,
             )
             session.backend = "megatron"
             # Associate session with actor in resource pool immediately
             self._touch_actor(session)
-
-            # Reinitialize LoRA weights for fresh session (statelessness)
-            # This ensures each new session starts with fresh random weights
-            # instead of inheriting trained weights from previous session
-            print(f"[DEBUG] About to call reinit_lora_weights for {model_id}, lr={session.learning_rate}, rank={lora_rank}", flush=True)
-            logger.info(f"[{model_id}] Reinitializing Megatron LoRA weights for new session (lr={session.learning_rate}, rank={lora_rank})...")
-            import ray
-            result = ray.get(worker.reinit_lora_weights.remote(learning_rate=session.learning_rate, actual_rank=lora_rank))
-            print(f"[DEBUG] reinit_lora_weights result: {result}", flush=True)
-            logger.info(f"[{model_id}] Megatron LoRA weights reinitialized: {result.get('total_params', 0)} params")
+            # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
+            # with session_id for proper session state management (Issue #44)
         else:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
@@ -1555,7 +1549,7 @@ class VerlTrainingEngine:
                 base_model=base_model,
                 lora_rank=lora_rank,
                 learning_rate=session.learning_rate,
-                session_id=session.session_id,
+                session_id=session.model_id,
             )
             worker = entry.actor
 
@@ -1568,7 +1562,7 @@ class VerlTrainingEngine:
             logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
             # Update pool entry with current session
-            entry.current_session = session.session_id
+            entry.current_session = session.model_id
             entry.actual_rank = lora_rank
 
             session.backend = "peft"
@@ -1609,7 +1603,7 @@ class VerlTrainingEngine:
 
         # Remote call - pass session_id for stateless trainer pattern
         result = await worker.forward_backward.remote(
-            data_items, loss_fn, loss_fn_config, session.session_id
+            data_items, loss_fn, loss_fn_config, session.model_id
         )
 
         # Update session state
@@ -1643,7 +1637,7 @@ class VerlTrainingEngine:
         data_items = [item.model_dump() for item in request.forward_input.data]
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.forward.remote(data_items, session.session_id)
+        result = await worker.forward.remote(data_items, session.model_id)
 
         logger.info(f"[{model_id}] forward completed")
         return result
@@ -1691,7 +1685,7 @@ class VerlTrainingEngine:
         lr = request.adam_params.learning_rate if request.adam_params else None
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.optim_step.remote(lr, session.session_id)
+        result = await worker.optim_step.remote(lr, session.model_id)
 
         # Update session state
         session.current_step += 1
@@ -1740,14 +1734,20 @@ class VerlTrainingEngine:
 
         if use_train_step:
             # MoE: Use combined train_step to keep gradients in same context
-            result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
+            result = await worker.train_step.remote(
+                data_items,
+                loss_fn,
+                loss_fn_config,
+                lr,
+                session.model_id,
+            )
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
             fb_result = await worker.forward_backward.remote(
-                data_items, loss_fn, loss_fn_config, session.session_id
+                data_items, loss_fn, loss_fn_config, session.model_id
             )
-            opt_result = await worker.optim_step.remote(lr, session.session_id)
+            opt_result = await worker.optim_step.remote(lr, session.model_id)
 
             # Merge results
             result = fb_result.copy()

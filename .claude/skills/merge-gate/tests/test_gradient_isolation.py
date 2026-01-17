@@ -483,8 +483,10 @@ class TestGradientIsolationMoE:
         print(f"{'='*70}")
         print(f"Report: {report_path}")
         print(f"Correlation: {data.compute_correlation():.3f}")
-        print(f"Session A reduction: {data.session_a.loss_reduction_pct:.1f}%")
-        print(f"Session B reduction: {data.session_b.loss_reduction_pct:.1f}%")
+        red_a = data.session_a.loss_reduction_pct
+        red_b = data.session_b.loss_reduction_pct
+        print(f"Session A reduction: {red_a:.1f}%" if red_a is not None else "Session A reduction: n/a")
+        print(f"Session B reduction: {red_b:.1f}%" if red_b is not None else "Session B reduction: n/a")
 
         if report.anomalies:
             print(f"\nANOMALIES ({len(report.anomalies)}):")

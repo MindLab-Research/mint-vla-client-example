@@ -16,6 +16,7 @@ BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 
 DENSE_MODEL = "Qwen/Qwen3-0.6B"  # Primary dense test model (Phase 1)
+DENSE_SMALL_MODEL = DENSE_MODEL  # Alias used by some tests for clarity
 DENSE_MEDIUM_MODEL = "Qwen/Qwen3-4B"  # Medium dense model (Phase 3 stress tests)
 DENSE_LARGE_MODEL = "Qwen/Qwen3-8B"  # Large dense model (Phase 3 stress tests)
 MOE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -157,6 +158,13 @@ def tokenizer():
     """Get tokenizer for Dense model (Qwen3-0.6B)."""
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(DENSE_MODEL, trust_remote_code=True)
+
+
+@pytest.fixture(scope="module")
+def small_tokenizer():
+    """Get tokenizer for small Dense model (alias of primary dense model)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")

@@ -135,16 +135,28 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
-    # Inference: TP=8 (8x A800)
-    # Training: TP=16 (16x A800)
+    # Model config: num_attention_heads=64, num_key_value_heads=4 (GQA)
+    # vLLM DP placement requires DP ranks colocated on one node (8 GPUs/node),
+    # so DP=4 is not feasible. Use multi-node TP=16 instead (16 GPUs total).
+    # Training: TP=4, EP=8 => 32 GPUs total
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
-        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
-        max_model_len=40960,
+        is_moe=True,
+        inference_tp=16,
+        inference_dp=1,
+        train_tp=4,
+        train_ep=8,
+        max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
+        max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
-        is_moe=True, inference_tp=8, inference_dp=1, train_tp=16, train_ep=1,
-        max_model_len=40960,
+        is_moe=True,
+        inference_tp=16,
+        inference_dp=1,
+        train_tp=4,
+        train_ep=8,
+        max_lora_rank=16,
+        max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
@@ -192,22 +204,20 @@ MODEL_CONFIGS = {
         max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
     ),
-    # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
-    # Same DeepseekV3ForCausalLM architecture with MLA attention
-    # PROMPT.md settings:
-    # - Megatron: TP=8, CP=1, PP=1, EP=8, ETP=1, lora_rank=16
-    # - vLLM: TP=8, max_lora_rank=16 (8 GPUs)
+    # Moonlight-16B-A3B - smaller DeepSeek V3 MLA model (64 experts, 27 layers)
+    # Merge gate settings:
+    # - Megatron: TP=2, EP=4 (8 GPUs)
+    # - vLLM: TP=4 (4 GPUs)
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
-        inference_tp=8,  # Inference: TP=8 (PROMPT.md spec)
+        inference_tp=4,
         inference_dp=1,
-        train_tp=8,  # Training: TP=8 (PROMPT.md spec)
-        train_ep=8,  # Training: EP=8 (PROMPT.md spec)
+        train_tp=2,
+        train_ep=4,
         train_cp=1,
-        train_etp=1,
         quantization=None,  # BF16, no quantization needed
         max_loras=1,
-        max_lora_rank=16,
+        max_lora_rank=32,
         max_model_len=8192,  # 8K context
         is_mla=True,  # DeepSeek V3 MLA architecture
     ),
@@ -306,4 +316,3 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-0.6B",
     ]
     return [m for m in MODEL_CONFIGS.keys() if m in allowed]
-

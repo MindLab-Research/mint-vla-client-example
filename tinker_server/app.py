@@ -74,25 +74,36 @@ async def _cleanup_stale_actors() -> None:
                     # Determine actor type and GPU count from name/diagnostics
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
-                        # vLLM GPU count depends on model - query actor for accurate count
-                        try:
-                            # MultiNodeVLLMEngine has tensor_parallel_size attribute
-                            if hasattr(actor, "tensor_parallel_size"):
-                                num_gpus = ray.get(getattr(actor, "tensor_parallel_size").remote(), timeout=5)
-                            else:
-                                num_gpus = 1  # Single-node default
-                        except Exception:
-                            num_gpus = 1
+                        # vLLM actors may reserve num_gpus=0 (multi-node) while still
+                        # consuming GPUs via internal Ray workers. Infer total GPUs
+                        # from the model registry when possible.
+                        base_model = ""
+                        num_gpus = 1  # Fallback for unknown models
+                        if name.startswith("tinker_vllm_"):
+                            model_part = name[len("tinker_vllm_"):]
+                            try:
+                                from tinker_server.backend.model_registry import MODEL_CONFIGS
+
+                                for model_name, cfg in MODEL_CONFIGS.items():
+                                    if model_name.split("/")[-1].lower() == model_part:
+                                        base_model = model_name
+                                        num_gpus = cfg.total_gpus
+                                        break
+                            except Exception:
+                                pass
                     elif name.startswith("dense_trainer_pool_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
+                        base_model = ""
                     elif name.startswith("megatron_"):
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
                         # Query actual GPU count from diagnostics
+                        base_model = ""
                         try:
                             diag = ray.get(actor.get_diagnostics.remote(), timeout=10)
                             num_gpus = diag.get("world_size", 8)
+                            base_model = diag.get("base_model", "") or ""
                         except Exception:
                             num_gpus = 8  # Default fallback
                     else:
@@ -105,6 +116,7 @@ async def _cleanup_stale_actors() -> None:
                         num_gpus=num_gpus,
                         actor_handle=actor,
                         namespace=PERSISTENT_NAMESPACE,
+                        base_model=base_model,
                     )
                     # Mark as ready since the actor passed health check
                     resource_pool.mark_ready(name)

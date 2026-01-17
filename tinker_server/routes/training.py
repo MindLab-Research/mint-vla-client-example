@@ -4,6 +4,7 @@ Endpoints:
 - POST /create_model: Create a training model
 - POST /create_model_from_state: Create model and load checkpoint (resume training)
 - POST /forward_backward: Forward + backward pass
+- POST /train_step: Combined forward_backward + optim_step
 - POST /forward: Forward pass only (no backward), returns logprobs
 - POST /optim_step: Optimizer update
 - POST /save_weights_for_sampler: Save weights for inference
@@ -40,6 +41,7 @@ from ..models.types import (
     ResetExpertBiasResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
+    TrainStepRequest,
     UntypedAPIFuture,
 )
 from ..usage_logger import get_usage_logger
@@ -383,6 +385,63 @@ async def _do_forward_backward(
 
     except Exception as e:
         logger.exception(f"[forward_backward] Failed: {e}")
+        future_store.fail(request_id, str(e))
+
+
+# =============================================================================
+# train_step - async (forward_backward + optim_step)
+# =============================================================================
+
+
+@router.post("/train_step", response_model=UntypedAPIFuture)
+async def train_step(
+    request: TrainStepRequest,
+    background_tasks: BackgroundTasks,
+    http_request: Request,
+) -> UntypedAPIFuture:
+    """Perform a combined forward_backward + optim_step."""
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    session = training_manager.get_session(request.model_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
+
+    request_id = future_store.create()
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_train_step, request_id, session, request, user_id)
+    return UntypedAPIFuture(request_id=request_id)
+
+
+async def _do_train_step(
+    request_id: str, session, request: TrainStepRequest, user_id: str | None
+) -> None:
+    """Background task for train_step."""
+    try:
+        if training_engine is None:
+            raise RuntimeError("Training engine not initialized")
+
+        result = await training_engine.train_step(session, request)
+        future_store.resolve(request_id, result)
+
+        # Log usage
+        if user_id:
+            token_count = sum(
+                len(datum.model_input.to_token_ids()) for datum in request.forward_backward_input.data
+            )
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="train_step",
+                model_name=session.base_model,
+                token_count=token_count,
+                session_id=session.model_id,
+                request_id=request_id,
+            )
+
+    except Exception as e:
+        logger.exception(f"[train_step] Failed: {e}")
         future_store.fail(request_id, str(e))
 
 

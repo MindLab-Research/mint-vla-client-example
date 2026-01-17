@@ -325,6 +325,75 @@ class TestStress:
             f"Not all clients completed: {completed}/{len(client_configs)}"
         )
 
+    def test_concurrent_moe_sessions(self):
+        """Test concurrent MoE sessions (Issue #44 regression guard).
+
+        Two concurrent MoE SFT sessions on Qwen3-30B-A3B.
+        Pass criteria: both sessions complete without deadlock or error.
+        """
+        client_configs = [
+            (1, run_moe_sft_client, 32),
+            (2, run_moe_sft_client, 32),
+        ]
+
+        results = []
+        start_time = time.time()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(func, client_id, rank, 3): client_id
+                for client_id, func, rank in client_configs
+            }
+
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=1200):
+                    client_id = futures[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        results.append({
+                            "client_id": client_id,
+                            "status": "exception",
+                            "errors": [str(e)],
+                        })
+            except concurrent.futures.TimeoutError:
+                # Some futures did not complete: treat as deadlock/freeze.
+                for future, client_id in futures.items():
+                    if not future.done():
+                        results.append({
+                            "client_id": client_id,
+                            "status": "timeout",
+                            "errors": ["Timeout waiting for client completion (possible deadlock/freeze)"],
+                        })
+
+        elapsed = time.time() - start_time
+
+        print(f"\n{'='*60}")
+        print("STRESS TEST RESULTS: MoE Concurrent Sessions")
+        print(f"{'='*60}")
+        print(f"Total time: {elapsed:.2f}s")
+        print(f"Clients: {len(results)}")
+
+        completed = sum(1 for r in results if r.get("status") == "completed")
+        failed = sum(1 for r in results if r.get("status") != "completed")
+        print(f"Completed: {completed}")
+        print(f"Failed: {failed}")
+
+        for r in results:
+            status_mark = "PASS" if r.get("status") == "completed" else "FAIL"
+            print(
+                f"  Client {r.get('client_id', '?')}: {status_mark} "
+                f"({r.get('model', 'MoE')}/{r.get('task', 'SFT')}/rank={r.get('rank', '?')})"
+            )
+            if r.get("errors"):
+                for err in r["errors"][:2]:
+                    print(f"    Error: {err}")
+
+        assert completed == len(client_configs), (
+            f"Not all MoE clients completed: {completed}/{len(client_configs)}"
+        )
+
     def test_mixed_model_lru_eviction(self):
         """Test LRU eviction with Dense and MoE clients.
 

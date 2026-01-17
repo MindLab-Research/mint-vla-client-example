@@ -272,6 +272,9 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 
 def _require_admin(request: Request) -> None:
     """Raise 403 if not admin user."""
+    from ..config import config as server_config
+    if not server_config.auth_enabled:
+        return
     user_data = getattr(request.state, "user_data", None)
     if not user_data or user_data.get("user_id") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -382,9 +385,9 @@ async def megatron_status(request: Request, base_model: str | None = None) -> di
     # Get list of all Megatron actors
     resource_pool = get_resource_pool()
     actors = [
-        {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
+        {"name": e["actor_name"], "gpus": e["num_gpus"], "base_model": e["base_model"]}
         for e in resource_pool.list_actors()
-        if e.actor_type == ActorType.MEGATRON
+        if e.get("actor_type") == ActorType.MEGATRON.value
     ]
 
     return {"alive": alive, "actors": actors, "query_base_model": base_model}
