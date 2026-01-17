@@ -54,7 +54,7 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 | External URL | `https://mint.macaron.im` |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
-| Ray Configs | `mint-prod-head.yaml`, `mint-prod-worker.yaml` |
+| Ray Configs | `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`, `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` |
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
@@ -350,9 +350,22 @@ Prod-specific values:
 
 ---
 
-## 6. GPU Requirements for MoE Models
+## 6. GPU Requirements (Production)
 
-> **CRITICAL: ALWAYS verify cluster has enough GPUs before starting MoE actors.**
+> **CRITICAL: ALWAYS verify cluster has enough GPUs before starting or switching model actors.**
+
+### Official supported model lineup (0.6B, 4B, 30B, 235B)
+
+Production worker replica size: 8 GPUs (`.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` runs `ray start --num-gpus=8`).
+
+| Model | vLLM GPUs (inference) | Training GPUs | Total GPUs (simultaneous) | 8-GPU worker replicas (total) |
+|-------|------------------------|--------------|----------------------------|-------------------------------|
+| Qwen3-0.6B (Dense) | 1 | 1 | 2 | 1 |
+| Qwen3-4B (Dense) | 1 | 1 | 2 | 1 |
+| Qwen3-30B-A3B (MoE) | 4 | 4 | 8 | 1 |
+| Qwen3-235B-A22B (MoE) | 16 | 32 | 48 | 6 |
+
+**Full production lineup (all four models resident):** 60 GPUs total, so 8 worker replicas (64 GPUs) plus 1 head node.
 
 ### GPU Requirements by Model
 
