@@ -338,7 +338,10 @@ class TestMoonlightSFT:
                 if is_correct:
                     correct_count += 1
 
-                print(f"  {question} -> '{generated_text[:20]}' (parsed={parsed}, correct={answer}) {'✓' if is_correct else '✗'}")
+                verdict = "ok" if is_correct else "bad"
+                print(
+                    f"  {question} -> '{generated_text[:20]}' (parsed={parsed}, correct={answer}) {verdict}"
+                )
 
                 # Build training datum
                 input_tokens = prompt_tokens + generated_tokens[:-1]
@@ -432,4 +435,3 @@ class TestMoonlightSFT:
         print(f"  Rewards: {[f'{r:.2f}' for r in metrics['rewards']]}")
 
         print("\nMoonlight RL test: PASS (check curve visually)")
-

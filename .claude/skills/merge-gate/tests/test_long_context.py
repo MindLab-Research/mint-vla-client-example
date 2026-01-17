@@ -4,7 +4,7 @@ Tests issue #9 fix: vLLM should use model's max_position_embeddings
 instead of hardcoded defaults.
 
 Tests:
-- Dense model (Qwen3-0.6B): 32K context
+- Dense model (Qwen3-0.6B): 40K context
 - MoE model (Qwen3-30B-A3B): Maximum supported context (both inference AND training)
 - Prompt near context limit should succeed
 - Prompt exceeding context limit should give clear error
@@ -29,7 +29,7 @@ from .conftest import (
 
 
 # Context limits (from model_registry.py max_model_len)
-DENSE_CONTEXT = 40960   # Qwen3-0.6B
+DENSE_CONTEXT = 40960   # Qwen3-0.6B (40K context)
 MOE_CONTEXT = 40960     # Qwen3-30B-A3B-Instruct-2507 (40K context)
 
 
@@ -42,11 +42,11 @@ def generate_tokens(tokenizer, target_length: int) -> list[int]:
 
 
 class TestDenseLongContext:
-    """Long context tests for Dense model (32K context)."""
+    """Long context tests for Dense model (40K vLLM context)."""
 
     def test_near_context_limit(self, tokenizer):
-        """Test prompt near 32K limit succeeds."""
-        # Use 30K tokens (near 32K limit, leaving room for response)
+        """Test prompt near context limit succeeds."""
+        # Use 30K tokens (large prompt, leaving room for response)
         prompt_size = 30000
         prompt_tokens = generate_tokens(tokenizer, prompt_size)
 
@@ -62,9 +62,8 @@ class TestDenseLongContext:
         print(f"Dense near-limit ({prompt_size:,} tokens): Generated {len(result['sequences'][0]['tokens'])} tokens")
 
     def test_exceed_context_limit(self, tokenizer):
-        """Test prompt exceeding 32K limit gives clear error."""
-        # Use 35K tokens (exceeds 32K limit)
-        prompt_size = 35000
+        """Test prompt exceeding context limit gives clear error."""
+        prompt_size = 45000  # Exceeds DENSE_CONTEXT
         prompt_tokens = generate_tokens(tokenizer, prompt_size)
 
         session_id, model_id = create_session(DENSE_MODEL, lora_rank=32, lr=1e-4)
@@ -201,9 +200,8 @@ class TestMoELongContext:
         result = train_step(model_id, [datum], lr=1e-5, loss_fn="cross_entropy")
 
         assert "error" not in result, f"Long context training failed: {result.get('error')}"
-        assert "loss" in result, "No loss returned from training"
-
-        loss = result["loss"]
+        loss = result.get("metrics", {}).get("loss:mean")
+        assert loss is not None, "No loss returned from training metrics"
         assert loss > 0, f"Invalid loss: {loss}"
         assert loss < 100, f"Loss suspiciously high: {loss}"
 

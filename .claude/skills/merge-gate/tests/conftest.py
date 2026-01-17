@@ -161,6 +161,13 @@ def tokenizer():
 
 
 @pytest.fixture(scope="module")
+def small_tokenizer():
+    """Get tokenizer for small Dense model (alias of primary dense model)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(DENSE_SMALL_MODEL, trust_remote_code=True)
+
+
+@pytest.fixture(scope="module")
 def moe_tokenizer():
     """Get tokenizer for MoE model."""
     from transformers import AutoTokenizer
