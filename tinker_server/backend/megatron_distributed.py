@@ -3766,6 +3766,48 @@ class MegatronWorkerGroup:
             "metrics": metrics,
         }
 
+    def train_step(
+        self,
+        data_items: list[dict],
+        loss_fn: str = "cross_entropy",
+        loss_fn_config: dict | None = None,
+        learning_rate: float | None = None,
+        session_id: str | None = None,
+    ) -> dict:
+        """Combined forward_backward + optim_step in a single actor call.
+
+        This keeps both operations within the same MegatronWorkerGroup method
+        invocation, which is required for some param_offload flows.
+
+        Args:
+            data_items: List of Tinker Datum dicts.
+            loss_fn: Loss function type.
+            loss_fn_config: Optional loss config.
+            learning_rate: Optional LR override (defaults to current group's LR).
+            session_id: Session ID for multi-tenant gradient isolation.
+
+        Returns:
+            forward_backward result dict with optim_step metrics merged in.
+        """
+        effective_session_id = session_id or self._current_session
+        if effective_session_id is None:
+            raise ValueError("train_step requires session_id (no current session set)")
+
+        fb_result = self.forward_backward(
+            data_items=data_items,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            session_id=effective_session_id,
+        )
+
+        lr = learning_rate if learning_rate is not None else self.learning_rate
+        opt_result = self.optim_step(lr, session_id=effective_session_id)
+
+        metrics = dict(fb_result.get("metrics", {}))
+        metrics.update(opt_result.get("metrics", {}))
+        fb_result["metrics"] = metrics
+        return fb_result
+
     def forward(
         self,
         data_items: list[dict],

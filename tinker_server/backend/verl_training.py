@@ -1734,7 +1734,13 @@ class VerlTrainingEngine:
 
         if use_train_step:
             # MoE: Use combined train_step to keep gradients in same context
-            result = await worker.train_step.remote(data_items, loss_fn, loss_fn_config, lr)
+            result = await worker.train_step.remote(
+                data_items,
+                loss_fn,
+                loss_fn_config,
+                lr,
+                session.model_id,
+            )
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
