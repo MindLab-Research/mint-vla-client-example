@@ -369,11 +369,12 @@ Production worker replica size: 8 GPUs (`.claude/skills/volcano-cluster/configs/
 
 ### GPU Requirements by Model
 
-| Model | vLLM (Inference) | Megatron (Training) | Total (Simultaneous) |
+| Model | vLLM (Inference) | Training (PEFT/Megatron) | Total (Simultaneous) |
 |-------|------------------|---------------------|----------------------|
-| **Qwen3-30B-A3B** | TP=4 → **4 GPUs** | TP=4, EP=1 → **4 GPUs** | **8 GPUs** |
-| **Moonlight-16B-A3B** | TP=8 → **8 GPUs** | TP=8, EP=8 → **8 GPUs** | **16 GPUs** |
-| Dense models (7B-14B) | **1 GPU** | **1 GPU** | **2 GPUs** |
+| **Qwen3-0.6B (Dense)** | TP=1 → **1 GPU** | **1 GPU** | **2 GPUs** |
+| **Qwen3-4B (Dense)** | TP=1 → **1 GPU** | **1 GPU** | **2 GPUs** |
+| **Qwen3-30B-A3B (MoE)** | TP=4 → **4 GPUs** | TP=4, EP=1 → **4 GPUs** | **8 GPUs** |
+| **Qwen3-235B-A22B (MoE)** | TP=16 → **16 GPUs** | TP=4, EP=8 → **32 GPUs** | **48 GPUs** |
 
 ### Pre-flight Check (MANDATORY)
 
