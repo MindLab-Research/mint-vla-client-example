@@ -204,19 +204,17 @@ MODEL_CONFIGS = {
         max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
     ),
-    # Moonlight-16B-A3B - smaller K2-like model (64 experts, 27 layers)
-    # Same DeepseekV3ForCausalLM architecture with MLA attention
-    # PROMPT.md settings:
-    # - Megatron: TP=8, CP=1, PP=1, EP=8, ETP=1, lora_rank=16
-    # - vLLM: TP=8, max_lora_rank=16 (8 GPUs)
+    # Moonlight-16B-A3B - smaller DeepSeek V3 MLA model (64 experts, 27 layers)
+    # Merge gate settings:
+    # - Megatron: TP=2, EP=4 (8 GPUs)
+    # - vLLM: TP=4 (4 GPUs)
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
-        inference_tp=8,  # Inference: TP=8 (PROMPT.md spec)
+        inference_tp=4,
         inference_dp=1,
-        train_tp=8,  # Training: TP=8 (PROMPT.md spec)
-        train_ep=8,  # Training: EP=8 (PROMPT.md spec)
+        train_tp=2,
+        train_ep=4,
         train_cp=1,
-        train_etp=1,
         quantization=None,  # BF16, no quantization needed
         max_loras=1,
         max_lora_rank=16,

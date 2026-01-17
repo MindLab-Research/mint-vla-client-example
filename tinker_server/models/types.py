@@ -291,6 +291,18 @@ class OptimStepResponse(BaseModel):
     type: Literal["optim_step"] = "optim_step"
 
 
+class TrainStepRequest(BaseModel):
+    """Request to perform a combined train step (forward_backward + optim_step)."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    forward_backward_input: ForwardBackwardInput
+    adam_params: AdamParams | None = None
+    model_id: str
+    seq_id: int | None = None
+    type: Literal["train_step"] = "train_step"
+
+
 class ResetExpertBiasRequest(BaseModel):
     """Request to reset expert_bias buffers in MoE router modules.
 

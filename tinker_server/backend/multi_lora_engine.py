@@ -765,6 +765,12 @@ class MultiLoRAInferenceEngine:
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
+
         # Look up LoRA ID for this session (None = base model)
         lora_id = None
         if sampling_session_id is not None:
@@ -824,6 +830,12 @@ class MultiLoRAInferenceEngine:
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
+
         # Look up LoRA ID for this session (None = base model)
         lora_id = None
         if sampling_session_id is not None:
@@ -870,6 +882,12 @@ class MultiLoRAInferenceEngine:
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
+
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
 
         # Look up LoRA ID for this session (None = base model)
         lora_id = None
