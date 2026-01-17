@@ -217,7 +217,7 @@ MODEL_CONFIGS = {
         train_cp=1,
         quantization=None,  # BF16, no quantization needed
         max_loras=1,
-        max_lora_rank=16,
+        max_lora_rank=32,
         max_model_len=8192,  # 8K context
         is_mla=True,  # DeepSeek V3 MLA architecture
     ),
