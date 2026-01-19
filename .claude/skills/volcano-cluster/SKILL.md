@@ -15,20 +15,34 @@ description: |
 ## Quick Reference
 
 ```bash
+# Volcano CLI is pre-installed and configured on the SSH bastions:
+# - Dev:  ssh volcano
+# - Prod: ssh mint-prod
+#
+# Use the absolute path to avoid PATH mismatches:
+#   /root/.volc/bin/volc
+#
+# Note: /root/.volc/bin/volc prints a version banner before JSON output.
+# When parsing JSON, strip everything before the first '[' or '{'.
+
+# Version (do NOT use "--version")
+/root/.volc/bin/volc version
+
 # List all tasks
-volc ml_task list --output json
+ssh mint-prod '/root/.volc/bin/volc ml_task list --output json'
 
 # Cancel task
-volc ml_task cancel --id <task_id> --output json
+ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
 
 # View task logs (find Ray IP here)
-volc ml_task logs -t <task_id> -i worker_0
+ssh mint-prod '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
 
 # Ray dashboard
 http://<RAY_HEAD_IP>:8265
 ```
 
 **IMPORTANT:** Use `--output json` to avoid interactive TUI mode.
+**IMPORTANT:** `volc ml_task list --output json` emits a banner before the JSON payload.
 
 ---
 
@@ -78,16 +92,72 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
 
 ## 4. Create Cluster
 
+## 4.0 Pre-flight: identify current usage (dev vs prod)
+
+Always measure what is already running before submitting or canceling tasks.
+
+### List Volcano jobs (from prod bastion)
+
+```bash
+ssh mint-prod '/root/.volc/bin/volc ml_task list --output json --limit 200' | python3 - <<'PY'
+import json, re, sys
+s=sys.stdin.read()
+m=re.search(r'[\[{]', s)
+if not m:
+    raise SystemExit("no JSON in volc output")
+j=json.loads(s[m.start():])
+for job in j:
+    name=job.get("JobName","")
+    jid=job.get("JobId","")
+    status=job.get("Status","")
+    start=job.get("Start","")
+    rq=job.get("ResourceQueueId","")
+    specs=job.get("TaskRoleSpecs") or []
+    reps=[]
+    flavors=[]
+    for spec in specs:
+        reps.append(str(spec.get("RoleReplicas")))
+        flavors.append(str(spec.get("ResourceSpecId")))
+    print(f"{status}\t{name}\t{jid}\t{start}\t{rq}\treps={','.join(reps)}\tflavors={','.join(flavors)}")
+PY
+```
+
+Conventions used by these configs:
+- Prod head: `mint-prod-head`
+- Prod workers: `mint-prod-worker*`
+- Dev head: `ray-head`
+- Dev workers: `ray-worker-*`
+
+### List Ray GPU nodes (no Volcano CLI required)
+
+```bash
+ssh mint-prod python3 - <<'PY'
+import ray
+ray.init(address="auto")
+nodes=[n for n in ray.nodes() if n.get("Alive")]
+gpu_nodes=[n for n in nodes if (n.get("Resources") or {}).get("GPU",0)]
+print("prod_gpu_nodes", len(gpu_nodes), "gpu_total", ray.cluster_resources().get("GPU"), "gpu_avail", ray.available_resources().get("GPU"))
+PY
+
+ssh volcano python3 - <<'PY'
+import ray
+ray.init(address="auto")
+nodes=[n for n in ray.nodes() if n.get("Alive")]
+gpu_nodes=[n for n in nodes if (n.get("Resources") or {}).get("GPU",0)]
+print("dev_gpu_nodes", len(gpu_nodes), "gpu_total", ray.cluster_resources().get("GPU"), "gpu_avail", ray.available_resources().get("GPU"))
+PY
+```
+
 ### Development Cluster
 
 1. **Submit head:**
    ```bash
-   volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-head.yaml --output json
+   ssh volcano '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server/.claude/skills/volcano-cluster/configs/mint-dev-head.yaml --output json'
    ```
 
 2. **Get head IP from logs:**
    ```bash
-   volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
+   ssh volcano '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
    ```
 
 3. **Copy template and fill in head IP:**
@@ -98,7 +168,7 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
 
 4. **Submit worker from temp file:**
    ```bash
-   volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json
+   ssh volcano '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
    ```
 
 5. **Connect SSH server to cluster:**
@@ -112,18 +182,31 @@ Prod head writes IP to PFS automatically. Workers read from PFS.
 
 1. **Submit head:**
    ```bash
-   volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-prod-head.yaml --output json
+   ssh mint-prod '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-head.yaml --output json'
    ```
 
 2. **Wait for head to write IP to PFS:**
    ```bash
-   # Check PFS file (head writes on startup)
-   cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt
+   # Check PFS file (head should write on startup)
+   ssh mint-prod 'ls -la /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
+   ```
+
+   If the file is missing but the Ray cluster is running, recover it from Ray and write it:
+
+   ```bash
+   ssh mint-prod 'ip=$(python3 - <<\"PY\"
+import ray
+ray.init(address=\"auto\")
+nodes=[n for n in ray.nodes() if n.get(\"Alive\")]
+head=[n for n in nodes if (n.get(\"Resources\") or {}).get(\"node:__internal_head__\")]
+print(head[0][\"NodeManagerAddress\"] if head else \"\")
+PY
+); test -n \"$ip\" && echo \"$ip\" > /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
    ```
 
 3. **Submit worker (reads head IP from PFS):**
    ```bash
-   volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-prod-worker.yaml --output json
+   ssh mint-prod '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml --output json'
    ```
 
 4. **Connect SSH server to cluster:**
@@ -138,7 +221,7 @@ Prod head writes IP to PFS automatically. Workers read from PFS.
 ### List Tasks
 
 ```bash
-volc ml_task list --output json
+ssh mint-prod '/root/.volc/bin/volc ml_task list --output json --limit 200'
 ```
 
 Look for task names containing your cluster identifier.
@@ -147,11 +230,11 @@ Look for task names containing your cluster identifier.
 
 ```bash
 # Cancel single task
-volc ml_task cancel --id <task_id> --output json
+ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
 
 # Cancel multiple (run sequentially)
-volc ml_task cancel --id <worker_task_id> --output json
-volc ml_task cancel --id <head_task_id> --output json
+ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <worker_task_id> --output json'
+ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <head_task_id> --output json'
 ```
 
 **WARNING:** Production tasks include "prod" in names. Never cancel prod tasks for dev work.
@@ -250,7 +333,7 @@ Shows: actors, tasks, resources, logs, errors.
 ### Task Logs
 
 ```bash
-volc ml_task logs -t <task_id> -i worker_0
+ssh mint-prod '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
 ```
 
 ### Finding Ray Head IP
