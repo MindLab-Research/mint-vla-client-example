@@ -1479,47 +1479,34 @@ class VerlTrainingEngine:
     ):
         """Await a Ray call while periodically touching ResourcePool.
 
-        If the SDK stops heartbeating for the owning session, kill the actor to
-        prevent orphaned work from wedging pooled actors indefinitely.
+        Uses a poll loop with `ray.get(..., timeout=...)` executed in a thread to
+        avoid blocking the asyncio event loop. This ensures `timeout_s` and the
+        heartbeat-based cancellation can actually fire during long Ray calls.
         """
-        self._touch_actor(session)
-        stop = False
+        start = time.time()
+        while True:
+            if not self._is_session_live(session):
+                logger.warning(
+                    f"[{session.model_id}] Session heartbeat stale; killing actor to cancel in-flight work"
+                )
+                self._kill_session_actor(session)
+                raise RuntimeError("Session heartbeat stale; cancelled in-flight Ray call")
 
-        async def _keepalive():
-            nonlocal stop
-            while not stop:
-                await asyncio.sleep(interval_s)
-                if stop:
-                    return
-                if not self._is_session_live(session):
-                    logger.warning(
-                        f"[{session.model_id}] Session heartbeat stale; killing actor to cancel in-flight work"
-                    )
-                    self._kill_session_actor(session)
-                    return
-                self._touch_actor(session)
+            self._touch_actor(session)
 
-        task = asyncio.create_task(_keepalive())
-        main_task = asyncio.create_task(self._await_ray(awaitable))
-        try:
+            wait_s = interval_s
             if timeout_s is not None and timeout_s > 0:
-                done, _ = await asyncio.wait({main_task}, timeout=timeout_s)
-                if not done:
+                remaining = timeout_s - (time.time() - start)
+                if remaining <= 0:
                     logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s; killing actor")
                     self._kill_session_actor(session)
-                    main_task.cancel()
                     raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
-            return await main_task
-        finally:
-            stop = True
-            task.cancel()
-            with contextlib.suppress(Exception):
-                await task
-            with contextlib.suppress(Exception):
-                await main_task
+                wait_s = min(wait_s, remaining)
 
-    async def _await_ray(self, awaitable):
-        return await awaitable
+            try:
+                return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
+            except ray.exceptions.GetTimeoutError:
+                continue
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
