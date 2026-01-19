@@ -1381,6 +1381,13 @@ class TrainingWorker:
         if hasattr(self, "optimizer"):
             del self.optimizer
         torch.cuda.empty_cache()
+        # Ensure this actor cannot remain alive in a partially-shutdown state.
+        # A detached actor that survives after deleting model/optimizer will
+        # later fail get_session_info()/training calls and wedge create_model.
+        try:
+            ray.actor.exit_actor()
+        except Exception:
+            pass
 
 
 class VerlTrainingEngine:
@@ -2078,10 +2085,14 @@ class DenseTrainerPool:
             key = self._make_key(entry.base_model)
             self._actors.pop(key, None)
 
-            # Kill actor (no state to save since it's idle)
+            # Kill actor (no state to save since it's idle). Do not skip ray.kill
+            # if shutdown is blocked behind an in-flight actor method.
             try:
                 ray.get(entry.actor.shutdown.remote(), timeout=30)
-                ray.kill(entry.actor)
+            except Exception:
+                pass
+            try:
+                ray.kill(entry.actor, no_restart=True)
             except Exception as e:
                 logger.warning(f"[DenseTrainerPool] Error killing evicted actor: {e}")
 
@@ -2223,6 +2234,13 @@ class DenseTrainerPool:
                 logger.warning(f"[DenseTrainerPool] Actor {actor_name} get_session_info timed out; assuming busy and reusing actor")
                 actor = existing_actor
                 need_create = False
+            except Exception as e:
+                # Actor responded but is unhealthy (e.g., shutdown left it without optimizer/model).
+                logger.warning(f"[DenseTrainerPool] Actor {actor_name} failed get_session_info: {e}; killing to recreate")
+                try:
+                    ray.kill(existing_actor, no_restart=True)
+                except Exception as kill_err:
+                    logger.warning(f"[DenseTrainerPool] Could not kill unhealthy actor: {kill_err}")
 
             if need_create:
                 # Create new detached actor
@@ -2297,7 +2315,10 @@ class DenseTrainerPool:
             if kill_actor:
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                except Exception:
+                    pass
+                try:
+                    ray.kill(entry.actor, no_restart=True)
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
 
