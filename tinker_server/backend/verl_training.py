@@ -1603,7 +1603,10 @@ class VerlTrainingEngine:
         else:
             base_model = requested_model
 
-        print(f"[DEBUG create_training_session] use_megatron={use_megatron}, base_model={base_model}", flush=True)
+        print(
+            f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
+            flush=True,
+        )
 
         if use_megatron:
             import asyncio
@@ -1627,6 +1630,10 @@ class VerlTrainingEngine:
             # Use async version to avoid blocking uvicorn event loop
             # Issue #44: Pass model_id for unique session state isolation
             megatron_timeout_s = float(os.environ.get("MINT_MEGATRON_CREATE_TIMEOUT_S", "1800"))
+            print(
+                f"[DEBUG {model_id}] megatron get_or_create start: timeout_s={megatron_timeout_s}",
+                flush=True,
+            )
             try:
                 worker = await asyncio.wait_for(
                     async_get_or_create_megatron_worker_group(
@@ -1649,6 +1656,10 @@ class VerlTrainingEngine:
                 except Exception:
                     pass
                 raise
+            print(
+                f"[DEBUG {model_id}] megatron get_or_create done",
+                flush=True,
+            )
             session.backend = "megatron"
             from .megatron_distributed import _make_megatron_actor_name
 
@@ -1661,13 +1672,25 @@ class VerlTrainingEngine:
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
 
             import asyncio
+            dense_get_timeout_s = float(os.environ.get("MINT_DENSE_GET_OR_CREATE_TIMEOUT_S", "1800"))
             pool = get_dense_trainer_pool()
-            entry = await asyncio.to_thread(
-                pool.get_or_create,
-                base_model,
-                lora_rank,
-                session.learning_rate,
-                session.model_id,
+            print(
+                f"[DEBUG {model_id}] dense get_or_create start: timeout_s={dense_get_timeout_s}",
+                flush=True,
+            )
+            entry = await asyncio.wait_for(
+                asyncio.to_thread(
+                    pool.get_or_create,
+                    base_model,
+                    lora_rank,
+                    session.learning_rate,
+                    session.model_id,
+                ),
+                timeout=dense_get_timeout_s,
+            )
+            print(
+                f"[DEBUG {model_id}] dense get_or_create done: max_rank={entry.max_lora_rank}",
+                flush=True,
             )
             worker = entry.actor
             self._resource_pool_actor_names[model_id] = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
@@ -1678,11 +1701,19 @@ class VerlTrainingEngine:
             # instead of inheriting trained weights from previous session
             logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
             reinit_timeout_s = float(os.environ.get("MINT_REINIT_LORA_TIMEOUT_S", "120"))
+            print(
+                f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={reinit_timeout_s}",
+                flush=True,
+            )
             result = await self._await_with_keepalive(
                 worker.reinit_lora_weights.remote(session.learning_rate),
                 session,
                 interval_s=30.0,
                 timeout_s=reinit_timeout_s,
+            )
+            print(
+                f"[DEBUG {model_id}] dense reinit_lora_weights done",
+                flush=True,
             )
             logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
@@ -1696,11 +1727,19 @@ class VerlTrainingEngine:
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
         ready_timeout_s = float(os.environ.get("MINT_ACTOR_READY_TIMEOUT_S", "900"))
+        print(
+            f"[DEBUG {model_id}] __ray_ready__ start: timeout_s={ready_timeout_s}",
+            flush=True,
+        )
         await self._await_with_keepalive(
             worker.__ray_ready__.remote(),
             session,
             interval_s=30.0,
             timeout_s=ready_timeout_s,
+        )
+        print(
+            f"[DEBUG {model_id}] __ray_ready__ done",
+            flush=True,
         )
 
         self._workers[model_id] = worker
