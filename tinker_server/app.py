@@ -47,6 +47,21 @@ async def _cleanup_stale_actors() -> None:
         if not ray.is_initialized():
             ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
+        def _normalize_model_part(s: str) -> str:
+            return s.lower().replace("-", "_").replace(".", "_")
+
+        def _lookup_model_config(model_part: str):
+            try:
+                from tinker_server.backend.model_registry import MODEL_CONFIGS
+            except Exception:
+                return "", None
+
+            needle = _normalize_model_part(model_part)
+            for model_name, cfg in MODEL_CONFIGS.items():
+                if _normalize_model_part(model_name.split("/")[-1]) == needle:
+                    return model_name, cfg
+            return "", None
+
         # Get all named actors in the tinker namespace
         actors = ray.util.list_named_actors(all_namespaces=True)
         tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
@@ -66,7 +81,9 @@ async def _cleanup_stale_actors() -> None:
             try:
                 actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
 
-                # Check if actor is alive
+                # Check if actor is alive.
+                # WARNING: __ray_ready__ is a normal actor task and can time out if the actor is busy.
+                # Do not treat GetTimeoutError as death; killing busy detached actors breaks in-flight work.
                 try:
                     ray.get(actor.__ray_ready__.remote(), timeout=2)
 
@@ -74,23 +91,16 @@ async def _cleanup_stale_actors() -> None:
                     # Determine actor type and GPU count from name/diagnostics
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
-                        # vLLM actors may reserve num_gpus=0 (multi-node) while still
-                        # consuming GPUs via internal Ray workers. Infer total GPUs
-                        # from the model registry when possible.
                         base_model = ""
                         num_gpus = 1  # Fallback for unknown models
                         if name.startswith("tinker_vllm_"):
                             model_part = name[len("tinker_vllm_"):]
-                            try:
-                                from tinker_server.backend.model_registry import MODEL_CONFIGS
-
-                                for model_name, cfg in MODEL_CONFIGS.items():
-                                    if model_name.split("/")[-1].lower() == model_part:
-                                        base_model = model_name
-                                        num_gpus = cfg.total_gpus
-                                        break
-                            except Exception:
-                                pass
+                        else:
+                            model_part = name[len("multinode_vllm_"):]
+                        model_name, cfg = _lookup_model_config(model_part)
+                        if cfg is not None:
+                            base_model = model_name
+                            num_gpus = cfg.total_gpus
                     elif name.startswith("dense_trainer_pool_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -98,14 +108,22 @@ async def _cleanup_stale_actors() -> None:
                     elif name.startswith("megatron_"):
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
-                        # Query actual GPU count from diagnostics
                         base_model = ""
+                        model_part = name[len("megatron_"):]
+                        model_name, cfg = _lookup_model_config(model_part)
+                        if cfg is not None:
+                            base_model = model_name
+                            num_gpus = cfg.train_gpus
+                        else:
+                            num_gpus = 8  # Fallback for unknown models
+
+                        # Prefer real world_size when actor is responsive.
                         try:
                             diag = ray.get(actor.get_diagnostics.remote(), timeout=10)
-                            num_gpus = diag.get("world_size", 8)
-                            base_model = diag.get("base_model", "") or ""
+                            num_gpus = int(diag.get("world_size", num_gpus))
+                            base_model = diag.get("base_model", "") or base_model
                         except Exception:
-                            num_gpus = 8  # Default fallback
+                            pass
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
@@ -123,14 +141,61 @@ async def _cleanup_stale_actors() -> None:
                     registered += 1
                     logger.info(f"Registered existing actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
 
-                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                    # Actor is dead or unresponsive
-                    logger.info(f"Cleaning up dead/unresponsive actor: {name}")
+                except ray.exceptions.RayActorError:
+                    # Actor is dead
+                    logger.info(f"Cleaning up dead actor: {name}")
                     try:
                         ray.kill(actor, no_restart=True)
                         cleaned += 1
                     except Exception as kill_err:
                         logger.warning(f"Failed to kill actor {name}: {kill_err}")
+                except ray.exceptions.GetTimeoutError:
+                    # Actor might be busy; register it and move on.
+                    logger.warning(f"Actor {name} __ray_ready__ timed out; assuming busy and registering without kill")
+                    try:
+                        if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
+                            actor_type = ActorType.VLLM
+                            num_gpus = 1
+                            base_model = ""
+                            if name.startswith("tinker_vllm_"):
+                                model_part = name[len("tinker_vllm_"):]
+                            else:
+                                model_part = name[len("multinode_vllm_"):]
+                            model_name, cfg = _lookup_model_config(model_part)
+                            if cfg is not None:
+                                base_model = model_name
+                                num_gpus = cfg.total_gpus
+                        elif name.startswith("dense_trainer_pool_"):
+                            actor_type = ActorType.DENSE
+                            num_gpus = 1
+                            base_model = ""
+                        elif name.startswith("megatron_"):
+                            actor_type = ActorType.MEGATRON
+                            base_model = ""
+                            model_part = name[len("megatron_"):]
+                            model_name, cfg = _lookup_model_config(model_part)
+                            if cfg is not None:
+                                base_model = model_name
+                                num_gpus = cfg.train_gpus
+                            else:
+                                num_gpus = 8
+                        else:
+                            logger.debug(f"Unknown actor type for {name}, skipping registration")
+                            continue
+
+                        resource_pool.register(
+                            actor_name=name,
+                            actor_type=actor_type,
+                            num_gpus=num_gpus,
+                            actor_handle=actor,
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=base_model,
+                        )
+                        resource_pool.mark_ready(name)
+                        registered += 1
+                        logger.info(f"Registered busy actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
+                    except Exception as reg_err:
+                        logger.warning(f"Failed to register busy actor {name}: {reg_err}")
 
             except ValueError:
                 # Actor name registered but no actor exists

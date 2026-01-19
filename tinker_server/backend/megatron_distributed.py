@@ -4660,13 +4660,18 @@ class MegatronActorPool:
             except ValueError:
                 # Actor doesn't exist, will create new one
                 pass
-            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                # Actor is dead or unresponsive, kill to free name before creating new one
-                logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead/unresponsive, killing to free name")
+            except ray.exceptions.RayActorError:
+                # Actor is dead, kill to free name before creating new one
+                logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead, killing to free name")
                 try:
                     ray.kill(existing_actor, no_restart=True)
                 except Exception as kill_err:
                     logger.warning(f"[MegatronActorPool] Could not kill dead actor: {kill_err}")
+            except ray.exceptions.GetTimeoutError:
+                # Actor might be busy; do not kill on timeout.
+                logger.warning(f"[MegatronActorPool] Actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor")
+                actor = existing_actor
+                need_create = False
 
             if need_create:
                 # Create new detached actor
@@ -4876,7 +4881,7 @@ def get_or_create_megatron_worker_group(
         # Verify actor is alive
         try:
             ray.get(actor.get_diagnostics.remote(), timeout=10)
-        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+        except ray.exceptions.RayActorError:
             # Actor is dead, kill to free name
             logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
             try:
@@ -4884,6 +4889,12 @@ def get_or_create_megatron_worker_group(
             except Exception:
                 pass
             raise ValueError("Actor dead, will recreate")
+        except ray.exceptions.GetTimeoutError:
+            # Actor might be busy (queued tasks) rather than dead.
+            # Killing on timeout will terminate active training and corrupt in-flight requests.
+            logger.warning(
+                f"Megatron actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor"
+            )
         
         # Register with resource pool (reconnection case)
         resource_pool.register(

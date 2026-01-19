@@ -1544,12 +1544,14 @@ class VerlTrainingEngine:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
 
+            import asyncio
             pool = get_dense_trainer_pool()
-            entry = pool.get_or_create(
-                base_model=base_model,
-                lora_rank=lora_rank,
-                learning_rate=session.learning_rate,
-                session_id=session.model_id,
+            entry = await asyncio.to_thread(
+                pool.get_or_create,
+                base_model,
+                lora_rank,
+                session.learning_rate,
+                session.model_id,
             )
             worker = entry.actor
 
@@ -1557,8 +1559,7 @@ class VerlTrainingEngine:
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
             logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
-            import ray
-            result = ray.get(worker.reinit_lora_weights.remote(session.learning_rate))
+            result = await worker.reinit_lora_weights.remote(session.learning_rate)
             logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
             # Update pool entry with current session
@@ -2185,13 +2186,18 @@ class DenseTrainerPool:
             except ValueError:
                 # Actor doesn't exist, will create new one
                 pass
-            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                # Actor is dead or unresponsive, kill to free name before creating new one
-                logger.warning(f"[DenseTrainerPool] Actor {actor_name} is dead/unresponsive, killing to free name")
+            except ray.exceptions.RayActorError:
+                # Actor is dead, kill to free name before creating new one
+                logger.warning(f"[DenseTrainerPool] Actor {actor_name} is dead, killing to free name")
                 try:
                     ray.kill(existing_actor, no_restart=True)
                 except Exception as kill_err:
                     logger.warning(f"[DenseTrainerPool] Could not kill dead actor: {kill_err}")
+            except ray.exceptions.GetTimeoutError:
+                # Actor might be busy; don't kill on timeout.
+                logger.warning(f"[DenseTrainerPool] Actor {actor_name} get_session_info timed out; assuming busy and reusing actor")
+                actor = existing_actor
+                need_create = False
 
             if need_create:
                 # Create new detached actor
@@ -2242,6 +2248,7 @@ class DenseTrainerPool:
                 base_model=base_model,
                 session_id=session_id,
             )
+            resource_pool.mark_ready(actor_name)
 
             return entry
 

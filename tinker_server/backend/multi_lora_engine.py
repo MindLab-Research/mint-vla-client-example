@@ -298,10 +298,10 @@ class MultiLoRAInferenceEngine:
                         # Mark as ready since it's an existing actor that responded to health check
                         resource_pool.mark_ready(self.actor_name)
                         return
-                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                    # Actor is dead or unresponsive, need to create new one
+                except ray.exceptions.RayActorError:
+                    # Actor is dead, need to create new one
                     logger.warning(
-                        f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
+                        f"vLLM actor {self.actor_name} is dead, creating new one"
                     )
                     # Must kill dead actor to free the name for reuse
                     # Ray keeps names registered even for dead actors
@@ -313,6 +313,35 @@ class MultiLoRAInferenceEngine:
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
                     self._initialized = False
+                except ray.exceptions.GetTimeoutError:
+                    # Actor might be busy (queued tasks) rather than dead.
+                    # Killing on timeout will terminate active inference and training flows.
+                    logger.warning(
+                        f"vLLM actor {self.actor_name} __ray_ready__/is_engine_ready timed out; assuming busy and reusing actor"
+                    )
+                    logger.info(
+                        f"Connected to existing persistent vLLM actor: {self.actor_name}"
+                    )
+                    self._initialized = True
+
+                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                    total_gpus = self.tensor_parallel_size * self.data_parallel_size
+                    resource_pool = get_resource_pool()
+                    actor_node_id = _get_actor_node_id(self.server)
+                    logger.info(
+                        f"Registering existing actor {self.actor_name} with ResourcePool (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
+                    )
+                    resource_pool.register(
+                        actor_name=self.actor_name,
+                        actor_type=ActorType.VLLM,
+                        num_gpus=total_gpus,
+                        actor_handle=self.server,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=self.model_path,
+                        node_id=actor_node_id,
+                    )
+                    resource_pool.mark_ready(self.actor_name)
+                    return
             except ValueError:
                 # Actor doesn't exist, create new one
                 logger.info(
@@ -339,7 +368,8 @@ class MultiLoRAInferenceEngine:
             from tinker_server.backend.resource_pool import get_resource_pool
             resource_pool = get_resource_pool()
             try:
-                resource_pool.ensure_gpus_available(total_gpus)
+                import asyncio
+                await asyncio.to_thread(resource_pool.ensure_gpus_available, total_gpus)
             except ValueError as e:
                 # Unable to free enough GPUs even after eviction
                 logger.error(f"Cannot create vLLM actor: {e}")

@@ -484,7 +484,12 @@ class MultiNodeInferenceEngine:
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
             except ray.exceptions.GetTimeoutError:
-                logger.warning(f"Actor {self.actor_name} exists but is_ready timed out, will recreate")
+                # Actor might be busy (queued tasks) rather than dead.
+                # Do not kill on timeout; reuse and allow requests to queue.
+                logger.warning(f"Actor {self.actor_name} is_ready timed out; assuming busy and reusing actor")
+                self.engine = existing_actor
+                self._initialized = True
+                return
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -493,7 +498,7 @@ class MultiNodeInferenceEngine:
                     # Wait for Ray to clean up the actor name
                     import time
                     for _ in range(10):
-                        time.sleep(1)
+                        await asyncio.sleep(1)
                         try:
                             ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                         except ValueError:
@@ -517,7 +522,7 @@ class MultiNodeInferenceEngine:
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel})"
             )
-            resource_pool.ensure_gpus_available(total_required_gpus, timeout=300)
+            await asyncio.to_thread(resource_pool.ensure_gpus_available, total_required_gpus, 300)
 
             # Step 2: Find nodes with AVAILABLE GPUs
             # Available = Total - PG_used - Actor_used (same logic as multi_lora_engine.py)
