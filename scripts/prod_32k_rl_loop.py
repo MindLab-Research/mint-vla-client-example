@@ -66,7 +66,9 @@ def main() -> int:
 
     random.seed(42)
 
+    print(f"[{_ts()}] create ServiceClient", flush=True)
     service_client = mint.ServiceClient()
+    print(f"[{_ts()}] create_lora_training_client start", flush=True)
     training_client = service_client.create_lora_training_client(
         base_model=base_model,
         rank=lora_rank,
@@ -74,7 +76,9 @@ def main() -> int:
         train_attn=True,
         train_unembed=True,
     )
+    print(f"[{_ts()}] get_tokenizer start", flush=True)
     tokenizer = training_client.get_tokenizer()
+    print(f"[{_ts()}] get_tokenizer done vocab_size={tokenizer.vocab_size}", flush=True)
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
 
@@ -198,4 +202,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
