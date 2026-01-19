@@ -1406,10 +1406,6 @@ class VerlTrainingEngine:
         # Map model_id -> Ray actor name registered in ResourcePool, used to keep
         # actors marked as active during long-running calls (32k forward/backward).
         self._resource_pool_actor_names: dict[str, str] = {}
-        # Session heartbeats are best-effort; if the SDK stops heartbeating mid-call,
-        # we treat the session as abandoned and kill its actor to prevent pooled
-        # actors from being wedged indefinitely by orphaned work.
-        self._session_heartbeat_ttl_s = int(os.environ.get("MINT_SESSION_HEARTBEAT_TTL_S", "180"))
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1417,17 +1413,6 @@ class VerlTrainingEngine:
             # Use fixed namespace for persistent vLLM actor support
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
-
-    def _is_session_live(self, session: "TrainingSession") -> bool:
-        ttl_s = self._session_heartbeat_ttl_s
-        if ttl_s <= 0:
-            return True
-        session_id = getattr(session, "session_id", None)
-        if not session_id:
-            return True
-        from .session_heartbeat_store import session_heartbeat_store
-
-        return not session_heartbeat_store.is_stale(session_id, ttl_s)
 
     def _kill_session_actor(self, session: "TrainingSession") -> None:
         model_id = session.model_id
@@ -1459,8 +1444,6 @@ class VerlTrainingEngine:
         longer than the idle timeout. We keep actors marked as active while a
         request is in-flight to prevent eviction of busy actors.
         """
-        if not self._is_session_live(session):
-            return
         actor_name = self._resource_pool_actor_names.get(session.model_id)
         if not actor_name:
             return
@@ -1480,18 +1463,11 @@ class VerlTrainingEngine:
         """Await a Ray call while periodically touching ResourcePool.
 
         Uses a poll loop with `ray.get(..., timeout=...)` executed in a thread to
-        avoid blocking the asyncio event loop. This ensures `timeout_s` and the
-        heartbeat-based cancellation can actually fire during long Ray calls.
+        avoid blocking the asyncio event loop. This ensures `timeout_s` can fire
+        during long Ray calls.
         """
         start = time.time()
         while True:
-            if not self._is_session_live(session):
-                logger.warning(
-                    f"[{session.model_id}] Session heartbeat stale; killing actor to cancel in-flight work"
-                )
-                self._kill_session_actor(session)
-                raise RuntimeError("Session heartbeat stale; cancelled in-flight Ray call")
-
             self._touch_actor(session)
 
             wait_s = interval_s
