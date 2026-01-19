@@ -4947,12 +4947,9 @@ def get_or_create_megatron_worker_group(
             learning_rate=learning_rate,
             distributed_config=config,
         )
-
-        # Wait for initialization
-        ray.get(actor.__ray_ready__.remote())
-        logger.info(f"Megatron worker group {actor_name} initialized (detached actor)")
-
-        # Register with unified resource pool for LRU tracking
+        # Register immediately (creating=True) to account for GPU usage and prevent eviction.
+        # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
+        # marks the entry ready (creating=False) after __ray_ready__ completes.
         resource_pool.register(
             actor_name=actor_name,
             actor_type=ActorType.MEGATRON,
@@ -4960,10 +4957,8 @@ def get_or_create_megatron_worker_group(
             actor_handle=actor,
             namespace=PERSISTENT_NAMESPACE,
             base_model=base_model,
+            session_id=session_id,
         )
-        # Mark as ready after initialization completes
-        resource_pool.mark_ready(actor_name)
-
         return actor
     finally:
         # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)

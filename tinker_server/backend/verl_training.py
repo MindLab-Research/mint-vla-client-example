@@ -1728,6 +1728,11 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] __ray_ready__ done",
             flush=True,
         )
+        actor_name = self._resource_pool_actor_names.get(model_id)
+        if actor_name:
+            from .resource_pool import get_resource_pool
+
+            get_resource_pool().mark_ready(actor_name)
 
         self._workers[model_id] = worker
         session.is_active = True
