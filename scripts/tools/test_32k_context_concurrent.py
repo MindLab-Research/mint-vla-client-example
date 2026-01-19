@@ -4,7 +4,7 @@
 Runs three concurrent SFT loops (forward_backward + optim_step) at a fixed
 sequence length (default: 32000 tokens):
   - Qwen/Qwen3-0.6B
-  - Qwen/Qwen3-4B
+  - Qwen/Qwen3-4B-Instruct-2507
   - Qwen/Qwen3-30B-A3B-Instruct-2507
 
 Target server:
@@ -225,7 +225,7 @@ def main() -> int:
 
     models = [
         "Qwen/Qwen3-0.6B",
-        "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
     ]
 
