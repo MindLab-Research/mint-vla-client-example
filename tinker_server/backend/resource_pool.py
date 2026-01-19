@@ -212,6 +212,27 @@ class ResourcePool:
             if entry:
                 entry.current_session = session_id
 
+    def clear_session(self, session_id: str) -> int:
+        """Clear session tracking entries matching session_id.
+
+        Used when a training session is deleted while actor creation/session
+        initialization is still in-flight, to avoid permanently pinning an
+        actor as non-idle due to a stale current_session value.
+
+        Returns:
+            Number of actor entries updated.
+        """
+        cleared = 0
+        with self._pool_lock:
+            for entry in self._entries.values():
+                if entry.current_session == session_id:
+                    entry.current_session = None
+                    entry.touch()
+                    cleared += 1
+        if cleared:
+            logger.info(f"[ResourcePool] Cleared current_session={session_id} for {cleared} actor(s)")
+        return cleared
+
     def touch(self, actor_name: str) -> bool:
         """Update last_accessed timestamp to mark actor as recently used.
 

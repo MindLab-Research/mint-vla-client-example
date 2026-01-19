@@ -190,6 +190,14 @@ async def _do_create_model(
         # Clean up session if it was created
         if training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
+        # If session tracking was updated in ResourcePool during a partially-failed
+        # create_training_session, clear it to avoid pinning actors as non-idle.
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            get_resource_pool().clear_session(model_id)
+        except Exception:
+            pass
         future_store.fail(request_id, str(e))
 
         # 发送 failed 状态
@@ -860,6 +868,14 @@ async def delete_model(model_id: str):
 
     await training_engine.shutdown_session(session)
     training_manager.delete_session(model_id)
+    # Clear ResourcePool session tracking even if shutdown_session couldn't find a worker
+    # (e.g., deletion races with create_training_session still in-flight).
+    try:
+        from ..backend.resource_pool import get_resource_pool
+
+        get_resource_pool().clear_session(model_id)
+    except Exception:
+        pass
 
     return {"model_id": model_id, "status": "deleted"}
 

@@ -2123,7 +2123,7 @@ class DenseTrainerPool:
                 # Check if actor is still alive (may have self-terminated due to idle timeout)
                 try:
                     ray.get(entry.actor.heartbeat.remote(), timeout=5)
-                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                except ray.exceptions.RayActorError:
                     logger.warning(
                         f"[DenseTrainerPool] Actor for {base_model} is dead (idle timeout?), removing from pool"
                     )
@@ -2134,6 +2134,27 @@ class DenseTrainerPool:
                     resource_pool = get_resource_pool()
                     resource_pool.unregister(actor_name)
                     # Fall through to create new actor
+                except ray.exceptions.GetTimeoutError:
+                    # A timeout does NOT imply the actor is dead: it may be busy running a long
+                    # forward/backward. Treat as alive and reuse the existing entry.
+                    if lora_rank > entry.max_lora_rank:
+                        raise ValueError(
+                            f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
+                            f"Kill the actor and restart with higher max_lora_rank."
+                        )
+                    entry.touch()  # Phase 9: Update LRU
+                    from tinker_server.backend.resource_pool import get_resource_pool
+
+                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+                    resource_pool = get_resource_pool()
+                    pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                    if pool_entry:
+                        pool_entry.current_session = session_id
+
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor {actor_name} heartbeat timed out; assuming busy and reusing actor"
+                    )
+                    return entry
                 else:
                     if lora_rank > entry.max_lora_rank:
                         raise ValueError(
