@@ -6,6 +6,7 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -1402,6 +1403,9 @@ class VerlTrainingEngine:
         self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
+        # Map model_id -> Ray actor name registered in ResourcePool, used to keep
+        # actors marked as active during long-running calls (32k forward/backward).
+        self._resource_pool_actor_names: dict[str, str] = {}
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1413,23 +1417,38 @@ class VerlTrainingEngine:
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
-        Called during training operations to:
-        1. Mark actor as recently used (prevents LRU eviction)
-        2. Associate current session with actor (prevents idle eviction)
+        ResourcePool idleness is time-based; a 32k forward/backward can easily run
+        longer than the idle timeout. We keep actors marked as active while a
+        request is in-flight to prevent eviction of busy actors.
         """
+        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        if not actor_name:
+            return
         from .resource_pool import get_resource_pool
-        from .megatron_distributed import _make_megatron_actor_name
 
-        # Only Megatron actors are tracked in the unified resource pool
-        # Dense trainers use their own DenseTrainerPool with touch() calls
-        if session.backend == "megatron":
-            base_model = session.base_model or self.default_base_model
-            if base_model:
-                actor_name = _make_megatron_actor_name(base_model)
-                resource_pool = get_resource_pool()
-                resource_pool.touch(actor_name)
-                # Associate session with actor to prevent idle eviction
-                resource_pool.set_session(actor_name, session.model_id)
+        resource_pool = get_resource_pool()
+        resource_pool.touch(actor_name)
+        resource_pool.set_session(actor_name, session.model_id)
+
+    async def _await_with_keepalive(self, awaitable, session: "TrainingSession", interval_s: float = 30.0):
+        """Await a Ray call while periodically touching ResourcePool."""
+        self._touch_actor(session)
+        stop = False
+
+        async def _keepalive():
+            nonlocal stop
+            while not stop:
+                await asyncio.sleep(interval_s)
+                self._touch_actor(session)
+
+        task = asyncio.create_task(_keepalive())
+        try:
+            return await awaitable
+        finally:
+            stop = True
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -1543,7 +1562,9 @@ class VerlTrainingEngine:
                 session_id=session.model_id,
             )
             session.backend = "megatron"
-            # Associate session with actor in resource pool immediately
+            from .megatron_distributed import _make_megatron_actor_name
+
+            self._resource_pool_actor_names[model_id] = _make_megatron_actor_name(base_model or "")
             self._touch_actor(session)
             # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
             # with session_id for proper session state management (Issue #44)
@@ -1561,6 +1582,8 @@ class VerlTrainingEngine:
                 session.model_id,
             )
             worker = entry.actor
+            self._resource_pool_actor_names[model_id] = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
+            self._touch_actor(session)
 
             # Reinitialize LoRA weights for fresh session (statelessness)
             # This ensures each new session starts with fresh random weights
@@ -1578,7 +1601,7 @@ class VerlTrainingEngine:
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
-        await worker.__ray_ready__.remote()
+        await self._await_with_keepalive(worker.__ray_ready__.remote(), session, interval_s=30.0)
 
         self._workers[model_id] = worker
         session.is_active = True
@@ -1610,9 +1633,10 @@ class VerlTrainingEngine:
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.forward_backward.remote(
+        pending = worker.forward_backward.remote(
             data_items, loss_fn, loss_fn_config, session.model_id
         )
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
         session.accumulated_gradients += 1
@@ -1645,7 +1669,8 @@ class VerlTrainingEngine:
         data_items = [item.model_dump() for item in request.forward_input.data]
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.forward.remote(data_items, session.model_id)
+        pending = worker.forward.remote(data_items, session.model_id)
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         logger.info(f"[{model_id}] forward completed")
         return result
@@ -1693,7 +1718,8 @@ class VerlTrainingEngine:
         lr = request.adam_params.learning_rate if request.adam_params else None
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.optim_step.remote(lr, session.model_id)
+        pending = worker.optim_step.remote(lr, session.model_id)
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
         session.current_step += 1
@@ -1742,20 +1768,23 @@ class VerlTrainingEngine:
 
         if use_train_step:
             # MoE: Use combined train_step to keep gradients in same context
-            result = await worker.train_step.remote(
+            pending = worker.train_step.remote(
                 data_items,
                 loss_fn,
                 loss_fn_config,
                 lr,
                 session.model_id,
             )
+            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
-            fb_result = await worker.forward_backward.remote(
+            fb_pending = worker.forward_backward.remote(
                 data_items, loss_fn, loss_fn_config, session.model_id
             )
-            opt_result = await worker.optim_step.remote(lr, session.model_id)
+            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
+            opt_pending = worker.optim_step.remote(lr, session.model_id)
+            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
 
             # Merge results
             result = fb_result.copy()
@@ -1919,6 +1948,7 @@ class VerlTrainingEngine:
             session: TrainingSession to shutdown.
         """
         model_id = session.model_id
+        self._resource_pool_actor_names.pop(model_id, None)
         worker = self._workers.pop(model_id, None)
         if worker:
             # Best-effort clean shutdown, but don't block on an in-flight long
