@@ -1914,13 +1914,17 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers.pop(model_id, None)
         if worker:
-            # Call shutdown method first for clean cleanup
+            # Best-effort clean shutdown, but don't block on an in-flight long
+            # forward/backward. Deleting a model should be able to interrupt work.
             try:
-                await worker.shutdown.remote()
+                worker.shutdown.remote()
             except Exception:
                 pass  # Actor may already be dead
             # Kill the actor to release resources
-            ray.kill(worker)
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception:
+                pass
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker shutdown")
 
