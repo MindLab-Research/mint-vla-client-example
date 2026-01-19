@@ -1406,6 +1406,10 @@ class VerlTrainingEngine:
         # Map model_id -> Ray actor name registered in ResourcePool, used to keep
         # actors marked as active during long-running calls (32k forward/backward).
         self._resource_pool_actor_names: dict[str, str] = {}
+        # Session heartbeats are best-effort; if the SDK stops heartbeating mid-call,
+        # we treat the session as abandoned and kill its actor to prevent pooled
+        # actors from being wedged indefinitely by orphaned work.
+        self._session_heartbeat_ttl_s = int(os.environ.get("MINT_SESSION_HEARTBEAT_TTL_S", "180"))
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1414,6 +1418,40 @@ class VerlTrainingEngine:
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
+    def _is_session_live(self, session: "TrainingSession") -> bool:
+        ttl_s = self._session_heartbeat_ttl_s
+        if ttl_s <= 0:
+            return True
+        session_id = getattr(session, "session_id", None)
+        if not session_id:
+            return True
+        from .session_heartbeat_store import session_heartbeat_store
+
+        return not session_heartbeat_store.is_stale(session_id, ttl_s)
+
+    def _kill_session_actor(self, session: "TrainingSession") -> None:
+        model_id = session.model_id
+
+        worker = self._workers.get(model_id)
+        if worker is not None:
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception:
+                pass
+            return
+
+        actor_name = self._resource_pool_actor_names.get(model_id)
+        if not actor_name:
+            return
+        try:
+            actor = ray.get_actor(actor_name, namespace="tinker")
+        except Exception:
+            return
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass
+
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
@@ -1421,6 +1459,8 @@ class VerlTrainingEngine:
         longer than the idle timeout. We keep actors marked as active while a
         request is in-flight to prevent eviction of busy actors.
         """
+        if not self._is_session_live(session):
+            return
         actor_name = self._resource_pool_actor_names.get(session.model_id)
         if not actor_name:
             return
@@ -1430,8 +1470,18 @@ class VerlTrainingEngine:
         resource_pool.touch(actor_name)
         resource_pool.set_session(actor_name, session.model_id)
 
-    async def _await_with_keepalive(self, awaitable, session: "TrainingSession", interval_s: float = 30.0):
-        """Await a Ray call while periodically touching ResourcePool."""
+    async def _await_with_keepalive(
+        self,
+        awaitable,
+        session: "TrainingSession",
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+    ):
+        """Await a Ray call while periodically touching ResourcePool.
+
+        If the SDK stops heartbeating for the owning session, kill the actor to
+        prevent orphaned work from wedging pooled actors indefinitely.
+        """
         self._touch_actor(session)
         stop = False
 
@@ -1439,16 +1489,37 @@ class VerlTrainingEngine:
             nonlocal stop
             while not stop:
                 await asyncio.sleep(interval_s)
+                if stop:
+                    return
+                if not self._is_session_live(session):
+                    logger.warning(
+                        f"[{session.model_id}] Session heartbeat stale; killing actor to cancel in-flight work"
+                    )
+                    self._kill_session_actor(session)
+                    return
                 self._touch_actor(session)
 
         task = asyncio.create_task(_keepalive())
+        main_task = asyncio.create_task(self._await_ray(awaitable))
         try:
-            return await awaitable
+            if timeout_s is not None and timeout_s > 0:
+                done, _ = await asyncio.wait({main_task}, timeout=timeout_s)
+                if not done:
+                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s; killing actor")
+                    self._kill_session_actor(session)
+                    main_task.cancel()
+                    raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+            return await main_task
         finally:
             stop = True
             task.cancel()
             with contextlib.suppress(Exception):
                 await task
+            with contextlib.suppress(Exception):
+                await main_task
+
+    async def _await_ray(self, awaitable):
+        return await awaitable
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -1535,6 +1606,7 @@ class VerlTrainingEngine:
         print(f"[DEBUG create_training_session] use_megatron={use_megatron}, base_model={base_model}", flush=True)
 
         if use_megatron:
+            import asyncio
             # MoE models need tensor/expert parallelism from model registry
             from .model_registry import get_training_parallelism, requires_fp8
 
@@ -1554,13 +1626,29 @@ class VerlTrainingEngine:
             # Uses detached Ray actor pattern like vLLM for crash resilience
             # Use async version to avoid blocking uvicorn event loop
             # Issue #44: Pass model_id for unique session state isolation
-            worker = await async_get_or_create_megatron_worker_group(
-                base_model=base_model,
-                lora_rank=lora_rank,
-                learning_rate=session.learning_rate,
-                distributed_config=distributed_config,
-                session_id=session.model_id,
-            )
+            megatron_timeout_s = float(os.environ.get("MINT_MEGATRON_CREATE_TIMEOUT_S", "1800"))
+            try:
+                worker = await asyncio.wait_for(
+                    async_get_or_create_megatron_worker_group(
+                        base_model=base_model,
+                        lora_rank=lora_rank,
+                        learning_rate=session.learning_rate,
+                        distributed_config=distributed_config,
+                        session_id=session.model_id,
+                    ),
+                    timeout=megatron_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                # Best-effort: kill the persistent Megatron actor to unblock retries.
+                from .megatron_distributed import _make_megatron_actor_name
+
+                actor_name = _make_megatron_actor_name(base_model or requested_model or "")
+                try:
+                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
+                raise
             session.backend = "megatron"
             from .megatron_distributed import _make_megatron_actor_name
 
@@ -1589,7 +1677,13 @@ class VerlTrainingEngine:
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
             logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
-            result = await worker.reinit_lora_weights.remote(session.learning_rate)
+            reinit_timeout_s = float(os.environ.get("MINT_REINIT_LORA_TIMEOUT_S", "120"))
+            result = await self._await_with_keepalive(
+                worker.reinit_lora_weights.remote(session.learning_rate),
+                session,
+                interval_s=30.0,
+                timeout_s=reinit_timeout_s,
+            )
             logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
             # Update pool entry with current session
@@ -1601,7 +1695,13 @@ class VerlTrainingEngine:
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
-        await self._await_with_keepalive(worker.__ray_ready__.remote(), session, interval_s=30.0)
+        ready_timeout_s = float(os.environ.get("MINT_ACTOR_READY_TIMEOUT_S", "900"))
+        await self._await_with_keepalive(
+            worker.__ray_ready__.remote(),
+            session,
+            interval_s=30.0,
+            timeout_s=ready_timeout_s,
+        )
 
         self._workers[model_id] = worker
         session.is_active = True
@@ -1948,7 +2048,7 @@ class VerlTrainingEngine:
             session: TrainingSession to shutdown.
         """
         model_id = session.model_id
-        self._resource_pool_actor_names.pop(model_id, None)
+        actor_name = self._resource_pool_actor_names.pop(model_id, None)
         worker = self._workers.pop(model_id, None)
         if worker:
             # Best-effort clean shutdown, but don't block on an in-flight long
@@ -1960,6 +2060,15 @@ class VerlTrainingEngine:
             # Kill the actor to release resources
             try:
                 ray.kill(worker, no_restart=True)
+            except Exception:
+                pass
+        elif actor_name:
+            # Session deletion can race with create_training_session still in-flight;
+            # in that case the worker isn't registered in self._workers yet, but we
+            # still want to kill the actor to unblock the pending create_model.
+            try:
+                actor = ray.get_actor(actor_name, namespace="tinker")
+                ray.kill(actor, no_restart=True)
             except Exception:
                 pass
         session.is_active = False
@@ -2298,7 +2407,18 @@ class DenseTrainerPool:
                 )
 
                 # Wait for initialization
-                ray.get(actor.__ray_ready__.remote())
+                init_timeout_s = float(os.environ.get("MINT_DENSE_ACTOR_INIT_TIMEOUT_S", "600"))
+                try:
+                    ray.get(actor.__ray_ready__.remote(), timeout=init_timeout_s)
+                except ray.exceptions.GetTimeoutError:
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor {actor_name} init timed out after {init_timeout_s}s; killing"
+                    )
+                    try:
+                        ray.kill(actor, no_restart=True)
+                    except Exception:
+                        pass
+                    raise
                 logger.info(f"[DenseTrainerPool] Actor {actor_name} initialized")
 
             entry = DenseTrainerEntry(
