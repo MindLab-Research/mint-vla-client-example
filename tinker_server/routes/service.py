@@ -78,9 +78,6 @@ async def create_session(request: CreateSessionRequest) -> CreateSessionResponse
         "tags": request.tags,
         "metadata": request.user_metadata,
     }
-    # Seed heartbeat timestamp at creation time so the server can later detect
-    # abandoned sessions (clients that stop heartbeating mid-operation).
-    session_heartbeat_store.update(session_id)
     return CreateSessionResponse(session_id=session_id)
 
 
