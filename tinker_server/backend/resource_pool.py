@@ -15,6 +15,8 @@ from typing import Callable
 
 import ray
 
+from . import ray_kill
+
 logger = logging.getLogger(__name__)
 
 
@@ -348,7 +350,21 @@ class ResourcePool:
                 pass
 
             # Force kill
-            ray.kill(actor)
+            ray_kill.kill(
+                actor,
+                reason="resource_pool_evict",
+                actor_name=entry.actor_name,
+                namespace=entry.namespace,
+                actor_type=entry.actor_type.value,
+                num_gpus=entry.num_gpus,
+                base_model=entry.base_model,
+                current_session=entry.current_session,
+                creating=entry.creating,
+                idle_time=f"{entry.idle_time():.1f}",
+                age=f"{entry.age():.1f}",
+                min_actor_age=self.MIN_ACTOR_AGE,
+                session_idle_timeout=self.SESSION_IDLE_TIMEOUT,
+            )
             logger.info(f"[ResourcePool] Killed actor: {entry.actor_name}")
             return True
 

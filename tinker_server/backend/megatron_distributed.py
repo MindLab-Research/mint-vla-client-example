@@ -24,6 +24,8 @@ import ray
 # to ensure CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
 # (tensordict imports torch internally)
 
+from . import ray_kill
+
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
@@ -4417,7 +4419,7 @@ class MegatronWorkerGroup:
         # Then force kill all workers to release GPU memory
         for w in self.workers:
             try:
-                ray.kill(w, no_restart=True)
+                ray_kill.kill(w, reason="megatron_worker_group_shutdown", no_restart=True)
             except Exception:
                 pass
 
@@ -4563,7 +4565,16 @@ class MegatronActorPool:
             # Kill actor (no state to save since it's idle)
             try:
                 ray.get(entry.actor.shutdown.remote(), timeout=30)
-                ray.kill(entry.actor)
+                ray_kill.kill(
+                    entry.actor,
+                    reason="megatron_pool_evict",
+                    actor_name=_make_megatron_actor_name(entry.base_model),
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=entry.base_model,
+                    num_gpus=entry.num_gpus,
+                    idle_time=f"{entry.idle_time():.1f}",
+                    age=f"{entry.age():.1f}",
+                )
             except Exception as e:
                 logger.warning(f"[MegatronActorPool] Error killing evicted actor: {e}")
 
@@ -4664,7 +4675,14 @@ class MegatronActorPool:
                 # Actor is dead, kill to free name before creating new one
                 logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead, killing to free name")
                 try:
-                    ray.kill(existing_actor, no_restart=True)
+                    ray_kill.kill(
+                        existing_actor,
+                        reason="megatron_pool_existing_dead",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        base_model=base_model,
+                    )
                 except Exception as kill_err:
                     logger.warning(f"[MegatronActorPool] Could not kill dead actor: {kill_err}")
             except ray.exceptions.GetTimeoutError:
@@ -4745,7 +4763,13 @@ class MegatronActorPool:
             if kill_actor:
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="megatron_pool_remove",
+                        actor_name=_make_megatron_actor_name(entry.base_model),
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
 
@@ -4798,7 +4822,13 @@ class MegatronActorPool:
                 self._actors.pop(key, None)
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="megatron_pool_evict_idle",
+                        actor_name=_make_megatron_actor_name(entry.base_model),
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[MegatronActorPool] Error killing idle actor: {e}")
                 logger.info(f"[MegatronActorPool] Evicted idle actor: {entry.base_model}")
@@ -4820,7 +4850,13 @@ class MegatronActorPool:
                 for entry in self._actors.values():
                     try:
                         ray.get(entry.actor.shutdown.remote(), timeout=30)
-                        ray.kill(entry.actor)
+                        ray_kill.kill(
+                            entry.actor,
+                            reason="megatron_pool_clear",
+                            actor_name=_make_megatron_actor_name(entry.base_model),
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=entry.base_model,
+                        )
                     except Exception as e:
                         logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
             self._actors.clear()
@@ -4885,7 +4921,13 @@ def get_or_create_megatron_worker_group(
             # Actor is dead, kill to free name
             logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
             try:
-                ray.kill(actor, no_restart=True)
+                ray_kill.kill(
+                    actor,
+                    reason="megatron_actor_dead_free_name",
+                    actor_name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                )
             except Exception:
                 pass
             raise ValueError("Actor dead, will recreate")
@@ -5026,7 +5068,14 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                 ray.get(actor.shutdown.remote(), timeout=10)
             except Exception:
                 pass
-            ray.kill(actor, no_restart=True)
+            ray_kill.kill(
+                actor,
+                reason="kill_megatron_actor",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+                no_restart=True,
+                base_model=base_model,
+            )
             logger.info(f"Killed Megatron actor: {actor_name}")
             resource_pool.unregister(actor_name)
             killed_any = True
@@ -5042,7 +5091,14 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                         ray.get(actor.shutdown.remote(), timeout=10)
                     except Exception:
                         pass
-                    ray.kill(actor, no_restart=True)
+                    ray_kill.kill(
+                        actor,
+                        reason="kill_megatron_actor",
+                        actor_name=entry.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        base_model=entry.base_model,
+                    )
                     logger.info(f"Killed Megatron actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     killed_any = True

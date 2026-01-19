@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from . import ray_kill
+
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
@@ -1419,8 +1421,16 @@ class VerlTrainingEngine:
 
         worker = self._workers.get(model_id)
         if worker is not None:
+            actor_name = self._resource_pool_actor_names.get(model_id)
             try:
-                ray.kill(worker, no_restart=True)
+                ray_kill.kill(
+                    worker,
+                    reason="session_timeout",
+                    actor_name=actor_name,
+                    namespace="tinker",
+                    no_restart=True,
+                    model_id=model_id,
+                )
             except Exception:
                 pass
             return
@@ -1433,7 +1443,14 @@ class VerlTrainingEngine:
         except Exception:
             return
         try:
-            ray.kill(actor, no_restart=True)
+            ray_kill.kill(
+                actor,
+                reason="session_timeout",
+                actor_name=actor_name,
+                namespace="tinker",
+                no_restart=True,
+                model_id=model_id,
+            )
         except Exception:
             pass
 
@@ -1615,7 +1632,15 @@ class VerlTrainingEngine:
                 actor_name = _make_megatron_actor_name(base_model or requested_model or "")
                 try:
                     actor = ray.get_actor(actor_name, namespace="tinker")
-                    ray.kill(actor, no_restart=True)
+                    ray_kill.kill(
+                        actor,
+                        reason="megatron_create_timeout",
+                        actor_name=actor_name,
+                        namespace="tinker",
+                        no_restart=True,
+                        model_id=model_id,
+                        timeout_s=megatron_timeout_s,
+                    )
                 except Exception:
                     pass
                 raise
@@ -2055,29 +2080,67 @@ class VerlTrainingEngine:
             session: TrainingSession to shutdown.
         """
         model_id = session.model_id
-        actor_name = self._resource_pool_actor_names.pop(model_id, None)
-        worker = self._workers.pop(model_id, None)
-        if worker:
-            # Best-effort clean shutdown, but don't block on an in-flight long
-            # forward/backward. Deleting a model should be able to interrupt work.
-            try:
-                worker.shutdown.remote()
-            except Exception:
-                pass  # Actor may already be dead
-            # Kill the actor to release resources
-            try:
-                ray.kill(worker, no_restart=True)
-            except Exception:
-                pass
-        elif actor_name:
-            # Session deletion can race with create_training_session still in-flight;
-            # in that case the worker isn't registered in self._workers yet, but we
-            # still want to kill the actor to unblock the pending create_model.
-            try:
-                actor = ray.get_actor(actor_name, namespace="tinker")
-                ray.kill(actor, no_restart=True)
-            except Exception:
-                pass
+
+        actor_name = self._resource_pool_actor_names.get(model_id)
+        worker = self._workers.get(model_id)
+
+        other_users: list[str] = []
+        if actor_name:
+            other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
+        should_kill_actor = not other_users
+
+        self._resource_pool_actor_names.pop(model_id, None)
+        self._workers.pop(model_id, None)
+
+        # If this session was loaded on a pooled dense actor, clear pool tracking
+        # so the actor can become evictable after session deletion.
+        try:
+            if session.backend == "peft":
+                get_dense_trainer_pool().clear_session(model_id)
+        except Exception:
+            pass
+
+        if should_kill_actor:
+            if worker:
+                # Best-effort clean shutdown, but don't block on an in-flight long
+                # forward/backward. Deleting a model should be able to interrupt work.
+                try:
+                    worker.shutdown.remote()
+                except Exception:
+                    pass  # Actor may already be dead
+                try:
+                    ray_kill.kill(
+                        worker,
+                        reason="shutdown_session",
+                        actor_name=actor_name,
+                        namespace="tinker",
+                        no_restart=True,
+                        model_id=model_id,
+                    )
+                except Exception:
+                    pass
+            elif actor_name:
+                # Session deletion can race with create_training_session still in-flight;
+                # in that case the worker isn't registered in self._workers yet, but we
+                # still want to kill the actor to unblock the pending create_model.
+                try:
+                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    ray_kill.kill(
+                        actor,
+                        reason="shutdown_session_race_no_worker",
+                        actor_name=actor_name,
+                        namespace="tinker",
+                        no_restart=True,
+                        model_id=model_id,
+                    )
+                except Exception:
+                    pass
+        else:
+            logger.info(
+                f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
+                f"(still referenced by {len(other_users)} other model_id(s))"
+            )
+
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker shutdown")
 
@@ -2190,6 +2253,26 @@ class DenseTrainerPool:
                 entry.touch()  # Phase 9: Update LRU
             return entry
 
+    def clear_session(self, session_id: str) -> int:
+        """Clear current_session pointers matching session_id.
+
+        Deleting a training model should not leave pooled actors pinned as
+        non-idle forever.
+
+        Returns:
+            Number of pool entries updated.
+        """
+        cleared = 0
+        with self._lock:
+            for entry in self._actors.values():
+                if entry.current_session == session_id:
+                    entry.current_session = None
+                    entry.touch()
+                    cleared += 1
+        if cleared:
+            logger.info(f"[DenseTrainerPool] Cleared current_session={session_id} for {cleared} actor(s)")
+        return cleared
+
     def _get_idle_actors_lru(self) -> list[DenseTrainerEntry]:
         """Get idle actors sorted by last access time (LRU first).
 
@@ -2240,7 +2323,18 @@ class DenseTrainerPool:
             except Exception:
                 pass
             try:
-                ray.kill(entry.actor, no_restart=True)
+                ray_kill.kill(
+                    entry.actor,
+                    reason="dense_trainer_pool_evict",
+                    actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                    namespace=PERSISTENT_DENSE_NAMESPACE,
+                    no_restart=True,
+                    base_model=entry.base_model,
+                    num_gpus=entry.num_gpus,
+                    current_session=entry.current_session,
+                    idle_time=f"{entry.idle_time():.1f}",
+                    age=f"{entry.age():.1f}",
+                )
             except Exception as e:
                 logger.warning(f"[DenseTrainerPool] Error killing evicted actor: {e}")
 
@@ -2400,7 +2494,14 @@ class DenseTrainerPool:
                 except ray.exceptions.RayActorError:
                     logger.warning(f"[DenseTrainerPool] Actor {actor_name} is dead, killing to free name")
                     try:
-                        ray.kill(existing_actor, no_restart=True)
+                        ray_kill.kill(
+                            existing_actor,
+                            reason="dense_trainer_pool_existing_dead",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            no_restart=True,
+                            base_model=base_model,
+                        )
                     except Exception as kill_err:
                         logger.warning(f"[DenseTrainerPool] Could not kill dead actor: {kill_err}")
                 except ray.exceptions.GetTimeoutError:
@@ -2414,7 +2515,14 @@ class DenseTrainerPool:
                         f"[DenseTrainerPool] Actor {actor_name} failed get_session_info: {e}; killing to recreate"
                     )
                     try:
-                        ray.kill(existing_actor, no_restart=True)
+                        ray_kill.kill(
+                            existing_actor,
+                            reason="dense_trainer_pool_existing_unhealthy",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            no_restart=True,
+                            base_model=base_model,
+                        )
                     except Exception as kill_err:
                         logger.warning(f"[DenseTrainerPool] Could not kill unhealthy actor: {kill_err}")
 
@@ -2450,7 +2558,15 @@ class DenseTrainerPool:
                             f"[DenseTrainerPool] Actor {actor_name} init timed out after {init_timeout_s}s; killing"
                         )
                         try:
-                            ray.kill(actor, no_restart=True)
+                            ray_kill.kill(
+                                actor,
+                                reason="dense_trainer_pool_init_timeout",
+                                actor_name=actor_name,
+                                namespace=PERSISTENT_DENSE_NAMESPACE,
+                                no_restart=True,
+                                base_model=base_model,
+                                timeout_s=init_timeout_s,
+                            )
                         except Exception:
                             pass
                         raise
@@ -2512,7 +2628,14 @@ class DenseTrainerPool:
                 except Exception:
                     pass
                 try:
-                    ray.kill(entry.actor, no_restart=True)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="dense_trainer_pool_remove",
+                        actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                        namespace=PERSISTENT_DENSE_NAMESPACE,
+                        no_restart=True,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
 
@@ -2565,7 +2688,13 @@ class DenseTrainerPool:
                 self._actors.pop(key, None)
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="dense_trainer_pool_evict_idle",
+                        actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                        namespace=PERSISTENT_DENSE_NAMESPACE,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing idle actor: {e}")
                 logger.info(f"[DenseTrainerPool] Evicted idle actor: {entry.base_model}")
@@ -2587,7 +2716,13 @@ class DenseTrainerPool:
                 for entry in self._actors.values():
                     try:
                         ray.get(entry.actor.shutdown.remote(), timeout=30)
-                        ray.kill(entry.actor)
+                        ray_kill.kill(
+                            entry.actor,
+                            reason="dense_trainer_pool_clear",
+                            actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            base_model=entry.base_model,
+                        )
                     except Exception as e:
                         logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
             self._actors.clear()

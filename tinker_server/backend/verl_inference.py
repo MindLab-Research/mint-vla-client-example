@@ -20,6 +20,8 @@ import ray
 import torch
 from omegaconf import OmegaConf
 
+from . import ray_kill
+
 if TYPE_CHECKING:
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
@@ -1468,7 +1470,7 @@ class VerlInferenceEngine:
     async def shutdown(self) -> None:
         """Cleanup Ray actors."""
         if self.server:
-            ray.kill(self.server)
+            ray_kill.kill(self.server, reason="verl_inference_shutdown", namespace="tinker")
             self.server = None
         self._initialized = False
         logger.info("VerlInferenceEngine shutdown")

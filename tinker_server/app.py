@@ -41,6 +41,7 @@ async def _cleanup_stale_actors() -> None:
 
     try:
         import ray
+        from .backend import ray_kill
         from .backend.multi_lora_engine import PERSISTENT_NAMESPACE
         from .backend.resource_pool import get_resource_pool, ActorType
 
@@ -145,7 +146,13 @@ async def _cleanup_stale_actors() -> None:
                     # Actor is dead
                     logger.info(f"Cleaning up dead actor: {name}")
                     try:
-                        ray.kill(actor, no_restart=True)
+                        ray_kill.kill(
+                            actor,
+                            reason="startup_cleanup_dead_actor",
+                            actor_name=name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
                         cleaned += 1
                     except Exception as kill_err:
                         logger.warning(f"Failed to kill actor {name}: {kill_err}")

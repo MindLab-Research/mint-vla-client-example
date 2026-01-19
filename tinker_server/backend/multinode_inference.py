@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from . import ray_kill
+
 if TYPE_CHECKING:
     pass
 
@@ -494,7 +496,13 @@ class MultiNodeInferenceEngine:
             # Kill existing actor if any before creating new
             if existing_actor is not None:
                 try:
-                    ray.kill(existing_actor, no_restart=True)
+                    ray_kill.kill(
+                        existing_actor,
+                        reason="multinode_vllm_recreate",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
                     # Wait for Ray to clean up the actor name
                     import time
                     for _ in range(10):
@@ -651,7 +659,14 @@ class MultiNodeInferenceEngine:
                 )
             except ray.exceptions.GetTimeoutError:
                 logger.error(f"Engine initialization timed out after {init_timeout}s")
-                ray.kill(self.engine, no_restart=True)
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_init_timeout",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=init_timeout,
+                )
                 self.engine = None
                 raise RuntimeError(f"MultiNodeVLLMEngine init timed out")
 
@@ -846,7 +861,12 @@ class MultiNodeInferenceEngine:
         """Disconnect from the engine."""
         if self.engine is not None and kill_actor:
             try:
-                ray.kill(self.engine)
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_shutdown",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
                 logger.info("Killed MultiNodeVLLMEngine actor")
             except Exception as e:
                 logger.warning(f"Error killing actor: {e}")

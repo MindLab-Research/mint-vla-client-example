@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 import ray
 
+from . import ray_kill
+
 if TYPE_CHECKING:
     pass
 
@@ -268,7 +270,13 @@ class MultiLoRAInferenceEngine:
                             f"vLLM actor {self.actor_name} has broken engine, killing and recreating"
                         )
                         try:
-                            ray.kill(self.server, no_restart=True)
+                            ray_kill.kill(
+                                self.server,
+                                reason="vllm_engine_broken",
+                                actor_name=self.actor_name,
+                                namespace=PERSISTENT_NAMESPACE,
+                                no_restart=True,
+                            )
                         except Exception as kill_err:
                             logger.debug(f"Failed to kill broken actor: {kill_err}")
                         self.server = None
@@ -306,7 +314,13 @@ class MultiLoRAInferenceEngine:
                     # Must kill dead actor to free the name for reuse
                     # Ray keeps names registered even for dead actors
                     try:
-                        ray.kill(self.server, no_restart=True)
+                        ray_kill.kill(
+                            self.server,
+                            reason="vllm_actor_dead_free_name",
+                            actor_name=self.actor_name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
                         logger.debug(f"Killed dead actor to free name: {self.actor_name}")
                     except Exception as kill_err:
                         logger.debug(f"Could not kill dead actor: {kill_err}")
@@ -586,7 +600,13 @@ class MultiLoRAInferenceEngine:
                 logger.error(f"vLLM launch timed out after {init_timeout}s for {self.actor_name}")
                 # Kill the stuck actor
                 try:
-                    ray.kill(self.server, no_restart=True)
+                    ray_kill.kill(
+                        self.server,
+                        reason="vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
                 except Exception:
                     pass
                 self.server = None
@@ -975,7 +995,12 @@ class MultiLoRAInferenceEngine:
         """
         if self.server is not None and kill_actor:
             try:
-                ray.kill(self.server)
+                ray_kill.kill(
+                    self.server,
+                    reason="vllm_shutdown",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
                 logger.info("Killed persistent vLLM actor")
             except Exception as e:
                 logger.warning(f"Error killing server actor: {e}")
@@ -1242,7 +1267,12 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
         actor_name = _model_to_actor_name(model_name)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-            ray.kill(actor)
+            ray_kill.kill(
+                actor,
+                reason="vllm_kill_by_name",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+            )
             logger.info(f"Killed vLLM actor: {actor_name}")
             resource_pool.unregister(actor_name)
             return True
@@ -1256,7 +1286,12 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
-                    ray.kill(actor)
+                    ray_kill.kill(
+                        actor,
+                        reason="vllm_kill_by_name",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                    )
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     killed_any = True
