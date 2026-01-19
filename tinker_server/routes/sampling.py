@@ -92,6 +92,21 @@ async def _do_sample(
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
             is_multi_lora = session_manager.is_multi_lora_session(session_id)
+            if is_multi_lora:
+                base_model = session_manager.get_session_base_model(session_id)
+                if base_model:
+                    try:
+                        from ..backend.model_registry import get_model_config, normalize_model_name
+
+                        cfg = get_model_config(normalize_model_name(base_model))
+                        max_model_len = int(cfg.max_model_len)
+                    except Exception:
+                        max_model_len = None
+                    if max_model_len is not None and len(token_ids) > max_model_len:
+                        raise ValueError(
+                            f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                            f"for model {base_model}"
+                        )
 
             # Generate for each sample
             sequences = []
@@ -263,6 +278,21 @@ async def _do_compute_logprobs(
 
         # Check if session uses multi-LoRA mode (includes base model sessions)
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
+        if is_multi_lora:
+            base_model = session_manager.get_session_base_model(session_id)
+            if base_model:
+                try:
+                    from ..backend.model_registry import get_model_config, normalize_model_name
+
+                    cfg = get_model_config(normalize_model_name(base_model))
+                    max_model_len = int(cfg.max_model_len)
+                except Exception:
+                    max_model_len = None
+                if max_model_len is not None and len(token_ids) > max_model_len:
+                    raise ValueError(
+                        f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    )
 
         if is_multi_lora:
             # Multi-LoRA mode: handles both LoRA and base model sessions

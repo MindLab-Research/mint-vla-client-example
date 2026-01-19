@@ -1,5 +1,6 @@
 """FastAPI application for tinker-server."""
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -214,6 +215,137 @@ async def _cleanup_stale_actors() -> None:
         # Don't fail startup if cleanup fails
         logger.warning(f"Actor cleanup failed (continuing anyway): {e}")
 
+async def _prewarm_persistent_models(
+    train_engine: VerlTrainingEngine,
+    multi_model_manager: MultiModelInferenceManager | None,
+) -> None:
+    """Pre-create and protect persistent actors at server startup.
+
+    Controlled by:
+      - MINT_PERSISTENT_MODELS: comma-separated HF model names
+      - MINT_PERSISTENT_TRAIN_LORA_RANK (default: 16)
+      - MINT_PERSISTENT_TRAIN_LR (default: 5e-5)
+
+    When enabled, creates:
+      - Training actors (dense trainer pools and MegatronWorkerGroup)
+      - vLLM inference actors (MultiModelInferenceManager)
+
+    and marks them as ResourcePool protected to prevent LRU eviction.
+    """
+    models_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+    if not models_csv:
+        logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
+        return
+
+    models = [m.strip() for m in models_csv.split(",") if m.strip()]
+    if not models:
+        logger.info("No persistent models configured (MINT_PERSISTENT_MODELS parsed empty); skipping prewarm")
+        return
+
+    lora_rank = int(os.environ.get("MINT_PERSISTENT_TRAIN_LORA_RANK", "16"))
+    learning_rate = float(os.environ.get("MINT_PERSISTENT_TRAIN_LR", "5e-5"))
+    megatron_ready_timeout_s = float(os.environ.get("MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S", "3600"))
+
+    from tinker_server.backend.model_registry import (
+        get_model_config,
+        get_training_parallelism,
+        normalize_model_name,
+        requires_fp8,
+    )
+    from tinker_server.backend.resource_pool import get_resource_pool
+
+    resource_pool = get_resource_pool()
+    import ray
+
+    logger.info(
+        f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
+        f"megatron_ready_timeout_s={megatron_ready_timeout_s}"
+    )
+
+    for model in models:
+        try:
+            model_name = normalize_model_name(model)
+        except Exception:
+            model_name = model
+
+        cfg = get_model_config(model_name)
+
+        # -------------------------
+        # Training actor prewarm
+        # -------------------------
+        try:
+            base_model = model_name
+            if model_name and not model_name.startswith("/"):
+                base_model = train_engine._resolve_hf_model_path(model_name)
+                if not base_model:
+                    raise RuntimeError(f"HF cache path not found for {model_name}")
+
+            if cfg.is_moe:
+                from tinker_server.backend.megatron_distributed import (
+                    DistributedConfig,
+                    _make_megatron_actor_name,
+                    async_get_or_create_megatron_worker_group,
+                )
+
+                train_tp, train_ep, train_cp, train_etp = get_training_parallelism(model_name)
+                use_fp8 = requires_fp8(model_name)
+                distributed_config = DistributedConfig(
+                    tensor_parallel_size=train_tp,
+                    expert_parallel_size=train_ep,
+                    context_parallel_size=train_cp,
+                    expert_tensor_parallel_size=train_etp,
+                    use_fp8=use_fp8,
+                )
+
+                logger.info(
+                    f"[prewarm] training create start model={model_name} backend=megatron "
+                    f"TP={train_tp} EP={train_ep} CP={train_cp} ETP={train_etp} world_size={distributed_config.world_size}"
+                )
+                actor = await async_get_or_create_megatron_worker_group(
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    learning_rate=learning_rate,
+                    distributed_config=distributed_config,
+                    session_id=None,
+                )
+                actor_name = _make_megatron_actor_name(base_model or model_name)
+                logger.info(f"[prewarm] training __ray_ready__ start model={model_name} actor={actor_name}")
+                await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
+                resource_pool.mark_ready(actor_name)
+                resource_pool.set_protected(actor_name, True)
+                logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+            else:
+                from tinker_server.backend.verl_training import (
+                    PERSISTENT_DENSE_ACTOR_PREFIX,
+                    get_dense_trainer_pool,
+                )
+
+                pool = get_dense_trainer_pool()
+                logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
+                entry = await asyncio.to_thread(pool.get_or_create, base_model, lora_rank, learning_rate, None)
+                actor_name = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
+                resource_pool.set_protected(actor_name, True)
+                logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+        except Exception as e:
+            logger.exception(f"[prewarm] training failed model={model_name}: {e}")
+
+        # -------------------------
+        # Inference (vLLM) prewarm
+        # -------------------------
+        if multi_model_manager is None:
+            logger.warning(f"[prewarm] inference skipped (multi-LoRA disabled) model={model_name}")
+            continue
+        try:
+            logger.info(f"[prewarm] inference create start model={model_name}")
+            engine = await multi_model_manager.get_engine(model_name)
+            actor_name = getattr(engine, "actor_name", None)
+            if not actor_name:
+                raise RuntimeError("engine has no actor_name")
+            resource_pool.set_protected(actor_name, True)
+            logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
+        except Exception as e:
+            logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -294,6 +426,11 @@ async def lifespan(app: FastAPI):
     weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
 
     logger.info("Training components initialized")
+
+    # ==========================================================================
+    # Persistent actors: pre-create and protect at startup
+    # ==========================================================================
+    await _prewarm_persistent_models(train_engine, multi_model_manager)
 
     yield
 

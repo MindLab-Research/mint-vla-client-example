@@ -2084,10 +2084,20 @@ class VerlTrainingEngine:
         actor_name = self._resource_pool_actor_names.get(model_id)
         worker = self._workers.get(model_id)
 
+        actor_protected = False
         other_users: list[str] = []
         if actor_name:
             other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
         should_kill_actor = not other_users
+        if actor_name:
+            try:
+                from .resource_pool import get_resource_pool
+
+                actor_protected = get_resource_pool().is_protected(actor_name)
+                if actor_protected:
+                    should_kill_actor = False
+            except Exception:
+                pass
 
         self._resource_pool_actor_names.pop(model_id, None)
         self._workers.pop(model_id, None)
@@ -2097,6 +2107,14 @@ class VerlTrainingEngine:
         try:
             if session.backend == "peft":
                 get_dense_trainer_pool().clear_session(model_id)
+        except Exception:
+            pass
+        # Also clear ResourcePool session pinning so protected actors can become idle.
+        try:
+            if actor_name:
+                from .resource_pool import get_resource_pool
+
+                get_resource_pool().set_session(actor_name, None)
         except Exception:
             pass
 
@@ -2136,10 +2154,13 @@ class VerlTrainingEngine:
                 except Exception:
                     pass
         else:
-            logger.info(
-                f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
-                f"(still referenced by {len(other_users)} other model_id(s))"
-            )
+            if actor_protected:
+                logger.info(f"[{model_id}] shutdown_session: session deleted; keeping protected actor {actor_name}")
+            else:
+                logger.info(
+                    f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
+                    f"(still referenced by {len(other_users)} other model_id(s))"
+                )
 
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker shutdown")

@@ -47,6 +47,8 @@ class ActorEntry:
     # Protection flag: actor being created/initialized is not evictable
     # Set to False after initialization completes
     creating: bool = True
+    # If True, actor is never evicted by ResourcePool LRU.
+    protected: bool = False
 
     def touch(self):
         """Update last_accessed timestamp."""
@@ -140,6 +142,7 @@ class ResourcePool:
         base_model: str = "",
         session_id: str | None = None,
         node_id: str | None = None,
+        protected: bool = False,
     ) -> ActorEntry:
         """Register an actor with the pool.
 
@@ -167,6 +170,8 @@ class ResourcePool:
                     entry.actor_handle = actor_handle
                 if node_id:
                     entry.node_id = node_id
+                if protected:
+                    entry.protected = True
                 logger.info(f"[ResourcePool] Updated existing entry: {actor_name}")
             else:
                 entry = ActorEntry(
@@ -178,6 +183,7 @@ class ResourcePool:
                     base_model=base_model,
                     current_session=session_id,
                     node_id=node_id,
+                    protected=protected,
                 )
                 self._entries[actor_name] = entry
                 logger.info(
@@ -213,6 +219,21 @@ class ResourcePool:
             entry = self._entries.get(actor_name)
             if entry:
                 entry.current_session = session_id
+
+    def set_protected(self, actor_name: str, protected: bool = True) -> bool:
+        """Set (or clear) eviction protection for an actor."""
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            if entry is None:
+                return False
+            entry.protected = protected
+            return True
+
+    def is_protected(self, actor_name: str) -> bool:
+        """Return True if actor is marked protected in the pool."""
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            return bool(entry and entry.protected)
 
     def clear_session(self, session_id: str) -> int:
         """Clear session tracking entries matching session_id.
@@ -322,7 +343,11 @@ class ResourcePool:
         """
         evictable = [
             e for e in self._entries.values()
-            if e.is_idle(self.SESSION_IDLE_TIMEOUT) and e.idle_time() > self.MIN_ACTOR_AGE
+            if (
+                not e.protected
+                and e.is_idle(self.SESSION_IDLE_TIMEOUT)
+                and e.idle_time() > self.MIN_ACTOR_AGE
+            )
         ]
         return sorted(evictable, key=lambda e: e.last_accessed)
 
@@ -517,6 +542,7 @@ class ResourcePool:
                     "current_session": e.current_session,
                     "node_id": e.node_id,
                     "creating": e.creating,
+                    "protected": e.protected,
                     "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
                     "idle_time": e.idle_time(),
                     "age": e.age(),
