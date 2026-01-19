@@ -929,11 +929,6 @@ class TrainingWorker:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = learning_rate
 
-        # Log gradient state before applying update
-        grad_count = sum(1 for p in self.model.parameters() if p.requires_grad and p.grad is not None)
-        pre_clip_norm = sum((p.grad.norm().item() ** 2) for p in self.model.parameters() if p.requires_grad and p.grad is not None) ** 0.5
-        print(f"[DEBUG] optim_step: {grad_count} grads, pre_clip_norm={pre_clip_norm:.4f}", flush=True)
-
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         self.optimizer.zero_grad()

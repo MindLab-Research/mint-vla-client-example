@@ -893,17 +893,59 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Compute logprobs with session-specific LoRA
-            result = await self.server.compute_prompt_logprobs_with_lora.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-            )
+            try:
+                result = await self.server.compute_prompt_logprobs_with_lora.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    lora_int_id=lora_id,
+                )
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
+                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                    try:
+                        from tinker_server.backend.resource_pool import get_resource_pool
+
+                        ray_kill.kill(
+                            self.server,
+                            reason="vllm_compute_logprobs_failed",
+                            actor_name=self.actor_name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
+                        get_resource_pool().unregister(self.actor_name)
+                    except Exception:
+                        pass
+                    self.server = None
+                    self._initialized = False
+                raise
         else:
             # Compute logprobs with base model (no LoRA)
-            result = await self.server.compute_prompt_logprobs_base.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-            )
+            try:
+                result = await self.server.compute_prompt_logprobs_base.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                )
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
+                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                    try:
+                        from tinker_server.backend.resource_pool import get_resource_pool
+
+                        ray_kill.kill(
+                            self.server,
+                            reason="vllm_compute_logprobs_failed",
+                            actor_name=self.actor_name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
+                        get_resource_pool().unregister(self.actor_name)
+                    except Exception:
+                        pass
+                    self.server = None
+                    self._initialized = False
+                raise
 
         return list(result)
 
@@ -1289,8 +1331,8 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     ray_kill.kill(
                         actor,
                         reason="vllm_kill_by_name",
-                        actor_name=actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
+                        actor_name=entry.actor_name,
+                        namespace=entry.namespace,
                     )
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)

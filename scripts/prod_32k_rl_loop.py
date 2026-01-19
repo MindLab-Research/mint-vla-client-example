@@ -84,8 +84,10 @@ def main() -> int:
 
     for step in range(steps):
         ckpt_name = f"rl_step_{step:04d}"
-        print(f"[{_ts()}] step {step+1}/{steps}: save_weights_and_get_sampling_client name={ckpt_name}", flush=True)
+        print(f"[{_ts()}] step {step+1}/{steps}: save_weights_and_get_sampling_client start name={ckpt_name}", flush=True)
+        t0 = time.time()
         sampling_client = training_client.save_weights_and_get_sampling_client(name=ckpt_name)
+        print(f"[{_ts()}] step {step+1}/{steps}: save_weights_and_get_sampling_client done elapsed_s={time.time()-t0:.1f}", flush=True)
 
         datums: list[types.Datum] = []
         step_rewards: list[float] = []
@@ -148,17 +150,20 @@ def main() -> int:
 
             for reward, (full_tokens, prompt_len, completion_tokens) in zip(rewards, token_payloads):
                 adv_scalar = float(reward - mean_reward)
-                # Compute sampling logprobs for the full padded sequence.
-                lp_future = sampling_client.compute_logprobs(types.ModelInput.from_ints(tokens=full_tokens))
-                prompt_logprobs = _wait_future(
-                    lp_future,
-                    label=f"compute_logprobs prompt {p+1}/{prompts_per_step} step {step+1}/{steps}",
+                # Use training model forward() to compute per-token logprobs for PPO.
+                # vLLM prompt_logprobs at 32k can OOM; forward() stays within the training worker.
+                lp_datum = types.Datum(
+                    model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
+                    loss_fn_inputs={"target_tokens": full_tokens[1:]},
+                )
+                fwd_future = training_client.forward([lp_datum], loss_fn="cross_entropy")
+                fwd_res = _wait_future(
+                    fwd_future,
+                    label=f"forward(logprobs) prompt {p+1}/{prompts_per_step} step {step+1}/{steps}",
                     heartbeat_s=heartbeat_s,
                 )
-                # prompt_logprobs aligns with full_tokens length; drop the first token to align with target_tokens.
-                sampling_logprobs = [
-                    float(x) if x is not None else 0.0 for x in list(prompt_logprobs)[1:]
-                ]
+                logprobs_td = fwd_res.loss_fn_outputs[0]["logprobs"]
+                sampling_logprobs = [float(x) for x in list(getattr(logprobs_td, "data", logprobs_td))]
 
                 # Build advantage vector aligned with target_tokens (len = max_seq_len-1).
                 n = max_seq_len - 1

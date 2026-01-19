@@ -416,16 +416,18 @@ async def _do_forward_backward(
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
-        logger.info(
+        msg = (
             f"[{session.model_id}] forward_backward start request_id={request_id} "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
             f"loss_fn={request.forward_backward_input.loss_fn}"
         )
+        print(msg, flush=True)
+        logger.info(msg)
         result = await training_engine.forward_backward(session, request)
         elapsed_s = time.time() - t0
-        logger.info(
-            f"[{session.model_id}] forward_backward done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        )
+        msg = f"[{session.model_id}] forward_backward done request_id={request_id} elapsed_s={elapsed_s:.3f}"
+        print(msg, flush=True)
+        logger.info(msg)
         future_store.resolve(request_id, result)
 
         # Log usage
@@ -494,15 +496,17 @@ async def _do_train_step(
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
-        logger.info(
+        msg = (
             f"[{session.model_id}] train_step start request_id={request_id} "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
         )
+        print(msg, flush=True)
+        logger.info(msg)
         result = await training_engine.train_step(session, request)
         elapsed_s = time.time() - t0
-        logger.info(
-            f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        )
+        msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
+        print(msg, flush=True)
+        logger.info(msg)
         future_store.resolve(request_id, result)
 
         # Log usage
@@ -611,10 +615,14 @@ async def _do_optim_step(request_id: str, session, request: OptimStepRequest) ->
 
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
-        logger.info(f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}")
+        msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
+        print(msg, flush=True)
+        logger.info(msg)
         result = await training_engine.optim_step(session, request)
         elapsed_s = time.time() - t0
-        logger.info(f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}")
+        msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
+        print(msg, flush=True)
+        logger.info(msg)
         future_store.resolve(request_id, result)
 
     except Exception as e:

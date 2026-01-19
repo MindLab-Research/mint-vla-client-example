@@ -677,6 +677,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             # So logprobs[0] = prompt_logprobs[1], etc.
             for i in range(1, len(prompt_logprobs)):
                 if prompt_logprobs[i] is None:
+                    # Keep output length consistent: len(prompt_ids) - 1.
+                    logprobs.append(-100.0)
                     continue
                 # Get logprob for the actual token at position i
                 token_id = prompt_ids[i]
@@ -843,6 +845,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             logprobs = []
             for i in range(1, len(prompt_logprobs)):
                 if prompt_logprobs[i] is None:
+                    # Keep output length consistent: len(prompt_ids) - 1.
+                    logprobs.append(-100.0)
                     continue
                 token_id = prompt_ids[i]
                 if token_id in prompt_logprobs[i]:
