@@ -430,7 +430,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Persistent actors: pre-create and protect at startup
     # ==========================================================================
-    await _prewarm_persistent_models(train_engine, multi_model_manager)
+    asyncio.create_task(_prewarm_persistent_models(train_engine, multi_model_manager))
 
     yield
 
