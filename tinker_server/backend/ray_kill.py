@@ -9,6 +9,27 @@ import ray
 
 logger = logging.getLogger(__name__)
 
+def _remove_placement_group_for_actor_name(actor_name: str | None) -> None:
+    if not actor_name:
+        return
+
+    pg_name = f"{actor_name}_pg"
+    try:
+        from ray.util import get_placement_group, remove_placement_group
+    except Exception:
+        return
+
+    try:
+        pg = get_placement_group(pg_name)
+    except Exception:
+        return
+
+    try:
+        remove_placement_group(pg)
+        logger.warning(f"[ray.kill] removed placement_group={pg_name}")
+    except Exception as e:
+        logger.warning(f"[ray.kill] failed remove placement_group={pg_name}: {type(e).__name__}: {e}")
+
 
 def kill(
     actor: Any,
@@ -38,3 +59,4 @@ def kill(
     else:
         ray.kill(actor, no_restart=no_restart)
 
+    _remove_placement_group_for_actor_name(actor_name)
