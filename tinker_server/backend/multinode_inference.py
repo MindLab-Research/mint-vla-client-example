@@ -640,7 +640,13 @@ class MultiNodeInferenceEngine:
             scheduling_opts = {
                 "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
-                    placement_group_bundle_index=0,
+                    # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
+                    # If the controller occupies bundle 0, RayWorkerWrapper(rank=0) will stay
+                    # PENDING_CREATION forever, and engine init never completes.
+                    #
+                    # Reserve the *last* bundle for the controller; leave [0..worker_gpus-1]
+                    # available for vLLM workers.
+                    placement_group_bundle_index=total_required_gpus - 1,
                     placement_group_capture_child_tasks=True,
                 )
             }
