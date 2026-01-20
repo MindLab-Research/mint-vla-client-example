@@ -1285,7 +1285,9 @@ class VerlInferenceEngine:
         max_num_seqs = cfg.max_num_seqs or 256
         gpu_util = cfg.gpu_memory_utilization or self.gpu_memory_utilization
         # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
-        max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
+        max_num_batched_tokens = cfg.max_num_batched_tokens
+        if max_num_batched_tokens is None:
+            max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
         # verl calculates max_model_len = prompt_length + response_length
         # We split evenly, but this does NOT restrict actual prompt/response sizes:
         # - The split only affects verl's default max_new_tokens (response_length)

@@ -113,6 +113,7 @@ def _create_multinode_vllm_actor(
     max_loras: int = 1,
     max_lora_rank: int = 8,
     max_num_seqs: int = 256,
+    max_num_batched_tokens: int | None = None,
 ):
     """Create a Ray actor class that wraps vLLM's AsyncLLMEngine for multi-node TP.
 
@@ -141,6 +142,7 @@ def _create_multinode_vllm_actor(
             quantization: str | None = None,
             enable_lora: bool = True,
             kv_cache_dtype: str | None = None,
+            max_num_batched_tokens: int | None = None,
         ):
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
@@ -155,6 +157,7 @@ def _create_multinode_vllm_actor(
             self.max_lora_rank = max_lora_rank
             self.max_num_seqs = max_num_seqs
             self.kv_cache_dtype = kv_cache_dtype
+            self.max_num_batched_tokens = max_num_batched_tokens
 
             self.engine = None
             self._initialized = False
@@ -174,7 +177,9 @@ def _create_multinode_vllm_actor(
 
             # Build engine args for multi-node TP
             # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
-            max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
+            max_num_batched_tokens = self.max_num_batched_tokens
+            if max_num_batched_tokens is None:
+                max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -440,6 +445,7 @@ class MultiNodeInferenceEngine:
         max_loras: int = 1,
         max_lora_rank: int = 8,
         max_num_seqs: int = 256,
+        max_num_batched_tokens: int | None = None,
         quantization: str | None = None,
         kv_cache_dtype: str | None = None,
         actor_name: str | None = None,
@@ -455,6 +461,7 @@ class MultiNodeInferenceEngine:
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.quantization = quantization
         self.kv_cache_dtype = kv_cache_dtype
         self.actor_name = actor_name or f"multinode_vllm_{model_path.split('/')[-1].lower()}"
@@ -610,6 +617,7 @@ class MultiNodeInferenceEngine:
                 max_loras=self.max_loras,
                 max_lora_rank=self.max_lora_rank,
                 max_num_seqs=self.max_num_seqs,
+                max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
             # target_node is guaranteed set (RuntimeError raised above if no candidates)
@@ -648,6 +656,7 @@ class MultiNodeInferenceEngine:
                 quantization=self.quantization,
                 enable_lora=self.max_loras > 0,
                 kv_cache_dtype=self.kv_cache_dtype or "auto",
+                max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
             # Initialize engine (this spawns vLLM's Ray workers)

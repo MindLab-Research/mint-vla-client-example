@@ -1709,7 +1709,8 @@ class VerlTrainingEngine:
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
-        ready_timeout_s = float(os.environ.get("MINT_ACTOR_READY_TIMEOUT_S", "900"))
+        default_ready_timeout_s = "3600" if session.backend == "megatron" else "900"
+        ready_timeout_s = float(os.environ.get("MINT_ACTOR_READY_TIMEOUT_S", default_ready_timeout_s))
         print(
             f"[DEBUG {model_id}] __ray_ready__ start: timeout_s={ready_timeout_s}",
             flush=True,

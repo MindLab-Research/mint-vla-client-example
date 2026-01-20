@@ -408,7 +408,10 @@ class MultiLoRAInferenceEngine:
             # Use model registry's max_model_len (single source of truth)
             max_model_len = model_cfg.max_model_len
             # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
-            max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
+            # max_num_batched_tokens limits chunk size during prefill/logprobs to cap peak allocations.
+            max_num_batched_tokens = model_cfg.max_num_batched_tokens
+            if max_num_batched_tokens is None:
+                max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
             # verl calculates max_model_len = prompt_length + response_length
             # We split evenly, but this does NOT restrict actual prompt/response sizes:
             # - The split only affects verl's default max_new_tokens (response_length)
@@ -1242,6 +1245,7 @@ class MultiModelInferenceManager:
                     max_loras=model_max_loras,
                     max_lora_rank=model_max_lora_rank,
                     max_num_seqs=model_max_num_seqs,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
                     quantization=quantization,
                     kv_cache_dtype=model_kv_cache_dtype,
                     actor_name=actor_name,
