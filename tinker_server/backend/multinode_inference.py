@@ -525,15 +525,20 @@ class MultiNodeInferenceEngine:
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
             from tinker_server.backend.resource_pool import get_resource_pool
             resource_pool = get_resource_pool()
-            total_required_gpus = (
+            # vLLM v1 requires the controller actor to have a CUDA-visible GPU.
+            # Without this, vLLM falls back to "no active driver" and engine core init fails.
+            controller_gpus = 1
+            worker_gpus = (
                 self.tensor_parallel_size
                 * self.pipeline_parallel_size
                 * self.data_parallel_size
             )
+            total_required_gpus = worker_gpus + controller_gpus
             logger.info(
-                f"Ensuring {total_required_gpus} GPUs available for vLLM "
+                f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
-                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel})"
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
+                f"controller_gpus={controller_gpus}, worker_gpus={worker_gpus})"
             )
             await asyncio.to_thread(resource_pool.ensure_gpus_available, total_required_gpus, 300)
 
@@ -615,11 +620,12 @@ class MultiNodeInferenceEngine:
                 )
             }
 
-            # Actor has num_gpus=0 because vLLM's Ray backend manages GPU workers
+            # Controller actor must reserve a GPU for vLLM v1 engine core (CUDA visibility).
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                num_gpus=controller_gpus,
                 **scheduling_opts,
                 runtime_env={
                     "env_vars": {
