@@ -173,6 +173,8 @@ def _create_multinode_vllm_actor(
             from vllm import AsyncEngineArgs, AsyncLLMEngine
 
             # Build engine args for multi-node TP
+            # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
+            max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -181,13 +183,14 @@ def _create_multinode_vllm_actor(
                 data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
                 enable_expert_parallel=self.enable_expert_parallel,
                 distributed_executor_backend="ray",  # Key: use Ray for multi-node
+                disable_custom_all_reduce=True,  # Avoid PyNcclCommunicator issues in multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 dtype="auto",
                 trust_remote_code=True,
                 max_model_len=self.max_model_len,
                 max_num_seqs=self.max_num_seqs,
                 enable_chunked_prefill=True,
-                max_num_batched_tokens=8192,
+                max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=True,
                 disable_log_stats=True,
                 enforce_eager=True,  # CUDA graphs OOM on K2 at 0.98 util
@@ -339,18 +342,21 @@ def _create_multinode_vllm_actor(
             request_id: str,
             lora_int_id: int | None,
             lora_path: str | None,
-        ) -> list[float]:
+        ) -> list[float | None]:
             """Compute logprobs for prompt tokens.
 
-            Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-            Output length is len(prompt_ids) - 1.
+            Returns a list of length len(prompt_ids), where:
+            - logprobs[0] is None (first token has no conditioning context)
+            - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -385,19 +391,18 @@ def _create_multinode_vllm_actor(
             # Extract prompt logprobs
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            logprobs = []
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
+            out: list[float | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
                     continue
                 token_id = prompt_ids[i]
-                if token_id in prompt_logprobs[i]:
-                    logprobs.append(prompt_logprobs[i][token_id].logprob)
-                else:
-                    logprobs.append(-100.0)
+                token_lp = prompt_logprobs[i].get(token_id)
+                out.append(token_lp.logprob if token_lp is not None else None)
 
-            return logprobs
+            return out
 
     return MultiNodeVLLMEngine
 
@@ -823,7 +828,7 @@ class MultiNodeInferenceEngine:
         sampling_session_id: str | None,
         prompt_ids: list[int],
         request_id: str,
-    ) -> list[float]:
+    ) -> list[float | None]:
         """Compute logprobs using session-specific LoRA or base model."""
         if not self._initialized:
             raise RuntimeError("Engine not initialized")

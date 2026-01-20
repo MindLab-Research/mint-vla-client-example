@@ -407,6 +407,8 @@ class MultiLoRAInferenceEngine:
             model_cfg = get_model_config(self.model_path)
             # Use model registry's max_model_len (single source of truth)
             max_model_len = model_cfg.max_model_len
+            # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
+            max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
             # verl calculates max_model_len = prompt_length + response_length
             # We split evenly, but this does NOT restrict actual prompt/response sizes:
             # - The split only affects verl's default max_new_tokens (response_length)
@@ -431,7 +433,7 @@ class MultiLoRAInferenceEngine:
                 load_format="auto",
                 enforce_eager=False,
                 enable_chunked_prefill=True,
-                max_num_batched_tokens=8192,
+                max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=True,
                 disable_log_stats=True,
                 temperature=1.0,
@@ -863,13 +865,14 @@ class MultiLoRAInferenceEngine:
         sampling_session_id: str | None,
         prompt_ids: list[int],
         request_id: str,
-    ) -> list[float]:
+    ) -> list[float | None]:
         """Compute logprobs using session-specific LoRA or base model.
 
         If sampling_session_id is None or has no registered LoRA, uses base model.
 
-        Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-        Output length is len(prompt_ids) - 1.
+        Returns a list of length len(prompt_ids), where:
+        - logprobs[0] is None (first token has no conditioning context)
+        - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
 
         Args:
             sampling_session_id: The sampling session to use, or None for base model.
@@ -877,7 +880,7 @@ class MultiLoRAInferenceEngine:
             request_id: Unique request identifier.
 
         Returns:
-            List of logprobs, length = len(prompt_ids) - 1.
+            List of logprobs, length = len(prompt_ids).
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
@@ -957,13 +960,14 @@ class MultiLoRAInferenceEngine:
         prompt_ids: list[int],
         request_id: str,
         k: int = 10,
-    ) -> list[dict[int, float]]:
+    ) -> list[dict[int, float] | None]:
         """Compute top-K tokens using session-specific LoRA or base model.
 
         If sampling_session_id is None or has no registered LoRA, uses base model.
 
-        Returns topk[i] = dict of {token_id: logprob} for position i.
-        Output length is len(prompt_ids) - 1.
+        Returns a list of length len(prompt_ids), where:
+        - topk[0] is None (first token has no conditioning context)
+        - topk[i] is a dict of token_id -> logprob for token i's distribution (i >= 1)
 
         Args:
             sampling_session_id: The sampling session to use, or None for base model.
@@ -972,7 +976,7 @@ class MultiLoRAInferenceEngine:
             k: Number of top tokens to return.
 
         Returns:
-            List of dicts mapping token_id to logprob.
+            List of dicts mapping token_id to logprob, length = len(prompt_ids).
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")

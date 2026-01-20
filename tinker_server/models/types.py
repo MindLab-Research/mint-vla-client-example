@@ -82,16 +82,19 @@ class SampleResponse(BaseModel):
     """Response containing generated samples."""
 
     sequences: list[SampledSequence]
-    prompt_logprobs: list[float] | None = None
-    topk_prompt_logprobs: list[dict[int, float]] | None = None
+    # Tinker SDK: first entry is None (first token has no conditioning context).
+    prompt_logprobs: list[float | None] | None = None
+    # Tinker SDK: first entry is None (no prior context for token 0).
+    topk_prompt_logprobs: list[dict[int, float] | None] | None = None
     type: Literal["sample"] = "sample"
 
 
 class ComputeLogprobsRequest(BaseModel):
     """Request to compute logprobs for a sequence.
 
-    Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-    Output length is len(sequence) - 1.
+    Returns a list of length len(sequence), where:
+    - logprobs[0] is None (first token has no conditioning context)
+    - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
     """
 
     sampling_session_id: str
@@ -102,7 +105,7 @@ class ComputeLogprobsRequest(BaseModel):
 class ComputeLogprobsResponse(BaseModel):
     """Response containing computed logprobs."""
 
-    logprobs: list[float]
+    logprobs: list[float | None]
     type: Literal["compute_logprobs"] = "compute_logprobs"
 
 
