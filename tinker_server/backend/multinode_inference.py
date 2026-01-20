@@ -553,9 +553,12 @@ class MultiNodeInferenceEngine:
             # Count GPUs used by actors tracked in ResourcePool
             gpus_used_by_actors = resource_pool.gpus_used_by_node()
 
-            # Find nodes with enough available GPUs
-            # For multi-node vLLM (TP=16), we need nodes with 8 free GPUs each
-            gpus_per_node = 8  # Standard GPU node size
+            # Find a node to host the controller actor (num_gpus=0).
+            #
+            # vLLM's Ray backend will schedule the actual GPU workers across the cluster.
+            # Requiring a full 8-GPU-empty node here is unnecessary and can block
+            # multi-node engines when the cluster is fragmented (e.g., many 1-GPU actors).
+            gpus_per_node = 1
             candidates: list[tuple[str, str, int]] = []  # (node_id, ip, available_gpus)
 
             for node in ray.nodes():
