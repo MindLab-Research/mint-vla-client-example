@@ -1130,7 +1130,18 @@ class MultiModelInferenceManager:
 
         # Dict of model_name -> engine
         self._engines: dict[str, MultiLoRAInferenceEngine] = {}
-        self._init_lock = asyncio.Lock()
+        # Per-model init locks: avoid blocking other models while one
+        # model's vLLM actor is (re)initializing.
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    async def _get_model_lock(self, model_name: str) -> asyncio.Lock:
+        async with self._locks_guard:
+            lock = self._locks.get(model_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[model_name] = lock
+            return lock
 
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
@@ -1147,7 +1158,8 @@ class MultiModelInferenceManager:
         Returns:
             Initialized inference engine for the model.
         """
-        async with self._init_lock:
+        lock = await self._get_model_lock(model_name)
+        async with lock:
             if model_name in self._engines:
                 engine = self._engines[model_name]
                 # Check if actor is still alive before returning cached engine

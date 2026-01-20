@@ -109,6 +109,7 @@ MODEL_CONFIGS = {
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
         max_num_seqs=32,  # Leave headroom for long-context prompt_logprobs
+        max_num_batched_tokens=2048,  # Cap prompt_logprobs peak allocations at long context
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     "Qwen/Qwen3-8B": ModelConfig(

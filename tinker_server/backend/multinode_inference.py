@@ -171,6 +171,9 @@ def _create_multinode_vllm_actor(
             # v1's multiprocess architecture requires coordinator to have GPU
             import os
             os.environ["VLLM_USE_V1"] = "0"
+            # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
+            # disable to fall back to torch.distributed collectives.
+            os.environ["VLLM_DISABLE_PYNCCL"] = "1"
 
             # Import vLLM components AFTER setting env var
             from vllm import AsyncEngineArgs, AsyncLLMEngine
@@ -643,6 +646,7 @@ class MultiNodeInferenceEngine:
                         # Force vLLM v0 engine - v1's multiprocess architecture
                         # conflicts with Ray distributed executor backend
                         "VLLM_USE_V1": "0",
+                        "VLLM_DISABLE_PYNCCL": "1",
                     }
                 },
             ).remote(
