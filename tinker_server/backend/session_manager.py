@@ -57,7 +57,7 @@ class SessionManager:
         self,
         tensor_parallel_size: int = 1,
         data_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.9,
+        gpu_memory_utilization: float = 0.85,
         max_model_len: int | None = None,
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
         shared_engine_lora_rank: int = 32,

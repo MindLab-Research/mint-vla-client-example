@@ -89,11 +89,13 @@ MODEL_CONFIGS = {
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
+        max_num_seqs=32,  # Leave vLLM headroom for 32K prompt_logprobs
         gradient_checkpointing=True,  # Required for sequences >5000 tokens
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
+        max_num_seqs=64,  # Leave headroom for long-context prompt_logprobs
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
@@ -104,6 +106,7 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
+        max_num_seqs=32,  # Leave headroom for long-context prompt_logprobs
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     "Qwen/Qwen3-8B": ModelConfig(
@@ -117,6 +120,7 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,  # 40K context - full model capability
+        max_num_seqs=16,  # Constrain KV cache; avoids OOM during prompt_logprobs at long context
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
@@ -147,6 +151,7 @@ MODEL_CONFIGS = {
         train_ep=8,
         max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
         max_model_len=32768,  # 32K context
+        max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(

@@ -215,6 +215,7 @@ class MultiLoRAInferenceEngine:
         data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.85,
         max_model_len: int | None = None,
+        max_num_seqs: int = 256,
         max_loras: int = DEFAULT_MAX_LORAS,
         max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
         max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
@@ -227,6 +228,7 @@ class MultiLoRAInferenceEngine:
         self.quantization = quantization
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.max_num_seqs = max_num_seqs
         self.max_loras = max_loras
         self.max_cpu_loras = max_cpu_loras
         self.max_lora_rank = max_lora_rank
@@ -424,7 +426,7 @@ class MultiLoRAInferenceEngine:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 prompt_length=prompt_length,
                 response_length=response_length,
-                max_num_seqs=256,
+                max_num_seqs=self.max_num_seqs,
                 dtype="auto",
                 load_format="auto",
                 enforce_eager=False,
@@ -1254,6 +1256,7 @@ class MultiModelInferenceManager:
                     data_parallel_size=config.inference_dp,
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
+                    max_num_seqs=model_max_num_seqs,
                     max_loras=model_max_loras,
                     max_cpu_loras=model_max_cpu_loras,
                     max_lora_rank=model_max_lora_rank,

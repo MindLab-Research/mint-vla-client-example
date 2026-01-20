@@ -166,6 +166,13 @@ export TINKER_API_KEY=$TINKER_API_KEY          # from .secrets.env
 export TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY  # from .secrets.env
 export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
+
+# Persistent actors (server startup prewarm; eviction-protected)
+# Configure these in `.secrets.env` and restart the server to apply.
+export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
+export MINT_PERSISTENT_TRAIN_LORA_RANK=16
+export MINT_PERSISTENT_TRAIN_LR=5e-5
+export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 ```
 
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.

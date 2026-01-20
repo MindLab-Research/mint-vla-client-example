@@ -262,13 +262,28 @@ async def _prewarm_persistent_models(
         f"megatron_ready_timeout_s={megatron_ready_timeout_s}"
     )
 
+    # Order by descending GPU footprint to avoid fragmenting the cluster before
+    # large multi-node actors (e.g., 235B vLLM TP=16) are created.
+    ordered: list[tuple[int, str, str]] = []
     for model in models:
         try:
             model_name = normalize_model_name(model)
         except Exception:
             model_name = model
+        try:
+            cfg = get_model_config(model_name)
+            gpus = max(cfg.train_gpus, cfg.total_gpus)
+        except Exception:
+            gpus = 0
+        ordered.append((gpus, model_name, model))
+    ordered.sort(key=lambda x: (-x[0], x[1]))
 
-        cfg = get_model_config(model_name)
+    for _, model_name, _raw_model in ordered:
+        try:
+            cfg = get_model_config(model_name)
+        except Exception as e:
+            logger.exception(f"[prewarm] unknown model in MINT_PERSISTENT_MODELS: {model_name}: {e}")
+            continue
 
         # -------------------------
         # Training actor prewarm

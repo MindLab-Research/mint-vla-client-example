@@ -61,7 +61,7 @@ class ServerConfig:
     # Model settings (no default model - clients specify per-request)
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1  # For MoE: EP = TP * DP
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.85
     max_model_len: int | None = None
 
     # Multi-LoRA settings
@@ -85,7 +85,7 @@ class ServerConfig:
             usage_log_dir=os.environ.get("TINKER_USAGE_LOG_DIR", "/tmp/tinker_usage"),
             tensor_parallel_size=int(os.environ.get("TINKER_TP_SIZE", "1")),
             data_parallel_size=int(os.environ.get("TINKER_DP_SIZE", "1")),
-            gpu_memory_utilization=float(os.environ.get("TINKER_GPU_MEM_UTIL", "0.9")),
+            gpu_memory_utilization=float(os.environ.get("TINKER_GPU_MEM_UTIL", "0.85")),
             max_model_len=int(os.environ["TINKER_MAX_MODEL_LEN"])
             if os.environ.get("TINKER_MAX_MODEL_LEN")
             else None,
