@@ -2004,6 +2004,21 @@ class MegatronRankWorker:
             ep_size = 1
             ep_rank = 0
 
+        # For MoE models, exporting routed expert LoRAs requires EP gathering and
+        # per-expert expansion for vLLM. If we're not exporting per-expert weights,
+        # skip the MLP subtree early to avoid expensive TP/EP collectives.
+        try:
+            model_is_moe = get_model_config(self.base_model).is_moe
+        except Exception:
+            model_is_moe = False
+
+        skip_mlp_params = model_is_moe and not use_per_expert_lora
+
+        import os
+
+        debug_lora_export = os.environ.get("MINT_DEBUG_LORA_EXPORT", "0") == "1"
+        debug_lora_export_max_params = int(os.environ.get("MINT_DEBUG_LORA_EXPORT_MAX_PARAMS", "10"))
+
         def _gather_expert_lora_across_ep(tensor, ep_group, ep_size: int):
             """Gather expert LoRA tensor from all EP ranks.
 
@@ -2061,49 +2076,54 @@ class MegatronRankWorker:
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
                         original_shape = list(param.data.shape)
+                        do_debug_param = debug_lora_export and (len(lora_param_names) <= debug_lora_export_max_params)
+
+                        # MoE MLP/expert LoRAs are only needed when exporting per-expert weights.
+                        # If we aren't exporting per-expert LoRAs, skip the MLP subtree early to
+                        # avoid expensive TP/EP collectives and CPU copies.
+                        if skip_mlp_params and ".mlp." in name_lower:
+                            continue
+
                         # DEBUG: Log original tensor shape with more detail
-                        if self.rank == 0:
+                        if self.rank == 0 and do_debug_param:
                             is_lora_a = '.adapter.linear_in.' in name or '.lora_a.' in name_lower
                             lora_type = "lora_A" if is_lora_a else "lora_B"
                             logger.info(f"[Rank 0] Megatron {lora_type} {name}: shape={original_shape}")
                         # CRITICAL: ALL ranks must participate in gathering to avoid NCCL deadlock!
                         # Check if this parameter needs TP gathering
                         split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
-                        if self.rank == 0:
+                        if self.rank == 0 and do_debug_param:
                             # Detailed logging for shape debugging
                             is_expert = '.mlp.experts.' in name or '.mlp.shared_experts.' in name or '.mlp.linear_fc' in name
                             logger.info(f"[Rank 0] {name}: split_dim={split_dim}, is_expert={is_expert}, etp_size={etp_size}, tp_size={tp_size}")
                         if split_dim is not None and tp_group is not None and tp_size > 1:
-                            # Gather across TP ranks, then clone to CPU
+                            # Gather across TP ranks (NCCL collective).
                             gathered = _gather_tensor_across_tp(param.data, tp_group, split_dim)
-                            cloned = gathered.cpu()
-                            if self.rank == 0:
-                                # Log shape change due to gathering
-                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(cloned.shape)} (dim={split_dim})")
+                            tensor_for_export = gathered
+                            if self.rank == 0 and do_debug_param:
+                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(gathered.shape)} (dim={split_dim})")
                         else:
-                            # No TP gathering needed - just clone
-                            cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
-                            if self.rank == 0:
-                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(cloned.shape)}")
+                            tensor_for_export = param.data
+                            if self.rank == 0 and do_debug_param:
+                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(tensor_for_export.shape)}")
 
-                        # CRITICAL FIX: EP gathering for routed expert LoRAs
-                        # With EP=8, each rank holds different experts (64/8 = 8 per rank)
-                        # We must gather from ALL EP ranks to export complete expert weights
+                        # EP gather is only required when exporting per-expert expert LoRAs.
                         is_routed_expert = '.mlp.experts.' in name and '.mlp.shared_experts.' not in name
-                        if is_routed_expert and ep_group is not None and ep_size > 1:
-                            # ALL ranks participate in EP allgather
-                            ep_gathered = _gather_expert_lora_across_ep(cloned, ep_group, ep_size)
+                        if use_per_expert_lora and is_routed_expert and ep_group is not None and ep_size > 1:
+                            # ALL ranks participate in EP all_gather (NCCL collective).
+                            ep_gathered = _gather_expert_lora_across_ep(tensor_for_export, ep_group, ep_size)
                             if self.rank == 0:
-                                logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
+                                if do_debug_param:
+                                    logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
                                 # Store with EP rank index for later expansion
                                 # Key format: original_name::EP_RANK::{i}
                                 for i, tensor in enumerate(ep_gathered):
                                     ep_key = f"{name}::EP_RANK::{i}"
-                                    adapter_state[ep_key] = tensor.cpu() if tensor.is_cuda else tensor
+                                    adapter_state[ep_key] = tensor.detach().cpu()
                         else:
                             # Non-expert param or EP=1: store normally (only rank 0)
                             if self.rank == 0:
-                                adapter_state[name] = cloned
+                                adapter_state[name] = tensor_for_export.detach().cpu()
 
                 logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
 
@@ -2230,12 +2250,6 @@ class MegatronRankWorker:
                            'gate_proj', 'up_proj', 'down_proj', 'shared_expert']
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
-
-        # Check if model is MoE
-        try:
-            model_is_moe = get_model_config(self.base_model).is_moe
-        except ValueError:
-            model_is_moe = False
 
         # Get number of experts for per-expert expansion (only when use_per_expert_lora=True)
         num_experts = 0
