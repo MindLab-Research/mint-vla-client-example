@@ -69,7 +69,7 @@ from mint.exceptions import (
 try:
     service_client = mint.ServiceClient()
     training_client = service_client.create_lora_training_client(
-        base_model="Qwen/Qwen3-8B"
+        base_model="Qwen/Qwen3-4B-Instruct-2507"
     )
 except AuthenticationError:
     print("Invalid API key")
@@ -150,7 +150,7 @@ from mint.exceptions import (
 try:
     service_client = mint.ServiceClient()
     training_client = service_client.create_lora_training_client(
-        base_model="Qwen/Qwen3-8B"
+        base_model="Qwen/Qwen3-4B-Instruct-2507"
     )
 except AuthenticationError:
     print("无效的 API key")

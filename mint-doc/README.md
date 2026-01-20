@@ -59,8 +59,7 @@ npm start
 
 ## Features
 
-- **Training API:** Fine-tune open-weight models (Qwen, Llama, DeepSeek)
-- **Vision-Language Support:** Train multimodal models
+- **Training API:** Fine-tune Qwen3 models (0.6B, 4B-Instruct-2507, 30B-A3B-Instruct-2507, 235B-A22B-Instruct-2507)
 - **LoRA Fine-tuning:** Efficient adaptation with low-rank methods
 - **Multiple Training Paradigms:** Supervised learning, reinforcement learning, preference learning
 - **Flexible Loss Functions:** Built-in and custom loss functions

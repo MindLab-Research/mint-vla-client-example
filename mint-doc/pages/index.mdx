@@ -20,7 +20,7 @@ MinT abstracts away infrastructure complexity—GPU clusters, model states, dist
 
 ### Key Features
 
-- **Model Support**: Kimi, K2, DeepSeek, Qwen, π0, and others—ensuring a rapid closed loop from inference to training
+- **Model Support**: Qwen3-0.6B, Qwen3-4B-Instruct-2507, Qwen3-30B-A3B-Instruct-2507, Qwen3-235B-A22B-Instruct-2507—kept in sync with server availability
 - **Algorithm Support**: Robust training pipeline centered on RLHF/GRPO and general policy optimization
 - **Frictionless Migration**: Initial API compatibility with [ThinkingMachines Tinker](https://thinkingmachines.ai/tinker/), designed as a familiar drop-in upgrade
 - **Scaled Agentic RL**: Capture and utilize experience at scale across wider task distributions, longer interaction horizons, and richer environmental constraints
@@ -29,7 +29,6 @@ MinT abstracts away infrastructure complexity—GPU clusters, model states, dist
 
 - LoRA fine-tuning for efficient training of large models
 - Distributed data collection and rolling training
-- Support for vision-language models (Qwen3-VL)
 - Weight management and model publishing
 - Online evaluation on standard CPU clusters
 
@@ -72,7 +71,7 @@ MinT 封装了基础设施的复杂性——GPU 集群、模型状态、分布�
 
 ### 核心特性
 
-- **模型支持**：Kimi、K2、DeepSeek、Qwen、π0 等，确保推理到训练的快速闭环
+- **模型支持**：Qwen3-0.6B、Qwen3-4B-Instruct-2507、Qwen3-30B-A3B-Instruct-2507、Qwen3-235B-A22B-Instruct-2507，与服务端可用模型保持一致
 - **算法支持**：以 RLHF/GRPO 和通用策略优化为核心的稳健训练 pipeline
 - **无缝迁移**：初始 API 兼容 [ThinkingMachines Tinker](https://thinkingmachines.ai/tinker/)，作为熟悉的平替升级
 - **规模化 Agentic RL**：在更广泛的任务分布、更长的交互 horizon、更丰富的环境约束下采集和利用经验
@@ -81,7 +80,6 @@ MinT 封装了基础设施的复杂性——GPU 集群、模型状态、分布�
 
 - 大模型高效训练的 LoRA fine-tuning
 - 分布式数据采集和滚动训练
-- 支持视觉语言模型（Qwen3-VL）
 - 权重管理和模型发布
 - 标准 CPU 集群上的在线评估
 
