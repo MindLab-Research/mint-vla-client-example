@@ -326,10 +326,19 @@ async def _prewarm_persistent_models(
                 actor_name = _make_megatron_actor_name(base_model or model_name)
                 # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
                 resource_pool.set_protected(actor_name, True)
-                logger.info(f"[prewarm] training __ray_ready__ start model={model_name} actor={actor_name}")
-                await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
-                resource_pool.mark_ready(actor_name)
-                logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
+
+                async def _await_ready() -> None:
+                    try:
+                        await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
+                        resource_pool.mark_ready(actor_name)
+                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                    except Exception as ready_err:
+                        logger.warning(
+                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
+                        )
+
+                asyncio.create_task(_await_ready())
             else:
                 from tinker_server.backend.verl_training import (
                     PERSISTENT_DENSE_ACTOR_PREFIX,

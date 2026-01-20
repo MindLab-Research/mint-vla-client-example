@@ -119,6 +119,9 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 rsync -avz --dry-run --delete \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='LOG.md' \
+  --exclude='PROMPT.md' \
+  --exclude='ray_head_ip.txt' \
   --exclude='.claude' \
   ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
 
@@ -126,6 +129,9 @@ rsync -avz --dry-run --delete \
 rsync -avz --delete \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='LOG.md' \
+  --exclude='PROMPT.md' \
+  --exclude='ray_head_ip.txt' \
   --exclude='.claude' \
   ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
 ```
