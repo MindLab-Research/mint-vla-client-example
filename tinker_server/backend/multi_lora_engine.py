@@ -376,48 +376,6 @@ class MultiLoRAInferenceEngine:
 
             from .verl_inference import _create_extended_server_class
 
-            def _pg_name() -> str:
-                return f"{self.actor_name}_pg"
-
-            async def _get_or_create_pg() -> ray.util.placement_group.PlacementGroup:
-                pg_name = _pg_name()
-                try:
-                    pg = ray.util.get_placement_group(pg_name)
-                except Exception:
-                    # vLLM's Ray executor requires placement group bundles to have <= 1 GPU each.
-                    # Reserve N GPU bundles (for TP*DP workers) plus a CPU-only bundle for the
-                    # controller actor so it doesn't occupy a worker bundle.
-                    pg = ray.util.placement_group(
-                        ([{"GPU": 1, "CPU": 1}] * total_gpus) + [{"CPU": 1}],
-                        strategy="PACK",
-                        name=pg_name,
-                        lifetime="detached",
-                    )
-                try:
-                    await asyncio.to_thread(ray.get, pg.ready())
-                except SystemExit as e:
-                    # Ray can raise SystemExit for some internal failures; do not let this
-                    # terminate the API server process.
-                    if getattr(e, "code", None) == 15:
-                        raise
-                    try:
-                        ray.util.remove_placement_group(pg)
-                    except Exception:
-                        pass
-                    raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
-                return pg
-
-            def _remove_pg() -> None:
-                pg_name = _pg_name()
-                try:
-                    pg = ray.util.get_placement_group(pg_name)
-                except Exception:
-                    return
-                try:
-                    ray.util.remove_placement_group(pg)
-                except Exception:
-                    pass
-
             # Pass multi-LoRA config to vLLM engine
             ExtendedVLLMHttpServer = _create_extended_server_class(
                 max_loras=self.max_loras,
@@ -518,36 +476,16 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-            pg = await _get_or_create_pg()
-            scheduling_opts = {
-                "scheduling_strategy": PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    # Reserve the last (CPU-only) bundle for the controller, leaving
-                    # worker bundles [0..total_gpus-1] for vLLM's RayWorkerWrapper ranks.
-                    placement_group_bundle_index=total_gpus,
-                    placement_group_capture_child_tasks=True,
-                )
-            }
-
             self.server = ExtendedVLLMHttpServer.options(
-                # The vLLM engine uses Ray workers (1 GPU each). The controller itself
-                # should not consume a GPU bundle (it runs in the CPU-only bundle).
-                num_gpus=0,
+                num_gpus=total_gpus,
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
-                **scheduling_opts,
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
-                        # vLLM v1 Ray executor rejects placement groups with bundle GPUs > 1.
-                        # We schedule single-node vLLM actors inside a placement group bundle with
-                        # num_gpus=TP*DP to avoid GPU collisions with Megatron placement groups.
-                        "VLLM_USE_V1": "0",
                     }
                 },
             ).remote(
@@ -596,7 +534,6 @@ class MultiLoRAInferenceEngine:
                     )
                 except Exception:
                     pass
-                _remove_pg()
                 self.server = None
                 raise RuntimeError(f"ray.get(launch_server) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
@@ -612,7 +549,6 @@ class MultiLoRAInferenceEngine:
                     )
                 except Exception:
                     pass
-                _remove_pg()
                 self.server = None
                 raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out after {init_timeout}s")
             except Exception:
@@ -629,7 +565,6 @@ class MultiLoRAInferenceEngine:
                     )
                 except Exception:
                     pass
-                _remove_pg()
                 self.server = None
                 raise
 
