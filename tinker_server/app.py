@@ -371,24 +371,46 @@ async def _prewarm_persistent_models(
             logger.warning(f"[prewarm] inference skipped (multi-LoRA disabled) model={model_name}")
             continue
 
-        async def _prewarm_inference(model_name=model_name) -> None:
-            timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
-            try:
-                logger.info(f"[prewarm] inference create start model={model_name} timeout_s={timeout_s}")
-                engine = await asyncio.wait_for(multi_model_manager.get_engine(model_name), timeout=timeout_s)
-                actor_name = getattr(engine, "actor_name", None)
-                if not actor_name:
-                    raise RuntimeError("engine has no actor_name")
-                resource_pool.set_protected(actor_name, True)
-                logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
-            except SystemExit as e:
-                if getattr(e, "code", None) == 15:
-                    raise
-                logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
-            except Exception as e:
-                logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
+        # NOTE: prewarm inference is scheduled after training loop, ordered to avoid
+        # multi-node vLLM initialization fragmenting the cluster before 4-GPU single-node vLLM
+        # actors (e.g., Qwen3-30B TP=4) can be placed.
 
-        asyncio.create_task(_prewarm_inference())
+    if multi_model_manager is None:
+        return
+
+    def _infer_gpus(model_name: str) -> int:
+        try:
+            cfg = get_model_config(model_name)
+            return int(cfg.total_gpus)
+        except Exception:
+            return 0
+
+    # Order inference: single-node actors first (<=8 GPUs), then multi-node (>8 GPUs).
+    # This avoids the common failure mode where multi-node vLLM reserves GPUs across
+    # many nodes and leaves no node with 4 free GPUs for Qwen3-30B.
+    infer_models = [m for _, m, _ in ordered]
+    infer_single = [m for m in infer_models if _infer_gpus(m) <= 8]
+    infer_multi = [m for m in infer_models if _infer_gpus(m) > 8]
+    infer_single.sort(key=lambda m: (-_infer_gpus(m), m))
+    infer_multi.sort(key=lambda m: (-_infer_gpus(m), m))
+
+    timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
+
+    for model_name in infer_single + infer_multi:
+        try:
+            logger.info(f"[prewarm] inference create start model={model_name} timeout_s={timeout_s}")
+            engine = await asyncio.wait_for(multi_model_manager.get_engine(model_name), timeout=timeout_s)
+            actor_name = getattr(engine, "actor_name", None)
+            if not actor_name:
+                raise RuntimeError("engine has no actor_name")
+            resource_pool.set_protected(actor_name, True)
+            logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
+        except SystemExit as e:
+            if getattr(e, "code", None) == 15:
+                raise
+            logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
+        except Exception as e:
+            logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
 
 
 @asynccontextmanager
