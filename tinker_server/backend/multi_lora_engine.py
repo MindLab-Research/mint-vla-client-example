@@ -431,6 +431,7 @@ class MultiLoRAInferenceEngine:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 prompt_length=prompt_length,
                 response_length=response_length,
+                max_model_len=max_model_len,
                 max_num_seqs=self.max_num_seqs,
                 dtype="auto",
                 load_format="auto",

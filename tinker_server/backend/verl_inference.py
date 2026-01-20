@@ -1307,6 +1307,7 @@ class VerlInferenceEngine:
             gpu_memory_utilization=gpu_util,
             prompt_length=prompt_length,
             response_length=response_length,
+            max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
             dtype="auto",
             load_format="auto",
