@@ -430,7 +430,6 @@ class MultiLoRAInferenceEngine:
             from tinker_server.backend.resource_pool import get_resource_pool
             resource_pool = get_resource_pool()
             try:
-                import asyncio
                 await asyncio.to_thread(resource_pool.ensure_gpus_available, total_gpus)
             except ValueError as e:
                 # Unable to free enough GPUs even after eviction
@@ -556,7 +555,6 @@ class MultiLoRAInferenceEngine:
             # - Small models (1-2 GPUs): 300s (5 min)
             # - Medium models (4 GPUs): 600s (10 min)
             # - Large models (8+ GPUs, e.g., K2): 1800s (30 min)
-            import asyncio
             loop = asyncio.get_event_loop()
 
             # Compute timeout based on model size (proxy: number of GPUs)
