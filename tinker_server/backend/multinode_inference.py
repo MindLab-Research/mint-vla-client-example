@@ -506,7 +506,15 @@ class MultiNodeInferenceEngine:
             existing_actor = None
             try:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
-                is_ready = ray.get(existing_actor.is_ready.remote(), timeout=30)
+                try:
+                    is_ready = ray.get(existing_actor.is_ready.remote(), timeout=30)
+                except SystemExit as e:
+                    if getattr(e, "code", None) == 15:
+                        raise
+                    logger.warning(
+                        f"ray.get(is_ready) triggered SystemExit for {self.actor_name}: {e}; treating as not-ready"
+                    )
+                    is_ready = False
                 if is_ready:
                     logger.info(f"Connected to existing MultiNodeVLLMEngine: {self.actor_name}")
                     self.engine = existing_actor
@@ -607,7 +615,16 @@ class MultiNodeInferenceEngine:
                     name=pg_name,
                     lifetime="detached",
                 )
-            ray.get(pg.ready())
+            try:
+                ray.get(pg.ready())
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+                raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
 
             # Create new engine actor
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
@@ -678,6 +695,26 @@ class MultiNodeInferenceEngine:
                     None,
                     lambda: ray.get(self.engine.initialize.remote(), timeout=init_timeout)
                 )
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                try:
+                    ray_kill.kill(
+                        self.engine,
+                        reason="multinode_vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        timeout_s=init_timeout,
+                    )
+                except Exception:
+                    pass
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+                self.engine = None
+                raise RuntimeError(f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
                 logger.error(f"Engine initialization timed out after {init_timeout}s")
                 ray_kill.kill(

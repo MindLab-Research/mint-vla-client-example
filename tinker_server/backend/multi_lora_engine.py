@@ -384,7 +384,18 @@ class MultiLoRAInferenceEngine:
                         name=pg_name,
                         lifetime="detached",
                     )
-                ray.get(pg.ready())
+                try:
+                    ray.get(pg.ready())
+                except SystemExit as e:
+                    # Ray can raise SystemExit for some internal failures; do not let this
+                    # terminate the API server process.
+                    if getattr(e, "code", None) == 15:
+                        raise
+                    try:
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
                 return pg
 
             def _remove_pg() -> None:
@@ -556,6 +567,22 @@ class MultiLoRAInferenceEngine:
                     None,  # Use default thread pool
                     lambda: ray.get(self.server.launch_server.remote(), timeout=init_timeout)
                 )
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                try:
+                    ray_kill.kill(
+                        self.server,
+                        reason="vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
+                except Exception:
+                    pass
+                _remove_pg()
+                self.server = None
+                raise RuntimeError(f"ray.get(launch_server) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
                 logger.error(f"vLLM launch timed out after {init_timeout}s for {self.actor_name}")
                 # Kill the stuck actor

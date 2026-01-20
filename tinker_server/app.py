@@ -337,6 +337,12 @@ async def _prewarm_persistent_models(
                         await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
                         resource_pool.mark_ready(actor_name)
                         logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                    except SystemExit as ready_err:
+                        if getattr(ready_err, "code", None) == 15:
+                            raise
+                        logger.warning(
+                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
+                        )
                     except Exception as ready_err:
                         logger.warning(
                             f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
@@ -375,6 +381,10 @@ async def _prewarm_persistent_models(
                     raise RuntimeError("engine has no actor_name")
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
             except Exception as e:
                 logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
 
