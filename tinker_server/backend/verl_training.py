@@ -2431,6 +2431,14 @@ class DenseTrainerPool:
                             f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
                             f"Kill the actor and restart with higher max_lora_rank."
                         )
+                    # The dense trainer actor is single-threaded. If it's busy and currently serving a
+                    # different training session, do not enqueue a session swap (reinit_lora_weights):
+                    # it would run later and disrupt the in-flight session. Fail fast instead.
+                    if session_id is not None and session_id != entry.current_session:
+                        raise RuntimeError(
+                            f"DenseTrainerPool actor busy; cannot switch sessions while busy: "
+                            f"actor={actor_name} current_session={entry.current_session} requested_session={session_id}"
+                        )
                     entry.touch()
                     from tinker_server.backend.resource_pool import get_resource_pool
 
