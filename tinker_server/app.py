@@ -364,16 +364,21 @@ async def _prewarm_persistent_models(
         if multi_model_manager is None:
             logger.warning(f"[prewarm] inference skipped (multi-LoRA disabled) model={model_name}")
             continue
-        try:
-            logger.info(f"[prewarm] inference create start model={model_name}")
-            engine = await multi_model_manager.get_engine(model_name)
-            actor_name = getattr(engine, "actor_name", None)
-            if not actor_name:
-                raise RuntimeError("engine has no actor_name")
-            resource_pool.set_protected(actor_name, True)
-            logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
-        except Exception as e:
-            logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
+
+        async def _prewarm_inference(model_name=model_name) -> None:
+            timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
+            try:
+                logger.info(f"[prewarm] inference create start model={model_name} timeout_s={timeout_s}")
+                engine = await asyncio.wait_for(multi_model_manager.get_engine(model_name), timeout=timeout_s)
+                actor_name = getattr(engine, "actor_name", None)
+                if not actor_name:
+                    raise RuntimeError("engine has no actor_name")
+                resource_pool.set_protected(actor_name, True)
+                logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
+            except Exception as e:
+                logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
+
+        asyncio.create_task(_prewarm_inference())
 
 
 @asynccontextmanager
