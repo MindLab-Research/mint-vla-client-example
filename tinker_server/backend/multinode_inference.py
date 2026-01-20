@@ -518,6 +518,11 @@ class MultiNodeInferenceEngine:
                         namespace=PERSISTENT_NAMESPACE,
                         no_restart=True,
                     )
+                    try:
+                        pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
                     # Wait for Ray to clean up the actor name
                     import time
                     for _ in range(10):
@@ -552,68 +557,24 @@ class MultiNodeInferenceEngine:
             )
             await asyncio.to_thread(resource_pool.ensure_gpus_available, total_required_gpus, 300)
 
-            # Step 2: Find nodes with AVAILABLE GPUs
-            # Available = Total - PG_used - Actor_used (same logic as multi_lora_engine.py)
-            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-            target_node = None
-
-            # Count GPUs used by placement groups per node
-            pg_table = ray.util.placement_group_table()
-            gpus_used_by_pg: dict[str, int] = {}
-            for pg_id, pg_info in pg_table.items():
-                if pg_info.get("state") != "CREATED":
-                    continue
-                bundles_to_node = pg_info.get("bundles_to_node_id", {})
-                for bundle_idx, node_id in bundles_to_node.items():
-                    if node_id:
-                        # Each Megatron bundle uses 1 GPU
-                        gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
-
-            # Count GPUs used by actors tracked in ResourcePool
-            gpus_used_by_actors = resource_pool.gpus_used_by_node()
-
-            # Find a node to host the controller actor (num_gpus=0).
+            # Step 2: Create a detached placement group and capture child tasks.
             #
-            # vLLM's Ray backend will schedule the actual GPU workers across the cluster.
-            # Requiring a full 8-GPU-empty node here is unnecessary and can block
-            # multi-node engines when the cluster is fragmented (e.g., many 1-GPU actors).
-            gpus_per_node = 1
-            candidates: list[tuple[str, str, int]] = []  # (node_id, ip, available_gpus)
+            # vLLM's Ray backend spawns 1-GPU RayWorkerWrapper actors. Without a placement group,
+            # those workers can collide with Megatron placement groups, leading to vLLM init failures
+            # like "Free memory on device ... is less than desired GPU memory utilization".
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-            for node in ray.nodes():
-                if not node["Alive"]:
-                    continue
-                node_id = node["NodeID"]
-                node_ip = node["NodeManagerAddress"]
-                node_total_gpus = node.get("Resources", {}).get("GPU", 0)
-                if node_total_gpus == 0:
-                    continue
-
-                pg_gpus = gpus_used_by_pg.get(node_id, 0)
-                actor_gpus = gpus_used_by_actors.get(node_id, 0)
-                available_gpus = int(node_total_gpus - pg_gpus - actor_gpus)
-
-                logger.debug(
-                    f"Node {node_id[:8]} ({node_ip}): total={node_total_gpus}, "
-                    f"pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpus}"
+            pg_name = f"{self.actor_name}_pg"
+            try:
+                pg = ray.util.get_placement_group(pg_name)
+            except Exception:
+                pg = ray.util.placement_group(
+                    [{"GPU": 1, "CPU": 1}] * total_required_gpus,
+                    strategy="SPREAD",
+                    name=pg_name,
+                    lifetime="detached",
                 )
-
-                if available_gpus >= gpus_per_node:
-                    candidates.append((node_id, node_ip, available_gpus))
-
-            if not candidates:
-                raise RuntimeError(
-                    f"No nodes with {gpus_per_node}+ free GPUs after ensure_gpus_available({self.tensor_parallel_size}). "
-                    f"Check ResourcePool and placement group state."
-                )
-
-            # Prefer nodes with most available GPUs (cleanest placement)
-            candidates.sort(key=lambda x: -x[2])
-            target_node, target_ip, available = candidates[0]
-            logger.info(
-                f"Selected node {target_ip} ({target_node[:8]}) with {available} available GPUs"
-            )
+            ray.get(pg.ready())
 
             # Create new engine actor
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
@@ -623,11 +584,11 @@ class MultiNodeInferenceEngine:
                 max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
-            # target_node is guaranteed set (RuntimeError raised above if no candidates)
-            # soft=False: fail if target unavailable, no fallback
             scheduling_opts = {
-                "scheduling_strategy": NodeAffinitySchedulingStrategy(
-                    node_id=target_node, soft=False
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=0,
+                    placement_group_capture_child_tasks=True,
                 )
             }
 
@@ -694,8 +655,30 @@ class MultiNodeInferenceEngine:
                     no_restart=True,
                     timeout_s=init_timeout,
                 )
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
                 self.engine = None
                 raise RuntimeError(f"MultiNodeVLLMEngine init timed out")
+            except Exception:
+                try:
+                    ray_kill.kill(
+                        self.engine,
+                        reason="multinode_vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        timeout_s=init_timeout,
+                    )
+                except Exception:
+                    pass
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+                self.engine = None
+                raise
 
             self._initialized = True
             logger.info(f"MultiNodeInferenceEngine initialized: {self.actor_name}")
