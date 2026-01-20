@@ -798,6 +798,7 @@ async def _do_save_weights_for_sampler(
                     session_id=sampling_session_id,
                     base_model=base_model,
                     lora_rank=lora_rank,
+                    adapter_path=save_path,
                 )
                 print(f"[DEBUG _do_save_weights_for_sampler] registered session", flush=True)
 

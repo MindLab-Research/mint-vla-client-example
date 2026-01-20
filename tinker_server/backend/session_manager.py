@@ -40,6 +40,7 @@ class SessionInfo:
     uses_multi_lora: bool = False  # True if using MultiLoRAInferenceEngine
     uses_base_model: bool = False  # True if multi-LoRA without any LoRA adapter
     base_model: str | None = None  # Base model name for multi-model support
+    adapter_path: str | None = None  # Optional (ephemeral) adapter directory to cleanup
 
 
 class SessionManager:
@@ -94,7 +95,9 @@ class SessionManager:
             sid
             for sid, info in self._sessions.items()
             if now - info.last_activity > self.inactivity_timeout
-            and not info.is_shared  # Don't cleanup shared engine sessions
+            # Keep shared engine sessions unless they are multi-LoRA registrations
+            # (multi-LoRA uses per-session LoRA IDs and must be GC'd to avoid leaks).
+            and (not info.is_shared or info.uses_multi_lora)
         ]
         for sid in inactive:
             logger.info(f"Auto-cleaning inactive session {sid}")
@@ -338,6 +341,32 @@ class SessionManager:
         if info is None:
             return False
 
+        if info.uses_multi_lora:
+            # Best-effort: remove LoRA from vLLM and delete ephemeral adapter dir.
+            manager = self.get_multi_model_manager()
+            if manager is not None and info.base_model:
+                engine = manager.get_engine_if_exists(info.base_model)
+                if engine is not None:
+                    try:
+                        await engine.remove_session(session_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove multi-LoRA session {session_id} from engine: {e}")
+
+            if info.adapter_path:
+                import os
+                import shutil
+
+                adapter_path = info.adapter_path
+                try:
+                    if os.path.isdir(adapter_path) and os.path.basename(adapter_path).startswith("_ephemeral_"):
+                        await asyncio.to_thread(shutil.rmtree, adapter_path)
+                        logger.info(f"Deleted ephemeral adapter dir for session {session_id}: {adapter_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete adapter dir for session {session_id}: {adapter_path}: {e}")
+
+            logger.info(f"Ended multi-LoRA session {session_id}")
+            return True
+
         # Only shutdown non-shared engines (shared engine is reused)
         if not info.is_shared:
             await info.engine.shutdown()
@@ -428,6 +457,8 @@ class SessionManager:
             Base model name, or None if session not found.
         """
         info = self._sessions.get(session_id)
+        if info is not None:
+            info.last_activity = time.time()
         return info.base_model if info else None
 
     async def get_engine_for_session(self, session_id: str) -> "MultiLoRAInferenceEngine | None":
@@ -449,6 +480,7 @@ class SessionManager:
         session_id: str,
         base_model: str,
         lora_rank: int = 32,
+        adapter_path: str | None = None,
     ) -> None:
         """Register a sampling session that uses the shared multi-LoRA engine.
 
@@ -458,6 +490,8 @@ class SessionManager:
             session_id: Unique identifier for the sampling session.
             base_model: Base model name for this session.
             lora_rank: LoRA rank for the adapter.
+            adapter_path: Optional adapter directory path to delete when the
+                sampling session expires (ephemeral save_weights_for_sampler).
 
         Raises:
             ValueError: If session_id already exists.
@@ -472,6 +506,7 @@ class SessionManager:
             is_shared=True,
             uses_multi_lora=True,
             base_model=base_model,
+            adapter_path=adapter_path,
         )
         logger.info(
             f"Registered multi-LoRA session {session_id} (model={base_model}, lora_rank={lora_rank})"
