@@ -4,7 +4,7 @@ import { En, Zh } from '../../components/Lang'
 
 # Model Lineup
 
-MinT currently supports a focused lineup of Qwen3 text models.
+MinT lists models by availability status.
 
 ## Available Models
 
@@ -14,6 +14,23 @@ MinT currently supports a focused lineup of Qwen3 text models.
 | Qwen/Qwen3-4B-Instruct-2507 | Instruction | Dense | Compact |
 | Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | Medium |
 | Qwen/Qwen3-235B-A22B-Instruct-2507 | Instruction | MoE | Large |
+
+## Coming Soon
+
+| Model Name | Training Type | Architecture | Size |
+|------------|---------------|--------------|------|
+| Qwen/Qwen3-30B-A3B | Hybrid | MoE | Medium |
+| Qwen/Qwen3-30B-A3B-Base | Base | MoE | Medium |
+| Qwen/Qwen3-8B | Hybrid | Dense | Small |
+| Qwen/Qwen3-8B-Base | Base | Dense | Small |
+| deepseek-ai/DeepSeek-V3.1 | Hybrid | MoE | Large |
+| deepseek-ai/DeepSeek-V3.1-Base | Base | MoE | Large |
+| moonshotai/Kimi-K2-Thinking* | Reasoning | MoE | Large |
+| Qwen/Qwen3-VL-30B-A3B-Instruct | Vision | MoE | Medium |
+| Qwen/Qwen3-VL-235B-A22B-Instruct | Vision | MoE | Large |
+| π0 | Robotics | Dense | Small |
+
+*Contact sales for Kimi-K2 access
 
 ## Model Selection Recommendations
 
@@ -32,7 +49,7 @@ MinT currently supports a focused lineup of Qwen3 text models.
 - **MoE (Mixture of Experts)** - Sparse activation for efficiency
 
 ### By Size
-- **Tiny:** <1B parameters
+- **Tiny:** under 1B parameters
 - **Compact:** 1-4B parameters
 - **Medium:** ~30B parameters
 - **Large:** 200B+ parameters
@@ -47,7 +64,7 @@ MoE models offer superior cost-efficiency: pricing scales with **active paramete
 
 # 模型列表
 
-MinT 目前支持一组精简的 Qwen3 文本模型。
+MinT 按可用性状态列出模型。
 
 ## 可用模型
 
@@ -57,6 +74,23 @@ MinT 目前支持一组精简的 Qwen3 文本模型。
 | Qwen/Qwen3-4B-Instruct-2507 | Instruction | Dense | Compact |
 | Qwen/Qwen3-30B-A3B-Instruct-2507 | Instruction | MoE | Medium |
 | Qwen/Qwen3-235B-A22B-Instruct-2507 | Instruction | MoE | Large |
+
+## 即将上线
+
+| 模型名称 | 训练类型 | 架构 | 规模 |
+|----------|----------|------|------|
+| Qwen/Qwen3-30B-A3B | Hybrid | MoE | Medium |
+| Qwen/Qwen3-30B-A3B-Base | Base | MoE | Medium |
+| Qwen/Qwen3-8B | Hybrid | Dense | Small |
+| Qwen/Qwen3-8B-Base | Base | Dense | Small |
+| deepseek-ai/DeepSeek-V3.1 | Hybrid | MoE | Large |
+| deepseek-ai/DeepSeek-V3.1-Base | Base | MoE | Large |
+| moonshotai/Kimi-K2-Thinking* | Reasoning | MoE | Large |
+| Qwen/Qwen3-VL-30B-A3B-Instruct | Vision | MoE | Medium |
+| Qwen/Qwen3-VL-235B-A22B-Instruct | Vision | MoE | Large |
+| π0 | Robotics | Dense | Small |
+
+*Kimi-K2 访问权限请联系销售
 
 ## 选型建议
 
@@ -75,7 +109,7 @@ MinT 目前支持一组精简的 Qwen3 文本模型。
 - **MoE（Mixture of Experts）**：稀疏激活，更高效
 
 ### 按规模
-- **Tiny**：<1B 参数
+- **Tiny**：1B 以下参数
 - **Compact**：1-4B 参数
 - **Medium**：~30B 参数
 - **Large**：200B+ 参数
