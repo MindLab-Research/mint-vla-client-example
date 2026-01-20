@@ -1225,6 +1225,7 @@ class MultiModelInferenceManager:
                 # - creating a new actor (includes its own GPU availability checks)
                 engine = MultiNodeInferenceEngine(
                     model_path=model_path,
+                    model_name=model_name,
                     tensor_parallel_size=config.inference_tp,
                     data_parallel_size=config.inference_dp,
                     enable_expert_parallel=enable_expert_parallel,

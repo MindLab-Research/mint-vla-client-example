@@ -432,13 +432,14 @@ class MultiNodeInferenceEngine:
 
     Key differences from MultiLoRAInferenceEngine:
     - Uses vLLM's Ray backend instead of verl's single-node ZMQ pattern
-    - Outer actor has num_gpus=0 (vLLM manages GPU workers internally)
+    - Controller actor reserves 1 GPU for CUDA visibility; vLLM spawns 1-GPU workers in Ray
     - LoRA adapters must be on shared filesystem (all nodes access same path)
     """
 
     def __init__(
         self,
         model_path: str,
+        model_name: str | None = None,
         tensor_parallel_size: int = 16,
         pipeline_parallel_size: int = 1,
         data_parallel_size: int = 1,
@@ -455,6 +456,7 @@ class MultiNodeInferenceEngine:
         shared_adapter_dir: str = "/vePFS-Mindverse/share/tinker_adapters",
     ):
         self.model_path = model_path
+        self.model_name = model_name
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.data_parallel_size = data_parallel_size
@@ -477,14 +479,28 @@ class MultiNodeInferenceEngine:
 
     async def initialize(self) -> None:
         """Initialize the multi-node vLLM engine."""
-        print(f"[DEBUG] MultiNodeInferenceEngine.initialize() called", flush=True)
         async with self._init_lock:
             if self._initialized:
-                print(f"[DEBUG] Already initialized, returning", flush=True)
                 return
 
             if not ray.is_initialized():
                 ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+            # vLLM v1 requires the controller actor to have a CUDA-visible GPU.
+            # Without this, vLLM falls back to "no active driver" and engine core init fails.
+            controller_gpus = 1
+            worker_gpus = (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * self.data_parallel_size
+            )
+            total_required_gpus = worker_gpus + controller_gpus
+
+            is_persistent = False
+            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+            if persistent_csv and self.model_name:
+                persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
+                is_persistent = self.model_name in persistent_models
 
             # Try to connect to existing actor
             existing_actor = None
@@ -495,6 +511,19 @@ class MultiNodeInferenceEngine:
                     logger.info(f"Connected to existing MultiNodeVLLMEngine: {self.actor_name}")
                     self.engine = existing_actor
                     self._initialized = True
+                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                    resource_pool = get_resource_pool()
+                    resource_pool.register(
+                        actor_name=self.actor_name,
+                        actor_type=ActorType.VLLM,
+                        num_gpus=total_required_gpus,
+                        actor_handle=self.engine,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=self.model_path,
+                        protected=is_persistent,
+                    )
+                    resource_pool.mark_ready(self.actor_name)
                     return
                 else:
                     logger.warning(f"Actor {self.actor_name} exists but not ready, will recreate")
@@ -506,6 +535,19 @@ class MultiNodeInferenceEngine:
                 logger.warning(f"Actor {self.actor_name} is_ready timed out; assuming busy and reusing actor")
                 self.engine = existing_actor
                 self._initialized = True
+                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                resource_pool = get_resource_pool()
+                resource_pool.register(
+                    actor_name=self.actor_name,
+                    actor_type=ActorType.VLLM,
+                    num_gpus=total_required_gpus,
+                    actor_handle=self.engine,
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=self.model_path,
+                    protected=is_persistent,
+                )
+                resource_pool.mark_ready(self.actor_name)
                 return
 
             # Kill existing actor if any before creating new
@@ -538,17 +580,8 @@ class MultiNodeInferenceEngine:
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
-            from tinker_server.backend.resource_pool import get_resource_pool
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
             resource_pool = get_resource_pool()
-            # vLLM v1 requires the controller actor to have a CUDA-visible GPU.
-            # Without this, vLLM falls back to "no active driver" and engine core init fails.
-            controller_gpus = 1
-            worker_gpus = (
-                self.tensor_parallel_size
-                * self.pipeline_parallel_size
-                * self.data_parallel_size
-            )
-            total_required_gpus = worker_gpus + controller_gpus
             logger.info(
                 f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
@@ -685,8 +718,6 @@ class MultiNodeInferenceEngine:
 
             # Register with unified resource pool for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
-            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-            resource_pool = get_resource_pool()
             resource_pool.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
@@ -694,6 +725,7 @@ class MultiNodeInferenceEngine:
                 actor_handle=self.engine,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
+                protected=is_persistent,
             )
             # Mark as ready since initialization completed
             resource_pool.mark_ready(self.actor_name)
