@@ -27,11 +27,10 @@ Represents tokenized input to the model.
 - `to_ints()` - Convert to list of token IDs
 - `context_length()` - Get total number of tokens
 - `append_tokens(tokens)` - Add tokens to the end
-- `append_chunks(chunks)` - Add text/image chunks
+- `append_chunks(chunks)` - Add text chunks
 
 **Supports:**
 - Pure text (list of token IDs)
-- Multimodal (mixed `EncodedTextChunk` and `ImageChunk`)
 
 ## SamplingParams
 
@@ -117,11 +116,10 @@ Adam optimizer 配置。
 - `to_ints()`：转换为 token ID 列表
 - `context_length()`：获取总 token 数
 - `append_tokens(tokens)`：末尾添加 token
-- `append_chunks(chunks)`：添加文本/图像 chunk
+- `append_chunks(chunks)`：添加文本 chunk
 
 **支持**：
 - 纯文本（token ID 列表）
-- 多模态（混合 `EncodedTextChunk` 和 `ImageChunk`）
 
 ## SamplingParams
 

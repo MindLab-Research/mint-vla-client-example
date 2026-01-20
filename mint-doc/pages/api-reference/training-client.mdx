@@ -127,7 +127,7 @@ Get the model's tokenizer for encoding/decoding text.
 
 ```python
 training_client = service_client.create_lora_training_client(
-    base_model="Qwen/Qwen3-8B"
+    base_model="Qwen/Qwen3-4B-Instruct-2507"
 )
 
 fwdbwd_future = training_client.forward_backward(training_data, "cross_entropy")
@@ -265,7 +265,7 @@ get_tokenizer()
 
 ```python
 training_client = service_client.create_lora_training_client(
-    base_model="Qwen/Qwen3-8B"
+    base_model="Qwen/Qwen3-4B-Instruct-2507"
 )
 
 fwdbwd_future = training_client.forward_backward(training_data, "cross_entropy")
