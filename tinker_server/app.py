@@ -103,6 +103,10 @@ async def _cleanup_stale_actors() -> None:
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
+                            # MultiNodeInferenceEngine reserves an additional controller GPU.
+                            # We route MoE TP>=4 through it even when the model fits on one node.
+                            if cfg.is_moe and cfg.total_gpus >= 4:
+                                num_gpus += 1
                     elif name.startswith("dense_trainer_pool_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -173,6 +177,8 @@ async def _cleanup_stale_actors() -> None:
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
+                                if cfg.is_moe and cfg.total_gpus >= 4:
+                                    num_gpus += 1
                         elif name.startswith("dense_trainer_pool_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
