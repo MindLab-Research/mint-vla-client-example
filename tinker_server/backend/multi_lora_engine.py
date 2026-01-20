@@ -263,11 +263,17 @@ class MultiLoRAInferenceEngine:
                 # Health check: try calling a method to verify actor is alive
                 # This will raise RayActorError if actor is dead
                 try:
-                    ray.get(self.server.__ray_ready__.remote(), timeout=5)
-
-                    # Check if engine is actually initialized (not just actor alive)
-                    # A broken actor can be "alive" but have failed engine init
-                    engine_ready = ray.get(self.server.is_engine_ready.remote(), timeout=10)
+                    try:
+                        await asyncio.to_thread(ray.get, self.server.__ray_ready__.remote(), timeout=5)
+                        # Check if engine is actually initialized (not just actor alive)
+                        # A broken actor can be "alive" but have failed engine init
+                        engine_ready = await asyncio.to_thread(ray.get, self.server.is_engine_ready.remote(), timeout=10)
+                    except SystemExit as e:
+                        if getattr(e, "code", None) == 15:
+                            raise
+                        raise RuntimeError(
+                            f"ray.get(__ray_ready__/is_engine_ready) triggered SystemExit for {self.actor_name}: {e}"
+                        ) from e
                     if not engine_ready:
                         logger.warning(
                             f"vLLM actor {self.actor_name} has broken engine, killing and recreating"
@@ -373,7 +379,7 @@ class MultiLoRAInferenceEngine:
             def _pg_name() -> str:
                 return f"{self.actor_name}_pg"
 
-            def _get_or_create_pg() -> ray.util.placement_group.PlacementGroup:
+            async def _get_or_create_pg() -> ray.util.placement_group.PlacementGroup:
                 pg_name = _pg_name()
                 try:
                     pg = ray.util.get_placement_group(pg_name)
@@ -385,7 +391,7 @@ class MultiLoRAInferenceEngine:
                         lifetime="detached",
                     )
                 try:
-                    ray.get(pg.ready())
+                    await asyncio.to_thread(ray.get, pg.ready())
                 except SystemExit as e:
                     # Ray can raise SystemExit for some internal failures; do not let this
                     # terminate the API server process.
@@ -512,7 +518,7 @@ class MultiLoRAInferenceEngine:
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
             from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-            pg = _get_or_create_pg()
+            pg = await _get_or_create_pg()
             scheduling_opts = {
                 "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
@@ -1170,13 +1176,19 @@ class MultiModelInferenceManager:
                 actor_handle = getattr(engine, 'server', None) or getattr(engine, 'engine', None)
                 if actor_handle is not None:
                     try:
-                        # MultiNodeInferenceEngine uses is_ready, MultiLoRAInferenceEngine uses __ray_ready__
                         if hasattr(engine, 'server'):
-                            ray.get(actor_handle.__ray_ready__.remote(), timeout=5)
+                            await asyncio.to_thread(ray.get, actor_handle.__ray_ready__.remote(), timeout=5)
                         else:
-                            ray.get(actor_handle.is_ready.remote(), timeout=5)
+                            await asyncio.to_thread(ray.get, actor_handle.is_ready.remote(), timeout=5)
                         # Actor alive, return cached engine
                         return engine
+                    except SystemExit as e:
+                        if getattr(e, "code", None) == 15:
+                            raise
+                        logger.warning(
+                            f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
+                        )
+                        del self._engines[model_name]
                     except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                         # Actor is dead, remove from cache and recreate
                         logger.warning(

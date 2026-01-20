@@ -507,7 +507,7 @@ class MultiNodeInferenceEngine:
             try:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 try:
-                    is_ready = ray.get(existing_actor.is_ready.remote(), timeout=30)
+                    is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
                 except SystemExit as e:
                     if getattr(e, "code", None) == 15:
                         raise
@@ -616,7 +616,7 @@ class MultiNodeInferenceEngine:
                     lifetime="detached",
                 )
             try:
-                ray.get(pg.ready())
+                await asyncio.to_thread(ray.get, pg.ready())
             except SystemExit as e:
                 if getattr(e, "code", None) == 15:
                     raise
