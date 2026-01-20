@@ -689,6 +689,8 @@ class MultiNodeInferenceEngine:
                 init_timeout = 3600
             elif total_required_gpus >= 8:
                 init_timeout = 1800
+            elif total_required_gpus >= 4:
+                init_timeout = 1800
             else:
                 init_timeout = 600
 
