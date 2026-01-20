@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -369,6 +370,34 @@ class MultiLoRAInferenceEngine:
 
             from .verl_inference import _create_extended_server_class
 
+            def _pg_name() -> str:
+                return f"{self.actor_name}_pg"
+
+            def _get_or_create_pg() -> ray.util.placement_group.PlacementGroup:
+                pg_name = _pg_name()
+                try:
+                    pg = ray.util.get_placement_group(pg_name)
+                except Exception:
+                    pg = ray.util.placement_group(
+                        [{"GPU": total_gpus, "CPU": 1}],
+                        strategy="PACK",
+                        name=pg_name,
+                        lifetime="detached",
+                    )
+                ray.get(pg.ready())
+                return pg
+
+            def _remove_pg() -> None:
+                pg_name = _pg_name()
+                try:
+                    pg = ray.util.get_placement_group(pg_name)
+                except Exception:
+                    return
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+
             # Pass multi-LoRA config to vLLM engine
             ExtendedVLLMHttpServer = _create_extended_server_class(
                 max_loras=self.max_loras,
@@ -470,92 +499,15 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            #
-            # Find a node with enough free GPUs to avoid memory conflicts.
-            # When training and inference coexist, Megatron holds GPU memory even
-            # though Ray doesn't track actual CUDA memory usage. We must place
-            # vLLM on a separate node with completely free GPUs.
-            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-            # Find a node with enough AVAILABLE GPUs (not just total GPUs).
-            # Ray's node.Resources shows total, but other actors (Megatron) may hold GPUs.
-            # We compute available by checking:
-            # 1. GPUs used by active placement groups (Megatron training)
-            # 2. GPUs used by actors tracked in ResourcePool (vLLM, dense training)
-            target_node = None
-            logger.debug(f"Looking for node with {total_gpus} available GPUs for vLLM")
-
-            # Get cluster-wide available resources for validation
-            cluster_available = ray.available_resources()
-            cluster_gpus = cluster_available.get("GPU", 0)
-            logger.debug(f"Cluster has {cluster_gpus} GPUs available")
-
-            # Find GPUs used by active placement groups on each node
-            # Each bundle in a placement group typically uses 1 GPU
-            pg_table = ray.util.placement_group_table()
-            gpus_used_by_pg = {}  # node_id -> count of GPUs used by placement groups
-            for pg_id, pg_info in pg_table.items():
-                if pg_info.get("state") == "CREATED":
-                    # Count bundles per node (each bundle typically uses 1 GPU)
-                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
-                    for bundle_idx, node_id in bundles_to_node.items():
-                        gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
-
-            # Also get GPUs used by actors tracked in ResourcePool (vLLM, dense training)
-            # This is critical - without it, we may schedule to a node that already has vLLM actors
-            gpus_used_by_actors = resource_pool.gpus_used_by_node()
-
-            # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used - actor_used)
-            candidates = []
-            for node in ray.nodes():
-                node_id = node["NodeID"]
-                node_id_short = node_id[:8]
-                if node["Alive"]:
-                    total_res = node.get("Resources", {})
-                    total_gpu = total_res.get("GPU", 0)
-                    obj_store = total_res.get("object_store_memory", 0)
-                    pg_gpus = gpus_used_by_pg.get(node_id, 0)
-                    actor_gpus = gpus_used_by_actors.get(node_id, 0)
-                    available_gpu = total_gpu - pg_gpus - actor_gpus
-                    logger.debug(f"Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpu}")
-
-                    # Node must have enough AVAILABLE GPUs (after subtracting all usage) and enough object store
-                    if available_gpu >= total_gpus and obj_store > 100_000_000_000:
-                        candidates.append((node_id, available_gpu))
-
-            # Prefer nodes with NO placement groups first (to avoid GPU assignment conflicts)
-            # Among those, prefer nodes with more GPUs (more room)
-            if candidates:
-                # Separate into "clean" nodes (no PG or actors) and "partial" nodes
-                clean_nodes = [(nid, gpus) for nid, gpus in candidates
-                               if gpus_used_by_pg.get(nid, 0) == 0 and gpus_used_by_actors.get(nid, 0) == 0]
-                partial_nodes = [(nid, gpus) for nid, gpus in candidates
-                                 if gpus_used_by_pg.get(nid, 0) > 0 or gpus_used_by_actors.get(nid, 0) > 0]
-
-                if clean_nodes:
-                    # Prefer clean nodes
-                    clean_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
-                    target_node = clean_nodes[0][0]
-                    available_gpus = clean_nodes[0][1]
-                    logger.info(f"Selected clean node {target_node[:8]} with {available_gpus} available GPUs")
-                else:
-                    # Fall back to partial nodes
-                    partial_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
-                    target_node = partial_nodes[0][0]
-                    available_gpus = partial_nodes[0][1]
-                    pg_count = gpus_used_by_pg.get(target_node, 0)
-                    actor_count = gpus_used_by_actors.get(target_node, 0)
-                    logger.info(f"Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} PG, {actor_count} actors)")
-
-            scheduling_opts = {}
-            if target_node:
-                scheduling_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-                    node_id=target_node,
-                    soft=False,  # Hard constraint - fail if node unavailable
+            pg = _get_or_create_pg()
+            scheduling_opts = {
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=0,
                 )
-            else:
-                scheduling_opts["scheduling_strategy"] = "SPREAD"
-                logger.warning("No suitable node found, using SPREAD scheduling")
+            }
 
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
@@ -617,8 +569,26 @@ class MultiLoRAInferenceEngine:
                     )
                 except Exception:
                     pass
+                _remove_pg()
                 self.server = None
                 raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out after {init_timeout}s")
+            except Exception:
+                # launch_server can fail fast on GPU placement collisions (vLLM checks free memory on startup).
+                # In this case, the detached actor name is already taken; kill+remove the placement group so a
+                # retry can reschedule to a different node/GPU set.
+                try:
+                    ray_kill.kill(
+                        self.server,
+                        reason="vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
+                except Exception:
+                    pass
+                _remove_pg()
+                self.server = None
+                raise
 
             self._initialized = True
             logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
@@ -1056,6 +1026,11 @@ class MultiLoRAInferenceEngine:
                 logger.info("Killed persistent vLLM actor")
             except Exception as e:
                 logger.warning(f"Error killing server actor: {e}")
+            try:
+                pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
         self.server = None
         self._initialized = False
         logger.info("MultiLoRAInferenceEngine disconnected")
@@ -1288,6 +1263,17 @@ class MultiModelInferenceManager:
             await engine.initialize()
 
             self._engines[model_name] = engine
+            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+            if persistent_csv:
+                persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
+                if model_name in persistent_models:
+                    from tinker_server.backend.resource_pool import get_resource_pool
+
+                    resource_pool = get_resource_pool()
+                    if not resource_pool.set_protected(actor_name, True):
+                        logger.warning(
+                            f"Failed to protect vLLM actor for persistent model {model_name}: actor={actor_name}"
+                        )
             logger.info(f"Engine created for {model_name}")
             return engine
 
@@ -1341,9 +1327,19 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             )
             logger.info(f"Killed vLLM actor: {actor_name}")
             resource_pool.unregister(actor_name)
+            try:
+                pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
             return True
         except ValueError:
             logger.info(f"No vLLM actor found: {actor_name}")
+            try:
+                pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
             return False
     else:
         # Kill ALL vLLM actors via resource pool
@@ -1360,10 +1356,20 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     )
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
+                    try:
+                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
                     killed_any = True
                 except ValueError:
                     logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
+                    try:
+                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
         if not killed_any:
