@@ -4206,7 +4206,17 @@ class MegatronWorkerGroup:
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
         futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora) for w in self.workers]
-        results = ray.get(futures, timeout=300)
+        world_size = len(self.workers)
+        if world_size >= 32:
+            default_timeout_s = 3600
+        elif world_size >= 16:
+            default_timeout_s = 1800
+        elif world_size >= 4:
+            default_timeout_s = 600
+        else:
+            default_timeout_s = 300
+        timeout_s = int(os.environ.get("MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+        results = ray.get(futures, timeout=timeout_s)
         result = results[0]  # Only rank 0 returns actual data
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
