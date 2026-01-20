@@ -1239,11 +1239,10 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-            # Multi-node required if total GPUs exceed a single 8xA800 node.
-            # Examples:
-            # - K2: TP=32 => 32 GPUs
-            # - Qwen3-235B: TP=16 => 16 GPUs
-            needs_multinode = config.total_gpus > 8
+            # Use MultiNodeInferenceEngine (vLLM AsyncLLMEngine + Ray executor backend)
+            # for any TP > 1 model. verl's vLLM server path uses the vLLM v1 engine which
+            # enforces placement-group constraints and has repeatedly failed for TP>1 here.
+            needs_multinode = config.total_gpus > 1
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
