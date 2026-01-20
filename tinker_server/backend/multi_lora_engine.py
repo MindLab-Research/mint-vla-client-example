@@ -428,6 +428,11 @@ class MultiLoRAInferenceEngine:
             response_length = max_model_len - prompt_length
             logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
 
+            # vLLM V1 engine can fail during multi-GPU init when cudagraph/compile is enabled
+            # (worker subprocesses crash before reporting a useful exception). Eager mode trades
+            # some throughput for deterministic startup.
+            enforce_eager = bool(model_cfg.is_moe and total_gpus >= 4)
+
             # Configure rollout with multi-LoRA support
             # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
             # Expert parallelism is enabled via engine_kwargs instead
@@ -441,7 +446,7 @@ class MultiLoRAInferenceEngine:
                 max_num_seqs=self.max_num_seqs,
                 dtype="auto",
                 load_format="auto",
-                enforce_eager=False,
+                enforce_eager=enforce_eager,
                 enable_chunked_prefill=True,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=True,
