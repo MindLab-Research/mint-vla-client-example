@@ -384,8 +384,11 @@ class MultiLoRAInferenceEngine:
                 try:
                     pg = ray.util.get_placement_group(pg_name)
                 except Exception:
+                    # vLLM's Ray executor requires placement group bundles to have <= 1 GPU each.
+                    # Reserve N GPU bundles (for TP*DP workers) plus a CPU-only bundle for the
+                    # controller actor so it doesn't occupy a worker bundle.
                     pg = ray.util.placement_group(
-                        [{"GPU": total_gpus, "CPU": 1}],
+                        ([{"GPU": 1, "CPU": 1}] * total_gpus) + [{"CPU": 1}],
                         strategy="PACK",
                         name=pg_name,
                         lifetime="detached",
@@ -521,12 +524,17 @@ class MultiLoRAInferenceEngine:
             scheduling_opts = {
                 "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
-                    placement_group_bundle_index=0,
+                    # Reserve the last (CPU-only) bundle for the controller, leaving
+                    # worker bundles [0..total_gpus-1] for vLLM's RayWorkerWrapper ranks.
+                    placement_group_bundle_index=total_gpus,
+                    placement_group_capture_child_tasks=True,
                 )
             }
 
             self.server = ExtendedVLLMHttpServer.options(
-                num_gpus=total_gpus,
+                # The vLLM engine uses Ray workers (1 GPU each). The controller itself
+                # should not consume a GPU bundle (it runs in the CPU-only bundle).
+                num_gpus=0,
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
