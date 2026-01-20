@@ -1707,6 +1707,24 @@ class VerlTrainingEngine:
             session.backend = "peft"
             logger.info(f"[{model_id}] DenseTrainerPool: reusing actor for {base_model} (max_rank={entry.max_lora_rank})")
 
+        # For Megatron: avoid blocking create_session on __ray_ready__.
+        #
+        # __ray_ready__ is a normal actor task, so it can queue behind long-running
+        # initialization/work tasks and appear to "hang" for hours even when the actor
+        # is healthy. Returning early lets clients proceed; subsequent training calls
+        # will naturally queue until the actor is ready.
+        if session.backend == "megatron":
+            actor_name = self._resource_pool_actor_names.get(model_id)
+            if actor_name:
+                from .resource_pool import get_resource_pool
+
+                get_resource_pool().mark_ready(actor_name)
+
+            self._workers[model_id] = worker
+            session.is_active = True
+            logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
+            return
+
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
         default_ready_timeout_s = "3600" if session.backend == "megatron" else "900"
