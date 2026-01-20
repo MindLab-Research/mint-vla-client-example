@@ -1387,13 +1387,37 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
+    def _is_actor_ready(actor) -> bool:
+        """Return True if actor responds and (if supported) its engine is healthy.
+
+        Notes:
+        - For verl's ExtendedVLLMHttpServer: prefer is_engine_ready()
+        - For MultiNodeVLLMEngine: prefer is_ready() (touches EngineCore)
+        - If the readiness call times out, treat as "alive but busy".
+        """
+        try:
+            try:
+                ref = actor.is_engine_ready.remote()
+            except AttributeError:
+                ref = actor.is_ready.remote()
+        except AttributeError:
+            ref = actor.__ray_ready__.remote()
+
+        try:
+            res = ray.get(ref, timeout=5)
+        except ray.exceptions.GetTimeoutError:
+            return True
+
+        if isinstance(res, bool):
+            return res
+        return True
+
     if model_name:
         # Check specific model's actor
         actor_name = _model_to_actor_name(model_name)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-            ray.get(actor.__ray_ready__.remote(), timeout=5)
-            return True
+            return _is_actor_ready(actor)
         except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
             return False
     else:
@@ -1403,8 +1427,8 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
-                    ray.get(actor.__ray_ready__.remote(), timeout=5)
-                    return True
+                    if _is_actor_ready(actor):
+                        return True
                 except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     continue
         return False

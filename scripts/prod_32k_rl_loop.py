@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 
 import mint
@@ -102,7 +103,26 @@ def main() -> int:
                 flush=True,
             )
             t0 = time.time()
-            sampling_client = training_client.save_weights_and_get_sampling_client(name=ckpt_name)
+            out: dict[str, object] = {}
+
+            def _do_save() -> None:
+                try:
+                    out["client"] = training_client.save_weights_and_get_sampling_client(name=ckpt_name)
+                except BaseException as e:
+                    out["err"] = e
+
+            th = threading.Thread(target=_do_save, daemon=True)
+            th.start()
+            while th.is_alive():
+                th.join(timeout=heartbeat_s)
+                if th.is_alive():
+                    print(
+                        f"[{_ts()}] waiting save_weights_and_get_sampling_client base_model={base_model} elapsed_s={time.time()-t0:.0f}",
+                        flush=True,
+                    )
+            if "err" in out:
+                raise out["err"]  # type: ignore[misc]
+            sampling_client = out["client"]  # type: ignore[assignment]
             print(
                 f"[{_ts()}] step {step+1}/{steps}: save_weights_and_get_sampling_client done base_model={base_model} "
                 f"elapsed_s={time.time()-t0:.1f}",
@@ -210,19 +230,29 @@ def main() -> int:
                 f"[{_ts()}] step {step+1}/{steps}: forward_backward loss_fn=ppo base_model={base_model} batch={len(datums)}",
                 flush=True,
             )
+            fb_t0 = time.time()
             fb_future = training_client.forward_backward(datums, loss_fn="ppo")
             _wait_future(
                 fb_future,
                 label=f"forward_backward base_model={base_model} step {step+1}/{steps}",
                 heartbeat_s=heartbeat_s,
             )
+            print(
+                f"[{_ts()}] step {step+1}/{steps}: forward_backward done base_model={base_model} elapsed_s={time.time()-fb_t0:.1f}",
+                flush=True,
+            )
 
             print(f"[{_ts()}] step {step+1}/{steps}: optim_step base_model={base_model} lr={lr}", flush=True)
+            opt_t0 = time.time()
             opt_future = training_client.optim_step(types.AdamParams(learning_rate=lr))
             _wait_future(
                 opt_future,
                 label=f"optim_step base_model={base_model} step {step+1}/{steps}",
                 heartbeat_s=heartbeat_s,
+            )
+            print(
+                f"[{_ts()}] step {step+1}/{steps}: optim_step done base_model={base_model} elapsed_s={time.time()-opt_t0:.1f}",
+                flush=True,
             )
 
             avg_reward = sum(step_rewards) / max(1, len(step_rewards))

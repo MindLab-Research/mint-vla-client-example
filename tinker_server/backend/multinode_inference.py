@@ -224,8 +224,16 @@ def _create_multinode_vllm_actor(
             logger.info("MultiNodeVLLMEngine initialized")
 
         async def is_ready(self) -> bool:
-            """Check if engine is initialized and ready."""
-            return self._initialized and self.engine is not None
+            """Check if engine is initialized and the EngineCore is responsive."""
+            if not self._initialized or self.engine is None:
+                return False
+            try:
+                # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
+                await self.engine.list_loras()
+            except Exception as e:
+                logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
+                return False
+            return True
 
         async def add_lora(self, lora_int_id: int, lora_path: str, lora_name: str) -> None:
             """Add LoRA adapter from shared filesystem path.
@@ -495,6 +503,11 @@ class MultiNodeInferenceEngine:
                 * self.data_parallel_size
             )
             total_required_gpus = worker_gpus + controller_gpus
+            ray_cgraph_get_timeout = (
+                os.environ.get("RAY_CGRAPH_get_timeout")
+                or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
+                or "1800"
+            )
 
             is_persistent = False
             persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
@@ -663,6 +676,9 @@ class MultiNodeInferenceEngine:
                         "PYTHONPATH": PFS_PYTHONPATH,
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
+                        # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
+                        # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
+                        "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
                         # Force vLLM v0 engine - v1's multiprocess architecture
                         # conflicts with Ray distributed executor backend
                         "VLLM_USE_V1": "0",
