@@ -8,7 +8,10 @@ from dataclasses import dataclass
 # NOTE: vLLM 0.12.0 requires PyTorch 2.9.0, which requires NCCL 2.21+
 # System has NCCL 2.x (older) - cannot use PFS PyTorch 2.9.0
 # MoE LoRA blocked until Docker image upgraded with newer CUDA stack
-PFS_TINKER_PATH = "/vePFS-Mindverse/share/code/tinker-server"
+#
+# Default to the production code path so Ray actors use the same code as the
+# API server deployment.
+PFS_TINKER_PATH = os.environ.get("PFS_TINKER_PATH", "/vePFS-Mindverse/share/code/tinker-server-auth")
 
 # PFS verl path with _mutable_fields patch for LoRA config assignment
 PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
