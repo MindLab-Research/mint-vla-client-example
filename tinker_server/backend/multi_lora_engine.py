@@ -536,6 +536,10 @@ class MultiLoRAInferenceEngine:
                         "PYTHONPATH": PFS_PYTHONPATH,
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
+                        # vLLM v1 Ray executor rejects placement groups with bundle GPUs > 1.
+                        # We schedule single-node vLLM actors inside a placement group bundle with
+                        # num_gpus=TP*DP to avoid GPU collisions with Megatron placement groups.
+                        "VLLM_USE_V1": "0",
                     }
                 },
             ).remote(
