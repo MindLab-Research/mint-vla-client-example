@@ -278,6 +278,8 @@ async def _prewarm_persistent_models(
         ordered.append((gpus, model_name, model))
     ordered.sort(key=lambda x: (-x[0], x[1]))
 
+    deferred_dense_training: list[tuple[str, str]] = []
+
     for _, model_name, _raw_model in ordered:
         try:
             cfg = get_model_config(model_name)
@@ -350,17 +352,10 @@ async def _prewarm_persistent_models(
 
                 asyncio.create_task(_await_ready())
             else:
-                from tinker_server.backend.verl_training import (
-                    PERSISTENT_DENSE_ACTOR_PREFIX,
-                    get_dense_trainer_pool,
-                )
-
-                pool = get_dense_trainer_pool()
-                logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
-                entry = await asyncio.to_thread(pool.get_or_create, base_model, lora_rank, learning_rate, None)
-                actor_name = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
-                resource_pool.set_protected(actor_name, True)
-                logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                # Defer dense pool creation until after multi-node vLLM inference is initialized,
+                # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
+                deferred_dense_training.append((model_name, base_model))
+                logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
         except Exception as e:
             logger.exception(f"[prewarm] training failed model={model_name}: {e}")
 
@@ -385,18 +380,28 @@ async def _prewarm_persistent_models(
         except Exception:
             return 0
 
-    # Order inference: single-node actors first (<=8 GPUs), then multi-node (>8 GPUs).
-    # This avoids the common failure mode where multi-node vLLM reserves GPUs across
-    # many nodes and leaves no node with 4 free GPUs for Qwen3-30B.
+    def _infer_is_moe(model_name: str) -> bool:
+        try:
+            cfg = get_model_config(model_name)
+            return bool(cfg.is_moe)
+        except Exception:
+            return False
+
+    # Order inference:
+    # - Single-node MoE first (e.g., Qwen3-30B TP=4) to ensure a 4-GPU slot exists.
+    # - Multi-node next (e.g., Qwen3-235B TP=16) while 8-GPU nodes are still mostly free.
+    # - Dense models last (0.6B/4B) to avoid consuming 1 GPU on every free node.
     infer_models = [m for _, m, _ in ordered]
-    infer_single = [m for m in infer_models if _infer_gpus(m) <= 8]
+    infer_moe_single = [m for m in infer_models if _infer_is_moe(m) and _infer_gpus(m) <= 8]
     infer_multi = [m for m in infer_models if _infer_gpus(m) > 8]
-    infer_single.sort(key=lambda m: (-_infer_gpus(m), m))
     infer_multi.sort(key=lambda m: (-_infer_gpus(m), m))
+    infer_dense = [m for m in infer_models if not _infer_is_moe(m) and _infer_gpus(m) <= 8]
+    infer_moe_single.sort(key=lambda m: (-_infer_gpus(m), m))
+    infer_dense.sort(key=lambda m: (-_infer_gpus(m), m))
 
     timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
 
-    for model_name in infer_single + infer_multi:
+    for model_name in infer_moe_single + infer_multi + infer_dense:
         try:
             logger.info(f"[prewarm] inference create start model={model_name} timeout_s={timeout_s}")
             engine = await asyncio.wait_for(multi_model_manager.get_engine(model_name), timeout=timeout_s)
@@ -411,6 +416,26 @@ async def _prewarm_persistent_models(
             logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
         except Exception as e:
             logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
+
+    # -------------------------
+    # Dense training pools (deferred)
+    # -------------------------
+    if deferred_dense_training:
+        from tinker_server.backend.verl_training import (
+            PERSISTENT_DENSE_ACTOR_PREFIX,
+            get_dense_trainer_pool,
+        )
+
+        pool = get_dense_trainer_pool()
+        for model_name, base_model in deferred_dense_training:
+            try:
+                logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
+                entry = await asyncio.to_thread(pool.get_or_create, base_model, lora_rank, learning_rate, None)
+                actor_name = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
+                resource_pool.set_protected(actor_name, True)
+                logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+            except Exception as e:
+                logger.exception(f"[prewarm] training failed model={model_name} backend=dense_pool: {e}")
 
 
 @asynccontextmanager
