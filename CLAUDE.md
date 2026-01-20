@@ -97,7 +97,7 @@ ssh -f -N -L 8000:localhost:8000 volcano
 # Arithmetic RL (~5 min)
 TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
 python -m tinker_cookbook.recipes.math_rl.train \
-    model_name="Qwen/Qwen2.5-7B-Instruct" \
+    model_name="Qwen/Qwen3-4B-Instruct-2507" \
     renderer_name="qwen3_instruct" \
     group_size=4 groups_per_batch=100 learning_rate=1e-4
 ```
