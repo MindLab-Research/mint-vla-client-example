@@ -611,7 +611,10 @@ class MultiNodeInferenceEngine:
             except Exception:
                 pg = ray.util.placement_group(
                     [{"GPU": 1, "CPU": 1}] * total_required_gpus,
-                    strategy="SPREAD",
+                    # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
+                    # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
+                    # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
+                    strategy="PACK",
                     name=pg_name,
                     lifetime="detached",
                 )
