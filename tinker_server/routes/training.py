@@ -723,12 +723,24 @@ async def _do_save_weights_for_sampler(
             # Ephemeral save - generate unique temp name
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
 
+        use_per_expert_lora = bool(request.use_per_expert_lora)
+        if (
+            session.backend == "megatron"
+            and not use_per_expert_lora
+            and "use_per_expert_lora" not in getattr(request, "model_fields_set", set())
+        ):
+            # Default behavior for MoE: if the session trains MLP LoRA, export in
+            # per-expert format so vLLM can consume it.
+            if getattr(getattr(session, "lora_config", None), "train_mlp", False):
+                use_per_expert_lora = True
+
         print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
             checkpoint_base_dir=checkpoint_dir,
+            use_per_expert_lora=use_per_expert_lora,
         )
         print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 

@@ -2001,6 +2001,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -2010,6 +2011,8 @@ class VerlTrainingEngine:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
+            use_per_expert_lora: If True, export MoE MLP LoRA in per-expert format
+                (required by vLLM's MoE LoRA support).
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -2017,12 +2020,13 @@ class VerlTrainingEngine:
         import os
 
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
-        return await self.save_weights(session, save_path)
+        return await self.save_weights(session, save_path, use_per_expert_lora=use_per_expert_lora)
 
     async def save_weights(
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save checkpoint via Ray actor.
 
@@ -2032,6 +2036,8 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
+            use_per_expert_lora: If True, export MoE MLP LoRA in per-expert format
+                (required by vLLM for MoE models).
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -2065,7 +2071,10 @@ class VerlTrainingEngine:
         timeout_s = int(os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
         loop = asyncio.get_running_loop()
-        meta_ref = worker.save_checkpoint.remote(abs_path)
+        if session.backend == "megatron":
+            meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
+        else:
+            meta_ref = worker.save_checkpoint.remote(abs_path)
         meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
 
         # Update session state

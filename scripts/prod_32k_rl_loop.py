@@ -58,7 +58,7 @@ def main() -> int:
     prompts_per_step = int(os.environ.get("RL_PROMPTS_PER_STEP", "4"))
     samples_per_prompt = int(os.environ.get("RL_SAMPLES_PER_PROMPT", "2"))
     max_seq_len = int(os.environ.get("RL_MAX_SEQ_LEN", "32000"))
-    gen_max_tokens = int(os.environ.get("RL_GEN_MAX_TOKENS", "32"))
+    gen_max_tokens = int(os.environ.get("RL_GEN_MAX_TOKENS", "256"))
     temperature = float(os.environ.get("RL_TEMPERATURE", "0.7"))
     heartbeat_s = float(os.environ.get("MINT_FUTURE_HEARTBEAT_S", "60"))
 

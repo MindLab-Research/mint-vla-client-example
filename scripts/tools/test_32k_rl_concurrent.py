@@ -66,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--prompts-per-step", type=int, default=4)
     p.add_argument("--samples-per-prompt", type=int, default=2)
     p.add_argument("--max-seq-len", type=int, default=32000)
-    p.add_argument("--gen-max-tokens", type=int, default=32)
+    p.add_argument("--gen-max-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--learning-rate", type=float, default=5e-5)
