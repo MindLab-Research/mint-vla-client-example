@@ -2254,6 +2254,40 @@ class DenseTrainerPool:
         model_name = base_model.split("/")[-1].replace("-", "_").lower()
         return f"{PERSISTENT_DENSE_ACTOR_PREFIX}{model_name}_maxr{max_rank}"
 
+    def _pg_name(self, actor_name: str) -> str:
+        return f"{actor_name}_pg"
+
+    def _get_or_create_pg(self, actor_name: str) -> ray.util.placement_group.PlacementGroup:
+        """Ensure a detached 1-GPU placement group exists for this actor.
+
+        Dense training actors must not overlap GPUs with Megatron placement groups.
+        Scheduling them into their own placement groups forces Ray to allocate a
+        free physical GPU rather than colliding with bundle-assigned GPUs.
+        """
+        pg_name = self._pg_name(actor_name)
+        try:
+            pg = ray.util.get_placement_group(pg_name)
+        except Exception:
+            pg = ray.util.placement_group(
+                [{"GPU": 1, "CPU": 1}],
+                strategy="PACK",
+                name=pg_name,
+                lifetime="detached",
+            )
+        ray.get(pg.ready())
+        return pg
+
+    def _remove_pg(self, actor_name: str) -> None:
+        pg_name = self._pg_name(actor_name)
+        try:
+            pg = ray.util.get_placement_group(pg_name)
+        except Exception:
+            return
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception:
+            pass
+
     def get(self, base_model: str) -> DenseTrainerEntry | None:
         """Get existing actor entry if it exists.
 
@@ -2354,6 +2388,7 @@ class DenseTrainerPool:
                 )
             except Exception as e:
                 logger.warning(f"[DenseTrainerPool] Error killing evicted actor: {e}")
+            self._remove_pg(self._make_actor_name(entry.base_model, entry.max_lora_rank))
 
             freed_gpus += entry.num_gpus
 
@@ -2527,6 +2562,7 @@ class DenseTrainerPool:
                             no_restart=True,
                             base_model=base_model,
                         )
+                        self._remove_pg(actor_name)
                     except Exception as kill_err:
                         logger.warning(f"[DenseTrainerPool] Could not kill dead actor: {kill_err}")
                 except ray.exceptions.GetTimeoutError:
@@ -2548,6 +2584,7 @@ class DenseTrainerPool:
                             no_restart=True,
                             base_model=base_model,
                         )
+                        self._remove_pg(actor_name)
                     except Exception as kill_err:
                         logger.warning(f"[DenseTrainerPool] Could not kill unhealthy actor: {kill_err}")
 
@@ -2563,11 +2600,16 @@ class DenseTrainerPool:
                         }
                     }
 
+                    pg = self._get_or_create_pg(actor_name)
                     actor = TrainingWorker.options(
                         name=actor_name,
                         namespace=PERSISTENT_DENSE_NAMESPACE,
                         lifetime="detached",
                         num_gpus=1,
+                        scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=0,
+                        ),
                         runtime_env=runtime_env,
                     ).remote(
                         base_model=base_model,
@@ -2592,6 +2634,7 @@ class DenseTrainerPool:
                                 base_model=base_model,
                                 timeout_s=init_timeout_s,
                             )
+                            self._remove_pg(actor_name)
                         except Exception:
                             pass
                         raise
@@ -2648,6 +2691,7 @@ class DenseTrainerPool:
 
             entry = self._actors.pop(key)
             if kill_actor:
+                actor_name = self._make_actor_name(entry.base_model, entry.max_lora_rank)
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
                 except Exception:
@@ -2656,13 +2700,14 @@ class DenseTrainerPool:
                     ray_kill.kill(
                         entry.actor,
                         reason="dense_trainer_pool_remove",
-                        actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                        actor_name=actor_name,
                         namespace=PERSISTENT_DENSE_NAMESPACE,
                         no_restart=True,
                         base_model=entry.base_model,
                     )
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
+                self._remove_pg(actor_name)
 
             logger.info(f"[DenseTrainerPool] Removed actor for {base_model}")
             return True
@@ -2722,6 +2767,7 @@ class DenseTrainerPool:
                     )
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing idle actor: {e}")
+                self._remove_pg(self._make_actor_name(entry.base_model, entry.max_lora_rank))
                 logger.info(f"[DenseTrainerPool] Evicted idle actor: {entry.base_model}")
 
             return len(to_evict)
@@ -2739,17 +2785,19 @@ class DenseTrainerPool:
             count = len(self._actors)
             if kill_actors:
                 for entry in self._actors.values():
+                    actor_name = self._make_actor_name(entry.base_model, entry.max_lora_rank)
                     try:
                         ray.get(entry.actor.shutdown.remote(), timeout=30)
                         ray_kill.kill(
                             entry.actor,
                             reason="dense_trainer_pool_clear",
-                            actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                            actor_name=actor_name,
                             namespace=PERSISTENT_DENSE_NAMESPACE,
                             base_model=entry.base_model,
                         )
                     except Exception as e:
                         logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
+                    self._remove_pg(actor_name)
             self._actors.clear()
             logger.info(f"[DenseTrainerPool] Cleared {count} actors")
             return count

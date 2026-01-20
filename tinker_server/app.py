@@ -328,7 +328,11 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
-                async def _await_ready() -> None:
+                async def _await_ready(
+                    actor=actor,
+                    actor_name=actor_name,
+                    model_name=model_name,
+                ) -> None:
                     try:
                         await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
                         resource_pool.mark_ready(actor_name)
