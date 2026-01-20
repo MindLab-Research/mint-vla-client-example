@@ -1240,9 +1240,12 @@ class MultiModelInferenceManager:
             model_kv_cache_dtype = config.kv_cache_dtype
 
             # Use MultiNodeInferenceEngine (vLLM AsyncLLMEngine + Ray executor backend)
-            # for any TP > 1 model. verl's vLLM server path uses the vLLM v1 engine which
-            # enforces placement-group constraints and has repeatedly failed for TP>1 here.
-            needs_multinode = config.total_gpus > 1
+            # only when the model cannot fit on a single 8-GPU worker.
+            #
+            # For <=8 GPUs (e.g., Qwen3-30B TP=4), prefer the single-node
+            # MultiLoRAInferenceEngine to avoid vLLM's Ray executor multi-node
+            # networking constraints (e.g., VLLM_HOST_IP uniqueness checks).
+            needs_multinode = config.total_gpus > 8
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
