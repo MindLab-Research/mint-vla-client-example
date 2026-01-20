@@ -1193,7 +1193,10 @@ class MultiModelInferenceManager:
             # For <=8 GPUs (e.g., Qwen3-30B TP=4), prefer the single-node
             # MultiLoRAInferenceEngine to avoid vLLM's Ray executor multi-node
             # networking constraints (e.g., VLLM_HOST_IP uniqueness checks).
-            needs_multinode = config.total_gpus > 8
+            # vLLM v1 multiprocess TP has repeatedly failed to initialize for MoE TP>=4
+            # (worker subprocess dies before emitting a root-cause stack trace). Use vLLM's
+            # Ray distributed executor backend instead, even when the model fits on one node.
+            needs_multinode = config.total_gpus > 8 or (config.is_moe and config.total_gpus >= 4)
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
