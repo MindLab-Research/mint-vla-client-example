@@ -340,4 +340,4 @@ Key requirements:
 - [verl Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html)
 - [Kimi-K2-Instruct on HuggingFace](https://huggingface.co/moonshotai/Kimi-K2-Instruct)
 - [Tinker SDK test notebook](~/Downloads/tinker_test.ipynb)
-- [Tinker Official Agent Reference](./tinker_official_reference.txt)
+- [Tinker Official Agent Reference](./.claude/skills/tinker-official-reference/references/tinker_official_reference.txt)
