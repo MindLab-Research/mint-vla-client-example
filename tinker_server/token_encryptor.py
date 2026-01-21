@@ -1,4 +1,7 @@
-"""Token 加密解密器 - 使用 AES-CBC 生成/解析 sk- token"""
+"""Token encryptor/decryptor using AES-CBC.
+
+Accepts both legacy `sk-` tokens and `sk-mint-` tokens.
+"""
 
 import base64
 import hashlib
@@ -11,6 +14,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 class TokenEncryptor:
     """AES-CBC Token 加密解密器"""
+
+    _PREFIXES = ("sk-mint-", "sk-")
 
     def __init__(self, secret_key: str):
         """
@@ -38,35 +43,36 @@ class TokenEncryptor:
             user_data: 包含用户信息的字典 (必须包含 user_id 字段)
 
         Returns:
-            以 'sk-' 开头的加密 token
+            Encrypted token string (defaults to `sk-mint-` prefix).
         """
         json_str = json.dumps(user_data, ensure_ascii=False, separators=(",", ":"))
         iv = os.urandom(16)
         cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=default_backend())
         encryptor = cipher.encryptor()
         encrypted = encryptor.update(self._pad(json_str.encode())) + encryptor.finalize()
-        token_body = base64.b64encode(iv + encrypted).decode().rstrip("=")
-        return f"sk-{token_body}"
+        token_body = base64.urlsafe_b64encode(iv + encrypted).decode().rstrip("=")
+        return f"sk-mint-{token_body}"
 
     def decrypt_token(self, token: str) -> dict | None:
         """
-        解密 sk- token，获取原始用户数据
+        解密 token，获取原始用户数据
 
         Args:
-            token: 以 'sk-' 开头的加密 token
+            token: Encrypted token starting with `sk-mint-` or legacy `sk-`
 
         Returns:
             解密后的用户数据字典，失败返回 None
         """
-        if not token.startswith("sk-"):
+        prefix = next((p for p in self._PREFIXES if token.startswith(p)), None)
+        if prefix is None:
             return None
         try:
-            token_body = token[3:]
+            token_body = token[len(prefix) :]
             # 补充 base64 填充
-            padding = 4 - (len(token_body) % 4)
-            if padding != 4:
+            padding = (-len(token_body)) % 4
+            if padding:
                 token_body += "=" * padding
-            combined = base64.b64decode(token_body)
+            combined = base64.urlsafe_b64decode(token_body)
             iv, encrypted = combined[:16], combined[16:]
             cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=default_backend())
             decryptor = cipher.decryptor()
