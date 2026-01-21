@@ -53,10 +53,13 @@ async def retrieve_future(
         error = future_store.get_error(body.request_id)
         # Only expose full error details to privileged users
         if _is_privileged(http_request):
-            return {"error": error, "category": "system"}
+            payload = {"error": error, "category": "system"}
         else:
-            return {"error": GENERIC_ERROR_MESSAGE, "category": "system"}
+            payload = {"error": GENERIC_ERROR_MESSAGE, "category": "system"}
+        future_store.cleanup(body.request_id)
+        return payload
     else:
         # DONE - return the result
         result = future_store.get_result(body.request_id)
+        future_store.cleanup(body.request_id)
         return result
