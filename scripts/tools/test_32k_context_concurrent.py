@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Pressure test: concurrent 32k-context training across supported models.
 
-Runs three concurrent SFT loops (forward_backward + optim_step) at a fixed
-sequence length (default: 32000 tokens):
+Runs concurrent SFT loops (forward_backward + optim_step) at a fixed sequence
+length (default: 32000 tokens). Default models are the 4 always-on prod models:
   - Qwen/Qwen3-0.6B
-  - Qwen/Qwen3-4B
+  - Qwen/Qwen3-4B-Instruct-2507
   - Qwen/Qwen3-30B-A3B-Instruct-2507
+  - Qwen/Qwen3-235B-A22B-Instruct-2507
 
 Target server:
   - Set MINT_BASE_URL or TINKER_BASE_URL (expected to be a localhost tunnel).
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import os
 import random
 import time
@@ -30,6 +32,14 @@ from typing import Any
 from dotenv import load_dotenv
 
 DEFAULT_BASE_URL = "http://localhost:18000"
+DEFAULT_MODELS = ",".join(
+    [
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +50,7 @@ class TaskConfig:
     steps: int
     learning_rate: float
     call_timeout_s: float
+    heartbeat_s: float
 
 
 def _coalesce(*values: str | None) -> str | None:
@@ -60,15 +71,34 @@ def _load_env() -> None:
         os.environ["MINT_BASE_URL"] = DEFAULT_BASE_URL
 
 
+def _ts() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _wait_future(fut: Any, *, label: str, timeout_s: float, heartbeat_s: float) -> Any:
+    start = time.time()
+    while True:
+        elapsed = time.time() - start
+        remaining = timeout_s - elapsed
+        if remaining <= 0:
+            raise TimeoutError(f"timeout while waiting {label} elapsed_s={elapsed:.0f}")
+        try:
+            return fut.result(timeout=min(heartbeat_s, max(0.5, remaining)))
+        except TimeoutError:
+            print(f"[{_ts()}] waiting {label} elapsed_s={elapsed:.0f}", flush=True)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default=None, help="Overrides MINT_BASE_URL/TINKER_BASE_URL")
     p.add_argument("--api-key", default=None, help="Overrides MINT_API_KEY/TINKER_API_KEY")
+    p.add_argument("--models", default=DEFAULT_MODELS, help="Comma-separated HF model names")
     p.add_argument("--max-context-len", type=int, default=32000)
     p.add_argument("--steps", type=int, default=2)
     p.add_argument("--learning-rate", type=float, default=5e-5)
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--call-timeout-s", type=float, default=900.0)
+    p.add_argument("--heartbeat-s", type=float, default=60.0)
     return p.parse_args()
 
 
@@ -131,6 +161,7 @@ def _run_task(base_url: str, api_key: str | None, cfg: TaskConfig) -> dict[str, 
     from mint import types
 
     try:
+        t0 = time.time()
         sc = mint.ServiceClient(base_url=base_url, api_key=api_key)
         tc = sc.create_lora_training_client(
             base_model=cfg.model,
@@ -139,7 +170,13 @@ def _run_task(base_url: str, api_key: str | None, cfg: TaskConfig) -> dict[str, 
             train_attn=True,
             train_unembed=True,
         )
+        dt = time.time() - t0
+        print(f"[{_ts()}] [{cfg.model}] create_lora_training_client_s={dt:.2f}", flush=True)
+
+        t0 = time.time()
         tokenizer = tc.get_tokenizer()
+        dt = time.time() - t0
+        print(f"[{_ts()}] [{cfg.model}] get_tokenizer_s={dt:.2f}", flush=True)
     except Exception as e:
         return {
             "model": cfg.model,
@@ -170,8 +207,15 @@ def _run_task(base_url: str, api_key: str | None, cfg: TaskConfig) -> dict[str, 
 
     for step in range(cfg.steps):
         try:
+            t0 = time.time()
             fw_fut = tc.forward_backward(data=[datum], loss_fn="cross_entropy")
-            fw_res = fw_fut.result(timeout=cfg.call_timeout_s)
+            fw_res = _wait_future(
+                fw_fut,
+                label=f"forward_backward model={cfg.model} step={step + 1}/{cfg.steps}",
+                timeout_s=cfg.call_timeout_s,
+                heartbeat_s=cfg.heartbeat_s,
+            )
+            fw_s = time.time() - t0
         except Exception as e:
             return {
                 "model": cfg.model,
@@ -182,7 +226,9 @@ def _run_task(base_url: str, api_key: str | None, cfg: TaskConfig) -> dict[str, 
             }
 
         try:
+            t0 = time.time()
             loss = _compute_weighted_loss(fw_res.loss_fn_outputs, weights)
+            loss_s = time.time() - t0
             losses.append(loss)
         except Exception as e:
             return {
@@ -194,8 +240,15 @@ def _run_task(base_url: str, api_key: str | None, cfg: TaskConfig) -> dict[str, 
             }
 
         try:
+            t0 = time.time()
             opt_fut = tc.optim_step(types.AdamParams(learning_rate=cfg.learning_rate))
-            opt_fut.result(timeout=cfg.call_timeout_s)
+            _wait_future(
+                opt_fut,
+                label=f"optim_step model={cfg.model} step={step + 1}/{cfg.steps}",
+                timeout_s=cfg.call_timeout_s,
+                heartbeat_s=cfg.heartbeat_s,
+            )
+            opt_s = time.time() - t0
         except Exception as e:
             return {
                 "model": cfg.model,
@@ -205,7 +258,11 @@ def _run_task(base_url: str, api_key: str | None, cfg: TaskConfig) -> dict[str, 
                 "losses": losses,
             }
 
-        print(f"[{cfg.model}] step {step + 1}/{cfg.steps}: loss={loss:.4f}", flush=True)
+        print(
+            f"[{_ts()}] [{cfg.model}] step {step + 1}/{cfg.steps}: "
+            f"forward_backward_s={fw_s:.1f} loss_compute_s={loss_s:.1f} optim_step_s={opt_s:.1f} loss={loss:.4f}",
+            flush=True,
+        )
 
     return {"model": cfg.model, "status": "ok", "losses": losses}
 
@@ -223,11 +280,10 @@ def main() -> int:
     else:
         print("API key: missing (this is OK only if server allows unauthenticated access)", flush=True)
 
-    models = [
-        "Qwen/Qwen3-0.6B",
-        "Qwen/Qwen3-4B",
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",
-    ]
+    models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
+    if not models:
+        print("No models configured (empty --models)", flush=True)
+        return 2
 
     cfgs = [
         TaskConfig(
@@ -237,6 +293,7 @@ def main() -> int:
             steps=args.steps,
             learning_rate=args.learning_rate,
             call_timeout_s=args.call_timeout_s,
+            heartbeat_s=args.heartbeat_s,
         )
         for m in models
     ]

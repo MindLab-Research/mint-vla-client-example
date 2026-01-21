@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from . import ray_kill
+
 if TYPE_CHECKING:
     pass
 
@@ -111,6 +113,7 @@ def _create_multinode_vllm_actor(
     max_loras: int = 1,
     max_lora_rank: int = 8,
     max_num_seqs: int = 256,
+    max_num_batched_tokens: int | None = None,
 ):
     """Create a Ray actor class that wraps vLLM's AsyncLLMEngine for multi-node TP.
 
@@ -139,6 +142,7 @@ def _create_multinode_vllm_actor(
             quantization: str | None = None,
             enable_lora: bool = True,
             kv_cache_dtype: str | None = None,
+            max_num_batched_tokens: int | None = None,
         ):
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
@@ -153,6 +157,7 @@ def _create_multinode_vllm_actor(
             self.max_lora_rank = max_lora_rank
             self.max_num_seqs = max_num_seqs
             self.kv_cache_dtype = kv_cache_dtype
+            self.max_num_batched_tokens = max_num_batched_tokens
 
             self.engine = None
             self._initialized = False
@@ -166,11 +171,18 @@ def _create_multinode_vllm_actor(
             # v1's multiprocess architecture requires coordinator to have GPU
             import os
             os.environ["VLLM_USE_V1"] = "0"
+            # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
+            # disable to fall back to torch.distributed collectives.
+            os.environ["VLLM_DISABLE_PYNCCL"] = "1"
 
             # Import vLLM components AFTER setting env var
             from vllm import AsyncEngineArgs, AsyncLLMEngine
 
             # Build engine args for multi-node TP
+            # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
+            max_num_batched_tokens = self.max_num_batched_tokens
+            if max_num_batched_tokens is None:
+                max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -179,13 +191,14 @@ def _create_multinode_vllm_actor(
                 data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
                 enable_expert_parallel=self.enable_expert_parallel,
                 distributed_executor_backend="ray",  # Key: use Ray for multi-node
+                disable_custom_all_reduce=True,  # Avoid PyNcclCommunicator issues in multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 dtype="auto",
                 trust_remote_code=True,
                 max_model_len=self.max_model_len,
                 max_num_seqs=self.max_num_seqs,
                 enable_chunked_prefill=True,
-                max_num_batched_tokens=8192,
+                max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=True,
                 disable_log_stats=True,
                 enforce_eager=True,  # CUDA graphs OOM on K2 at 0.98 util
@@ -211,8 +224,16 @@ def _create_multinode_vllm_actor(
             logger.info("MultiNodeVLLMEngine initialized")
 
         async def is_ready(self) -> bool:
-            """Check if engine is initialized and ready."""
-            return self._initialized and self.engine is not None
+            """Check if engine is initialized and the EngineCore is responsive."""
+            if not self._initialized or self.engine is None:
+                return False
+            try:
+                # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
+                await self.engine.list_loras()
+            except Exception as e:
+                logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
+                return False
+            return True
 
         async def add_lora(self, lora_int_id: int, lora_path: str, lora_name: str) -> None:
             """Add LoRA adapter from shared filesystem path.
@@ -337,18 +358,21 @@ def _create_multinode_vllm_actor(
             request_id: str,
             lora_int_id: int | None,
             lora_path: str | None,
-        ) -> list[float]:
+        ) -> list[float | None]:
             """Compute logprobs for prompt tokens.
 
-            Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-            Output length is len(prompt_ids) - 1.
+            Returns a list of length len(prompt_ids), where:
+            - logprobs[0] is None (first token has no conditioning context)
+            - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -383,19 +407,18 @@ def _create_multinode_vllm_actor(
             # Extract prompt logprobs
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            logprobs = []
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
+            out: list[float | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
                     continue
                 token_id = prompt_ids[i]
-                if token_id in prompt_logprobs[i]:
-                    logprobs.append(prompt_logprobs[i][token_id].logprob)
-                else:
-                    logprobs.append(-100.0)
+                token_lp = prompt_logprobs[i].get(token_id)
+                out.append(token_lp.logprob if token_lp is not None else None)
 
-            return logprobs
+            return out
 
     return MultiNodeVLLMEngine
 
@@ -417,13 +440,14 @@ class MultiNodeInferenceEngine:
 
     Key differences from MultiLoRAInferenceEngine:
     - Uses vLLM's Ray backend instead of verl's single-node ZMQ pattern
-    - Outer actor has num_gpus=0 (vLLM manages GPU workers internally)
+    - Controller actor reserves 1 GPU for CUDA visibility; vLLM spawns 1-GPU workers in Ray
     - LoRA adapters must be on shared filesystem (all nodes access same path)
     """
 
     def __init__(
         self,
         model_path: str,
+        model_name: str | None = None,
         tensor_parallel_size: int = 16,
         pipeline_parallel_size: int = 1,
         data_parallel_size: int = 1,
@@ -433,12 +457,14 @@ class MultiNodeInferenceEngine:
         max_loras: int = 1,
         max_lora_rank: int = 8,
         max_num_seqs: int = 256,
+        max_num_batched_tokens: int | None = None,
         quantization: str | None = None,
         kv_cache_dtype: str | None = None,
         actor_name: str | None = None,
         shared_adapter_dir: str = "/vePFS-Mindverse/share/tinker_adapters",
     ):
         self.model_path = model_path
+        self.model_name = model_name
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.data_parallel_size = data_parallel_size
@@ -448,6 +474,7 @@ class MultiNodeInferenceEngine:
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.quantization = quantization
         self.kv_cache_dtype = kv_cache_dtype
         self.actor_name = actor_name or f"multinode_vllm_{model_path.split('/')[-1].lower()}"
@@ -460,40 +487,109 @@ class MultiNodeInferenceEngine:
 
     async def initialize(self) -> None:
         """Initialize the multi-node vLLM engine."""
-        print(f"[DEBUG] MultiNodeInferenceEngine.initialize() called", flush=True)
         async with self._init_lock:
             if self._initialized:
-                print(f"[DEBUG] Already initialized, returning", flush=True)
                 return
 
             if not ray.is_initialized():
                 ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
+            # vLLM v1 requires the controller actor to have a CUDA-visible GPU.
+            # Without this, vLLM falls back to "no active driver" and engine core init fails.
+            controller_gpus = 1
+            worker_gpus = (
+                self.tensor_parallel_size
+                * self.pipeline_parallel_size
+                * self.data_parallel_size
+            )
+            total_required_gpus = worker_gpus + controller_gpus
+            ray_cgraph_get_timeout = (
+                os.environ.get("RAY_CGRAPH_get_timeout")
+                or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
+                or "1800"
+            )
+
+            is_persistent = False
+            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+            if persistent_csv and self.model_name:
+                persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
+                is_persistent = self.model_name in persistent_models
+
             # Try to connect to existing actor
             existing_actor = None
             try:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
-                is_ready = ray.get(existing_actor.is_ready.remote(), timeout=30)
+                try:
+                    is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
+                except SystemExit as e:
+                    if getattr(e, "code", None) == 15:
+                        raise
+                    logger.warning(
+                        f"ray.get(is_ready) triggered SystemExit for {self.actor_name}: {e}; treating as not-ready"
+                    )
+                    is_ready = False
                 if is_ready:
                     logger.info(f"Connected to existing MultiNodeVLLMEngine: {self.actor_name}")
                     self.engine = existing_actor
                     self._initialized = True
+                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                    resource_pool = get_resource_pool()
+                    resource_pool.register(
+                        actor_name=self.actor_name,
+                        actor_type=ActorType.VLLM,
+                        num_gpus=total_required_gpus,
+                        actor_handle=self.engine,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=self.model_path,
+                        protected=is_persistent,
+                    )
+                    resource_pool.mark_ready(self.actor_name)
                     return
                 else:
                     logger.warning(f"Actor {self.actor_name} exists but not ready, will recreate")
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
             except ray.exceptions.GetTimeoutError:
-                logger.warning(f"Actor {self.actor_name} exists but is_ready timed out, will recreate")
+                # Actor might be busy (queued tasks) rather than dead.
+                # Do not kill on timeout; reuse and allow requests to queue.
+                logger.warning(f"Actor {self.actor_name} is_ready timed out; assuming busy and reusing actor")
+                self.engine = existing_actor
+                self._initialized = True
+                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                resource_pool = get_resource_pool()
+                resource_pool.register(
+                    actor_name=self.actor_name,
+                    actor_type=ActorType.VLLM,
+                    num_gpus=total_required_gpus,
+                    actor_handle=self.engine,
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=self.model_path,
+                    protected=is_persistent,
+                )
+                resource_pool.mark_ready(self.actor_name)
+                return
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
                 try:
-                    ray.kill(existing_actor, no_restart=True)
+                    ray_kill.kill(
+                        existing_actor,
+                        reason="multinode_vllm_recreate",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
+                    try:
+                        pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
                     # Wait for Ray to clean up the actor name
                     import time
                     for _ in range(10):
-                        time.sleep(1)
+                        await asyncio.sleep(1)
                         try:
                             ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                         except ValueError:
@@ -505,109 +601,88 @@ class MultiNodeInferenceEngine:
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
 
             # Step 1: Ensure enough GPUs are available (evict idle actors if needed)
-            from tinker_server.backend.resource_pool import get_resource_pool
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
             resource_pool = get_resource_pool()
-            total_required_gpus = (
-                self.tensor_parallel_size
-                * self.pipeline_parallel_size
-                * self.data_parallel_size
-            )
             logger.info(
-                f"Ensuring {total_required_gpus} GPUs available for vLLM "
+                f"Ensuring {total_required_gpus} GPUs available for multi-node vLLM "
                 f"(TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
-                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel})"
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
+                f"controller_gpus={controller_gpus}, worker_gpus={worker_gpus})"
             )
-            resource_pool.ensure_gpus_available(total_required_gpus, timeout=300)
+            await asyncio.to_thread(resource_pool.ensure_gpus_available, total_required_gpus, 300)
 
-            # Step 2: Find nodes with AVAILABLE GPUs
-            # Available = Total - PG_used - Actor_used (same logic as multi_lora_engine.py)
-            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+            # Step 2: Create a detached placement group and capture child tasks.
+            #
+            # vLLM's Ray backend spawns 1-GPU RayWorkerWrapper actors. Without a placement group,
+            # those workers can collide with Megatron placement groups, leading to vLLM init failures
+            # like "Free memory on device ... is less than desired GPU memory utilization".
+            from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-            target_node = None
-
-            # Count GPUs used by placement groups per node
-            pg_table = ray.util.placement_group_table()
-            gpus_used_by_pg: dict[str, int] = {}
-            for pg_id, pg_info in pg_table.items():
-                if pg_info.get("state") != "CREATED":
-                    continue
-                bundles_to_node = pg_info.get("bundles_to_node_id", {})
-                for bundle_idx, node_id in bundles_to_node.items():
-                    if node_id:
-                        # Each Megatron bundle uses 1 GPU
-                        gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
-
-            # Count GPUs used by actors tracked in ResourcePool
-            gpus_used_by_actors = resource_pool.gpus_used_by_node()
-
-            # Find nodes with enough available GPUs
-            # For multi-node vLLM (TP=16), we need nodes with 8 free GPUs each
-            gpus_per_node = 8  # Standard GPU node size
-            candidates: list[tuple[str, str, int]] = []  # (node_id, ip, available_gpus)
-
-            for node in ray.nodes():
-                if not node["Alive"]:
-                    continue
-                node_id = node["NodeID"]
-                node_ip = node["NodeManagerAddress"]
-                node_total_gpus = node.get("Resources", {}).get("GPU", 0)
-                if node_total_gpus == 0:
-                    continue
-
-                pg_gpus = gpus_used_by_pg.get(node_id, 0)
-                actor_gpus = gpus_used_by_actors.get(node_id, 0)
-                available_gpus = int(node_total_gpus - pg_gpus - actor_gpus)
-
-                logger.debug(
-                    f"Node {node_id[:8]} ({node_ip}): total={node_total_gpus}, "
-                    f"pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpus}"
+            pg_name = f"{self.actor_name}_pg"
+            try:
+                pg = ray.util.get_placement_group(pg_name)
+            except Exception:
+                pg = ray.util.placement_group(
+                    [{"GPU": 1, "CPU": 1}] * total_required_gpus,
+                    # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
+                    # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
+                    # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
+                    strategy="PACK",
+                    name=pg_name,
+                    lifetime="detached",
                 )
-
-                if available_gpus >= gpus_per_node:
-                    candidates.append((node_id, node_ip, available_gpus))
-
-            if not candidates:
-                raise RuntimeError(
-                    f"No nodes with {gpus_per_node}+ free GPUs after ensure_gpus_available({self.tensor_parallel_size}). "
-                    f"Check ResourcePool and placement group state."
-                )
-
-            # Prefer nodes with most available GPUs (cleanest placement)
-            candidates.sort(key=lambda x: -x[2])
-            target_node, target_ip, available = candidates[0]
-            logger.info(
-                f"Selected node {target_ip} ({target_node[:8]}) with {available} available GPUs"
-            )
+            try:
+                await asyncio.to_thread(ray.get, pg.ready())
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+                raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
 
             # Create new engine actor
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
                 max_loras=self.max_loras,
                 max_lora_rank=self.max_lora_rank,
                 max_num_seqs=self.max_num_seqs,
+                max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
-            # target_node is guaranteed set (RuntimeError raised above if no candidates)
-            # soft=False: fail if target unavailable, no fallback
             scheduling_opts = {
-                "scheduling_strategy": NodeAffinitySchedulingStrategy(
-                    node_id=target_node, soft=False
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
+                    # If the controller occupies bundle 0, RayWorkerWrapper(rank=0) will stay
+                    # PENDING_CREATION forever, and engine init never completes.
+                    #
+                    # Reserve the *last* bundle for the controller; leave [0..worker_gpus-1]
+                    # available for vLLM workers.
+                    placement_group_bundle_index=total_required_gpus - 1,
+                    placement_group_capture_child_tasks=True,
                 )
             }
 
-            # Actor has num_gpus=0 because vLLM's Ray backend manages GPU workers
+            # Controller actor must reserve a GPU for vLLM v1 engine core (CUDA visibility).
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                num_gpus=controller_gpus,
                 **scheduling_opts,
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
+                        # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
+                        # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
+                        "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
                         # Force vLLM v0 engine - v1's multiprocess architecture
                         # conflicts with Ray distributed executor backend
                         "VLLM_USE_V1": "0",
+                        "VLLM_DISABLE_PYNCCL": "1",
                     }
                 },
             ).remote(
@@ -621,6 +696,7 @@ class MultiNodeInferenceEngine:
                 quantization=self.quantization,
                 enable_lora=self.max_loras > 0,
                 kv_cache_dtype=self.kv_cache_dtype or "auto",
+                max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
             # Initialize engine (this spawns vLLM's Ray workers)
@@ -635,6 +711,8 @@ class MultiNodeInferenceEngine:
                 init_timeout = 3600
             elif total_required_gpus >= 8:
                 init_timeout = 1800
+            elif total_required_gpus >= 4:
+                init_timeout = 1800
             else:
                 init_timeout = 600
 
@@ -644,19 +722,66 @@ class MultiNodeInferenceEngine:
                     None,
                     lambda: ray.get(self.engine.initialize.remote(), timeout=init_timeout)
                 )
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                try:
+                    ray_kill.kill(
+                        self.engine,
+                        reason="multinode_vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        timeout_s=init_timeout,
+                    )
+                except Exception:
+                    pass
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+                self.engine = None
+                raise RuntimeError(f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
                 logger.error(f"Engine initialization timed out after {init_timeout}s")
-                ray.kill(self.engine, no_restart=True)
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_init_timeout",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=init_timeout,
+                )
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
                 self.engine = None
                 raise RuntimeError(f"MultiNodeVLLMEngine init timed out")
+            except Exception:
+                try:
+                    ray_kill.kill(
+                        self.engine,
+                        reason="multinode_vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        timeout_s=init_timeout,
+                    )
+                except Exception:
+                    pass
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+                self.engine = None
+                raise
 
             self._initialized = True
             logger.info(f"MultiNodeInferenceEngine initialized: {self.actor_name}")
 
             # Register with unified resource pool for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
-            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-            resource_pool = get_resource_pool()
             resource_pool.register(
                 actor_name=self.actor_name,
                 actor_type=ActorType.VLLM,
@@ -664,6 +789,7 @@ class MultiNodeInferenceEngine:
                 actor_handle=self.engine,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=self.model_path,
+                protected=is_persistent,
             )
             # Mark as ready since initialization completed
             resource_pool.mark_ready(self.actor_name)
@@ -800,7 +926,7 @@ class MultiNodeInferenceEngine:
         sampling_session_id: str | None,
         prompt_ids: list[int],
         request_id: str,
-    ) -> list[float]:
+    ) -> list[float | None]:
         """Compute logprobs using session-specific LoRA or base model."""
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
@@ -841,7 +967,12 @@ class MultiNodeInferenceEngine:
         """Disconnect from the engine."""
         if self.engine is not None and kill_actor:
             try:
-                ray.kill(self.engine)
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_shutdown",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
                 logger.info("Killed MultiNodeVLLMEngine actor")
             except Exception as e:
                 logger.warning(f"Error killing actor: {e}")

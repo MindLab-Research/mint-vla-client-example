@@ -15,6 +15,8 @@ from typing import Callable
 
 import ray
 
+from . import ray_kill
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +47,8 @@ class ActorEntry:
     # Protection flag: actor being created/initialized is not evictable
     # Set to False after initialization completes
     creating: bool = True
+    # If True, actor is never evicted by ResourcePool LRU.
+    protected: bool = False
 
     def touch(self):
         """Update last_accessed timestamp."""
@@ -138,6 +142,7 @@ class ResourcePool:
         base_model: str = "",
         session_id: str | None = None,
         node_id: str | None = None,
+        protected: bool = False,
     ) -> ActorEntry:
         """Register an actor with the pool.
 
@@ -165,6 +170,8 @@ class ResourcePool:
                     entry.actor_handle = actor_handle
                 if node_id:
                     entry.node_id = node_id
+                if protected:
+                    entry.protected = True
                 logger.info(f"[ResourcePool] Updated existing entry: {actor_name}")
             else:
                 entry = ActorEntry(
@@ -176,6 +183,7 @@ class ResourcePool:
                     base_model=base_model,
                     current_session=session_id,
                     node_id=node_id,
+                    protected=protected,
                 )
                 self._entries[actor_name] = entry
                 logger.info(
@@ -211,6 +219,42 @@ class ResourcePool:
             entry = self._entries.get(actor_name)
             if entry:
                 entry.current_session = session_id
+
+    def set_protected(self, actor_name: str, protected: bool = True) -> bool:
+        """Set (or clear) eviction protection for an actor."""
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            if entry is None:
+                return False
+            entry.protected = protected
+            return True
+
+    def is_protected(self, actor_name: str) -> bool:
+        """Return True if actor is marked protected in the pool."""
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            return bool(entry and entry.protected)
+
+    def clear_session(self, session_id: str) -> int:
+        """Clear session tracking entries matching session_id.
+
+        Used when a training session is deleted while actor creation/session
+        initialization is still in-flight, to avoid permanently pinning an
+        actor as non-idle due to a stale current_session value.
+
+        Returns:
+            Number of actor entries updated.
+        """
+        cleared = 0
+        with self._pool_lock:
+            for entry in self._entries.values():
+                if entry.current_session == session_id:
+                    entry.current_session = None
+                    entry.touch()
+                    cleared += 1
+        if cleared:
+            logger.info(f"[ResourcePool] Cleared current_session={session_id} for {cleared} actor(s)")
+        return cleared
 
     def touch(self, actor_name: str) -> bool:
         """Update last_accessed timestamp to mark actor as recently used.
@@ -299,7 +343,11 @@ class ResourcePool:
         """
         evictable = [
             e for e in self._entries.values()
-            if e.is_idle(self.SESSION_IDLE_TIMEOUT) and e.idle_time() > self.MIN_ACTOR_AGE
+            if (
+                not e.protected
+                and e.is_idle(self.SESSION_IDLE_TIMEOUT)
+                and e.idle_time() > self.MIN_ACTOR_AGE
+            )
         ]
         return sorted(evictable, key=lambda e: e.last_accessed)
 
@@ -327,7 +375,21 @@ class ResourcePool:
                 pass
 
             # Force kill
-            ray.kill(actor)
+            ray_kill.kill(
+                actor,
+                reason="resource_pool_evict",
+                actor_name=entry.actor_name,
+                namespace=entry.namespace,
+                actor_type=entry.actor_type.value,
+                num_gpus=entry.num_gpus,
+                base_model=entry.base_model,
+                current_session=entry.current_session,
+                creating=entry.creating,
+                idle_time=f"{entry.idle_time():.1f}",
+                age=f"{entry.age():.1f}",
+                min_actor_age=self.MIN_ACTOR_AGE,
+                session_idle_timeout=self.SESSION_IDLE_TIMEOUT,
+            )
             logger.info(f"[ResourcePool] Killed actor: {entry.actor_name}")
             return True
 
@@ -480,6 +542,7 @@ class ResourcePool:
                     "current_session": e.current_session,
                     "node_id": e.node_id,
                     "creating": e.creating,
+                    "protected": e.protected,
                     "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
                     "idle_time": e.idle_time(),
                     "age": e.age(),

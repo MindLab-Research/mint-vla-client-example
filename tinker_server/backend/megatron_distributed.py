@@ -24,6 +24,8 @@ import ray
 # to ensure CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
 # (tensordict imports torch internally)
 
+from . import ray_kill
+
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
@@ -2002,6 +2004,21 @@ class MegatronRankWorker:
             ep_size = 1
             ep_rank = 0
 
+        # For MoE models, exporting routed expert LoRAs requires EP gathering and
+        # per-expert expansion for vLLM. If we're not exporting per-expert weights,
+        # skip the MLP subtree early to avoid expensive TP/EP collectives.
+        try:
+            model_is_moe = get_model_config(self.base_model).is_moe
+        except Exception:
+            model_is_moe = False
+
+        skip_mlp_params = model_is_moe and not use_per_expert_lora
+
+        import os
+
+        debug_lora_export = os.environ.get("MINT_DEBUG_LORA_EXPORT", "0") == "1"
+        debug_lora_export_max_params = int(os.environ.get("MINT_DEBUG_LORA_EXPORT_MAX_PARAMS", "10"))
+
         def _gather_expert_lora_across_ep(tensor, ep_group, ep_size: int):
             """Gather expert LoRA tensor from all EP ranks.
 
@@ -2059,49 +2076,54 @@ class MegatronRankWorker:
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
                         original_shape = list(param.data.shape)
+                        do_debug_param = debug_lora_export and (len(lora_param_names) <= debug_lora_export_max_params)
+
+                        # MoE MLP/expert LoRAs are only needed when exporting per-expert weights.
+                        # If we aren't exporting per-expert LoRAs, skip the MLP subtree early to
+                        # avoid expensive TP/EP collectives and CPU copies.
+                        if skip_mlp_params and ".mlp." in name_lower:
+                            continue
+
                         # DEBUG: Log original tensor shape with more detail
-                        if self.rank == 0:
+                        if self.rank == 0 and do_debug_param:
                             is_lora_a = '.adapter.linear_in.' in name or '.lora_a.' in name_lower
                             lora_type = "lora_A" if is_lora_a else "lora_B"
                             logger.info(f"[Rank 0] Megatron {lora_type} {name}: shape={original_shape}")
                         # CRITICAL: ALL ranks must participate in gathering to avoid NCCL deadlock!
                         # Check if this parameter needs TP gathering
                         split_dim = _get_lora_tp_split_dim(name, etp_size=etp_size)
-                        if self.rank == 0:
+                        if self.rank == 0 and do_debug_param:
                             # Detailed logging for shape debugging
                             is_expert = '.mlp.experts.' in name or '.mlp.shared_experts.' in name or '.mlp.linear_fc' in name
                             logger.info(f"[Rank 0] {name}: split_dim={split_dim}, is_expert={is_expert}, etp_size={etp_size}, tp_size={tp_size}")
                         if split_dim is not None and tp_group is not None and tp_size > 1:
-                            # Gather across TP ranks, then clone to CPU
+                            # Gather across TP ranks (NCCL collective).
                             gathered = _gather_tensor_across_tp(param.data, tp_group, split_dim)
-                            cloned = gathered.cpu()
-                            if self.rank == 0:
-                                # Log shape change due to gathering
-                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(cloned.shape)} (dim={split_dim})")
+                            tensor_for_export = gathered
+                            if self.rank == 0 and do_debug_param:
+                                logger.info(f"[Rank 0] GATHERED {name}: {original_shape} -> {list(gathered.shape)} (dim={split_dim})")
                         else:
-                            # No TP gathering needed - just clone
-                            cloned = param.data.clone().cpu() if param.is_cuda else param.data.clone()
-                            if self.rank == 0:
-                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(cloned.shape)}")
+                            tensor_for_export = param.data
+                            if self.rank == 0 and do_debug_param:
+                                logger.info(f"[Rank 0] NO_GATHER {name}: shape={list(tensor_for_export.shape)}")
 
-                        # CRITICAL FIX: EP gathering for routed expert LoRAs
-                        # With EP=8, each rank holds different experts (64/8 = 8 per rank)
-                        # We must gather from ALL EP ranks to export complete expert weights
+                        # EP gather is only required when exporting per-expert expert LoRAs.
                         is_routed_expert = '.mlp.experts.' in name and '.mlp.shared_experts.' not in name
-                        if is_routed_expert and ep_group is not None and ep_size > 1:
-                            # ALL ranks participate in EP allgather
-                            ep_gathered = _gather_expert_lora_across_ep(cloned, ep_group, ep_size)
+                        if use_per_expert_lora and is_routed_expert and ep_group is not None and ep_size > 1:
+                            # ALL ranks participate in EP all_gather (NCCL collective).
+                            ep_gathered = _gather_expert_lora_across_ep(tensor_for_export, ep_group, ep_size)
                             if self.rank == 0:
-                                logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
+                                if do_debug_param:
+                                    logger.info(f"[Rank 0] EP_GATHERED {name}: {ep_size} shards, shape={list(ep_gathered[0].shape)}")
                                 # Store with EP rank index for later expansion
                                 # Key format: original_name::EP_RANK::{i}
                                 for i, tensor in enumerate(ep_gathered):
                                     ep_key = f"{name}::EP_RANK::{i}"
-                                    adapter_state[ep_key] = tensor.cpu() if tensor.is_cuda else tensor
+                                    adapter_state[ep_key] = tensor.detach().cpu()
                         else:
                             # Non-expert param or EP=1: store normally (only rank 0)
                             if self.rank == 0:
-                                adapter_state[name] = cloned
+                                adapter_state[name] = tensor_for_export.detach().cpu()
 
                 logger.info(f"[Rank {self.rank}] named_parameters() returned {len(all_param_names)} total, {len(lora_param_names)} LoRA params")
 
@@ -2228,12 +2250,6 @@ class MegatronRankWorker:
                            'gate_proj', 'up_proj', 'down_proj', 'shared_expert']
             name_lower = param_name.lower()
             return any(p in name_lower for p in mlp_patterns)
-
-        # Check if model is MoE
-        try:
-            model_is_moe = get_model_config(self.base_model).is_moe
-        except ValueError:
-            model_is_moe = False
 
         # Get number of experts for per-expert expansion (only when use_per_expert_lora=True)
         num_experts = 0
@@ -4204,7 +4220,17 @@ class MegatronWorkerGroup:
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
         futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora) for w in self.workers]
-        results = ray.get(futures, timeout=300)
+        world_size = len(self.workers)
+        if world_size >= 32:
+            default_timeout_s = 3600
+        elif world_size >= 16:
+            default_timeout_s = 1800
+        elif world_size >= 4:
+            default_timeout_s = 600
+        else:
+            default_timeout_s = 300
+        timeout_s = int(os.environ.get("MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+        results = ray.get(futures, timeout=timeout_s)
         result = results[0]  # Only rank 0 returns actual data
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
@@ -4417,7 +4443,7 @@ class MegatronWorkerGroup:
         # Then force kill all workers to release GPU memory
         for w in self.workers:
             try:
-                ray.kill(w, no_restart=True)
+                ray_kill.kill(w, reason="megatron_worker_group_shutdown", no_restart=True)
             except Exception:
                 pass
 
@@ -4563,7 +4589,16 @@ class MegatronActorPool:
             # Kill actor (no state to save since it's idle)
             try:
                 ray.get(entry.actor.shutdown.remote(), timeout=30)
-                ray.kill(entry.actor)
+                ray_kill.kill(
+                    entry.actor,
+                    reason="megatron_pool_evict",
+                    actor_name=_make_megatron_actor_name(entry.base_model),
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=entry.base_model,
+                    num_gpus=entry.num_gpus,
+                    idle_time=f"{entry.idle_time():.1f}",
+                    age=f"{entry.age():.1f}",
+                )
             except Exception as e:
                 logger.warning(f"[MegatronActorPool] Error killing evicted actor: {e}")
 
@@ -4660,13 +4695,25 @@ class MegatronActorPool:
             except ValueError:
                 # Actor doesn't exist, will create new one
                 pass
-            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                # Actor is dead or unresponsive, kill to free name before creating new one
-                logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead/unresponsive, killing to free name")
+            except ray.exceptions.RayActorError:
+                # Actor is dead, kill to free name before creating new one
+                logger.warning(f"[MegatronActorPool] Actor {actor_name} is dead, killing to free name")
                 try:
-                    ray.kill(existing_actor, no_restart=True)
+                    ray_kill.kill(
+                        existing_actor,
+                        reason="megatron_pool_existing_dead",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        base_model=base_model,
+                    )
                 except Exception as kill_err:
                     logger.warning(f"[MegatronActorPool] Could not kill dead actor: {kill_err}")
+            except ray.exceptions.GetTimeoutError:
+                # Actor might be busy; do not kill on timeout.
+                logger.warning(f"[MegatronActorPool] Actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor")
+                actor = existing_actor
+                need_create = False
 
             if need_create:
                 # Create new detached actor
@@ -4740,7 +4787,13 @@ class MegatronActorPool:
             if kill_actor:
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="megatron_pool_remove",
+                        actor_name=_make_megatron_actor_name(entry.base_model),
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
 
@@ -4793,7 +4846,13 @@ class MegatronActorPool:
                 self._actors.pop(key, None)
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="megatron_pool_evict_idle",
+                        actor_name=_make_megatron_actor_name(entry.base_model),
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[MegatronActorPool] Error killing idle actor: {e}")
                 logger.info(f"[MegatronActorPool] Evicted idle actor: {entry.base_model}")
@@ -4815,7 +4874,13 @@ class MegatronActorPool:
                 for entry in self._actors.values():
                     try:
                         ray.get(entry.actor.shutdown.remote(), timeout=30)
-                        ray.kill(entry.actor)
+                        ray_kill.kill(
+                            entry.actor,
+                            reason="megatron_pool_clear",
+                            actor_name=_make_megatron_actor_name(entry.base_model),
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=entry.base_model,
+                        )
                     except Exception as e:
                         logger.warning(f"[MegatronActorPool] Error killing actor: {e}")
             self._actors.clear()
@@ -4876,14 +4941,26 @@ def get_or_create_megatron_worker_group(
         # Verify actor is alive
         try:
             ray.get(actor.get_diagnostics.remote(), timeout=10)
-        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+        except ray.exceptions.RayActorError:
             # Actor is dead, kill to free name
             logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
             try:
-                ray.kill(actor, no_restart=True)
+                ray_kill.kill(
+                    actor,
+                    reason="megatron_actor_dead_free_name",
+                    actor_name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                )
             except Exception:
                 pass
             raise ValueError("Actor dead, will recreate")
+        except ray.exceptions.GetTimeoutError:
+            # Actor might be busy (queued tasks) rather than dead.
+            # Killing on timeout will terminate active training and corrupt in-flight requests.
+            logger.warning(
+                f"Megatron actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor"
+            )
         
         # Register with resource pool (reconnection case)
         resource_pool.register(
@@ -4936,12 +5013,9 @@ def get_or_create_megatron_worker_group(
             learning_rate=learning_rate,
             distributed_config=config,
         )
-
-        # Wait for initialization
-        ray.get(actor.__ray_ready__.remote())
-        logger.info(f"Megatron worker group {actor_name} initialized (detached actor)")
-
-        # Register with unified resource pool for LRU tracking
+        # Register immediately (creating=True) to account for GPU usage and prevent eviction.
+        # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
+        # marks the entry ready (creating=False) after __ray_ready__ completes.
         resource_pool.register(
             actor_name=actor_name,
             actor_type=ActorType.MEGATRON,
@@ -4949,10 +5023,8 @@ def get_or_create_megatron_worker_group(
             actor_handle=actor,
             namespace=PERSISTENT_NAMESPACE,
             base_model=base_model,
+            session_id=session_id,
         )
-        # Mark as ready after initialization completes
-        resource_pool.mark_ready(actor_name)
-
         return actor
     finally:
         # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
@@ -5020,7 +5092,14 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                 ray.get(actor.shutdown.remote(), timeout=10)
             except Exception:
                 pass
-            ray.kill(actor, no_restart=True)
+            ray_kill.kill(
+                actor,
+                reason="kill_megatron_actor",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+                no_restart=True,
+                base_model=base_model,
+            )
             logger.info(f"Killed Megatron actor: {actor_name}")
             resource_pool.unregister(actor_name)
             killed_any = True
@@ -5036,7 +5115,14 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                         ray.get(actor.shutdown.remote(), timeout=10)
                     except Exception:
                         pass
-                    ray.kill(actor, no_restart=True)
+                    ray_kill.kill(
+                        actor,
+                        reason="kill_megatron_actor",
+                        actor_name=entry.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        base_model=entry.base_model,
+                    )
                     logger.info(f"Killed Megatron actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     killed_any = True

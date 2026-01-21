@@ -20,6 +20,8 @@ import ray
 import torch
 from omegaconf import OmegaConf
 
+from . import ray_kill
+
 if TYPE_CHECKING:
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
@@ -601,18 +603,19 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             prompt_ids: list[int],
             request_id: str,
-        ) -> list[float]:
+        ) -> list[float | None]:
             """Compute logprobs for each token in the prompt.
 
-            Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-            Output length is len(prompt_ids) - 1.
+            Returns a list of length len(prompt_ids), where:
+            - logprobs[0] is None (first token has no conditioning context)
+            - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
 
             Args:
                 prompt_ids: Input token IDs.
                 request_id: Unique request identifier.
 
             Returns:
-                List of logprobs, length = len(prompt_ids) - 1.
+                List of logprobs, length = len(prompt_ids).
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -624,8 +627,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 VLLM_LORA_PATH,
             )
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             # Use max_tokens=1 with prompt_logprobs to get logprobs for prompt tokens
             # prompt_logprobs=1 returns top-1 logprob for each position
@@ -663,40 +668,32 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             # Extract prompt logprobs
             # prompt_logprobs is a list where element i contains logprob info for token i
-            # Skip first element (no conditioning) - want logprobs[i] = P(token[i+1] | token[0:i+1])
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            logprobs = []
-            # prompt_logprobs[i] contains logprob of token[i] given tokens[0:i]
-            # So prompt_logprobs[1] is P(token[1] | token[0])
-            # We want logprobs[i] = P(token[i+1] | token[0:i+1])
-            # So logprobs[0] = prompt_logprobs[1], etc.
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
+            out: list[float | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
                     continue
-                # Get logprob for the actual token at position i
                 token_id = prompt_ids[i]
-                if token_id in prompt_logprobs[i]:
-                    logprobs.append(prompt_logprobs[i][token_id].logprob)
-                else:
-                    # Token wasn't in top-k, use a default small value
-                    logprobs.append(-100.0)
+                token_lp = prompt_logprobs[i].get(token_id)
+                out.append(token_lp.logprob if token_lp is not None else None)
 
-            return logprobs
+            return out
 
         async def compute_prompt_topk(
             self,
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
-        ) -> list[dict[int, float]]:
+        ) -> list[dict[int, float] | None]:
             """Get top-K tokens and logprobs at each prompt position.
 
             Returns topk[i] = dict of {token_id: logprob} for top-K tokens
             at position i (predicting token i+1 given tokens 0..i).
-            Output length is len(prompt_ids) - 1.
+            Output length is len(prompt_ids), with topk[0]=None.
 
             Args:
                 prompt_ids: Input token IDs.
@@ -716,8 +713,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 VLLM_LORA_PATH,
             )
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -756,17 +755,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            result = []
-            # prompt_logprobs[i] contains logprob info for token[i] given tokens[0:i]
-            # Skip position 0 (no prior context)
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
-                    result.append({})
+            result: list[dict[int, float] | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    result.append(None)
                     continue
-                # Convert to dict of token_id -> logprob
-                pos_dict = {}
+                pos_dict: dict[int, float] = {}
                 for token_id, logprob_obj in prompt_logprobs[i].items():
                     pos_dict[token_id] = logprob_obj.logprob
                 result.append(pos_dict)
@@ -778,7 +774,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             lora_int_id: int,
-        ) -> list[float]:
+        ) -> list[float | None]:
             """Compute logprobs with specific LoRA adapter.
 
             For multi-LoRA: routes request to session-specific adapter.
@@ -789,14 +785,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 lora_int_id: The LoRA adapter ID to use.
 
             Returns:
-                List of logprobs, length = len(prompt_ids) - 1.
+                List of logprobs, length = len(prompt_ids).
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -836,19 +834,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             # Extract prompt logprobs
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            logprobs = []
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
+            out: list[float | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
                     continue
                 token_id = prompt_ids[i]
-                if token_id in prompt_logprobs[i]:
-                    logprobs.append(prompt_logprobs[i][token_id].logprob)
-                else:
-                    logprobs.append(-100.0)
+                token_lp = prompt_logprobs[i].get(token_id)
+                out.append(token_lp.logprob if token_lp is not None else None)
 
-            return logprobs
+            return out
 
         async def compute_prompt_topk_with_lora(
             self,
@@ -856,11 +853,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             request_id: str,
             lora_int_id: int,
             k: int = 10,
-        ) -> list[dict[int, float]]:
+        ) -> list[dict[int, float] | None]:
             """Get top-K tokens with specific LoRA adapter.
 
             Returns topk[i] = dict of {token_id: logprob} for position i.
-            Output length is len(prompt_ids) - 1.
+            Output length is len(prompt_ids), with topk[0]=None.
 
             Args:
                 prompt_ids: Input token IDs.
@@ -875,8 +872,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -912,14 +911,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            result = []
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
-                    result.append({})
+            result: list[dict[int, float] | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    result.append(None)
                     continue
-                pos_dict = {}
+                pos_dict: dict[int, float] = {}
                 for token_id, logprob_obj in prompt_logprobs[i].items():
                     pos_dict[token_id] = logprob_obj.logprob
                 result.append(pos_dict)
@@ -930,7 +929,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             prompt_ids: list[int],
             request_id: str,
-        ) -> list[float]:
+        ) -> list[float | None]:
             """Compute logprobs using base model without any LoRA adapter.
 
             For multi-LoRA engine: computes logprobs with base model weights only.
@@ -940,13 +939,15 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 request_id: Unique request identifier.
 
             Returns:
-                List of logprobs, length = len(prompt_ids) - 1.
+                List of logprobs, length = len(prompt_ids).
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -973,26 +974,25 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             # Extract prompt logprobs
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            logprobs = []
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
+            out: list[float | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
                     continue
                 token_id = prompt_ids[i]
-                if token_id in prompt_logprobs[i]:
-                    logprobs.append(prompt_logprobs[i][token_id].logprob)
-                else:
-                    logprobs.append(-100.0)
+                token_lp = prompt_logprobs[i].get(token_id)
+                out.append(token_lp.logprob if token_lp is not None else None)
 
-            return logprobs
+            return out
 
         async def compute_prompt_topk_base(
             self,
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
-        ) -> list[dict[int, float]]:
+        ) -> list[dict[int, float] | None]:
             """Get top-K tokens using base model without any LoRA adapter.
 
             For multi-LoRA engine: computes top-K with base model weights only.
@@ -1008,8 +1008,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
 
-            if len(prompt_ids) < 2:
+            if not prompt_ids:
                 return []
+            if len(prompt_ids) == 1:
+                return [None]
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -1034,14 +1036,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
-                return []
+                return [None] * len(prompt_ids)
 
-            result = []
-            for i in range(1, len(prompt_logprobs)):
-                if prompt_logprobs[i] is None:
-                    result.append({})
+            result: list[dict[int, float] | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    result.append(None)
                     continue
-                pos_dict = {}
+                pos_dict: dict[int, float] = {}
                 for token_id, logprob_obj in prompt_logprobs[i].items():
                     pos_dict[token_id] = logprob_obj.logprob
                 result.append(pos_dict)
@@ -1277,8 +1279,15 @@ class VerlInferenceEngine:
             }
             logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
 
-        # Use model registry's max_model_len (single source of truth)
-        max_model_len = get_model_config(self.model_path).max_model_len
+        # Use model registry as single source of truth for memory constraints.
+        cfg = get_model_config(self.model_path)
+        max_model_len = cfg.max_model_len
+        max_num_seqs = cfg.max_num_seqs or 256
+        gpu_util = cfg.gpu_memory_utilization or self.gpu_memory_utilization
+        # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
+        max_num_batched_tokens = cfg.max_num_batched_tokens
+        if max_num_batched_tokens is None:
+            max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
         # verl calculates max_model_len = prompt_length + response_length
         # We split evenly, but this does NOT restrict actual prompt/response sizes:
         # - The split only affects verl's default max_new_tokens (response_length)
@@ -1295,15 +1304,16 @@ class VerlInferenceEngine:
         rollout_config = RolloutConfig(
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
-            gpu_memory_utilization=self.gpu_memory_utilization,
+            gpu_memory_utilization=gpu_util,
             prompt_length=prompt_length,
             response_length=response_length,
-            max_num_seqs=256,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
             dtype="auto",
             load_format="auto",
             enforce_eager=False,
             enable_chunked_prefill=True,
-            max_num_batched_tokens=8192,
+            max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=True,
             disable_log_stats=True,
             temperature=1.0,
@@ -1410,18 +1420,19 @@ class VerlInferenceEngine:
         self,
         prompt_ids: list[int],
         request_id: str,
-    ) -> list[float]:
+    ) -> list[float | None]:
         """Compute logprobs for each token in the sequence.
 
-        Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-        Output length is len(prompt_ids) - 1.
+        Returns a list of length len(prompt_ids), where:
+        - logprobs[0] is None (first token has no conditioning context)
+        - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
 
         Args:
             prompt_ids: Input token IDs.
             request_id: Unique request identifier.
 
         Returns:
-            List of logprobs, length = len(prompt_ids) - 1.
+            List of logprobs, length = len(prompt_ids).
         """
         if not self._initialized:
             await self.initialize()
@@ -1468,7 +1479,7 @@ class VerlInferenceEngine:
     async def shutdown(self) -> None:
         """Cleanup Ray actors."""
         if self.server:
-            ray.kill(self.server)
+            ray_kill.kill(self.server, reason="verl_inference_shutdown", namespace="tinker")
             self.server = None
         self._initialized = False
         logger.info("VerlInferenceEngine shutdown")

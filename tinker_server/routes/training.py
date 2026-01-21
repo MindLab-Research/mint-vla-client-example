@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,7 @@ from ..models.types import (
     CreateModelFromStateResponse,
     CreateModelRequest,
     CreateModelResponse,
+    Datum,
     ForwardBackwardRequest,
     ForwardRequest,
     GetInfoRequest,
@@ -85,6 +87,32 @@ def _get_webhook_url(request: Request) -> str | None:
 def _generate_model_id(session_id: str, model_seq_id: int) -> str:
     """Generate unique model_id from session_id and model_seq_id."""
     return f"{session_id}_{model_seq_id}"
+
+def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
+    """Compute (total_tokens, max_seq_len) without materializing token-id lists."""
+    total_tokens = 0
+    max_seq_len = 0
+    for datum in data:
+        seq_len = 0
+        for chunk in datum.model_input.chunks:
+            if chunk.type == "encoded_text":
+                seq_len += len(chunk.tokens)
+        total_tokens += seq_len
+        if seq_len > max_seq_len:
+            max_seq_len = seq_len
+    return total_tokens, max_seq_len
+
+def _get_max_model_len(base_model: str | None) -> int | None:
+    """Return the configured max_model_len for a supported model name, else None."""
+    if not base_model:
+        return None
+    try:
+        from ..backend.model_registry import get_model_config, normalize_model_name
+
+        model_name = normalize_model_name(base_model)
+        return int(get_model_config(model_name).max_model_len)
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -190,6 +218,14 @@ async def _do_create_model(
         # Clean up session if it was created
         if training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
+        # If session tracking was updated in ResourcePool during a partially-failed
+        # create_training_session, clear it to avoid pinning actors as non-idle.
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            get_resource_pool().clear_session(model_id)
+        except Exception:
+            pass
         future_store.fail(request_id, str(e))
 
         # 发送 failed 状态
@@ -351,6 +387,18 @@ async def forward_backward(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    max_model_len = _get_max_model_len(session.base_model)
+    if max_model_len is not None:
+        _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
+        if max_seq_len > max_model_len:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                    f"for model {session.base_model}"
+                ),
+            )
+
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
     background_tasks.add_task(_do_forward_backward, request_id, session, request, user_id)
@@ -365,15 +413,25 @@ async def _do_forward_backward(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
+        batch = request.forward_backward_input.data
+        token_count, max_seq_len = _compute_token_stats(batch)
+        t0 = time.time()
+        msg = (
+            f"[{session.model_id}] forward_backward start request_id={request_id} "
+            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
+            f"loss_fn={request.forward_backward_input.loss_fn}"
+        )
+        print(msg, flush=True)
+        logger.info(msg)
         result = await training_engine.forward_backward(session, request)
+        elapsed_s = time.time() - t0
+        msg = f"[{session.model_id}] forward_backward done request_id={request_id} elapsed_s={elapsed_s:.3f}"
+        print(msg, flush=True)
+        logger.info(msg)
         future_store.resolve(request_id, result)
 
         # Log usage
         if user_id:
-            # Count tokens in the batch
-            token_count = sum(
-                len(datum.model_input.to_token_ids()) for datum in request.forward_backward_input.data
-            )
             get_usage_logger().log(
                 user_id=user_id,
                 operation_type="forward_backward",
@@ -409,6 +467,18 @@ async def train_step(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
+    max_model_len = _get_max_model_len(session.base_model)
+    if max_model_len is not None:
+        _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
+        if max_seq_len > max_model_len:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                    f"for model {session.base_model}"
+                ),
+            )
+
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
     background_tasks.add_task(_do_train_step, request_id, session, request, user_id)
@@ -423,14 +493,24 @@ async def _do_train_step(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
+        batch = request.forward_backward_input.data
+        token_count, max_seq_len = _compute_token_stats(batch)
+        t0 = time.time()
+        msg = (
+            f"[{session.model_id}] train_step start request_id={request_id} "
+            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
+        )
+        print(msg, flush=True)
+        logger.info(msg)
         result = await training_engine.train_step(session, request)
+        elapsed_s = time.time() - t0
+        msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
+        print(msg, flush=True)
+        logger.info(msg)
         future_store.resolve(request_id, result)
 
         # Log usage
         if user_id:
-            token_count = sum(
-                len(datum.model_input.to_token_ids()) for datum in request.forward_backward_input.data
-            )
             get_usage_logger().log(
                 user_id=user_id,
                 operation_type="train_step",
@@ -468,6 +548,18 @@ async def forward(
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
+
+    max_model_len = _get_max_model_len(session.base_model)
+    if max_model_len is not None:
+        _, max_seq_len = _compute_token_stats(request.forward_input.data)
+        if max_seq_len > max_model_len:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                    f"for model {session.base_model}"
+                ),
+            )
 
     request_id = future_store.create()
     background_tasks.add_task(_do_forward, request_id, session, request)
@@ -521,7 +613,16 @@ async def _do_optim_step(request_id: str, session, request: OptimStepRequest) ->
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
+        lr = request.adam_params.learning_rate if request.adam_params else None
+        t0 = time.time()
+        msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
+        print(msg, flush=True)
+        logger.info(msg)
         result = await training_engine.optim_step(session, request)
+        elapsed_s = time.time() - t0
+        msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
+        print(msg, flush=True)
+        logger.info(msg)
         future_store.resolve(request_id, result)
 
     except Exception as e:
@@ -622,12 +723,24 @@ async def _do_save_weights_for_sampler(
             # Ephemeral save - generate unique temp name
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
 
+        use_per_expert_lora = bool(request.use_per_expert_lora)
+        if (
+            session.backend == "megatron"
+            and not use_per_expert_lora
+            and "use_per_expert_lora" not in getattr(request, "model_fields_set", set())
+        ):
+            # Default behavior for MoE: if the session trains MLP LoRA, export in
+            # per-expert format so vLLM can consume it.
+            if getattr(getattr(session, "lora_config", None), "train_mlp", False):
+                use_per_expert_lora = True
+
         print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
             checkpoint_base_dir=checkpoint_dir,
+            use_per_expert_lora=use_per_expert_lora,
         )
         print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
@@ -685,6 +798,7 @@ async def _do_save_weights_for_sampler(
                     session_id=sampling_session_id,
                     base_model=base_model,
                     lora_rank=lora_rank,
+                    adapter_path=save_path,
                 )
                 print(f"[DEBUG _do_save_weights_for_sampler] registered session", flush=True)
 
@@ -860,6 +974,14 @@ async def delete_model(model_id: str):
 
     await training_engine.shutdown_session(session)
     training_manager.delete_session(model_id)
+    # Clear ResourcePool session tracking even if shutdown_session couldn't find a worker
+    # (e.g., deletion races with create_training_session still in-flight).
+    try:
+        from ..backend.resource_pool import get_resource_pool
+
+        get_resource_pool().clear_session(model_id)
+    except Exception:
+        pass
 
     return {"model_id": model_id, "status": "deleted"}
 

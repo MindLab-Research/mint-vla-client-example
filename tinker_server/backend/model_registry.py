@@ -49,6 +49,8 @@ class ModelConfig:
     max_lora_rank: int | None = None  # None = use global default, or override for large models
     max_model_len: int  # vLLM context limit (required - no fallback)
     max_num_seqs: int | None = None  # None = use default (256), or lower for large MoE models with KV cache constraints
+    # prompt_logprobs/logits can spike memory; lower values reduce peak usage at the cost of speed.
+    max_num_batched_tokens: int | None = None  # None = use engine default heuristic
     kv_cache_dtype: str | None = None  # None = use model's default, "fp8_e5m2" halves KV cache memory
     gradient_checkpointing: bool = False  # Enable for large dense models to reduce VRAM usage
     is_mla: bool = False  # Uses Multi-Latent Attention (DeepSeek V3 architecture)
@@ -89,11 +91,13 @@ MODEL_CONFIGS = {
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
+        max_num_seqs=32,  # Leave vLLM headroom for 32K prompt_logprobs
         gradient_checkpointing=True,  # Required for sequences >5000 tokens
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
+        max_num_seqs=64,  # Leave headroom for long-context prompt_logprobs
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
@@ -104,6 +108,8 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
+        max_num_seqs=32,  # Leave headroom for long-context prompt_logprobs
+        max_num_batched_tokens=2048,  # Cap prompt_logprobs peak allocations at long context
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     "Qwen/Qwen3-8B": ModelConfig(
@@ -117,6 +123,8 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,  # 40K context - full model capability
+        max_num_seqs=8,  # Constrain KV cache; prompt_logprobs needs headroom at long context
+        max_num_batched_tokens=1024,  # Avoid multi-GB logits buffers during prompt_logprobs
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
@@ -147,6 +155,8 @@ MODEL_CONFIGS = {
         train_ep=8,
         max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
         max_model_len=32768,  # 32K context
+        max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
+        max_num_batched_tokens=512,  # prompt_logprobs memory spike at 32K
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(

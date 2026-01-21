@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from safetensors.torch import load_file
 
+from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateSamplingSessionRequest,
@@ -252,6 +253,7 @@ async def session_heartbeat(
 
     Accepts heartbeat and returns acknowledgment. Session validation not implemented.
     """
+    session_heartbeat_store.update(request.session_id)
     return SessionHeartbeatResponse()
 
 

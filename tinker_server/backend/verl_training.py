@@ -6,6 +6,7 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from .training_session_manager import TrainingSession
 
 logger = logging.getLogger(__name__)
+
+from . import ray_kill
 
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
@@ -926,11 +929,6 @@ class TrainingWorker:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = learning_rate
 
-        # Log gradient state before applying update
-        grad_count = sum(1 for p in self.model.parameters() if p.requires_grad and p.grad is not None)
-        pre_clip_norm = sum((p.grad.norm().item() ** 2) for p in self.model.parameters() if p.requires_grad and p.grad is not None) ** 0.5
-        print(f"[DEBUG] optim_step: {grad_count} grads, pre_clip_norm={pre_clip_norm:.4f}", flush=True)
-
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -1381,6 +1379,13 @@ class TrainingWorker:
         if hasattr(self, "optimizer"):
             del self.optimizer
         torch.cuda.empty_cache()
+        # Ensure this actor cannot remain alive in a partially-shutdown state.
+        # A detached actor that survives after deleting model/optimizer will
+        # later fail get_session_info()/training calls and wedge create_model.
+        try:
+            ray.actor.exit_actor()
+        except Exception:
+            pass
 
 
 class VerlTrainingEngine:
@@ -1395,6 +1400,9 @@ class VerlTrainingEngine:
         self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
+        # Map model_id -> Ray actor name registered in ResourcePool, used to keep
+        # actors marked as active during long-running calls (32k forward/backward).
+        self._resource_pool_actor_names: dict[str, str] = {}
 
     async def initialize(self) -> None:
         """Initialize Ray connection."""
@@ -1403,26 +1411,90 @@ class VerlTrainingEngine:
             ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
+    def _kill_session_actor(self, session: "TrainingSession") -> None:
+        model_id = session.model_id
+
+        worker = self._workers.get(model_id)
+        if worker is not None:
+            actor_name = self._resource_pool_actor_names.get(model_id)
+            try:
+                ray_kill.kill(
+                    worker,
+                    reason="session_timeout",
+                    actor_name=actor_name,
+                    namespace="tinker",
+                    no_restart=True,
+                    model_id=model_id,
+                )
+            except Exception:
+                pass
+            return
+
+        actor_name = self._resource_pool_actor_names.get(model_id)
+        if not actor_name:
+            return
+        try:
+            actor = ray.get_actor(actor_name, namespace="tinker")
+        except Exception:
+            return
+        try:
+            ray_kill.kill(
+                actor,
+                reason="session_timeout",
+                actor_name=actor_name,
+                namespace="tinker",
+                no_restart=True,
+                model_id=model_id,
+            )
+        except Exception:
+            pass
+
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
-        Called during training operations to:
-        1. Mark actor as recently used (prevents LRU eviction)
-        2. Associate current session with actor (prevents idle eviction)
+        ResourcePool idleness is time-based; a 32k forward/backward can easily run
+        longer than the idle timeout. We keep actors marked as active while a
+        request is in-flight to prevent eviction of busy actors.
         """
+        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        if not actor_name:
+            return
         from .resource_pool import get_resource_pool
-        from .megatron_distributed import _make_megatron_actor_name
 
-        # Only Megatron actors are tracked in the unified resource pool
-        # Dense trainers use their own DenseTrainerPool with touch() calls
-        if session.backend == "megatron":
-            base_model = session.base_model or self.default_base_model
-            if base_model:
-                actor_name = _make_megatron_actor_name(base_model)
-                resource_pool = get_resource_pool()
-                resource_pool.touch(actor_name)
-                # Associate session with actor to prevent idle eviction
-                resource_pool.set_session(actor_name, session.model_id)
+        resource_pool = get_resource_pool()
+        resource_pool.touch(actor_name)
+        resource_pool.set_session(actor_name, session.model_id)
+
+    async def _await_with_keepalive(
+        self,
+        awaitable,
+        session: "TrainingSession",
+        interval_s: float = 30.0,
+        timeout_s: float | None = None,
+    ):
+        """Await a Ray call while periodically touching ResourcePool.
+
+        Uses a poll loop with `ray.get(..., timeout=...)` executed in a thread to
+        avoid blocking the asyncio event loop. This ensures `timeout_s` can fire
+        during long Ray calls.
+        """
+        start = time.time()
+        while True:
+            self._touch_actor(session)
+
+            wait_s = interval_s
+            if timeout_s is not None and timeout_s > 0:
+                remaining = timeout_s - (time.time() - start)
+                if remaining <= 0:
+                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s; killing actor")
+                    self._kill_session_actor(session)
+                    raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+                wait_s = min(wait_s, remaining)
+
+            try:
+                return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
+            except ray.exceptions.GetTimeoutError:
+                continue
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -1506,9 +1578,13 @@ class VerlTrainingEngine:
         else:
             base_model = requested_model
 
-        print(f"[DEBUG create_training_session] use_megatron={use_megatron}, base_model={base_model}", flush=True)
+        print(
+            f"[DEBUG {model_id}] create_training_session start: requested_model={requested_model} use_megatron={use_megatron} base_model={base_model}",
+            flush=True,
+        )
 
         if use_megatron:
+            import asyncio
             # MoE models need tensor/expert parallelism from model registry
             from .model_registry import get_training_parallelism, requires_fp8
 
@@ -1528,15 +1604,49 @@ class VerlTrainingEngine:
             # Uses detached Ray actor pattern like vLLM for crash resilience
             # Use async version to avoid blocking uvicorn event loop
             # Issue #44: Pass model_id for unique session state isolation
-            worker = await async_get_or_create_megatron_worker_group(
-                base_model=base_model,
-                lora_rank=lora_rank,
-                learning_rate=session.learning_rate,
-                distributed_config=distributed_config,
-                session_id=session.model_id,
+            megatron_timeout_s = float(os.environ.get("MINT_MEGATRON_CREATE_TIMEOUT_S", "1800"))
+            print(
+                f"[DEBUG {model_id}] megatron get_or_create start: timeout_s={megatron_timeout_s}",
+                flush=True,
+            )
+            try:
+                worker = await asyncio.wait_for(
+                    async_get_or_create_megatron_worker_group(
+                        base_model=base_model,
+                        lora_rank=lora_rank,
+                        learning_rate=session.learning_rate,
+                        distributed_config=distributed_config,
+                        session_id=session.model_id,
+                    ),
+                    timeout=megatron_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                # Best-effort: kill the persistent Megatron actor to unblock retries.
+                from .megatron_distributed import _make_megatron_actor_name
+
+                actor_name = _make_megatron_actor_name(base_model or requested_model or "")
+                try:
+                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    ray_kill.kill(
+                        actor,
+                        reason="megatron_create_timeout",
+                        actor_name=actor_name,
+                        namespace="tinker",
+                        no_restart=True,
+                        model_id=model_id,
+                        timeout_s=megatron_timeout_s,
+                    )
+                except Exception:
+                    pass
+                raise
+            print(
+                f"[DEBUG {model_id}] megatron get_or_create done",
+                flush=True,
             )
             session.backend = "megatron"
-            # Associate session with actor in resource pool immediately
+            from .megatron_distributed import _make_megatron_actor_name
+
+            self._resource_pool_actor_names[model_id] = _make_megatron_actor_name(base_model or "")
             self._touch_actor(session)
             # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
             # with session_id for proper session state management (Issue #44)
@@ -1544,21 +1654,50 @@ class VerlTrainingEngine:
             # Phase 8: Use DenseTrainerPool for actor reuse
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
 
+            import asyncio
+            dense_get_timeout_s = float(os.environ.get("MINT_DENSE_GET_OR_CREATE_TIMEOUT_S", "1800"))
             pool = get_dense_trainer_pool()
-            entry = pool.get_or_create(
-                base_model=base_model,
-                lora_rank=lora_rank,
-                learning_rate=session.learning_rate,
-                session_id=session.model_id,
+            print(
+                f"[DEBUG {model_id}] dense get_or_create start: timeout_s={dense_get_timeout_s}",
+                flush=True,
+            )
+            entry = await asyncio.wait_for(
+                asyncio.to_thread(
+                    pool.get_or_create,
+                    base_model,
+                    lora_rank,
+                    session.learning_rate,
+                    session.model_id,
+                ),
+                timeout=dense_get_timeout_s,
+            )
+            print(
+                f"[DEBUG {model_id}] dense get_or_create done: max_rank={entry.max_lora_rank}",
+                flush=True,
             )
             worker = entry.actor
+            self._resource_pool_actor_names[model_id] = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
+            self._touch_actor(session)
 
             # Reinitialize LoRA weights for fresh session (statelessness)
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
             logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
-            import ray
-            result = ray.get(worker.reinit_lora_weights.remote(session.learning_rate))
+            reinit_timeout_s = float(os.environ.get("MINT_REINIT_LORA_TIMEOUT_S", "120"))
+            print(
+                f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={reinit_timeout_s}",
+                flush=True,
+            )
+            result = await self._await_with_keepalive(
+                worker.reinit_lora_weights.remote(session.learning_rate),
+                session,
+                interval_s=30.0,
+                timeout_s=reinit_timeout_s,
+            )
+            print(
+                f"[DEBUG {model_id}] dense reinit_lora_weights done",
+                flush=True,
+            )
             logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
 
             # Update pool entry with current session
@@ -1568,9 +1707,47 @@ class VerlTrainingEngine:
             session.backend = "peft"
             logger.info(f"[{model_id}] DenseTrainerPool: reusing actor for {base_model} (max_rank={entry.max_lora_rank})")
 
+        # For Megatron: avoid blocking create_session on __ray_ready__.
+        #
+        # __ray_ready__ is a normal actor task, so it can queue behind long-running
+        # initialization/work tasks and appear to "hang" for hours even when the actor
+        # is healthy. Returning early lets clients proceed; subsequent training calls
+        # will naturally queue until the actor is ready.
+        if session.backend == "megatron":
+            actor_name = self._resource_pool_actor_names.get(model_id)
+            if actor_name:
+                from .resource_pool import get_resource_pool
+
+                get_resource_pool().mark_ready(actor_name)
+
+            self._workers[model_id] = worker
+            session.is_active = True
+            logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
+            return
+
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
-        await worker.__ray_ready__.remote()
+        default_ready_timeout_s = "3600" if session.backend == "megatron" else "900"
+        ready_timeout_s = float(os.environ.get("MINT_ACTOR_READY_TIMEOUT_S", default_ready_timeout_s))
+        print(
+            f"[DEBUG {model_id}] __ray_ready__ start: timeout_s={ready_timeout_s}",
+            flush=True,
+        )
+        await self._await_with_keepalive(
+            worker.__ray_ready__.remote(),
+            session,
+            interval_s=30.0,
+            timeout_s=ready_timeout_s,
+        )
+        print(
+            f"[DEBUG {model_id}] __ray_ready__ done",
+            flush=True,
+        )
+        actor_name = self._resource_pool_actor_names.get(model_id)
+        if actor_name:
+            from .resource_pool import get_resource_pool
+
+            get_resource_pool().mark_ready(actor_name)
 
         self._workers[model_id] = worker
         session.is_active = True
@@ -1602,9 +1779,10 @@ class VerlTrainingEngine:
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.forward_backward.remote(
+        pending = worker.forward_backward.remote(
             data_items, loss_fn, loss_fn_config, session.model_id
         )
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
         session.accumulated_gradients += 1
@@ -1637,7 +1815,8 @@ class VerlTrainingEngine:
         data_items = [item.model_dump() for item in request.forward_input.data]
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.forward.remote(data_items, session.model_id)
+        pending = worker.forward.remote(data_items, session.model_id)
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         logger.info(f"[{model_id}] forward completed")
         return result
@@ -1685,7 +1864,8 @@ class VerlTrainingEngine:
         lr = request.adam_params.learning_rate if request.adam_params else None
 
         # Remote call - pass session_id for stateless trainer pattern
-        result = await worker.optim_step.remote(lr, session.model_id)
+        pending = worker.optim_step.remote(lr, session.model_id)
+        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
         session.current_step += 1
@@ -1734,20 +1914,23 @@ class VerlTrainingEngine:
 
         if use_train_step:
             # MoE: Use combined train_step to keep gradients in same context
-            result = await worker.train_step.remote(
+            pending = worker.train_step.remote(
                 data_items,
                 loss_fn,
                 loss_fn_config,
                 lr,
                 session.model_id,
             )
+            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
-            fb_result = await worker.forward_backward.remote(
+            fb_pending = worker.forward_backward.remote(
                 data_items, loss_fn, loss_fn_config, session.model_id
             )
-            opt_result = await worker.optim_step.remote(lr, session.model_id)
+            fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
+            opt_pending = worker.optim_step.remote(lr, session.model_id)
+            opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
 
             # Merge results
             result = fb_result.copy()
@@ -1818,6 +2001,7 @@ class VerlTrainingEngine:
         session: TrainingSession,
         checkpoint_name: str,
         checkpoint_base_dir: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save LoRA weights for inference use.
 
@@ -1827,6 +2011,8 @@ class VerlTrainingEngine:
             session: Training session with model.
             checkpoint_name: Name for this checkpoint.
             checkpoint_base_dir: Base directory for checkpoints.
+            use_per_expert_lora: If True, export MoE MLP LoRA in per-expert format
+                (required by vLLM's MoE LoRA support).
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1834,12 +2020,13 @@ class VerlTrainingEngine:
         import os
 
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
-        return await self.save_weights(session, save_path)
+        return await self.save_weights(session, save_path, use_per_expert_lora=use_per_expert_lora)
 
     async def save_weights(
         self,
         session: TrainingSession,
         save_path: str,
+        use_per_expert_lora: bool = False,
     ) -> str:
         """Save checkpoint via Ray actor.
 
@@ -1849,6 +2036,8 @@ class VerlTrainingEngine:
         Args:
             session: Training session.
             save_path: Directory path for checkpoint.
+            use_per_expert_lora: If True, export MoE MLP LoRA in per-expert format
+                (required by vLLM for MoE models).
 
         Returns:
             Absolute path to saved checkpoint directory.
@@ -1858,14 +2047,35 @@ class VerlTrainingEngine:
 
         import ray
 
+        from .model_registry import get_model_config
+
         model_id = session.model_id
         worker = self._workers[model_id]
         abs_path = os.path.abspath(save_path)
 
         # Save on worker - returns metadata
+        try:
+            cfg = get_model_config(session.base_model)
+            train_gpus = cfg.train_gpus
+        except Exception:
+            train_gpus = 1
+
+        if train_gpus >= 32:
+            default_timeout_s = 3600
+        elif train_gpus >= 16:
+            default_timeout_s = 1800
+        elif train_gpus >= 4:
+            default_timeout_s = 600
+        else:
+            default_timeout_s = 300
+        timeout_s = int(os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+
         loop = asyncio.get_running_loop()
-        meta_ref = worker.save_checkpoint.remote(abs_path)
-        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=300))
+        if session.backend == "megatron":
+            meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
+        else:
+            meta_ref = worker.save_checkpoint.remote(abs_path)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
 
         # Update session state
         session.current_step = meta.get("current_step", session.current_step)
@@ -1911,15 +2121,88 @@ class VerlTrainingEngine:
             session: TrainingSession to shutdown.
         """
         model_id = session.model_id
-        worker = self._workers.pop(model_id, None)
-        if worker:
-            # Call shutdown method first for clean cleanup
+
+        actor_name = self._resource_pool_actor_names.get(model_id)
+        worker = self._workers.get(model_id)
+
+        actor_protected = False
+        other_users: list[str] = []
+        if actor_name:
+            other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
+        should_kill_actor = not other_users
+        if actor_name:
             try:
-                await worker.shutdown.remote()
+                from .resource_pool import get_resource_pool
+
+                actor_protected = get_resource_pool().is_protected(actor_name)
+                if actor_protected:
+                    should_kill_actor = False
             except Exception:
-                pass  # Actor may already be dead
-            # Kill the actor to release resources
-            ray.kill(worker)
+                pass
+
+        self._resource_pool_actor_names.pop(model_id, None)
+        self._workers.pop(model_id, None)
+
+        # If this session was loaded on a pooled dense actor, clear pool tracking
+        # so the actor can become evictable after session deletion.
+        try:
+            if session.backend == "peft":
+                get_dense_trainer_pool().clear_session(model_id)
+        except Exception:
+            pass
+        # Also clear ResourcePool session pinning so protected actors can become idle.
+        try:
+            if actor_name:
+                from .resource_pool import get_resource_pool
+
+                get_resource_pool().set_session(actor_name, None)
+        except Exception:
+            pass
+
+        if should_kill_actor:
+            if worker:
+                # Best-effort clean shutdown, but don't block on an in-flight long
+                # forward/backward. Deleting a model should be able to interrupt work.
+                try:
+                    worker.shutdown.remote()
+                except Exception:
+                    pass  # Actor may already be dead
+                try:
+                    ray_kill.kill(
+                        worker,
+                        reason="shutdown_session",
+                        actor_name=actor_name,
+                        namespace="tinker",
+                        no_restart=True,
+                        model_id=model_id,
+                    )
+                except Exception:
+                    pass
+            elif actor_name:
+                # Session deletion can race with create_training_session still in-flight;
+                # in that case the worker isn't registered in self._workers yet, but we
+                # still want to kill the actor to unblock the pending create_model.
+                try:
+                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    ray_kill.kill(
+                        actor,
+                        reason="shutdown_session_race_no_worker",
+                        actor_name=actor_name,
+                        namespace="tinker",
+                        no_restart=True,
+                        model_id=model_id,
+                    )
+                except Exception:
+                    pass
+        else:
+            if actor_protected:
+                logger.info(f"[{model_id}] shutdown_session: session deleted; keeping protected actor {actor_name}")
+            else:
+                logger.info(
+                    f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
+                    f"(still referenced by {len(other_users)} other model_id(s))"
+                )
+
         session.is_active = False
         logger.info(f"[{model_id}] TrainingWorker shutdown")
 
@@ -2003,6 +2286,8 @@ class DenseTrainerPool:
         import threading
 
         self._actors: dict[str, DenseTrainerEntry] = {}  # key: base_model
+        self._inflight: dict[str, threading.Event] = {}
+        self._inflight_errors: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def _make_key(self, base_model: str) -> str:
@@ -2013,6 +2298,40 @@ class DenseTrainerPool:
         """Create unique actor name for this config."""
         model_name = base_model.split("/")[-1].replace("-", "_").lower()
         return f"{PERSISTENT_DENSE_ACTOR_PREFIX}{model_name}_maxr{max_rank}"
+
+    def _pg_name(self, actor_name: str) -> str:
+        return f"{actor_name}_pg"
+
+    def _get_or_create_pg(self, actor_name: str) -> ray.util.placement_group.PlacementGroup:
+        """Ensure a detached 1-GPU placement group exists for this actor.
+
+        Dense training actors must not overlap GPUs with Megatron placement groups.
+        Scheduling them into their own placement groups forces Ray to allocate a
+        free physical GPU rather than colliding with bundle-assigned GPUs.
+        """
+        pg_name = self._pg_name(actor_name)
+        try:
+            pg = ray.util.get_placement_group(pg_name)
+        except Exception:
+            pg = ray.util.placement_group(
+                [{"GPU": 1, "CPU": 1}],
+                strategy="PACK",
+                name=pg_name,
+                lifetime="detached",
+            )
+        ray.get(pg.ready())
+        return pg
+
+    def _remove_pg(self, actor_name: str) -> None:
+        pg_name = self._pg_name(actor_name)
+        try:
+            pg = ray.util.get_placement_group(pg_name)
+        except Exception:
+            return
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception:
+            pass
 
     def get(self, base_model: str) -> DenseTrainerEntry | None:
         """Get existing actor entry if it exists.
@@ -2029,6 +2348,26 @@ class DenseTrainerPool:
             if entry:
                 entry.touch()  # Phase 9: Update LRU
             return entry
+
+    def clear_session(self, session_id: str) -> int:
+        """Clear current_session pointers matching session_id.
+
+        Deleting a training model should not leave pooled actors pinned as
+        non-idle forever.
+
+        Returns:
+            Number of pool entries updated.
+        """
+        cleared = 0
+        with self._lock:
+            for entry in self._actors.values():
+                if entry.current_session == session_id:
+                    entry.current_session = None
+                    entry.touch()
+                    cleared += 1
+        if cleared:
+            logger.info(f"[DenseTrainerPool] Cleared current_session={session_id} for {cleared} actor(s)")
+        return cleared
 
     def _get_idle_actors_lru(self) -> list[DenseTrainerEntry]:
         """Get idle actors sorted by last access time (LRU first).
@@ -2073,12 +2412,28 @@ class DenseTrainerPool:
             key = self._make_key(entry.base_model)
             self._actors.pop(key, None)
 
-            # Kill actor (no state to save since it's idle)
+            # Kill actor (no state to save since it's idle). Do not skip ray.kill
+            # if shutdown is blocked behind an in-flight actor method.
             try:
                 ray.get(entry.actor.shutdown.remote(), timeout=30)
-                ray.kill(entry.actor)
+            except Exception:
+                pass
+            try:
+                ray_kill.kill(
+                    entry.actor,
+                    reason="dense_trainer_pool_evict",
+                    actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                    namespace=PERSISTENT_DENSE_NAMESPACE,
+                    no_restart=True,
+                    base_model=entry.base_model,
+                    num_gpus=entry.num_gpus,
+                    current_session=entry.current_session,
+                    idle_time=f"{entry.idle_time():.1f}",
+                    age=f"{entry.age():.1f}",
+                )
             except Exception as e:
                 logger.warning(f"[DenseTrainerPool] Error killing evicted actor: {e}")
+            self._remove_pg(self._make_actor_name(entry.base_model, entry.max_lora_rank))
 
             freed_gpus += entry.num_gpus
 
@@ -2113,36 +2468,79 @@ class DenseTrainerPool:
             ValueError: If rank exceeds max or insufficient resources.
         """
         key = self._make_key(base_model)
+        import threading
 
-        with self._lock:
-            # Return existing actor if available
-            if key in self._actors:
-                entry = self._actors[key]
+        wait_timeout_s = float(os.environ.get("MINT_DENSE_INFLIGHT_WAIT_S", "1800"))
 
-                # Check if actor is still alive (may have self-terminated due to idle timeout)
+        while True:
+            with self._lock:
+                entry = self._actors.get(key)
+                if entry is not None:
+                    entry.touch()
+                    inflight = None
+                    creator = False
+                else:
+                    inflight = self._inflight.get(key)
+                    if inflight is None:
+                        inflight = threading.Event()
+                        self._inflight[key] = inflight
+                        self._inflight_errors.pop(key, None)
+                        creator = True
+                    else:
+                        creator = False
+
+            if entry is not None:
+                actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
                 try:
                     ray.get(entry.actor.heartbeat.remote(), timeout=5)
-                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                except ray.exceptions.RayActorError:
                     logger.warning(
                         f"[DenseTrainerPool] Actor for {base_model} is dead (idle timeout?), removing from pool"
                     )
-                    self._actors.pop(key, None)
-                    # Also remove from unified resource pool
+                    with self._lock:
+                        if self._actors.get(key) is entry:
+                            self._actors.pop(key, None)
                     from tinker_server.backend.resource_pool import get_resource_pool
-                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+
+                    get_resource_pool().unregister(actor_name)
+                    continue
+                except ray.exceptions.GetTimeoutError:
+                    # A timeout does NOT imply the actor is dead: it may be busy running a long
+                    # forward/backward. Treat as alive and reuse the existing entry.
+                    if lora_rank > entry.max_lora_rank:
+                        raise ValueError(
+                            f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
+                            f"Kill the actor and restart with higher max_lora_rank."
+                        )
+                    # The dense trainer actor is single-threaded. If it's busy and currently serving a
+                    # different training session, do not enqueue a session swap (reinit_lora_weights):
+                    # it would run later and disrupt the in-flight session. Fail fast instead.
+                    if session_id is not None and session_id != entry.current_session:
+                        raise RuntimeError(
+                            f"DenseTrainerPool actor busy; cannot switch sessions while busy: "
+                            f"actor={actor_name} current_session={entry.current_session} requested_session={session_id}"
+                        )
+                    entry.touch()
+                    from tinker_server.backend.resource_pool import get_resource_pool
+
                     resource_pool = get_resource_pool()
-                    resource_pool.unregister(actor_name)
-                    # Fall through to create new actor
+                    pool_entry = resource_pool.get(actor_name)  # This calls touch()
+                    if pool_entry:
+                        pool_entry.current_session = session_id
+
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor {actor_name} heartbeat timed out; assuming busy and reusing actor"
+                    )
+                    return entry
                 else:
                     if lora_rank > entry.max_lora_rank:
                         raise ValueError(
                             f"Requested rank {lora_rank} exceeds actor's max_lora_rank {entry.max_lora_rank}. "
                             f"Kill the actor and restart with higher max_lora_rank."
                         )
-                    entry.touch()  # Phase 9: Update LRU
-                    # Also update unified resource pool
+                    entry.touch()
                     from tinker_server.backend.resource_pool import get_resource_pool
-                    actor_name = self._make_actor_name(base_model, entry.max_lora_rank)
+
                     resource_pool = get_resource_pool()
                     pool_entry = resource_pool.get(actor_name)  # This calls touch()
                     if pool_entry:
@@ -2154,96 +2552,171 @@ class DenseTrainerPool:
                     )
                     return entry
 
-            # Create new actor with max rank
-            effective_max_rank = max(
-                lora_rank,
-                max_lora_rank or 0,
-                self.DEFAULT_MAX_LORA_RANK,
-            )
-            actor_name = self._make_actor_name(base_model, effective_max_rank)
-            num_gpus = self.DEFAULT_NUM_GPUS  # 1 GPU for dense models
-            logger.info(
-                f"[DenseTrainerPool] Creating new actor: {actor_name} for {base_model}, "
-                f"max_rank={effective_max_rank}, gpus={num_gpus}"
-            )
+            if not creator:
+                assert inflight is not None
+                if not inflight.wait(timeout=wait_timeout_s):
+                    raise TimeoutError(
+                        f"DenseTrainerPool inflight create timed out after {wait_timeout_s}s for base_model={base_model}"
+                    )
+                with self._lock:
+                    err = self._inflight_errors.get(key)
+                    created = self._actors.get(key)
+                if created is not None:
+                    continue
+                if err:
+                    raise RuntimeError(err)
+                continue
 
-            # Phase 9: Check available GPUs and evict LRU actors if necessary
-            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-            resource_pool = get_resource_pool()
-            resource_pool.ensure_gpus_available(num_gpus)
-
-            # Check if detached actor already exists
-            actor = None
-            need_create = True
+            # Creator path: create new actor without holding the pool lock.
             try:
-                existing_actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
-                logger.info(f"[DenseTrainerPool] Found existing detached actor: {actor_name}")
-                # Verify it's alive
-                ray.get(existing_actor.get_session_info.remote(), timeout=10)
-                actor = existing_actor  # Use existing actor
-                need_create = False
-            except ValueError:
-                # Actor doesn't exist, will create new one
-                pass
-            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                # Actor is dead or unresponsive, kill to free name before creating new one
-                logger.warning(f"[DenseTrainerPool] Actor {actor_name} is dead/unresponsive, killing to free name")
-                try:
-                    ray.kill(existing_actor, no_restart=True)
-                except Exception as kill_err:
-                    logger.warning(f"[DenseTrainerPool] Could not kill dead actor: {kill_err}")
-
-            if need_create:
-                # Create new detached actor
-                runtime_env = {
-                    "env_vars": {
-                        "PYTHONPATH": PFS_PYTHONPATH_DENSE,
-                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                        "HF_HUB_OFFLINE": "1",
-                        "TRANSFORMERS_OFFLINE": "1",
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                    }
-                }
-
-                actor = TrainingWorker.options(
-                    name=actor_name,
-                    namespace=PERSISTENT_DENSE_NAMESPACE,
-                    lifetime="detached",
-                    num_gpus=1,
-                    runtime_env=runtime_env,
-                ).remote(
-                    base_model=base_model,
-                    lora_rank=effective_max_rank,  # Initialize with max rank
-                    learning_rate=learning_rate,
+                effective_max_rank = max(
+                    lora_rank,
+                    max_lora_rank or 0,
+                    self.DEFAULT_MAX_LORA_RANK,
+                )
+                actor_name = self._make_actor_name(base_model, effective_max_rank)
+                num_gpus = self.DEFAULT_NUM_GPUS
+                logger.info(
+                    f"[DenseTrainerPool] Creating new actor: {actor_name} for {base_model}, "
+                    f"max_rank={effective_max_rank}, gpus={num_gpus}"
                 )
 
-                # Wait for initialization
-                ray.get(actor.__ray_ready__.remote())
-                logger.info(f"[DenseTrainerPool] Actor {actor_name} initialized")
+                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
 
-            entry = DenseTrainerEntry(
-                actor=actor,
-                base_model=base_model,
-                max_lora_rank=effective_max_rank,
-                num_gpus=self.DEFAULT_NUM_GPUS,
-                current_session=session_id,
-                actual_rank=lora_rank,
-            )
-            self._actors[key] = entry
+                resource_pool = get_resource_pool()
+                resource_pool.ensure_gpus_available(num_gpus)
 
-            # Register with unified resource pool for LRU tracking
-            resource_pool.register(
-                actor_name=actor_name,
-                actor_type=ActorType.DENSE,
-                num_gpus=self.DEFAULT_NUM_GPUS,
-                actor_handle=actor,
-                namespace=PERSISTENT_DENSE_NAMESPACE,
-                base_model=base_model,
-                session_id=session_id,
-            )
+                actor = None
+                need_create = True
+                try:
+                    existing_actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
+                    logger.info(f"[DenseTrainerPool] Found existing detached actor: {actor_name}")
+                    ray.get(existing_actor.get_session_info.remote(), timeout=10)
+                    actor = existing_actor
+                    need_create = False
+                except ValueError:
+                    pass
+                except ray.exceptions.RayActorError:
+                    logger.warning(f"[DenseTrainerPool] Actor {actor_name} is dead, killing to free name")
+                    try:
+                        ray_kill.kill(
+                            existing_actor,
+                            reason="dense_trainer_pool_existing_dead",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            no_restart=True,
+                            base_model=base_model,
+                        )
+                        self._remove_pg(actor_name)
+                    except Exception as kill_err:
+                        logger.warning(f"[DenseTrainerPool] Could not kill dead actor: {kill_err}")
+                except ray.exceptions.GetTimeoutError:
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor {actor_name} get_session_info timed out; assuming busy and reusing actor"
+                    )
+                    actor = existing_actor
+                    need_create = False
+                except Exception as e:
+                    logger.warning(
+                        f"[DenseTrainerPool] Actor {actor_name} failed get_session_info: {e}; killing to recreate"
+                    )
+                    try:
+                        ray_kill.kill(
+                            existing_actor,
+                            reason="dense_trainer_pool_existing_unhealthy",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            no_restart=True,
+                            base_model=base_model,
+                        )
+                        self._remove_pg(actor_name)
+                    except Exception as kill_err:
+                        logger.warning(f"[DenseTrainerPool] Could not kill unhealthy actor: {kill_err}")
 
-            return entry
+                if need_create:
+                    runtime_env = {
+                        "env_vars": {
+                            "PYTHONPATH": PFS_PYTHONPATH_DENSE,
+                            "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                            "HF_HUB_OFFLINE": "1",
+                            "TRANSFORMERS_OFFLINE": "1",
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                        }
+                    }
+
+                    pg = self._get_or_create_pg(actor_name)
+                    actor = TrainingWorker.options(
+                        name=actor_name,
+                        namespace=PERSISTENT_DENSE_NAMESPACE,
+                        lifetime="detached",
+                        num_gpus=1,
+                        scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=0,
+                        ),
+                        runtime_env=runtime_env,
+                    ).remote(
+                        base_model=base_model,
+                        lora_rank=effective_max_rank,
+                        learning_rate=learning_rate,
+                    )
+
+                    init_timeout_s = float(os.environ.get("MINT_DENSE_ACTOR_INIT_TIMEOUT_S", "600"))
+                    try:
+                        ray.get(actor.__ray_ready__.remote(), timeout=init_timeout_s)
+                    except ray.exceptions.GetTimeoutError:
+                        logger.warning(
+                            f"[DenseTrainerPool] Actor {actor_name} init timed out after {init_timeout_s}s; killing"
+                        )
+                        try:
+                            ray_kill.kill(
+                                actor,
+                                reason="dense_trainer_pool_init_timeout",
+                                actor_name=actor_name,
+                                namespace=PERSISTENT_DENSE_NAMESPACE,
+                                no_restart=True,
+                                base_model=base_model,
+                                timeout_s=init_timeout_s,
+                            )
+                            self._remove_pg(actor_name)
+                        except Exception:
+                            pass
+                        raise
+                    logger.info(f"[DenseTrainerPool] Actor {actor_name} initialized")
+
+                new_entry = DenseTrainerEntry(
+                    actor=actor,
+                    base_model=base_model,
+                    max_lora_rank=effective_max_rank,
+                    num_gpus=self.DEFAULT_NUM_GPUS,
+                    current_session=session_id,
+                    actual_rank=lora_rank,
+                )
+
+                with self._lock:
+                    self._actors[key] = new_entry
+
+                resource_pool.register(
+                    actor_name=actor_name,
+                    actor_type=ActorType.DENSE,
+                    num_gpus=self.DEFAULT_NUM_GPUS,
+                    actor_handle=actor,
+                    namespace=PERSISTENT_DENSE_NAMESPACE,
+                    base_model=base_model,
+                    session_id=session_id,
+                )
+                resource_pool.mark_ready(actor_name)
+                return new_entry
+            except Exception as e:
+                with self._lock:
+                    self._inflight_errors[key] = str(e)
+                raise
+            finally:
+                with self._lock:
+                    ev = self._inflight.pop(key, None)
+                if ev is not None:
+                    ev.set()
 
     def remove(self, base_model: str, kill_actor: bool = True) -> bool:
         """Remove actor from pool.
@@ -2263,11 +2736,23 @@ class DenseTrainerPool:
 
             entry = self._actors.pop(key)
             if kill_actor:
+                actor_name = self._make_actor_name(entry.base_model, entry.max_lora_rank)
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                except Exception:
+                    pass
+                try:
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="dense_trainer_pool_remove",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_DENSE_NAMESPACE,
+                        no_restart=True,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
+                self._remove_pg(actor_name)
 
             logger.info(f"[DenseTrainerPool] Removed actor for {base_model}")
             return True
@@ -2318,9 +2803,16 @@ class DenseTrainerPool:
                 self._actors.pop(key, None)
                 try:
                     ray.get(entry.actor.shutdown.remote(), timeout=30)
-                    ray.kill(entry.actor)
+                    ray_kill.kill(
+                        entry.actor,
+                        reason="dense_trainer_pool_evict_idle",
+                        actor_name=self._make_actor_name(entry.base_model, entry.max_lora_rank),
+                        namespace=PERSISTENT_DENSE_NAMESPACE,
+                        base_model=entry.base_model,
+                    )
                 except Exception as e:
                     logger.warning(f"[DenseTrainerPool] Error killing idle actor: {e}")
+                self._remove_pg(self._make_actor_name(entry.base_model, entry.max_lora_rank))
                 logger.info(f"[DenseTrainerPool] Evicted idle actor: {entry.base_model}")
 
             return len(to_evict)
@@ -2338,11 +2830,19 @@ class DenseTrainerPool:
             count = len(self._actors)
             if kill_actors:
                 for entry in self._actors.values():
+                    actor_name = self._make_actor_name(entry.base_model, entry.max_lora_rank)
                     try:
                         ray.get(entry.actor.shutdown.remote(), timeout=30)
-                        ray.kill(entry.actor)
+                        ray_kill.kill(
+                            entry.actor,
+                            reason="dense_trainer_pool_clear",
+                            actor_name=actor_name,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            base_model=entry.base_model,
+                        )
                     except Exception as e:
                         logger.warning(f"[DenseTrainerPool] Error killing actor: {e}")
+                    self._remove_pg(actor_name)
             self._actors.clear()
             logger.info(f"[DenseTrainerPool] Cleared {count} actors")
             return count

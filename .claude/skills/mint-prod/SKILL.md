@@ -23,7 +23,8 @@ description: |
 > | SSH to server | `ssh mint-prod` (NOT `volcano`, NOT direct IP) |
 > | Server logs | `ssh mint-prod "tail -50 /tmp/tinker_server_auth.log"` |
 > | Health check | `curl http://localhost:18000/api/v1/healthz` |
-> | Stop server | `ssh mint-prod 'fuser -k 18000/tcp'` (NOT pkill) |
+> | Restart server | `ssh mint-prod 'supervisorctl restart tinker-server-auth'` |
+> | Stop server (fallback) | `ssh mint-prod 'fuser -k 18000/tcp'` (NOT pkill) |
 > | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
@@ -119,6 +120,10 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 rsync -avz --dry-run --delete \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='.secrets.env' \
+  --exclude='LOG.md' \
+  --exclude='PROMPT.md' \
+  --exclude='ray_head_ip.txt' \
   --exclude='.claude' \
   ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
 
@@ -126,6 +131,10 @@ rsync -avz --dry-run --delete \
 rsync -avz --delete \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='.secrets.env' \
+  --exclude='LOG.md' \
+  --exclude='PROMPT.md' \
+  --exclude='ray_head_ip.txt' \
   --exclude='.claude' \
   ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
 ```
@@ -151,9 +160,19 @@ ssh mint-prod "rm -rf /root/tinker_project/tinker-server-auth && \
 
 ### Environment Variables
 
-**Secrets are stored in `.secrets.env` (gitignored). Source before use:**
+**Prod runs under supervisord and sources `/root/tinker_project/tinker-server-auth/.secrets.env`.**
+
+**Update secrets on prod (recommended):**
 ```bash
-# Read secrets from local file
+# Copy local secrets to prod and restart (supervisord sources this file at boot)
+scp /home/yiwen/tinker_project/tinker-server-prod/.secrets.env \
+  mint-prod:/root/tinker_project/tinker-server-auth/.secrets.env
+ssh mint-prod 'chmod 600 /root/tinker_project/tinker-server-auth/.secrets.env'
+ssh mint-prod 'supervisorctl restart tinker-server-auth'
+```
+
+**Load secrets locally (for auth-required curl):**
+```bash
 source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
 ```
 
@@ -166,30 +185,23 @@ export TINKER_API_KEY=$TINKER_API_KEY          # from .secrets.env
 export TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY  # from .secrets.env
 export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
+
+# Persistent actors (server startup prewarm; eviction-protected)
+# Configure these in `.secrets.env` and restart the server to apply.
+export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
+export MINT_PERSISTENT_TRAIN_LORA_RANK=16
+export MINT_PERSISTENT_TRAIN_LR=5e-5
+export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 ```
 
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
 
 **Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
 
-### Start Server
+### Restart Server (supervisord)
 
-**First source secrets locally, then start server:**
 ```bash
-# Source secrets (run locally)
-source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
-
-# Start server with secrets
-ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
-  PYTHONPATH=/root/tinker_project/tinker-server-auth:\$PYTHONPATH \
-  HF_HUB_OFFLINE=1 \
-  HF_HOME=/vePFS-Mindverse/share/huggingface \
-  PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_API_KEY=$TINKER_API_KEY \
-  TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
-  TINKER_PORT=18000 \
-  TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints \
-  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
+ssh mint-prod 'supervisorctl restart tinker-server-auth'
 ```
 
 ### Stop Server
@@ -285,43 +297,17 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 ### Fast Restart (no vLLM changes)
 
 ```bash
-# Source secrets first
-source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
-
-ssh mint-prod 'fuser -k 18000/tcp 2>/dev/null; sleep 2'
-ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
-  PYTHONPATH=/root/tinker_project/tinker-server-auth:\$PYTHONPATH \
-  HF_HUB_OFFLINE=1 \
-  HF_HOME=/vePFS-Mindverse/share/huggingface \
-  PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_API_KEY=$TINKER_API_KEY \
-  TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
-  TINKER_PORT=18000 \
-  TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints \
-  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
+ssh mint-prod 'supervisorctl restart tinker-server-auth'
 ```
 
 ### Full Restart (vLLM changes)
 
 ```bash
-# Source secrets first
-source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
-
 # Kill vLLM (requires auth)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
 # Restart server
-ssh mint-prod 'fuser -k 18000/tcp 2>/dev/null; sleep 2'
-ssh mint-prod "cd /root/tinker_project/tinker-server-auth && nohup env \
-  PYTHONPATH=/root/tinker_project/tinker-server-auth:\$PYTHONPATH \
-  HF_HUB_OFFLINE=1 \
-  HF_HOME=/vePFS-Mindverse/share/huggingface \
-  PYTHONDONTWRITEBYTECODE=1 \
-  TINKER_API_KEY=$TINKER_API_KEY \
-  TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY \
-  TINKER_PORT=18000 \
-  TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints \
-  python scripts/run_server.py > /tmp/tinker_server_auth.log 2>&1 &"
+ssh mint-prod 'supervisorctl restart tinker-server-auth'
 
 # Wait for vLLM init (~80s)
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz

@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import ray
+
+from . import ray_kill
 
 if TYPE_CHECKING:
     pass
@@ -213,6 +216,7 @@ class MultiLoRAInferenceEngine:
         data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.85,
         max_model_len: int | None = None,
+        max_num_seqs: int = 256,
         max_loras: int = DEFAULT_MAX_LORAS,
         max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
         max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
@@ -225,6 +229,7 @@ class MultiLoRAInferenceEngine:
         self.quantization = quantization
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.max_num_seqs = max_num_seqs
         self.max_loras = max_loras
         self.max_cpu_loras = max_cpu_loras
         self.max_lora_rank = max_lora_rank
@@ -258,17 +263,29 @@ class MultiLoRAInferenceEngine:
                 # Health check: try calling a method to verify actor is alive
                 # This will raise RayActorError if actor is dead
                 try:
-                    ray.get(self.server.__ray_ready__.remote(), timeout=5)
-
-                    # Check if engine is actually initialized (not just actor alive)
-                    # A broken actor can be "alive" but have failed engine init
-                    engine_ready = ray.get(self.server.is_engine_ready.remote(), timeout=10)
+                    try:
+                        await asyncio.to_thread(ray.get, self.server.__ray_ready__.remote(), timeout=5)
+                        # Check if engine is actually initialized (not just actor alive)
+                        # A broken actor can be "alive" but have failed engine init
+                        engine_ready = await asyncio.to_thread(ray.get, self.server.is_engine_ready.remote(), timeout=10)
+                    except SystemExit as e:
+                        if getattr(e, "code", None) == 15:
+                            raise
+                        raise RuntimeError(
+                            f"ray.get(__ray_ready__/is_engine_ready) triggered SystemExit for {self.actor_name}: {e}"
+                        ) from e
                     if not engine_ready:
                         logger.warning(
                             f"vLLM actor {self.actor_name} has broken engine, killing and recreating"
                         )
                         try:
-                            ray.kill(self.server, no_restart=True)
+                            ray_kill.kill(
+                                self.server,
+                                reason="vllm_engine_broken",
+                                actor_name=self.actor_name,
+                                namespace=PERSISTENT_NAMESPACE,
+                                no_restart=True,
+                            )
                         except Exception as kill_err:
                             logger.debug(f"Failed to kill broken actor: {kill_err}")
                         self.server = None
@@ -298,21 +315,56 @@ class MultiLoRAInferenceEngine:
                         # Mark as ready since it's an existing actor that responded to health check
                         resource_pool.mark_ready(self.actor_name)
                         return
-                except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                    # Actor is dead or unresponsive, need to create new one
+                except ray.exceptions.RayActorError:
+                    # Actor is dead, need to create new one
                     logger.warning(
-                        f"vLLM actor {self.actor_name} is dead/unresponsive, creating new one"
+                        f"vLLM actor {self.actor_name} is dead, creating new one"
                     )
                     # Must kill dead actor to free the name for reuse
                     # Ray keeps names registered even for dead actors
                     try:
-                        ray.kill(self.server, no_restart=True)
+                        ray_kill.kill(
+                            self.server,
+                            reason="vllm_actor_dead_free_name",
+                            actor_name=self.actor_name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
                         logger.debug(f"Killed dead actor to free name: {self.actor_name}")
                     except Exception as kill_err:
                         logger.debug(f"Could not kill dead actor: {kill_err}")
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
                     self._initialized = False
+                except ray.exceptions.GetTimeoutError:
+                    # Actor might be busy (queued tasks) rather than dead.
+                    # Killing on timeout will terminate active inference and training flows.
+                    logger.warning(
+                        f"vLLM actor {self.actor_name} __ray_ready__/is_engine_ready timed out; assuming busy and reusing actor"
+                    )
+                    logger.info(
+                        f"Connected to existing persistent vLLM actor: {self.actor_name}"
+                    )
+                    self._initialized = True
+
+                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+                    total_gpus = self.tensor_parallel_size * self.data_parallel_size
+                    resource_pool = get_resource_pool()
+                    actor_node_id = _get_actor_node_id(self.server)
+                    logger.info(
+                        f"Registering existing actor {self.actor_name} with ResourcePool (node={actor_node_id[:8] if actor_node_id else 'unknown'})"
+                    )
+                    resource_pool.register(
+                        actor_name=self.actor_name,
+                        actor_type=ActorType.VLLM,
+                        num_gpus=total_gpus,
+                        actor_handle=self.server,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=self.model_path,
+                        node_id=actor_node_id,
+                    )
+                    resource_pool.mark_ready(self.actor_name)
+                    return
             except ValueError:
                 # Actor doesn't exist, create new one
                 logger.info(
@@ -339,7 +391,7 @@ class MultiLoRAInferenceEngine:
             from tinker_server.backend.resource_pool import get_resource_pool
             resource_pool = get_resource_pool()
             try:
-                resource_pool.ensure_gpus_available(total_gpus)
+                await asyncio.to_thread(resource_pool.ensure_gpus_available, total_gpus)
             except ValueError as e:
                 # Unable to free enough GPUs even after eviction
                 logger.error(f"Cannot create vLLM actor: {e}")
@@ -361,6 +413,11 @@ class MultiLoRAInferenceEngine:
             model_cfg = get_model_config(self.model_path)
             # Use model registry's max_model_len (single source of truth)
             max_model_len = model_cfg.max_model_len
+            # prompt_logprobs uses float32 log_softmax over [tokens, vocab], which can spike memory.
+            # max_num_batched_tokens limits chunk size during prefill/logprobs to cap peak allocations.
+            max_num_batched_tokens = model_cfg.max_num_batched_tokens
+            if max_num_batched_tokens is None:
+                max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
             # verl calculates max_model_len = prompt_length + response_length
             # We split evenly, but this does NOT restrict actual prompt/response sizes:
             # - The split only affects verl's default max_new_tokens (response_length)
@@ -371,6 +428,11 @@ class MultiLoRAInferenceEngine:
             response_length = max_model_len - prompt_length
             logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
 
+            # vLLM V1 engine can fail during multi-GPU init when cudagraph/compile is enabled
+            # (worker subprocesses crash before reporting a useful exception). Eager mode trades
+            # some throughput for deterministic startup.
+            enforce_eager = bool(model_cfg.is_moe and total_gpus >= 4)
+
             # Configure rollout with multi-LoRA support
             # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
             # Expert parallelism is enabled via engine_kwargs instead
@@ -380,12 +442,13 @@ class MultiLoRAInferenceEngine:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 prompt_length=prompt_length,
                 response_length=response_length,
-                max_num_seqs=256,
+                max_model_len=max_model_len,
+                max_num_seqs=self.max_num_seqs,
                 dtype="auto",
                 load_format="auto",
-                enforce_eager=False,
+                enforce_eager=enforce_eager,
                 enable_chunked_prefill=True,
-                max_num_batched_tokens=8192,
+                max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=True,
                 disable_log_stats=True,
                 temperature=1.0,
@@ -418,99 +481,11 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            #
-            # Find a node with enough free GPUs to avoid memory conflicts.
-            # When training and inference coexist, Megatron holds GPU memory even
-            # though Ray doesn't track actual CUDA memory usage. We must place
-            # vLLM on a separate node with completely free GPUs.
-            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-            # Find a node with enough AVAILABLE GPUs (not just total GPUs).
-            # Ray's node.Resources shows total, but other actors (Megatron) may hold GPUs.
-            # We compute available by checking:
-            # 1. GPUs used by active placement groups (Megatron training)
-            # 2. GPUs used by actors tracked in ResourcePool (vLLM, dense training)
-            target_node = None
-            logger.debug(f"Looking for node with {total_gpus} available GPUs for vLLM")
-
-            # Get cluster-wide available resources for validation
-            cluster_available = ray.available_resources()
-            cluster_gpus = cluster_available.get("GPU", 0)
-            logger.debug(f"Cluster has {cluster_gpus} GPUs available")
-
-            # Find GPUs used by active placement groups on each node
-            # Each bundle in a placement group typically uses 1 GPU
-            pg_table = ray.util.placement_group_table()
-            gpus_used_by_pg = {}  # node_id -> count of GPUs used by placement groups
-            for pg_id, pg_info in pg_table.items():
-                if pg_info.get("state") == "CREATED":
-                    # Count bundles per node (each bundle typically uses 1 GPU)
-                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
-                    for bundle_idx, node_id in bundles_to_node.items():
-                        gpus_used_by_pg[node_id] = gpus_used_by_pg.get(node_id, 0) + 1
-
-            # Also get GPUs used by actors tracked in ResourcePool (vLLM, dense training)
-            # This is critical - without it, we may schedule to a node that already has vLLM actors
-            gpus_used_by_actors = resource_pool.gpus_used_by_node()
-
-            # Collect candidate nodes based on AVAILABLE GPUs (total - pg_used - actor_used)
-            candidates = []
-            for node in ray.nodes():
-                node_id = node["NodeID"]
-                node_id_short = node_id[:8]
-                if node["Alive"]:
-                    total_res = node.get("Resources", {})
-                    total_gpu = total_res.get("GPU", 0)
-                    obj_store = total_res.get("object_store_memory", 0)
-                    pg_gpus = gpus_used_by_pg.get(node_id, 0)
-                    actor_gpus = gpus_used_by_actors.get(node_id, 0)
-                    available_gpu = total_gpu - pg_gpus - actor_gpus
-                    logger.debug(f"Node {node_id_short}: total={total_gpu}, pg_used={pg_gpus}, actor_used={actor_gpus}, available={available_gpu}")
-
-                    # Node must have enough AVAILABLE GPUs (after subtracting all usage) and enough object store
-                    if available_gpu >= total_gpus and obj_store > 100_000_000_000:
-                        candidates.append((node_id, available_gpu))
-
-            # Prefer nodes with NO placement groups first (to avoid GPU assignment conflicts)
-            # Among those, prefer nodes with more GPUs (more room)
-            if candidates:
-                # Separate into "clean" nodes (no PG or actors) and "partial" nodes
-                clean_nodes = [(nid, gpus) for nid, gpus in candidates
-                               if gpus_used_by_pg.get(nid, 0) == 0 and gpus_used_by_actors.get(nid, 0) == 0]
-                partial_nodes = [(nid, gpus) for nid, gpus in candidates
-                                 if gpus_used_by_pg.get(nid, 0) > 0 or gpus_used_by_actors.get(nid, 0) > 0]
-
-                if clean_nodes:
-                    # Prefer clean nodes
-                    clean_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
-                    target_node = clean_nodes[0][0]
-                    available_gpus = clean_nodes[0][1]
-                    logger.info(f"Selected clean node {target_node[:8]} with {available_gpus} available GPUs")
-                else:
-                    # Fall back to partial nodes
-                    partial_nodes.sort(key=lambda x: -x[1])  # Sort by available GPUs descending
-                    target_node = partial_nodes[0][0]
-                    available_gpus = partial_nodes[0][1]
-                    pg_count = gpus_used_by_pg.get(target_node, 0)
-                    actor_count = gpus_used_by_actors.get(target_node, 0)
-                    logger.info(f"Selected partial node {target_node[:8]} with {available_gpus} available GPUs ({pg_count} PG, {actor_count} actors)")
-
-            scheduling_opts = {}
-            if target_node:
-                scheduling_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-                    node_id=target_node,
-                    soft=False,  # Hard constraint - fail if node unavailable
-                )
-            else:
-                scheduling_opts["scheduling_strategy"] = "SPREAD"
-                logger.warning("No suitable node found, using SPREAD scheduling")
-
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
-                **scheduling_opts,
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,
@@ -535,7 +510,6 @@ class MultiLoRAInferenceEngine:
             # - Small models (1-2 GPUs): 300s (5 min)
             # - Medium models (4 GPUs): 600s (10 min)
             # - Large models (8+ GPUs, e.g., K2): 1800s (30 min)
-            import asyncio
             loop = asyncio.get_event_loop()
 
             # Compute timeout based on model size (proxy: number of GPUs)
@@ -552,15 +526,52 @@ class MultiLoRAInferenceEngine:
                     None,  # Use default thread pool
                     lambda: ray.get(self.server.launch_server.remote(), timeout=init_timeout)
                 )
+            except SystemExit as e:
+                if getattr(e, "code", None) == 15:
+                    raise
+                try:
+                    ray_kill.kill(
+                        self.server,
+                        reason="vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
+                except Exception:
+                    pass
+                self.server = None
+                raise RuntimeError(f"ray.get(launch_server) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
                 logger.error(f"vLLM launch timed out after {init_timeout}s for {self.actor_name}")
                 # Kill the stuck actor
                 try:
-                    ray.kill(self.server, no_restart=True)
+                    ray_kill.kill(
+                        self.server,
+                        reason="vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
                 except Exception:
                     pass
                 self.server = None
                 raise RuntimeError(f"vLLM actor {self.actor_name} launch timed out after {init_timeout}s")
+            except Exception:
+                # launch_server can fail fast on GPU placement collisions (vLLM checks free memory on startup).
+                # In this case, the detached actor name is already taken; kill+remove the placement group so a
+                # retry can reschedule to a different node/GPU set.
+                try:
+                    ray_kill.kill(
+                        self.server,
+                        reason="vllm_init_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
+                except Exception:
+                    pass
+                self.server = None
+                raise
 
             self._initialized = True
             logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
@@ -811,13 +822,14 @@ class MultiLoRAInferenceEngine:
         sampling_session_id: str | None,
         prompt_ids: list[int],
         request_id: str,
-    ) -> list[float]:
+    ) -> list[float | None]:
         """Compute logprobs using session-specific LoRA or base model.
 
         If sampling_session_id is None or has no registered LoRA, uses base model.
 
-        Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-        Output length is len(prompt_ids) - 1.
+        Returns a list of length len(prompt_ids), where:
+        - logprobs[0] is None (first token has no conditioning context)
+        - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
 
         Args:
             sampling_session_id: The sampling session to use, or None for base model.
@@ -825,7 +837,7 @@ class MultiLoRAInferenceEngine:
             request_id: Unique request identifier.
 
         Returns:
-            List of logprobs, length = len(prompt_ids) - 1.
+            List of logprobs, length = len(prompt_ids).
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
@@ -843,17 +855,59 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Compute logprobs with session-specific LoRA
-            result = await self.server.compute_prompt_logprobs_with_lora.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-            )
+            try:
+                result = await self.server.compute_prompt_logprobs_with_lora.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    lora_int_id=lora_id,
+                )
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
+                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                    try:
+                        from tinker_server.backend.resource_pool import get_resource_pool
+
+                        ray_kill.kill(
+                            self.server,
+                            reason="vllm_compute_logprobs_failed",
+                            actor_name=self.actor_name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
+                        get_resource_pool().unregister(self.actor_name)
+                    except Exception:
+                        pass
+                    self.server = None
+                    self._initialized = False
+                raise
         else:
             # Compute logprobs with base model (no LoRA)
-            result = await self.server.compute_prompt_logprobs_base.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-            )
+            try:
+                result = await self.server.compute_prompt_logprobs_base.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                )
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
+                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                    try:
+                        from tinker_server.backend.resource_pool import get_resource_pool
+
+                        ray_kill.kill(
+                            self.server,
+                            reason="vllm_compute_logprobs_failed",
+                            actor_name=self.actor_name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
+                        get_resource_pool().unregister(self.actor_name)
+                    except Exception:
+                        pass
+                    self.server = None
+                    self._initialized = False
+                raise
 
         return list(result)
 
@@ -863,13 +917,14 @@ class MultiLoRAInferenceEngine:
         prompt_ids: list[int],
         request_id: str,
         k: int = 10,
-    ) -> list[dict[int, float]]:
+    ) -> list[dict[int, float] | None]:
         """Compute top-K tokens using session-specific LoRA or base model.
 
         If sampling_session_id is None or has no registered LoRA, uses base model.
 
-        Returns topk[i] = dict of {token_id: logprob} for position i.
-        Output length is len(prompt_ids) - 1.
+        Returns a list of length len(prompt_ids), where:
+        - topk[0] is None (first token has no conditioning context)
+        - topk[i] is a dict of token_id -> logprob for token i's distribution (i >= 1)
 
         Args:
             sampling_session_id: The sampling session to use, or None for base model.
@@ -878,7 +933,7 @@ class MultiLoRAInferenceEngine:
             k: Number of top tokens to return.
 
         Returns:
-            List of dicts mapping token_id to logprob.
+            List of dicts mapping token_id to logprob, length = len(prompt_ids).
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
@@ -945,10 +1000,20 @@ class MultiLoRAInferenceEngine:
         """
         if self.server is not None and kill_actor:
             try:
-                ray.kill(self.server)
+                ray_kill.kill(
+                    self.server,
+                    reason="vllm_shutdown",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
                 logger.info("Killed persistent vLLM actor")
             except Exception as e:
                 logger.warning(f"Error killing server actor: {e}")
+            try:
+                pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
         self.server = None
         self._initialized = False
         logger.info("MultiLoRAInferenceEngine disconnected")
@@ -1024,7 +1089,18 @@ class MultiModelInferenceManager:
 
         # Dict of model_name -> engine
         self._engines: dict[str, MultiLoRAInferenceEngine] = {}
-        self._init_lock = asyncio.Lock()
+        # Per-model init locks: avoid blocking other models while one
+        # model's vLLM actor is (re)initializing.
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    async def _get_model_lock(self, model_name: str) -> asyncio.Lock:
+        async with self._locks_guard:
+            lock = self._locks.get(model_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[model_name] = lock
+            return lock
 
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
@@ -1041,7 +1117,8 @@ class MultiModelInferenceManager:
         Returns:
             Initialized inference engine for the model.
         """
-        async with self._init_lock:
+        lock = await self._get_model_lock(model_name)
+        async with lock:
             if model_name in self._engines:
                 engine = self._engines[model_name]
                 # Check if actor is still alive before returning cached engine
@@ -1049,13 +1126,19 @@ class MultiModelInferenceManager:
                 actor_handle = getattr(engine, 'server', None) or getattr(engine, 'engine', None)
                 if actor_handle is not None:
                     try:
-                        # MultiNodeInferenceEngine uses is_ready, MultiLoRAInferenceEngine uses __ray_ready__
                         if hasattr(engine, 'server'):
-                            ray.get(actor_handle.__ray_ready__.remote(), timeout=5)
+                            await asyncio.to_thread(ray.get, actor_handle.__ray_ready__.remote(), timeout=5)
                         else:
-                            ray.get(actor_handle.is_ready.remote(), timeout=5)
+                            await asyncio.to_thread(ray.get, actor_handle.is_ready.remote(), timeout=5)
                         # Actor alive, return cached engine
                         return engine
+                    except SystemExit as e:
+                        if getattr(e, "code", None) == 15:
+                            raise
+                        logger.warning(
+                            f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
+                        )
+                        del self._engines[model_name]
                     except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                         # Actor is dead, remove from cache and recreate
                         logger.warning(
@@ -1104,11 +1187,16 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-            # Multi-node required if total GPUs exceed a single 8xA800 node.
-            # Examples:
-            # - K2: TP=32 => 32 GPUs
-            # - Qwen3-235B: TP=16 => 16 GPUs
-            needs_multinode = config.total_gpus > 8
+            # Use MultiNodeInferenceEngine (vLLM AsyncLLMEngine + Ray executor backend)
+            # only when the model cannot fit on a single 8-GPU worker.
+            #
+            # For <=8 GPUs (e.g., Qwen3-30B TP=4), prefer the single-node
+            # MultiLoRAInferenceEngine to avoid vLLM's Ray executor multi-node
+            # networking constraints (e.g., VLLM_HOST_IP uniqueness checks).
+            # vLLM v1 multiprocess TP has repeatedly failed to initialize for MoE TP>=4
+            # (worker subprocess dies before emitting a root-cause stack trace). Use vLLM's
+            # Ray distributed executor backend instead, even when the model fits on one node.
+            needs_multinode = config.total_gpus > 8 or (config.is_moe and config.total_gpus >= 4)
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
@@ -1131,6 +1219,7 @@ class MultiModelInferenceManager:
                 # - creating a new actor (includes its own GPU availability checks)
                 engine = MultiNodeInferenceEngine(
                     model_path=model_path,
+                    model_name=model_name,
                     tensor_parallel_size=config.inference_tp,
                     data_parallel_size=config.inference_dp,
                     enable_expert_parallel=enable_expert_parallel,
@@ -1139,6 +1228,7 @@ class MultiModelInferenceManager:
                     max_loras=model_max_loras,
                     max_lora_rank=model_max_lora_rank,
                     max_num_seqs=model_max_num_seqs,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
                     quantization=quantization,
                     kv_cache_dtype=model_kv_cache_dtype,
                     actor_name=actor_name,
@@ -1157,6 +1247,7 @@ class MultiModelInferenceManager:
                     data_parallel_size=config.inference_dp,
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
+                    max_num_seqs=model_max_num_seqs,
                     max_loras=model_max_loras,
                     max_cpu_loras=model_max_cpu_loras,
                     max_lora_rank=model_max_lora_rank,
@@ -1167,6 +1258,17 @@ class MultiModelInferenceManager:
             await engine.initialize()
 
             self._engines[model_name] = engine
+            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+            if persistent_csv:
+                persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
+                if model_name in persistent_models:
+                    from tinker_server.backend.resource_pool import get_resource_pool
+
+                    resource_pool = get_resource_pool()
+                    if not resource_pool.set_protected(actor_name, True):
+                        logger.warning(
+                            f"Failed to protect vLLM actor for persistent model {model_name}: actor={actor_name}"
+                        )
             logger.info(f"Engine created for {model_name}")
             return engine
 
@@ -1212,12 +1314,27 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
         actor_name = _model_to_actor_name(model_name)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-            ray.kill(actor)
+            ray_kill.kill(
+                actor,
+                reason="vllm_kill_by_name",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+            )
             logger.info(f"Killed vLLM actor: {actor_name}")
             resource_pool.unregister(actor_name)
+            try:
+                pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
             return True
         except ValueError:
             logger.info(f"No vLLM actor found: {actor_name}")
+            try:
+                pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
             return False
     else:
         # Kill ALL vLLM actors via resource pool
@@ -1226,13 +1343,28 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
-                    ray.kill(actor)
+                    ray_kill.kill(
+                        actor,
+                        reason="vllm_kill_by_name",
+                        actor_name=entry.actor_name,
+                        namespace=entry.namespace,
+                    )
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
+                    try:
+                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
                     killed_any = True
                 except ValueError:
                     logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
+                    try:
+                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
         if not killed_any:
@@ -1255,13 +1387,37 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
     if not ray.is_initialized():
         ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
+    def _is_actor_ready(actor) -> bool:
+        """Return True if actor responds and (if supported) its engine is healthy.
+
+        Notes:
+        - For verl's ExtendedVLLMHttpServer: prefer is_engine_ready()
+        - For MultiNodeVLLMEngine: prefer is_ready() (touches EngineCore)
+        - If the readiness call times out, treat as "alive but busy".
+        """
+        try:
+            try:
+                ref = actor.is_engine_ready.remote()
+            except AttributeError:
+                ref = actor.is_ready.remote()
+        except AttributeError:
+            ref = actor.__ray_ready__.remote()
+
+        try:
+            res = ray.get(ref, timeout=5)
+        except ray.exceptions.GetTimeoutError:
+            return True
+
+        if isinstance(res, bool):
+            return res
+        return True
+
     if model_name:
         # Check specific model's actor
         actor_name = _model_to_actor_name(model_name)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-            ray.get(actor.__ray_ready__.remote(), timeout=5)
-            return True
+            return _is_actor_ready(actor)
         except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
             return False
     else:
@@ -1271,8 +1427,8 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
             if entry.actor_type == ActorType.VLLM:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
-                    ray.get(actor.__ray_ready__.remote(), timeout=5)
-                    return True
+                    if _is_actor_ready(actor):
+                        return True
                 except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     continue
         return False

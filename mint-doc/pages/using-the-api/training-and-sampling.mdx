@@ -16,9 +16,11 @@ The output becomes *h = Wx + BAx*, where *W* is frozen and only the low-rank mat
 import mint
 service_client = mint.ServiceClient()
 training_client = service_client.create_lora_training_client(
-    base_model="Qwen/Qwen3-VL-30B-A3B-Instruct"
+    base_model="Qwen/Qwen3-4B-Instruct-2507"
 )
 ```
+
+Choose a `base_model` from the current Model Lineup.
 
 ## Data Preparation
 
@@ -35,13 +37,6 @@ for _ in range(6):
     fwdbwd_future = training_client.forward_backward(examples, "cross_entropy")
     optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 ```
-
-## Vision Support
-
-For vision-language models:
-
-- `ModelInput` accepts mixed chunks: `EncodedTextChunk` for text, `ImageChunk` for images
-- Vision-language models require special tokens like `<|vision_start|>` and `<|vision_end|>`
 
 ## Sampling
 
@@ -77,9 +72,11 @@ MinT 使用 **LoRA（Low-Rank Adaptation）** 进行高效 fine-tune。核心思
 import mint
 service_client = mint.ServiceClient()
 training_client = service_client.create_lora_training_client(
-    base_model="Qwen/Qwen3-VL-30B-A3B-Instruct"
+    base_model="Qwen/Qwen3-4B-Instruct-2507"
 )
 ```
+
+请从当前模型列表中选择 `base_model`。
 
 ## 数据准备
 
@@ -96,13 +93,6 @@ for _ in range(6):
     fwdbwd_future = training_client.forward_backward(examples, "cross_entropy")
     optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 ```
-
-## 视觉模型支持
-
-对于视觉语言模型：
-
-- `ModelInput` 支持混合 chunk：文本用 `EncodedTextChunk`，图像用 `ImageChunk`
-- 需要特殊 token：`<|vision_start|>` 和 `<|vision_end|>`
 
 ## Sampling
 

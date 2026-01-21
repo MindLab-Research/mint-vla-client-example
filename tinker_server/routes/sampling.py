@@ -92,6 +92,21 @@ async def _do_sample(
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
             is_multi_lora = session_manager.is_multi_lora_session(session_id)
+            if is_multi_lora:
+                base_model = session_manager.get_session_base_model(session_id)
+                if base_model:
+                    try:
+                        from ..backend.model_registry import get_model_config, normalize_model_name
+
+                        cfg = get_model_config(normalize_model_name(base_model))
+                        max_model_len = int(cfg.max_model_len)
+                    except Exception:
+                        max_model_len = None
+                    if max_model_len is not None and len(token_ids) > max_model_len:
+                        raise ValueError(
+                            f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                            f"for model {base_model}"
+                        )
 
             # Generate for each sample
             sequences = []
@@ -156,9 +171,6 @@ async def _do_sample(
 
             # Handle prompt logprobs if requested
             if want_prompt_logprobs:
-                # Use compute_logprobs to get prompt log probabilities
-                # compute_logprobs returns len(sequence)-1 values: logprobs[i] = log P(token[i+1] | token[0:i+1])
-                # The API expects len(sequence) values with prompt_logprobs[0] as placeholder (no conditioning)
                 if is_multi_lora:
                     # Get engine for session (already fetched above, but refetch to ensure exists)
                     engine_for_logprobs = await session_manager.get_engine_for_session(session_id)
@@ -174,8 +186,7 @@ async def _do_sample(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_prompt_logprobs",
                     )
-                # Prepend 0.0 for first token (no log probability for unconditional token)
-                response.prompt_logprobs = [0.0] + computed_logprobs
+                response.prompt_logprobs = computed_logprobs
 
             # Handle top-K prompt logprobs if requested
             if request.topk_prompt_logprobs > 0:
@@ -195,8 +206,7 @@ async def _do_sample(
                         request_id=f"{request_id}_topk",
                         k=request.topk_prompt_logprobs,
                     )
-                # Prepend empty dict for first token (no prior context)
-                response.topk_prompt_logprobs = [{}] + list(computed_topk)
+                response.topk_prompt_logprobs = list(computed_topk)
 
             future_store.resolve(request_id, response.model_dump())
             logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
@@ -241,8 +251,9 @@ async def compute_logprobs(
 ) -> UntypedAPIFuture:
     """Compute logprobs for a sequence.
 
-    Returns logprobs[i] = log P(token[i+1] | token[0:i+1]).
-    Output length is len(sequence) - 1.
+    Returns a list of length len(sequence), where:
+    - logprobs[0] is None (first token has no conditioning context)
+    - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
     """
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
@@ -263,6 +274,21 @@ async def _do_compute_logprobs(
 
         # Check if session uses multi-LoRA mode (includes base model sessions)
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
+        if is_multi_lora:
+            base_model = session_manager.get_session_base_model(session_id)
+            if base_model:
+                try:
+                    from ..backend.model_registry import get_model_config, normalize_model_name
+
+                    cfg = get_model_config(normalize_model_name(base_model))
+                    max_model_len = int(cfg.max_model_len)
+                except Exception:
+                    max_model_len = None
+                if max_model_len is not None and len(token_ids) > max_model_len:
+                    raise ValueError(
+                        f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    )
 
         if is_multi_lora:
             # Multi-LoRA mode: handles both LoRA and base model sessions
