@@ -3,6 +3,7 @@
 
 Modes:
 - `concurrent` (default): spawns one child process per base model.
+- `multi-session`: spawns multiple sessions for the same base model.
 - `single`: runs the RL loop for one base model in-process.
 
 Why one file:
@@ -13,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
+import math
 import os
 import random
 import re
@@ -22,6 +25,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -34,6 +38,14 @@ DEFAULT_MODELS = ",".join(
         "Qwen/Qwen3-235B-A22B-Instruct-2507",
     ]
 )
+
+STAGE_SAVE = "save_weights_and_get_sampling_client"
+STAGE_ROLLOUT = "rollout_sample"
+STAGE_LOGPROBS = "compute_logprobs"
+STAGE_FORWARD_BACKWARD = "forward_backward"
+STAGE_OPTIM_STEP = "optim_step"
+STAGE_HEARTBEAT = "heartbeat"
+STAGE_BARRIER = "barrier"
 
 
 def _ts() -> str:
@@ -80,6 +92,33 @@ def _tail1(path: Path) -> str:
         return ""
 
 
+def _tail_jsonl(path: Path) -> dict[str, Any] | None:
+    line = _tail1(path)
+    if not line:
+        return None
+    try:
+        out = json.loads(line)
+        return out if isinstance(out, dict) else None
+    except Exception:
+        return None
+
+
+class _JsonlWriter:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._f = path.open("a", encoding="utf-8")
+
+    def write(self, rec: dict[str, Any]) -> None:
+        self._f.write(json.dumps(rec, sort_keys=True) + "\n")
+        self._f.flush()
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
 @dataclass(frozen=True)
 class RLConfig:
     steps: int
@@ -109,7 +148,13 @@ def _pad_to(tokens: list[int], length: int, pad_id: int) -> list[int]:
     return tokens + [pad_id] * (length - len(tokens))
 
 
-def _wait_future(fut, *, label: str, heartbeat_s: float) -> object:
+def _wait_future(
+    fut: Any,
+    *,
+    label: str,
+    heartbeat_s: float,
+    on_heartbeat: Callable[[float], None] | None = None,
+) -> Any:
     start = time.time()
     while True:
         try:
@@ -117,6 +162,8 @@ def _wait_future(fut, *, label: str, heartbeat_s: float) -> object:
         except TimeoutError:
             elapsed = time.time() - start
             print(f"[{_ts()}] waiting {label} elapsed_s={elapsed:.0f}", flush=True)
+            if on_heartbeat:
+                on_heartbeat(elapsed)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -127,6 +174,10 @@ def _parse_args() -> argparse.Namespace:
     p_single.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
     p_single.add_argument("--api-key", default=None, help="MINT_API_KEY/TINKER_API_KEY override")
     p_single.add_argument("--model", required=True, help="HF model name")
+    p_single.add_argument("--session-idx", type=int, default=0, help="Optional session index for logging")
+    p_single.add_argument("--jsonl-path", default=None, help="Write per-stage timing logs to this JSONL file")
+    p_single.add_argument("--barrier-dir", default=None, help="Optional directory for step barrier files")
+    p_single.add_argument("--barrier-sessions", type=int, default=0, help="Expected session count for step barrier")
 
     p_conc = sub.add_parser("concurrent", help="Run RL loops concurrently (default)")
     p_conc.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
@@ -137,7 +188,18 @@ def _parse_args() -> argparse.Namespace:
     p_conc.add_argument("--heartbeat-s", type=float, default=60.0, help="Print status every N seconds")
     p_conc.add_argument("--max-runtime-s", type=float, default=0.0, help="0 = no limit")
 
-    for pp in (p_single, p_conc):
+    p_ms = sub.add_parser("multi-session", help="Run multiple RL sessions concurrently for one base model")
+    p_ms.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
+    p_ms.add_argument("--api-key", default=None, help="MINT_API_KEY/TINKER_API_KEY override")
+    p_ms.add_argument("--model", required=True, help="HF model name")
+    p_ms.add_argument("--num-sessions", type=int, required=True, help="Number of concurrent sessions (>=2)")
+    p_ms.add_argument("--run-dir", default=None, help="Directory to write per-session logs")
+    p_ms.add_argument("--stagger-s", type=float, default=0.0, help="Sleep between process launches")
+    p_ms.add_argument("--heartbeat-s", type=float, default=30.0, help="Print status every N seconds")
+    p_ms.add_argument("--stall-timeout-s", type=float, default=1800.0, help="Fail if no progress for this long")
+    p_ms.add_argument("--sync-steps", action="store_true", help="Barrier at step boundaries across sessions")
+
+    for pp in (p_single, p_conc, p_ms):
         pp.add_argument("--steps", type=int, default=2)
         pp.add_argument("--prompts-per-step", type=int, default=4)
         pp.add_argument("--samples-per-prompt", type=int, default=2)
@@ -165,130 +227,264 @@ def _rl_cfg_from_args(args: argparse.Namespace) -> RLConfig:
     )
 
 
-def _run_single(*, base_url: str, api_key: str | None, model: str, cfg: RLConfig) -> int:
+def _run_single(
+    *,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    cfg: RLConfig,
+    session_idx: int = 0,
+    jsonl_path: Path | None = None,
+    barrier_dir: Path | None = None,
+    barrier_sessions: int = 0,
+) -> int:
     import mint
     from mint import types
 
-    print(f"[{_ts()}] RL start base_model={model} lora_rank={cfg.lora_rank} lr={cfg.learning_rate}", flush=True)
-    print(
-        f"[{_ts()}] cfg steps={cfg.steps} prompts_per_step={cfg.prompts_per_step} "
-        f"samples_per_prompt={cfg.samples_per_prompt} max_seq_len={cfg.max_seq_len} "
-        f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature}",
-        flush=True,
-    )
+    writer = _JsonlWriter(jsonl_path) if jsonl_path else None
+    pid = os.getpid()
 
-    random.seed(42)
-    service_client = mint.ServiceClient(base_url=base_url, api_key=api_key)
+    def _emit(stage: str, *, step_idx: int, elapsed_s: float, **extra: Any) -> None:
+        if not writer:
+            return
+        rec: dict[str, Any] = {
+            "ts": _ts(),
+            "session_idx": session_idx,
+            "step_idx": step_idx,
+            "stage": stage,
+            "elapsed_s": float(elapsed_s),
+            "model": model,
+            "pid": pid,
+        }
+        rec.update(extra)
+        writer.write(rec)
 
-    print(f"[{_ts()}] create_lora_training_client start base_model={model}", flush=True)
-    training_client = service_client.create_lora_training_client(
-        base_model=model,
-        rank=cfg.lora_rank,
-        train_mlp=True,
-        train_attn=True,
-        train_unembed=True,
-    )
-    print(f"[{_ts()}] get_tokenizer start base_model={model}", flush=True)
-    tokenizer = training_client.get_tokenizer()
-    print(f"[{_ts()}] get_tokenizer done base_model={model} vocab_size={tokenizer.vocab_size}", flush=True)
-    eos_id = tokenizer.eos_token_id
+    def _heartbeat(*, stage: str, step_idx: int, elapsed_s: float, label: str) -> None:
+        if not writer:
+            return
+        writer.write(
+            {
+                "ts": _ts(),
+                "session_idx": session_idx,
+                "step_idx": step_idx,
+                "stage": STAGE_HEARTBEAT,
+                "current_stage": stage,
+                "elapsed_s": float(elapsed_s),
+                "label": label,
+                "model": model,
+                "pid": pid,
+            }
+        )
 
-    filler_ids = tokenizer.encode(" a", add_special_tokens=False) or tokenizer.encode("0", add_special_tokens=False)
-    if not filler_ids:
-        raise RuntimeError("Failed to get filler token id from tokenizer")
-    filler_id = int(filler_ids[0])
+    def _barrier(step_idx: int) -> None:
+        if not barrier_dir or barrier_sessions <= 0:
+            return
+        step_dir = barrier_dir / f"step_{step_idx:04d}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        ready_path = step_dir / f"session_{session_idx:02d}.ready"
+        ready_path.write_text(_ts() + "\n", encoding="utf-8")
 
-    for step in range(cfg.steps):
-        ckpt_name = f"{model.replace('/', '_')}_rl_step_{step:04d}"
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: save_weights_and_get_sampling_client start name={ckpt_name}", flush=True)
         t0 = time.time()
-        out: dict[str, object] = {}
-
-        def _do_save() -> None:
-            try:
-                out["client"] = training_client.save_weights_and_get_sampling_client(name=ckpt_name)
-            except BaseException as e:
-                out["err"] = e
-
-        th = threading.Thread(target=_do_save, daemon=True)
-        th.start()
-        while th.is_alive():
-            th.join(timeout=cfg.heartbeat_s)
-            if th.is_alive():
-                print(f"[{_ts()}] waiting save_weights_and_get_sampling_client elapsed_s={time.time()-t0:.0f}", flush=True)
-        if "err" in out:
-            raise out["err"]  # type: ignore[misc]
-        sampling_client = out["client"]  # type: ignore[assignment]
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: save_weights_and_get_sampling_client done elapsed_s={time.time()-t0:.1f}", flush=True)
-
-        datums: list[types.Datum] = []
-        step_rewards: list[float] = []
-
-        for p in range(cfg.prompts_per_step):
-            a = random.randint(10, 99)
-            b = random.randint(10, 99)
-            expected = a * b
-
-            prompt_text = f"Question: What is {a} * {b}?\\nAnswer:"
-            base_prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
-
-            desired_prompt_len = max(2, cfg.max_seq_len - cfg.gen_max_tokens - 1)
-            prompt_tokens = _pad_to(base_prompt_tokens, desired_prompt_len, filler_id)
-            prompt = types.ModelInput.from_ints(tokens=prompt_tokens)
-
-            print(
-                f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p+1}/{cfg.prompts_per_step} "
-                f"num_samples={cfg.samples_per_prompt} prompt_len={len(prompt_tokens)}",
-                flush=True,
+        if writer:
+            writer.write(
+                {
+                    "ts": _ts(),
+                    "session_idx": session_idx,
+                    "step_idx": step_idx,
+                    "stage": STAGE_BARRIER,
+                    "event": "arrive",
+                    "model": model,
+                    "pid": pid,
+                }
             )
 
-            sample_future = sampling_client.sample(
-                prompt=prompt,
-                num_samples=cfg.samples_per_prompt,
-                sampling_params=types.SamplingParams(
-                    max_tokens=cfg.gen_max_tokens,
-                    temperature=cfg.temperature,
-                    top_k=-1,
-                    top_p=1.0,
-                ),
+        while True:
+            if len(list(step_dir.glob("session_*.ready"))) >= barrier_sessions:
+                break
+            time.sleep(0.25)
+
+        if writer:
+            writer.write(
+                {
+                    "ts": _ts(),
+                    "session_idx": session_idx,
+                    "step_idx": step_idx,
+                    "stage": STAGE_BARRIER,
+                    "event": "release",
+                    "wait_s": float(time.time() - t0),
+                    "model": model,
+                    "pid": pid,
+                }
             )
-            sample_res = _wait_future(
-                sample_future,
-                label=f"sample model={model} prompt {p+1}/{cfg.prompts_per_step} step {step+1}/{cfg.steps}",
-                heartbeat_s=cfg.heartbeat_s,
-            )
 
-            rewards: list[float] = []
-            token_payloads: list[tuple[list[int], int, list[int]]] = []
+    if writer:
+        writer.write(
+            {
+                "ts": _ts(),
+                "session_idx": session_idx,
+                "step_idx": -1,
+                "stage": "start",
+                "model": model,
+                "pid": pid,
+            }
+        )
 
-            for seq in sample_res.sequences:
-                completion_tokens = list(seq.tokens)
-                if completion_tokens[: len(prompt_tokens)] == prompt_tokens:
-                    full_tokens = completion_tokens
-                    completion_tokens = completion_tokens[len(prompt_tokens) :]
-                else:
-                    full_tokens = prompt_tokens + completion_tokens
+    try:
+        print(f"[{_ts()}] RL start base_model={model} session_idx={session_idx} lora_rank={cfg.lora_rank} lr={cfg.learning_rate}", flush=True)
+        print(
+            f"[{_ts()}] cfg steps={cfg.steps} prompts_per_step={cfg.prompts_per_step} "
+            f"samples_per_prompt={cfg.samples_per_prompt} max_seq_len={cfg.max_seq_len} "
+            f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature}",
+            flush=True,
+        )
 
-                if not full_tokens or full_tokens[-1] != eos_id:
-                    full_tokens = full_tokens + [eos_id]
+        random.seed(42 + int(session_idx))
+        service_client = mint.ServiceClient(base_url=base_url, api_key=api_key)
 
-                full_tokens = _pad_to(full_tokens, cfg.max_seq_len, filler_id)
-                completion_text = tokenizer.decode(completion_tokens)
-                pred = _first_int(completion_text)
-                reward = 1.0 if pred == expected else 0.0
-                rewards.append(reward)
-                token_payloads.append((full_tokens, len(prompt_tokens), completion_tokens))
+        print(f"[{_ts()}] create_lora_training_client start base_model={model}", flush=True)
+        training_client = service_client.create_lora_training_client(
+            base_model=model,
+            rank=cfg.lora_rank,
+            train_mlp=True,
+            train_attn=True,
+            train_unembed=True,
+        )
+        print(f"[{_ts()}] get_tokenizer start base_model={model}", flush=True)
+        tokenizer = training_client.get_tokenizer()
+        print(f"[{_ts()}] get_tokenizer done base_model={model} vocab_size={tokenizer.vocab_size}", flush=True)
+        eos_id = tokenizer.eos_token_id
 
-            mean_reward = sum(rewards) / max(1, len(rewards))
+        filler_ids = tokenizer.encode(" a", add_special_tokens=False) or tokenizer.encode("0", add_special_tokens=False)
+        if not filler_ids:
+            raise RuntimeError("Failed to get filler token id from tokenizer")
+        filler_id = int(filler_ids[0])
 
-            for reward, (full_tokens, prompt_len, completion_tokens) in zip(rewards, token_payloads):
-                adv_scalar = float(reward - mean_reward)
+        for step in range(cfg.steps):
+            if barrier_dir and barrier_sessions > 0:
+                _barrier(step)
 
+            ckpt_name = f"{model.replace('/', '_')}_session_{session_idx:02d}_rl_step_{step:04d}"
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: save_weights_and_get_sampling_client start name={ckpt_name}", flush=True)
+
+            save_t0 = time.time()
+            out: dict[str, object] = {}
+
+            def _do_save() -> None:
+                try:
+                    out["client"] = training_client.save_weights_and_get_sampling_client(name=ckpt_name)
+                except BaseException as e:
+                    out["err"] = e
+
+            th = threading.Thread(target=_do_save, daemon=True)
+            th.start()
+            while th.is_alive():
+                th.join(timeout=cfg.heartbeat_s)
+                if th.is_alive():
+                    elapsed = time.time() - save_t0
+                    print(f"[{_ts()}] waiting save_weights_and_get_sampling_client elapsed_s={elapsed:.0f}", flush=True)
+                    _heartbeat(stage=STAGE_SAVE, step_idx=step, elapsed_s=elapsed, label="save_weights_and_get_sampling_client")
+
+            if "err" in out:
+                raise out["err"]  # type: ignore[misc]
+            sampling_client = out["client"]  # type: ignore[assignment]
+            save_elapsed = time.time() - save_t0
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: save_weights_and_get_sampling_client done elapsed_s={save_elapsed:.1f}", flush=True)
+            _emit(STAGE_SAVE, step_idx=step, elapsed_s=save_elapsed)
+
+            step_rewards: list[float] = []
+            samples_to_score: list[tuple[list[int], int, list[int], float, float]] = []
+
+            rollout_t0 = time.time()
+            for p in range(cfg.prompts_per_step):
+                a = random.randint(10, 99)
+                b = random.randint(10, 99)
+                expected = a * b
+
+                prompt_text = f"Question: What is {a} * {b}?\\nAnswer:"
+                base_prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
+
+                desired_prompt_len = max(2, cfg.max_seq_len - cfg.gen_max_tokens - 1)
+                prompt_tokens = _pad_to(base_prompt_tokens, desired_prompt_len, filler_id)
+                prompt = types.ModelInput.from_ints(tokens=prompt_tokens)
+
+                print(
+                    f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p+1}/{cfg.prompts_per_step} "
+                    f"num_samples={cfg.samples_per_prompt} prompt_len={len(prompt_tokens)}",
+                    flush=True,
+                )
+
+                sample_future = sampling_client.sample(
+                    prompt=prompt,
+                    num_samples=cfg.samples_per_prompt,
+                    sampling_params=types.SamplingParams(
+                        max_tokens=cfg.gen_max_tokens,
+                        temperature=cfg.temperature,
+                        top_k=-1,
+                        top_p=1.0,
+                    ),
+                )
+                sample_res = _wait_future(
+                    sample_future,
+                    label=f"sample model={model} session={session_idx} prompt {p+1}/{cfg.prompts_per_step} step {step+1}/{cfg.steps}",
+                    heartbeat_s=cfg.heartbeat_s,
+                    on_heartbeat=lambda elapsed: _heartbeat(
+                        stage=STAGE_ROLLOUT, step_idx=step, elapsed_s=elapsed, label="sample"
+                    ),
+                )
+                _heartbeat(
+                    stage=STAGE_ROLLOUT,
+                    step_idx=step,
+                    elapsed_s=time.time() - rollout_t0,
+                    label=f"prompt {p+1}/{cfg.prompts_per_step} complete",
+                )
+
+                rewards: list[float] = []
+                payloads: list[tuple[list[int], int, list[int], float]] = []
+
+                for seq in sample_res.sequences:
+                    completion_tokens = list(seq.tokens)
+                    if completion_tokens[: len(prompt_tokens)] == prompt_tokens:
+                        full_tokens = completion_tokens
+                        completion_tokens = completion_tokens[len(prompt_tokens) :]
+                    else:
+                        full_tokens = prompt_tokens + completion_tokens
+
+                    if not full_tokens or full_tokens[-1] != eos_id:
+                        full_tokens = full_tokens + [eos_id]
+
+                    full_tokens = _pad_to(full_tokens, cfg.max_seq_len, filler_id)
+                    completion_text = tokenizer.decode(completion_tokens)
+                    pred = _first_int(completion_text)
+                    reward = 1.0 if pred == expected else 0.0
+                    rewards.append(reward)
+                    payloads.append((full_tokens, len(prompt_tokens), completion_tokens, reward))
+
+                mean_reward = sum(rewards) / max(1, len(rewards))
+                for full_tokens, prompt_len, completion_tokens, reward in payloads:
+                    adv_scalar = float(reward - mean_reward)
+                    samples_to_score.append((full_tokens, prompt_len, completion_tokens, adv_scalar, reward))
+                    step_rewards.append(reward)
+
+            rollout_elapsed = time.time() - rollout_t0
+            _emit(STAGE_ROLLOUT, step_idx=step, elapsed_s=rollout_elapsed, num_samples=len(samples_to_score))
+
+            datums: list[types.Datum] = []
+            logprob_t0 = time.time()
+            for full_tokens, prompt_len, completion_tokens, adv_scalar, reward in samples_to_score:
                 lp_future = sampling_client.compute_logprobs(types.ModelInput.from_ints(tokens=full_tokens))
                 lp_res = _wait_future(
                     lp_future,
-                    label=f"compute_logprobs model={model} prompt {p+1}/{cfg.prompts_per_step} step {step+1}/{cfg.steps}",
+                    label=f"compute_logprobs model={model} session={session_idx} step {step+1}/{cfg.steps}",
                     heartbeat_s=cfg.heartbeat_s,
+                    on_heartbeat=lambda elapsed: _heartbeat(
+                        stage=STAGE_LOGPROBS, step_idx=step, elapsed_s=elapsed, label="compute_logprobs"
+                    ),
+                )
+                _heartbeat(
+                    stage=STAGE_LOGPROBS,
+                    step_idx=step,
+                    elapsed_s=time.time() - logprob_t0,
+                    label=f"sample {len(datums)+1}/{len(samples_to_score)} complete",
                 )
                 lp = [(-100.0 if x is None else float(x)) for x in list(lp_res)]
                 sampling_logprobs = lp[1:]
@@ -298,7 +494,7 @@ def _run_single(*, base_url: str, api_key: str | None, model: str, cfg: RLConfig
                 start_i = max(0, prompt_len - 1)
                 end_i = min(n, start_i + len(completion_tokens) + 1)
                 for i in range(start_i, end_i):
-                    adv[i] = adv_scalar
+                    adv[i] = float(adv_scalar)
 
                 datum = types.Datum(
                     model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
@@ -309,32 +505,319 @@ def _run_single(*, base_url: str, api_key: str | None, model: str, cfg: RLConfig
                     },
                 )
                 datums.append(datum)
-                step_rewards.append(reward)
 
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward loss_fn=ppo batch={len(datums)}", flush=True)
-        fb_t0 = time.time()
-        fb_future = training_client.forward_backward(datums, loss_fn="ppo")
-        _wait_future(
-            fb_future,
-            label=f"forward_backward model={model} step {step+1}/{cfg.steps}",
-            heartbeat_s=cfg.heartbeat_s,
-        )
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward done elapsed_s={time.time()-fb_t0:.1f}", flush=True)
+            logprob_elapsed = time.time() - logprob_t0
+            _emit(STAGE_LOGPROBS, step_idx=step, elapsed_s=logprob_elapsed, num_datums=len(datums))
 
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: optim_step lr={cfg.learning_rate}", flush=True)
-        opt_t0 = time.time()
-        opt_future = training_client.optim_step(types.AdamParams(learning_rate=cfg.learning_rate))
-        _wait_future(
-            opt_future,
-            label=f"optim_step model={model} step {step+1}/{cfg.steps}",
-            heartbeat_s=cfg.heartbeat_s,
-        )
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: optim_step done elapsed_s={time.time()-opt_t0:.1f}", flush=True)
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward loss_fn=ppo batch={len(datums)}", flush=True)
+            fb_t0 = time.time()
+            fb_future = training_client.forward_backward(datums, loss_fn="ppo")
+            _wait_future(
+                fb_future,
+                label=f"forward_backward model={model} session={session_idx} step {step+1}/{cfg.steps}",
+                heartbeat_s=cfg.heartbeat_s,
+                on_heartbeat=lambda elapsed: _heartbeat(
+                    stage=STAGE_FORWARD_BACKWARD, step_idx=step, elapsed_s=elapsed, label="forward_backward"
+                ),
+            )
+            fb_elapsed = time.time() - fb_t0
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward done elapsed_s={fb_elapsed:.1f}", flush=True)
+            _emit(STAGE_FORWARD_BACKWARD, step_idx=step, elapsed_s=fb_elapsed)
 
-        avg_reward = sum(step_rewards) / max(1, len(step_rewards))
-        print(f"[{_ts()}] step {step+1}/{cfg.steps}: avg_reward={avg_reward:.4f}", flush=True)
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: optim_step lr={cfg.learning_rate}", flush=True)
+            opt_t0 = time.time()
+            opt_future = training_client.optim_step(types.AdamParams(learning_rate=cfg.learning_rate))
+            _wait_future(
+                opt_future,
+                label=f"optim_step model={model} session={session_idx} step {step+1}/{cfg.steps}",
+                heartbeat_s=cfg.heartbeat_s,
+                on_heartbeat=lambda elapsed: _heartbeat(
+                    stage=STAGE_OPTIM_STEP, step_idx=step, elapsed_s=elapsed, label="optim_step"
+                ),
+            )
+            opt_elapsed = time.time() - opt_t0
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: optim_step done elapsed_s={opt_elapsed:.1f}", flush=True)
+            _emit(STAGE_OPTIM_STEP, step_idx=step, elapsed_s=opt_elapsed)
 
-    return 0
+            avg_reward = sum(step_rewards) / max(1, len(step_rewards))
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: avg_reward={avg_reward:.4f}", flush=True)
+
+        if writer:
+            writer.write(
+                {
+                    "ts": _ts(),
+                    "session_idx": session_idx,
+                    "step_idx": cfg.steps,
+                    "stage": "end",
+                    "model": model,
+                    "pid": pid,
+                }
+            )
+        return 0
+    finally:
+        if writer:
+            writer.close()
+
+
+_SUMMARY_STAGES = [
+    STAGE_SAVE,
+    STAGE_ROLLOUT,
+    STAGE_LOGPROBS,
+    STAGE_FORWARD_BACKWARD,
+    STAGE_OPTIM_STEP,
+]
+
+
+def _percentile(xs: list[float], p: float) -> float | None:
+    if not xs:
+        return None
+    if p <= 0:
+        return min(xs)
+    if p >= 1:
+        return max(xs)
+    xs_sorted = sorted(xs)
+    n = len(xs_sorted)
+    idx = int(math.ceil(p * n) - 1)
+    idx = max(0, min(n - 1, idx))
+    return float(xs_sorted[idx])
+
+
+def _stage_stats(xs: list[float]) -> dict[str, float | int | None]:
+    return {
+        "count": len(xs),
+        "p50_s": _percentile(xs, 0.50),
+        "p95_s": _percentile(xs, 0.95),
+        "max_s": (max(xs) if xs else None),
+    }
+
+
+def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _write_summary(*, run_dir: Path, model: str, num_sessions: int, cfg: RLConfig, sessions: dict[int, Path]) -> None:
+    by_session: dict[str, dict[str, dict[str, float | int | None]]] = {}
+    all_values: dict[str, list[float]] = {stage: [] for stage in _SUMMARY_STAGES}
+
+    for session_idx, jsonl_path in sorted(sessions.items()):
+        vals: dict[str, list[float]] = {stage: [] for stage in _SUMMARY_STAGES}
+        for rec in _iter_jsonl(jsonl_path):
+            stage = rec.get("stage")
+            if stage not in _SUMMARY_STAGES:
+                continue
+            elapsed = rec.get("elapsed_s")
+            if isinstance(elapsed, (int, float)):
+                vals[stage].append(float(elapsed))
+
+        by_session[f"session_{session_idx:02d}"] = {stage: _stage_stats(v) for stage, v in vals.items()}
+        for stage, v in vals.items():
+            all_values[stage].extend(v)
+
+    summary = {
+        "model": model,
+        "num_sessions": num_sessions,
+        "cfg": {
+            "steps": cfg.steps,
+            "prompts_per_step": cfg.prompts_per_step,
+            "samples_per_prompt": cfg.samples_per_prompt,
+            "max_seq_len": cfg.max_seq_len,
+            "gen_max_tokens": cfg.gen_max_tokens,
+            "temperature": cfg.temperature,
+            "lora_rank": cfg.lora_rank,
+            "learning_rate": cfg.learning_rate,
+            "future_heartbeat_s": cfg.heartbeat_s,
+        },
+        "by_session": by_session,
+        "all_sessions": {stage: _stage_stats(v) for stage, v in all_values.items()},
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _run_multi_session(
+    *,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    num_sessions: int,
+    cfg: RLConfig,
+    run_dir: Path,
+    stagger_s: float,
+    heartbeat_s: float,
+    stall_timeout_s: float,
+    sync_steps: bool,
+) -> int:
+    if num_sessions < 2:
+        print("--num-sessions must be >= 2", file=sys.stderr)
+        return 2
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    barrier_dir = run_dir / "barrier" if sync_steps else None
+    if barrier_dir:
+        barrier_dir.mkdir(parents=True, exist_ok=True)
+
+    script_path = Path(__file__).resolve()
+
+    procs: dict[int, subprocess.Popen] = {}
+    jsonls: dict[int, Path] = {}
+    logs: dict[int, Path] = {}
+    starts: dict[int, float] = {}
+
+    print(f"[{_ts()}] base_url={base_url} model={model} num_sessions={num_sessions} run_dir={run_dir}", flush=True)
+    print(
+        f"[{_ts()}] cfg steps={cfg.steps} prompts_per_step={cfg.prompts_per_step} "
+        f"samples_per_prompt={cfg.samples_per_prompt} max_seq_len={cfg.max_seq_len} "
+        f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature} lora_rank={cfg.lora_rank}",
+        flush=True,
+    )
+
+    for session_idx in range(num_sessions):
+        jsonl_path = run_dir / f"session_{session_idx:02d}.jsonl"
+        log_path = run_dir / f"session_{session_idx:02d}.log"
+        jsonls[session_idx] = jsonl_path
+        logs[session_idx] = log_path
+        starts[session_idx] = time.time()
+
+        log_f = log_path.open("wb")
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["MINT_BASE_URL"] = base_url
+        if api_key:
+            env["MINT_API_KEY"] = api_key
+
+        argv = [
+            sys.executable,
+            "-u",
+            str(script_path),
+            "single",
+            "--model",
+            model,
+            "--session-idx",
+            str(session_idx),
+            "--jsonl-path",
+            str(jsonl_path),
+            "--steps",
+            str(cfg.steps),
+            "--prompts-per-step",
+            str(cfg.prompts_per_step),
+            "--samples-per-prompt",
+            str(cfg.samples_per_prompt),
+            "--max-seq-len",
+            str(cfg.max_seq_len),
+            "--gen-max-tokens",
+            str(cfg.gen_max_tokens),
+            "--temperature",
+            str(cfg.temperature),
+            "--lora-rank",
+            str(cfg.lora_rank),
+            "--learning-rate",
+            str(cfg.learning_rate),
+            "--future-heartbeat-s",
+            str(cfg.heartbeat_s),
+        ]
+        if barrier_dir:
+            argv += ["--barrier-dir", str(barrier_dir), "--barrier-sessions", str(num_sessions)]
+
+        proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT, env=env)
+        procs[session_idx] = proc
+        print(f"[{_ts()}] started session_idx={session_idx} pid={proc.pid} log={log_path} jsonl={jsonl_path}", flush=True)
+        if stagger_s > 0:
+            time.sleep(stagger_s)
+
+    start = time.time()
+    last_report = 0.0
+    stalled = False
+    stalled_session: int | None = None
+
+    try:
+        while True:
+            now = time.time()
+            alive = [i for i, p in procs.items() if p.poll() is None]
+            if not alive:
+                break
+
+            for session_idx in alive:
+                jsonl_path = jsonls[session_idx]
+                last_mtime = jsonl_path.stat().st_mtime if jsonl_path.exists() else starts[session_idx]
+                if (now - last_mtime) > stall_timeout_s:
+                    stalled = True
+                    stalled_session = session_idx
+                    break
+
+            if stalled:
+                break
+
+            if heartbeat_s > 0 and (now - last_report) >= heartbeat_s:
+                last_report = now
+                print(f"[{_ts()}] heartbeat elapsed_s={now - start:.0f} alive={len(alive)}/{num_sessions}", flush=True)
+                for session_idx in range(num_sessions):
+                    p = procs[session_idx]
+                    jsonl_path = jsonls[session_idx]
+                    rc = p.poll()
+                    mtime = jsonl_path.stat().st_mtime if jsonl_path.exists() else starts[session_idx]
+                    last = _tail_jsonl(jsonl_path)
+                    if not last:
+                        last_desc = "<no jsonl>"
+                    elif last.get("stage") == STAGE_HEARTBEAT:
+                        last_desc = f"heartbeat({last.get('current_stage')}) step={last.get('step_idx')}"
+                    else:
+                        last_desc = f"{last.get('stage')} step={last.get('step_idx')}"
+                    print(
+                        f"[{_ts()}] session_idx={session_idx} pid={p.pid} rc={rc} jsonl_age_s={now - mtime:.0f} last={last_desc}",
+                        flush=True,
+                    )
+
+            time.sleep(1.0)
+    finally:
+        if stalled:
+            print(f"[{_ts()}] stall detected session_idx={stalled_session} timeout_s={stall_timeout_s:.0f}; terminating children", flush=True)
+            for session_idx, p in procs.items():
+                if p.poll() is None:
+                    p.terminate()
+            for session_idx, p in procs.items():
+                try:
+                    p.wait(timeout=30)
+                except Exception:
+                    pass
+
+            for session_idx in range(num_sessions):
+                last = _tail_jsonl(jsonls[session_idx])
+                if not last:
+                    last_desc = "<no jsonl>"
+                elif last.get("stage") == STAGE_HEARTBEAT:
+                    last_desc = f"heartbeat({last.get('current_stage')}) step={last.get('step_idx')}"
+                else:
+                    last_desc = f"{last.get('stage')} step={last.get('step_idx')}"
+                print(f"[{_ts()}] session_idx={session_idx} last={last_desc}", flush=True)
+
+        _write_summary(run_dir=run_dir, model=model, num_sessions=num_sessions, cfg=cfg, sessions=jsonls)
+
+    rc = 0
+    for p in procs.values():
+        if p.returncode not in (0, None):
+            rc = 1
+    if stalled:
+        rc = 1
+    print(f"[{_ts()}] finished rc={rc} stalled={stalled} run_dir={run_dir}", flush=True)
+    for session_idx in range(num_sessions):
+        p = procs[session_idx]
+        print(f"[{_ts()}] session_idx={session_idx} rc={p.returncode} log={logs[session_idx]} jsonl={jsonls[session_idx]}", flush=True)
+    return rc
 
 
 def main() -> int:
@@ -349,10 +832,48 @@ def main() -> int:
             return 2
         api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
         cfg = _rl_cfg_from_args(args)
+        jsonl_path = Path(args.jsonl_path) if getattr(args, "jsonl_path", None) else None
+        barrier_dir = Path(args.barrier_dir) if getattr(args, "barrier_dir", None) else None
+        barrier_sessions = int(getattr(args, "barrier_sessions", 0) or 0)
+        session_idx = int(getattr(args, "session_idx", 0) or 0)
         try:
-            return _run_single(base_url=base_url, api_key=api_key, model=args.model, cfg=cfg)
+            return _run_single(
+                base_url=base_url,
+                api_key=api_key,
+                model=args.model,
+                cfg=cfg,
+                session_idx=session_idx,
+                jsonl_path=jsonl_path,
+                barrier_dir=barrier_dir,
+                barrier_sessions=barrier_sessions,
+            )
         except Exception as e:
-            print(f"[{_ts()}] error model={args.model} {type(e).__name__}: {e}", flush=True)
+            print(
+                f"[{_ts()}] error model={args.model} session_idx={session_idx} {type(e).__name__}: {e}",
+                flush=True,
+            )
+            return 1
+
+    if cmd == "multi-session":
+        base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"), DEFAULT_BASE_URL)
+        api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
+        cfg = _rl_cfg_from_args(args)
+        run_dir = Path(args.run_dir or f"/tmp/32k_rl_multi_session.{int(time.time())}")
+        try:
+            return _run_multi_session(
+                base_url=base_url,
+                api_key=api_key,
+                model=args.model,
+                num_sessions=int(args.num_sessions),
+                cfg=cfg,
+                run_dir=run_dir,
+                stagger_s=float(args.stagger_s),
+                heartbeat_s=float(args.heartbeat_s),
+                stall_timeout_s=float(args.stall_timeout_s),
+                sync_steps=bool(args.sync_steps),
+            )
+        except Exception as e:
+            print(f"[{_ts()}] error multi-session model={args.model} {type(e).__name__}: {e}", flush=True)
             return 1
 
     if cmd != "concurrent":
@@ -395,18 +916,35 @@ def main() -> int:
         if api_key:
             env["MINT_API_KEY"] = api_key
 
-        env["RL_STEPS"] = str(cfg.steps)
-        env["RL_PROMPTS_PER_STEP"] = str(cfg.prompts_per_step)
-        env["RL_SAMPLES_PER_PROMPT"] = str(cfg.samples_per_prompt)
-        env["RL_MAX_SEQ_LEN"] = str(cfg.max_seq_len)
-        env["RL_GEN_MAX_TOKENS"] = str(cfg.gen_max_tokens)
-        env["RL_TEMPERATURE"] = str(cfg.temperature)
-        env["LORA_RANK"] = str(cfg.lora_rank)
-        env["RL_LEARNING_RATE"] = str(cfg.learning_rate)
-        env["MINT_FUTURE_HEARTBEAT_S"] = str(cfg.heartbeat_s)
+        argv = [
+            sys.executable,
+            "-u",
+            str(script_path),
+            "single",
+            "--model",
+            model,
+            "--steps",
+            str(cfg.steps),
+            "--prompts-per-step",
+            str(cfg.prompts_per_step),
+            "--samples-per-prompt",
+            str(cfg.samples_per_prompt),
+            "--max-seq-len",
+            str(cfg.max_seq_len),
+            "--gen-max-tokens",
+            str(cfg.gen_max_tokens),
+            "--temperature",
+            str(cfg.temperature),
+            "--lora-rank",
+            str(cfg.lora_rank),
+            "--learning-rate",
+            str(cfg.learning_rate),
+            "--future-heartbeat-s",
+            str(cfg.heartbeat_s),
+        ]
 
         proc = subprocess.Popen(
-            [sys.executable, "-u", str(script_path), "single", "--model", model],
+            argv,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
