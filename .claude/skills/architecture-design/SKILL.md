@@ -20,7 +20,7 @@ Read `references/architecture.md` first (index). For design intent, read `refere
 - Inference architecture: `references/inference.md`
 - Training architecture: `references/training.md`
 - Training multi-tenancy (state swap): `references/training-multitenancy.md`
-- Ray placement groups (Megatron worker groups): `references/placement-groups.md`
+- Ray placement groups (Megatron, multi-node vLLM, dense pool): `references/placement-groups.md`
 - Weights and checkpoints: `references/weights-checkpoints.md`
 - Auto eviction and GPU allocation: `references/eviction.md`
 - Authentication and model access: `references/auth-access.md`

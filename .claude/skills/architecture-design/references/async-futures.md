@@ -10,6 +10,8 @@ Many endpoints return `{"request_id": "<uuid>"}` and do the work in the backgrou
 
 This contract is assumed by the SDK. Preserve it when adding endpoints that need background execution.
 
+Note: retrieving a failed/done future deletes it from `FutureStore` (`future_store.cleanup(request_id)`), so `request_id` is single-use. A second `retrieve_future` for the same `request_id` returns HTTP 404.
+
 ## Why futures exist in Mint
 
 Most work runs on Ray GPU actors and can exceed typical HTTP request lifetimes. The futures protocol keeps the HTTP surface stable and matches the Tinker client contract. Do not silently change status codes (for example, 408 to 202) or switch to streaming without updating the client contract.

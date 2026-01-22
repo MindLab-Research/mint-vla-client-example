@@ -1,6 +1,6 @@
-# Ray placement groups (Megatron worker groups)
+# Ray placement groups (Megatron, multi-node vLLM, dense trainer pool)
 
-Ray placement groups are used in Mint to co-schedule distributed Megatron training workers as a unit.
+Ray placement groups are used in Mint to co-schedule multi-actor GPU workloads as a unit and to prevent Ray from fragmenting GPU allocations across nodes in ways that break large-model initialization.
 
 ## What placement groups provide (in this codebase)
 
@@ -8,11 +8,14 @@ Ray placement groups are used in Mint to co-schedule distributed Megatron traini
 - Pin each rank worker to an explicit bundle index so rank 0..N-1 map to predictable GPU bundles.
 - Prefer colocation via `strategy="PACK"` while still allowing multi-node scheduling when `world_size` exceeds a single node.
 
-Mint uses placement groups only for MoE Megatron training. Inference (vLLM actors) does not create placement groups, but it reads placement group state to avoid placing inference on nodes already used by Megatron training.
+Mint uses placement groups for:
+- MoE Megatron training (MegatronWorkerGroup rank workers).
+- Multi-node vLLM inference (MultiNodeInferenceEngine: controller + captured worker actors).
+- Dense training pool actors (DenseTrainerPool: isolates 1-GPU trainers and makes cleanup deterministic).
 
 ## Where they are created
 
-`tinker_server/backend/megatron_distributed.py`:
+`tinker_server/backend/megatron_distributed.py` (MoE training):
 - `MegatronWorkerGroup._initialize()` creates a placement group:
   - bundles: `[{\"GPU\": 1, \"CPU\": 1}] * world_size`
   - strategy: `"PACK"`
@@ -23,19 +26,19 @@ Mint uses placement groups only for MoE Megatron training. Inference (vLLM actor
 
 The key property is that Ray will not start the worker group unless it can reserve all bundles in the placement group.
 
+`tinker_server/backend/multinode_inference.py` (multi-node vLLM):
+- Creates a detached placement group named `{actor_name}_pg` with `total_required_gpus = worker_gpus + 1` bundles.
+- Uses `strategy="PACK"` to keep 1-GPU workers from consuming 1 GPU on every node.
+- Schedules the controller actor into the last bundle index and enables `placement_group_capture_child_tasks=True` so vLLM worker actors land in the same group.
+
+`tinker_server/backend/verl_training.py` (DenseTrainerPool):
+- Creates a detached placement group named `{actor_name}_pg` for each pooled `TrainingWorker` actor.
+
 ## Why PACK (not STRICT_PACK)
 
 The intent is "single node if possible, multi-node if required".
 
 For large configurations (for example, `world_size=16` on 8-GPU nodes), `STRICT_PACK` would block forever because it requires all bundles on one node. `PACK` still prefers colocation but permits spilling across nodes.
-
-## Interactions with inference placement
-
-`tinker_server/backend/multi_lora_engine.py` and `tinker_server/backend/multinode_inference.py` compute per-node "available GPUs" as:
-
-`available = total - gpus_used_by_placement_groups - gpus_used_by_resource_pool_actors`
-
-This is a workaround for the fact that "GPU slot assigned by Ray" is not the same thing as "CUDA memory available for another large model". Mint treats placement groups as hard occupancy signals when picking nodes for vLLM.
 
 ## Cleanup and failure mode
 
@@ -43,6 +46,6 @@ This is a workaround for the fact that "GPU slot assigned by Ray" is not the sam
 
 If the worker group process is terminated without running that shutdown path (eviction, crash), placement groups can remain in Ray state and continue to reserve GPU resources. Symptoms:
 - new Megatron worker groups fail to schedule despite idle GPUs
-- vLLM placement avoids nodes due to "PG-used GPU" accounting
+- multi-node vLLM init fails because expected bundles cannot be reserved
 
 When this happens, clean up placement groups at the Ray cluster level (see `volcano-cluster` skill procedures).

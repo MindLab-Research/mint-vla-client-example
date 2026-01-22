@@ -51,3 +51,10 @@ Fallback paths:
 
 Output:
 - The conversion produces PEFT-style parameter names and saves `adapter_model.safetensors` and `adapter_config.json` for downstream vLLM loading.
+
+## MoE per-expert LoRA export for inference
+
+For MoE sessions that train MLP LoRA, Mint can export adapters in a per-expert format that vLLM expects.
+
+`POST /api/v1/save_weights_for_sampler` behavior (`tinker_server/routes/training.py`):
+- If `session.backend == "megatron"` and the request does not explicitly set `use_per_expert_lora`, the server defaults `use_per_expert_lora=True` when the session's LoRA config indicates MLP LoRA training.

@@ -150,6 +150,19 @@ A fix is ONLY complete when:
 - Test until it works
 - If truly blocked, explain the specific technical blocker and ask for guidance
 
+### 3.3 Sync Architecture Docs (If Needed)
+
+After the reproduction script passes on development, check whether the bugfix changes any documented system behavior or operator workflow.
+
+If it does, update the architecture docs accordingly:
+- `.claude/skills/architecture-design/SKILL.md`
+- Any referenced `.claude/skills/architecture-design/references/*.md` pages that describe the affected component
+
+Examples that usually require doc updates:
+- New/changed endpoints, request/response shapes, or auth behavior
+- Ray actor lifecycle changes (naming, namespaces, eviction rules, persistence)
+- Changes to training/inference session lifecycle or weight transfer semantics
+
 ---
 
 ## Quick Reference

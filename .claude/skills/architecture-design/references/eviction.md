@@ -37,6 +37,7 @@ In practice, `DenseTrainerPool.get_or_create(...)` calls `ResourcePool.ensure_gp
 
 Each actor has:
 - `creating`: True while the actor is initializing. Creating actors are never evicted.
+- `protected`: True means the actor is never evicted by `ResourcePool` LRU (used for "persistent" actors).
 - `last_accessed`: updated via `touch()`/`get()` to implement LRU.
 - `current_session`: optional marker for training actors.
 
@@ -67,9 +68,20 @@ If a caller ignores pending reservations and uses raw Ray availability, the pool
 `ResourcePool._kill_actor(entry)`:
 - gets actor handle (cached handle or `ray.get_actor(name, namespace)`)
 - tries `actor.shutdown.remote()` if present (best-effort)
-- then `ray.kill(actor)` and removes it from `_entries`
+- then `ray_kill.kill(...)` and removes it from `_entries`
 
 This frees GPUs at Ray scheduling level. It does not guarantee CUDA memory defragmentation on the node.
+
+`ray_kill.kill(...)`:
+- logs structured context (reason, actor_name, namespace, GPU footprint, etc.)
+- optionally logs a call stack when `MINT_LOG_KILL_STACK=1`
+- best-effort removes a detached placement group named `{actor_name}_pg` (a common leak source)
+
+## Clearing stale session pins
+
+Session deletion can race with in-flight actor creation. Two helpers exist to avoid permanently pinning an actor as "non-idle" due to stale `current_session` values:
+- `ResourcePool.clear_session(session_id)` clears `current_session` fields that still point at a deleted session.
+- Dense training has a parallel mechanism: `DenseTrainerPool.clear_session(session_id)` (see `tinker_server/backend/verl_training.py`).
 
 ## Startup reconciliation (detached actors)
 
@@ -85,10 +97,24 @@ Startup hook `tinker_server/app.py:_cleanup_stale_actors()`:
 
 This keeps `ResourcePool` aligned with the set of detached actors that still exist.
 
+## Persistent actors (prewarm + eviction protection)
+
+At API server startup, Mint can optionally pre-create long-lived training/inference actors and mark them as `protected` in `ResourcePool` so they are not evicted under LRU pressure.
+
+Implementation: `tinker_server/app.py:_prewarm_persistent_models(...)`.
+
+Controls:
+- `MINT_PERSISTENT_MODELS`: comma-separated HF model names (enables prewarm)
+- `MINT_PERSISTENT_TRAIN_LORA_RANK` (default 16)
+- `MINT_PERSISTENT_TRAIN_LR` (default 5e-5)
+- `MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S` (default 3600)
+- `MINT_PERSISTENT_INFER_TIMEOUT_S` (default 1800)
+
 ## Implications for architecture changes
 
 - If you introduce a new GPU-using actor type, register it in `ResourcePool` and decide how it should set:
   - `creating` (protect during init)
+  - `protected` (if you need a never-evict policy)
   - `current_session` (if training-like)
   - `node_id` (if placement decisions need it)
 - Ensure the code path that creates the actor calls `ensure_gpus_available` before `ray.remote(...).remote(...)`.
