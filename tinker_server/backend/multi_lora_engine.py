@@ -31,11 +31,12 @@ DEFAULT_MAX_LORA_RANK = 64  # Maximum supported rank
 
 # Well-known name for persistent vLLM actor
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
-# Fixed namespace for persistent actors (without this, each process gets random namespace)
-PERSISTENT_NAMESPACE = "tinker"
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+
+# Fixed namespace for persistent actors (without this, each process gets random namespace)
+PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
 # Import model registry
 from tinker_server.backend.model_registry import get_model_config

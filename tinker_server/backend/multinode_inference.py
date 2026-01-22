@@ -29,10 +29,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 # Namespace for actors
-PERSISTENT_NAMESPACE = "tinker"
+PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
 
 @dataclass

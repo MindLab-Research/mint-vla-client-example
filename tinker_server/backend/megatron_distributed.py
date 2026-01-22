@@ -29,11 +29,11 @@ from . import ray_kill
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.backend.model_registry import get_model_config
 
 # Persistent actor configuration
-PERSISTENT_NAMESPACE = "tinker"  # Same namespace as vLLM
+PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

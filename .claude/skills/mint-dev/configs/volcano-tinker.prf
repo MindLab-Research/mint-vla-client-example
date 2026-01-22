@@ -2,6 +2,9 @@
 # Install: cp volcano-tinker.prf ~/.unison/
 # Usage: unison volcano-tinker -repeat watch
 #
+# For concurrent dev runs (Issue #83): copy this profile and change the PFS root
+# to a per-developer path (example: /vePFS-Mindverse/share/code/$USER/tinker-server).
+#
 # PFS is single source of truth. Edit on either local machine or server.
 # Unison keeps both in sync, preferring newer changes.
 

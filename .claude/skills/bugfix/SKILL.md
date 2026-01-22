@@ -27,7 +27,7 @@ description: |
 Write a script that can run against either production or development:
 
 ```python
-# scripts/reproduce_issue_<NUMBER>.py
+# scripts/tools/reproduce_issue_<NUMBER>.py
 import os
 
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
@@ -49,7 +49,7 @@ If the bug was reported from production, verify it exists:
 # Use admin API key to see full server-side errors
 TINKER_BASE_URL=https://mint.macaron.im \
 TINKER_API_KEY=<admin_key> \
-python scripts/reproduce_issue_<NUMBER>.py
+python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
 
 > **Admin API Key Benefit**: When using the admin API key, server-side error details
@@ -95,14 +95,14 @@ If dev server is not running, use the `mint-dev` skill to start it.
 
 ```bash
 # Default environment uses dev server
-python scripts/reproduce_issue_<NUMBER>.py
+python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
 
 Or explicitly:
 ```bash
 TINKER_BASE_URL=http://localhost:8000 \
 TINKER_API_KEY=dummy \
-python scripts/reproduce_issue_<NUMBER>.py
+python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
 
 ### 2.3 Implement Fix
@@ -119,7 +119,7 @@ python scripts/reproduce_issue_<NUMBER>.py
 
 ```bash
 # Run reproduction script - should now pass
-python scripts/reproduce_issue_<NUMBER>.py
+python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
 
 ### 2.5 Check for Regressions
@@ -169,8 +169,8 @@ Examples that usually require doc updates:
 
 | Task | Command |
 |------|---------|
-| Reproduce on prod | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/reproduce_issue_X.py` |
-| Reproduce on dev | `python scripts/reproduce_issue_X.py` |
+| Reproduce on prod | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
+| Reproduce on dev | `python scripts/tools/reproduce_issue_X.py` |
 | Prod logs (READ-ONLY) | `ssh mint-prod "tail -100 /tmp/tinker_server_auth.log"` |
 | Dev logs | `ssh volcano "tail -100 /tmp/tinker_server.log"` |
 | Health check | `curl http://localhost:8000/api/v1/healthz` |

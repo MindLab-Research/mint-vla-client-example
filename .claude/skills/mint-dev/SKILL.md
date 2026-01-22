@@ -59,11 +59,41 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 | SSH Host | `volcano` |
 | Port | 8000 |
 | Code Directory | `tinker-server` |
-| PFS Path | `/vePFS-Mindverse/share/code/tinker-server` |
-| Unison Profile | `volcano-tinker` |
+| PFS Path | Default: `/vePFS-Mindverse/share/code/tinker-server` |
+| Unison Profile | Default: `volcano-tinker` |
 | Ray Configs | `mint-dev-head.yaml`, `mint-dev-worker.yaml` |
 | API Key | Not required (auth disabled when `TINKER_API_KEY` unset) |
 | Log File | `/tmp/tinker_server.log` |
+
+---
+
+## Concurrent Dev Runs (Issue #83)
+
+Goal: isolate code + detached Ray actor state across developers sharing the same dev Ray cluster.
+
+Required env vars:
+- `TINKER_RAY_NAMESPACE`: Ray namespace for all server-owned actors (default `tinker`)
+- `PFS_TINKER_PATH`: PFS code root used in Ray worker `runtime_env` `PYTHONPATH`
+
+### Unison Profile (Per-Developer)
+
+Create a per-developer profile by copying and editing the PFS root:
+
+```bash
+cp .claude/skills/mint-dev/configs/volcano-tinker.prf ~/.unison/volcano-tinker-$USER.prf
+# Edit ~/.unison/volcano-tinker-$USER.prf:
+#   root = ssh://volcano//vePFS-Mindverse/share/code/$USER/tinker-server
+unison volcano-tinker-$USER -repeat watch
+```
+
+### Volcano Symlink (Per-Developer)
+
+Point the server working tree at the same per-developer PFS directory:
+
+```bash
+ssh volcano "rm -rf /root/tinker_project/tinker-server && \
+  ln -s /vePFS-Mindverse/share/code/$USER/tinker-server /root/tinker_project/tinker-server"
+```
 
 ---
 
@@ -151,6 +181,9 @@ export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
+export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server
+# For concurrent dev runs, set this to a unique value (example: tinker_$USER).
+# export TINKER_RAY_NAMESPACE=tinker
 ```
 
 **Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
@@ -162,6 +195,7 @@ ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
   "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server \
    python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
 ```
 
@@ -240,7 +274,7 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 > **Actor naming convention:**
 > - vLLM: `tinker_vllm_{model_name}` (e.g., `tinker_vllm_kimi-k2-thinking`)
 > - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi-k2-thinking`)
-> - Namespace: `tinker`
+> - Namespace: `TINKER_RAY_NAMESPACE` (default `tinker`)
 >
 > **When to kill actors:**
 > - Implementation code changed (actors cache old code)
@@ -250,10 +284,12 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ```bash
 # Kill vLLM actor for K2
 ssh volcano 'python3 -c "
+import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
-    actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=\"tinker\")
+    ns = os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\")
+    actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed vLLM actor\")
 except ValueError as e:
@@ -262,10 +298,12 @@ except ValueError as e:
 
 # Kill Megatron actor for K2
 ssh volcano 'python3 -c "
+import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
-    actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=\"tinker\")
+    ns = os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\")
+    actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed Megatron actor\")
 except ValueError as e:
@@ -274,11 +312,12 @@ except ValueError as e:
 
 # List all actors in tinker namespace (to find actor names)
 ssh volcano 'python3 -c "
+import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 actors = ray.util.list_named_actors(all_namespaces=True)
 for a in actors:
-    if \"tinker\" in str(a):
+    if os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\") in str(a):
         print(a)
 "'
 ```

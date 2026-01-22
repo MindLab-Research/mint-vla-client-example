@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 # Import model registry
 from tinker_server.backend.model_registry import get_model_config
@@ -77,10 +77,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             """Initialize with VLLMHijack applied first."""
             # Set PYTHONPATH in OS environment so vLLM's TP workers inherit it
             # Ray's runtime_env only sets it for this process, not multiprocessing children
-            # NOTE: Hardcode path since we can't import config before setting up path
             import os
             import sys
-            pfs_pythonpath = "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/huggingface/modules"
+            pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
                 if p and p not in sys.path:
@@ -1261,7 +1260,7 @@ class VerlInferenceEngine:
             # Use 'auto' to connect to existing cluster if available
             # If no cluster, this falls back to starting a local Ray instance
             # Use fixed namespace for persistent vLLM actor support
-            ray.init(address='auto', namespace="tinker", ignore_reinit_error=True)
+            ray.init(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         # Compute total GPUs needed for MoE models
         # For EP (expert parallelism), total_gpus = TP * DP
@@ -1479,7 +1478,7 @@ class VerlInferenceEngine:
     async def shutdown(self) -> None:
         """Cleanup Ray actors."""
         if self.server:
-            ray_kill.kill(self.server, reason="verl_inference_shutdown", namespace="tinker")
+            ray_kill.kill(self.server, reason="verl_inference_shutdown", namespace=RAY_NAMESPACE)
             self.server = None
         self._initialized = False
         logger.info("VerlInferenceEngine shutdown")

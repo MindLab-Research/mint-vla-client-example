@@ -31,7 +31,7 @@ from . import ray_kill
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 
 # =====================================================================
@@ -1408,7 +1408,7 @@ class VerlTrainingEngine:
         """Initialize Ray connection."""
         if not ray.is_initialized():
             # Use fixed namespace for persistent vLLM actor support
-            ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
+            ray.init(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
     def _kill_session_actor(self, session: "TrainingSession") -> None:
@@ -1422,7 +1422,7 @@ class VerlTrainingEngine:
                     worker,
                     reason="session_timeout",
                     actor_name=actor_name,
-                    namespace="tinker",
+                    namespace=RAY_NAMESPACE,
                     no_restart=True,
                     model_id=model_id,
                 )
@@ -1434,7 +1434,7 @@ class VerlTrainingEngine:
         if not actor_name:
             return
         try:
-            actor = ray.get_actor(actor_name, namespace="tinker")
+            actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
         except Exception:
             return
         try:
@@ -1442,7 +1442,7 @@ class VerlTrainingEngine:
                 actor,
                 reason="session_timeout",
                 actor_name=actor_name,
-                namespace="tinker",
+                namespace=RAY_NAMESPACE,
                 no_restart=True,
                 model_id=model_id,
             )
@@ -1626,12 +1626,12 @@ class VerlTrainingEngine:
 
                 actor_name = _make_megatron_actor_name(base_model or requested_model or "")
                 try:
-                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
                     ray_kill.kill(
                         actor,
                         reason="megatron_create_timeout",
                         actor_name=actor_name,
-                        namespace="tinker",
+                        namespace=RAY_NAMESPACE,
                         no_restart=True,
                         model_id=model_id,
                         timeout_s=megatron_timeout_s,
@@ -2172,7 +2172,7 @@ class VerlTrainingEngine:
                         worker,
                         reason="shutdown_session",
                         actor_name=actor_name,
-                        namespace="tinker",
+                        namespace=RAY_NAMESPACE,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -2183,12 +2183,12 @@ class VerlTrainingEngine:
                 # in that case the worker isn't registered in self._workers yet, but we
                 # still want to kill the actor to unblock the pending create_model.
                 try:
-                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
                     ray_kill.kill(
                         actor,
                         reason="shutdown_session_race_no_worker",
                         actor_name=actor_name,
-                        namespace="tinker",
+                        namespace=RAY_NAMESPACE,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -2212,11 +2212,11 @@ class VerlTrainingEngine:
 # =====================================================================
 
 # Persistent actor naming
-PERSISTENT_DENSE_NAMESPACE = "tinker"
+PERSISTENT_DENSE_NAMESPACE = RAY_NAMESPACE
 PERSISTENT_DENSE_ACTOR_PREFIX = "dense_trainer_pool_"
 
 # PFS PYTHONPATH for worker processes
-PFS_PYTHONPATH_DENSE = "/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/vllm"
+PFS_PYTHONPATH_DENSE = PFS_PYTHONPATH
 
 
 @dataclass
