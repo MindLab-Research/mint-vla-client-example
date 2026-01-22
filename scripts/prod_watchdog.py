@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watchdog for prod tinker-server-auth.
+"""Watchdog for prod tinker-server-auth (server/ops side).
 
 If /api/v1/healthz is unresponsive or non-200 for N consecutive checks,
 restart the supervisord program `tinker-server-auth`.

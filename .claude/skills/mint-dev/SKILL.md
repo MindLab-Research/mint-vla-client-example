@@ -435,7 +435,7 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 
 > **CRITICAL: Test Scripts Run LOCALLY, Not on Server**
 >
-> Test scripts that use HTTP API (pytest, test_client.py, etc.) run on your LOCAL machine.
+> Test scripts that use HTTP API (pytest, `scripts/tools/smoke.py service`, etc.) run on your LOCAL machine.
 > Local machine has internet access for downloading tokenizers from HuggingFace Hub.
 >
 > **Do NOT:**
@@ -451,7 +451,7 @@ ssh -f -N -L 8000:localhost:8000 volcano
 
 # Run test script LOCALLY (downloads tokenizer from HuggingFace)
 # CRITICAL: Always set TINKER_TELEMETRY=0 to prevent log flooding
-TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python scripts/test_client.py
+TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python scripts/tools/smoke.py service
 
 # Run merge gate tests LOCALLY
 TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m pytest .claude/skills/merge-gate/tests/ -v

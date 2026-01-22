@@ -31,7 +31,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-DEFAULT_BASE_URL = "http://localhost:18000"
+DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_MODELS = ",".join(
     [
         "Qwen/Qwen3-0.6B",

@@ -187,7 +187,7 @@ The system supports multiple model variants. All variants of the same base model
 ```bash
 # Useful for rapid development testing
 TINKER_BASE_URL=http://localhost:8000 \
-python scripts/test_qwen3_06b.py
+python scripts/tools/smoke.py dense-train
 ```
 
 Stress test configurations (using Qwen3 models):
@@ -603,4 +603,3 @@ a pattern worth reviewing, but analysis shows implementation is correct.
 - Loss doesn't decrease but training runs without error (data or hyperparameters)
 - Timeout on operation that normally succeeds (timeout too short)
 - Anomaly flagged but pattern matches expected behavior
-
