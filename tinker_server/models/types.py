@@ -85,7 +85,8 @@ class SampleResponse(BaseModel):
     # Tinker SDK: first entry is None (first token has no conditioning context).
     prompt_logprobs: list[float | None] | None = None
     # Tinker SDK: first entry is None (no prior context for token 0).
-    topk_prompt_logprobs: list[dict[int, float] | None] | None = None
+    # Each subsequent entry is a list of (token_id, logprob) pairs.
+    topk_prompt_logprobs: list[list[tuple[int, float]] | None] | None = None
     type: Literal["sample"] = "sample"
 
 

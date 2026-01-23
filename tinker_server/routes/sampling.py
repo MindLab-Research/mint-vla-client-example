@@ -145,6 +145,34 @@ async def _flush_coalesced_group(key: tuple, delay_s: float) -> None:
                 fut.set_exception(e)
 
 
+def _normalize_topk_prompt_logprobs(
+    raw: list[dict[int, float] | list[tuple[int, float]] | None],
+    k: int,
+) -> list[list[tuple[int, float]] | None]:
+    out: list[list[tuple[int, float]] | None] = []
+    for i, entry in enumerate(raw):
+        if entry is None:
+            out.append(None)
+            continue
+        if isinstance(entry, dict):
+            pairs = [(int(tok), float(lp)) for tok, lp in entry.items()]
+            pairs.sort(key=lambda kv: kv[1], reverse=True)
+            out.append(pairs[:k])
+            continue
+        if isinstance(entry, list):
+            pairs: list[tuple[int, float]] = []
+            for pair in entry:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError(f"topk_prompt_logprobs[{i}] has invalid pair: {pair!r}")
+                tok, lp = pair
+                pairs.append((int(tok), float(lp)))
+            pairs.sort(key=lambda kv: kv[1], reverse=True)
+            out.append(pairs[:k])
+            continue
+        raise ValueError(f"topk_prompt_logprobs[{i}] has invalid entry type: {type(entry)}")
+    return out
+
+
 def _should_backpressure(http_request: Request) -> bool:
     if http_request.headers.get(_SAMPLING_BACKPRESSURE_HEADER) != "1":
         return False
@@ -362,7 +390,10 @@ async def _do_sample(
                         request_id=f"{request_id}_topk",
                         k=request.topk_prompt_logprobs,
                     )
-                response.topk_prompt_logprobs = list(computed_topk)
+                response.topk_prompt_logprobs = _normalize_topk_prompt_logprobs(
+                    list(computed_topk),
+                    request.topk_prompt_logprobs,
+                )
 
             future_store.resolve(request_id, response.model_dump())
             logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")

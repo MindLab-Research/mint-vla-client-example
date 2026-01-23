@@ -1000,14 +1000,14 @@ class MultiLoRAInferenceEngine:
         prompt_ids: list[int],
         request_id: str,
         k: int = 10,
-    ) -> list[dict[int, float] | None]:
+    ) -> list[list[tuple[int, float]] | None]:
         """Compute top-K tokens using session-specific LoRA or base model.
 
         If sampling_session_id is None or has no registered LoRA, uses base model.
 
         Returns a list of length len(prompt_ids), where:
         - topk[0] is None (first token has no conditioning context)
-        - topk[i] is a dict of token_id -> logprob for token i's distribution (i >= 1)
+        - topk[i] is a list of (token_id, logprob) pairs for token i's distribution (i >= 1)
 
         Args:
             sampling_session_id: The sampling session to use, or None for base model.
@@ -1016,7 +1016,7 @@ class MultiLoRAInferenceEngine:
             k: Number of top tokens to return.
 
         Returns:
-            List of dicts mapping token_id to logprob, length = len(prompt_ids).
+            List of per-position top-k lists, length = len(prompt_ids).
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
