@@ -31,6 +31,7 @@ from ..models.types import (
     TelemetryRequest,
     TelemetryResponse,
 )
+from ..server_info import get_server_info
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -65,6 +66,11 @@ async def get_server_capabilities() -> dict:
     return {
         "supported_models": [{"model_name": m} for m in supported],
     }
+
+
+@router.get("/server_info")
+async def server_info() -> dict:
+    return get_server_info()
 
 
 @router.post("/create_session")

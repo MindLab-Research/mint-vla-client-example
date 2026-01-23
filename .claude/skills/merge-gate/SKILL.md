@@ -236,7 +236,7 @@ ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-
   nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 MINT_MIN_ACTOR_AGE=0 \
-  python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+  python scripts/run_server.py" >> /tmp/tinker_server.log 2>&1 &'
 
 # Wait for server to start
 sleep 10 && curl http://localhost:8000/api/v1/healthz

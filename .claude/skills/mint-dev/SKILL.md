@@ -199,7 +199,7 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   python scripts/run_server.py\" > /tmp/tinker_server.log 2>&1 &"
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Stop Server
@@ -342,7 +342,7 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   python scripts/run_server.py\" > /tmp/tinker_server.log 2>&1 &"
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Full Restart (vLLM changes)
@@ -358,7 +358,7 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   python scripts/run_server.py\" > /tmp/tinker_server.log 2>&1 &"
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 
 # Wait for vLLM init (~80s)
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
