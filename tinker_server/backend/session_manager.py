@@ -41,6 +41,7 @@ class SessionInfo:
     uses_base_model: bool = False  # True if multi-LoRA without any LoRA adapter
     base_model: str | None = None  # Base model name for multi-model support
     adapter_path: str | None = None  # Optional (ephemeral) adapter directory to cleanup
+    inflight_requests: int = 0  # Prevent cleanup while requests are running
 
 
 class SessionManager:
@@ -94,6 +95,7 @@ class SessionManager:
         inactive = [
             sid
             for sid, info in self._sessions.items()
+            if info.inflight_requests == 0
             if now - info.last_activity > self.inactivity_timeout
             # Keep shared engine sessions unless they are multi-LoRA registrations
             # (multi-LoRA uses per-session LoRA IDs and must be GC'd to avoid leaks).
@@ -102,6 +104,18 @@ class SessionManager:
         for sid in inactive:
             logger.info(f"Auto-cleaning inactive session {sid}")
             await self.end_session(sid)
+
+    def mark_session_inflight(self, session_id: str, delta: int) -> None:
+        """Mark a session as having in-flight work to prevent cleanup.
+
+        This is required for long-context requests that can exceed the inactivity
+        timeout while still actively running.
+        """
+        info = self._sessions.get(session_id)
+        if info is None:
+            return
+        info.last_activity = time.time()
+        info.inflight_requests = max(0, info.inflight_requests + delta)
 
     # =========================================================================
     # Shared Engine Methods (for fast ephemeral weight sync)

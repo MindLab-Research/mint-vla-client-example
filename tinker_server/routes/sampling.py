@@ -7,6 +7,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import logging
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ session_manager: SessionManager | None = None
 
 _SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
 _MAX_INFLIGHT_SAMPLE_TASKS = int(os.environ.get("TINKER_MAX_INFLIGHT_SAMPLE_TASKS", "64"))
+_MAX_CONCURRENT_SAMPLES_PER_REQUEST = int(os.environ.get("TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST", "8"))
 _inflight_sample_tasks = 0
 
 
@@ -79,6 +81,7 @@ async def _do_sample(
 ) -> None:
     """Background task to perform sampling."""
     global _inflight_sample_tasks
+    session_id: str | None = None
     try:
         try:
             if session_manager is None:
@@ -86,6 +89,7 @@ async def _do_sample(
 
             token_ids = request.prompt.to_token_ids()
             session_id = request.get_session_id()  # Supports both sampling_session_id and model_id
+            session_manager.mark_session_inflight(session_id, +1)
 
             # Handle include_prompt_logprobs alias
             want_prompt_logprobs = request.prompt_logprobs or request.include_prompt_logprobs
@@ -109,16 +113,18 @@ async def _do_sample(
                         )
 
             # Generate for each sample
-            sequences = []
-            for i in range(request.num_samples):
-                if is_multi_lora:
-                    # Multi-LoRA mode: handles both LoRA and base model sessions
-                    # Get engine for this session's model (dynamically creates if needed)
-                    multi_lora_engine = await session_manager.get_engine_for_session(session_id)
-                    if multi_lora_engine is None:
-                        raise RuntimeError(f"No engine found for session {session_id}")
+            if request.num_samples < 1:
+                raise ValueError(f"num_samples must be >= 1 (got {request.num_samples})")
 
-                    result = await multi_lora_engine.generate(
+            if is_multi_lora:
+                # Multi-LoRA mode: handles both LoRA and base model sessions
+                # Get engine once; it is shared across samples for batching.
+                engine = await session_manager.get_engine_for_session(session_id)
+                if engine is None:
+                    raise RuntimeError(f"No engine found for session {session_id}")
+
+                async def _generate_one(i: int):
+                    return await engine.generate(
                         sampling_session_id=session_id,
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_{i}",
@@ -128,15 +134,14 @@ async def _do_sample(
                         top_p=request.sampling_params.top_p,
                         logprobs=True,
                     )
-                else:
-                    # Legacy mode: per-session engine
-                    engine = session_manager.get_engine(session_id)
-                    if engine is None:
-                        raise RuntimeError(
-                            f"No engine found for session {session_id}"
-                        )
+            else:
+                # Legacy mode: per-session engine
+                engine = session_manager.get_engine(session_id)
+                if engine is None:
+                    raise RuntimeError(f"No engine found for session {session_id}")
 
-                    result = await engine.generate(
+                async def _generate_one(i: int):
+                    return await engine.generate(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_{i}",
                         max_tokens=request.sampling_params.max_tokens,
@@ -146,13 +151,25 @@ async def _do_sample(
                         logprobs=True,
                     )
 
+            max_concurrent = _MAX_CONCURRENT_SAMPLES_PER_REQUEST
+            if max_concurrent <= 0:
+                max_concurrent = request.num_samples
+            sem = asyncio.Semaphore(max_concurrent)
+
+            async def _generate_limited(i: int):
+                async with sem:
+                    return await _generate_one(i)
+
+            results = await asyncio.gather(*(_generate_limited(i) for i in range(request.num_samples)))
+
+            sequences = []
+            eos_tokens = {151645, 151643}
+            for result in results:
                 # Normalize logprobs attribute name (multi-LoRA uses 'logprobs', legacy uses 'log_probs')
-                logprobs = getattr(result, 'logprobs', None) or getattr(result, 'log_probs', None)
+                logprobs = getattr(result, "logprobs", None) or getattr(result, "log_probs", None)
 
                 # Infer stop reason: check if EOS tokens are present
                 # verl's TokenOutput doesn't include finish_reason, so we infer it
-                # Common EOS tokens: 151645 (<|im_end|>), 151643 (<|endoftext|>)
-                eos_tokens = {151645, 151643}
                 if result.token_ids and result.token_ids[-1] in eos_tokens:
                     stop_reason = "stop"
                 else:
@@ -240,6 +257,8 @@ async def _do_sample(
             logger.exception(f"Request {request_id} failed: {e}")
             future_store.fail(request_id, str(e))
     finally:
+        if session_manager is not None and session_id is not None:
+            session_manager.mark_session_inflight(session_id, -1)
         _inflight_sample_tasks -= 1
 
 
@@ -265,12 +284,14 @@ async def _do_compute_logprobs(
     request_id: str, request: ComputeLogprobsRequest, user_id: str | None
 ) -> None:
     """Background task to compute logprobs."""
+    session_id: str | None = None
     try:
         if session_manager is None:
             raise RuntimeError("Session manager not initialized")
 
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
+        session_manager.mark_session_inflight(session_id, +1)
 
         # Check if session uses multi-LoRA mode (includes base model sessions)
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
@@ -322,3 +343,6 @@ async def _do_compute_logprobs(
     except Exception as e:
         logger.exception(f"Request {request_id} failed: {e}")
         future_store.fail(request_id, str(e))
+    finally:
+        if session_manager is not None and session_id is not None:
+            session_manager.mark_session_inflight(session_id, -1)

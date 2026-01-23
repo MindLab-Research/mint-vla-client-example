@@ -487,6 +487,7 @@ class MultiLoRAInferenceEngine:
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,
@@ -1140,7 +1141,14 @@ class MultiModelInferenceManager:
                             f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
                         )
                         del self._engines[model_name]
-                    except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    except ray.exceptions.GetTimeoutError:
+                        # Actor tasks can queue behind long-running generations/logprobs.
+                        # A short timeout here is not evidence of death.
+                        logger.warning(
+                            f"Cached vLLM engine for {model_name} is busy during is_alive check; reusing cached engine"
+                        )
+                        return engine
+                    except ray.exceptions.RayActorError:
                         # Actor is dead, remove from cache and recreate
                         logger.warning(
                             f"Cached vLLM engine for {model_name} has dead actor, recreating"
@@ -1169,8 +1177,21 @@ class MultiModelInferenceManager:
                 model_max_loras = 1  # Default for MoE: minimal LoRA support
             else:
                 model_max_loras = self.max_loras
-            # Disable CPU LoRA cache if LoRA is disabled or MoE model
-            model_max_cpu_loras = 0 if model_max_loras == 0 or config.is_moe else self.max_cpu_loras
+
+            # Determine max_cpu_loras:
+            # - per-model override (if set)
+            # - LoRA disabled -> 0
+            # - MoE default -> vLLM default (None => max_cpu_loras=max_loras)
+            # - dense default -> global default
+            model_max_cpu_loras_override = getattr(config, "max_cpu_loras", None)
+            if model_max_cpu_loras_override is not None:
+                model_max_cpu_loras: int | None = int(model_max_cpu_loras_override)
+            elif model_max_loras == 0:
+                model_max_cpu_loras = 0
+            elif config.is_moe:
+                model_max_cpu_loras = None
+            else:
+                model_max_cpu_loras = self.max_cpu_loras
 
             # Use per-model max_lora_rank override if specified (K2 needs rank 8 to fit).
             # Large MoE models have huge LoRA buffers: 384 experts × rank × hidden_size.
@@ -1227,6 +1248,7 @@ class MultiModelInferenceManager:
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
                     max_loras=model_max_loras,
+                    max_cpu_loras=model_max_cpu_loras,
                     max_lora_rank=model_max_lora_rank,
                     max_num_seqs=model_max_num_seqs,
                     max_num_batched_tokens=config.max_num_batched_tokens,
@@ -1250,7 +1272,7 @@ class MultiModelInferenceManager:
                     max_model_len=model_max_model_len,
                     max_num_seqs=model_max_num_seqs,
                     max_loras=model_max_loras,
-                    max_cpu_loras=model_max_cpu_loras,
+                    max_cpu_loras=self.max_cpu_loras if model_max_cpu_loras is None else int(model_max_cpu_loras),
                     max_lora_rank=model_max_lora_rank,
                     actor_name=actor_name,
                     quantization=quantization,

@@ -27,6 +27,7 @@ class ModelConfig:
     Memory configuration:
         - gpu_memory_utilization: Override for vLLM memory utilization (None = use global default 0.85).
         - max_loras: Override max number of LoRAs (None = use default, 0 = disable LoRA).
+        - max_cpu_loras: Override vLLM CPU LoRA cache size (None = vLLM default).
         - max_lora_rank: Override max LoRA rank for inference (None = use global default).
         - max_model_len: vLLM context limit (required for all models).
 
@@ -46,6 +47,7 @@ class ModelConfig:
     # vLLM memory settings
     gpu_memory_utilization: float | None = None  # None = use global default (0.85), or override for large models
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
+    max_cpu_loras: int | None = None  # None = vLLM default (max_cpu_loras=max_loras)
     max_lora_rank: int | None = None  # None = use global default, or override for large models
     max_model_len: int  # vLLM context limit (required - no fallback)
     max_num_seqs: int | None = None  # None = use default (256), or lower for large MoE models with KV cache constraints
@@ -125,6 +127,8 @@ MODEL_CONFIGS = {
         max_model_len=40960,  # 40K context - full model capability
         max_num_seqs=8,  # Constrain KV cache; prompt_logprobs needs headroom at long context
         max_num_batched_tokens=1024,  # Avoid multi-GB logits buffers during prompt_logprobs
+        max_loras=8,
+        max_cpu_loras=16,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(

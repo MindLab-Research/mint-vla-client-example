@@ -13,6 +13,8 @@ import os
 import math
 import socket
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
@@ -34,6 +36,18 @@ from tinker_server.backend.model_registry import get_model_config
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
+
+_megatron_create_locks: dict[str, threading.Lock] = {}
+_megatron_create_locks_guard = threading.Lock()
+
+
+def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
+    with _megatron_create_locks_guard:
+        lock = _megatron_create_locks.get(actor_name)
+        if lock is None:
+            lock = threading.Lock()
+            _megatron_create_locks[actor_name] = lock
+        return lock
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -3587,6 +3601,9 @@ class MegatronWorkerGroup:
             logger.debug(f"[MegatronWorkerGroup] Session {session_id} already loaded")
             return
 
+        timing = _env_flag("MINT_TIMING_DIAG", default=False)
+        t0 = time.perf_counter() if timing else 0.0
+
         logger.info(
             f"[MegatronWorkerGroup] Session switch: {self._current_session} -> {session_id}"
         )
@@ -3606,6 +3623,7 @@ class MegatronWorkerGroup:
         )
 
         # Save outgoing session's LoRA weights to disk
+        t_save0 = time.perf_counter() if timing else 0.0
         if self._current_session is not None:
             old_path = self._session_manager.get_session_path(self._current_session)
             logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
@@ -3617,13 +3635,17 @@ class MegatronWorkerGroup:
                 self.learning_rate,
                 self._actual_rank,
             )
+        t_save1 = time.perf_counter() if timing else 0.0
 
         # Swap session state on workers (gradients + optimizer)
         # This saves outgoing session's gradients/optimizer to CPU memory,
         # and restores incoming session's (or resets for new sessions)
+        t_swap0 = time.perf_counter() if timing else 0.0
         self._swap_session_on_workers(session_id)
+        t_swap1 = time.perf_counter() if timing else 0.0
 
         # Load new session's LoRA weights from disk (or reset for new session)
+        t_load0 = time.perf_counter() if timing else 0.0
         session_exists = self._session_manager.session_exists(session_id)
         logger.info(f"[MegatronWorkerGroup] session_exists({session_id}) = {session_exists}")
         if session_exists:
@@ -3643,13 +3665,16 @@ class MegatronWorkerGroup:
             self.reinit_lora_weights()
             self._step_count = 0
             self._actual_rank = self.lora_rank
+        t_load1 = time.perf_counter() if timing else 0.0
 
         # Reset expert_bias on every session switch to avoid cross-session leakage.
         # expert_bias is not saved/restored with LoRA checkpoints.
+        t_bias0 = time.perf_counter() if timing else 0.0
         try:
             self.reset_expert_bias()
         except Exception as e:
             logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for {session_id}: {e}")
+        t_bias1 = time.perf_counter() if timing else 0.0
 
         # DEBUG: Log LoRA norm/checksum after switch
         norm_after = self._get_lora_weight_norm()
@@ -3664,6 +3689,17 @@ class MegatronWorkerGroup:
         )
 
         self._current_session = session_id
+        if timing:
+            t1 = time.perf_counter()
+            logger.info(
+                f"[MegatronWorkerGroup] session_switch timing: "
+                f"save_s={t_save1 - t_save0:.3f} "
+                f"swap_s={t_swap1 - t_swap0:.3f} "
+                f"load_s={t_load1 - t_load0:.3f} "
+                f"reset_bias_s={t_bias1 - t_bias0:.3f} "
+                f"total_s={t1 - t0:.3f} "
+                f"session_exists={session_exists}"
+            )
 
     def forward_backward(
         self,
@@ -3689,18 +3725,31 @@ class MegatronWorkerGroup:
         """
         loss_fn_config = loss_fn_config or {}
 
+        timing = _env_flag("MINT_TIMING_DIAG", default=False)
+        t0 = time.perf_counter() if timing else 0.0
+
         # Issue #44: Ensure correct session's LoRA weights are loaded before training
         # This saves outgoing session state and loads incoming session state
         effective_session_id = session_id or self._current_session
         self._ensure_session_loaded(effective_session_id)
+        t1 = time.perf_counter() if timing else 0.0
 
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
+        t2 = time.perf_counter() if timing else 0.0
         futures = [
             w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id, reset_bias)
             for w in self.workers
         ]
         results = ray.get(futures)
+        t3 = time.perf_counter() if timing else 0.0
+        if timing:
+            logger.info(
+                f"[MegatronWorkerGroup] forward_backward timing: "
+                f"ensure_session_s={t1 - t0:.3f} "
+                f"worker_fb_s={t3 - t2:.3f} "
+                f"items={len(data_items)} loss_fn={loss_fn}"
+            )
 
         # Pick the first non-empty result (pipeline last stage).
         rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
@@ -3940,12 +3989,24 @@ class MegatronWorkerGroup:
         Returns:
             Dict with metrics including grad_norm from rank 0.
         """
+        timing = _env_flag("MINT_TIMING_DIAG", default=False)
+        t0 = time.perf_counter() if timing else 0.0
+
         # Issue #44: Ensure correct session's LoRA weights are loaded before optim step
         effective_session_id = session_id or self._current_session
         self._ensure_session_loaded(effective_session_id)
+        t1 = time.perf_counter() if timing else 0.0
 
+        t2 = time.perf_counter() if timing else 0.0
         futures = [w.optim_step.remote(learning_rate, effective_session_id) for w in self.workers]
         results = ray.get(futures)
+        t3 = time.perf_counter() if timing else 0.0
+        if timing:
+            logger.info(
+                f"[MegatronWorkerGroup] optim_step timing: "
+                f"ensure_session_s={t1 - t0:.3f} "
+                f"worker_optim_s={t3 - t2:.3f}"
+            )
 
         # Rank 0 returns the actual result with grad_norm
         rank0_result = results[0]
@@ -4933,102 +4994,119 @@ def get_or_create_megatron_worker_group(
     resource_pool = get_resource_pool()
     actor_name = _make_megatron_actor_name(base_model)
 
-    # Try to get existing persistent actor for this model
-    try:
-        actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-        logger.info(f"Connected to existing Megatron actor: {actor_name}")
-        
-        # Verify actor is alive
+    create_lock = _get_megatron_create_lock(actor_name)
+    with create_lock:
+        # Try to get existing persistent actor for this model.
+        # Must be inside a per-actor lock to avoid concurrent create_lora_training_client races.
         try:
-            ray.get(actor.get_diagnostics.remote(), timeout=10)
-        except ray.exceptions.RayActorError:
-            # Actor is dead, kill to free name
-            logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+            logger.info(f"Connected to existing Megatron actor: {actor_name}")
+
+            # Verify actor is alive
             try:
-                ray_kill.kill(
-                    actor,
-                    reason="megatron_actor_dead_free_name",
-                    actor_name=actor_name,
-                    namespace=PERSISTENT_NAMESPACE,
-                    no_restart=True,
+                ray.get(actor.get_diagnostics.remote(), timeout=10)
+            except ray.exceptions.RayActorError:
+                # Actor is dead, kill to free name
+                logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
+                try:
+                    ray_kill.kill(
+                        actor,
+                        reason="megatron_actor_dead_free_name",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                    )
+                except Exception:
+                    pass
+                raise ValueError("Actor dead, will recreate")
+            except ray.exceptions.GetTimeoutError:
+                # Actor might be busy (queued tasks) rather than dead.
+                # Killing on timeout will terminate active training and corrupt in-flight requests.
+                logger.warning(
+                    f"Megatron actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor"
                 )
-            except Exception:
-                pass
-            raise ValueError("Actor dead, will recreate")
-        except ray.exceptions.GetTimeoutError:
-            # Actor might be busy (queued tasks) rather than dead.
-            # Killing on timeout will terminate active training and corrupt in-flight requests.
-            logger.warning(
-                f"Megatron actor {actor_name} get_diagnostics timed out; assuming busy and reusing actor"
+
+            # Register with resource pool (reconnection case)
+            resource_pool.register(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=num_gpus,
+                actor_handle=actor,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=base_model,
             )
-        
-        # Register with resource pool (reconnection case)
-        resource_pool.register(
-            actor_name=actor_name,
-            actor_type=ActorType.MEGATRON,
-            num_gpus=num_gpus,
-            actor_handle=actor,
-            namespace=PERSISTENT_NAMESPACE,
-            base_model=base_model,
-        )
-        # Existing actor is already ready
-        resource_pool.mark_ready(actor_name)
-        # NOTE: Do NOT reinit weights here for existing actors.
-        # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
-        # to avoid clobbering active sessions during create_model.
-        return actor
-    except ValueError:
-        # Actor doesn't exist, create new one
-        logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
+            # Existing actor is already ready
+            resource_pool.mark_ready(actor_name)
+            # NOTE: Do NOT reinit weights here for existing actors.
+            # Session swapping + reinit happens inside MegatronWorkerGroup._ensure_session_loaded()
+            # to avoid clobbering active sessions during create_model.
+            return actor
+        except ValueError:
+            # Actor doesn't exist, create new one
+            logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
-    # Check available GPUs and evict LRU actors if necessary
-    resource_pool.ensure_gpus_available(num_gpus)
+        # Check available GPUs and evict LRU actors if necessary
+        resource_pool.ensure_gpus_available(num_gpus)
 
-    # Reserve GPUs to prevent race conditions with concurrent requests
-    # This must be done AFTER ensure_gpus_available and BEFORE actor creation
-    resource_pool.reserve_gpus(num_gpus)
+        # Reserve GPUs to prevent race conditions with concurrent requests
+        # This must be done AFTER ensure_gpus_available and BEFORE actor creation
+        resource_pool.reserve_gpus(num_gpus)
 
-    try:
-        # Runtime env for PFS code access
-        runtime_env = {
-            "env_vars": {
-                "PYTHONPATH": PFS_PYTHONPATH,
-                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1",
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
+        try:
+            # Runtime env for PFS code access
+            runtime_env = {
+                "env_vars": {
+                    "PYTHONPATH": PFS_PYTHONPATH,
+                    "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                    "HF_HUB_OFFLINE": "1",
+                    "TRANSFORMERS_OFFLINE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
+                }
             }
-        }
+            timing = os.environ.get("MINT_TIMING_DIAG")
+            if timing is not None:
+                runtime_env["env_vars"]["MINT_TIMING_DIAG"] = timing
 
-        # Create detached Ray actor with per-model name
-        actor = MegatronWorkerGroup.options(
-            name=actor_name,
-            namespace=PERSISTENT_NAMESPACE,
-            lifetime="detached",
-            runtime_env=runtime_env,
-        ).remote(
-            base_model=base_model,
-            lora_rank=lora_rank,
-            learning_rate=learning_rate,
-            distributed_config=config,
-        )
-        # Register immediately (creating=True) to account for GPU usage and prevent eviction.
-        # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
-        # marks the entry ready (creating=False) after __ray_ready__ completes.
-        resource_pool.register(
-            actor_name=actor_name,
-            actor_type=ActorType.MEGATRON,
-            num_gpus=num_gpus,
-            actor_handle=actor,
-            namespace=PERSISTENT_NAMESPACE,
-            base_model=base_model,
-            session_id=session_id,
-        )
-        return actor
-    finally:
-        # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
-        resource_pool.release_pending_gpus(num_gpus)
+            # Create detached Ray actor with per-model name
+            try:
+                actor = MegatronWorkerGroup.options(
+                    name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    lifetime="detached",
+                    runtime_env=runtime_env,
+                ).remote(
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    learning_rate=learning_rate,
+                    distributed_config=config,
+                )
+            except Exception as e:
+                msg = str(e)
+                if actor_name in msg and "already exists" in msg:
+                    logger.warning(
+                        f"Megatron actor create raced (already exists): {actor_name}; reusing existing actor"
+                    )
+                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                else:
+                    raise
+
+            # Register immediately (creating=True) to account for GPU usage and prevent eviction.
+            # Actor readiness is awaited in VerlTrainingEngine.create_training_session, which also
+            # marks the entry ready (creating=False) after __ray_ready__ completes.
+            resource_pool.register(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=num_gpus,
+                actor_handle=actor,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=base_model,
+                session_id=session_id,
+            )
+            return actor
+        finally:
+            # Release pending GPU reservation (GPUs now tracked by registered actor or freed on failure)
+            resource_pool.release_pending_gpus(num_gpus)
 
 
 async def async_get_or_create_megatron_worker_group(

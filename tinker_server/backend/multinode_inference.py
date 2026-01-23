@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,13 @@ from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 @dataclass
@@ -109,8 +117,48 @@ class MultiNodeLoRARegistry:
             return len(self._session_to_id)
 
 
+class _AsyncRWLock:
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    @asynccontextmanager
+    async def read_locked(self):
+        async with self._cond:
+            while self._writer or self._writers_waiting > 0:
+                await self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @asynccontextmanager
+    async def write_locked(self):
+        async with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers > 0:
+                    await self._cond.wait()
+                self._writer = True
+            finally:
+                self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._writer = False
+                self._cond.notify_all()
+
+
 def _create_multinode_vllm_actor(
     max_loras: int = 1,
+    max_cpu_loras: int | None = None,
     max_lora_rank: int = 8,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int | None = None,
@@ -122,6 +170,7 @@ def _create_multinode_vllm_actor(
 
     Args:
         max_loras: Maximum LoRAs in a single batch.
+        max_cpu_loras: Maximum LoRAs to store in CPU memory (None = vLLM default).
         max_lora_rank: Maximum LoRA rank.
         max_num_seqs: Maximum concurrent sequences (reduce for large models with KV cache constraints).
     """
@@ -154,6 +203,7 @@ def _create_multinode_vllm_actor(
             self.quantization = quantization
             self.enable_lora = enable_lora
             self.max_loras = max_loras
+            self.max_cpu_loras = max_cpu_loras
             self.max_lora_rank = max_lora_rank
             self.max_num_seqs = max_num_seqs
             self.kv_cache_dtype = kv_cache_dtype
@@ -161,6 +211,33 @@ def _create_multinode_vllm_actor(
 
             self.engine = None
             self._initialized = False
+            self._rw_lock = _AsyncRWLock()
+            self._lock_mode = os.environ.get("MINT_VLLM_ENGINE_LOCK_MODE", "rw").strip().lower()
+            self._timing = _env_flag("MINT_VLLM_REQUEST_TIMING", default=False)
+            self._serialize_prompt_logprobs = _env_flag("MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE", default=False)
+            self._prompt_logprobs_lock = asyncio.Lock() if self._serialize_prompt_logprobs else None
+
+        @asynccontextmanager
+        async def _lock_read(self):
+            if self._lock_mode == "all":
+                async with self._rw_lock.write_locked():
+                    yield
+            else:
+                async with self._rw_lock.read_locked():
+                    yield
+
+        @asynccontextmanager
+        async def _lock_write(self):
+            async with self._rw_lock.write_locked():
+                yield
+
+        @asynccontextmanager
+        async def _maybe_prompt_logprobs_lock(self):
+            if self._prompt_logprobs_lock is None:
+                yield
+                return
+            async with self._prompt_logprobs_lock:
+                yield
 
         async def initialize(self) -> None:
             """Initialize vLLM engine with Ray distributed backend."""
@@ -200,7 +277,7 @@ def _create_multinode_vllm_actor(
                 enable_chunked_prefill=True,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=True,
-                disable_log_stats=True,
+                disable_log_stats=not _env_flag("MINT_VLLM_LOG_STATS", default=False),
                 enforce_eager=True,  # CUDA graphs OOM on K2 at 0.98 util
                 quantization=self.quantization,
                 kv_cache_dtype=self.kv_cache_dtype or "auto",  # None -> "auto" for vLLM CacheConfig validation
@@ -208,6 +285,7 @@ def _create_multinode_vllm_actor(
                 enable_lora=self.enable_lora,
                 max_loras=self.max_loras if self.enable_lora else None,
                 max_lora_rank=self.max_lora_rank if self.enable_lora else None,
+                max_cpu_loras=self.max_cpu_loras if self.enable_lora else None,
             )
 
             logger.info(
@@ -229,7 +307,8 @@ def _create_multinode_vllm_actor(
                 return False
             try:
                 # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
-                await self.engine.list_loras()
+                async with self._lock_read():
+                    await self.engine.list_loras()
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
@@ -254,17 +333,38 @@ def _create_multinode_vllm_actor(
                 lora_path=lora_path,
             )
 
-            await self.engine.add_lora(lora_request)
+            t0 = time.perf_counter()
+            async with self._lock_write():
+                t1 = time.perf_counter()
+                await self.engine.add_lora(lora_request)
+            t2 = time.perf_counter()
+            if self._timing:
+                print(
+                    f"[vLLM timing] add_lora id={lora_int_id} lock_wait_s={t1 - t0:.3f} engine_s={t2 - t1:.3f} total_s={t2 - t0:.3f}"
+                    ,
+                    flush=True,
+                )
             logger.info(f"Added LoRA {lora_name} (id={lora_int_id}) from {lora_path}")
 
         async def remove_lora(self, lora_int_id: int) -> None:
             """Remove a LoRA adapter."""
-            await self.engine.remove_lora(lora_int_id)
+            t0 = time.perf_counter()
+            async with self._lock_write():
+                t1 = time.perf_counter()
+                await self.engine.remove_lora(lora_int_id)
+            t2 = time.perf_counter()
+            if self._timing:
+                print(
+                    f"[vLLM timing] remove_lora id={lora_int_id} lock_wait_s={t1 - t0:.3f} engine_s={t2 - t1:.3f} total_s={t2 - t0:.3f}"
+                    ,
+                    flush=True,
+                )
             logger.info(f"Removed LoRA id={lora_int_id}")
 
         async def list_loras(self) -> set[int]:
             """List loaded LoRA adapter IDs."""
-            return await self.engine.list_loras()
+            async with self._lock_read():
+                return await self.engine.list_loras()
 
         async def generate(
             self,
@@ -318,18 +418,31 @@ def _create_multinode_vllm_actor(
                     lora_path=lora_path,
                 )
 
-            generator = self.engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                lora_request=lora_request,
-            )
-
+            t0 = time.perf_counter()
+            first_tok_s: float | None = None
             # Get final response
-            final_res = None
-            async for output in generator:
-                final_res = output
-            assert final_res is not None
+            async with self._lock_read():
+                t1 = time.perf_counter()
+                generator = self.engine.generate(
+                    prompt=prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    lora_request=lora_request,
+                )
+                final_res = None
+                async for output in generator:
+                    if first_tok_s is None:
+                        first_tok_s = time.perf_counter() - t0
+                    final_res = output
+                assert final_res is not None
+            t2 = time.perf_counter()
+            if self._timing:
+                print(
+                    f"[vLLM timing] generate req={request_id} prompt_len={len(prompt_ids)} max_tokens={max_tokens} "
+                    f"lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f} first_tok_s={first_tok_s}"
+                    ,
+                    flush=True,
+                )
 
             token_ids = list(final_res.outputs[0].token_ids)
             log_probs = None
@@ -391,18 +504,30 @@ def _create_multinode_vllm_actor(
                     lora_path=lora_path,
                 )
 
-            generator = self.engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                lora_request=lora_request,
-            )
+            t0 = time.perf_counter()
+            async with self._maybe_prompt_logprobs_lock():
+                async with self._lock_read():
+                    t1 = time.perf_counter()
+                    generator = self.engine.generate(
+                        prompt=prompt,
+                        sampling_params=sampling_params,
+                        request_id=request_id,
+                        lora_request=lora_request,
+                    )
 
-            # Get final response
-            final_res = None
-            async for output in generator:
-                final_res = output
-            assert final_res is not None
+                    # Get final response
+                    final_res = None
+                    async for output in generator:
+                        final_res = output
+                    assert final_res is not None
+            t2 = time.perf_counter()
+            if self._timing:
+                print(
+                    f"[vLLM timing] prompt_logprobs req={request_id} prompt_len={len(prompt_ids)} "
+                    f"lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f}"
+                    ,
+                    flush=True,
+                )
 
             # Extract prompt logprobs
             prompt_logprobs = final_res.prompt_logprobs
@@ -455,6 +580,7 @@ class MultiNodeInferenceEngine:
         gpu_memory_utilization: float = 0.80,
         max_model_len: int | None = None,
         max_loras: int = 1,
+        max_cpu_loras: int | None = None,
         max_lora_rank: int = 8,
         max_num_seqs: int = 256,
         max_num_batched_tokens: int | None = None,
@@ -472,6 +598,7 @@ class MultiNodeInferenceEngine:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_loras = max_loras
+        self.max_cpu_loras = max_cpu_loras
         self.max_lora_rank = max_lora_rank
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -645,6 +772,7 @@ class MultiNodeInferenceEngine:
             # Create new engine actor
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
                 max_loras=self.max_loras,
+                max_cpu_loras=self.max_cpu_loras,
                 max_lora_rank=self.max_lora_rank,
                 max_num_seqs=self.max_num_seqs,
                 max_num_batched_tokens=self.max_num_batched_tokens,
@@ -665,26 +793,36 @@ class MultiNodeInferenceEngine:
             }
 
             # Controller actor must reserve a GPU for vLLM v1 engine core (CUDA visibility).
+            env_vars = {
+                "PYTHONPATH": PFS_PYTHONPATH,
+                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                "HF_HUB_OFFLINE": "1",
+                # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
+                # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
+                "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
+                # Force vLLM v0 engine - v1's multiprocess architecture
+                # conflicts with Ray distributed executor backend
+                "VLLM_USE_V1": "0",
+                "VLLM_DISABLE_PYNCCL": "1",
+            }
+            for k in (
+                "MINT_VLLM_LOG_STATS",
+                "MINT_VLLM_ENGINE_LOCK_MODE",
+                "MINT_VLLM_REQUEST_TIMING",
+                "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    env_vars[k] = v
+
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
                 num_gpus=controller_gpus,
+                max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 **scheduling_opts,
-                runtime_env={
-                    "env_vars": {
-                        "PYTHONPATH": PFS_PYTHONPATH,
-                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                        "HF_HUB_OFFLINE": "1",
-                        # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
-                        # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
-                        "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
-                        # Force vLLM v0 engine - v1's multiprocess architecture
-                        # conflicts with Ray distributed executor backend
-                        "VLLM_USE_V1": "0",
-                        "VLLM_DISABLE_PYNCCL": "1",
-                    }
-                },
+                runtime_env={"env_vars": env_vars},
             ).remote(
                 model_path=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
