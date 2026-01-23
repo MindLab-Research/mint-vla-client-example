@@ -93,6 +93,8 @@ def _run_one(
     prompt_tokens: list[int],
     num_samples: int,
     max_tokens: int,
+    prompt_logprobs: bool,
+    topk_prompt_logprobs: int,
     poll_s: float,
     call_timeout_s: float,
     expect_sequences: int | None,
@@ -113,8 +115,8 @@ def _run_one(
                     "top_k": -1,
                     "top_p": 1.0,
                 },
-                "prompt_logprobs": False,
-                "topk_prompt_logprobs": 0,
+                "prompt_logprobs": bool(prompt_logprobs),
+                "topk_prompt_logprobs": int(topk_prompt_logprobs),
             },
             timeout_s=call_timeout_s,
         )["request_id"]
@@ -152,6 +154,8 @@ def main() -> None:
     p.add_argument("--prompt-len", type=int, default=32000)
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--max-tokens", type=int, default=8)
+    p.add_argument("--prompt-logprobs", action="store_true")
+    p.add_argument("--topk-prompt-logprobs", type=int, default=0)
     p.add_argument("--concurrency", default="1,2,4,8", help="Comma-separated concurrency values")
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--poll-s", type=float, default=1.0)
@@ -174,7 +178,12 @@ def main() -> None:
 
     run_dir = Path(args.run_dir) if args.run_dir else Path("results") / "issue87" / _ts_dir()
     run_dir.mkdir(parents=True, exist_ok=True)
-    out_path = run_dir / f"bench_sample_{args.model.replace('/', '_')}_pl{args.prompt_len}_ns{args.num_samples}_mt{args.max_tokens}.jsonl"
+    suffix = ""
+    if args.prompt_logprobs:
+        suffix += "_plp1"
+    if args.topk_prompt_logprobs:
+        suffix += f"_topk{int(args.topk_prompt_logprobs)}"
+    out_path = run_dir / f"bench_sample_{args.model.replace('/', '_')}_pl{args.prompt_len}_ns{args.num_samples}_mt{args.max_tokens}{suffix}.jsonl"
 
     prompt_tokens = [10] * int(args.prompt_len)
     expect_sequences = int(args.num_samples) if args.expect_sequences else None
@@ -191,6 +200,8 @@ def main() -> None:
                     "prompt_len": args.prompt_len,
                     "num_samples": args.num_samples,
                     "max_tokens": args.max_tokens,
+                    "prompt_logprobs": bool(args.prompt_logprobs),
+                    "topk_prompt_logprobs": int(args.topk_prompt_logprobs),
                     "concurrency": conc,
                     "repeats": args.repeats,
                 },
@@ -217,6 +228,8 @@ def main() -> None:
                         prompt_tokens=prompt_tokens,
                         num_samples=args.num_samples,
                         max_tokens=args.max_tokens,
+                        prompt_logprobs=bool(args.prompt_logprobs),
+                        topk_prompt_logprobs=int(args.topk_prompt_logprobs),
                         poll_s=args.poll_s,
                         call_timeout_s=args.call_timeout_s,
                         expect_sequences=expect_sequences,
@@ -238,6 +251,8 @@ def main() -> None:
                     "prompt_len": args.prompt_len,
                     "num_samples": args.num_samples,
                     "max_tokens": args.max_tokens,
+                    "prompt_logprobs": bool(args.prompt_logprobs),
+                    "topk_prompt_logprobs": int(args.topk_prompt_logprobs),
                     "concurrency": c,
                     "repeat": rep,
                     "ok": len(errors) == 0,
@@ -257,4 +272,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
