@@ -41,7 +41,6 @@ DEFAULT_MODELS = ",".join(
 
 STAGE_SAVE = "save_weights_and_get_sampling_client"
 STAGE_ROLLOUT = "rollout_sample"
-STAGE_LOGPROBS = "compute_logprobs"
 STAGE_FORWARD_BACKWARD = "forward_backward"
 STAGE_OPTIM_STEP = "optim_step"
 STAGE_HEARTBEAT = "heartbeat"
@@ -129,6 +128,8 @@ class RLConfig:
     temperature: float
     lora_rank: int
     learning_rate: float
+    rollout_max_inflight: int
+    train_microbatch: int
     heartbeat_s: float
 
 
@@ -208,6 +209,18 @@ def _parse_args() -> argparse.Namespace:
         pp.add_argument("--temperature", type=float, default=0.7)
         pp.add_argument("--lora-rank", type=int, default=16)
         pp.add_argument("--learning-rate", type=float, default=5e-5)
+        pp.add_argument(
+            "--rollout-max-inflight",
+            type=int,
+            default=1,
+            help="Max in-flight sampling requests per step (higher enables vLLM continuous batching)",
+        )
+        pp.add_argument(
+            "--train-microbatch",
+            type=int,
+            default=0,
+            help="If >0, split forward_backward into chunks of this size (gradient accumulates until optim_step)",
+        )
         pp.add_argument("--future-heartbeat-s", type=float, default=60.0)
 
     return p.parse_args()
@@ -223,6 +236,8 @@ def _rl_cfg_from_args(args: argparse.Namespace) -> RLConfig:
         temperature=float(args.temperature),
         lora_rank=int(args.lora_rank),
         learning_rate=float(args.learning_rate),
+        rollout_max_inflight=int(args.rollout_max_inflight),
+        train_microbatch=int(args.train_microbatch),
         heartbeat_s=float(args.future_heartbeat_s),
     )
 
@@ -334,7 +349,9 @@ def _run_single(
         print(
             f"[{_ts()}] cfg steps={cfg.steps} prompts_per_step={cfg.prompts_per_step} "
             f"samples_per_prompt={cfg.samples_per_prompt} max_seq_len={cfg.max_seq_len} "
-            f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature}",
+            f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature} "
+            f"rollout_max_inflight={cfg.rollout_max_inflight} "
+            f"train_microbatch={cfg.train_microbatch}",
             flush=True,
         )
 
@@ -392,137 +409,167 @@ def _run_single(
             _emit(STAGE_SAVE, step_idx=step, elapsed_s=save_elapsed)
 
             step_rewards: list[float] = []
-            samples_to_score: list[tuple[list[int], int, list[int], float, float]] = []
+            datums: list[types.Datum] = []
 
             rollout_t0 = time.time()
+            desired_prompt_len = max(2, cfg.max_seq_len - cfg.gen_max_tokens - 1)
+            prompt_specs: list[tuple[int, int, int, list[int]]] = []
             for p in range(cfg.prompts_per_step):
                 a = random.randint(10, 99)
                 b = random.randint(10, 99)
                 expected = a * b
-
                 prompt_text = f"Question: What is {a} * {b}?\\nAnswer:"
                 base_prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
-
-                desired_prompt_len = max(2, cfg.max_seq_len - cfg.gen_max_tokens - 1)
                 prompt_tokens = _pad_to(base_prompt_tokens, desired_prompt_len, filler_id)
-                prompt = types.ModelInput.from_ints(tokens=prompt_tokens)
+                prompt_specs.append((p, expected, len(prompt_tokens), prompt_tokens))
 
-                print(
-                    f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p+1}/{cfg.prompts_per_step} "
-                    f"num_samples={cfg.samples_per_prompt} prompt_len={len(prompt_tokens)}",
-                    flush=True,
-                )
+            rollout_inflight = max(1, int(cfg.rollout_max_inflight))
+            prompt_cursor = 0
+            while prompt_cursor < len(prompt_specs):
+                chunk = prompt_specs[prompt_cursor : prompt_cursor + rollout_inflight]
+                prompt_cursor += rollout_inflight
 
-                sample_future = sampling_client.sample(
-                    prompt=prompt,
-                    num_samples=cfg.samples_per_prompt,
-                    sampling_params=types.SamplingParams(
-                        max_tokens=cfg.gen_max_tokens,
-                        temperature=cfg.temperature,
-                        top_k=-1,
-                        top_p=1.0,
-                    ),
-                )
-                sample_res = _wait_future(
-                    sample_future,
-                    label=f"sample model={model} session={session_idx} prompt {p+1}/{cfg.prompts_per_step} step {step+1}/{cfg.steps}",
-                    heartbeat_s=cfg.heartbeat_s,
-                    on_heartbeat=lambda elapsed: _heartbeat(
-                        stage=STAGE_ROLLOUT, step_idx=step, elapsed_s=elapsed, label="sample"
-                    ),
-                )
-                _heartbeat(
-                    stage=STAGE_ROLLOUT,
-                    step_idx=step,
-                    elapsed_s=time.time() - rollout_t0,
-                    label=f"prompt {p+1}/{cfg.prompts_per_step} complete",
-                )
+                futures = []
+                for p_idx, expected, prompt_len, prompt_tokens in chunk:
+                    print(
+                        f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p_idx+1}/{cfg.prompts_per_step} "
+                        f"num_samples={cfg.samples_per_prompt} prompt_len={prompt_len}",
+                        flush=True,
+                    )
+                    futures.append(
+                        (
+                            p_idx,
+                            expected,
+                            prompt_tokens,
+                            sampling_client.sample(
+                                prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
+                                num_samples=cfg.samples_per_prompt,
+                                sampling_params=types.SamplingParams(
+                                    max_tokens=cfg.gen_max_tokens,
+                                    temperature=cfg.temperature,
+                                    top_k=-1,
+                                    top_p=1.0,
+                                ),
+                            ),
+                        )
+                    )
 
-                rewards: list[float] = []
-                payloads: list[tuple[list[int], int, list[int], float]] = []
+                for p_idx, expected, prompt_tokens, sample_future in futures:
+                    sample_res = _wait_future(
+                        sample_future,
+                        label=f"sample model={model} session={session_idx} prompt {p_idx+1}/{cfg.prompts_per_step} step {step+1}/{cfg.steps}",
+                        heartbeat_s=cfg.heartbeat_s,
+                        on_heartbeat=lambda elapsed: _heartbeat(
+                            stage=STAGE_ROLLOUT, step_idx=step, elapsed_s=elapsed, label="sample"
+                        ),
+                    )
+                    _heartbeat(
+                        stage=STAGE_ROLLOUT,
+                        step_idx=step,
+                        elapsed_s=time.time() - rollout_t0,
+                        label=f"prompt {p_idx+1}/{cfg.prompts_per_step} complete",
+                    )
 
-                for seq in sample_res.sequences:
-                    completion_tokens = list(seq.tokens)
-                    if completion_tokens[: len(prompt_tokens)] == prompt_tokens:
-                        full_tokens = completion_tokens
-                        completion_tokens = completion_tokens[len(prompt_tokens) :]
-                    else:
-                        full_tokens = prompt_tokens + completion_tokens
+                    rewards: list[float] = []
+                    payloads: list[tuple[list[int], int, list[int], list[float], float]] = []
+                    for seq in sample_res.sequences:
+                        completion_tokens = list(seq.tokens)
+                        completion_logprobs = seq.logprobs
+                        if completion_logprobs is None:
+                            raise RuntimeError("sample() returned no logprobs; expected per-token logprobs for PPO")
+                        if len(completion_logprobs) != len(completion_tokens):
+                            raise RuntimeError(
+                                f"sample() returned logprobs length mismatch: "
+                                f"tokens={len(completion_tokens)} logprobs={len(completion_logprobs)}"
+                            )
+                        if completion_tokens[: len(prompt_tokens)] == prompt_tokens:
+                            full_tokens = completion_tokens
+                            completion_logprobs = completion_logprobs[len(prompt_tokens) :]
+                            completion_tokens = completion_tokens[len(prompt_tokens) :]
+                        else:
+                            full_tokens = prompt_tokens + completion_tokens
 
-                    if not full_tokens or full_tokens[-1] != eos_id:
-                        full_tokens = full_tokens + [eos_id]
+                        full_tokens = _pad_to(full_tokens, cfg.max_seq_len, filler_id)
+                        completion_text = tokenizer.decode(completion_tokens)
+                        pred = _first_int(completion_text)
+                        reward = 1.0 if pred == expected else 0.0
+                        rewards.append(reward)
+                        payloads.append(
+                            (full_tokens, len(prompt_tokens), completion_tokens, list(completion_logprobs), reward)
+                        )
 
-                    full_tokens = _pad_to(full_tokens, cfg.max_seq_len, filler_id)
-                    completion_text = tokenizer.decode(completion_tokens)
-                    pred = _first_int(completion_text)
-                    reward = 1.0 if pred == expected else 0.0
-                    rewards.append(reward)
-                    payloads.append((full_tokens, len(prompt_tokens), completion_tokens, reward))
+                    mean_reward = sum(rewards) / max(1, len(rewards))
+                    # With samples_per_prompt=1 (or with identical rewards across samples),
+                    # reward-mean_reward produces all-zero advantages, which can yield num_tokens=0
+                    # in PPO and trigger NaN loss logging in Megatron.
+                    baseline = 0.5 if len(set(rewards)) <= 1 else mean_reward
+                    n = cfg.max_seq_len - 1
+                    for full_tokens, prompt_len, completion_tokens, completion_logprobs, reward in payloads:
+                        adv_scalar = float(reward - baseline)
 
-                mean_reward = sum(rewards) / max(1, len(rewards))
-                for full_tokens, prompt_len, completion_tokens, reward in payloads:
-                    adv_scalar = float(reward - mean_reward)
-                    samples_to_score.append((full_tokens, prompt_len, completion_tokens, adv_scalar, reward))
-                    step_rewards.append(reward)
+                        sampling_logprobs = [0.0] * n
+                        start_i = max(0, prompt_len - 1)
+                        end_i = min(n, start_i + len(completion_tokens))
+                        for j in range(max(0, end_i - start_i)):
+                            sampling_logprobs[start_i + j] = float(completion_logprobs[j])
+
+                        adv = [0.0] * n
+                        for i in range(start_i, end_i):
+                            adv[i] = float(adv_scalar)
+
+                        datum = types.Datum(
+                            model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
+                            loss_fn_inputs={
+                                "target_tokens": full_tokens[1:],
+                                "logprobs": sampling_logprobs,
+                                "advantages": adv,
+                            },
+                        )
+                        datums.append(datum)
+                        step_rewards.append(reward)
 
             rollout_elapsed = time.time() - rollout_t0
-            _emit(STAGE_ROLLOUT, step_idx=step, elapsed_s=rollout_elapsed, num_samples=len(samples_to_score))
+            _emit(STAGE_ROLLOUT, step_idx=step, elapsed_s=rollout_elapsed, num_samples=len(datums))
 
-            datums: list[types.Datum] = []
-            logprob_t0 = time.time()
-            for full_tokens, prompt_len, completion_tokens, adv_scalar, reward in samples_to_score:
-                lp_future = sampling_client.compute_logprobs(types.ModelInput.from_ints(tokens=full_tokens))
-                lp_res = _wait_future(
-                    lp_future,
-                    label=f"compute_logprobs model={model} session={session_idx} step {step+1}/{cfg.steps}",
+            train_microbatch = int(cfg.train_microbatch)
+            if train_microbatch <= 0:
+                if len(datums) > 64:
+                    raise RuntimeError(
+                        f"forward_backward batch too large ({len(datums)} datums); set --train-microbatch to avoid OOM"
+                    )
+                microbatches = [datums]
+            else:
+                microbatches = [datums[i : i + train_microbatch] for i in range(0, len(datums), train_microbatch)]
+
+            fb_total_t0 = time.time()
+            for mb_idx, mb in enumerate(microbatches):
+                print(
+                    f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward loss_fn=ppo microbatch {mb_idx+1}/{len(microbatches)} "
+                    f"batch={len(mb)}",
+                    flush=True,
+                )
+                fb_t0 = time.time()
+                fb_future = training_client.forward_backward(mb, loss_fn="ppo")
+                _wait_future(
+                    fb_future,
+                    label=f"forward_backward model={model} session={session_idx} step {step+1}/{cfg.steps} microbatch {mb_idx+1}/{len(microbatches)}",
                     heartbeat_s=cfg.heartbeat_s,
                     on_heartbeat=lambda elapsed: _heartbeat(
-                        stage=STAGE_LOGPROBS, step_idx=step, elapsed_s=elapsed, label="compute_logprobs"
+                        stage=STAGE_FORWARD_BACKWARD, step_idx=step, elapsed_s=elapsed, label="forward_backward"
                     ),
                 )
-                _heartbeat(
-                    stage=STAGE_LOGPROBS,
+                fb_elapsed = time.time() - fb_t0
+                _emit(
+                    STAGE_FORWARD_BACKWARD,
                     step_idx=step,
-                    elapsed_s=time.time() - logprob_t0,
-                    label=f"sample {len(datums)+1}/{len(samples_to_score)} complete",
+                    elapsed_s=fb_elapsed,
+                    microbatch_idx=mb_idx,
+                    microbatch_count=len(microbatches),
+                    microbatch_size=len(mb),
                 )
-                lp = [(-100.0 if x is None else float(x)) for x in list(lp_res)]
-                sampling_logprobs = lp[1:]
 
-                n = cfg.max_seq_len - 1
-                adv = [0.0] * n
-                start_i = max(0, prompt_len - 1)
-                end_i = min(n, start_i + len(completion_tokens) + 1)
-                for i in range(start_i, end_i):
-                    adv[i] = float(adv_scalar)
-
-                datum = types.Datum(
-                    model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
-                    loss_fn_inputs={
-                        "target_tokens": full_tokens[1:],
-                        "logprobs": sampling_logprobs,
-                        "advantages": adv,
-                    },
-                )
-                datums.append(datum)
-
-            logprob_elapsed = time.time() - logprob_t0
-            _emit(STAGE_LOGPROBS, step_idx=step, elapsed_s=logprob_elapsed, num_datums=len(datums))
-
-            print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward loss_fn=ppo batch={len(datums)}", flush=True)
-            fb_t0 = time.time()
-            fb_future = training_client.forward_backward(datums, loss_fn="ppo")
-            _wait_future(
-                fb_future,
-                label=f"forward_backward model={model} session={session_idx} step {step+1}/{cfg.steps}",
-                heartbeat_s=cfg.heartbeat_s,
-                on_heartbeat=lambda elapsed: _heartbeat(
-                    stage=STAGE_FORWARD_BACKWARD, step_idx=step, elapsed_s=elapsed, label="forward_backward"
-                ),
-            )
-            fb_elapsed = time.time() - fb_t0
-            print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward done elapsed_s={fb_elapsed:.1f}", flush=True)
-            _emit(STAGE_FORWARD_BACKWARD, step_idx=step, elapsed_s=fb_elapsed)
+            fb_total_elapsed = time.time() - fb_total_t0
+            print(f"[{_ts()}] step {step+1}/{cfg.steps}: forward_backward total elapsed_s={fb_total_elapsed:.1f}", flush=True)
 
             print(f"[{_ts()}] step {step+1}/{cfg.steps}: optim_step lr={cfg.learning_rate}", flush=True)
             opt_t0 = time.time()
@@ -562,7 +609,6 @@ def _run_single(
 _SUMMARY_STAGES = [
     STAGE_SAVE,
     STAGE_ROLLOUT,
-    STAGE_LOGPROBS,
     STAGE_FORWARD_BACKWARD,
     STAGE_OPTIM_STEP,
 ]
@@ -640,6 +686,8 @@ def _write_summary(*, run_dir: Path, model: str, num_sessions: int, cfg: RLConfi
             "temperature": cfg.temperature,
             "lora_rank": cfg.lora_rank,
             "learning_rate": cfg.learning_rate,
+            "rollout_max_inflight": cfg.rollout_max_inflight,
+            "train_microbatch": cfg.train_microbatch,
             "future_heartbeat_s": cfg.heartbeat_s,
         },
         "by_session": by_session,
@@ -681,7 +729,9 @@ def _run_multi_session(
     print(
         f"[{_ts()}] cfg steps={cfg.steps} prompts_per_step={cfg.prompts_per_step} "
         f"samples_per_prompt={cfg.samples_per_prompt} max_seq_len={cfg.max_seq_len} "
-        f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature} lora_rank={cfg.lora_rank}",
+        f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature} lora_rank={cfg.lora_rank} "
+        f"rollout_max_inflight={cfg.rollout_max_inflight} "
+        f"train_microbatch={cfg.train_microbatch}",
         flush=True,
     )
 
@@ -727,6 +777,10 @@ def _run_multi_session(
             str(cfg.lora_rank),
             "--learning-rate",
             str(cfg.learning_rate),
+            "--rollout-max-inflight",
+            str(cfg.rollout_max_inflight),
+            "--train-microbatch",
+            str(cfg.train_microbatch),
             "--future-heartbeat-s",
             str(cfg.heartbeat_s),
         ]
@@ -743,6 +797,25 @@ def _run_multi_session(
     last_report = 0.0
     stalled = False
     stalled_session: int | None = None
+    last_key: dict[int, tuple[int, str] | None] = {i: None for i in range(num_sessions)}
+    last_key_ts: dict[int, float] = {i: starts[i] for i in range(num_sessions)}
+
+    def _progress_key(last: dict[str, Any] | None) -> tuple[int, str] | None:
+        if not last:
+            return None
+        if last.get("stage") == STAGE_HEARTBEAT:
+            stage = last.get("current_stage") or STAGE_HEARTBEAT
+            step = last.get("step_idx")
+        else:
+            stage = last.get("stage")
+            step = last.get("step_idx")
+        if not stage or step is None:
+            return None
+        try:
+            step_i = int(step)
+        except Exception:
+            return None
+        return (step_i, str(stage))
 
     try:
         while True:
@@ -753,8 +826,13 @@ def _run_multi_session(
 
             for session_idx in alive:
                 jsonl_path = jsonls[session_idx]
-                last_mtime = jsonl_path.stat().st_mtime if jsonl_path.exists() else starts[session_idx]
-                if (now - last_mtime) > stall_timeout_s:
+                last = _tail_jsonl(jsonl_path)
+                key = _progress_key(last)
+                if key != last_key[session_idx]:
+                    last_key[session_idx] = key
+                    last_key_ts[session_idx] = now
+
+                if (now - last_key_ts[session_idx]) > stall_timeout_s:
                     stalled = True
                     stalled_session = session_idx
                     break
@@ -778,7 +856,8 @@ def _run_multi_session(
                     else:
                         last_desc = f"{last.get('stage')} step={last.get('step_idx')}"
                     print(
-                        f"[{_ts()}] session_idx={session_idx} pid={p.pid} rc={rc} jsonl_age_s={now - mtime:.0f} last={last_desc}",
+                        f"[{_ts()}] session_idx={session_idx} pid={p.pid} rc={rc} "
+                        f"jsonl_age_s={now - mtime:.0f} stage_age_s={now - last_key_ts[session_idx]:.0f} last={last_desc}",
                         flush=True,
                     )
 
@@ -898,7 +977,9 @@ def main() -> int:
     print(
         f"[{_ts()}] cfg steps={cfg.steps} prompts_per_step={cfg.prompts_per_step} "
         f"samples_per_prompt={cfg.samples_per_prompt} max_seq_len={cfg.max_seq_len} "
-        f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature} lora_rank={cfg.lora_rank}",
+        f"gen_max_tokens={cfg.gen_max_tokens} temperature={cfg.temperature} lora_rank={cfg.lora_rank} "
+        f"rollout_max_inflight={cfg.rollout_max_inflight} "
+        f"train_microbatch={cfg.train_microbatch}",
         flush=True,
     )
 
@@ -939,6 +1020,10 @@ def main() -> int:
             str(cfg.lora_rank),
             "--learning-rate",
             str(cfg.learning_rate),
+            "--rollout-max-inflight",
+            str(cfg.rollout_max_inflight),
+            "--train-microbatch",
+            str(cfg.train_microbatch),
             "--future-heartbeat-s",
             str(cfg.heartbeat_s),
         ]

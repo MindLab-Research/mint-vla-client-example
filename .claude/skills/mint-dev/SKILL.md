@@ -158,7 +158,7 @@ nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$US
 pgrep -af "unison.*volcano-tinker-$USER"
 
 # Stop daemon
-pkill -f "unison.*volcano-tinker-$USER"
+pkill -f "[u]nison.*volcano-tinker-$USER" || true
 ```
 
 **First-time setup:**
@@ -205,7 +205,7 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
 ### Stop Server
 
 ```bash
-ssh volcano 'pkill -f "python scripts/run_server.py"'
+ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ```
 
 ### Check Status
@@ -336,7 +336,7 @@ for a in actors:
 ### Fast Restart (no vLLM changes)
 
 ```bash
-ssh volcano 'pkill -f "run_server" 2>/dev/null'
+ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
@@ -352,7 +352,7 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Restart server
-ssh volcano 'pkill -f "run_server" 2>/dev/null'
+ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
