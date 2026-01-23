@@ -30,6 +30,10 @@ REPORT="$(mktemp /tmp/auto-bugfix-review.XXXXXX.md)"
 gh pr comment "$PR_URL" --body-file "$REPORT"
 ```
 
+Getting file line numbers:
+- Option A (preferred): `gh pr checkout "$PR_URL"`, then use `rg -n` or `nl -ba <file>` to cite file line numbers.
+- Option B: use `gh pr diff "$PR_URL" --color=never` and cite the `@@ ... @@` hunk headers (line ranges on the head side).
+
 Report content requirements:
 - Say whether the PR matches the issue scope (and where it does not).
 - List concrete technical concerns with file paths and line numbers to inspect.

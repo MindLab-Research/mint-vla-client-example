@@ -95,6 +95,8 @@ Branch naming (stable per issue): `bot/issue-<NUMBER>`.
 ISSUE=123
 BRANCH="bot/issue-$ISSUE"
 
+test -z "$(git status --porcelain)" || { echo "error: working tree is dirty"; exit 1; }
+
 git fetch origin
 
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
@@ -125,37 +127,43 @@ Issue-specific code sync (do not manually sync; use unison daemon mode):
 LOCAL_ROOT="$(git rev-parse --show-toplevel)"
 
 mkdir -p ~/.unison
-sed \
-  -e "s|root = /home/yiwen/tinker_project/tinker-server|root = $LOCAL_ROOT|" \
-  -e "s|/vePFS-Mindverse/share/code/__PFS_USER__/tinker-server|/vePFS-Mindverse/share/code/__PFS_USER__/tinker-server-issue-$ISSUE|" \
-  -e "s/__PFS_USER__/$USER/g" \
-  .claude/skills/mint-dev/configs/volcano-tinker.prf \
-  > ~/.unison/$UNISON_PROFILE.prf
+python - <<'PY'
+import os
+from pathlib import Path
 
+issue = os.environ["ISSUE"]
+user = os.environ["USER"]
+local_root = os.environ["LOCAL_ROOT"]
+unison_profile = os.environ["UNISON_PROFILE"]
+
+template = Path(".claude/skills/mint-dev/configs/volcano-tinker.prf").read_text()
+lines = template.splitlines(True)
+roots = [i for i, ln in enumerate(lines) if ln.startswith("root = ")]
+if len(roots) != 2:
+    raise SystemExit(f"expected 2 root lines, got {len(roots)}")
+
+lines[roots[0]] = f"root = {local_root}\n"
+lines[roots[1]] = f"root = ssh://volcano//vePFS-Mindverse/share/code/{user}/tinker-server-issue-{issue}\n"
+out = "".join(lines).replace("__PFS_USER__", user)
+
+dst = Path.home() / ".unison" / f"{unison_profile}.prf"
+dst.write_text(out)
+print(dst)
+PY
+
+pkill -f "[u]nison.*$UNISON_PROFILE" 2>/dev/null || true
 nohup unison "$UNISON_PROFILE" -repeat watch > "/tmp/unison-$UNISON_PROFILE.log" 2>&1 &
 pgrep -af "unison.*$UNISON_PROFILE"
 ```
 
-Issue-specific server root on volcano (avoid touching `/root/tinker_project/tinker-server`):
+Issue-specific server root on volcano (keep `mint-dev` paths stable):
 ```bash
-ssh volcano "mkdir -p $PFS_TINKER_PATH && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
+ssh volcano "mkdir -p $PFS_TINKER_PATH && rm -rf /root/tinker_project/tinker-server && ln -s $PFS_TINKER_PATH /root/tinker_project/tinker-server"
 ```
 
-Start dev server with both `TINKER_RAY_NAMESPACE` and issue-specific `PFS_TINKER_PATH`:
-```bash
-ssh volcano "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server-issue-$ISSUE:\\$PYTHONPATH \
-   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-   PYTHONDONTWRITEBYTECODE=1 \
-   PFS_TINKER_PATH=$PFS_TINKER_PATH \
-   TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
-   python scripts/run_server.py\" > /tmp/tinker_server_issue_$ISSUE.log 2>&1 &"
-```
-
-Issue-specific logs:
-```bash
-ssh volcano "tail -50 /tmp/tinker_server_issue_$ISSUE.log"
-```
+Start dev server by following `mint-dev` "Start Server", with two changes:
+- set `PFS_TINKER_PATH` to the issue-specific path
+- set `TINKER_RAY_NAMESPACE` to the issue-specific namespace
 
 ### 3c) Delegate the fix to a bugfixer subagent
 
@@ -256,7 +264,8 @@ If reviewer recommendation is `iterate`:
 
 If reviewer recommendation is `merge`:
 ```bash
-gh pr merge "$PR_URL" --merge --delete-branch --auto
+gh pr merge "$PR_URL" --merge --delete-branch --auto \
+  || gh pr merge "$PR_URL" --merge --delete-branch
 ```
 
 Then re-list the issue queue and continue until empty.
