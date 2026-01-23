@@ -12,7 +12,7 @@ description: |
 
   Refers to:
   - `bugfix` skill for reproduction discipline
-  - `mint-dev` skill for dev server operations (volcano:8000)
+  - `mint-dev` skill for dev environment constraints (volcano host; default port 8000)
   - `architecture-design` skill for architecture docs alignment
 
   Triggers: "auto-bugfix", "bot queue", "assign-to-bot"
@@ -30,7 +30,8 @@ Responsibility split:
 Hard rules:
 - Production is read-only. Use `mint-prod` skill if production reads are required.
 - Never substitute requirements. If reproduction fails, fix the real failure.
-- Restart dev server after code changes (Python server does not hot-reload). See `mint-dev`.
+- Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
+- Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
 
 Files:
 - Bugfixer subagent prompt: `.claude/skills/auto-bugfix/prompts/bugfixer.md`
@@ -110,7 +111,7 @@ fi
 
 ### 3b) Set up dev env using issue-specific namespace and PFS path
 
-Use `mint-dev` for the exact SSH/log/start/stop commands.
+Use `mint-dev` for shared dev constraints and definitions. Do not reuse its start/stop/log commands because this skill must not stop or replace the default dev server.
 
 Namespace goal: isolate Ray actor state per issue (avoid collisions across concurrent dev runs).
 `mint-dev` documents `TINKER_RAY_NAMESPACE` for this.
@@ -121,6 +122,7 @@ export ISSUE=123
 export TINKER_RAY_NAMESPACE="tinker_${USER}_issue_${ISSUE}"
 export PFS_TINKER_PATH="/vePFS-Mindverse/share/code/$USER/tinker-server-issue-$ISSUE"
 export UNISON_PROFILE="volcano-tinker-$USER-issue-$ISSUE"
+export TINKER_PORT="$((10000 + ISSUE % 5000))"
 ```
 
 Issue-specific code sync (do not manually sync; use unison daemon mode):
@@ -158,14 +160,38 @@ nohup unison "$UNISON_PROFILE" -repeat watch > "/tmp/unison-$UNISON_PROFILE.log"
 pgrep -af "unison.*$UNISON_PROFILE"
 ```
 
-Issue-specific server root on volcano (keep `mint-dev` paths stable):
+Issue-specific server root on volcano:
 ```bash
-ssh volcano "mkdir -p $PFS_TINKER_PATH && ( [ ! -e /root/tinker_project/tinker-server ] || [ -L /root/tinker_project/tinker-server ] ) && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server"
+ssh volcano "mkdir -p $PFS_TINKER_PATH && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
 ```
 
-Start dev server by following `mint-dev` "Start Server", with two changes:
-- set `PFS_TINKER_PATH` to the issue-specific path
-- set `TINKER_RAY_NAMESPACE` to the issue-specific namespace
+Start an issue-scoped dev server (does not touch the default dev server on port 8000):
+```bash
+ssh volcano "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c \
+  \"PYTHONPATH=/root/tinker_project/tinker-server-issue-$ISSUE:\\$PYTHONPATH \
+   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   PFS_TINKER_PATH=$PFS_TINKER_PATH \
+   TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
+   TINKER_PORT=$TINKER_PORT \
+   python scripts/run_server.py\" > /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \\$! > /tmp/tinker_server_issue_$ISSUE.pid"
+```
+
+Issue-scoped health check (via local SSH tunnel):
+```bash
+ssh -f -N -L $TINKER_PORT:localhost:$TINKER_PORT volcano
+curl http://localhost:$TINKER_PORT/api/v1/healthz
+```
+
+Issue-scoped logs:
+```bash
+ssh volcano "tail -50 /tmp/tinker_server_issue_$ISSUE.log"
+```
+
+Issue-scoped stop:
+```bash
+ssh volcano "test -f /tmp/tinker_server_issue_$ISSUE.pid && xargs -r kill < /tmp/tinker_server_issue_$ISSUE.pid || true"
+```
 
 ### 3c) Delegate the fix to a bugfixer subagent
 
@@ -188,7 +214,7 @@ Bugfixer deliverable back to orchestrator:
 
 Use the `bugfix` workflow:
 - Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py`
-- Run it against dev (`TINKER_BASE_URL=http://localhost:8000`, `TINKER_API_KEY=dummy`)
+- Run it against the issue-scoped dev server (`TINKER_BASE_URL=http://localhost:$TINKER_PORT`, `TINKER_API_KEY=dummy`)
 
 ### 3e) Fix issue
 
@@ -196,7 +222,7 @@ Implement the minimal root-cause fix.
 
 After code changes:
 1) verify code synced to volcano (unison)
-2) restart dev server (see `mint-dev`)
+2) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
 3) confirm health endpoint
 
 ### 3f) Re-run reproduction script
