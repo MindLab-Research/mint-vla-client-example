@@ -22,6 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
+from ..checkpoints import CHECKPOINTS_DIR, resolve_checkpoint_path
 from ..models.types import (
     CheckpointInfo,
     CheckpointsListResponse,
@@ -44,11 +45,6 @@ training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
-# Checkpoint directory (shared filesystem required for distributed deployments)
-# Must be absolute path on vePFS for all Ray workers to access
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
-
-
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state."""
     return getattr(request.state, "user_data", None)
@@ -68,60 +64,6 @@ def _get_webhook_url(request: Request) -> str | None:
     if user_data:
         return user_data.get("webhook_url")
     return None
-
-
-def _resolve_mint_path(mint_uri: str) -> str:
-    """Convert path identifier to filesystem path.
-
-    Args:
-        mint_uri: One of:
-            - checkpoint_id (ckpt_xxx): Search in all checkpoint directories
-            - mint://{model_id}/{name}: Legacy format -> /checkpoints/{model_id}/{name}
-            - file:///path: Strip prefix
-            - Absolute path: Return as-is
-
-    Returns:
-        Filesystem path.
-    """
-    import json
-
-    # New format: checkpoint_id (ckpt_xxx)
-    if mint_uri.startswith("ckpt_"):
-        # Search for checkpoint by ID in metadata
-        for top_level in os.listdir(CHECKPOINTS_DIR):
-            top_path = os.path.join(CHECKPOINTS_DIR, top_level)
-            if not os.path.isdir(top_path):
-                continue
-            for sub_dir in os.listdir(top_path):
-                sub_path = os.path.join(top_path, sub_dir)
-                if not os.path.isdir(sub_path):
-                    continue
-                metadata_path = os.path.join(sub_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    try:
-                        with open(metadata_path) as f:
-                            metadata = json.load(f)
-                        if metadata.get("checkpoint_id") == mint_uri:
-                            return sub_path
-                    except (json.JSONDecodeError, OSError):
-                        pass
-        # Not found - return as-is (will fail later)
-        return mint_uri
-
-    # tinker:// or mint:// format: {scheme}://{model_id}/checkpoint-100
-    if mint_uri.startswith("tinker://"):
-        path_part = mint_uri[len("tinker://"):]
-        return os.path.join(CHECKPOINTS_DIR, path_part)
-    if mint_uri.startswith("mint://"):
-        path_part = mint_uri[len("mint://"):]
-        return os.path.join(CHECKPOINTS_DIR, path_part)
-
-    # File URI
-    if mint_uri.startswith("file://"):
-        return mint_uri[7:]
-
-    # Absolute path
-    return mint_uri
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
@@ -276,13 +218,6 @@ async def _do_save_state(
             except Exception as reg_err:
                 logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
-        # Build mint:// path for response
-        mint_path = _to_mint_path(session.model_id, checkpoint_id)
-
-        # Include state_dict metadata in response for verification (e.g., checking MLP modules)
-        # Keys are JSON-serializable, tensors are not
-        state_dict_keys = []  # state_dict not available in path-based flow
-
         future_store.resolve(request_id, {
             "checkpoint_id": checkpoint_id,
             "path": save_path,  # Filesystem path for debugging
@@ -357,7 +292,7 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
             raise RuntimeError("Training engine not initialized")
 
         # Resolve path
-        load_path = _resolve_mint_path(request.path)
+        load_path = resolve_checkpoint_path(request.path)
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
