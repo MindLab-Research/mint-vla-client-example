@@ -129,7 +129,11 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,  # 40K context - full model capability
-        max_num_seqs=8,  # Constrain KV cache; prompt_logprobs needs headroom at long context
+        # NOTE: vLLM's `max_num_seqs` caps the total number of *active sequences*,
+        # not the number of HTTP requests. When sampling uses `SamplingParams(n=8)`,
+        # a single prompt consumes up to 8 sequence slots. With `max_num_seqs=8`,
+        # the engine effectively runs prompts sequentially (no cross-prompt batching).
+        max_num_seqs=16,
         max_num_batched_tokens=1024,  # Avoid multi-GB logits buffers during prompt_logprobs
         max_loras=8,
         max_cpu_loras=16,
