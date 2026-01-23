@@ -98,6 +98,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             super().__init__(*args, **kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
+            self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
 
         async def is_engine_ready(self) -> bool:
             """Check if vLLM engine is properly initialized.
@@ -404,10 +411,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             # Get final response
             if sampling_params.n == 1:
+                t0 = time.perf_counter()
+                first_tok_s: float | None = None
                 final_res = None
                 async for output in generator:
+                    if first_tok_s is None:
+                        first_tok_s = time.perf_counter() - t0
                     final_res = output
                 assert final_res is not None
+                if self._timing:
+                    print(
+                        f"[vLLM timing] generate_with_lora req={request_id} prompt_len={len(prompt_ids)} "
+                        f"max_tokens={max_tokens} n={sampling_params.n} lora_id={lora_int_id} "
+                        f"total_s={time.perf_counter() - t0:.3f} first_tok_s={first_tok_s}"
+                        ,
+                        flush=True,
+                    )
 
                 token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
@@ -430,10 +449,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     "stop_reason": stop_reason,
                 }
 
+            t0 = time.perf_counter()
+            first_tok_s: float | None = None
             by_index: dict[int, Any] = {}
             async for output in generator:
+                if first_tok_s is None:
+                    first_tok_s = time.perf_counter() - t0
                 for out in output.outputs:
                     by_index[int(out.index)] = out
+            if self._timing:
+                print(
+                    f"[vLLM timing] generate_with_lora req={request_id} prompt_len={len(prompt_ids)} "
+                    f"max_tokens={max_tokens} n={sampling_params.n} lora_id={lora_int_id} "
+                    f"total_s={time.perf_counter() - t0:.3f} first_tok_s={first_tok_s}"
+                    ,
+                    flush=True,
+                )
 
             if len(by_index) != sampling_params.n:
                 raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
@@ -530,10 +561,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             # Get final response
             if sampling_params.n == 1:
+                t0 = time.perf_counter()
+                first_tok_s: float | None = None
                 final_res = None
                 async for output in generator:
+                    if first_tok_s is None:
+                        first_tok_s = time.perf_counter() - t0
                     final_res = output
                 assert final_res is not None
+                if self._timing:
+                    print(
+                        f"[vLLM timing] generate_base req={request_id} prompt_len={len(prompt_ids)} "
+                        f"max_tokens={max_tokens} n={sampling_params.n} total_s={time.perf_counter() - t0:.3f} "
+                        f"first_tok_s={first_tok_s}"
+                        ,
+                        flush=True,
+                    )
 
                 token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
@@ -556,10 +599,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     "stop_reason": stop_reason,
                 }
 
+            t0 = time.perf_counter()
+            first_tok_s: float | None = None
             by_index: dict[int, Any] = {}
             async for output in generator:
+                if first_tok_s is None:
+                    first_tok_s = time.perf_counter() - t0
                 for out in output.outputs:
                     by_index[int(out.index)] = out
+            if self._timing:
+                print(
+                    f"[vLLM timing] generate_base req={request_id} prompt_len={len(prompt_ids)} "
+                    f"max_tokens={max_tokens} n={sampling_params.n} total_s={time.perf_counter() - t0:.3f} "
+                    f"first_tok_s={first_tok_s}"
+                    ,
+                    flush=True,
+                )
 
             if len(by_index) != sampling_params.n:
                 raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
@@ -1329,9 +1384,6 @@ class VerlInferenceEngine:
         from verl.workers.config import HFModelConfig, RolloutConfig
         from verl.workers.rollout.replica import RolloutMode
 
-        # Use our extended server with add_lora support
-        ExtendedVLLMHttpServer = _create_extended_server_class()
-
         if not ray.is_initialized():
             # Use 'auto' to connect to existing cluster if available
             # If no cluster, this falls back to starting a local Ray instance
@@ -1356,6 +1408,19 @@ class VerlInferenceEngine:
 
         # Use model registry as single source of truth for memory constraints.
         cfg = get_model_config(self.model_path)
+        if cfg.max_loras is not None:
+            max_loras = int(cfg.max_loras)
+        else:
+            max_loras = 1 if cfg.is_moe else 64
+        if cfg.max_cpu_loras is not None:
+            max_cpu_loras = int(cfg.max_cpu_loras)
+        else:
+            max_cpu_loras = max_loras
+        # Use our extended server with add_lora support
+        ExtendedVLLMHttpServer = _create_extended_server_class(
+            max_loras=max_loras,
+            max_cpu_loras=max_cpu_loras,
+        )
         max_model_len = cfg.max_model_len
         max_num_seqs = cfg.max_num_seqs or 256
         gpu_util = cfg.gpu_memory_utilization or self.gpu_memory_utilization
@@ -1418,6 +1483,7 @@ class VerlInferenceEngine:
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
         self.server = ExtendedVLLMHttpServer.options(
             num_gpus=total_gpus,
+            max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
             runtime_env={
                 "env_vars": {
                     "PYTHONPATH": PFS_PYTHONPATH,

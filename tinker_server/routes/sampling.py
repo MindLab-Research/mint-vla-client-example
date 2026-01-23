@@ -8,6 +8,8 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import array
+import hashlib
 import os
 import logging
 from typing import TYPE_CHECKING
@@ -39,6 +41,108 @@ _SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
 _MAX_INFLIGHT_SAMPLE_TASKS = int(os.environ.get("TINKER_MAX_INFLIGHT_SAMPLE_TASKS", "64"))
 _MAX_CONCURRENT_SAMPLES_PER_REQUEST = int(os.environ.get("TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST", "8"))
 _inflight_sample_tasks = 0
+
+_SAMPLE_COALESCE = os.environ.get("TINKER_SAMPLE_COALESCE", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+_SAMPLE_COALESCE_WINDOW_MS = float(os.environ.get("TINKER_SAMPLE_COALESCE_WINDOW_MS", "2.0"))
+_SAMPLE_COALESCE_MAX_BATCH = int(os.environ.get("TINKER_SAMPLE_COALESCE_MAX_BATCH", "32"))
+_sample_coalesce_lock = asyncio.Lock()
+_sample_coalesce_groups: dict[tuple, dict] = {}
+
+
+def _prompt_fingerprint(token_ids: list[int]) -> bytes:
+    # 32k token prompts are common; collisions must be negligible but hashing cost is amortized by prefill.
+    a = array.array("I", token_ids)
+    return hashlib.blake2b(a.tobytes(), digest_size=16).digest()
+
+
+async def _coalesced_generate_one(
+    *,
+    engine,
+    sampling_session_id: str,
+    prompt_ids: list[int],
+    request_id: str,
+    max_tokens: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+):
+    key = (
+        sampling_session_id,
+        _prompt_fingerprint(prompt_ids),
+        int(max_tokens),
+        float(temperature),
+        int(top_k),
+        float(top_p),
+    )
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    do_flush_now = False
+    async with _sample_coalesce_lock:
+        g = _sample_coalesce_groups.get(key)
+        if g is None:
+            g = {
+                "engine": engine,
+                "sampling_session_id": sampling_session_id,
+                "prompt_ids": prompt_ids,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+                "leader_request_id": request_id,
+                "waiters": [],
+                "flush_task": None,
+            }
+            _sample_coalesce_groups[key] = g
+        g["waiters"].append(fut)
+        if len(g["waiters"]) >= _SAMPLE_COALESCE_MAX_BATCH:
+            do_flush_now = True
+        if g["flush_task"] is None:
+            delay_s = 0.0 if do_flush_now else max(0.0, _SAMPLE_COALESCE_WINDOW_MS / 1000.0)
+            g["flush_task"] = asyncio.create_task(_flush_coalesced_group(key, delay_s))
+
+    return await fut
+
+
+async def _flush_coalesced_group(key: tuple, delay_s: float) -> None:
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+    async with _sample_coalesce_lock:
+        g = _sample_coalesce_groups.pop(key, None)
+    if g is None:
+        return
+
+    waiters = list(g["waiters"])
+    if not waiters:
+        return
+
+    try:
+        results = await g["engine"].generate_many(
+            sampling_session_id=g["sampling_session_id"],
+            prompt_ids=g["prompt_ids"],
+            request_id=f"{g['leader_request_id']}_coalesced",
+            num_samples=len(waiters),
+            max_tokens=g["max_tokens"],
+            temperature=g["temperature"],
+            top_k=g["top_k"],
+            top_p=g["top_p"],
+            logprobs=True,
+        )
+        if len(results) != len(waiters):
+            raise RuntimeError(f"coalesce: got {len(results)} results for {len(waiters)} waiters")
+        for fut, res in zip(waiters, results):
+            if not fut.done():
+                fut.set_result(res)
+    except Exception as e:
+        for fut in waiters:
+            if not fut.done():
+                fut.set_exception(e)
 
 
 def _should_backpressure(http_request: Request) -> bool:
@@ -124,8 +228,14 @@ async def _do_sample(
                     raise RuntimeError(f"No engine found for session {session_id}")
 
                 if request.num_samples == 1:
-                    results = [
-                        await engine.generate(
+                    if (
+                        _SAMPLE_COALESCE
+                        and (not want_prompt_logprobs)
+                        and request.topk_prompt_logprobs == 0
+                        and _SAMPLE_COALESCE_MAX_BATCH > 1
+                    ):
+                        one = await _coalesced_generate_one(
+                            engine=engine,
                             sampling_session_id=session_id,
                             prompt_ids=token_ids,
                             request_id=request_id,
@@ -133,9 +243,21 @@ async def _do_sample(
                             temperature=request.sampling_params.temperature,
                             top_k=request.sampling_params.top_k,
                             top_p=request.sampling_params.top_p,
-                            logprobs=True,
                         )
-                    ]
+                        results = [one]
+                    else:
+                        results = [
+                            await engine.generate(
+                                sampling_session_id=session_id,
+                                prompt_ids=token_ids,
+                                request_id=request_id,
+                                max_tokens=request.sampling_params.max_tokens,
+                                temperature=request.sampling_params.temperature,
+                                top_k=request.sampling_params.top_k,
+                                top_p=request.sampling_params.top_p,
+                                logprobs=True,
+                            )
+                        ]
                 else:
                     gen_many = getattr(engine, "generate_many", None)
                     if gen_many is None:
