@@ -118,16 +118,33 @@ async def _do_sample(
 
             if is_multi_lora:
                 # Multi-LoRA mode: handles both LoRA and base model sessions
-                # Get engine once; it is shared across samples for batching.
+                # Get engine once; it is shared across samples.
                 engine = await session_manager.get_engine_for_session(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
 
-                async def _generate_one(i: int):
-                    return await engine.generate(
+                if request.num_samples == 1:
+                    results = [
+                        await engine.generate(
+                            sampling_session_id=session_id,
+                            prompt_ids=token_ids,
+                            request_id=request_id,
+                            max_tokens=request.sampling_params.max_tokens,
+                            temperature=request.sampling_params.temperature,
+                            top_k=request.sampling_params.top_k,
+                            top_p=request.sampling_params.top_p,
+                            logprobs=True,
+                        )
+                    ]
+                else:
+                    gen_many = getattr(engine, "generate_many", None)
+                    if gen_many is None:
+                        raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
+                    results = await gen_many(
                         sampling_session_id=session_id,
                         prompt_ids=token_ids,
-                        request_id=f"{request_id}_{i}",
+                        request_id=request_id,
+                        num_samples=request.num_samples,
                         max_tokens=request.sampling_params.max_tokens,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
@@ -151,16 +168,16 @@ async def _do_sample(
                         logprobs=True,
                     )
 
-            max_concurrent = _MAX_CONCURRENT_SAMPLES_PER_REQUEST
-            if max_concurrent <= 0:
-                max_concurrent = request.num_samples
-            sem = asyncio.Semaphore(max_concurrent)
+                max_concurrent = _MAX_CONCURRENT_SAMPLES_PER_REQUEST
+                if max_concurrent <= 0:
+                    max_concurrent = request.num_samples
+                sem = asyncio.Semaphore(max_concurrent)
 
-            async def _generate_limited(i: int):
-                async with sem:
-                    return await _generate_one(i)
+                async def _generate_limited(i: int):
+                    async with sem:
+                        return await _generate_one(i)
 
-            results = await asyncio.gather(*(_generate_limited(i) for i in range(request.num_samples)))
+                results = await asyncio.gather(*(_generate_limited(i) for i in range(request.num_samples)))
 
             sequences = []
             eos_tokens = {151645, 151643}

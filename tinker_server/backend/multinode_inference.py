@@ -377,7 +377,8 @@ def _create_multinode_vllm_actor(
             top_k: int = -1,
             top_p: float = 1.0,
             logprobs: bool = True,
-        ) -> dict:
+            n: int = 1,
+        ) -> dict | list[dict]:
             """Generate tokens with optional LoRA adapter.
 
             Args:
@@ -390,6 +391,7 @@ def _create_multinode_vllm_actor(
                 top_k: Top-k sampling parameter.
                 top_p: Top-p sampling parameter.
                 logprobs: Whether to return log probabilities.
+                n: Number of sequences to sample for the same prompt.
 
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
@@ -404,6 +406,7 @@ def _create_multinode_vllm_actor(
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
+                n=max(1, int(n)),
                 stop_token_ids=[151645, 151643],  # Qwen EOS tokens
             )
 
@@ -445,25 +448,51 @@ def _create_multinode_vllm_actor(
                 )
 
             token_ids = list(final_res.outputs[0].token_ids)
-            log_probs = None
-            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+            if sampling_params.n == 1:
+                log_probs = None
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                    log_probs = [
+                        logprobs[token_ids[i]].logprob
+                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                    ]
 
-            # Determine stop reason
-            stop_reason = "length"
-            if final_res.outputs[0].finish_reason == "stop":
-                stop_reason = "stop"
-            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
-                stop_reason = "stop"
+                # Determine stop reason
+                stop_reason = "length"
+                if final_res.outputs[0].finish_reason == "stop":
+                    stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                    stop_reason = "stop"
 
-            return {
-                "token_ids": token_ids,
-                "logprobs": log_probs,
-                "stop_reason": stop_reason,
-            }
+                return {
+                    "token_ids": token_ids,
+                    "logprobs": log_probs,
+                    "stop_reason": stop_reason,
+                }
+
+            outs: list[dict] = []
+            for out in final_res.outputs:
+                out_token_ids = list(out.token_ids)
+                out_log_probs = None
+                if sampling_params.logprobs is not None and out.logprobs:
+                    out_log_probs = [
+                        lp[out_token_ids[i]].logprob
+                        for i, lp in enumerate(out.logprobs)
+                    ]
+
+                out_stop_reason = "length"
+                if out.finish_reason == "stop":
+                    out_stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                    out_stop_reason = "stop"
+
+                outs.append(
+                    {
+                        "token_ids": out_token_ids,
+                        "logprobs": out_log_probs,
+                        "stop_reason": out_stop_reason,
+                    }
+                )
+            return outs
 
         async def compute_prompt_logprobs(
             self,
@@ -1058,6 +1087,60 @@ class MultiNodeInferenceEngine:
             logprobs=result.get("logprobs"),
             stop_reason=result.get("stop_reason"),
         )
+
+    async def generate_many(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        num_samples: int,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = -1,
+        top_p: float = 1.0,
+        logprobs: bool = True,
+    ) -> list[GenerateResult]:
+        """Generate multiple sequences for the same prompt in a single vLLM request."""
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1 (got {num_samples})")
+
+        # Look up LoRA for this session
+        lora_id = None
+        lora_path = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+            if lora_id is not None:
+                lora_path = await self.registry.get_adapter_path(lora_id)
+
+        raw = await self.engine.generate.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            logprobs=logprobs,
+            n=num_samples,
+        )
+
+        if isinstance(raw, dict):
+            raw_list: list[dict] = [raw]
+        else:
+            raw_list = list(raw)
+
+        return [
+            GenerateResult(
+                token_ids=r["token_ids"],
+                logprobs=r.get("logprobs"),
+                stop_reason=r.get("stop_reason"),
+            )
+            for r in raw_list
+        ]
 
     async def compute_logprobs(
         self,

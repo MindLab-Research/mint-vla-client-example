@@ -334,7 +334,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_k: int = -1,
             top_p: float = 1.0,
             logprobs: bool = True,
-        ) -> dict:
+            n: int = 1,
+        ) -> dict | list[dict]:
             """Generate with a specific LoRA adapter.
 
             For multi-LoRA: routes request to session-specific adapter.
@@ -348,6 +349,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k: Top-k sampling parameter.
                 top_p: Top-p sampling parameter.
                 logprobs: Whether to return log probabilities.
+                n: Number of sequences to sample for the same prompt.
 
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
@@ -374,6 +376,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
+                n=max(1, int(n)),
                 # EOS token handling for Qwen
                 stop_token_ids=[151645, 151643],
             )
@@ -406,25 +409,51 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             assert final_res is not None
 
             token_ids = list(final_res.outputs[0].token_ids)
-            log_probs = None
-            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+            if sampling_params.n == 1:
+                log_probs = None
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                    log_probs = [
+                        logprobs[token_ids[i]].logprob
+                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                    ]
 
-            # Determine stop reason
-            stop_reason = "length"
-            if final_res.outputs[0].finish_reason == "stop":
-                stop_reason = "stop"
-            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
-                stop_reason = "stop"
+                # Determine stop reason
+                stop_reason = "length"
+                if final_res.outputs[0].finish_reason == "stop":
+                    stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                    stop_reason = "stop"
 
-            return {
-                "token_ids": token_ids,
-                "logprobs": log_probs,
-                "stop_reason": stop_reason,
-            }
+                return {
+                    "token_ids": token_ids,
+                    "logprobs": log_probs,
+                    "stop_reason": stop_reason,
+                }
+
+            outs: list[dict] = []
+            for out in final_res.outputs:
+                out_token_ids = list(out.token_ids)
+                out_log_probs = None
+                if sampling_params.logprobs is not None and out.logprobs:
+                    out_log_probs = [
+                        lp[out_token_ids[i]].logprob
+                        for i, lp in enumerate(out.logprobs)
+                    ]
+
+                out_stop_reason = "length"
+                if out.finish_reason == "stop":
+                    out_stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                    out_stop_reason = "stop"
+
+                outs.append(
+                    {
+                        "token_ids": out_token_ids,
+                        "logprobs": out_log_probs,
+                        "stop_reason": out_stop_reason,
+                    }
+                )
+            return outs
 
         async def generate_base(
             self,
@@ -435,7 +464,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_k: int = -1,
             top_p: float = 1.0,
             logprobs: bool = True,
-        ) -> dict:
+            n: int = 1,
+        ) -> dict | list[dict]:
             """Generate using base model without any LoRA adapter.
 
             For multi-LoRA engine: generates with base model weights only.
@@ -448,6 +478,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k: Top-k sampling parameter.
                 top_p: Top-p sampling parameter.
                 logprobs: Whether to return log probabilities.
+                n: Number of sequences to sample for the same prompt.
 
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
@@ -473,6 +504,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
+                n=max(1, int(n)),
                 # EOS token handling for Qwen
                 stop_token_ids=[151645, 151643],
             )
@@ -494,25 +526,51 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             assert final_res is not None
 
             token_ids = list(final_res.outputs[0].token_ids)
-            log_probs = None
-            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+            if sampling_params.n == 1:
+                log_probs = None
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                    log_probs = [
+                        logprobs[token_ids[i]].logprob
+                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                    ]
 
-            # Determine stop reason
-            stop_reason = "length"
-            if final_res.outputs[0].finish_reason == "stop":
-                stop_reason = "stop"
-            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
-                stop_reason = "stop"
+                # Determine stop reason
+                stop_reason = "length"
+                if final_res.outputs[0].finish_reason == "stop":
+                    stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                    stop_reason = "stop"
 
-            return {
-                "token_ids": token_ids,
-                "logprobs": log_probs,
-                "stop_reason": stop_reason,
-            }
+                return {
+                    "token_ids": token_ids,
+                    "logprobs": log_probs,
+                    "stop_reason": stop_reason,
+                }
+
+            outs: list[dict] = []
+            for out in final_res.outputs:
+                out_token_ids = list(out.token_ids)
+                out_log_probs = None
+                if sampling_params.logprobs is not None and out.logprobs:
+                    out_log_probs = [
+                        lp[out_token_ids[i]].logprob
+                        for i, lp in enumerate(out.logprobs)
+                    ]
+
+                out_stop_reason = "length"
+                if out.finish_reason == "stop":
+                    out_stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                    out_stop_reason = "stop"
+
+                outs.append(
+                    {
+                        "token_ids": out_token_ids,
+                        "logprobs": out_log_probs,
+                        "stop_reason": out_stop_reason,
+                    }
+                )
+            return outs
 
         async def generate(
             self,

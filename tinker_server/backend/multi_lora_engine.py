@@ -819,6 +819,74 @@ class MultiLoRAInferenceEngine:
             stop_reason=result.get("stop_reason"),
         )
 
+    async def generate_many(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        num_samples: int,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = -1,
+        top_p: float = 1.0,
+        logprobs: bool = True,
+    ) -> list[GenerateResult]:
+        """Generate multiple sequences for the same prompt in a single vLLM request."""
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1 (got {num_samples})")
+
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
+
+        # Look up LoRA ID for this session (None = base model)
+        lora_id = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+
+        if lora_id is not None:
+            raw = await self.server.generate_with_lora.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+                n=num_samples,
+            )
+        else:
+            raw = await self.server.generate_base.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+                n=num_samples,
+            )
+
+        if isinstance(raw, dict):
+            raw_list: list[dict] = [raw]
+        else:
+            raw_list = list(raw)
+
+        return [
+            GenerateResult(
+                token_ids=r["token_ids"],
+                logprobs=r.get("logprobs"),
+                stop_reason=r.get("stop_reason"),
+            )
+            for r in raw_list
+        ]
+
     async def compute_logprobs(
         self,
         sampling_session_id: str | None,
