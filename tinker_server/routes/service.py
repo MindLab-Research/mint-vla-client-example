@@ -60,11 +60,17 @@ async def healthz() -> dict:
 @router.get("/get_server_capabilities")
 async def get_server_capabilities() -> dict:
     """Return server capabilities for tinker client."""
-    from ..backend.model_registry import list_supported_models
+    from ..backend.model_registry import get_model_config, list_supported_models
 
     supported = list_supported_models()
     return {
-        "supported_models": [{"model_name": m} for m in supported],
+        "supported_models": [
+            {
+                "model_name": m,
+                "max_context_length": get_model_config(m).max_model_len,
+            }
+            for m in supported
+        ],
     }
 
 
