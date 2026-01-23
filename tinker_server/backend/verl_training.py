@@ -514,7 +514,27 @@ class TrainingWorker:
         if session_id:
             self._ensure_session_loaded(session_id)
 
-        self.model.train()
+        # Check if this is custom loss backward (has negative weights)
+        # For custom loss, we need eval() mode to match forward() behavior
+        has_custom_loss = False
+        for item in data_items:
+            loss_fn_inputs = item.get("loss_fn_inputs", {})
+            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
+            if weights_data:
+                weights = weights_data.get("data", [])
+                if weights and any(w < 0 for w in weights):
+                    has_custom_loss = True
+                    break
+
+        # CRITICAL: For custom loss backward, use eval() mode to ensure
+        # deterministic forward pass that matches forward() call.
+        # Dropout in train() mode causes different logprobs between forward()
+        # and forward_backward(), breaking gradient consistency.
+        if has_custom_loss:
+            self.model.eval()
+        else:
+            self.model.train()
+
         loss_fn_config = loss_fn_config or {}
 
         total_loss = 0.0
@@ -531,12 +551,20 @@ class TrainingWorker:
             model_input = item.get("model_input", {})
             loss_fn_inputs = item.get("loss_fn_inputs", {})
 
-            # Extract input token IDs from model_input.chunks[0].tokens
+            # Extract input token IDs from ALL chunks (not just chunks[0])
             chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                input_ids = chunks[0]["tokens"]
+            if chunks:
+                # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
+                input_ids = []
+                for chunk in chunks:
+                    if chunk.get("type") == "encoded_text" and "tokens" in chunk:
+                        input_ids.extend(chunk["tokens"])
+
+                if not input_ids:
+                    logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                    continue
             else:
-                logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
+                logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
                 continue
 
             # Extract target tokens and weights/mask
@@ -615,15 +643,57 @@ class TrainingWorker:
             has_negative_weights = (weights_flat < 0).any().item()
 
             # For standard loss: average over non-zero weights
-            # For custom loss backward: sum without averaging (weights encode gradients)
+            # For custom loss backward: weights encode gradients from client
             if has_negative_weights:
-                # Custom loss backward: sum(ce * weights) without averaging
+                # Custom loss backward: weights = -grad from client
+                # We need to directly apply these gradients to logprobs
                 num_weighted = 1.0  # No averaging
             else:
                 # Standard SFT/RL: average over weighted tokens
                 num_weighted = weights_flat.sum()
 
-            if loss_fn == "cross_entropy":
+            if loss_fn == "cross_entropy" and has_negative_weights:
+                # Custom loss backward: directly apply gradients
+                # SDK passes weights = -grad, where grad = ∂loss/∂logprob
+                #
+                # CRITICAL: We must use the SAME logits that were used in forward()
+                # to compute the original logprobs. The gradients from the client
+                # are relative to those logprobs, not to newly computed ones.
+                #
+                # To ensure consistency, we compute logprobs from logits WITHOUT
+                # detaching, so the backward pass will correctly propagate gradients
+                # through the same computation graph.
+
+                # Compute log probabilities from logits
+                # This creates the computation graph: logits -> log_probs -> target_logprobs
+                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)  # [seq_len, vocab]
+                target_logprobs = torch.gather(
+                    log_probs, dim=-1, index=targets_flat.unsqueeze(-1)
+                ).squeeze(-1)  # [seq_len]
+
+                # DEBUG: Log logprobs for first few items at step 0
+                if self._step_count == 0 and len(loss_fn_outputs) < 4:
+                    print(f"  target_logprobs[:10]: {target_logprobs[:10].tolist()}")
+                    print(f"  target_logprobs mean: {target_logprobs.mean().item():.4f}")
+                    weighted_sum = (target_logprobs * weights_flat).sum().item()
+                    print(f"  weighted_sum (before negation): {weighted_sum:.4f}")
+
+                # Apply gradients: loss = -sum(logprob * weight) = sum(logprob * grad)
+                # where weight = -grad from client
+                #
+                # This produces: ∂loss/∂θ = grad * ∂logprob/∂θ
+                # The chain rule ensures gradients flow correctly through the model
+                loss = -(target_logprobs * weights_flat).sum()
+                loss.backward()
+
+                item_loss = loss.item()
+                logprobs_list = target_logprobs.detach().tolist()
+                loss_fn_outputs.append({
+                    "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
+                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
+                })
+
+            elif loss_fn == "cross_entropy":
                 # Cross-entropy loss
                 ce_loss = torch.nn.functional.cross_entropy(
                     logits_flat, targets_flat, reduction="none"
@@ -802,12 +872,20 @@ class TrainingWorker:
                 model_input = item.get("model_input", {})
                 loss_fn_inputs = item.get("loss_fn_inputs", {})
 
-                # Extract input token IDs from model_input.chunks[0].tokens
+                # Extract input token IDs from ALL chunks (not just chunks[0])
                 chunks = model_input.get("chunks", [])
-                if chunks and "tokens" in chunks[0]:
-                    input_ids = chunks[0]["tokens"]
+                if chunks:
+                    # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
+                    input_ids = []
+                    for chunk in chunks:
+                        if chunk.get("type") == "encoded_text" and "tokens" in chunk:
+                            input_ids.extend(chunk["tokens"])
+
+                    if not input_ids:
+                        logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                        continue
                 else:
-                    logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
+                    logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
                     continue
 
                 # Extract target tokens and weights/mask
