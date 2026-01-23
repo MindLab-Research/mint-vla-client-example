@@ -403,13 +403,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Get final response
-            final_res = None
-            async for output in generator:
-                final_res = output
-            assert final_res is not None
-
-            token_ids = list(final_res.outputs[0].token_ids)
             if sampling_params.n == 1:
+                final_res = None
+                async for output in generator:
+                    final_res = output
+                assert final_res is not None
+
+                token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
                 if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
                     log_probs = [
@@ -430,8 +430,17 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     "stop_reason": stop_reason,
                 }
 
+            by_index: dict[int, Any] = {}
+            async for output in generator:
+                for out in output.outputs:
+                    by_index[int(out.index)] = out
+
+            if len(by_index) != sampling_params.n:
+                raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
+
             outs: list[dict] = []
-            for out in final_res.outputs:
+            for idx in range(sampling_params.n):
+                out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
                 if sampling_params.logprobs is not None and out.logprobs:
@@ -520,13 +529,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Get final response
-            final_res = None
-            async for output in generator:
-                final_res = output
-            assert final_res is not None
-
-            token_ids = list(final_res.outputs[0].token_ids)
             if sampling_params.n == 1:
+                final_res = None
+                async for output in generator:
+                    final_res = output
+                assert final_res is not None
+
+                token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
                 if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
                     log_probs = [
@@ -547,8 +556,17 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     "stop_reason": stop_reason,
                 }
 
+            by_index: dict[int, Any] = {}
+            async for output in generator:
+                for out in output.outputs:
+                    by_index[int(out.index)] = out
+
+            if len(by_index) != sampling_params.n:
+                raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
+
             outs: list[dict] = []
-            for out in final_res.outputs:
+            for idx in range(sampling_params.n):
+                out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
                 if sampling_params.logprobs is not None and out.logprobs:

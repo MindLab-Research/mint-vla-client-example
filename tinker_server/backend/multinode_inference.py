@@ -432,12 +432,21 @@ def _create_multinode_vllm_actor(
                     request_id=request_id,
                     lora_request=lora_request,
                 )
-                final_res = None
-                async for output in generator:
-                    if first_tok_s is None:
-                        first_tok_s = time.perf_counter() - t0
-                    final_res = output
-                assert final_res is not None
+                if sampling_params.n == 1:
+                    final_res = None
+                    async for output in generator:
+                        if first_tok_s is None:
+                            first_tok_s = time.perf_counter() - t0
+                        final_res = output
+                    assert final_res is not None
+                else:
+                    by_index: dict[int, Any] = {}
+                    async for output in generator:
+                        if first_tok_s is None:
+                            first_tok_s = time.perf_counter() - t0
+                        for out in output.outputs:
+                            by_index[int(out.index)] = out
+                    final_res = None
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -447,18 +456,18 @@ def _create_multinode_vllm_actor(
                     flush=True,
                 )
 
-            token_ids = list(final_res.outputs[0].token_ids)
             if sampling_params.n == 1:
+                token_ids = list(final_res.outputs[0].token_ids)  # type: ignore[union-attr]
                 log_probs = None
-                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:  # type: ignore[union-attr]
                     log_probs = [
                         logprobs[token_ids[i]].logprob
-                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)  # type: ignore[union-attr]
                     ]
 
                 # Determine stop reason
                 stop_reason = "length"
-                if final_res.outputs[0].finish_reason == "stop":
+                if final_res.outputs[0].finish_reason == "stop":  # type: ignore[union-attr]
                     stop_reason = "stop"
                 elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
                     stop_reason = "stop"
@@ -469,8 +478,12 @@ def _create_multinode_vllm_actor(
                     "stop_reason": stop_reason,
                 }
 
+            if len(by_index) != sampling_params.n:
+                raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
+
             outs: list[dict] = []
-            for out in final_res.outputs:
+            for idx in range(sampling_params.n):
+                out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
                 if sampling_params.logprobs is not None and out.logprobs:
