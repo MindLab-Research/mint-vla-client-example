@@ -72,6 +72,9 @@ class LoRASlotInfo:
     loaded_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
+    def idle_time(self) -> float:
+        return time.time() - self.last_used
+
 
 class LoRARegistry:
     """Maps sampling_session_id to lora_int_id with LRU tracking.
@@ -152,10 +155,20 @@ class LoRARegistry:
             List of lora_int_ids in LRU order (oldest first).
         """
         async with self._lock:
+            try:
+                min_idle_s = float(os.environ.get("TINKER_LORA_EVICT_MIN_IDLE_S", "5.0"))
+            except ValueError:
+                min_idle_s = 5.0
+
             candidates = []
             for lora_id in self._lru_order:
                 if len(candidates) >= count:
                     break
+                slot = self._slot_info.get(lora_id)
+                if slot is None:
+                    continue
+                if slot.idle_time() <= min_idle_s:
+                    continue
                 candidates.append(lora_id)
             return candidates
 
