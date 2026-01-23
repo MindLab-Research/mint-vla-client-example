@@ -1,6 +1,10 @@
 """Model configuration registry for hardware requirements."""
 
-from dataclasses import dataclass
+import logging
+import os
+from dataclasses import dataclass, replace
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -290,9 +294,35 @@ def get_model_config(model_name: str) -> ModelConfig:
     Raises:
         ValueError: If model is not in the supported list
     """
+    def _int_env(name: str) -> int | None:
+        v = os.environ.get(name)
+        if v is None or v.strip() == "":
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            logger.warning(f"Ignoring invalid {name}={v!r} (expected int)")
+            return None
+
     # Normalize path to model name
     normalized = normalize_model_name(model_name)
-    return MODEL_CONFIGS[normalized]
+    cfg = MODEL_CONFIGS[normalized]
+
+    overrides: dict[str, int] = {}
+    for field, env_name in (
+        ("max_num_seqs", "MINT_VLLM_MAX_NUM_SEQS"),
+        ("max_num_batched_tokens", "MINT_VLLM_MAX_NUM_BATCHED_TOKENS"),
+        ("max_loras", "MINT_VLLM_MAX_LORAS"),
+        ("max_cpu_loras", "MINT_VLLM_MAX_CPU_LORAS"),
+        ("max_lora_rank", "MINT_VLLM_MAX_LORA_RANK"),
+    ):
+        v = _int_env(env_name)
+        if v is not None:
+            overrides[field] = v
+
+    if overrides:
+        cfg = replace(cfg, **overrides)
+    return cfg
 
 
 def get_training_parallelism(model_name: str) -> tuple[int, int, int, int]:
