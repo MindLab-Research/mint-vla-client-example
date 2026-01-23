@@ -462,6 +462,13 @@ def _run_single(
                     fut: (p_idx, expected, prompt_tokens, submit_t0)
                     for p_idx, expected, prompt_tokens, submit_t0, fut in futures
                 }
+                # Mint futures can be lazy (polling starts on first .result() call).
+                # Prime them so concurrent wait() reflects actual completion order.
+                for fut in list(pending.keys()):
+                    try:
+                        fut.result(timeout=0)
+                    except concurrent.futures.TimeoutError:
+                        pass
                 while pending:
                     done, _not_done = concurrent.futures.wait(
                         pending.keys(),
