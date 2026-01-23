@@ -174,12 +174,12 @@ ssh volcano "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c
    PFS_TINKER_PATH=$PFS_TINKER_PATH \
    TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
    TINKER_PORT=$TINKER_PORT \
-   python scripts/run_server.py\" > /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \\$! > /tmp/tinker_server_issue_$ISSUE.pid"
+   python scripts/run_server.py\" >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
 ```
 
 Issue-scoped health check (via local SSH tunnel):
 ```bash
-ssh -f -N -L $TINKER_PORT:localhost:$TINKER_PORT volcano
+ssh -f -N -L ${TINKER_PORT}:localhost:${TINKER_PORT} volcano
 curl http://localhost:$TINKER_PORT/api/v1/healthz
 ```
 
