@@ -763,12 +763,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
-        ) -> list[dict[int, float] | None]:
+        ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens and logprobs at each prompt position.
 
-            Returns topk[i] = dict of {token_id: logprob} for top-K tokens
-            at position i (predicting token i+1 given tokens 0..i).
+            Returns topk[i] = list of (token_id, logprob) pairs for position i.
             Output length is len(prompt_ids), with topk[0]=None.
+            Each non-None entry is sorted by logprob descending and truncated to <= k.
 
             Args:
                 prompt_ids: Input token IDs.
@@ -776,7 +776,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 k: Number of top tokens to return (default 10).
 
             Returns:
-                List of dicts, each mapping token_id to logprob.
+                List of per-position top-k lists.
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -792,6 +792,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return []
             if len(prompt_ids) == 1:
                 return [None]
+            if k <= 0:
+                return [None] * len(prompt_ids)
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -832,15 +834,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
 
-            result: list[dict[int, float] | None] = [None]
+            result: list[list[tuple[int, float]] | None] = [None]
             for i in range(1, len(prompt_ids)):
                 if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
                     result.append(None)
                     continue
-                pos_dict: dict[int, float] = {}
-                for token_id, logprob_obj in prompt_logprobs[i].items():
-                    pos_dict[token_id] = logprob_obj.logprob
-                result.append(pos_dict)
+                pos = [(int(token_id), float(lp.logprob)) for token_id, lp in prompt_logprobs[i].items()]
+                pos.sort(key=lambda x: x[1], reverse=True)
+                result.append(pos[:k])
 
             return result
 
@@ -928,11 +929,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             request_id: str,
             lora_int_id: int,
             k: int = 10,
-        ) -> list[dict[int, float] | None]:
+        ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens with specific LoRA adapter.
 
-            Returns topk[i] = dict of {token_id: logprob} for position i.
+            Returns topk[i] = list of (token_id, logprob) pairs for position i.
             Output length is len(prompt_ids), with topk[0]=None.
+            Each non-None entry is sorted by logprob descending and truncated to <= k.
 
             Args:
                 prompt_ids: Input token IDs.
@@ -941,7 +943,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 k: Number of top tokens to return.
 
             Returns:
-                List of dicts mapping token_id to logprob.
+                List of per-position top-k lists.
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -951,6 +953,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return []
             if len(prompt_ids) == 1:
                 return [None]
+            if k <= 0:
+                return [None] * len(prompt_ids)
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -988,15 +992,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
 
-            result: list[dict[int, float] | None] = [None]
+            result: list[list[tuple[int, float]] | None] = [None]
             for i in range(1, len(prompt_ids)):
                 if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
                     result.append(None)
                     continue
-                pos_dict: dict[int, float] = {}
-                for token_id, logprob_obj in prompt_logprobs[i].items():
-                    pos_dict[token_id] = logprob_obj.logprob
-                result.append(pos_dict)
+                pos = [(int(token_id), float(lp.logprob)) for token_id, lp in prompt_logprobs[i].items()]
+                pos.sort(key=lambda x: x[1], reverse=True)
+                result.append(pos[:k])
 
             return result
 
@@ -1067,7 +1070,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
-        ) -> list[dict[int, float] | None]:
+        ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens using base model without any LoRA adapter.
 
             For multi-LoRA engine: computes top-K with base model weights only.
@@ -1078,7 +1081,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 k: Number of top tokens to return.
 
             Returns:
-                List of dicts mapping token_id to logprob.
+                List of per-position top-k lists.
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -1087,6 +1090,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return []
             if len(prompt_ids) == 1:
                 return [None]
+            if k <= 0:
+                return [None] * len(prompt_ids)
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -1113,15 +1118,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
 
-            result: list[dict[int, float] | None] = [None]
+            result: list[list[tuple[int, float]] | None] = [None]
             for i in range(1, len(prompt_ids)):
                 if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
                     result.append(None)
                     continue
-                pos_dict: dict[int, float] = {}
-                for token_id, logprob_obj in prompt_logprobs[i].items():
-                    pos_dict[token_id] = logprob_obj.logprob
-                result.append(pos_dict)
+                pos = [(int(token_id), float(lp.logprob)) for token_id, lp in prompt_logprobs[i].items()]
+                pos.sort(key=lambda x: x[1], reverse=True)
+                result.append(pos[:k])
 
             return result
 
