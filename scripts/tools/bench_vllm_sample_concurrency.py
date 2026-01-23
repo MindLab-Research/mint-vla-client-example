@@ -156,6 +156,11 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=8)
     p.add_argument("--prompt-logprobs", action="store_true")
     p.add_argument("--topk-prompt-logprobs", type=int, default=0)
+    p.add_argument(
+        "--unique-prompts",
+        action="store_true",
+        help="Make prompt tokens unique per request to avoid vLLM prefix-caching effects",
+    )
     p.add_argument("--concurrency", default="1,2,4,8", help="Comma-separated concurrency values")
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--poll-s", type=float, default=1.0)
@@ -185,7 +190,7 @@ def main() -> None:
         suffix += f"_topk{int(args.topk_prompt_logprobs)}"
     out_path = run_dir / f"bench_sample_{args.model.replace('/', '_')}_pl{args.prompt_len}_ns{args.num_samples}_mt{args.max_tokens}{suffix}.jsonl"
 
-    prompt_tokens = [10] * int(args.prompt_len)
+    base_prompt_tokens = [10] * int(args.prompt_len)
     expect_sequences = int(args.num_samples) if args.expect_sequences else None
 
     with out_path.open("a", encoding="utf-8") as f:
@@ -202,6 +207,7 @@ def main() -> None:
                     "max_tokens": args.max_tokens,
                     "prompt_logprobs": bool(args.prompt_logprobs),
                     "topk_prompt_logprobs": int(args.topk_prompt_logprobs),
+                    "unique_prompts": bool(args.unique_prompts),
                     "concurrency": conc,
                     "repeats": args.repeats,
                 },
@@ -217,10 +223,21 @@ def main() -> None:
                     _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
                     for _ in range(c)
                 ]
+                if args.unique_prompts:
+                    prompt_tokens_by_req: list[list[int]] = []
+                    for i in range(c):
+                        # Use a unique prefix token to prevent vLLM prefix caching from reusing KV
+                        # across requests. Keep the rest identical to preserve prompt length.
+                        first_tok = 1000 + (rep * 10000 + i) % 50000
+                        toks = list(base_prompt_tokens)
+                        toks[0] = first_tok
+                        prompt_tokens_by_req.append(toks)
+                else:
+                    prompt_tokens_by_req = [base_prompt_tokens] * c
 
                 barrier = threading.Barrier(c + 1)
 
-                def _worker(sid: str) -> OneResult:
+                def _worker(sid: str, prompt_tokens: list[int]) -> OneResult:
                     barrier.wait()
                     return _run_one(
                         base_url=base_url,
@@ -237,7 +254,10 @@ def main() -> None:
 
                 t0 = time.time()
                 with ThreadPoolExecutor(max_workers=c) as ex:
-                    futs = [ex.submit(_worker, sid) for sid in sessions]
+                    futs = [
+                        ex.submit(_worker, sid, prompt_tokens)
+                        for sid, prompt_tokens in zip(sessions, prompt_tokens_by_req)
+                    ]
                     barrier.wait()
                     results = [fu.result() for fu in futs]
                 elapsed_wall = time.time() - t0
@@ -253,6 +273,7 @@ def main() -> None:
                     "max_tokens": args.max_tokens,
                     "prompt_logprobs": bool(args.prompt_logprobs),
                     "topk_prompt_logprobs": int(args.topk_prompt_logprobs),
+                    "unique_prompts": bool(args.unique_prompts),
                     "concurrency": c,
                     "repeat": rep,
                     "ok": len(errors) == 0,
