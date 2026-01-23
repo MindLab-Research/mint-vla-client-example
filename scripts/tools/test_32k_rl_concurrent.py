@@ -13,6 +13,7 @@ Why one file:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import json
 import math
@@ -41,6 +42,7 @@ DEFAULT_MODELS = ",".join(
 
 STAGE_SAVE = "save_weights_and_get_sampling_client"
 STAGE_ROLLOUT = "rollout_sample"
+STAGE_ROLLOUT_ITEM = "rollout_sample_item"
 STAGE_FORWARD_BACKWARD = "forward_backward"
 STAGE_OPTIM_STEP = "optim_step"
 STAGE_HEARTBEAT = "heartbeat"
@@ -429,18 +431,20 @@ def _run_single(
                 chunk = prompt_specs[prompt_cursor : prompt_cursor + rollout_inflight]
                 prompt_cursor += rollout_inflight
 
-                futures = []
+                futures: list[tuple[int, int, list[int], float, concurrent.futures.Future]] = []
                 for p_idx, expected, prompt_len, prompt_tokens in chunk:
                     print(
                         f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p_idx+1}/{cfg.prompts_per_step} "
                         f"num_samples={cfg.samples_per_prompt} prompt_len={prompt_len}",
                         flush=True,
                     )
+                    submit_t0 = time.time()
                     futures.append(
                         (
                             p_idx,
                             expected,
                             prompt_tokens,
+                            submit_t0,
                             sampling_client.sample(
                                 prompt=types.ModelInput.from_ints(tokens=prompt_tokens),
                                 num_samples=cfg.samples_per_prompt,
@@ -454,79 +458,102 @@ def _run_single(
                         )
                     )
 
-                for p_idx, expected, prompt_tokens, sample_future in futures:
-                    sample_res = _wait_future(
-                        sample_future,
-                        label=f"sample model={model} session={session_idx} prompt {p_idx+1}/{cfg.prompts_per_step} step {step+1}/{cfg.steps}",
-                        heartbeat_s=cfg.heartbeat_s,
-                        on_heartbeat=lambda elapsed: _heartbeat(
-                            stage=STAGE_ROLLOUT, step_idx=step, elapsed_s=elapsed, label="sample"
-                        ),
+                pending: dict[concurrent.futures.Future, tuple[int, int, list[int], float]] = {
+                    fut: (p_idx, expected, prompt_tokens, submit_t0)
+                    for p_idx, expected, prompt_tokens, submit_t0, fut in futures
+                }
+                while pending:
+                    done, _not_done = concurrent.futures.wait(
+                        pending.keys(),
+                        timeout=cfg.heartbeat_s,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
-                    _heartbeat(
-                        stage=STAGE_ROLLOUT,
-                        step_idx=step,
-                        elapsed_s=time.time() - rollout_t0,
-                        label=f"prompt {p_idx+1}/{cfg.prompts_per_step} complete",
-                    )
+                    if not done:
+                        _heartbeat(
+                            stage=STAGE_ROLLOUT,
+                            step_idx=step,
+                            elapsed_s=time.time() - rollout_t0,
+                            label=f"sample pending={len(pending)}",
+                        )
+                        continue
 
-                    rewards: list[float] = []
-                    payloads: list[tuple[list[int], int, list[int], list[float], float]] = []
-                    for seq in sample_res.sequences:
-                        completion_tokens = list(seq.tokens)
-                        completion_logprobs = seq.logprobs
-                        if completion_logprobs is None:
-                            raise RuntimeError("sample() returned no logprobs; expected per-token logprobs for PPO")
-                        if len(completion_logprobs) != len(completion_tokens):
-                            raise RuntimeError(
-                                f"sample() returned logprobs length mismatch: "
-                                f"tokens={len(completion_tokens)} logprobs={len(completion_logprobs)}"
+                    for fut in done:
+                        p_idx, expected, prompt_tokens, submit_t0 = pending.pop(fut)
+                        sample_res = fut.result()
+                        sample_latency_s = time.time() - submit_t0
+                        _emit(
+                            STAGE_ROLLOUT_ITEM,
+                            step_idx=step,
+                            elapsed_s=time.time() - rollout_t0,
+                            prompt_idx=p_idx,
+                            prompt_len=len(prompt_tokens),
+                            num_samples=cfg.samples_per_prompt,
+                            sample_latency_s=sample_latency_s,
+                        )
+                        _heartbeat(
+                            stage=STAGE_ROLLOUT,
+                            step_idx=step,
+                            elapsed_s=time.time() - rollout_t0,
+                            label=f"prompt {p_idx+1}/{cfg.prompts_per_step} complete",
+                        )
+
+                        rewards: list[float] = []
+                        payloads: list[tuple[list[int], int, list[int], list[float], float]] = []
+                        for seq in sample_res.sequences:
+                            completion_tokens = list(seq.tokens)
+                            completion_logprobs = seq.logprobs
+                            if completion_logprobs is None:
+                                raise RuntimeError("sample() returned no logprobs; expected per-token logprobs for PPO")
+                            if len(completion_logprobs) != len(completion_tokens):
+                                raise RuntimeError(
+                                    f"sample() returned logprobs length mismatch: "
+                                    f"tokens={len(completion_tokens)} logprobs={len(completion_logprobs)}"
+                                )
+                            if completion_tokens[: len(prompt_tokens)] == prompt_tokens:
+                                full_tokens = completion_tokens
+                                completion_logprobs = completion_logprobs[len(prompt_tokens) :]
+                                completion_tokens = completion_tokens[len(prompt_tokens) :]
+                            else:
+                                full_tokens = prompt_tokens + completion_tokens
+
+                            full_tokens = _pad_to(full_tokens, cfg.max_seq_len, filler_id)
+                            completion_text = tokenizer.decode(completion_tokens)
+                            pred = _first_int(completion_text)
+                            reward = 1.0 if pred == expected else 0.0
+                            rewards.append(reward)
+                            payloads.append(
+                                (full_tokens, len(prompt_tokens), completion_tokens, list(completion_logprobs), reward)
                             )
-                        if completion_tokens[: len(prompt_tokens)] == prompt_tokens:
-                            full_tokens = completion_tokens
-                            completion_logprobs = completion_logprobs[len(prompt_tokens) :]
-                            completion_tokens = completion_tokens[len(prompt_tokens) :]
-                        else:
-                            full_tokens = prompt_tokens + completion_tokens
 
-                        full_tokens = _pad_to(full_tokens, cfg.max_seq_len, filler_id)
-                        completion_text = tokenizer.decode(completion_tokens)
-                        pred = _first_int(completion_text)
-                        reward = 1.0 if pred == expected else 0.0
-                        rewards.append(reward)
-                        payloads.append(
-                            (full_tokens, len(prompt_tokens), completion_tokens, list(completion_logprobs), reward)
-                        )
+                        mean_reward = sum(rewards) / max(1, len(rewards))
+                        # With samples_per_prompt=1 (or with identical rewards across samples),
+                        # reward-mean_reward produces all-zero advantages, which can yield num_tokens=0
+                        # in PPO and trigger NaN loss logging in Megatron.
+                        baseline = 0.5 if len(set(rewards)) <= 1 else mean_reward
+                        n = cfg.max_seq_len - 1
+                        for full_tokens, prompt_len, completion_tokens, completion_logprobs, reward in payloads:
+                            adv_scalar = float(reward - baseline)
 
-                    mean_reward = sum(rewards) / max(1, len(rewards))
-                    # With samples_per_prompt=1 (or with identical rewards across samples),
-                    # reward-mean_reward produces all-zero advantages, which can yield num_tokens=0
-                    # in PPO and trigger NaN loss logging in Megatron.
-                    baseline = 0.5 if len(set(rewards)) <= 1 else mean_reward
-                    n = cfg.max_seq_len - 1
-                    for full_tokens, prompt_len, completion_tokens, completion_logprobs, reward in payloads:
-                        adv_scalar = float(reward - baseline)
+                            sampling_logprobs = [0.0] * n
+                            start_i = max(0, prompt_len - 1)
+                            end_i = min(n, start_i + len(completion_tokens))
+                            for j in range(max(0, end_i - start_i)):
+                                sampling_logprobs[start_i + j] = float(completion_logprobs[j])
 
-                        sampling_logprobs = [0.0] * n
-                        start_i = max(0, prompt_len - 1)
-                        end_i = min(n, start_i + len(completion_tokens))
-                        for j in range(max(0, end_i - start_i)):
-                            sampling_logprobs[start_i + j] = float(completion_logprobs[j])
+                            adv = [0.0] * n
+                            for i in range(start_i, end_i):
+                                adv[i] = float(adv_scalar)
 
-                        adv = [0.0] * n
-                        for i in range(start_i, end_i):
-                            adv[i] = float(adv_scalar)
-
-                        datum = types.Datum(
-                            model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
-                            loss_fn_inputs={
-                                "target_tokens": full_tokens[1:],
-                                "logprobs": sampling_logprobs,
-                                "advantages": adv,
-                            },
-                        )
-                        datums.append(datum)
-                        step_rewards.append(reward)
+                            datum = types.Datum(
+                                model_input=types.ModelInput.from_ints(tokens=full_tokens[:-1]),
+                                loss_fn_inputs={
+                                    "target_tokens": full_tokens[1:],
+                                    "logprobs": sampling_logprobs,
+                                    "advantages": adv,
+                                },
+                            )
+                            datums.append(datum)
+                            step_rewards.append(reward)
 
             rollout_elapsed = time.time() - rollout_t0
             _emit(STAGE_ROLLOUT, step_idx=step, elapsed_s=rollout_elapsed, num_samples=len(datums))
