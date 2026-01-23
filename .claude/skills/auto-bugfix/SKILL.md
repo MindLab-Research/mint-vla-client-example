@@ -101,6 +101,7 @@ git fetch origin
 
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
   git switch "$BRANCH" || git switch -c "$BRANCH" --track "origin/$BRANCH"
+  git pull --ff-only origin "$BRANCH" || { echo "error: local branch diverged from origin/$BRANCH"; exit 1; }
   git merge --no-edit origin/develop
 else
   git switch -c "$BRANCH" origin/develop
@@ -116,15 +117,15 @@ Namespace goal: isolate Ray actor state per issue (avoid collisions across concu
 
 Example namespace + issue-specific PFS path:
 ```bash
-ISSUE=123
+export ISSUE=123
 export TINKER_RAY_NAMESPACE="tinker_${USER}_issue_${ISSUE}"
 export PFS_TINKER_PATH="/vePFS-Mindverse/share/code/$USER/tinker-server-issue-$ISSUE"
-UNISON_PROFILE="volcano-tinker-$USER-issue-$ISSUE"
+export UNISON_PROFILE="volcano-tinker-$USER-issue-$ISSUE"
 ```
 
 Issue-specific code sync (do not manually sync; use unison daemon mode):
 ```bash
-LOCAL_ROOT="$(git rev-parse --show-toplevel)"
+export LOCAL_ROOT="$(git rev-parse --show-toplevel)"
 
 mkdir -p ~/.unison
 python - <<'PY'
@@ -151,6 +152,7 @@ dst.write_text(out)
 print(dst)
 PY
 
+test -n "$UNISON_PROFILE" || { echo "error: UNISON_PROFILE is empty"; exit 1; }
 pkill -f "[u]nison.*$UNISON_PROFILE" 2>/dev/null || true
 nohup unison "$UNISON_PROFILE" -repeat watch > "/tmp/unison-$UNISON_PROFILE.log" 2>&1 &
 pgrep -af "unison.*$UNISON_PROFILE"
@@ -158,7 +160,7 @@ pgrep -af "unison.*$UNISON_PROFILE"
 
 Issue-specific server root on volcano (keep `mint-dev` paths stable):
 ```bash
-ssh volcano "mkdir -p $PFS_TINKER_PATH && rm -rf /root/tinker_project/tinker-server && ln -s $PFS_TINKER_PATH /root/tinker_project/tinker-server"
+ssh volcano "mkdir -p $PFS_TINKER_PATH && ( [ ! -e /root/tinker_project/tinker-server ] || [ -L /root/tinker_project/tinker-server ] ) && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server"
 ```
 
 Start dev server by following `mint-dev` "Start Server", with two changes:
