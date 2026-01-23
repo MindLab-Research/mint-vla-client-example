@@ -642,6 +642,16 @@ class TrainingWorker:
             # or standard SFT/RL (weights are non-negative mask)
             has_negative_weights = (weights_flat < 0).any().item()
 
+            # DEBUG: Log execution path at step 0
+            if self._step_count == 0 and len(loss_fn_outputs) < 4:
+                item_idx = len(loss_fn_outputs)
+                logger.info(f"[DPO PATH DEBUG] Step 0, Item {item_idx}:")
+                logger.info(f"  loss_fn: {loss_fn}")
+                logger.info(f"  has_negative_weights: {has_negative_weights}")
+                logger.info(f"  weights[:10]: {weights[:10]}")
+                logger.info(f"  weights min/max: {min(weights) if weights else 'N/A'} / {max(weights) if weights else 'N/A'}")
+                logger.info(f"  weights sum: {sum(weights) if weights else 0}")
+
             # For standard loss: average over non-zero weights
             # For custom loss backward: weights encode gradients from client
             if has_negative_weights:
@@ -652,7 +662,7 @@ class TrainingWorker:
                 # Standard SFT/RL: average over weighted tokens
                 num_weighted = weights_flat.sum()
 
-            if loss_fn == "cross_entropy" and has_negative_weights:
+            if True:
                 # Custom loss backward: directly apply gradients
                 # SDK passes weights = -grad, where grad = ∂loss/∂logprob
                 #
@@ -663,6 +673,18 @@ class TrainingWorker:
                 # To ensure consistency, we compute logprobs from logits WITHOUT
                 # detaching, so the backward pass will correctly propagate gradients
                 # through the same computation graph.
+
+                # DEBUG: Log data for first few items at step 0
+                if self._step_count == 0 and len(loss_fn_outputs) < 4:
+                    item_idx = len(loss_fn_outputs)
+                    print(f"[DPO DEBUG] Step 0, Item {item_idx} ({'chosen' if item_idx % 2 == 0 else 'rejected'}):")
+                    print(f"  input_ids length: {len(input_ids)}")
+                    print(f"  target_tokens length: {len(target_tokens)}")
+                    print(f"  weights length: {len(weights)}")
+                    print(f"  weights sum: {sum(weights):.2f}")
+                    print(f"  weights[:10]: {weights[:10]}")
+                    print(f"  has_negative_weights: {has_negative_weights}")
+                    print(f"  weights min/max: {min(weights):.4f} / {max(weights):.4f}")
 
                 # Compute log probabilities from logits
                 # This creates the computation graph: logits -> log_probs -> target_logprobs
@@ -681,8 +703,11 @@ class TrainingWorker:
                 # Apply gradients: loss = -sum(logprob * weight) = sum(logprob * grad)
                 # where weight = -grad from client
                 #
-                # This produces: ∂loss/∂θ = grad * ∂logprob/∂θ
-                # The chain rule ensures gradients flow correctly through the model
+                # SDK computes: grad = ∂loss_DPO/∂logprobs, then passes weights = -grad
+                # We construct: loss = -(logprobs * weights).sum() = (logprobs * grad).sum()
+                # Then: ∂loss/∂logprobs = grad
+                # Optimizer does: θ_new = θ - lr * ∂loss/∂θ = θ - lr * grad * ∂logprobs/∂θ
+                # This correctly applies the DPO gradient
                 loss = -(target_logprobs * weights_flat).sum()
                 loss.backward()
 
@@ -860,6 +885,10 @@ class TrainingWorker:
         if session_id:
             self._ensure_session_loaded(session_id)
 
+        # CRITICAL: Use eval() mode for deterministic forward pass
+        # In train() mode, dropout causes non-deterministic behavior, which breaks
+        # forward_backward_custom: the logprobs computed here differ from those
+        # recomputed in forward_backward(), causing gradient mismatch.
         self.model.eval()
 
         total_loss = 0.0
