@@ -413,18 +413,17 @@ def _create_multinode_vllm_actor(
                 # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
                 #
                 # IMPORTANT: `list_loras()` must not run concurrently with `generate()`.
-                # Also: do not block live traffic for liveness checks; when busy, assume alive.
+                # Also: avoid cancelling vLLM engine coroutines during liveness checks. Cancellation
+                # can leave engine state inconsistent and later generations can hang.
                 if self._gate_lock.locked():
                     return True
                 async with self._gate_lock:
                     async with self._active_generates_cond:
                         if self._active_generates > 0:
                             return True
-                    async with self._lock_read():
-                        try:
-                            await asyncio.wait_for(self.engine.list_loras(), timeout=self._is_ready_timeout_s)
-                        except asyncio.TimeoutError:
-                            return True
+                    # Best-effort: if idle, treat actor as ready without probing EngineCore.
+                    # Failures will surface naturally on real RPCs (generate / logprobs).
+                    return True
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
