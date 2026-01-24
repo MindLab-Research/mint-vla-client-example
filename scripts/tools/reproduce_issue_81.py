@@ -74,7 +74,9 @@ def _pick_training_model() -> str:
         if "A3B" in name or "A22B" in name:
             return name
 
-    return names[0]
+    raise RuntimeError(
+        "No MoE (Megatron) model found in supported_models; cannot exercise the Megatron multi-chunk path."
+    )
 
 
 def main() -> int:
