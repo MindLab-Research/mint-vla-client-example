@@ -32,7 +32,7 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
-- Both the bugfixer and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
+- Orchestrator, bugfixer, and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
   If the issue references another issue/PR for context, read that too before acting.
 - Static-only reproductions/tests are forbidden. Do not close an issue based on source inspection (grep/AST/string checks).
 - Mock-only or stub-only "runtime" is not an acceptable substitute for an integrated repro when an integrated repro is feasible.
@@ -45,6 +45,7 @@ Hard rules:
 - For any change that touches scheduling / placement groups / GPU allocation / engine initialization:
   - A "repro" that only asserts on computed resource numbers / GPU counts is partial evidence.
   - Require an integrated repro that (1) creates the affected session/engine in Ray and (2) completes at least one request using it (e.g. create_sampling_session + asample + retrieve_future).
+  - If the issue is scale-dependent (example: fails only at 16 GPUs / TP=16), the integrated repro must run at that target scale. Smaller-scale "it works at N<target" is partial evidence and is not merge/close evidence.
 - Treat issue-thread comprehension as testable: the bugfixer + reviewer issue digests must include explicit acceptance criteria extracted from the issue/comments (not just a generic summary).
 - Every issue MUST have runtime evidence:
   - Integrated reproduction:
@@ -61,12 +62,16 @@ Hard rules:
     - If the issue or change touches Ray-backed paths (sampling/inference, training, scheduling, actor lifecycle), require at least one integrated check
       that triggers real Ray execution:
       - Sampling/inference: run `python scripts/tools/smoke.py service --create-sampling-session` (engine/actor init in Ray).
+      - If the change touches inference/vLLM, do not accept "create_sampling_session succeeded" as sufficient evidence. Execute at least one end-to-end
+        sample through the running system (submit `/api/v1/asample`, then poll `/api/v1/retrieve_future` until ready) and assert on the returned payload
+        (prefer: in `reproduce_issue_<N>.py`).
       - Actor lifecycle / scheduling / placement-group changes: the issue-specific repro must also complete at least one request that uses the created
         session/engine (e.g. create_sampling_session + asample + retrieve_future).
       - Training/checkpointing: the issue-specific repro should exercise that path end-to-end.
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
   - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
 - If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.
+- Retroactive enforcement: if a closed `assign-to-bot` issue was closed based on static-only or partial evidence (no integrated runtime repro), reopen it and requeue it for a real integrated repro + smoke + pytest.
 
 Files:
 - Bugfixer subagent prompt: `.claude/skills/auto-bugfix/prompts/bugfixer.md`
