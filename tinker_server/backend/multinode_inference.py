@@ -455,6 +455,7 @@ def _create_multinode_vllm_actor(
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
 
+            n_req = max(1, int(n))
             sampling_params = SamplingParams(
                 max_tokens=max_tokens,
                 temperature=temperature,
