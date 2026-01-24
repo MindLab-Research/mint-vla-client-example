@@ -308,8 +308,13 @@ def _create_multinode_vllm_actor(
                 return False
             try:
                 # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
-                async with self._lock_read():
-                    await self.engine.list_loras()
+                #
+                # IMPORTANT: `list_loras()` must not run concurrently with `generate()`.
+                # Ray async actors can interleave method executions; without this lock,
+                # liveness checks can race active generations and wedge the vLLM engine.
+                async with self._generate_lock:
+                    async with self._lock_read():
+                        await self.engine.list_loras()
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
