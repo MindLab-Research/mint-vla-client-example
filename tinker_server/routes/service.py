@@ -51,6 +51,13 @@ def _get_user_data(request: Request) -> dict | None:
     return getattr(request.state, "user_data", None)
 
 
+def _get_user_id(request: Request) -> str | None:
+    user_data = _get_user_data(request)
+    if user_data:
+        return user_data.get("user_id")
+    return None
+
+
 @router.get("/healthz")
 async def healthz() -> dict:
     """Health check endpoint."""
@@ -111,12 +118,13 @@ async def create_sampling_session(
         raise HTTPException(status_code=503, detail="Session manager not initialized")
 
     sampling_session_id = str(uuid.uuid4())
+    user_id = _get_user_id(http_request)
 
     # Determine base_model from request or infer from model_path
     base_model = request.base_model
     if not base_model and request.model_path:
         # Try to infer base_model from adapter_config.json
-        adapter_path = _resolve_model_path(request.model_path)
+        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
         base_model = _infer_base_model_from_adapter(adapter_path)
 
     if not base_model:
@@ -139,7 +147,7 @@ async def create_sampling_session(
     if request.model_path:
         # Load LoRA weights from path into multi-LoRA engine
         # Resolve path (file://, tinker://localhost, or absolute path)
-        adapter_path = _resolve_model_path(request.model_path)
+        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
 
         # Load adapter weights and config from disk
         state_dict, peft_config = _load_adapter_from_path(adapter_path, request.lora_rank)
@@ -165,7 +173,7 @@ async def create_sampling_session(
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
 
-def _resolve_model_path(model_path: str) -> str:
+def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     """Resolve model_path URI to filesystem path.
 
     Args:
@@ -174,23 +182,19 @@ def _resolve_model_path(model_path: str) -> str:
     Returns:
         Absolute filesystem path to adapter directory.
     """
-    from ..checkpoints import get_checkpoints_dir
+    from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 
     checkpoint_dir = get_checkpoints_dir()
-
-    if model_path.startswith("file://"):
-        return model_path[7:]  # Strip file:// prefix
-    elif model_path.startswith("tinker://"):
-        # tinker://{model_id}/{checkpoint_name}
-        path_part = model_path[len("tinker://"):]
-        return os.path.join(checkpoint_dir, path_part)
-    elif model_path.startswith("mint://"):
-        # Legacy mint://{model_id}/{checkpoint_name}
-        path_part = model_path[len("mint://"):]
-        return os.path.join(checkpoint_dir, path_part)
-    else:
-        # Assume absolute path
-        return model_path
+    resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
+    if user_id and user_id != "admin":
+        resolved_real = os.path.realpath(resolved)
+        checkpoints_real = os.path.realpath(checkpoint_dir)
+        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, user_id))
+        if resolved_real.startswith(checkpoints_real + os.sep) and not resolved_real.startswith(
+            allowed_real + os.sep
+        ):
+            raise HTTPException(status_code=403, detail="Access denied")
+    return resolved
 
 
 def _infer_base_model_from_adapter(adapter_path: str) -> str | None:

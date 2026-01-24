@@ -93,43 +93,73 @@ def validate_checkpoint_dir(path: str) -> None:
         raise ValueError("Missing optimizer state in extracted checkpoint")
 
 
-def resolve_checkpoint_id(checkpoint_id: str, checkpoints_dir: str) -> str | None:
+def resolve_checkpoint_id(
+    checkpoint_id: str, checkpoints_dir: str, *, user_id: str | None = None
+) -> str | None:
     if not os.path.exists(checkpoints_dir):
         return None
 
-    for top_level in os.listdir(checkpoints_dir):
-        top_path = os.path.join(checkpoints_dir, top_level)
-        if not os.path.isdir(top_path):
-            continue
-        for sub_dir in os.listdir(top_path):
-            sub_path = os.path.join(top_path, sub_dir)
-            if not os.path.isdir(sub_path):
-                continue
-            metadata_path = os.path.join(sub_path, "metadata.json")
-            if not os.path.exists(metadata_path):
-                continue
+    if user_id and user_id != "admin":
+        base = os.path.join(checkpoints_dir, user_id)
+        patterns = [
+            os.path.join(base, "*", "metadata.json"),  # /checkpoints/<user>/<ckpt_id>/
+            os.path.join(base, "*", "*", "metadata.json"),  # /checkpoints/<user>/<model_id>/<ckpt_name>/
+        ]
+    else:
+        patterns = [
+            os.path.join(checkpoints_dir, "*", "*", "metadata.json"),  # /checkpoints/<model_id>/<ckpt_name>/
+            os.path.join(checkpoints_dir, "*", "metadata.json"),  # /checkpoints/<ckpt_id>/ (rare)
+            os.path.join(checkpoints_dir, "*", "*", "*", "metadata.json"),  # /checkpoints/<user>/<model_id>/<ckpt_name>/
+        ]
+
+    for pattern in patterns:
+        for metadata_path in glob.glob(pattern):
             try:
                 with open(metadata_path) as f:
                     metadata = json.load(f)
                 if metadata.get("checkpoint_id") == checkpoint_id:
-                    return sub_path
+                    return os.path.dirname(metadata_path)
             except (json.JSONDecodeError, OSError):
                 pass
 
     return None
 
 
-def resolve_checkpoint_uri(uri: str, checkpoints_dir: str) -> str:
+def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | None = None) -> str:
+    if uri.startswith("file://"):
+        return uri[7:]
+
     if uri.startswith("ckpt_"):
-        resolved = resolve_checkpoint_id(uri, checkpoints_dir)
+        owner_dir = user_id or "anonymous"
+        resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=owner_dir)
+        if resolved is None and user_id == "admin":
+            resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=None)
         return resolved or uri
 
     if uri.startswith("tinker://"):
-        path_part = uri[len("tinker://"):]
-        return os.path.join(checkpoints_dir, path_part)
+        path_part = uri[len("tinker://") :]
+        if user_id == "admin":
+            legacy = os.path.join(checkpoints_dir, path_part)
+            if os.path.exists(legacy):
+                return legacy
+            matches = glob.glob(os.path.join(checkpoints_dir, "*", path_part))
+            if len(matches) == 1 and os.path.exists(matches[0]):
+                return matches[0]
+            return legacy
+
+        owner_dir = user_id or "anonymous"
+        return os.path.join(checkpoints_dir, owner_dir, path_part)
     if uri.startswith("mint://"):
-        path_part = uri[len("mint://"):]
-        return os.path.join(checkpoints_dir, path_part)
-    if uri.startswith("file://"):
-        return uri[7:]
+        path_part = uri[len("mint://") :]
+        if user_id == "admin":
+            legacy = os.path.join(checkpoints_dir, path_part)
+            if os.path.exists(legacy):
+                return legacy
+            matches = glob.glob(os.path.join(checkpoints_dir, "*", path_part))
+            if len(matches) == 1 and os.path.exists(matches[0]):
+                return matches[0]
+            return legacy
+
+        owner_dir = user_id or "anonymous"
+        return os.path.join(checkpoints_dir, owner_dir, path_part)
     return uri

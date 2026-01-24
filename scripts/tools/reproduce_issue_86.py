@@ -36,6 +36,16 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout_s: float) -> dict[s
     return data
 
 
+def _get_json(url: str, *, timeout_s: float) -> dict[str, Any]:
+    resp = requests.get(url, headers=_headers(), timeout=timeout_s)
+    if resp.status_code != 200:
+        raise RuntimeError(f"GET {url} returned {resp.status_code}: {resp.text[:400]!r}")
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"GET {url} returned non-dict json: {type(data)}")
+    return data
+
+
 def _poll_future(request_id: str, *, timeout_s: float) -> dict[str, Any]:
     url = f"{BASE_URL}/api/v1/retrieve_future"
     deadline = time.time() + timeout_s
@@ -97,6 +107,16 @@ def main() -> int:
             return _fail(f"save_state failed: {saved.get('error')!r}")
 
         resume_path = f"tinker://{created_model_id}/{checkpoint_name}"
+
+        listed = _get_json(
+            f"{BASE_URL}/api/v1/training_runs/{created_model_id}/checkpoints",
+            timeout_s=60.0,
+        )
+        ckpts = listed.get("checkpoints")
+        if not isinstance(ckpts, list):
+            return _fail(f"list_checkpoints returned unexpected payload: {listed!r}")
+        if checkpoint_name not in {c.get("checkpoint_id") for c in ckpts if isinstance(c, dict)}:
+            return _fail(f"list_checkpoints missing {checkpoint_name!r}: {listed!r}")
 
         # Mimic "resume after restart": delete the training model, then create a new one from state.
         _delete_model(created_model_id)
