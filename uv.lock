@@ -4539,6 +4539,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "omegaconf" },
     { name = "peft" },
     { name = "pydantic" },
@@ -4558,6 +4559,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.100.0" },
+    { name = "httpx", specifier = ">=0.24.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "omegaconf", specifier = ">=2.3.0" },
     { name = "peft", specifier = ">=0.10.0" },
