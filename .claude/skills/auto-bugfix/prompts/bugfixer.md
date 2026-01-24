@@ -36,6 +36,7 @@ Process:
 7) Run an integrated smoke check (minimum): `python scripts/tools/smoke.py service` against the same issue-scoped dev server.
 8) If system behavior or operator workflow changed, update `.claude/skills/architecture-design/SKILL.md` and any relevant `references/*.md`.
 9) Provide the orchestrator:
+   - a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail)
    - the exact reproduction command used
    - the smoke command used (and output)
    - the exact dev-server start/stop/log commands used (if relevant)

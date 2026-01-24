@@ -73,6 +73,7 @@ Getting file line numbers:
 - Option B: use `gh pr diff "$PR_URL" --color=never` and cite the `@@ ... @@` hunk headers (line ranges on the head side).
 
 Report content requirements:
+- Include a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail).
 - Say whether the PR matches the issue scope (and where it does not).
 - List concrete technical concerns with file paths and line numbers to inspect.
 - State what evidence is missing if the reproduction proof is incomplete.

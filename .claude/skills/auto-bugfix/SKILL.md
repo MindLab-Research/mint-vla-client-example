@@ -44,9 +44,11 @@ Hard rules:
 - Assume an integrated repro IS feasible by default. Use the issue-scoped server on volcano + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
 - Every issue MUST have runtime evidence:
   - Integrated reproduction:
-    - Prefer: FAIL on old code and PASS on new code, by actually running `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server.
-    - The repro must exercise the production path of the bug (not just a helper function). If the issue is about runtime behavior, do not stop at unit-level assertions.
-    - If the issue is not server/runtime-related, still prefer an integrated smoke check (server starts) plus targeted local unit coverage.
+    - Required: execute `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server over HTTP.
+    - Required: FAIL on old code and PASS on new code, using the same command line.
+    - The repro must exercise the production path of the bug (not just a helper function). If the bug is observable via an HTTP endpoint, the repro must call that endpoint.
+    - If the production path uses Ray, the repro must trigger real Ray execution (e.g. create_session/create_model/create_sampling_session/asample) and must not bypass/stub Ray.
+    - Only exception: if the issue is truly local-only (no server/runtime surface), run an executed repro or unit test locally and explicitly explain why an integrated repro cannot exercise it.
   - Integrated smoke:
     - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
       HTTP flows work).
@@ -227,6 +229,7 @@ Inputs to bugfixer:
 - chosen `PFS_TINKER_PATH`
 
 Bugfixer deliverable back to orchestrator:
+- a short issue digest (3-8 bullets) summarizing the problem + constraints, referencing at least one specific issue comment (URL or quoted detail)
 - a reproduction script at `scripts/tools/reproduce_issue_<NUMBER>.py`
 - evidence that reproduction fails before the fix and passes after the fix (integrated dev server; no stubs)
 - the exact reproduction command used (env vars + invocation)
@@ -309,6 +312,7 @@ Input to reviewer:
 
 Review output contract:
 - a detailed review report posted as a PR comment (via `gh pr comment`)
+- a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail)
 - a merge recommendation (`recommendation: merge` or `recommendation: iterate`)
 - if iterate: blocking issues (with file paths and line numbers)
 - commands actually run (repro + tests) and observed results; static-only repro is a blocking issue
