@@ -56,7 +56,7 @@ class UsageSummaryResponse(BaseModel):
     """Response for usage summary."""
 
     total_tokens: int
-    operation_counts: dict[str, int]
+    operation_counts: dict[str, int]  # token totals by operation type
 
 
 class HealthResponse(BaseModel):
