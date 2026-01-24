@@ -727,15 +727,17 @@ class MultiNodeInferenceEngine:
                     **ray_log_to_driver_kwargs(),
                 )
 
-            # vLLM v1 requires the controller actor to have a CUDA-visible GPU.
-            # Without this, vLLM falls back to "no active driver" and engine core init fails.
-            controller_gpus = 1
+            # MultiNodeVLLMEngine itself does not need Ray GPU resources (vLLM's Ray backend
+            # manages the 1-GPU worker actors). Reserving an extra GPU for the controller
+            # breaks TP=16 scheduling on 2x8-GPU clusters (would require 17 GPUs).
+            controller_gpus = 0
+            controller_cpus = 0
             worker_gpus = (
                 self.tensor_parallel_size
                 * self.pipeline_parallel_size
                 * self.data_parallel_size
             )
-            total_required_gpus = worker_gpus + controller_gpus
+            total_required_gpus = worker_gpus
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
@@ -898,7 +900,6 @@ class MultiNodeInferenceEngine:
                 )
             }
 
-            # Controller actor must reserve a GPU for vLLM v1 engine core (CUDA visibility).
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
@@ -926,6 +927,7 @@ class MultiNodeInferenceEngine:
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                num_cpus=controller_cpus,
                 num_gpus=controller_gpus,
                 max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 **scheduling_opts,
