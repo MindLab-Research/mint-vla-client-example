@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.ray_utils import ray_log_to_driver_kwargs
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
@@ -663,7 +664,12 @@ class MultiNodeInferenceEngine:
                 return
 
             if not ray.is_initialized():
-                ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+                ray.init(
+                    address="auto",
+                    namespace=PERSISTENT_NAMESPACE,
+                    ignore_reinit_error=True,
+                    **ray_log_to_driver_kwargs(),
+                )
 
             # vLLM v1 requires the controller actor to have a CUDA-visible GPU.
             # Without this, vLLM falls back to "no active driver" and engine core init fails.

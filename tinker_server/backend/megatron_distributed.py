@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.backend.model_registry import get_model_config
+from tinker_server.ray_utils import ray_log_to_driver_kwargs
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -5048,7 +5049,12 @@ def get_or_create_megatron_worker_group(
     num_gpus = config.world_size
 
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        ray.init(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+            **ray_log_to_driver_kwargs(),
+        )
 
     resource_pool = get_resource_pool()
     actor_name = _make_megatron_actor_name(base_model)
@@ -5215,7 +5221,12 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     from tinker_server.backend.resource_pool import get_resource_pool, ActorType
 
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        ray.init(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+            **ray_log_to_driver_kwargs(),
+        )
 
     resource_pool = get_resource_pool()
     killed_any = False
@@ -5280,7 +5291,12 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
         True if actor exists and is actually alive (not dead).
     """
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        ray.init(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+            **ray_log_to_driver_kwargs(),
+        )
 
     if base_model:
         actor_name = _make_megatron_actor_name(base_model)

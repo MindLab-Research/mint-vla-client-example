@@ -34,6 +34,7 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.ray_utils import ray_log_to_driver_kwargs
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
@@ -267,7 +268,12 @@ class MultiLoRAInferenceEngine:
 
             if not ray.is_initialized():
                 # Use fixed namespace so detached actors can be found across process restarts
-                ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+                ray.init(
+                    address="auto",
+                    namespace=PERSISTENT_NAMESPACE,
+                    ignore_reinit_error=True,
+                    **ray_log_to_driver_kwargs(),
+                )
 
             # Try to get existing persistent actor
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
@@ -1409,7 +1415,12 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
     from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        ray.init(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+            **ray_log_to_driver_kwargs(),
+        )
 
     resource_pool = get_resource_pool()
 
@@ -1489,7 +1500,12 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
     from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        ray.init(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+            **ray_log_to_driver_kwargs(),
+        )
 
     def _is_actor_ready(actor) -> bool:
         """Return True if actor responds and (if supported) its engine is healthy.
