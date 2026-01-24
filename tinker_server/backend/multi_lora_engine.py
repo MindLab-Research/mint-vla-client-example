@@ -1166,7 +1166,11 @@ class MultiModelInferenceManager:
             # vLLM v1 multiprocess TP has repeatedly failed to initialize for MoE TP>=4
             # (worker subprocess dies before emitting a root-cause stack trace). Use vLLM's
             # Ray distributed executor backend instead, even when the model fits on one node.
-            needs_multinode = config.total_gpus > 8 or (config.is_moe and config.total_gpus >= 4)
+            multinode_min_gpus = int(os.environ.get("MINT_MULTINODE_MIN_GPUS", "8"))
+            moe_multinode_min_gpus = int(os.environ.get("MINT_MOE_MULTINODE_MIN_GPUS", "4"))
+            needs_multinode = (config.total_gpus > multinode_min_gpus) or (
+                config.is_moe and config.total_gpus >= moe_multinode_min_gpus
+            )
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
