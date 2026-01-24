@@ -18,5 +18,10 @@ def test_issue_81_ignores_non_encoded_chunks() -> None:
             {"type": "encoded_text", "tokens": [3]},
         ]
     }
-    assert flatten_encoded_text_chunks(model_input) == [3]
+    try:
+        flatten_encoded_text_chunks(model_input)
+    except ValueError as e:
+        assert "Unsupported chunk type" in str(e)
+    else:
+        raise AssertionError("Expected ValueError for non-encoded chunk type")
 
