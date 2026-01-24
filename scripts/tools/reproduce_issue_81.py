@@ -62,12 +62,25 @@ def _pick_training_model() -> str:
         if isinstance(entry, dict) and isinstance(entry.get("model_name"), str):
             names.append(entry["model_name"])
 
-    if "Qwen/Qwen3-0.6B" in names:
-        return "Qwen/Qwen3-0.6B"
-    return names[0]
+    # Issue #81 is a Megatron-path bug (MoE models); force a known MoE model if available.
+    for prefer in (
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    ):
+        if prefer in names:
+            return prefer
+
+    for name in names:
+        if "A3B" in name or "A22B" in name:
+            return name
+
+    raise RuntimeError(
+        "No MoE (Megatron) model found in supported_models; cannot exercise the Megatron multi-chunk path."
+    )
 
 
 def main() -> int:
+    model_id: str | None = None
     try:
         base_model = _pick_training_model()
         session = _post_json(
@@ -135,6 +148,16 @@ def main() -> int:
         _poll_future(forward_request_id, timeout_s=600.0)
     except Exception as e:
         return _fail(str(e))
+    finally:
+        if model_id:
+            try:
+                requests.delete(
+                    f"{BASE_URL}/api/v1/models/{model_id}",
+                    headers=_headers(),
+                    timeout=60,
+                )
+            except Exception:
+                pass
 
     print("PASS")
     return 0
