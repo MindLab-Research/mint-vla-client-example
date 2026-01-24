@@ -14,6 +14,8 @@ Non-negotiable rules:
 - Static-only checks are forbidden. Do not use grep/AST/string matching as the reproduction.
 - Do not use "runtime" stubs (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) as a substitute for an integrated repro when an
   integrated repro is feasible.
+- "Runtime without Ray" is not runtime for Ray-backed production paths. If the production code path uses Ray, your repro must run against a server connected
+  to real Ray (no stubs, no bypassing Ray).
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - Use issue-specific `TINKER_RAY_NAMESPACE` to isolate Ray actor state.
 - Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.

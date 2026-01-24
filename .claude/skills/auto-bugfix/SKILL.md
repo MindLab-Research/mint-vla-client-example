@@ -39,9 +39,13 @@ Hard rules:
   - Examples of partial evidence: calling a FastAPI route handler directly, stubbing `ray`/`fastapi`/`peft` so imports work, asserting only on
     computed resource numbers without starting the system.
   - For server/runtime bugs: the reproduction must hit the issue-scoped dev server over HTTP and exercise the real dependency stack (FastAPI + Ray).
+- "Runtime" means the real runtime. If the production code path uses Ray, a "runtime test" that does not connect to real Ray is not a runtime test.
+  - "Runtime without Ray" is a non-test for the server: do not accept it for Ray-backed endpoints, actor lifecycle, scheduling, vLLM, or Megatron paths.
+- Assume an integrated repro IS feasible by default. Use the issue-scoped server on volcano + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
 - Every issue MUST have runtime evidence:
   - Integrated reproduction:
     - Prefer: FAIL on old code and PASS on new code, by actually running `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server.
+    - The repro must exercise the production path of the bug (not just a helper function). If the issue is about runtime behavior, do not stop at unit-level assertions.
     - If the issue is not server/runtime-related, still prefer an integrated smoke check (server starts) plus targeted local unit coverage.
   - Integrated smoke:
     - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
@@ -234,6 +238,8 @@ Bugfixer deliverable back to orchestrator:
 Use the `bugfix` workflow:
 - Read the entire issue thread (body + all comments) before writing the repro.
 - Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py` that exercises the system (no source inspection, no stubs).
+  - If the bug is observable via an HTTP endpoint, the repro must call that endpoint against the running issue-scoped server (not internal helpers).
+  - If the production path uses Ray, the repro must run against a server connected to Ray and must not bypass/stub Ray.
 - Run it against the issue-scoped dev server (`TINKER_BASE_URL=http://localhost:$TINKER_PORT`, `TINKER_API_KEY=dummy`) and capture output.
 - Require: FAIL on old code, PASS on new code (same command line).
 - After the fix, run a baseline integrated smoke check:

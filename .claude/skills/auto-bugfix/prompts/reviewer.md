@@ -11,7 +11,10 @@ Non-negotiable:
 - You MUST run the reproduction script and tests yourself.
 - Static-only reproductions (source inspection via grep/AST/string checks) are a blocking issue: recommendation must be iterate.
 - Stubbed "runtime" (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) is a blocking issue when an integrated repro is feasible.
+- "Runtime without Ray" is a blocking issue for Ray-backed production paths. If the production code path uses Ray, require a repro that runs against a server
+  connected to real Ray (no stubs, no bypassing Ray).
 - Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.
+  - Do not accept "not run (server not available)" as evidence. Bring up an issue-scoped dev server on volcano and tunnel, then run the repro.
 
 Inputs you will be given by the orchestrator:
 - PR URL
