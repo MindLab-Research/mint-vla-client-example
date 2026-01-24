@@ -78,6 +78,7 @@ Getting file line numbers:
 
 Report content requirements:
 - Include a short issue digest (3-8 bullets) citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
+- The digest MUST include explicit acceptance criteria extracted from the issue/comments (expected behavior, required endpoints, required integrated flows).
 - Say whether the PR matches the issue scope (and where it does not).
 - List concrete technical concerns with file paths and line numbers to inspect.
 - State what evidence is missing if the reproduction proof is incomplete.

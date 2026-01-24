@@ -42,6 +42,10 @@ Hard rules:
 - "Runtime" means the real runtime. If the production code path uses Ray, a "runtime test" that does not connect to real Ray is not a runtime test.
   - "Runtime without Ray" is a non-test for the server: do not accept it for Ray-backed endpoints, actor lifecycle, scheduling, vLLM, or Megatron paths.
 - Assume an integrated repro IS feasible by default. Use the issue-scoped server on volcano + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
+- For any change that touches scheduling / placement groups / GPU allocation / engine initialization:
+  - A "repro" that only asserts on computed resource numbers / GPU counts is partial evidence.
+  - Require an integrated repro that (1) creates the affected session/engine in Ray and (2) completes at least one request using it (e.g. create_sampling_session + asample + retrieve_future).
+- Treat issue-thread comprehension as testable: the bugfixer + reviewer issue digests must include explicit acceptance criteria extracted from the issue/comments (not just a generic summary).
 - Every issue MUST have runtime evidence:
   - Integrated reproduction:
     - Required: execute `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server over HTTP.
@@ -202,6 +206,7 @@ ssh volcano "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c
    PFS_TINKER_PATH=$PFS_TINKER_PATH \
    TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
    TINKER_PORT=$TINKER_PORT \
+   TINKER_USAGE_LOG_DIR=/tmp/tinker_usage_issue_$ISSUE \
    python scripts/run_server.py\" >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
 ```
 
