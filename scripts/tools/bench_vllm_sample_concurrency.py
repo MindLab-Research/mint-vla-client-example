@@ -172,6 +172,11 @@ def main() -> None:
         help="Make prompt tokens unique per request to avoid vLLM prefix-caching effects",
     )
     p.add_argument(
+        "--unique-batches",
+        action="store_true",
+        help="Make prompt tokens unique per (concurrency, repeat) but identical within the concurrent batch",
+    )
+    p.add_argument(
         "--reuse-sampling-session",
         action="store_true",
         help="Use a single sampling_session_id for all concurrent requests (tests intra-session concurrency)",
@@ -246,6 +251,9 @@ def main() -> None:
                         _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
                         for _ in range(c)
                     ]
+                if args.unique_prompts and args.unique_batches:
+                    raise SystemExit("--unique-prompts and --unique-batches are mutually exclusive")
+
                 if args.unique_prompts:
                     prompt_tokens_by_req: list[list[int]] = []
                     for i in range(c):
@@ -258,6 +266,13 @@ def main() -> None:
                         toks = list(base_prompt_tokens)
                         toks[0] = first_tok
                         prompt_tokens_by_req.append(toks)
+                elif args.unique_batches:
+                    # Use a unique prefix token per batch so repeated runs do not benefit from prefix caching,
+                    # while requests within the same concurrent batch can still be coalesced.
+                    first_tok = 1000 + (c * 1000 + rep)
+                    toks = list(base_prompt_tokens)
+                    toks[0] = first_tok
+                    prompt_tokens_by_req = [toks] * c
                 else:
                     prompt_tokens_by_req = [base_prompt_tokens] * c
 
