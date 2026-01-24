@@ -270,12 +270,9 @@ class SessionManager:
         Returns:
             Absolute filesystem path to adapter directory.
         """
-        # Get checkpoint base directory
-        import os
-        checkpoint_dir = os.environ.get(
-            "TINKER_CHECKPOINT_DIR",
-            os.path.join(os.getcwd(), "checkpoints")
-        )
+        from ..checkpoints import get_checkpoints_dir
+
+        checkpoint_dir = get_checkpoints_dir()
 
         if model_path.startswith("file://"):
             return model_path[7:]  # Strip file:// prefix

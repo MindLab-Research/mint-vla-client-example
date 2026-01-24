@@ -22,7 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, Up
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
-from ..checkpoints import resolve_checkpoint_uri, safe_extract_checkpoint_archive, validate_checkpoint_dir
+from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri, safe_extract_checkpoint_archive, validate_checkpoint_dir
 from ..models.types import (
     CheckpointInfo,
     CheckpointUploadResponse,
@@ -47,8 +47,8 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-# Must be absolute path on vePFS for all Ray workers to access
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
+# Must be an absolute path on shared storage for all Ray workers to access.
+CHECKPOINTS_DIR = get_checkpoints_dir()
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -72,7 +72,7 @@ def _get_webhook_url(request: Request) -> str | None:
     return None
 
 
-def _resolve_mint_path(mint_uri: str) -> str:
+def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
     """Convert path identifier to filesystem path.
 
     Args:
@@ -85,7 +85,7 @@ def _resolve_mint_path(mint_uri: str) -> str:
     Returns:
         Filesystem path.
     """
-    return resolve_checkpoint_uri(mint_uri, CHECKPOINTS_DIR)
+    return resolve_checkpoint_uri(mint_uri, CHECKPOINTS_DIR, user_id=user_id)
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
@@ -173,7 +173,7 @@ async def _do_save_state(
 ) -> None:
     """Background task to save state.
 
-    Uses new storage schema: /checkpoints/{user_id}/{checkpoint_id}/
+    Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
     import json
@@ -182,12 +182,15 @@ async def _do_save_state(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Generate unique checkpoint_id (spec format: ckpt_xxx)
-        checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
+        checkpoint_name = request.path.strip() if request.path is not None else ""
+        if checkpoint_name:
+            if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
+                raise ValueError(f"Invalid checkpoint name: {request.path!r}")
+        else:
+            checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
-        # Use user-based directory (fallback to "anonymous" if no user)
         owner_dir = user_id or "anonymous"
-        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id)
+        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, session.model_id, checkpoint_name)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
@@ -200,7 +203,7 @@ async def _do_save_state(
         os.makedirs(save_path, exist_ok=True)
 
         metadata = {
-            "checkpoint_id": checkpoint_id,
+            "checkpoint_id": checkpoint_name,
             "owner_id": user_id,
             "model_id": session.model_id,
             "model_name": session.base_model,
@@ -240,17 +243,20 @@ async def _do_save_state(
             except Exception as reg_err:
                 logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
-        # Build mint:// path for response
-        mint_path = _to_mint_path(session.model_id, checkpoint_id)
+        # Use tinker:// URI format (official contract), keep mint:// as legacy alias.
+        tinker_path = f"tinker://{session.model_id}/{checkpoint_name}"
+        mint_path = _to_mint_path(session.model_id, checkpoint_name)
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
         state_dict_keys = []  # state_dict not available in path-based flow
 
         future_store.resolve(request_id, {
-            "checkpoint_id": checkpoint_id,
-            "path": save_path,  # Filesystem path for debugging
-            "type": "save_weights",
+            "checkpoint_id": checkpoint_name,
+            "path": tinker_path,
+            "mint_path": mint_path,
+            "filesystem_path": save_path,
+            "type": "save_state",
             "sampling_registered": sampling_registered,
         })
 
@@ -264,7 +270,7 @@ async def _do_save_state(
                 task_name=f"Training {session.base_model}",
                 task_type="training",
                 model_name=session.base_model,
-                result={"checkpoint_id": checkpoint_id, "step": session.current_step},
+                result={"checkpoint_id": checkpoint_name, "step": session.current_step},
             )
 
     except Exception as e:
@@ -295,6 +301,7 @@ async def _do_save_state(
 async def load_state(
     request: LoadStateRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Load model state from checkpoint."""
     if training_engine is None or training_manager is None:
@@ -305,23 +312,29 @@ async def load_state(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_load_state, request_id, session, request)
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_load_state, request_id, session, request, user_id)
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_load_state(request_id: str, session, request: LoadStateRequest) -> None:
+async def _do_load_state(
+    request_id: str, session, request: LoadStateRequest, user_id: str | None
+) -> None:
     """Background task to load state."""
-    # DEBUG: Log entry
-    with open("/vePFS-Mindverse/share/code/load_adapter_debug.log", "a") as dbg:
-        dbg.write(f"[_do_load_state] ENTRY: request_id={request_id}, model_id={session.model_id}, path={request.path}\n")
-        dbg.flush()
-
     try:
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
         # Resolve path
-        load_path = _resolve_mint_path(request.path)
+        load_path = _resolve_mint_path(request.path, user_id=user_id)
+        if user_id and user_id != "admin":
+            load_real = os.path.realpath(load_path)
+            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
+            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
+                allowed_real + os.sep
+            ):
+                raise PermissionError("Access denied")
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
@@ -462,26 +475,54 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     Ownership verified via metadata.json (admin can access all).
     """
     user_id = _get_user_id(request)
-    checkpoints_path = os.path.join(CHECKPOINTS_DIR, model_id)
+    owner_dir = user_id or "anonymous"
 
-    if not os.path.exists(checkpoints_path):
-        raise HTTPException(status_code=404, detail=f"No checkpoints found for model '{model_id}'")
+    candidate_paths: list[str] = [
+        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id),
+        os.path.join(CHECKPOINTS_DIR, model_id),  # legacy (pre user-scoping)
+    ]
+    if user_id == "admin":
+        candidate_paths = [os.path.join(CHECKPOINTS_DIR, model_id)]
+        try:
+            for owner in os.listdir(CHECKPOINTS_DIR):
+                candidate_paths.append(os.path.join(CHECKPOINTS_DIR, owner, model_id))
+        except OSError:
+            pass
+
+    if not any(os.path.exists(p) for p in candidate_paths):
+        raise HTTPException(
+            status_code=404, detail=f"No checkpoints found for model '{model_id}'"
+        )
 
     checkpoints = []
-    for name in os.listdir(checkpoints_path):
-        ckpt_path = os.path.join(checkpoints_path, name)
-        if os.path.isdir(ckpt_path):
-            # Check ownership via metadata.json (admin can access all, others only their own)
-            if user_id != "admin":
-                metadata_path = os.path.join(ckpt_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    import json
-                    with open(metadata_path) as f:
-                        metadata = json.load(f)
-                    if metadata.get("owner_id") != user_id:
-                        continue  # Skip checkpoints not owned by user
-                else:
-                    continue  # Skip checkpoints without metadata (legacy)
+    seen: set[str] = set()
+    for checkpoints_path in candidate_paths:
+        if not os.path.isdir(checkpoints_path):
+            continue
+        for name in os.listdir(checkpoints_path):
+            ckpt_path = os.path.join(checkpoints_path, name)
+            if not os.path.isdir(ckpt_path):
+                continue
+            key = f"{checkpoints_path}:{name}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            metadata_path = os.path.join(ckpt_path, "metadata.json")
+            if not os.path.exists(metadata_path):
+                continue  # refuse unauthenticated legacy dirs
+            try:
+                import json
+
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+            except Exception:
+                continue
+
+            if metadata.get("model_id") != model_id:
+                continue
+            if user_id != "admin" and metadata.get("owner_id") != user_id:
+                continue
 
             # Try to parse step from directory name
             step = None
@@ -491,17 +532,63 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 except (IndexError, ValueError):
                     pass
 
-            # Get creation time
-            created_at = datetime.fromtimestamp(
-                os.path.getctime(ckpt_path)
-            ).isoformat()
+            created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
 
-            checkpoints.append(CheckpointInfo(
-                checkpoint_id=name,
-                path=_to_mint_path(model_id, name),
-                step=step,
-                created_at=created_at,
-            ))
+            checkpoints.append(
+                CheckpointInfo(
+                    checkpoint_id=name,
+                    path=_to_mint_path(model_id, name),
+                    step=step,
+                    created_at=created_at,
+                )
+            )
+
+    # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
+    owner_roots: list[str]
+    if user_id == "admin":
+        try:
+            owner_roots = [
+                os.path.join(CHECKPOINTS_DIR, d)
+                for d in os.listdir(CHECKPOINTS_DIR)
+                if os.path.isdir(os.path.join(CHECKPOINTS_DIR, d))
+            ]
+        except OSError:
+            owner_roots = []
+    else:
+        owner_roots = [os.path.join(CHECKPOINTS_DIR, owner_dir)]
+
+    for root in owner_roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if not name.startswith("ckpt_"):
+                continue
+            ckpt_path = os.path.join(root, name)
+            if not os.path.isdir(ckpt_path):
+                continue
+            metadata_path = os.path.join(ckpt_path, "metadata.json")
+            if not os.path.exists(metadata_path):
+                continue
+            try:
+                import json
+
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+            except Exception:
+                continue
+            if metadata.get("model_id") != model_id:
+                continue
+            if user_id != "admin" and metadata.get("owner_id") != user_id:
+                continue
+            created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
+            checkpoints.append(
+                CheckpointInfo(
+                    checkpoint_id=name,
+                    path=_to_mint_path(model_id, name),
+                    step=None,
+                    created_at=created_at,
+                )
+            )
 
     # Sort by step (descending)
     checkpoints.sort(key=lambda x: x.step or 0, reverse=True)
@@ -524,23 +611,40 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     Ownership verified via metadata.json (admin can delete all).
     """
     user_id = _get_user_id(request)
-    ckpt_path = os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id)
+    owner_dir = user_id or "anonymous"
+    candidates = [
+        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_id),
+        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id),  # legacy
+        os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id),  # uploaded /checkpoints/{owner}/{ckpt_id}
+    ]
+    if user_id == "admin":
+        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_id))
+        try:
+            for owner in os.listdir(CHECKPOINTS_DIR):
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_id))
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_id))
+        except OSError:
+            pass
 
-    if not os.path.exists(ckpt_path):
+    ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
+    if ckpt_path is None:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    # Check ownership (admin can delete all, others only their own)
-    if user_id != "admin":
-        metadata_path = os.path.join(ckpt_path, "metadata.json")
-        if os.path.exists(metadata_path):
-            import json
-            with open(metadata_path) as f:
-                metadata = json.load(f)
-            if metadata.get("owner_id") != user_id:
-                raise HTTPException(status_code=403, detail="Access denied")
-        else:
-            # No metadata.json = legacy checkpoint = deny access for non-admin
-            raise HTTPException(status_code=403, detail="Access denied")
+    metadata_path = os.path.join(ckpt_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        import json
+
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+    except Exception:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if metadata.get("model_id") != model_id:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+    if user_id != "admin" and metadata.get("owner_id") != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     shutil.rmtree(ckpt_path)
 
@@ -565,23 +669,40 @@ async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request
     import subprocess
 
     user_id = _get_user_id(request)
-    ckpt_path = os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id)
+    owner_dir = user_id or "anonymous"
+    candidates = [
+        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_id),
+        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id),  # legacy
+        os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id),  # uploaded /checkpoints/{owner}/{ckpt_id}
+    ]
+    if user_id == "admin":
+        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_id))
+        try:
+            for owner in os.listdir(CHECKPOINTS_DIR):
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_id))
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_id))
+        except OSError:
+            pass
 
-    if not os.path.exists(ckpt_path):
+    ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
+    if ckpt_path is None:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    # Check ownership (admin can download all, others only their own)
-    if user_id != "admin":
-        metadata_path = os.path.join(ckpt_path, "metadata.json")
-        if os.path.exists(metadata_path):
-            import json
-            with open(metadata_path) as f:
-                metadata = json.load(f)
-            if metadata.get("owner_id") != user_id:
-                raise HTTPException(status_code=403, detail="Access denied")
-        else:
-            # No metadata.json = legacy checkpoint = deny access for non-admin
-            raise HTTPException(status_code=403, detail="Access denied")
+    metadata_path = os.path.join(ckpt_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        import json
+
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+    except Exception:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if metadata.get("model_id") != model_id:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+    if user_id != "admin" and metadata.get("owner_id") != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""

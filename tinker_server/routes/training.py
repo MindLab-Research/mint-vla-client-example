@@ -247,10 +247,12 @@ async def _do_create_model(
 # =============================================================================
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
+from ..checkpoints import get_checkpoints_dir
+
+CHECKPOINTS_DIR = get_checkpoints_dir()
 
 
-def _resolve_state_path(state_uri: str) -> str:
+def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
     """Convert mint://{model_id}/name or file:// to filesystem path.
 
     Args:
@@ -261,7 +263,7 @@ def _resolve_state_path(state_uri: str) -> str:
     """
     from ..checkpoints import resolve_checkpoint_uri
 
-    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR)
+    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR, user_id=user_id)
 
 
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
@@ -287,12 +289,13 @@ async def create_model_from_state(
         )
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_create_model_from_state, request_id, request)
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_create_model_from_state, request_id, request, user_id)
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_create_model_from_state(
-    request_id: str, request: CreateModelFromStateRequest
+    request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
     try:
@@ -300,6 +303,19 @@ async def _do_create_model_from_state(
             raise RuntimeError("Training engine not initialized")
 
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
+
+        # Resolve state path (before creating a session/actor)
+        load_path = _resolve_state_path(request.state_path, user_id=user_id)
+        if user_id and user_id != "admin":
+            load_real = os.path.realpath(load_path)
+            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
+            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
+                allowed_real + os.sep
+            ):
+                raise PermissionError("Access denied")
+        if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(load_path):
+            raise FileNotFoundError(f"Checkpoint not found: {request.state_path}")
 
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
@@ -320,9 +336,6 @@ async def _do_create_model_from_state(
 
         # Create Ray actor
         await training_engine.create_training_session(session)
-
-        # Resolve state path
-        load_path = _resolve_state_path(request.state_path)
 
         # Load checkpoint into the newly created model
         await training_engine.load_weights(
@@ -701,11 +714,9 @@ async def _do_save_weights_for_sampler(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Get checkpoint directory from environment or default
-        checkpoint_dir = os.environ.get(
-            "TINKER_CHECKPOINT_DIR",
-            os.path.join(os.getcwd(), "checkpoints")
-        )
+        from ..checkpoints import get_checkpoints_dir
+
+        checkpoint_dir = get_checkpoints_dir()
 
         # Determine checkpoint name
         if request.path is not None:
