@@ -4,17 +4,19 @@ from pathlib import Path
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
-    src = repo_root / "tinker_server/routes/futures.py"
-    txt = src.read_text(encoding="utf-8")
+    sys.path.insert(0, str(repo_root))
 
-    required = [
-        "if status == FutureStatus.PENDING:",
-        "response.status_code = 408",
-        'response.headers["Retry-After"] = "1"',
-    ]
-    missing = [s for s in required if s not in txt]
-    if missing:
-        print(f"FAIL: missing expected strings in {src}: {missing}", file=sys.stderr)
+    from tinker_server.futures_utils import pending_future_http_response  # noqa: E402
+
+    pending = pending_future_http_response()
+    if pending.status_code != 408:
+        print(f"FAIL: status_code={pending.status_code!r} expected 408", file=sys.stderr)
+        return 1
+    if pending.headers.get("Retry-After") != "1":
+        print(f"FAIL: headers={pending.headers!r} expected Retry-After=1", file=sys.stderr)
+        return 1
+    if pending.body != {"queue_state": "active"}:
+        print(f"FAIL: body={pending.body!r} expected {{'queue_state': 'active'}}", file=sys.stderr)
         return 1
 
     print("PASS")
