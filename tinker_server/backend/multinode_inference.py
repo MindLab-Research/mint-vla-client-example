@@ -312,6 +312,9 @@ def _create_multinode_vllm_actor(
             max_num_batched_tokens = self.max_num_batched_tokens
             if max_num_batched_tokens is None:
                 max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
+            max_num_batched_tokens = int(os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_num_batched_tokens)))
+            enable_chunked_prefill = _env_flag("MINT_VLLM_ENABLE_CHUNKED_PREFILL", default=True)
+            enable_prefix_caching = _env_flag("MINT_VLLM_ENABLE_PREFIX_CACHING", default=True)
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -326,9 +329,9 @@ def _create_multinode_vllm_actor(
                 trust_remote_code=True,
                 max_model_len=self.max_model_len,
                 max_num_seqs=self.max_num_seqs,
-                enable_chunked_prefill=True,
+                enable_chunked_prefill=enable_chunked_prefill,
                 max_num_batched_tokens=max_num_batched_tokens,
-                enable_prefix_caching=True,
+                enable_prefix_caching=enable_prefix_caching,
                 disable_log_stats=not _env_flag("MINT_VLLM_LOG_STATS", default=False),
                 enforce_eager=True,  # CUDA graphs OOM on K2 at 0.98 util
                 quantization=self.quantization,
@@ -344,7 +347,9 @@ def _create_multinode_vllm_actor(
                 f"Creating AsyncLLMEngine: "
                 f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
-                f"backend=ray, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}"
+                f"backend=ray, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
+                f"chunked_prefill={enable_chunked_prefill}, max_num_batched_tokens={max_num_batched_tokens}, "
+                f"prefix_caching={enable_prefix_caching}"
             )
 
             # Create engine - vLLM will spawn Ray workers across nodes
