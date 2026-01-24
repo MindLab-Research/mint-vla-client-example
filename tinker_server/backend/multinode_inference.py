@@ -1221,6 +1221,8 @@ class MultiNodeInferenceEngine:
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
+        ray_get_timeout_s = float(os.environ.get("MINT_VLLM_RAY_GET_TIMEOUT_S", "0"))
+
         # Look up LoRA for this session
         lora_id = None
         lora_path = None
@@ -1229,7 +1231,7 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        result = await self.engine.generate.remote(
+        ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
             lora_int_id=lora_id,
@@ -1240,6 +1242,24 @@ class MultiNodeInferenceEngine:
             top_p=top_p,
             logprobs=logprobs,
         )
+        try:
+            if ray_get_timeout_s > 0:
+                result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+            else:
+                result = await asyncio.to_thread(ray.get, ref)
+        except Exception:
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise
 
         return GenerateResult(
             token_ids=result["token_ids"],
@@ -1263,6 +1283,8 @@ class MultiNodeInferenceEngine:
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
+        ray_get_timeout_s = float(os.environ.get("MINT_VLLM_RAY_GET_TIMEOUT_S", "0"))
+
         if num_samples < 1:
             raise ValueError(f"num_samples must be >= 1 (got {num_samples})")
 
@@ -1274,7 +1296,7 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        raw = await self.engine.generate.remote(
+        ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
             lora_int_id=lora_id,
@@ -1286,6 +1308,24 @@ class MultiNodeInferenceEngine:
             logprobs=logprobs,
             n=num_samples,
         )
+        try:
+            if ray_get_timeout_s > 0:
+                raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+            else:
+                raw = await asyncio.to_thread(ray.get, ref)
+        except Exception:
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
@@ -1311,6 +1351,8 @@ class MultiNodeInferenceEngine:
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
 
+        ray_get_timeout_s = float(os.environ.get("MINT_VLLM_RAY_GET_TIMEOUT_S", "0"))
+
         # Look up LoRA for this session
         lora_id = None
         lora_path = None
@@ -1319,12 +1361,30 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        result = await self.engine.compute_prompt_logprobs.remote(
+        ref = self.engine.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
             lora_int_id=lora_id,
             lora_path=lora_path,
         )
+        try:
+            if ray_get_timeout_s > 0:
+                result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+            else:
+                result = await asyncio.to_thread(ray.get, ref)
+        except Exception:
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise
 
         return list(result)
 
