@@ -34,6 +34,11 @@ Hard rules:
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
 - Static-only reproductions/tests are forbidden. Do not close an issue based on source inspection (grep/AST/string checks).
   A reproduction must execute code and validate observable behavior; for server bugs, it must hit the issue-scoped server over HTTP.
+- Every issue MUST have runtime evidence:
+  - Reproduction: FAIL on old code and PASS on new code, by actually running `scripts/tools/reproduce_issue_<N>.py`.
+  - Tests: `pytest -q` run on the PR branch.
+  - Record the exact commands and the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
+- If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.
 
 Files:
 - Bugfixer subagent prompt: `.claude/skills/auto-bugfix/prompts/bugfixer.md`
@@ -218,6 +223,7 @@ Use the `bugfix` workflow:
 - Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py` that exercises the system (no source inspection).
 - Run it against the issue-scoped dev server (`TINKER_BASE_URL=http://localhost:$TINKER_PORT`, `TINKER_API_KEY=dummy`) and capture output.
 - Require: FAIL on old code, PASS on new code (same command line).
+- Post the reproduction command and observed output in the PR (so review does not rely on trust).
 
 ### 3e) Fix issue
 
@@ -285,6 +291,7 @@ Review output contract:
 - a merge recommendation (`recommendation: merge` or `recommendation: iterate`)
 - if iterate: blocking issues (with file paths and line numbers)
 - commands actually run (repro + tests) and observed results; static-only repro is a blocking issue
+- treat missing runtime execution (cannot run repro/tests) as blocking: recommendation must be iterate
 
 ### 3k) Merge into `develop` if review passed (iterate otherwise)
 
