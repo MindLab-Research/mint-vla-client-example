@@ -32,6 +32,7 @@ DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.ray_utils import ray_log_to_driver_kwargs
 
 
 # =====================================================================
@@ -1515,7 +1516,12 @@ class VerlTrainingEngine:
         """Initialize Ray connection."""
         if not ray.is_initialized():
             # Use fixed namespace for persistent vLLM actor support
-            ray.init(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            ray.init(
+                address="auto",
+                namespace=RAY_NAMESPACE,
+                ignore_reinit_error=True,
+                **ray_log_to_driver_kwargs(),
+            )
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
     def _kill_session_actor(self, session: "TrainingSession") -> None:
