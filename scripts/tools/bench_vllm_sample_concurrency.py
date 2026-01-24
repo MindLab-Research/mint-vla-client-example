@@ -253,7 +253,10 @@ def main() -> None:
                     for i in range(c):
                         # Use a unique prefix token to prevent vLLM prefix caching from reusing KV
                         # across requests. Keep the rest identical to preserve prompt length.
-                        first_tok = 1000 + (rep * 10000 + i) % 50000
+                        #
+                        # Include `c` in the token to avoid collisions across different concurrency sweeps.
+                        # Keep the token in a conservative range (Qwen vocab is > 150k).
+                        first_tok = 1000 + (c * 1000 + rep * 100 + i)
                         toks = list(base_prompt_tokens)
                         toks[0] = first_tok
                         prompt_tokens_by_req.append(toks)
