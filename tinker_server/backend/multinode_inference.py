@@ -217,7 +217,13 @@ def _create_multinode_vllm_actor(
             self._timing = _env_flag("MINT_VLLM_REQUEST_TIMING", default=False)
             self._serialize_prompt_logprobs = _env_flag("MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE", default=False)
             self._prompt_logprobs_lock = asyncio.Lock() if self._serialize_prompt_logprobs else None
-            self._generate_lock = asyncio.Lock()
+            # vLLM supports concurrent requests for continuous batching, but some engine calls
+            # (notably list_loras) must not race active generation on multinode.
+            #
+            # Default to serialized generate for safety; set MINT_VLLM_SERIALIZE_GENERATE=0 to
+            # allow concurrent generate() calls (still protected by the RW lock).
+            self._serialize_generate = _env_flag("MINT_VLLM_SERIALIZE_GENERATE", default=True)
+            self._generate_lock = asyncio.Lock() if self._serialize_generate else None
 
         @asynccontextmanager
         async def _lock_read(self):
@@ -239,6 +245,14 @@ def _create_multinode_vllm_actor(
                 yield
                 return
             async with self._prompt_logprobs_lock:
+                yield
+
+        @asynccontextmanager
+        async def _maybe_generate_lock(self):
+            if self._generate_lock is None:
+                yield
+                return
+            async with self._generate_lock:
                 yield
 
         async def initialize(self) -> None:
@@ -311,11 +325,9 @@ def _create_multinode_vllm_actor(
                 # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
                 #
                 # IMPORTANT: `list_loras()` must not run concurrently with `generate()`.
-                # Ray async actors can interleave method executions; without this lock,
-                # liveness checks can race active generations and wedge the vLLM engine.
-                async with self._generate_lock:
-                    async with self._lock_read():
-                        await self.engine.list_loras()
+                # Treat it as a "write" operation to exclude concurrent readers.
+                async with self._lock_write():
+                    await self.engine.list_loras()
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
@@ -370,7 +382,8 @@ def _create_multinode_vllm_actor(
 
         async def list_loras(self) -> set[int]:
             """List loaded LoRA adapter IDs."""
-            async with self._lock_read():
+            # NOTE: list_loras must not race active generation on multinode.
+            async with self._lock_write():
                 return await self.engine.list_loras()
 
         async def generate(
@@ -431,7 +444,8 @@ def _create_multinode_vllm_actor(
             t0 = time.perf_counter()
             first_tok_s: float | None = None
             # Get final response
-            async with self._generate_lock:
+            async with self._maybe_generate_lock():
+                t_lock = time.perf_counter()
                 async with self._lock_read():
                     t1 = time.perf_counter()
                     generator = self.engine.generate(
@@ -459,7 +473,8 @@ def _create_multinode_vllm_actor(
             if self._timing:
                 print(
                     f"[vLLM timing] generate req={request_id} prompt_len={len(prompt_ids)} max_tokens={max_tokens} "
-                    f"lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f} first_tok_s={first_tok_s}"
+                    f"lora_id={lora_int_id} serialize_wait_s={t_lock - t0:.3f} rw_lock_wait_s={t1 - t_lock:.3f} "
+                    f"total_s={t2 - t0:.3f} first_tok_s={first_tok_s}"
                     ,
                     flush=True,
                 )
