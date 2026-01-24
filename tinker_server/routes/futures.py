@@ -67,12 +67,24 @@ async def retrieve_future(
             if lk.startswith("x-"):
                 response.headers[k] = v
         try:
-            return upstream_resp.json()
+            payload = upstream_resp.json()
         except Exception:
             raise HTTPException(
                 status_code=502,
                 detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
             )
+
+        # If the gateway uses an upstream credential (static_api_key), the upstream may treat
+        # the request as privileged. Preserve local error-masking semantics based on the caller.
+        if (
+            upstream_resp.status_code == 200
+            and isinstance(payload, dict)
+            and "error" in payload
+            and not _is_privileged(http_request)
+        ):
+            payload = dict(payload)
+            payload["error"] = GENERIC_ERROR_MESSAGE
+        return payload
 
     if status == FutureStatus.PENDING:
         # Tinker client expects HTTP 408 for pending

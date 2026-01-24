@@ -108,9 +108,7 @@ async def get_server_capabilities(http_request: Request) -> dict:
             continue
         seen.add(m)
 
-        if m in supported_local:
-            max_len = int(get_model_config(m).max_model_len)
-        else:
+        if m in cfg.model_to_upstream:
             upstream = upstream_for_model(m)
             if upstream is None:
                 continue
@@ -121,6 +119,8 @@ async def get_server_capabilities(http_request: Request) -> dict:
                     detail=f"Gateway misconfig: model {m!r} not present in upstream {upstream.alias!r} capabilities",
                 )
             max_len = int(caps[m])
+        else:
+            max_len = int(get_model_config(m).max_model_len)
 
         merged.append({"model_name": m, "max_context_length": max_len})
 
