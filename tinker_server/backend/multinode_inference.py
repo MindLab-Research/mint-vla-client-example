@@ -228,6 +228,10 @@ def _create_multinode_vllm_actor(
             # Default to serializing multi-sample requests (num_samples>1) only.
             self._serialize_multisample = _env_flag("MINT_VLLM_SERIALIZE_MULTISAMPLE", default=True)
             self._multisample_lock = asyncio.Lock() if self._serialize_multisample else None
+            # AsyncLLMEngine.add_request has shown hangs when called concurrently on multinode.
+            # Serialize add_request() while still allowing concurrent in-flight requests.
+            self._serialize_add_request = _env_flag("MINT_VLLM_SERIALIZE_ADD_REQUEST", default=True)
+            self._add_request_lock = asyncio.Lock() if self._serialize_add_request else None
             # For multinode, vLLM's `SamplingParams(n>1)` path has shown hangs even at low
             # concurrency. Optionally implement multi-sample by issuing N independent n=1
             # requests; rely on vLLM prefix caching to reuse the long prompt KV across calls.
@@ -304,6 +308,14 @@ def _create_multinode_vllm_actor(
                 yield
                 return
             async with self._multisample_lock:
+                yield
+
+        @asynccontextmanager
+        async def _maybe_add_request_lock(self):
+            if self._add_request_lock is None:
+                yield
+                return
+            async with self._add_request_lock:
                 yield
 
         async def _register_generate_start(self) -> None:
@@ -585,23 +597,24 @@ def _create_multinode_vllm_actor(
                             async with self._lock_read():
                                 t1 = time.perf_counter()
                                 try:
-                                    if self._generate_timeout_s > 0:
-                                        collector = await asyncio.wait_for(
-                                            self.engine.add_request(
+                                    async with self._maybe_add_request_lock():
+                                        if self._generate_timeout_s > 0:
+                                            collector = await asyncio.wait_for(
+                                                self.engine.add_request(
+                                                    request_id=request_id,
+                                                    prompt=prompt,
+                                                    params=sampling_params,
+                                                    lora_request=lora_request,
+                                                ),
+                                                timeout=self._generate_timeout_s,
+                                            )
+                                        else:
+                                            collector = await self.engine.add_request(
                                                 request_id=request_id,
                                                 prompt=prompt,
                                                 params=sampling_params,
                                                 lora_request=lora_request,
-                                            ),
-                                            timeout=self._generate_timeout_s,
-                                        )
-                                    else:
-                                        collector = await self.engine.add_request(
-                                            request_id=request_id,
-                                            prompt=prompt,
-                                            params=sampling_params,
-                                            lora_request=lora_request,
-                                        )
+                                            )
                                 except asyncio.TimeoutError as e:
                                     try:
                                         await self.engine.abort(request_id)
