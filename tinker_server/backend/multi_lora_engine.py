@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import ray
 
 from . import ray_kill
-from .lora_registry import LoRARegistry
+from .lora_registry import LoRARegistry, LoRASlotInfo
 
 if TYPE_CHECKING:
     pass
