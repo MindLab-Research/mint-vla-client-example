@@ -15,7 +15,7 @@ from .backend.session_manager import SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
-from .ray_utils import ray_log_to_driver_kwargs
+from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
@@ -48,11 +48,10 @@ async def _cleanup_stale_actors() -> None:
         from .backend.resource_pool import get_resource_pool, ActorType
 
         if not ray.is_initialized():
-            ray.init(
+            init_ray(
                 address="auto",
                 namespace=PERSISTENT_NAMESPACE,
                 ignore_reinit_error=True,
-                **ray_log_to_driver_kwargs(),
             )
 
         def _normalize_model_part(s: str) -> str:

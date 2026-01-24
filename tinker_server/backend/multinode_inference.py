@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
-from tinker_server.ray_utils import ray_log_to_driver_kwargs
+from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
 # Namespace for actors
@@ -894,11 +894,10 @@ class MultiNodeInferenceEngine:
                 return
 
             if not ray.is_initialized():
-                ray.init(
+                init_ray(
                     address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
-                    **ray_log_to_driver_kwargs(),
                 )
 
             # MultiNodeVLLMEngine itself does not need Ray GPU resources (vLLM's Ray backend
