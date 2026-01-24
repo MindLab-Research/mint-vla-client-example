@@ -58,13 +58,16 @@ Hard rules:
     - Temporary lack of cluster resources (e.g. "no 16-GPU slot available right now") is not a justification to merge/close with a partial test. Treat it as blocking and wait/coordinate until the integrated repro can run.
   - Integrated smoke:
     - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
-      HTTP flows work).
-    - Treat this as the baseline Ray connectivity sanity check (create_session must succeed).
-    - If the change touches sampling/inference/vLLM:
-      - Also run `python scripts/tools/smoke.py service --create-sampling-session`.
-      - Do not accept "create_sampling_session succeeded" as sufficient evidence. Execute at least one end-to-end sample through the running system
-        (submit `/api/v1/asample`, then poll `/api/v1/retrieve_future` until ready) and assert on the returned payload (prefer: in `reproduce_issue_<N>.py`).
-    - If the change touches training/checkpointing: run a minimal end-to-end call that exercises that path (issue-specific repro is preferred).
+      HTTP flows work). This does not validate Ray.
+    - If the issue or change touches Ray-backed paths (sampling/inference, training, scheduling, actor lifecycle), require at least one integrated check
+      that triggers real Ray execution:
+      - Sampling/inference: run `python scripts/tools/smoke.py service --create-sampling-session` (engine/actor init in Ray).
+      - If the change touches inference/vLLM, do not accept "create_sampling_session succeeded" as sufficient evidence. Execute at least one end-to-end
+        sample through the running system (submit `/api/v1/asample`, then poll `/api/v1/retrieve_future` until ready) and assert on the returned payload
+        (prefer: in `reproduce_issue_<N>.py`).
+      - Actor lifecycle / scheduling / placement-group changes: the issue-specific repro must also complete at least one request that uses the created
+        session/engine (e.g. create_sampling_session + asample + retrieve_future).
+      - Training/checkpointing: the issue-specific repro should exercise that path end-to-end.
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
   - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
 - If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.

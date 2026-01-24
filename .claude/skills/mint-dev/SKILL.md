@@ -213,6 +213,12 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
 
 ```bash
 ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+
+# If multiple server processes remain, force kill:
+ssh volcano 'pkill -9 -f "python scripts/run_server.py" 2>/dev/null || true'
+
+# Verify:
+ssh volcano 'ps aux | grep run_server | grep -v grep'
 ```
 
 ### Check Status

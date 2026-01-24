@@ -177,7 +177,12 @@ def _create_multinode_vllm_actor(
         max_num_seqs: Maximum concurrent sequences (reduce for large models with KV cache constraints).
     """
 
-    @ray.remote(num_cpus=1)  # num_gpus=0: vLLM's internal Ray backend manages GPU allocation
+    max_concurrency = int(os.environ.get("MINT_MULTINODE_VLLM_ACTOR_MAX_CONCURRENCY", "128"))
+
+    @ray.remote(
+        num_cpus=1,
+        max_concurrency=max_concurrency,
+    )  # num_gpus=0: vLLM's internal Ray backend manages GPU allocation
     class MultiNodeVLLMEngine:
         """vLLM engine with native Ray backend for multi-node TP."""
 
@@ -209,7 +214,12 @@ def _create_multinode_vllm_actor(
             self.max_lora_rank = max_lora_rank
             self.max_num_seqs = max_num_seqs
             self.kv_cache_dtype = kv_cache_dtype
-            self.max_num_batched_tokens = max_num_batched_tokens
+            env_max_num_batched_tokens = os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS")
+            self.max_num_batched_tokens = (
+                int(env_max_num_batched_tokens)
+                if env_max_num_batched_tokens is not None and env_max_num_batched_tokens.strip()
+                else max_num_batched_tokens
+            )
 
             self.engine = None
             self._initialized = False
@@ -221,14 +231,13 @@ def _create_multinode_vllm_actor(
             # vLLM supports concurrent requests for continuous batching, but some engine calls
             # (notably list_loras) must not race active generation on multinode.
             #
-            # Default to serialized generate for safety; set MINT_VLLM_SERIALIZE_GENERATE=0 to
-            # allow concurrent generate() calls (still protected by the RW lock).
-            self._serialize_generate = _env_flag("MINT_VLLM_SERIALIZE_GENERATE", default=True)
+            # Allow concurrent generate() calls by default so vLLM can continuously batch
+            # requests across clients. Set MINT_VLLM_SERIALIZE_GENERATE=1 to serialize.
+            self._serialize_generate = _env_flag("MINT_VLLM_SERIALIZE_GENERATE", default=False)
             self._generate_lock = asyncio.Lock() if self._serialize_generate else None
             # vLLM SamplingParams(n>1) has shown hangs under concurrent multinode traffic.
-            # Default to serializing multi-sample requests (num_samples>1) only.
-            self._serialize_multisample = _env_flag("MINT_VLLM_SERIALIZE_MULTISAMPLE", default=True)
-            self._multisample_lock = asyncio.Lock() if self._serialize_multisample else None
+            # Default to issuing N concurrent n=1 requests (see MINT_VLLM_MULTISAMPLE_MODE),
+            # avoiding vLLM's `SamplingParams(n>1)` path. Serialize only when using vLLM's n>1.
             # AsyncLLMEngine.add_request has shown hangs when called concurrently on multinode.
             # Serialize add_request() while still allowing concurrent in-flight requests.
             self._serialize_add_request = _env_flag("MINT_VLLM_SERIALIZE_ADD_REQUEST", default=True)
@@ -240,7 +249,14 @@ def _create_multinode_vllm_actor(
             # Modes:
             # - "vllm_n": use `SamplingParams(n=N)` (default vLLM multisample)
             # - "sequential_n1": run N sequential `SamplingParams(n=1)` requests
-            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "sequential_n1").strip().lower()
+            # - "concurrent_n1": run N concurrent `SamplingParams(n=1)` requests
+            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "concurrent_n1").strip().lower()
+            default_serialize_multisample = self._multisample_mode == "vllm_n"
+            self._serialize_multisample = _env_flag(
+                "MINT_VLLM_SERIALIZE_MULTISAMPLE",
+                default=default_serialize_multisample,
+            )
+            self._multisample_lock = asyncio.Lock() if self._serialize_multisample else None
             self._outer_to_subreq_ids: dict[str, set[str]] = {}
             self._outer_to_subreq_lock = asyncio.Lock()
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
@@ -538,26 +554,53 @@ def _create_multinode_vllm_actor(
             from vllm.lora.request import LoRARequest
 
             n_req = max(1, int(n))
-            if n_req > 1 and self._multisample_mode == "sequential_n1":
+            if n_req > 1 and self._multisample_mode in ("sequential_n1", "concurrent_n1"):
                 sub_ids = {f"{request_id}_s{i}" for i in range(n_req)}
                 try:
                     async with self._outer_to_subreq_lock:
                         self._outer_to_subreq_ids[request_id] = sub_ids
-                    outs: list[dict] = []
+                    if self._multisample_mode == "sequential_n1":
+                        outs: list[dict] = []
+                        for i in range(n_req):
+                            sub_id = f"{request_id}_s{i}"
+                            out = await self.generate(
+                                prompt_ids=prompt_ids,
+                                request_id=sub_id,
+                                lora_int_id=lora_int_id,
+                                lora_path=lora_path,
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                                top_k=top_k,
+                                top_p=top_p,
+                                logprobs=logprobs,
+                                n=1,
+                            )
+                            assert isinstance(out, dict)
+                            outs.append(out)
+                        return outs
+
+                    tasks = []
                     for i in range(n_req):
                         sub_id = f"{request_id}_s{i}"
-                        out = await self.generate(
-                            prompt_ids=prompt_ids,
-                            request_id=sub_id,
-                            lora_int_id=lora_int_id,
-                            lora_path=lora_path,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
-                            logprobs=logprobs,
-                            n=1,
+                        tasks.append(
+                            asyncio.create_task(
+                                self.generate(
+                                    prompt_ids=prompt_ids,
+                                    request_id=sub_id,
+                                    lora_int_id=lora_int_id,
+                                    lora_path=lora_path,
+                                    max_tokens=max_tokens,
+                                    temperature=temperature,
+                                    top_k=top_k,
+                                    top_p=top_p,
+                                    logprobs=logprobs,
+                                    n=1,
+                                )
+                            )
                         )
+                    outs_raw = await asyncio.gather(*tasks)
+                    outs: list[dict] = []
+                    for out in outs_raw:
                         assert isinstance(out, dict)
                         outs.append(out)
                     return outs
@@ -597,72 +640,71 @@ def _create_multinode_vllm_actor(
                         async with self._maybe_multisample_lock(n_req):
                             async with self._lock_read():
                                 t1 = time.perf_counter()
-                                agen = self.engine.generate(
-                                    prompt,
-                                    sampling_params,
-                                    request_id=request_id,
-                                    lora_request=lora_request,
-                                )
+                                # vLLM's AsyncLLMEngine.generate() is an async generator whose
+                                # first `__anext__()` both enqueues the request (add_request)
+                                # and waits for the first engine output. Serializing that
+                                # `__anext__()` across concurrent requests destroys continuous
+                                # batching for long prompts.
+                                #
+                                # Serialize only the enqueue (add_request) call, then allow
+                                # concurrent in-flight requests to progress.
+                                if self._add_request_lock is None:
+                                    collector = await self.engine.add_request(
+                                        request_id=request_id,
+                                        prompt=prompt,
+                                        params=sampling_params,
+                                        lora_request=lora_request,
+                                    )
+                                else:
+                                    async with self._add_request_lock:
+                                        collector = await self.engine.add_request(
+                                            request_id=request_id,
+                                            prompt=prompt,
+                                            params=sampling_params,
+                                            lora_request=lora_request,
+                                        )
+
                                 final_res = None
                                 by_index: dict[int, Any] | None = {} if n_req > 1 else None
                                 deadline = None
                                 if self._generate_timeout_s > 0:
                                     deadline = time.perf_counter() + self._generate_timeout_s
-                                first_step = True
-                                try:
-                                    while True:
-                                        try:
-                                            if deadline is None:
-                                                remaining = None
-                                            else:
-                                                remaining = deadline - time.perf_counter()
-                                                if remaining <= 0:
-                                                    raise asyncio.TimeoutError()
-
-                                            if first_step and self._add_request_lock is not None:
-                                                async with self._add_request_lock:
-                                                    if remaining is None:
-                                                        out = await agen.__anext__()
-                                                    else:
-                                                        out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-                                            else:
-                                                if remaining is None:
-                                                    out = await agen.__anext__()
-                                                else:
-                                                    out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-
-                                            first_step = False
-                                        except StopAsyncIteration:
-                                            break
-                                        except asyncio.TimeoutError as e:
-                                            try:
-                                                await self.engine.abort(request_id)
-                                            except Exception:
-                                                pass
-                                            raise RuntimeError(
-                                                f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                            ) from e
-                                        if first_tok_s is None:
-                                            first_tok_s = time.perf_counter() - t0
-                                        if by_index is not None:
-                                            for oo in out.outputs:
-                                                try:
-                                                    idx = int(getattr(oo, "index"))
-                                                except Exception:
-                                                    idx = -1
-                                                by_index[idx] = oo
-                                        final_res = out
-                                        if out.finished:
-                                            break
-                                finally:
-                                    # Ensure generator finalizers run before returning. If we break
-                                    # early on `out.finished`, the async generator is not exhausted;
-                                    # vLLM may keep per-request state alive until the generator is
-                                    # closed, which can wedge subsequent back-to-back requests.
+                                while True:
                                     try:
-                                        await agen.aclose()
-                                    except Exception:
-                                        pass
+                                        if deadline is None:
+                                            remaining = None
+                                        else:
+                                            remaining = deadline - time.perf_counter()
+                                            if remaining <= 0:
+                                                raise asyncio.TimeoutError()
+
+                                        if remaining is None:
+                                            out = collector.get_nowait() or await collector.get()
+                                        else:
+                                            out = collector.get_nowait() or await asyncio.wait_for(
+                                                collector.get(),
+                                                timeout=remaining,
+                                            )
+                                    except asyncio.TimeoutError as e:
+                                        try:
+                                            await self.engine.abort(request_id)
+                                        except Exception:
+                                            pass
+                                        raise RuntimeError(
+                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                        ) from e
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    if by_index is not None:
+                                        for oo in out.outputs:
+                                            try:
+                                                idx = int(getattr(oo, "index"))
+                                            except Exception:
+                                                idx = -1
+                                            by_index[idx] = oo
+                                    final_res = out
+                                    if out.finished:
+                                        break
                         assert final_res is not None
                     finally:
                         await self._register_generate_end()
@@ -898,11 +940,6 @@ class MultiNodeInferenceEngine:
         self.engine = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
-        # Avoid queueing multiple Ray tasks to the detached MultiNodeVLLMEngine actor.
-        # Empirically, multinode vLLM can wedge when multiple generate() calls are
-        # submitted concurrently (even if the actor serializes internally). Gate
-        # submission at the server-side wrapper so only one Ray task is in-flight.
-        self._submit_generate_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Initialize the multi-node vLLM engine."""
@@ -947,6 +984,11 @@ class MultiNodeInferenceEngine:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 try:
                     is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
+                except ray.exceptions.RayTaskError as e:
+                    logger.warning(
+                        f"ray.get(is_ready) failed for {self.actor_name}: {type(e).__name__}: {e}; treating as not-ready"
+                    )
+                    is_ready = False
                 except SystemExit as e:
                     if getattr(e, "code", None) == 15:
                         raise
@@ -1350,47 +1392,46 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        async with self._submit_generate_lock:
-            ref = self.engine.generate.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-            )
+        ref = self.engine.generate.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            logprobs=logprobs,
+        )
+        try:
+            if ray_get_timeout_s > 0:
+                result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+            else:
+                result = await asyncio.to_thread(ray.get, ref)
+        except ray.exceptions.GetTimeoutError as e:
+            # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
+            # Try aborting just this request, then fail loud to the client.
             try:
-                if ray_get_timeout_s > 0:
-                    result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-                else:
-                    result = await asyncio.to_thread(ray.get, ref)
-            except ray.exceptions.GetTimeoutError as e:
-                # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
-                # Try aborting just this request, then fail loud to the client.
-                try:
-                    abort_ref = self.engine.abort_request.remote(request_id)
-                    await asyncio.to_thread(ray.get, abort_ref, timeout=10)
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
-                ) from e
-            except Exception as e:
-                try:
-                    ray_kill.kill(
-                        self.engine,
-                        reason="multinode_vllm_ray_get_failed",
-                        actor_name=self.actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        no_restart=True,
-                        timeout_s=10,
-                    )
-                except Exception:
-                    pass
-                raise e
+                abort_ref = self.engine.abort_request.remote(request_id)
+                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
+            ) from e
+        except Exception as e:
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise e
 
         return GenerateResult(
             token_ids=result["token_ids"],
@@ -1427,46 +1468,45 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        async with self._submit_generate_lock:
-            ref = self.engine.generate.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                n=num_samples,
-            )
+        ref = self.engine.generate.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            logprobs=logprobs,
+            n=num_samples,
+        )
+        try:
+            if ray_get_timeout_s > 0:
+                raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+            else:
+                raw = await asyncio.to_thread(ray.get, ref)
+        except ray.exceptions.GetTimeoutError as e:
             try:
-                if ray_get_timeout_s > 0:
-                    raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-                else:
-                    raw = await asyncio.to_thread(ray.get, ref)
-            except ray.exceptions.GetTimeoutError as e:
-                try:
-                    abort_ref = self.engine.abort_request.remote(request_id)
-                    await asyncio.to_thread(ray.get, abort_ref, timeout=10)
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
-                ) from e
-            except Exception as e:
-                try:
-                    ray_kill.kill(
-                        self.engine,
-                        reason="multinode_vllm_ray_get_failed",
-                        actor_name=self.actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        no_restart=True,
-                        timeout_s=10,
-                    )
-                except Exception:
-                    pass
-                raise e
+                abort_ref = self.engine.abort_request.remote(request_id)
+                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
+            ) from e
+        except Exception as e:
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise e
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
