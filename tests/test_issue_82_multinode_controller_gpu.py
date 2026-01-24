@@ -1,11 +1,9 @@
-from pathlib import Path
+from tinker_server.backend.multinode_resources import compute_multinode_engine_resources
 
 
 def test_issue_82_multinode_controller_does_not_reserve_extra_gpu() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    src = repo_root / "tinker_server/backend/multinode_inference.py"
-    txt = src.read_text(encoding="utf-8")
-
-    assert "controller_gpus = 0" in txt
-    assert "total_required_gpus = worker_gpus" in txt
-
+    r = compute_multinode_engine_resources(worker_gpus=16)
+    assert r.controller_gpus == 0
+    assert r.total_required_gpus == 16
+    assert len([b for b in r.pg_bundles if b.get("GPU", 0) > 0]) == 16
+    assert r.pg_bundles[r.controller_bundle_index].get("GPU", 0) == 0
