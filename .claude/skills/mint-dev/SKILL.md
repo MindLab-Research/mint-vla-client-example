@@ -187,6 +187,12 @@ export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 # For concurrent dev runs, set this to a unique value (example: tinker_$USER).
 # export TINKER_RAY_NAMESPACE=tinker
+
+# MoE vLLM placement mode:
+# - Default: MINT_MOE_MULTINODE_MIN_GPUS=4, so Qwen3-30B (TP=4) uses MultiNodeInferenceEngine
+#   (Ray distributed executor, can spread TP across nodes; slower but schedules under GPU fragmentation).
+# - Set to 16 to force single-node MultiLoRAInferenceEngine for Qwen3-30B (requires 4 GPUs on one node).
+# export MINT_MOE_MULTINODE_MIN_GPUS=16
 ```
 
 **Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
@@ -199,6 +205,7 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   TINKER_RAY_NAMESPACE=tinker_$USER \
    python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
