@@ -39,13 +39,20 @@ Hard rules:
   - Examples of partial evidence: calling a FastAPI route handler directly, stubbing `ray`/`fastapi`/`peft` so imports work, asserting only on
     computed resource numbers without starting the system.
   - For server/runtime bugs: the reproduction must hit the issue-scoped dev server over HTTP and exercise the real dependency stack (FastAPI + Ray).
+- "Runtime" means the real runtime. If the production code path uses Ray, a "runtime test" that does not connect to real Ray is not a runtime test.
+  - "Runtime without Ray" is a non-test for the server: do not accept it for Ray-backed endpoints, actor lifecycle, scheduling, vLLM, or Megatron paths.
+- Assume an integrated repro IS feasible by default. Use the issue-scoped server on volcano + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
 - Every issue MUST have runtime evidence:
   - Integrated reproduction:
-    - Prefer: FAIL on old code and PASS on new code, by actually running `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server.
-    - If the issue is not server/runtime-related, still prefer an integrated smoke check (server starts) plus targeted local unit coverage.
+    - Required: execute `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server over HTTP.
+    - Required: FAIL on old code and PASS on new code, using the same command line.
+    - The repro must exercise the production path of the bug (not just a helper function). If the bug is observable via an HTTP endpoint, the repro must call that endpoint.
+    - If the production path uses Ray, the repro must trigger real Ray execution (e.g. create_session/create_model/create_sampling_session/asample) and must not bypass/stub Ray.
+    - Only exception: if the issue is truly local-only (no server/runtime surface), run an executed repro or unit test locally and explicitly explain why an integrated repro cannot exercise it. Mock-only/stub-only tests are still forbidden under this exception.
   - Integrated smoke:
     - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
       HTTP flows work).
+    - Treat this as the baseline Ray connectivity sanity check (create_session must succeed).
     - If the change touches sampling/inference: also run `python scripts/tools/smoke.py service --create-sampling-session`.
     - If the change touches training/checkpointing: run a minimal end-to-end call that exercises that path (issue-specific repro is preferred).
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
@@ -223,6 +230,7 @@ Inputs to bugfixer:
 - chosen `PFS_TINKER_PATH`
 
 Bugfixer deliverable back to orchestrator:
+- a short issue digest (3-8 bullets) summarizing the problem + constraints, referencing at least one specific issue comment (URL or quoted detail)
 - a reproduction script at `scripts/tools/reproduce_issue_<NUMBER>.py`
 - evidence that reproduction fails before the fix and passes after the fix (integrated dev server; no stubs)
 - the exact reproduction command used (env vars + invocation)
@@ -234,6 +242,8 @@ Bugfixer deliverable back to orchestrator:
 Use the `bugfix` workflow:
 - Read the entire issue thread (body + all comments) before writing the repro.
 - Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py` that exercises the system (no source inspection, no stubs).
+  - If the bug is observable via an HTTP endpoint, the repro must call that endpoint against the running issue-scoped server (not internal helpers).
+  - If the production path uses Ray, the repro must run against a server connected to Ray and must not bypass/stub Ray.
 - Run it against the issue-scoped dev server (`TINKER_BASE_URL=http://localhost:$TINKER_PORT`, `TINKER_API_KEY=dummy`) and capture output.
 - Require: FAIL on old code, PASS on new code (same command line).
 - After the fix, run a baseline integrated smoke check:
@@ -303,6 +313,7 @@ Input to reviewer:
 
 Review output contract:
 - a detailed review report posted as a PR comment (via `gh pr comment`)
+- a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail)
 - a merge recommendation (`recommendation: merge` or `recommendation: iterate`)
 - if iterate: blocking issues (with file paths and line numbers)
 - commands actually run (repro + tests) and observed results; static-only repro is a blocking issue

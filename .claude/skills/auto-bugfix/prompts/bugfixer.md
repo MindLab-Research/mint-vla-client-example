@@ -14,6 +14,8 @@ Non-negotiable rules:
 - Static-only checks are forbidden. Do not use grep/AST/string matching as the reproduction.
 - Do not use "runtime" stubs (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) as a substitute for an integrated repro when an
   integrated repro is feasible.
+- "Runtime without Ray" is not runtime for Ray-backed production paths. If the production code path uses Ray, your repro must run against a server connected
+  to real Ray (no stubs, no bypassing Ray).
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - Use issue-specific `TINKER_RAY_NAMESPACE` to isolate Ray actor state.
 - Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.
@@ -26,7 +28,7 @@ Inputs you will be given by the orchestrator:
 
 Process:
 1) Read the entire issue thread (body + all comments). Do not skip context.
-2) Create or update `scripts/tools/reproduce_issue_<NUMBER>.py` (must run via `TINKER_BASE_URL` and `TINKER_API_KEY` and hit the server over HTTP).
+2) Create or update `scripts/tools/reproduce_issue_<NUMBER>.py` (default: run via `TINKER_BASE_URL` and `TINKER_API_KEY` and hit the server over HTTP; only treat as local-only if you can justify why the issue has no server/runtime surface).
 3) Ensure the issue-scoped dev server is running in the provided `TINKER_RAY_NAMESPACE`, `PFS_TINKER_PATH`, and port (via `TINKER_PORT`) per `.claude/skills/auto-bugfix/SKILL.md`.
 4) Run the reproduction script until it fails deterministically.
 5) Identify root cause and implement the minimal fix.
@@ -34,6 +36,7 @@ Process:
 7) Run an integrated smoke check (minimum): `python scripts/tools/smoke.py service` against the same issue-scoped dev server.
 8) If system behavior or operator workflow changed, update `.claude/skills/architecture-design/SKILL.md` and any relevant `references/*.md`.
 9) Provide the orchestrator:
+   - a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail)
    - the exact reproduction command used
    - the smoke command used (and output)
    - the exact dev-server start/stop/log commands used (if relevant)

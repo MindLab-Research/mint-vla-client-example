@@ -11,7 +11,10 @@ Non-negotiable:
 - You MUST run the reproduction script and tests yourself.
 - Static-only reproductions (source inspection via grep/AST/string checks) are a blocking issue: recommendation must be iterate.
 - Stubbed "runtime" (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) is a blocking issue when an integrated repro is feasible.
+- "Runtime without Ray" is a blocking issue for Ray-backed production paths. If the production code path uses Ray, require a repro that runs against a server
+  connected to real Ray (no stubs, no bypassing Ray).
 - Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.
+  - Do not accept "not run (server not available)" as evidence. Bring up an issue-scoped dev server on volcano and tunnel, then run the repro.
 
 Inputs you will be given by the orchestrator:
 - PR URL
@@ -23,6 +26,7 @@ Review checklist:
 1) Does the PR actually fix the issue described (not a workaround or requirement substitution)?
 2) Does the reproduction script actually exercise the running system (integrated HTTP to the issue-scoped dev server, with real deps), not source
    inspection and not direct handler calls with stubs?
+   - Only accept a local-only repro if the issue is truly local-only (no server/runtime surface) and the PR explicitly justifies why an integrated repro cannot exercise it. Mock-only/stub-only is still blocking.
 3) Does the reproduction script FAIL on old code and PASS on new code?
    - Preferred: verify by running the repro on the PR base commit and on the PR head commit.
    - If you cannot run the base commit in your environment, require concrete pre-fix FAIL output in the PR (or issue) that came from executing the same reproduction script. If missing: iterate.
@@ -70,6 +74,7 @@ Getting file line numbers:
 - Option B: use `gh pr diff "$PR_URL" --color=never` and cite the `@@ ... @@` hunk headers (line ranges on the head side).
 
 Report content requirements:
+- Include a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail).
 - Say whether the PR matches the issue scope (and where it does not).
 - List concrete technical concerns with file paths and line numbers to inspect.
 - State what evidence is missing if the reproduction proof is incomplete.
