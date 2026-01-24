@@ -4,7 +4,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from tinker_server.sampling_utils import resolve_stop_reason  # noqa: E402
+from tinker_server.sampling_utils import sampled_sequence_from_result  # noqa: E402
 
 
 def _fail(msg: str) -> int:
@@ -13,22 +13,26 @@ def _fail(msg: str) -> int:
 
 
 def main() -> int:
-    cases = [
-        ("stop", [1, 2, 3], "stop"),
-        ("length", [1, 2, 3], "length"),
-        ("eos", [1, 2, 3], "eos"),
-        (None, [151645], "stop"),
-        ("unknown", [151643], "stop"),
-        (None, [42], "length"),
-    ]
+    class Dummy:
+        def __init__(self, *, token_ids, stop_reason, logprobs=None, log_probs=None):
+            self.token_ids = token_ids
+            self.stop_reason = stop_reason
+            if logprobs is not None:
+                self.logprobs = logprobs
+            if log_probs is not None:
+                self.log_probs = log_probs
 
-    for stop_reason, token_ids, expected in cases:
-        got = resolve_stop_reason(stop_reason=stop_reason, token_ids=token_ids)
-        if got != expected:
-            return _fail(
-                f"resolve_stop_reason(stop_reason={stop_reason!r}, token_ids={token_ids!r}) "
-                f"returned {got!r} expected {expected!r}"
-            )
+    seq = sampled_sequence_from_result(
+        Dummy(token_ids=[42], stop_reason="stop", log_probs=[-0.1])
+    )
+    if seq.stop_reason != "stop":
+        return _fail(f"stop_reason={seq.stop_reason!r} expected 'stop'")
+    if seq.logprobs != [-0.1]:
+        return _fail(f"logprobs={seq.logprobs!r} expected [-0.1]")
+
+    eos_seq = sampled_sequence_from_result(Dummy(token_ids=[151645], stop_reason=None))
+    if eos_seq.stop_reason != "stop":
+        return _fail(f"eos stop_reason={eos_seq.stop_reason!r} expected 'stop'")
 
     print("PASS")
     return 0
