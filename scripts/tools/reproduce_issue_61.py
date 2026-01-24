@@ -9,6 +9,8 @@ import requests
 
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
+CREATE_SAMPLING_TIMEOUT_S = float(os.environ.get("TINKER_CREATE_SAMPLING_TIMEOUT_S", "1200"))
+POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1200"))
 
 
 def _headers() -> dict[str, str]:
@@ -124,13 +126,13 @@ def main() -> int:
                 "sampling_session_seq_id": 0,
                 "base_model": base_model,
             },
-            timeout=90.0,
+            timeout=CREATE_SAMPLING_TIMEOUT_S,
         )
         sampling_session_id = sampling.get("sampling_session_id")
         if not sampling_session_id:
             return _fail(f"create_sampling_session missing sampling_session_id: {sampling!r}")
 
-        prompt_tokens = [1, 2, 3, 4]
+        prompt_tokens = [1000, 1001, 1002, 1003]
         k = 5
         sample_payload = {
             "sampling_session_id": sampling_session_id,
@@ -151,7 +153,7 @@ def main() -> int:
         if not request_id:
             return _fail(f"asample missing request_id: {fut!r}")
 
-        result = _poll_future(request_id, timeout_s=180.0)
+        result = _poll_future(request_id, timeout_s=POLL_TIMEOUT_S)
         topk = result.get("topk_prompt_logprobs")
         try:
             _validate_topk(topk, prompt_len=len(prompt_tokens), k=k)
