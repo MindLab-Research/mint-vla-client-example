@@ -233,6 +233,30 @@ def _create_multinode_vllm_actor(
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
             self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
+            # vLLM's `max_num_seqs` is a hard cap on active sequences. Under multinode + long-context
+            # + multi-sample (SamplingParams(n>1)), vLLM can hang when the server oversubscribes this
+            # cap and relies on vLLM internal queueing. Use explicit admission control to avoid
+            # exceeding `max_num_seqs` from the server side (no client API change).
+            self._admission_control = _env_flag("MINT_VLLM_ADMISSION_CONTROL", default=True)
+            self._active_seq_slots = 0
+            self._seq_slots_cond = asyncio.Condition()
+
+        @asynccontextmanager
+        async def _reserve_seq_slots(self, n_req: int):
+            if (not self._admission_control) or (self.max_num_seqs is None):
+                yield
+                return
+            need = max(1, int(n_req))
+            async with self._seq_slots_cond:
+                while self._active_seq_slots + need > int(self.max_num_seqs):
+                    await self._seq_slots_cond.wait()
+                self._active_seq_slots += need
+            try:
+                yield
+            finally:
+                async with self._seq_slots_cond:
+                    self._active_seq_slots -= need
+                    self._seq_slots_cond.notify_all()
 
         @asynccontextmanager
         async def _lock_read(self):
@@ -507,74 +531,75 @@ def _create_multinode_vllm_actor(
             # Get final response
             async with self._maybe_generate_lock():
                 t_lock = time.perf_counter()
-                await self._register_generate_start()
-                try:
-                    async with self._maybe_multisample_lock(n_req):
-                        async with self._lock_read():
-                            t1 = time.perf_counter()
-                            try:
-                                if self._generate_timeout_s > 0:
-                                    collector = await asyncio.wait_for(
-                                        self.engine.add_request(
+                async with self._reserve_seq_slots(n_req):
+                    await self._register_generate_start()
+                    try:
+                        async with self._maybe_multisample_lock(n_req):
+                            async with self._lock_read():
+                                t1 = time.perf_counter()
+                                try:
+                                    if self._generate_timeout_s > 0:
+                                        collector = await asyncio.wait_for(
+                                            self.engine.add_request(
+                                                request_id=request_id,
+                                                prompt=prompt,
+                                                params=sampling_params,
+                                                lora_request=lora_request,
+                                            ),
+                                            timeout=self._generate_timeout_s,
+                                        )
+                                    else:
+                                        collector = await self.engine.add_request(
                                             request_id=request_id,
                                             prompt=prompt,
                                             params=sampling_params,
                                             lora_request=lora_request,
-                                        ),
-                                        timeout=self._generate_timeout_s,
-                                    )
-                                else:
-                                    collector = await self.engine.add_request(
-                                        request_id=request_id,
-                                        prompt=prompt,
-                                        params=sampling_params,
-                                        lora_request=lora_request,
-                                    )
-                            except asyncio.TimeoutError as e:
-                                try:
-                                    await self.engine.abort(request_id)
-                                except Exception:
-                                    pass
-                                raise RuntimeError(
-                                    f"vllm_add_request_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                ) from e
-                            final_res = None
-                            by_index: dict[int, Any] | None = {} if n_req > 1 else None
-                            deadline = None
-                            if self._generate_timeout_s > 0:
-                                deadline = time.perf_counter() + self._generate_timeout_s
-                            while True:
-                                try:
-                                    if deadline is None:
-                                        out = await collector.get()
-                                    else:
-                                        remaining = deadline - time.perf_counter()
-                                        if remaining <= 0:
-                                            raise asyncio.TimeoutError()
-                                        out = await asyncio.wait_for(collector.get(), timeout=remaining)
+                                        )
                                 except asyncio.TimeoutError as e:
                                     try:
                                         await self.engine.abort(request_id)
                                     except Exception:
                                         pass
                                     raise RuntimeError(
-                                        f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                        f"vllm_add_request_timeout_s={self._generate_timeout_s} request_id={request_id}"
                                     ) from e
-                                if first_tok_s is None:
-                                    first_tok_s = time.perf_counter() - t0
-                                if by_index is not None:
-                                    for oo in out.outputs:
+                                final_res = None
+                                by_index: dict[int, Any] | None = {} if n_req > 1 else None
+                                deadline = None
+                                if self._generate_timeout_s > 0:
+                                    deadline = time.perf_counter() + self._generate_timeout_s
+                                while True:
+                                    try:
+                                        if deadline is None:
+                                            out = await collector.get()
+                                        else:
+                                            remaining = deadline - time.perf_counter()
+                                            if remaining <= 0:
+                                                raise asyncio.TimeoutError()
+                                            out = await asyncio.wait_for(collector.get(), timeout=remaining)
+                                    except asyncio.TimeoutError as e:
                                         try:
-                                            idx = int(getattr(oo, "index"))
+                                            await self.engine.abort(request_id)
                                         except Exception:
-                                            idx = -1
-                                        by_index[idx] = oo
-                                final_res = out
-                                if out.finished:
-                                    break
-                    assert final_res is not None
-                finally:
-                    await self._register_generate_end()
+                                            pass
+                                        raise RuntimeError(
+                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                        ) from e
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    if by_index is not None:
+                                        for oo in out.outputs:
+                                            try:
+                                                idx = int(getattr(oo, "index"))
+                                            except Exception:
+                                                idx = -1
+                                            by_index[idx] = oo
+                                    final_res = out
+                                    if out.finished:
+                                        break
+                        assert final_res is not None
+                    finally:
+                        await self._register_generate_end()
             t2 = time.perf_counter()
             if self._timing:
                 print(
