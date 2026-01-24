@@ -880,6 +880,7 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
+                "MINT_VLLM_SERIALIZE_GENERATE",
             ):
                 v = os.environ.get(k)
                 if v is not None:
