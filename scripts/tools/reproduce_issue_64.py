@@ -1,5 +1,6 @@
 import datetime
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -10,7 +11,6 @@ import requests
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 SSH_HOST = os.environ.get("TINKER_SSH_HOST", "volcano")
-REMOTE_LOG_DIR = os.environ.get("TINKER_USAGE_LOG_DIR", "/tmp/tinker_usage")
 
 
 def _headers() -> dict[str, str]:
@@ -32,13 +32,35 @@ def _get_json(url: str, *, timeout_s: float = 60.0) -> dict[str, Any]:
     return out
 
 
-def _ssh_write_usage_logs(*, user_id: str, date_str: str) -> None:
+def _infer_remote_log_dir() -> str:
+    v = os.environ.get("TINKER_USAGE_LOG_DIR")
+    if v:
+        return v
+
+    try:
+        info = _get_json(f"{BASE_URL}/api/v1/server_info", timeout_s=10.0)
+        stdout_target = (
+            info.get("logging", {})
+            .get("stdout", {})
+            .get("target")
+        )
+        if isinstance(stdout_target, str):
+            m = re.search(r"/tmp/tinker_server_issue_(\d+)\.log$", stdout_target)
+            if m:
+                return f"/tmp/tinker_usage_issue_{m.group(1)}"
+    except Exception:
+        pass
+
+    return "/tmp/tinker_usage"
+
+
+def _ssh_write_usage_logs(*, user_id: str, date_str: str, remote_log_dir: str) -> None:
     python_lines = [
         "import datetime",
         "import json",
         "import os",
         f"user_id = {user_id!r}",
-        f"log_dir = {REMOTE_LOG_DIR!r}",
+        f"log_dir = {remote_log_dir!r}",
         f"date_str = {date_str!r}",
         "os.makedirs(log_dir, exist_ok=True)",
         "path = os.path.join(log_dir, f'usage_{date_str}.jsonl')",
@@ -71,7 +93,11 @@ def main() -> int:
     try:
         user_id = f"issue64_{uuid.uuid4().hex[:8]}"
         date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        _ssh_write_usage_logs(user_id=user_id, date_str=date_str)
+        _ssh_write_usage_logs(
+            user_id=user_id,
+            date_str=date_str,
+            remote_log_dir=_infer_remote_log_dir(),
+        )
 
         out = _get_json(f"{BASE_URL}/internal/usage_summary/{user_id}", timeout_s=30)
         total_tokens = out.get("total_tokens")
