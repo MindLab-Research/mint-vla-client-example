@@ -16,6 +16,8 @@ Non-negotiable rules:
   integrated repro is feasible.
 - "Runtime without Ray" is not runtime for Ray-backed production paths. If the production code path uses Ray, your repro must run against a server connected
   to real Ray (no stubs, no bypassing Ray).
+- For actor lifecycle / resource scheduling / placement-group bugs: a repro that only asserts on computed resource numbers / GPU counts is partial. The repro
+  must create the affected session/engine in Ray and complete at least one request that uses it (e.g. create_sampling_session + asample + retrieve_future).
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - Use issue-specific `TINKER_RAY_NAMESPACE` to isolate Ray actor state.
 - Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.
@@ -36,7 +38,7 @@ Process:
 7) Run an integrated smoke check (minimum): `python scripts/tools/smoke.py service` against the same issue-scoped dev server.
 8) If system behavior or operator workflow changed, update `.claude/skills/architecture-design/SKILL.md` and any relevant `references/*.md`.
 9) Provide the orchestrator:
-   - a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail)
+   - a short issue digest (3-8 bullets) citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
    - the exact reproduction command used
    - the smoke command used (and output)
    - the exact dev-server start/stop/log commands used (if relevant)

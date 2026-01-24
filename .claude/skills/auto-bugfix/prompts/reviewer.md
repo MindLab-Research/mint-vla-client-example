@@ -13,6 +13,9 @@ Non-negotiable:
 - Stubbed "runtime" (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) is a blocking issue when an integrated repro is feasible.
 - "Runtime without Ray" is a blocking issue for Ray-backed production paths. If the production code path uses Ray, require a repro that runs against a server
   connected to real Ray (no stubs, no bypassing Ray).
+- For actor lifecycle / resource scheduling / placement-group changes: do not accept a "repro" that only asserts on computed resource numbers / GPU counts.
+  Require an integrated repro that creates the affected session/engine in Ray and completes at least one request that uses it (e.g. create_sampling_session +
+  asample + retrieve_future).
 - Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.
   - Do not accept "not run (server not available)" as evidence. Bring up an issue-scoped dev server on volcano and tunnel, then run the repro.
 
@@ -74,7 +77,7 @@ Getting file line numbers:
 - Option B: use `gh pr diff "$PR_URL" --color=never` and cite the `@@ ... @@` hunk headers (line ranges on the head side).
 
 Report content requirements:
-- Include a short issue digest (3-8 bullets) referencing at least one specific issue comment (URL or quoted detail).
+- Include a short issue digest (3-8 bullets) citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
 - Say whether the PR matches the issue scope (and where it does not).
 - List concrete technical concerns with file paths and line numbers to inspect.
 - State what evidence is missing if the reproduction proof is incomplete.
