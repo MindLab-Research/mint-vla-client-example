@@ -500,12 +500,32 @@ def _create_multinode_vllm_actor(
                     async with self._maybe_multisample_lock(n_req):
                         async with self._lock_read():
                             t1 = time.perf_counter()
-                            collector = await self.engine.add_request(
-                                request_id=request_id,
-                                prompt=prompt,
-                                params=sampling_params,
-                                lora_request=lora_request,
-                            )
+                            try:
+                                if self._generate_timeout_s > 0:
+                                    collector = await asyncio.wait_for(
+                                        self.engine.add_request(
+                                            request_id=request_id,
+                                            prompt=prompt,
+                                            params=sampling_params,
+                                            lora_request=lora_request,
+                                        ),
+                                        timeout=self._generate_timeout_s,
+                                    )
+                                else:
+                                    collector = await self.engine.add_request(
+                                        request_id=request_id,
+                                        prompt=prompt,
+                                        params=sampling_params,
+                                        lora_request=lora_request,
+                                    )
+                            except asyncio.TimeoutError as e:
+                                try:
+                                    await self.engine.abort(request_id)
+                                except Exception:
+                                    pass
+                                raise RuntimeError(
+                                    f"vllm_add_request_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                ) from e
                             final_res = None
                             by_index: dict[int, Any] | None = {} if n_req > 1 else None
                             deadline = None
