@@ -228,6 +228,7 @@ def _create_multinode_vllm_actor(
             # Default to serializing multi-sample requests (num_samples>1) only.
             self._serialize_multisample = _env_flag("MINT_VLLM_SERIALIZE_MULTISAMPLE", default=True)
             self._multisample_lock = asyncio.Lock() if self._serialize_multisample else None
+            self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
             self._gate_lock = asyncio.Lock()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
@@ -507,8 +508,26 @@ def _create_multinode_vllm_actor(
                             )
                             final_res = None
                             by_index: dict[int, Any] | None = {} if n_req > 1 else None
+                            deadline = None
+                            if self._generate_timeout_s > 0:
+                                deadline = time.perf_counter() + self._generate_timeout_s
                             while True:
-                                out = await collector.get()
+                                try:
+                                    if deadline is None:
+                                        out = await collector.get()
+                                    else:
+                                        remaining = deadline - time.perf_counter()
+                                        if remaining <= 0:
+                                            raise asyncio.TimeoutError()
+                                        out = await asyncio.wait_for(collector.get(), timeout=remaining)
+                                except asyncio.TimeoutError as e:
+                                    try:
+                                        await self.engine.abort(request_id)
+                                    except Exception:
+                                        pass
+                                    raise RuntimeError(
+                                        f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                    ) from e
                                 if first_tok_s is None:
                                     first_tok_s = time.perf_counter() - t0
                                 if by_index is not None:
