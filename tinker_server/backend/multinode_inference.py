@@ -608,50 +608,60 @@ def _create_multinode_vllm_actor(
                                 if self._generate_timeout_s > 0:
                                     deadline = time.perf_counter() + self._generate_timeout_s
                                 first_step = True
-                                while True:
-                                    try:
-                                        if deadline is None:
-                                            remaining = None
-                                        else:
-                                            remaining = deadline - time.perf_counter()
-                                            if remaining <= 0:
-                                                raise asyncio.TimeoutError()
+                                try:
+                                    while True:
+                                        try:
+                                            if deadline is None:
+                                                remaining = None
+                                            else:
+                                                remaining = deadline - time.perf_counter()
+                                                if remaining <= 0:
+                                                    raise asyncio.TimeoutError()
 
-                                        if first_step and self._add_request_lock is not None:
-                                            async with self._add_request_lock:
+                                            if first_step and self._add_request_lock is not None:
+                                                async with self._add_request_lock:
+                                                    if remaining is None:
+                                                        out = await agen.__anext__()
+                                                    else:
+                                                        out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
+                                            else:
                                                 if remaining is None:
                                                     out = await agen.__anext__()
                                                 else:
                                                     out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-                                        else:
-                                            if remaining is None:
-                                                out = await agen.__anext__()
-                                            else:
-                                                out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
 
-                                        first_step = False
-                                    except StopAsyncIteration:
-                                        break
-                                    except asyncio.TimeoutError as e:
-                                        try:
-                                            await self.engine.abort(request_id)
-                                        except Exception:
-                                            pass
-                                        raise RuntimeError(
-                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                        ) from e
-                                    if first_tok_s is None:
-                                        first_tok_s = time.perf_counter() - t0
-                                    if by_index is not None:
-                                        for oo in out.outputs:
+                                            first_step = False
+                                        except StopAsyncIteration:
+                                            break
+                                        except asyncio.TimeoutError as e:
                                             try:
-                                                idx = int(getattr(oo, "index"))
+                                                await self.engine.abort(request_id)
                                             except Exception:
-                                                idx = -1
-                                            by_index[idx] = oo
-                                    final_res = out
-                                    if out.finished:
-                                        break
+                                                pass
+                                            raise RuntimeError(
+                                                f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                            ) from e
+                                        if first_tok_s is None:
+                                            first_tok_s = time.perf_counter() - t0
+                                        if by_index is not None:
+                                            for oo in out.outputs:
+                                                try:
+                                                    idx = int(getattr(oo, "index"))
+                                                except Exception:
+                                                    idx = -1
+                                                by_index[idx] = oo
+                                        final_res = out
+                                        if out.finished:
+                                            break
+                                finally:
+                                    # Ensure generator finalizers run before returning. If we break
+                                    # early on `out.finished`, the async generator is not exhausted;
+                                    # vLLM may keep per-request state alive until the generator is
+                                    # closed, which can wedge subsequent back-to-back requests.
+                                    try:
+                                        await agen.aclose()
+                                    except Exception:
+                                        pass
                         assert final_res is not None
                     finally:
                         await self._register_generate_end()
