@@ -22,7 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, Up
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
-from ..checkpoints import resolve_checkpoint_uri, safe_extract_checkpoint_archive, validate_checkpoint_dir
+from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri, safe_extract_checkpoint_archive, validate_checkpoint_dir
 from ..models.types import (
     CheckpointInfo,
     CheckpointUploadResponse,
@@ -47,8 +47,8 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-# Must be absolute path on vePFS for all Ray workers to access
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
+# Must be an absolute path on shared storage for all Ray workers to access.
+CHECKPOINTS_DIR = get_checkpoints_dir()
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -173,7 +173,7 @@ async def _do_save_state(
 ) -> None:
     """Background task to save state.
 
-    Uses new storage schema: /checkpoints/{user_id}/{checkpoint_id}/
+    Storage schema: /checkpoints/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
     import json
@@ -182,12 +182,14 @@ async def _do_save_state(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Generate unique checkpoint_id (spec format: ckpt_xxx)
-        checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
+        checkpoint_name = request.path.strip() if request.path is not None else ""
+        if checkpoint_name:
+            if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
+                raise ValueError(f"Invalid checkpoint name: {request.path!r}")
+        else:
+            checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
-        # Use user-based directory (fallback to "anonymous" if no user)
-        owner_dir = user_id or "anonymous"
-        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id)
+        save_path = os.path.join(CHECKPOINTS_DIR, session.model_id, checkpoint_name)
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
@@ -200,7 +202,7 @@ async def _do_save_state(
         os.makedirs(save_path, exist_ok=True)
 
         metadata = {
-            "checkpoint_id": checkpoint_id,
+            "checkpoint_id": checkpoint_name,
             "owner_id": user_id,
             "model_id": session.model_id,
             "model_name": session.base_model,
@@ -240,17 +242,20 @@ async def _do_save_state(
             except Exception as reg_err:
                 logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
-        # Build mint:// path for response
-        mint_path = _to_mint_path(session.model_id, checkpoint_id)
+        # Use tinker:// URI format (official contract), keep mint:// as legacy alias.
+        tinker_path = f"tinker://{session.model_id}/{checkpoint_name}"
+        mint_path = _to_mint_path(session.model_id, checkpoint_name)
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
         state_dict_keys = []  # state_dict not available in path-based flow
 
         future_store.resolve(request_id, {
-            "checkpoint_id": checkpoint_id,
-            "path": save_path,  # Filesystem path for debugging
-            "type": "save_weights",
+            "checkpoint_id": checkpoint_name,
+            "path": tinker_path,
+            "mint_path": mint_path,
+            "filesystem_path": save_path,
+            "type": "save_state",
             "sampling_registered": sampling_registered,
         })
 
@@ -264,7 +269,7 @@ async def _do_save_state(
                 task_name=f"Training {session.base_model}",
                 task_type="training",
                 model_name=session.base_model,
-                result={"checkpoint_id": checkpoint_id, "step": session.current_step},
+                result={"checkpoint_id": checkpoint_name, "step": session.current_step},
             )
 
     except Exception as e:

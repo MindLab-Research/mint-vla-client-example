@@ -247,7 +247,9 @@ async def _do_create_model(
 # =============================================================================
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
+from ..checkpoints import get_checkpoints_dir
+
+CHECKPOINTS_DIR = get_checkpoints_dir()
 
 
 def _resolve_state_path(state_uri: str) -> str:
@@ -701,11 +703,9 @@ async def _do_save_weights_for_sampler(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Get checkpoint directory from environment or default
-        checkpoint_dir = os.environ.get(
-            "TINKER_CHECKPOINT_DIR",
-            os.path.join(os.getcwd(), "checkpoints")
-        )
+        from ..checkpoints import get_checkpoints_dir
+
+        checkpoint_dir = get_checkpoints_dir()
 
         # Determine checkpoint name
         if request.path is not None:

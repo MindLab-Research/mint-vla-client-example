@@ -7,6 +7,12 @@ import shutil
 import tarfile
 from pathlib import Path
 
+DEFAULT_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/code/tinker-server/checkpoints"
+
+
+def get_checkpoints_dir() -> str:
+    return os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_CHECKPOINTS_DIR)
+
 
 def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
     """Safely extract a tar.gz checkpoint archive into dest_dir.
