@@ -247,7 +247,7 @@ async def _do_create_model(
 # =============================================================================
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
 
 
 def _resolve_state_path(state_uri: str) -> str:

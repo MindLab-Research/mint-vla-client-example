@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from ..usage_logger import get_usage_logger
 
 # Checkpoint directory (shared filesystem)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
 
 router = APIRouter()
 

@@ -22,7 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, Up
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
-from ..checkpoints import safe_extract_checkpoint_archive, validate_checkpoint_dir
+from ..checkpoints import resolve_checkpoint_uri, safe_extract_checkpoint_archive, validate_checkpoint_dir
 from ..models.types import (
     CheckpointInfo,
     CheckpointUploadResponse,
@@ -85,45 +85,7 @@ def _resolve_mint_path(mint_uri: str) -> str:
     Returns:
         Filesystem path.
     """
-    import json
-
-    # New format: checkpoint_id (ckpt_xxx)
-    if mint_uri.startswith("ckpt_"):
-        # Search for checkpoint by ID in metadata
-        for top_level in os.listdir(CHECKPOINTS_DIR):
-            top_path = os.path.join(CHECKPOINTS_DIR, top_level)
-            if not os.path.isdir(top_path):
-                continue
-            for sub_dir in os.listdir(top_path):
-                sub_path = os.path.join(top_path, sub_dir)
-                if not os.path.isdir(sub_path):
-                    continue
-                metadata_path = os.path.join(sub_path, "metadata.json")
-                if os.path.exists(metadata_path):
-                    try:
-                        with open(metadata_path) as f:
-                            metadata = json.load(f)
-                        if metadata.get("checkpoint_id") == mint_uri:
-                            return sub_path
-                    except (json.JSONDecodeError, OSError):
-                        pass
-        # Not found - return as-is (will fail later)
-        return mint_uri
-
-    # tinker:// or mint:// format: {scheme}://{model_id}/checkpoint-100
-    if mint_uri.startswith("tinker://"):
-        path_part = mint_uri[len("tinker://"):]
-        return os.path.join(CHECKPOINTS_DIR, path_part)
-    if mint_uri.startswith("mint://"):
-        path_part = mint_uri[len("mint://"):]
-        return os.path.join(CHECKPOINTS_DIR, path_part)
-
-    # File URI
-    if mint_uri.startswith("file://"):
-        return mint_uri[7:]
-
-    # Absolute path
-    return mint_uri
+    return resolve_checkpoint_uri(mint_uri, CHECKPOINTS_DIR)
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:

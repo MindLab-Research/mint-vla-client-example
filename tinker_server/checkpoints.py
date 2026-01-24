@@ -18,7 +18,12 @@ def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
     """
     os.makedirs(dest_dir, exist_ok=True)
 
-    with tarfile.open(archive_path, "r:gz") as tf:
+    try:
+        tf = tarfile.open(archive_path, "r:gz")
+    except tarfile.TarError as e:
+        raise ValueError("Invalid tar.gz archive") from e
+
+    with tf:
         members = [m for m in tf.getmembers() if m.name not in ("", ".")]
         if not members:
             raise ValueError("Empty archive")
@@ -122,4 +127,3 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str) -> str:
     if uri.startswith("file://"):
         return uri[7:]
     return uri
-
