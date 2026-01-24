@@ -247,7 +247,7 @@ async def _do_create_model(
 # =============================================================================
 
 # Checkpoint directory (shared filesystem required for distributed deployments)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
 
 
 def _resolve_state_path(state_uri: str) -> str:
@@ -259,17 +259,9 @@ def _resolve_state_path(state_uri: str) -> str:
     Returns:
         Filesystem path.
     """
-    if state_uri.startswith("tinker://"):
-        # tinker://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
-        path_part = state_uri[len("tinker://"):]
-        return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif state_uri.startswith("mint://"):
-        # Legacy mint://{model_id}/checkpoint-100 -> ./checkpoints/{model_id}/checkpoint-100
-        path_part = state_uri[len("mint://"):]
-        return os.path.join(CHECKPOINTS_DIR, path_part)
-    elif state_uri.startswith("file://"):
-        return state_uri[7:]
-    return state_uri
+    from ..checkpoints import resolve_checkpoint_uri
+
+    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR)
 
 
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)

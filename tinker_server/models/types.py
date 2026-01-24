@@ -438,6 +438,13 @@ class CheckpointsListResponse(BaseModel):
     checkpoints: list[CheckpointInfo]
 
 
+class CheckpointUploadResponse(BaseModel):
+    """Response from uploading a checkpoint archive."""
+
+    checkpoint_id: str
+    path: str
+
+
 class CreateModelFromStateRequest(BaseModel):
     """Request to create a training model from existing checkpoint.
 
