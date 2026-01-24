@@ -11,6 +11,7 @@ Non-negotiable rules:
 - Production is read-only.
 - Never substitute requirements.
 - Use an environment-agnostic reproduction script and re-run it after the fix.
+- Static-only checks are forbidden. Do not use grep/AST/string matching as the reproduction.
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - Use issue-specific `TINKER_RAY_NAMESPACE` to isolate Ray actor state.
 - Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.
