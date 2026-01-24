@@ -244,6 +244,7 @@ def _create_multinode_vllm_actor(
             self._outer_to_subreq_ids: dict[str, set[str]] = {}
             self._outer_to_subreq_lock = asyncio.Lock()
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
+            self._post_generate_delay_s = float(os.environ.get("MINT_VLLM_POST_GENERATE_DELAY_S", "0"))
             self._gate_lock = asyncio.Lock()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
@@ -665,6 +666,8 @@ def _create_multinode_vllm_actor(
                         assert final_res is not None
                     finally:
                         await self._register_generate_end()
+                        if self._post_generate_delay_s > 0:
+                            await asyncio.sleep(self._post_generate_delay_s)
             t2 = time.perf_counter()
             if self._timing:
                 print(
