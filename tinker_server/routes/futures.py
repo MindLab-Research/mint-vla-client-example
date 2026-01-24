@@ -7,6 +7,7 @@ Endpoints:
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..backend.future_store import FutureStatus, future_store
+from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
 
 router = APIRouter()
@@ -47,9 +48,10 @@ async def retrieve_future(
 
     if status == FutureStatus.PENDING:
         # Tinker client expects HTTP 408 for pending
-        response.status_code = 408
-        response.headers["Retry-After"] = "1"
-        return {"queue_state": "active"}
+        pending = pending_future_http_response()
+        response.status_code = pending.status_code
+        response.headers.update(pending.headers)
+        return pending.body
     elif status == FutureStatus.FAILED:
         error = future_store.get_error(body.request_id)
         # Only expose full error details to privileged users
