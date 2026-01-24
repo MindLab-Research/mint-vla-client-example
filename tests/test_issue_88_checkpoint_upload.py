@@ -57,3 +57,14 @@ def test_issue_88_resolve_ckpt_id(tmp_path: Path) -> None:
     (ckpt_dir / "metadata.json").write_text(json.dumps({"checkpoint_id": ckpt_id}), encoding="utf-8")
 
     assert checkpoints.resolve_checkpoint_uri(ckpt_id, str(tmp_path)) == str(ckpt_dir)
+
+
+def test_issue_88_validate_checkpoint_dir_accepts_megatron_shards(tmp_path: Path) -> None:
+    from tinker_server import checkpoints
+
+    ckpt_dir = tmp_path / "ckpt_x"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"dummy-lora")
+    (ckpt_dir / "mp_rank_00_optimizer.pt").write_bytes(b"dummy-optimizer")
+
+    checkpoints.validate_checkpoint_dir(str(ckpt_dir))

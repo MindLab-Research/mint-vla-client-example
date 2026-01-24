@@ -1,53 +1,62 @@
+import io
+import json
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
+
+
+def _fail(msg: str) -> int:
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
 
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
-    checkpoints_py = repo_root / "tinker_server/checkpoints.py"
-    weights_py = repo_root / "tinker_server/routes/weights.py"
-    training_py = repo_root / "tinker_server/routes/training.py"
-    types_py = repo_root / "tinker_server/models/types.py"
+    sys.path.insert(0, str(repo_root))
 
-    required = {
-        checkpoints_py: [
-            "def safe_extract_checkpoint_archive",
-            "def validate_checkpoint_dir",
-            "def resolve_checkpoint_id",
-            "def resolve_checkpoint_uri",
-            "Unsafe path in archive",
-        ],
-        weights_py: [
-            '@router.post("/checkpoints/upload"',
-            "def upload_checkpoint_archive",
-            "safe_extract_checkpoint_archive",
-            "validate_checkpoint_dir",
-            "CheckpointUploadResponse",
-            "path=checkpoint_id",
-        ],
-        training_py: [
-            "def _resolve_state_path",
-            "resolve_checkpoint_uri",
-        ],
-        types_py: [
-            "class CheckpointUploadResponse",
-            "checkpoint_id: str",
-            "path: str",
-        ],
-    }
+    from tinker_server import checkpoints  # noqa: E402
 
-    missing: list[str] = []
-    for path, needles in required.items():
-        txt = path.read_text(encoding="utf-8")
-        for s in needles:
-            if s not in txt:
-                missing.append(f"{path}: {s}")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
 
-    if missing:
-        print("FAIL: missing expected strings:", file=sys.stderr)
-        for m in missing:
-            print(f"- {m}", file=sys.stderr)
-        return 1
+        archive_path = tmp_path / "ckpt.tar.gz"
+        root = "ckpt_original"
+        payload = {
+            f"{root}/adapter_model.safetensors": b"dummy-lora",
+            f"{root}/optimizer.pt": b"dummy-optimizer",
+            f"{root}/training_meta.json": json.dumps({"current_step": 7}).encode("utf-8"),
+        }
+
+        with tarfile.open(archive_path, "w:gz") as tf:
+            for name, data in payload.items():
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+        out_dir = tmp_path / "extracted"
+        checkpoints.safe_extract_checkpoint_archive(str(archive_path), str(out_dir))
+        checkpoints.validate_checkpoint_dir(str(out_dir))
+
+        if not (out_dir / "adapter_model.safetensors").exists():
+            return _fail("missing adapter_model.safetensors after extract")
+        if not (out_dir / "optimizer.pt").exists():
+            return _fail("missing optimizer.pt after extract")
+        if not (out_dir / "training_meta.json").exists():
+            return _fail("missing training_meta.json after extract")
+        if (out_dir / root).exists():
+            return _fail("archive root dir not stripped during extract")
+
+        # checkpoint id resolution: ckpt_{id} -> {checkpoints_dir}/anonymous/{id}
+        ckpt_id = "ckpt_123456789abc"
+        ckpt_dir = tmp_path / "anonymous" / ckpt_id
+        ckpt_dir.mkdir(parents=True)
+        (ckpt_dir / "metadata.json").write_text(
+            json.dumps({"checkpoint_id": ckpt_id}), encoding="utf-8"
+        )
+        got = checkpoints.resolve_checkpoint_uri(ckpt_id, str(tmp_path))
+        if got != str(ckpt_dir):
+            return _fail(f"resolve_checkpoint_uri returned {got!r} expected {str(ckpt_dir)!r}")
 
     print("PASS")
     return 0
