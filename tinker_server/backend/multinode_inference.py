@@ -224,6 +224,10 @@ def _create_multinode_vllm_actor(
             # allow concurrent generate() calls (still protected by the RW lock).
             self._serialize_generate = _env_flag("MINT_VLLM_SERIALIZE_GENERATE", default=True)
             self._generate_lock = asyncio.Lock() if self._serialize_generate else None
+            # vLLM SamplingParams(n>1) has shown hangs under concurrent multinode traffic.
+            # Default to serializing multi-sample requests (num_samples>1) only.
+            self._serialize_multisample = _env_flag("MINT_VLLM_SERIALIZE_MULTISAMPLE", default=True)
+            self._multisample_lock = asyncio.Lock() if self._serialize_multisample else None
             self._gate_lock = asyncio.Lock()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
@@ -257,6 +261,14 @@ def _create_multinode_vllm_actor(
                 yield
                 return
             async with self._generate_lock:
+                yield
+
+        @asynccontextmanager
+        async def _maybe_multisample_lock(self, n_req: int):
+            if self._multisample_lock is None or n_req <= 1:
+                yield
+                return
+            async with self._multisample_lock:
                 yield
 
         async def _register_generate_start(self) -> None:
@@ -484,30 +496,31 @@ def _create_multinode_vllm_actor(
                 t_lock = time.perf_counter()
                 await self._register_generate_start()
                 try:
-                    async with self._lock_read():
-                        t1 = time.perf_counter()
-                        collector = await self.engine.add_request(
-                            request_id=request_id,
-                            prompt=prompt,
-                            params=sampling_params,
-                            lora_request=lora_request,
-                        )
-                        final_res = None
-                        by_index: dict[int, Any] | None = {} if n_req > 1 else None
-                        while True:
-                            out = await collector.get()
-                            if first_tok_s is None:
-                                first_tok_s = time.perf_counter() - t0
-                            if by_index is not None:
-                                for oo in out.outputs:
-                                    try:
-                                        idx = int(getattr(oo, "index"))
-                                    except Exception:
-                                        idx = -1
-                                    by_index[idx] = oo
-                            final_res = out
-                            if out.finished:
-                                break
+                    async with self._maybe_multisample_lock(n_req):
+                        async with self._lock_read():
+                            t1 = time.perf_counter()
+                            collector = await self.engine.add_request(
+                                request_id=request_id,
+                                prompt=prompt,
+                                params=sampling_params,
+                                lora_request=lora_request,
+                            )
+                            final_res = None
+                            by_index: dict[int, Any] | None = {} if n_req > 1 else None
+                            while True:
+                                out = await collector.get()
+                                if first_tok_s is None:
+                                    first_tok_s = time.perf_counter() - t0
+                                if by_index is not None:
+                                    for oo in out.outputs:
+                                        try:
+                                            idx = int(getattr(oo, "index"))
+                                        except Exception:
+                                            idx = -1
+                                        by_index[idx] = oo
+                                final_res = out
+                                if out.finished:
+                                    break
                     assert final_res is not None
                 finally:
                     await self._register_generate_end()
