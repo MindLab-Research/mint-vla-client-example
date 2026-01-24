@@ -41,10 +41,38 @@ async def retrieve_future(
     try:
         status = future_store.get_status(body.request_id)
     except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown request_id: {body.request_id}",
+        from ..gateway import decode_request_id, forward_json, upstream_for_alias
+
+        decoded = decode_request_id(body.request_id)
+        if decoded is None:
+            raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
+
+        upstream_alias, upstream_request_id = decoded
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+        upstream_resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/retrieve_future",
+            incoming_headers=dict(http_request.headers),
+            json_body={"request_id": upstream_request_id},
+            timeout_s=30.0,
         )
+
+        response.status_code = upstream_resp.status_code
+        for k, v in upstream_resp.headers.items():
+            lk = k.lower()
+            if lk.startswith("x-"):
+                response.headers[k] = v
+        try:
+            return upstream_resp.json()
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
+            )
 
     if status == FutureStatus.PENDING:
         # Tinker client expects HTTP 408 for pending
