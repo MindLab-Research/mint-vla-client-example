@@ -133,8 +133,11 @@ MODEL_CONFIGS = {
         # not the number of HTTP requests. When sampling uses `SamplingParams(n=8)`,
         # a single prompt consumes up to 8 sequence slots. With `max_num_seqs=8`,
         # the engine effectively runs prompts sequentially (no cross-prompt batching).
-        max_num_seqs=16,
+        # With 32K prompts and SamplingParams(n=8), c=2 uses 16 active sequences.
+        # Keep headroom above that to avoid scheduler edge cases at the cap.
+        max_num_seqs=24,
         max_num_batched_tokens=1024,  # Avoid multi-GB logits buffers during prompt_logprobs
+        gpu_memory_utilization=0.90,  # Increase KV cache headroom for long-context concurrency
         max_loras=8,
         max_cpu_loras=16,
         gradient_checkpointing=True,
