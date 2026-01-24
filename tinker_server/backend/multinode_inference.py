@@ -224,6 +224,9 @@ def _create_multinode_vllm_actor(
             # allow concurrent generate() calls (still protected by the RW lock).
             self._serialize_generate = _env_flag("MINT_VLLM_SERIALIZE_GENERATE", default=True)
             self._generate_lock = asyncio.Lock() if self._serialize_generate else None
+            self._gate_lock = asyncio.Lock()
+            self._active_generates = 0
+            self._active_generates_cond = asyncio.Condition()
 
         @asynccontextmanager
         async def _lock_read(self):
@@ -253,6 +256,25 @@ def _create_multinode_vllm_actor(
                 yield
                 return
             async with self._generate_lock:
+                yield
+
+        async def _register_generate_start(self) -> None:
+            async with self._gate_lock:
+                async with self._active_generates_cond:
+                    self._active_generates += 1
+
+        async def _register_generate_end(self) -> None:
+            async with self._active_generates_cond:
+                self._active_generates -= 1
+                if self._active_generates == 0:
+                    self._active_generates_cond.notify_all()
+
+        @asynccontextmanager
+        async def _exclusive_engine_op(self):
+            async with self._gate_lock:
+                async with self._active_generates_cond:
+                    while self._active_generates > 0:
+                        await self._active_generates_cond.wait()
                 yield
 
         async def initialize(self) -> None:
@@ -325,9 +347,15 @@ def _create_multinode_vllm_actor(
                 # Touch EngineCore. The Ray actor can be alive while EngineCore is dead.
                 #
                 # IMPORTANT: `list_loras()` must not run concurrently with `generate()`.
-                # Treat it as a "write" operation to exclude concurrent readers.
-                async with self._lock_write():
-                    await self.engine.list_loras()
+                # Also: do not block live traffic for liveness checks; when busy, assume alive.
+                if self._gate_lock.locked():
+                    return True
+                async with self._gate_lock:
+                    async with self._active_generates_cond:
+                        if self._active_generates > 0:
+                            return True
+                    async with self._lock_read():
+                        await self.engine.list_loras()
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
@@ -353,9 +381,10 @@ def _create_multinode_vllm_actor(
             )
 
             t0 = time.perf_counter()
-            async with self._lock_write():
-                t1 = time.perf_counter()
-                await self.engine.add_lora(lora_request)
+            async with self._exclusive_engine_op():
+                async with self._lock_write():
+                    t1 = time.perf_counter()
+                    await self.engine.add_lora(lora_request)
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -368,9 +397,10 @@ def _create_multinode_vllm_actor(
         async def remove_lora(self, lora_int_id: int) -> None:
             """Remove a LoRA adapter."""
             t0 = time.perf_counter()
-            async with self._lock_write():
-                t1 = time.perf_counter()
-                await self.engine.remove_lora(lora_int_id)
+            async with self._exclusive_engine_op():
+                async with self._lock_write():
+                    t1 = time.perf_counter()
+                    await self.engine.remove_lora(lora_int_id)
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -383,8 +413,9 @@ def _create_multinode_vllm_actor(
         async def list_loras(self) -> set[int]:
             """List loaded LoRA adapter IDs."""
             # NOTE: list_loras must not race active generation on multinode.
-            async with self._lock_write():
-                return await self.engine.list_loras()
+            async with self._exclusive_engine_op():
+                async with self._lock_read():
+                    return await self.engine.list_loras()
 
         async def generate(
             self,
@@ -446,29 +477,57 @@ def _create_multinode_vllm_actor(
             # Get final response
             async with self._maybe_generate_lock():
                 t_lock = time.perf_counter()
-                async with self._lock_read():
-                    t1 = time.perf_counter()
-                    generator = self.engine.generate(
-                        prompt=prompt,
-                        sampling_params=sampling_params,
-                        request_id=request_id,
-                        lora_request=lora_request,
-                    )
-                    if sampling_params.n == 1:
-                        final_res = None
-                        async for output in generator:
-                            if first_tok_s is None:
-                                first_tok_s = time.perf_counter() - t0
-                            final_res = output
-                        assert final_res is not None
+                await self._register_generate_start()
+                try:
+                    if self._serialize_generate:
+                        async with self._lock_read():
+                            t1 = time.perf_counter()
+                            generator = self.engine.generate(
+                                prompt=prompt,
+                                sampling_params=sampling_params,
+                                request_id=request_id,
+                                lora_request=lora_request,
+                            )
+                            if sampling_params.n == 1:
+                                final_res = None
+                                async for output in generator:
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    final_res = output
+                                assert final_res is not None
+                            else:
+                                by_index: dict[int, Any] = {}
+                                async for output in generator:
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    for out in output.outputs:
+                                        by_index[int(out.index)] = out
+                                final_res = None
                     else:
-                        by_index: dict[int, Any] = {}
-                        async for output in generator:
-                            if first_tok_s is None:
-                                first_tok_s = time.perf_counter() - t0
-                            for out in output.outputs:
-                                by_index[int(out.index)] = out
-                        final_res = None
+                        t1 = time.perf_counter()
+                        generator = self.engine.generate(
+                            prompt=prompt,
+                            sampling_params=sampling_params,
+                            request_id=request_id,
+                            lora_request=lora_request,
+                        )
+                        if sampling_params.n == 1:
+                            final_res = None
+                            async for output in generator:
+                                if first_tok_s is None:
+                                    first_tok_s = time.perf_counter() - t0
+                                final_res = output
+                            assert final_res is not None
+                        else:
+                            by_index: dict[int, Any] = {}
+                            async for output in generator:
+                                if first_tok_s is None:
+                                    first_tok_s = time.perf_counter() - t0
+                                for out in output.outputs:
+                                    by_index[int(out.index)] = out
+                            final_res = None
+                finally:
+                    await self._register_generate_end()
             t2 = time.perf_counter()
             if self._timing:
                 print(
