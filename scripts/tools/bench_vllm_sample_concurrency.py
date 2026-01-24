@@ -234,11 +234,15 @@ def main() -> None:
         )
         f.flush()
 
+        shared_sampling_session_id: str | None = None
+        if args.reuse_sampling_session:
+            shared_sampling_session_id = _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
+
         for c in conc:
             for rep in range(args.repeats):
                 if args.reuse_sampling_session:
-                    sid = _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
-                    sessions = [sid] * c
+                    assert shared_sampling_session_id is not None
+                    sessions = [shared_sampling_session_id] * c
                 else:
                     sessions = [
                         _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
