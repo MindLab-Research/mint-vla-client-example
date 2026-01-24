@@ -635,72 +635,71 @@ def _create_multinode_vllm_actor(
                         async with self._maybe_multisample_lock(n_req):
                             async with self._lock_read():
                                 t1 = time.perf_counter()
-                                agen = self.engine.generate(
-                                    prompt,
-                                    sampling_params,
-                                    request_id=request_id,
-                                    lora_request=lora_request,
-                                )
+                                # vLLM's AsyncLLMEngine.generate() is an async generator whose
+                                # first `__anext__()` both enqueues the request (add_request)
+                                # and waits for the first engine output. Serializing that
+                                # `__anext__()` across concurrent requests destroys continuous
+                                # batching for long prompts.
+                                #
+                                # Serialize only the enqueue (add_request) call, then allow
+                                # concurrent in-flight requests to progress.
+                                if self._add_request_lock is None:
+                                    collector = await self.engine.add_request(
+                                        request_id=request_id,
+                                        prompt=prompt,
+                                        params=sampling_params,
+                                        lora_request=lora_request,
+                                    )
+                                else:
+                                    async with self._add_request_lock:
+                                        collector = await self.engine.add_request(
+                                            request_id=request_id,
+                                            prompt=prompt,
+                                            params=sampling_params,
+                                            lora_request=lora_request,
+                                        )
+
                                 final_res = None
                                 by_index: dict[int, Any] | None = {} if n_req > 1 else None
                                 deadline = None
                                 if self._generate_timeout_s > 0:
                                     deadline = time.perf_counter() + self._generate_timeout_s
-                                first_step = True
-                                try:
-                                    while True:
-                                        try:
-                                            if deadline is None:
-                                                remaining = None
-                                            else:
-                                                remaining = deadline - time.perf_counter()
-                                                if remaining <= 0:
-                                                    raise asyncio.TimeoutError()
-
-                                            if first_step and self._add_request_lock is not None:
-                                                async with self._add_request_lock:
-                                                    if remaining is None:
-                                                        out = await agen.__anext__()
-                                                    else:
-                                                        out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-                                            else:
-                                                if remaining is None:
-                                                    out = await agen.__anext__()
-                                                else:
-                                                    out = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-
-                                            first_step = False
-                                        except StopAsyncIteration:
-                                            break
-                                        except asyncio.TimeoutError as e:
-                                            try:
-                                                await self.engine.abort(request_id)
-                                            except Exception:
-                                                pass
-                                            raise RuntimeError(
-                                                f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                            ) from e
-                                        if first_tok_s is None:
-                                            first_tok_s = time.perf_counter() - t0
-                                        if by_index is not None:
-                                            for oo in out.outputs:
-                                                try:
-                                                    idx = int(getattr(oo, "index"))
-                                                except Exception:
-                                                    idx = -1
-                                                by_index[idx] = oo
-                                        final_res = out
-                                        if out.finished:
-                                            break
-                                finally:
-                                    # Ensure generator finalizers run before returning. If we break
-                                    # early on `out.finished`, the async generator is not exhausted;
-                                    # vLLM may keep per-request state alive until the generator is
-                                    # closed, which can wedge subsequent back-to-back requests.
+                                while True:
                                     try:
-                                        await agen.aclose()
-                                    except Exception:
-                                        pass
+                                        if deadline is None:
+                                            remaining = None
+                                        else:
+                                            remaining = deadline - time.perf_counter()
+                                            if remaining <= 0:
+                                                raise asyncio.TimeoutError()
+
+                                        if remaining is None:
+                                            out = collector.get_nowait() or await collector.get()
+                                        else:
+                                            out = collector.get_nowait() or await asyncio.wait_for(
+                                                collector.get(),
+                                                timeout=remaining,
+                                            )
+                                    except asyncio.TimeoutError as e:
+                                        try:
+                                            await self.engine.abort(request_id)
+                                        except Exception:
+                                            pass
+                                        raise RuntimeError(
+                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                        ) from e
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    if by_index is not None:
+                                        for oo in out.outputs:
+                                            try:
+                                                idx = int(getattr(oo, "index"))
+                                            except Exception:
+                                                idx = -1
+                                            by_index[idx] = oo
+                                    final_res = out
+                                    if out.finished:
+                                        break
                         assert final_res is not None
                     finally:
                         await self._register_generate_end()
