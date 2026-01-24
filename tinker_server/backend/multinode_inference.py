@@ -483,53 +483,23 @@ def _create_multinode_vllm_actor(
                 t_lock = time.perf_counter()
                 await self._register_generate_start()
                 try:
-                    if self._serialize_generate:
-                        async with self._lock_read():
-                            t1 = time.perf_counter()
-                            generator = self.engine.generate(
-                                prompt=prompt,
-                                sampling_params=sampling_params,
-                                request_id=request_id,
-                                lora_request=lora_request,
-                            )
-                            if sampling_params.n == 1:
-                                final_res = None
-                                async for output in generator:
-                                    if first_tok_s is None:
-                                        first_tok_s = time.perf_counter() - t0
-                                    final_res = output
-                                assert final_res is not None
-                            else:
-                                by_index: dict[int, Any] = {}
-                                async for output in generator:
-                                    if first_tok_s is None:
-                                        first_tok_s = time.perf_counter() - t0
-                                    for out in output.outputs:
-                                        by_index[int(out.index)] = out
-                                final_res = None
-                    else:
+                    async with self._lock_read():
                         t1 = time.perf_counter()
-                        generator = self.engine.generate(
-                            prompt=prompt,
-                            sampling_params=sampling_params,
+                        collector = self.engine.add_request(
                             request_id=request_id,
+                            prompt=prompt,
+                            params=sampling_params,
                             lora_request=lora_request,
                         )
-                        if sampling_params.n == 1:
-                            final_res = None
-                            async for output in generator:
-                                if first_tok_s is None:
-                                    first_tok_s = time.perf_counter() - t0
-                                final_res = output
-                            assert final_res is not None
-                        else:
-                            by_index: dict[int, Any] = {}
-                            async for output in generator:
-                                if first_tok_s is None:
-                                    first_tok_s = time.perf_counter() - t0
-                                for out in output.outputs:
-                                    by_index[int(out.index)] = out
-                            final_res = None
+                        final_res = None
+                        while True:
+                            out = await collector.get()
+                            if first_tok_s is None:
+                                first_tok_s = time.perf_counter() - t0
+                            final_res = out
+                            if out.finished:
+                                break
+                    assert final_res is not None
                 finally:
                     await self._register_generate_end()
             t2 = time.perf_counter()
@@ -564,11 +534,13 @@ def _create_multinode_vllm_actor(
                     "stop_reason": stop_reason,
                 }
 
-            if len(by_index) != sampling_params.n:
-                raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
-
             outs: list[dict] = []
+            by_index: dict[int, Any] = {int(out.index): out for out in final_res.outputs}  # type: ignore[union-attr]
             for idx in range(sampling_params.n):
+                if idx not in by_index:
+                    raise RuntimeError(
+                        f"vLLM returned indices={sorted(by_index)} for n={sampling_params.n}"
+                    )
                 out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
@@ -636,17 +608,18 @@ def _create_multinode_vllm_actor(
             async with self._maybe_prompt_logprobs_lock():
                 async with self._lock_read():
                     t1 = time.perf_counter()
-                    generator = self.engine.generate(
-                        prompt=prompt,
-                        sampling_params=sampling_params,
+                    collector = self.engine.add_request(
                         request_id=request_id,
+                        prompt=prompt,
+                        params=sampling_params,
                         lora_request=lora_request,
                     )
-
-                    # Get final response
                     final_res = None
-                    async for output in generator:
-                        final_res = output
+                    while True:
+                        out = await collector.get()
+                        final_res = out
+                        if out.finished:
+                            break
                     assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
