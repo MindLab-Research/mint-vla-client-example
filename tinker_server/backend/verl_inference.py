@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
-from tinker_server.ray_utils import ray_log_to_driver_kwargs
+from tinker_server.ray_utils import init_ray
 
 # Import model registry
 from tinker_server.backend.model_registry import get_model_config
@@ -1393,11 +1393,10 @@ class VerlInferenceEngine:
             # Use 'auto' to connect to existing cluster if available
             # If no cluster, this falls back to starting a local Ray instance
             # Use fixed namespace for persistent vLLM actor support
-            ray.init(
+            init_ray(
                 address="auto",
                 namespace=RAY_NAMESPACE,
                 ignore_reinit_error=True,
-                **ray_log_to_driver_kwargs(),
             )
 
         # Compute total GPUs needed for MoE models

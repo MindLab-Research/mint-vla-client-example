@@ -12,3 +12,16 @@ def ray_log_to_driver_enabled() -> bool:
 def ray_log_to_driver_kwargs() -> dict[str, Any]:
     return {"log_to_driver": True} if ray_log_to_driver_enabled() else {}
 
+
+def init_ray(**kwargs: Any) -> Any:
+    """Initialize Ray with optional log forwarding to driver.
+
+    Adds log_to_driver=True when MINT_RAY_LOG_TO_DRIVER is enabled, unless explicitly
+    set by the caller.
+    """
+    import ray
+
+    for k, v in ray_log_to_driver_kwargs().items():
+        kwargs.setdefault(k, v)
+
+    return ray.init(**kwargs)

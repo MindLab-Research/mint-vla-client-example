@@ -1,47 +1,53 @@
-import ast
+import os
 import sys
+import types
+import importlib.machinery
 from pathlib import Path
 
 
-def _call_forwards_logs_to_driver(call: ast.Call) -> bool:
-    for kw in call.keywords:
-        if kw.arg == "log_to_driver":
-            return True
-        if kw.arg is not None:
-            continue
-        if not isinstance(kw.value, ast.Call):
-            continue
-        func = kw.value.func
-        if isinstance(func, ast.Name) and func.id == "ray_log_to_driver_kwargs":
-            return True
-        if isinstance(func, ast.Attribute) and func.attr == "ray_log_to_driver_kwargs":
-            return True
-    return False
+def _fail(msg: str) -> int:
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
+
+
+def _install_ray_stub():
+    if "ray" in sys.modules:
+        del sys.modules["ray"]
+
+    calls: list[dict] = []
+    ray = types.ModuleType("ray")
+    ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
+
+    def init(**kwargs):
+        calls.append(dict(kwargs))
+        return {"ok": True}
+
+    ray.init = init  # type: ignore[attr-defined]
+    sys.modules["ray"] = ray
+    return calls
 
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
-    errors: list[str] = []
+    sys.path.insert(0, str(repo_root))
 
-    for path in sorted((repo_root / "tinker_server").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr != "init":
-                continue
-            if not isinstance(node.func.value, ast.Name) or node.func.value.id != "ray":
-                continue
-            if not _call_forwards_logs_to_driver(node):
-                errors.append(f"{path}:{node.lineno}: ray.init missing log-to-driver forwarding")
+    from tinker_server.ray_utils import init_ray  # noqa: E402
 
-    if errors:
-        print("FAIL:", file=sys.stderr)
-        for e in errors:
-            print(f"- {e}", file=sys.stderr)
-        return 1
+    calls = _install_ray_stub()
+
+    os.environ.pop("MINT_RAY_LOG_TO_DRIVER", None)
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+    if calls[-1].get("log_to_driver") is not None:
+        return _fail(f"log_to_driver unexpectedly set when disabled: {calls[-1]!r}")
+
+    os.environ["MINT_RAY_LOG_TO_DRIVER"] = "1"
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+    if calls[-1].get("log_to_driver") is not True:
+        return _fail(f"log_to_driver not forwarded when enabled: {calls[-1]!r}")
+
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True, log_to_driver=False)
+    if calls[-1].get("log_to_driver") is not False:
+        return _fail(f"explicit log_to_driver override not respected: {calls[-1]!r}")
 
     print("PASS")
     return 0

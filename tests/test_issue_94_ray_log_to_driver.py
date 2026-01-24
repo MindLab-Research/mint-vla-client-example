@@ -1,40 +1,42 @@
-import ast
-from pathlib import Path
+import importlib.machinery
+import sys
+import types
 
 
-def _call_forwards_logs_to_driver(call: ast.Call) -> bool:
-    for kw in call.keywords:
-        if kw.arg == "log_to_driver":
-            return True
-        if kw.arg is not None:
-            continue
-        if not isinstance(kw.value, ast.Call):
-            continue
-        func = kw.value.func
-        if isinstance(func, ast.Name) and func.id == "ray_log_to_driver_kwargs":
-            return True
-        if isinstance(func, ast.Attribute) and func.attr == "ray_log_to_driver_kwargs":
-            return True
-    return False
+def _install_ray_stub(calls: list[dict]) -> None:
+    ray = types.ModuleType("ray")
+    ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
+
+    def init(**kwargs):
+        calls.append(dict(kwargs))
+        return {"ok": True}
+
+    ray.init = init  # type: ignore[attr-defined]
+    sys.modules["ray"] = ray
 
 
-def test_issue_94_ray_init_forwards_logs_to_driver() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    errors: list[str] = []
+def test_issue_94_init_ray_injects_log_to_driver(monkeypatch) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls)
 
-    for path in sorted((repo_root / "tinker_server").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr != "init":
-                continue
-            if not isinstance(node.func.value, ast.Name) or node.func.value.id != "ray":
-                continue
-            if not _call_forwards_logs_to_driver(node):
-                errors.append(f"{path}:{node.lineno}: ray.init missing log-to-driver forwarding")
+    from tinker_server.ray_utils import init_ray
 
-    assert not errors, "Issue #94 regression:\n" + "\n".join(errors)
+    monkeypatch.delenv("MINT_RAY_LOG_TO_DRIVER", raising=False)
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+    assert "log_to_driver" not in calls[-1]
+
+    monkeypatch.setenv("MINT_RAY_LOG_TO_DRIVER", "1")
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+    assert calls[-1]["log_to_driver"] is True
+
+
+def test_issue_94_init_ray_does_not_override_explicit_kwarg(monkeypatch) -> None:
+    calls: list[dict] = []
+    _install_ray_stub(calls)
+
+    from tinker_server.ray_utils import init_ray
+
+    monkeypatch.setenv("MINT_RAY_LOG_TO_DRIVER", "1")
+    init_ray(address="auto", namespace="ns", ignore_reinit_error=True, log_to_driver=False)
+    assert calls[-1]["log_to_driver"] is False
 
