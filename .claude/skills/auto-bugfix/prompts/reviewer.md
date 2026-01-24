@@ -16,6 +16,8 @@ Non-negotiable:
 - For actor lifecycle / resource scheduling / placement-group changes: do not accept a "repro" that only asserts on computed resource numbers / GPU counts.
   Require an integrated repro that creates the affected session/engine in Ray and completes at least one request that uses it (e.g. create_sampling_session +
   asample + retrieve_future).
+- If the issue is scale-dependent (example: fails only at 16 GPUs / TP=16), require the integrated repro to run at that target scale. Smaller-scale "it
+  works at N<target" is partial evidence and is not merge/close evidence. If the target scale cannot be scheduled right now, treat it as blocking.
 - For sampling/inference/vLLM changes: do not accept "create_sampling_session succeeded" as sufficient. Require an end-to-end sample via `/api/v1/asample`
   and `/api/v1/retrieve_future`, and verify the returned payload.
 - Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.

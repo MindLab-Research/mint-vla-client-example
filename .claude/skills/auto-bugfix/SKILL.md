@@ -45,6 +45,7 @@ Hard rules:
 - For any change that touches scheduling / placement groups / GPU allocation / engine initialization:
   - A "repro" that only asserts on computed resource numbers / GPU counts is partial evidence.
   - Require an integrated repro that (1) creates the affected session/engine in Ray and (2) completes at least one request using it (e.g. create_sampling_session + asample + retrieve_future).
+  - If the issue is scale-dependent (example: fails only at 16 GPUs / TP=16), the integrated repro must run at that target scale. Smaller-scale "it works at N<target" is partial evidence and is not merge/close evidence.
 - Treat issue-thread comprehension as testable: the bugfixer + reviewer issue digests must include explicit acceptance criteria extracted from the issue/comments (not just a generic summary).
 - Every issue MUST have runtime evidence:
   - Integrated reproduction:
@@ -67,6 +68,7 @@ Hard rules:
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
   - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
 - If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.
+- Retroactive enforcement: if a closed `assign-to-bot` issue was closed based on static-only or partial evidence (no integrated runtime repro), reopen it and requeue it for a real integrated repro + smoke + pytest.
 
 Files:
 - Bugfixer subagent prompt: `.claude/skills/auto-bugfix/prompts/bugfixer.md`
