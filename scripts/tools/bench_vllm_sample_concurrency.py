@@ -161,6 +161,11 @@ def main() -> None:
         action="store_true",
         help="Make prompt tokens unique per request to avoid vLLM prefix-caching effects",
     )
+    p.add_argument(
+        "--reuse-sampling-session",
+        action="store_true",
+        help="Use a single sampling_session_id for all concurrent requests (tests intra-session concurrency)",
+    )
     p.add_argument("--concurrency", default="1,2,4,8", help="Comma-separated concurrency values")
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--poll-s", type=float, default=1.0)
@@ -219,10 +224,14 @@ def main() -> None:
 
         for c in conc:
             for rep in range(args.repeats):
-                sessions = [
-                    _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
-                    for _ in range(c)
-                ]
+                if args.reuse_sampling_session:
+                    sid = _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
+                    sessions = [sid] * c
+                else:
+                    sessions = [
+                        _create_sampling_session(base_url, args.model, timeout_s=args.call_timeout_s)
+                        for _ in range(c)
+                    ]
                 if args.unique_prompts:
                     prompt_tokens_by_req: list[list[int]] = []
                     for i in range(c):
