@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.ray_utils import ray_log_to_driver_kwargs
+from .multinode_resources import compute_multinode_engine_resources
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
@@ -895,14 +896,15 @@ class MultiNodeInferenceEngine:
             # MultiNodeVLLMEngine itself does not need Ray GPU resources (vLLM's Ray backend
             # manages the 1-GPU worker actors). Reserving an extra GPU for the controller
             # breaks TP=16 scheduling on 2x8-GPU clusters (would require 17 GPUs).
-            controller_gpus = 0
-            controller_cpus = 1
             worker_gpus = (
                 self.tensor_parallel_size
                 * self.pipeline_parallel_size
                 * self.data_parallel_size
             )
-            total_required_gpus = worker_gpus
+            resources = compute_multinode_engine_resources(worker_gpus)
+            controller_gpus = resources.controller_gpus
+            controller_cpus = resources.controller_cpus
+            total_required_gpus = resources.total_required_gpus
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
@@ -1022,7 +1024,7 @@ class MultiNodeInferenceEngine:
             try:
                 pg = ray.util.get_placement_group(pg_name)
             except Exception:
-                pg_bundles = [{"GPU": 1, "CPU": 1}] * total_required_gpus + [{"CPU": controller_cpus}]
+                pg_bundles = resources.pg_bundles
                 pg = ray.util.placement_group(
                     pg_bundles,
                     # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
@@ -1058,7 +1060,7 @@ class MultiNodeInferenceEngine:
                     # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
                     # Place the controller into a CPU-only bundle to avoid reserving an extra GPU
                     # while keeping child task capture for vLLM's Ray worker actors.
-                    placement_group_bundle_index=total_required_gpus,
+                    placement_group_bundle_index=resources.controller_bundle_index,
                     placement_group_capture_child_tasks=True,
                 )
             }
