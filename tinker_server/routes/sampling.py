@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
+from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
@@ -263,6 +264,45 @@ async def asample(
     The request is processed in the background. Use /retrieve_future
     with the returned request_id to get results.
     """
+    # Gateway forwarding: if this sampling_session_id was created upstream, proxy the
+    # request and return a gateway-encoded request_id so /retrieve_future can route it.
+    from ..gateway import (
+        encode_request_id,
+        forward_json,
+        remote_sampling_session,
+        upstream_for_alias,
+    )
+
+    session_id = request.get_session_id()
+    remote = remote_sampling_session(session_id)
+    if remote is not None:
+        upstream_alias, base_model = remote
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+        user_data = getattr(http_request.state, "user_data", None)
+        if not can_access_model(base_model, user_data):
+            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/asample",
+            incoming_headers=dict(http_request.headers),
+            json_body=request.model_dump(),
+            timeout_s=300.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream asample returned invalid request_id")
+        return UntypedAPIFuture(
+            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+        )
+
     global _inflight_sample_tasks
     if _should_backpressure(http_request):
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
@@ -494,6 +534,42 @@ async def compute_logprobs(
     - logprobs[0] is None (first token has no conditioning context)
     - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
     """
+    from ..gateway import (
+        encode_request_id,
+        forward_json,
+        remote_sampling_session,
+        upstream_for_alias,
+    )
+
+    remote = remote_sampling_session(request.sampling_session_id)
+    if remote is not None:
+        upstream_alias, base_model = remote
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+        user_data = getattr(http_request.state, "user_data", None)
+        if not can_access_model(base_model, user_data):
+            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/compute_logprobs",
+            incoming_headers=dict(http_request.headers),
+            json_body=request.model_dump(),
+            timeout_s=300.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream compute_logprobs returned invalid request_id")
+        return UntypedAPIFuture(
+            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+        )
+
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
     background_tasks.add_task(_do_compute_logprobs, request_id, request, user_id)

@@ -65,19 +65,67 @@ async def healthz() -> dict:
 
 
 @router.get("/get_server_capabilities")
-async def get_server_capabilities() -> dict:
+async def get_server_capabilities(http_request: Request) -> dict:
     """Return server capabilities for tinker client."""
     from ..backend.model_registry import get_model_config, list_supported_models
+    from ..gateway import get_gateway_config, get_upstream_capabilities, upstream_for_model
 
-    supported = list_supported_models()
+    supported_local = list_supported_models()
+    cfg = get_gateway_config()
+
+    if cfg is None or not cfg.model_to_upstream:
+        supported = supported_local
+        return {
+            "supported_models": [
+                {
+                    "model_name": m,
+                    "max_context_length": get_model_config(m).max_model_len,
+                }
+                for m in supported
+            ],
+        }
+
+    incoming_headers = dict(http_request.headers)
+    remote_models = list(cfg.model_to_upstream.keys())
+
+    # Fetch capabilities once per upstream alias that has at least one routed model.
+    alias_to_caps: dict[str, dict[str, int]] = {}
+    for alias in set(cfg.model_to_upstream.values()):
+        upstream = cfg.upstreams.get(alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {alias!r}")
+        try:
+            alias_to_caps[alias] = await get_upstream_capabilities(
+                upstream=upstream, incoming_headers=incoming_headers
+            )
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"Upstream {alias!r} capabilities unavailable")
+
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for m in supported_local + remote_models:
+        if m in seen:
+            continue
+        seen.add(m)
+
+        if m in cfg.model_to_upstream:
+            upstream = upstream_for_model(m)
+            if upstream is None:
+                continue
+            caps = alias_to_caps.get(upstream.alias, {})
+            if m not in caps:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gateway misconfig: model {m!r} not present in upstream {upstream.alias!r} capabilities",
+                )
+            max_len = int(caps[m])
+        else:
+            max_len = int(get_model_config(m).max_model_len)
+
+        merged.append({"model_name": m, "max_context_length": max_len})
+
     return {
-        "supported_models": [
-            {
-                "model_name": m,
-                "max_context_length": get_model_config(m).max_model_len,
-            }
-            for m in supported
-        ],
+        "supported_models": merged,
     }
 
 
@@ -140,6 +188,42 @@ async def create_sampling_session(
             status_code=403,
             detail=get_access_denied_error(base_model)
         )
+
+    # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
+    # return upstream sampling_session_id (tracking it for subsequent asample routing).
+    from ..gateway import forward_json, register_remote_sampling_session, upstream_for_model
+
+    upstream = upstream_for_model(base_model)
+    if upstream is not None:
+        payload = request.model_dump()
+        payload["base_model"] = base_model
+        try:
+            resp = await forward_json(
+                upstream=upstream,
+                method="POST",
+                path="/api/v1/create_sampling_session",
+                incoming_headers=dict(http_request.headers),
+                json_body=payload,
+                timeout_s=90.0,
+            )
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"Upstream {upstream.alias!r} create_sampling_session failed")
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+        sampling_session_id_remote = data.get("sampling_session_id")
+        if not isinstance(sampling_session_id_remote, str) or not sampling_session_id_remote:
+            raise HTTPException(
+                status_code=502, detail="Upstream create_sampling_session returned invalid sampling_session_id"
+            )
+
+        register_remote_sampling_session(
+            sampling_session_id=sampling_session_id_remote,
+            upstream_alias=upstream.alias,
+            base_model=base_model,
+        )
+        return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id_remote)
 
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
     multi_lora_engine = await session_manager.get_engine_for_model(base_model)
