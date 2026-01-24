@@ -25,6 +25,7 @@ from ..models.types import (
     SampleResponse,
     UntypedAPIFuture,
 )
+from ..sampling_utils import resolve_stop_reason
 from ..usage_logger import get_usage_logger
 
 if TYPE_CHECKING:
@@ -344,17 +345,14 @@ async def _do_sample(
                 results = await asyncio.gather(*(_generate_limited(i) for i in range(request.num_samples)))
 
             sequences = []
-            eos_tokens = {151645, 151643}
             for result in results:
                 # Normalize logprobs attribute name (multi-LoRA uses 'logprobs', legacy uses 'log_probs')
                 logprobs = getattr(result, "logprobs", None) or getattr(result, "log_probs", None)
 
-                # Infer stop reason: check if EOS tokens are present
-                # verl's TokenOutput doesn't include finish_reason, so we infer it
-                if result.token_ids and result.token_ids[-1] in eos_tokens:
-                    stop_reason = "stop"
-                else:
-                    stop_reason = "length"
+                stop_reason = resolve_stop_reason(
+                    stop_reason=getattr(result, "stop_reason", None),
+                    token_ids=result.token_ids,
+                )
 
                 sequences.append(
                     SampledSequence(
