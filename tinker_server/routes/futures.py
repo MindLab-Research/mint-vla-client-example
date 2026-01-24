@@ -64,7 +64,7 @@ async def retrieve_future(
         response.status_code = upstream_resp.status_code
         for k, v in upstream_resp.headers.items():
             lk = k.lower()
-            if lk.startswith("x-"):
+            if lk.startswith("x-") or lk == "retry-after":
                 response.headers[k] = v
         try:
             payload = upstream_resp.json()
