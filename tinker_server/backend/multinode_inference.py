@@ -461,9 +461,9 @@ def _create_multinode_vllm_actor(
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
-                n=max(1, int(n)),
                 stop_token_ids=[151645, 151643],  # Qwen EOS tokens
             )
+            n_req = max(1, int(n))
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
 
@@ -478,6 +478,7 @@ def _create_multinode_vllm_actor(
 
             t0 = time.perf_counter()
             first_tok_s: float | None = None
+            multi_results: list[dict] | None = None
             # Get final response
             async with self._maybe_generate_lock():
                 t_lock = time.perf_counter()
@@ -485,25 +486,63 @@ def _create_multinode_vllm_actor(
                 try:
                     async with self._lock_read():
                         t1 = time.perf_counter()
-                        collector = await self.engine.add_request(
-                            request_id=request_id,
-                            prompt=prompt,
-                            params=sampling_params,
-                            lora_request=lora_request,
-                        )
                         final_res = None
-                        by_index: dict[int, Any] | None = {} if sampling_params.n > 1 else None
-                        while True:
-                            out = await collector.get()
-                            if first_tok_s is None:
-                                first_tok_s = time.perf_counter() - t0
-                            if by_index is not None:
-                                for oo in out.outputs:
-                                    by_index[int(oo.index)] = oo
-                            final_res = out
-                            if out.finished:
-                                break
-                    assert final_res is not None
+                        if n_req == 1:
+                            collector = await self.engine.add_request(
+                                request_id=request_id,
+                                prompt=prompt,
+                                params=sampling_params,
+                                lora_request=lora_request,
+                            )
+                            while True:
+                                out = await collector.get()
+                                if first_tok_s is None:
+                                    first_tok_s = time.perf_counter() - t0
+                                final_res = out
+                                if out.finished:
+                                    break
+                            assert final_res is not None
+                        else:
+                            async def _one(i: int) -> dict:
+                                nonlocal first_tok_s
+                                rid = f"{request_id}:{i}"
+                                collector = await self.engine.add_request(
+                                    request_id=rid,
+                                    prompt=prompt,
+                                    params=sampling_params,
+                                    lora_request=lora_request,
+                                )
+                                final = None
+                                while True:
+                                    out = await collector.get()
+                                    if first_tok_s is None:
+                                        first_tok_s = time.perf_counter() - t0
+                                    final = out
+                                    if out.finished:
+                                        break
+                                assert final is not None
+
+                                token_ids = list(final.outputs[0].token_ids)
+                                out_log_probs = None
+                                if sampling_params.logprobs is not None and final.outputs[0].logprobs:
+                                    out_log_probs = [
+                                        lp[token_ids[j]].logprob
+                                        for j, lp in enumerate(final.outputs[0].logprobs)
+                                    ]
+
+                                stop_reason = "length"
+                                if final.outputs[0].finish_reason == "stop":
+                                    stop_reason = "stop"
+                                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                                    stop_reason = "stop"
+
+                                return {
+                                    "token_ids": token_ids,
+                                    "logprobs": out_log_probs,
+                                    "stop_reason": stop_reason,
+                                }
+
+                            multi_results = await asyncio.gather(*[_one(i) for i in range(n_req)])
                 finally:
                     await self._register_generate_end()
             t2 = time.perf_counter()
@@ -516,7 +555,7 @@ def _create_multinode_vllm_actor(
                     flush=True,
                 )
 
-            if sampling_params.n == 1:
+            if n_req == 1:
                 token_ids = list(final_res.outputs[0].token_ids)  # type: ignore[union-attr]
                 log_probs = None
                 if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:  # type: ignore[union-attr]
@@ -538,46 +577,8 @@ def _create_multinode_vllm_actor(
                     "stop_reason": stop_reason,
                 }
 
-            assert by_index is not None
-            if len(by_index) != sampling_params.n:
-                raise RuntimeError(
-                    f"vLLM returned indices={sorted(by_index)} for n={sampling_params.n}"
-                )
-
-            if 0 not in by_index and len(by_index) == sampling_params.n:
-                keys = sorted(by_index)
-                if keys and keys[0] == 1 and keys[-1] == sampling_params.n:
-                    by_index = {k - 1: v for k, v in by_index.items()}
-
-            outs: list[dict] = []
-            for idx in range(sampling_params.n):
-                if idx not in by_index:
-                    raise RuntimeError(
-                        f"vLLM returned indices={sorted(by_index)} for n={sampling_params.n}"
-                    )
-                out = by_index[idx]
-                out_token_ids = list(out.token_ids)
-                out_log_probs = None
-                if sampling_params.logprobs is not None and out.logprobs:
-                    out_log_probs = [
-                        lp[out_token_ids[i]].logprob
-                        for i, lp in enumerate(out.logprobs)
-                    ]
-
-                out_stop_reason = "length"
-                if out.finish_reason == "stop":
-                    out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
-                    out_stop_reason = "stop"
-
-                outs.append(
-                    {
-                        "token_ids": out_token_ids,
-                        "logprobs": out_log_probs,
-                        "stop_reason": out_stop_reason,
-                    }
-                )
-            return outs
+            assert multi_results is not None
+            return list(multi_results)
 
         async def compute_prompt_logprobs(
             self,
