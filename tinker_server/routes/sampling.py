@@ -25,7 +25,7 @@ from ..models.types import (
     SampleResponse,
     UntypedAPIFuture,
 )
-from ..sampling_utils import resolve_stop_reason
+from ..sampling_utils import sampled_sequence_from_result
 from ..usage_logger import get_usage_logger
 
 if TYPE_CHECKING:
@@ -346,21 +346,7 @@ async def _do_sample(
 
             sequences = []
             for result in results:
-                # Normalize logprobs attribute name (multi-LoRA uses 'logprobs', legacy uses 'log_probs')
-                logprobs = getattr(result, "logprobs", None) or getattr(result, "log_probs", None)
-
-                stop_reason = resolve_stop_reason(
-                    stop_reason=getattr(result, "stop_reason", None),
-                    token_ids=result.token_ids,
-                )
-
-                sequences.append(
-                    SampledSequence(
-                        tokens=result.token_ids,
-                        logprobs=logprobs,
-                        stop_reason=stop_reason,
-                    )
-                )
+                sequences.append(sampled_sequence_from_result(result))
 
             # Build response
             response = SampleResponse(sequences=sequences)

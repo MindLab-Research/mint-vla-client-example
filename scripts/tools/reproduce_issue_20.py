@@ -1,36 +1,38 @@
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tinker_server.sampling_utils import sampled_sequence_from_result  # noqa: E402
+
+
+def _fail(msg: str) -> int:
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
+
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parents[2]
-    sampling_py = repo_root / "tinker_server/routes/sampling.py"
-    utils_py = repo_root / "tinker_server/sampling_utils.py"
+    class Dummy:
+        def __init__(self, *, token_ids, stop_reason, logprobs=None, log_probs=None):
+            self.token_ids = token_ids
+            self.stop_reason = stop_reason
+            if logprobs is not None:
+                self.logprobs = logprobs
+            if log_probs is not None:
+                self.log_probs = log_probs
 
-    required = {
-        sampling_py: [
-            "from ..sampling_utils import resolve_stop_reason",
-            "resolve_stop_reason(",
-            'getattr(result, "stop_reason", None)',
-        ],
-        utils_py: [
-            "def resolve_stop_reason(",
-            "DEFAULT_EOS_TOKENS",
-        ],
-    }
+    seq = sampled_sequence_from_result(
+        Dummy(token_ids=[42], stop_reason="stop", log_probs=[-0.1])
+    )
+    if seq.stop_reason != "stop":
+        return _fail(f"stop_reason={seq.stop_reason!r} expected 'stop'")
+    if seq.logprobs != [-0.1]:
+        return _fail(f"logprobs={seq.logprobs!r} expected [-0.1]")
 
-    missing: list[str] = []
-    for path, needles in required.items():
-        txt = path.read_text(encoding="utf-8")
-        for s in needles:
-            if s not in txt:
-                missing.append(f"{path}: {s}")
-
-    if missing:
-        print("FAIL: missing expected strings:", file=sys.stderr)
-        for m in missing:
-            print(f"- {m}", file=sys.stderr)
-        return 1
+    eos_seq = sampled_sequence_from_result(Dummy(token_ids=[151645], stop_reason=None))
+    if eos_seq.stop_reason != "stop":
+        return _fail(f"eos stop_reason={eos_seq.stop_reason!r} expected 'stop'")
 
     print("PASS")
     return 0
@@ -38,4 +40,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
