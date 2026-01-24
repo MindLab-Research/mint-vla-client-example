@@ -66,10 +66,23 @@ def _git_sha() -> str | None:
 
 
 def get_server_info() -> dict:
+    from .config import config as server_config
     return {
         "git_sha": _git_sha(),
         "started_at": STARTED_AT.isoformat(),
         "process": {"pid": os.getpid(), "argv": sys.argv},
         "logging": {"stdout": _fd_info(1), "stderr": _fd_info(2)},
+        "config": {
+            "host": server_config.host,
+            "port": server_config.port,
+            "tensor_parallel_size": server_config.tensor_parallel_size,
+            "data_parallel_size": server_config.data_parallel_size,
+            "gpu_memory_utilization": server_config.gpu_memory_utilization,
+            "max_model_len": server_config.max_model_len,
+            "enable_multi_lora": server_config.enable_multi_lora,
+            "max_loras": server_config.max_loras,
+            "max_cpu_loras": server_config.max_cpu_loras,
+            "max_lora_rank": server_config.max_lora_rank,
+            "auth_enabled": server_config.auth_enabled,
+        },
     }
-

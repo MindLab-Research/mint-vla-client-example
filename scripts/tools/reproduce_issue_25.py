@@ -24,6 +24,8 @@ LORA_A = os.environ.get("TINKER_LORA_A", "mint://ckpt_a7c51d595f34")
 LORA_B = os.environ.get("TINKER_LORA_B", "mint://ckpt_6722008bf425")
 
 POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "600"))
+EXPECTED_MAX_LORAS = int(os.environ.get("TINKER_EXPECTED_MAX_LORAS", "1"))
+EXPECTED_MAX_CPU_LORAS = int(os.environ.get("TINKER_EXPECTED_MAX_CPU_LORAS", "1"))
 
 
 def _headers() -> dict[str, str]:
@@ -34,6 +36,19 @@ def _headers() -> dict[str, str]:
 
 def _post_json(path: str, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
     r = requests.post(f"{BASE_URL}{path}", headers=_headers(), json=payload, timeout=timeout_s)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"_non_json_body": r.text[:400]}
+    if r.status_code != 200:
+        raise RuntimeError(f"{path} returned {r.status_code}: {data!r}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} returned non-dict JSON: {type(data)}")
+    return data
+
+
+def _get_json(path: str, *, timeout_s: float) -> dict[str, Any]:
+    r = requests.get(f"{BASE_URL}{path}", headers=_headers(), timeout=timeout_s)
     try:
         data = r.json()
     except Exception:
@@ -100,6 +115,18 @@ def _retrieve(request_id: str) -> tuple[int, dict[str, Any]]:
 
 def main() -> int:
     try:
+        info = _get_json("/api/v1/server_info", timeout_s=30.0)
+        cfg = info.get("config")
+        if not isinstance(cfg, dict):
+            raise RuntimeError(f"server_info missing config: {info!r}")
+        max_loras = cfg.get("max_loras")
+        max_cpu_loras = cfg.get("max_cpu_loras")
+        if max_loras != EXPECTED_MAX_LORAS or max_cpu_loras != EXPECTED_MAX_CPU_LORAS:
+            raise RuntimeError(
+                f"server not configured for eviction stress: max_loras={max_loras!r} max_cpu_loras={max_cpu_loras!r} "
+                f"(expected {EXPECTED_MAX_LORAS}/{EXPECTED_MAX_CPU_LORAS})"
+            )
+
         sid_a = _create_sampling_session(LORA_A)
         request_id_a = _asample(sid_a, max_tokens=4096)
 
