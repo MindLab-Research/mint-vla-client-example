@@ -41,9 +41,7 @@ def _parse_int_list(s: str) -> list[int]:
 def _p50(xs: list[float]) -> float:
     if not xs:
         return float("nan")
-    xs2 = sorted(xs)
-    mid = (len(xs2) - 1) // 2
-    return xs2[mid]
+    return float(statistics.median(xs))
 
 
 def _post(base_url: str, path: str, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
