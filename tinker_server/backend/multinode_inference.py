@@ -1091,6 +1091,15 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
                 "MINT_VLLM_SERIALIZE_GENERATE",
+                "MINT_VLLM_SERIALIZE_MULTISAMPLE",
+                "MINT_VLLM_MULTISAMPLE_MODE",
+                "MINT_VLLM_SERIALIZE_ADD_REQUEST",
+                "MINT_VLLM_GENERATE_TIMEOUT_S",
+                "MINT_VLLM_IS_READY_TIMEOUT_S",
+                "MINT_VLLM_ENABLE_CHUNKED_PREFILL",
+                "MINT_VLLM_ENABLE_PREFIX_CACHING",
+                "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
+                "MINT_VLLM_ADMISSION_CONTROL",
             ):
                 v = os.environ.get(k)
                 if v is not None:
