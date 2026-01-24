@@ -1,11 +1,12 @@
-"""MegatronTrainingWorker - MoE training via verl's Megatron backend.
+"""Shared Megatron training utilities and deprecated MegatronTrainingWorker.
 
-This module provides Tinker API compatibility for MoE model training using
-verl's MegatronEngine, which handles:
-- Expert Parallelism (EP) for MoE layers
-- Tensor/Pipeline/Context Parallelism
-- LoRA via Megatron-Bridge
-- Offloading for memory efficiency
+This module provides:
+- Tinker Datum -> verl TensorDict conversion
+- Loss functions (SFT/PPO/logprobs)
+- is_moe_model() routing helper
+
+MegatronTrainingWorker remains for legacy single-process training and is not used by
+VerlTrainingEngine (which uses megatron_distributed.MegatronWorkerGroup).
 """
 
 from __future__ import annotations

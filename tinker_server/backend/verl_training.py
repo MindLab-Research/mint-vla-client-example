@@ -1657,7 +1657,7 @@ class VerlTrainingEngine:
     async def create_training_session(self, session: TrainingSession) -> None:
         """Create Ray actor for session.
 
-        Routes MoE models to MegatronTrainingWorker, dense models to TrainingWorker.
+        Routes MoE models to MegatronWorkerGroup, dense models to DenseTrainerPool.
         Blocks until GPU is available (Ray queuing).
 
         Args:
