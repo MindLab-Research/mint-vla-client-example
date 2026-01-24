@@ -214,7 +214,12 @@ def _create_multinode_vllm_actor(
             self.max_lora_rank = max_lora_rank
             self.max_num_seqs = max_num_seqs
             self.kv_cache_dtype = kv_cache_dtype
-            self.max_num_batched_tokens = max_num_batched_tokens
+            env_max_num_batched_tokens = os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS")
+            self.max_num_batched_tokens = (
+                int(env_max_num_batched_tokens)
+                if env_max_num_batched_tokens is not None and env_max_num_batched_tokens.strip()
+                else max_num_batched_tokens
+            )
 
             self.engine = None
             self._initialized = False
