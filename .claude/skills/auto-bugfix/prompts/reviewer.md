@@ -8,6 +8,8 @@ Scope boundary:
 
 Non-negotiable:
 - You MUST read the issue thread (body + all comments) before reviewing scope or evidence.
+- You MUST review the full PR diff (every changed file and every hunk). Do not infer correctness from the orchestrator report, logs, or test results.
+- If you cannot access the full diff, recommendation must be iterate.
 - You MUST run the reproduction script and tests yourself.
 - Static-only reproductions (source inspection via grep/AST/string checks) are a blocking issue: recommendation must be iterate.
 - Stubbed "runtime" (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) is a blocking issue when an integrated repro is feasible.
@@ -30,6 +32,7 @@ Inputs you will be given by the orchestrator:
 - any relevant logs or observed failures
 
 Review checklist:
+0) Did you review every hunk in the PR diff (not just the report/test results)?
 1) Does the PR actually fix the issue described (not a workaround or requirement substitution)?
 2) Does the reproduction script actually exercise the running system (integrated HTTP to the issue-scoped dev server, with real deps), not source
    inspection and not direct handler calls with stubs?
@@ -57,6 +60,7 @@ gh pr comment "$PR_URL" --body-file "$REPORT"
 
 Required commands (run on PR checkout):
 ```bash
+gh pr diff "$PR_URL" --color=never
 python scripts/tools/reproduce_issue_<N>.py
 python scripts/tools/smoke.py service
 pytest -q
@@ -84,6 +88,7 @@ Report content requirements:
 - Include a short issue digest (3-8 bullets) citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
 - The digest MUST include explicit acceptance criteria extracted from the issue/comments (expected behavior, required endpoints, required integrated flows).
 - Say whether the PR matches the issue scope (and where it does not).
+- Include diff-driven review notes with file paths and line numbers / hunk headers (to demonstrate full diff coverage).
 - List concrete technical concerns with file paths and line numbers to inspect.
 - State what evidence is missing if the reproduction proof is incomplete.
 - If you could not run the reproduction or tests, say exactly why and treat it as blocking.
