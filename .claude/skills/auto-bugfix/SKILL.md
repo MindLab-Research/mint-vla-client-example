@@ -32,12 +32,24 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
+- Both the bugfixer and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
+  If the issue references another issue/PR for context, read that too before acting.
 - Static-only reproductions/tests are forbidden. Do not close an issue based on source inspection (grep/AST/string checks).
-  A reproduction must execute code and validate observable behavior; for server bugs, it must hit the issue-scoped server over HTTP.
+- Mock-only or stub-only "runtime" is not an acceptable substitute for an integrated repro when an integrated repro is feasible.
+  - Examples of partial evidence: calling a FastAPI route handler directly, stubbing `ray`/`fastapi`/`peft` so imports work, asserting only on
+    computed resource numbers without starting the system.
+  - For server/runtime bugs: the reproduction must hit the issue-scoped dev server over HTTP and exercise the real dependency stack (FastAPI + Ray).
 - Every issue MUST have runtime evidence:
-  - Reproduction: FAIL on old code and PASS on new code, by actually running `scripts/tools/reproduce_issue_<N>.py`.
-  - Tests: `pytest -q` run on the PR branch.
-  - Record the exact commands and the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
+  - Integrated reproduction:
+    - Prefer: FAIL on old code and PASS on new code, by actually running `scripts/tools/reproduce_issue_<N>.py` against the issue-scoped dev server.
+    - If the issue is not server/runtime-related, still prefer an integrated smoke check (server starts) plus targeted local unit coverage.
+  - Integrated smoke:
+    - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
+      HTTP flows work).
+    - If the change touches sampling/inference: also run `python scripts/tools/smoke.py service --create-sampling-session`.
+    - If the change touches training/checkpointing: run a minimal end-to-end call that exercises that path (issue-specific repro is preferred).
+  - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
+  - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
 - If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.
 
 Files:
@@ -212,7 +224,7 @@ Inputs to bugfixer:
 
 Bugfixer deliverable back to orchestrator:
 - a reproduction script at `scripts/tools/reproduce_issue_<NUMBER>.py`
-- evidence that reproduction fails before the fix and passes after the fix (dev)
+- evidence that reproduction fails before the fix and passes after the fix (integrated dev server; no stubs)
 - the exact reproduction command used (env vars + invocation)
 - the exact dev-server start/stop/log commands used (if relevant to troubleshooting)
 - any required updates to `.claude/skills/architecture-design/**`
@@ -220,10 +232,13 @@ Bugfixer deliverable back to orchestrator:
 ### 3d) Reproduce issue
 
 Use the `bugfix` workflow:
-- Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py` that exercises the system (no source inspection).
+- Read the entire issue thread (body + all comments) before writing the repro.
+- Create an environment-agnostic reproduction script: `scripts/tools/reproduce_issue_<NUMBER>.py` that exercises the system (no source inspection, no stubs).
 - Run it against the issue-scoped dev server (`TINKER_BASE_URL=http://localhost:$TINKER_PORT`, `TINKER_API_KEY=dummy`) and capture output.
 - Require: FAIL on old code, PASS on new code (same command line).
-- Post the reproduction command and observed output in the PR (so review does not rely on trust).
+- After the fix, run a baseline integrated smoke check:
+  - `TINKER_BASE_URL=http://localhost:$TINKER_PORT TINKER_API_KEY=dummy python scripts/tools/smoke.py service`
+- Post the reproduction command(s) and observed output in the PR (so review does not rely on trust).
 
 ### 3e) Fix issue
 

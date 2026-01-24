@@ -7,8 +7,10 @@ Scope boundary:
 - You do post your review report as a GitHub PR comment.
 
 Non-negotiable:
+- You MUST read the issue thread (body + all comments) before reviewing scope or evidence.
 - You MUST run the reproduction script and tests yourself.
 - Static-only reproductions (source inspection via grep/AST/string checks) are a blocking issue: recommendation must be iterate.
+- Stubbed "runtime" (e.g., stubbing `ray`/`fastapi`/`peft`, calling route handlers directly) is a blocking issue when an integrated repro is feasible.
 - Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.
 
 Inputs you will be given by the orchestrator:
@@ -19,14 +21,16 @@ Inputs you will be given by the orchestrator:
 
 Review checklist:
 1) Does the PR actually fix the issue described (not a workaround or requirement substitution)?
-2) Does the reproduction script actually exercise the system (not source inspection)?
+2) Does the reproduction script actually exercise the running system (integrated HTTP to the issue-scoped dev server, with real deps), not source
+   inspection and not direct handler calls with stubs?
 3) Does the reproduction script FAIL on old code and PASS on new code?
    - Preferred: verify by running the repro on the PR base commit and on the PR head commit.
    - If you cannot run the base commit in your environment, require concrete pre-fix FAIL output in the PR (or issue) that came from executing the same reproduction script. If missing: iterate.
 4) Do unit tests pass (`pytest -q`)?
-5) Does the fix introduce unhandled edge cases or obvious regressions?
-6) Are server restart, `TINKER_RAY_NAMESPACE`, and `PFS_TINKER_PATH` implications handled correctly (per `mint-dev`)?
-7) If behavior/operator workflow changed, were architecture docs updated (`architecture-design`)?
+5) Does an integrated smoke check pass (`python scripts/tools/smoke.py service` against the same issue-scoped dev server)?
+6) Does the fix introduce unhandled edge cases or obvious regressions?
+7) Are server restart, `TINKER_RAY_NAMESPACE`, and `PFS_TINKER_PATH` implications handled correctly (per `mint-dev`)?
+8) If behavior/operator workflow changed, were architecture docs updated (`architecture-design`)?
 
 Deliverable:
 1) Write a detailed review report (Markdown).
@@ -43,6 +47,7 @@ gh pr comment "$PR_URL" --body-file "$REPORT"
 Required commands (run on PR checkout):
 ```bash
 python scripts/tools/reproduce_issue_<N>.py
+python scripts/tools/smoke.py service
 pytest -q
 ```
 
