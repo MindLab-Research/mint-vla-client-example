@@ -3070,7 +3070,13 @@ class MegatronRankWorker:
 
         return info
 
-    def save_checkpoint(self, save_path: str, step_count: int = 0, actual_rank: int | None = None, use_per_expert_lora: bool = False) -> dict:
+    def save_checkpoint(
+        self,
+        save_path: str,
+        step_count: int = 0,
+        actual_rank: int | None = None,
+        use_per_expert_lora: bool = False,
+    ) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
         IMPORTANT: ALL ranks must call this method because get_lora_state_dict()
@@ -3088,25 +3094,40 @@ class MegatronRankWorker:
         """
         import json
         import os
+        import torch
 
         from safetensors.torch import save_file
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
 
         # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
         # Only rank 0 gets actual data, others get empty dict
         state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
 
-        # Only rank 0 saves to disk
+        os.makedirs(save_path, exist_ok=True)
+
+        # Save distributed adapter state for training resume (per-rank mp_rank_*_adapter.pt).
+        # ALL ranks must participate due to NCCL collectives.
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        self.save_adapter_state(
+            checkpoint_path=save_path,
+            actual_rank=effective_rank,
+            trainer_rank=self.lora_rank,
+        )
+
+        # Save per-rank optimizer shard (distributed optimizer state lives on each rank).
+        rank_path = _get_rank_checkpoint_path(save_path)
+        optimizer_file = rank_path + "_optimizer.pt"
+        torch.save(self._capture_optimizer_state(), optimizer_file)
+
+        # Only rank 0 saves PEFT-format artifacts used by vLLM.
         if self.rank != 0:
             return {}
-
-        os.makedirs(save_path, exist_ok=True)
 
         # 1. LoRA weights (PEFT format)
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
 
         # 2. LoRA config
         # Use actual session rank (Phase 7) or fall back to max_lora_rank
-        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
         try:
             model_is_mla = get_model_config(self.base_model).is_mla
         except ValueError:
@@ -3143,6 +3164,26 @@ class MegatronRankWorker:
         # Note: state_dict NOT included in return value to avoid OOM on API server
         # when transferring 37k+ MoE LoRA tensors through Ray. vLLM loads from path.
         return meta
+
+    def load_optimizer_state(self, checkpoint_path: str) -> dict:
+        """Load per-rank optimizer shard from disk (if present)."""
+        import os
+
+        import torch
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+
+        rank_path = _get_rank_checkpoint_path(checkpoint_path)
+        optimizer_file = rank_path + "_optimizer.pt"
+        if not os.path.isfile(optimizer_file):
+            return {}
+
+        state_dict = torch.load(optimizer_file, map_location="cpu")
+        with self.engine.train_mode():
+            self._restore_optimizer_state(state_dict)
+
+        if self.rank == 0:
+            return {"status": "ok", "optimizer_file": optimizer_file}
+        return {}
 
 
     # ========================================================================
@@ -4238,6 +4279,7 @@ class MegatronWorkerGroup:
         Returns:
             Dict with load metadata.
         """
+        import json
         import os
 
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
@@ -4254,6 +4296,23 @@ class MegatronWorkerGroup:
                 # Delegate to load_adapter_state
                 result = self.load_adapter_state(load_path, actual_rank=self._actual_rank or self.lora_rank)
                 result["load_method"] = "load_adapter_state"
+
+                if load_optimizer:
+                    opt_results = ray.get([w.load_optimizer_state.remote(load_path) for w in self.workers])
+                    result["optimizer_restored"] = any(
+                        isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
+                    )
+                else:
+                    result["optimizer_restored"] = False
+
+                meta_path = os.path.join(load_path, "training_meta.json")
+                if os.path.exists(meta_path):
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    result.update(meta)
+                    self._step_count = int(meta.get("current_step", self._step_count) or 0)
+                    self.learning_rate = float(meta.get("learning_rate", self.learning_rate) or self.learning_rate)
+
                 return result
             else:
                 logger.warning(f"[MegatronWorkerGroup] load_checkpoint: no adapter files found in {load_path}")
