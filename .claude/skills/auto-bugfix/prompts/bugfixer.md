@@ -28,7 +28,7 @@ Inputs you will be given by the orchestrator:
 
 Process:
 1) Read the entire issue thread (body + all comments). Do not skip context.
-2) Create or update `scripts/tools/reproduce_issue_<NUMBER>.py` (must run via `TINKER_BASE_URL` and `TINKER_API_KEY` and hit the server over HTTP).
+2) Create or update `scripts/tools/reproduce_issue_<NUMBER>.py` (default: run via `TINKER_BASE_URL` and `TINKER_API_KEY` and hit the server over HTTP; only treat as local-only if you can justify why the issue has no server/runtime surface).
 3) Ensure the issue-scoped dev server is running in the provided `TINKER_RAY_NAMESPACE`, `PFS_TINKER_PATH`, and port (via `TINKER_PORT`) per `.claude/skills/auto-bugfix/SKILL.md`.
 4) Run the reproduction script until it fails deterministically.
 5) Identify root cause and implement the minimal fix.

@@ -26,6 +26,7 @@ Review checklist:
 1) Does the PR actually fix the issue described (not a workaround or requirement substitution)?
 2) Does the reproduction script actually exercise the running system (integrated HTTP to the issue-scoped dev server, with real deps), not source
    inspection and not direct handler calls with stubs?
+   - Only accept a local-only repro if the issue is truly local-only (no server/runtime surface) and the PR explicitly justifies why an integrated repro cannot exercise it. Mock-only/stub-only is still blocking.
 3) Does the reproduction script FAIL on old code and PASS on new code?
    - Preferred: verify by running the repro on the PR base commit and on the PR head commit.
    - If you cannot run the base commit in your environment, require concrete pre-fix FAIL output in the PR (or issue) that came from executing the same reproduction script. If missing: iterate.

@@ -48,10 +48,11 @@ Hard rules:
     - Required: FAIL on old code and PASS on new code, using the same command line.
     - The repro must exercise the production path of the bug (not just a helper function). If the bug is observable via an HTTP endpoint, the repro must call that endpoint.
     - If the production path uses Ray, the repro must trigger real Ray execution (e.g. create_session/create_model/create_sampling_session/asample) and must not bypass/stub Ray.
-    - Only exception: if the issue is truly local-only (no server/runtime surface), run an executed repro or unit test locally and explicitly explain why an integrated repro cannot exercise it.
+    - Only exception: if the issue is truly local-only (no server/runtime surface), run an executed repro or unit test locally and explicitly explain why an integrated repro cannot exercise it. Mock-only/stub-only tests are still forbidden under this exception.
   - Integrated smoke:
     - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
       HTTP flows work).
+    - Treat this as the baseline Ray connectivity sanity check (create_session must succeed).
     - If the change touches sampling/inference: also run `python scripts/tools/smoke.py service --create-sampling-session`.
     - If the change touches training/checkpointing: run a minimal end-to-end call that exercises that path (issue-specific repro is preferred).
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
