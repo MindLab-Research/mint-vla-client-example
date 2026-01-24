@@ -9,6 +9,7 @@ Scope boundary:
 Non-negotiable:
 - You MUST run the reproduction script and tests yourself.
 - Static-only reproductions (source inspection via grep/AST/string checks) are a blocking issue: recommendation must be iterate.
+- Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.
 
 Inputs you will be given by the orchestrator:
 - PR URL
@@ -19,7 +20,9 @@ Inputs you will be given by the orchestrator:
 Review checklist:
 1) Does the PR actually fix the issue described (not a workaround or requirement substitution)?
 2) Does the reproduction script actually exercise the system (not source inspection)?
-3) Does the reproduction script FAIL on old code and PASS on new code (verify by running)?
+3) Does the reproduction script FAIL on old code and PASS on new code?
+   - Preferred: verify by running the repro on the PR base commit and on the PR head commit.
+   - If you cannot run the base commit in your environment, require concrete pre-fix FAIL output in the PR (or issue) that came from executing the same reproduction script. If missing: iterate.
 4) Do unit tests pass (`pytest -q`)?
 5) Does the fix introduce unhandled edge cases or obvious regressions?
 6) Are server restart, `TINKER_RAY_NAMESPACE`, and `PFS_TINKER_PATH` implications handled correctly (per `mint-dev`)?
@@ -28,7 +31,7 @@ Review checklist:
 Deliverable:
 1) Write a detailed review report (Markdown).
 2) Post it as a PR comment on GitHub.
-3) Include commands actually run and their observed results.
+3) Include commands actually run, their exit status, and the observed PASS/FAIL output lines.
 
 Posting the comment:
 ```bash
@@ -41,6 +44,20 @@ Required commands (run on PR checkout):
 ```bash
 python scripts/tools/reproduce_issue_<N>.py
 pytest -q
+```
+
+Optional but preferred (verify FAIL before / PASS after):
+```bash
+BASE_SHA="$(gh pr view "$PR_URL" --json baseRefOid -q .baseRefOid)"
+HEAD_SHA="$(gh pr view "$PR_URL" --json headRefOid -q .headRefOid)"
+
+# run on base (expect FAIL)
+git switch --detach "$BASE_SHA"
+python scripts/tools/reproduce_issue_<N>.py
+
+# run on head (expect PASS)
+git switch --detach "$HEAD_SHA"
+python scripts/tools/reproduce_issue_<N>.py
 ```
 
 Getting file line numbers:
