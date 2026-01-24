@@ -227,6 +227,7 @@ def _create_multinode_vllm_actor(
             self._gate_lock = asyncio.Lock()
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
+            self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
 
         @asynccontextmanager
         async def _lock_read(self):
@@ -355,7 +356,10 @@ def _create_multinode_vllm_actor(
                         if self._active_generates > 0:
                             return True
                     async with self._lock_read():
-                        await self.engine.list_loras()
+                        try:
+                            await asyncio.wait_for(self.engine.list_loras(), timeout=self._is_ready_timeout_s)
+                        except asyncio.TimeoutError:
+                            return True
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
