@@ -139,6 +139,11 @@ def _run_one(
                 continue
             r.raise_for_status()
             out = r.json()
+            if isinstance(out, dict) and "error" in out:
+                elapsed = time.time() - t0
+                err = out.get("error")
+                err_s = str(err)[:500] if err is not None else "unknown_error"
+                return OneResult(ok=False, elapsed_s=elapsed, sequences=None, error=err_s)
             seqs = out.get("sequences") if isinstance(out, dict) else None
             n = len(seqs) if isinstance(seqs, list) else None
             elapsed = time.time() - t0

@@ -485,7 +485,7 @@ def _create_multinode_vllm_actor(
                 try:
                     async with self._lock_read():
                         t1 = time.perf_counter()
-                        collector = self.engine.add_request(
+                        collector = await self.engine.add_request(
                             request_id=request_id,
                             prompt=prompt,
                             params=sampling_params,
@@ -608,7 +608,7 @@ def _create_multinode_vllm_actor(
             async with self._maybe_prompt_logprobs_lock():
                 async with self._lock_read():
                     t1 = time.perf_counter()
-                    collector = self.engine.add_request(
+                    collector = await self.engine.add_request(
                         request_id=request_id,
                         prompt=prompt,
                         params=sampling_params,
