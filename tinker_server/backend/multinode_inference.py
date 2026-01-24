@@ -680,7 +680,7 @@ class MultiNodeInferenceEngine:
 
     Key differences from MultiLoRAInferenceEngine:
     - Uses vLLM's Ray backend instead of verl's single-node ZMQ pattern
-    - Controller actor reserves 1 GPU for CUDA visibility; vLLM spawns 1-GPU workers in Ray
+    - Controller actor runs CPU-only; vLLM spawns 1-GPU workers in Ray
     - LoRA adapters must be on shared filesystem (all nodes access same path)
     """
 
@@ -745,7 +745,7 @@ class MultiNodeInferenceEngine:
             # manages the 1-GPU worker actors). Reserving an extra GPU for the controller
             # breaks TP=16 scheduling on 2x8-GPU clusters (would require 17 GPUs).
             controller_gpus = 0
-            controller_cpus = 0
+            controller_cpus = 1
             worker_gpus = (
                 self.tensor_parallel_size
                 * self.pipeline_parallel_size
@@ -871,8 +871,9 @@ class MultiNodeInferenceEngine:
             try:
                 pg = ray.util.get_placement_group(pg_name)
             except Exception:
+                pg_bundles = [{"GPU": 1, "CPU": 1}] * total_required_gpus + [{"CPU": controller_cpus}]
                 pg = ray.util.placement_group(
-                    [{"GPU": 1, "CPU": 1}] * total_required_gpus,
+                    pg_bundles,
                     # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
                     # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
                     # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
@@ -904,12 +905,9 @@ class MultiNodeInferenceEngine:
                 "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
-                    # If the controller occupies bundle 0, RayWorkerWrapper(rank=0) will stay
-                    # PENDING_CREATION forever, and engine init never completes.
-                    #
-                    # Reserve the *last* bundle for the controller; leave [0..worker_gpus-1]
-                    # available for vLLM workers.
-                    placement_group_bundle_index=total_required_gpus - 1,
+                    # Place the controller into a CPU-only bundle to avoid reserving an extra GPU
+                    # while keeping child task capture for vLLM's Ray worker actors.
+                    placement_group_bundle_index=total_required_gpus,
                     placement_group_capture_child_tasks=True,
                 )
             }

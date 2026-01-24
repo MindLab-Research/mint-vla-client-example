@@ -9,8 +9,10 @@ def main() -> int:
 
     required = [
         "controller_gpus = 0",
-        "controller_cpus = 0",
+        "controller_cpus = 1",
         "total_required_gpus = worker_gpus",
+        "pg_bundles = [{\"GPU\": 1, \"CPU\": 1}] * total_required_gpus + [{\"CPU\": controller_cpus}]",
+        "placement_group_bundle_index=total_required_gpus",
         "num_cpus=controller_cpus",
         "num_gpus=controller_gpus",
     ]
@@ -25,4 +27,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
