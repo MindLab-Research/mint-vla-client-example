@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import ray_log_to_driver_kwargs
+from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -1176,9 +1177,8 @@ class MegatronRankWorker:
         seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
-            chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                tokens = chunks[0]["tokens"]
+            tokens = flatten_encoded_text_chunks(model_input)
+            if tokens:
                 valid_items.append(item)
                 valid_indices.append(item_index)
                 seq_lengths.append(len(tokens))
@@ -1533,9 +1533,8 @@ class MegatronRankWorker:
         seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
-            chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                tokens = chunks[0]["tokens"]
+            tokens = flatten_encoded_text_chunks(model_input)
+            if tokens:
                 valid_items.append(item)
                 valid_indices.append(item_index)
                 seq_lengths.append(len(tokens))
