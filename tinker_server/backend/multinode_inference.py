@@ -228,6 +228,16 @@ def _create_multinode_vllm_actor(
             # Default to serializing multi-sample requests (num_samples>1) only.
             self._serialize_multisample = _env_flag("MINT_VLLM_SERIALIZE_MULTISAMPLE", default=True)
             self._multisample_lock = asyncio.Lock() if self._serialize_multisample else None
+            # For multinode, vLLM's `SamplingParams(n>1)` path has shown hangs even at low
+            # concurrency. Optionally implement multi-sample by issuing N independent n=1
+            # requests; rely on vLLM prefix caching to reuse the long prompt KV across calls.
+            #
+            # Modes:
+            # - "vllm_n": use `SamplingParams(n=N)` (default vLLM multisample)
+            # - "sequential_n1": run N sequential `SamplingParams(n=1)` requests
+            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "sequential_n1").strip().lower()
+            self._outer_to_subreq_ids: dict[str, set[str]] = {}
+            self._outer_to_subreq_lock = asyncio.Lock()
             self._generate_timeout_s = float(os.environ.get("MINT_VLLM_GENERATE_TIMEOUT_S", "0"))
             self._gate_lock = asyncio.Lock()
             self._active_generates = 0
@@ -466,6 +476,16 @@ def _create_multinode_vllm_actor(
         async def abort_request(self, request_id: str) -> None:
             """Abort an in-flight request in vLLM."""
             try:
+                async with self._outer_to_subreq_lock:
+                    sub_ids = list(self._outer_to_subreq_ids.get(request_id, ()))
+            except Exception:
+                sub_ids = []
+            try:
+                for sid in sub_ids:
+                    try:
+                        await self.engine.abort(sid)
+                    except Exception:
+                        pass
                 await self.engine.abort(request_id)
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine.abort_request failed: {type(e).__name__}: {e}")
@@ -505,6 +525,33 @@ def _create_multinode_vllm_actor(
             from vllm.lora.request import LoRARequest
 
             n_req = max(1, int(n))
+            if n_req > 1 and self._multisample_mode == "sequential_n1":
+                sub_ids = {f"{request_id}_s{i}" for i in range(n_req)}
+                try:
+                    async with self._outer_to_subreq_lock:
+                        self._outer_to_subreq_ids[request_id] = sub_ids
+                    outs: list[dict] = []
+                    for i in range(n_req):
+                        sub_id = f"{request_id}_s{i}"
+                        out = await self.generate(
+                            prompt_ids=prompt_ids,
+                            request_id=sub_id,
+                            lora_int_id=lora_int_id,
+                            lora_path=lora_path,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            logprobs=logprobs,
+                            n=1,
+                        )
+                        assert isinstance(out, dict)
+                        outs.append(out)
+                    return outs
+                finally:
+                    async with self._outer_to_subreq_lock:
+                        self._outer_to_subreq_ids.pop(request_id, None)
+
             sampling_params = SamplingParams(
                 max_tokens=max_tokens,
                 temperature=temperature,
