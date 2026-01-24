@@ -122,10 +122,17 @@ def _run_one(
         )["request_id"]
 
         while True:
+            if time.time() - t0 > call_timeout_s:
+                return OneResult(
+                    ok=False,
+                    elapsed_s=time.time() - t0,
+                    sequences=None,
+                    error=f"TimeoutError: retrieve_future exceeded {call_timeout_s}s",
+                )
             r = requests.post(
                 f"{base_url}/api/v1/retrieve_future",
                 json={"request_id": fut, "model_id": sampling_session_id},
-                timeout=call_timeout_s,
+                timeout=min(call_timeout_s, 30.0),
             )
             if r.status_code == 408:
                 time.sleep(poll_s)
