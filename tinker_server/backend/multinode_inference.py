@@ -492,10 +492,14 @@ def _create_multinode_vllm_actor(
                             lora_request=lora_request,
                         )
                         final_res = None
+                        by_index: dict[int, Any] | None = {} if sampling_params.n > 1 else None
                         while True:
                             out = await collector.get()
                             if first_tok_s is None:
                                 first_tok_s = time.perf_counter() - t0
+                            if by_index is not None:
+                                for oo in out.outputs:
+                                    by_index[int(oo.index)] = oo
                             final_res = out
                             if out.finished:
                                 break
@@ -534,8 +538,18 @@ def _create_multinode_vllm_actor(
                     "stop_reason": stop_reason,
                 }
 
+            assert by_index is not None
+            if len(by_index) != sampling_params.n:
+                raise RuntimeError(
+                    f"vLLM returned indices={sorted(by_index)} for n={sampling_params.n}"
+                )
+
+            if 0 not in by_index and len(by_index) == sampling_params.n:
+                keys = sorted(by_index)
+                if keys and keys[0] == 1 and keys[-1] == sampling_params.n:
+                    by_index = {k - 1: v for k, v in by_index.items()}
+
             outs: list[dict] = []
-            by_index: dict[int, Any] = {int(out.index): out for out in final_res.outputs}  # type: ignore[union-attr]
             for idx in range(sampling_params.n):
                 if idx not in by_index:
                     raise RuntimeError(
