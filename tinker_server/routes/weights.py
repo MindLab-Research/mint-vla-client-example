@@ -18,12 +18,14 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
+from ..checkpoints import safe_extract_checkpoint_archive, validate_checkpoint_dir
 from ..models.types import (
     CheckpointInfo,
+    CheckpointUploadResponse,
     CheckpointsListResponse,
     LoadStateRequest,
     SaveStateRequest,
@@ -372,6 +374,117 @@ async def _do_load_state(request_id: str, session, request: LoadStateRequest) ->
     except Exception as e:
         logger.error(f"[load_state] Failed: {e}", exc_info=True)
         future_store.fail(request_id, str(e))
+
+
+# =============================================================================
+# POST /checkpoints/upload - upload tar.gz archive for resume
+# =============================================================================
+
+
+@router.post("/checkpoints/upload", response_model=CheckpointUploadResponse)
+async def upload_checkpoint_archive(
+    http_request: Request,
+    file: UploadFile = File(...),
+) -> CheckpointUploadResponse:
+    """Upload a tar.gz checkpoint archive and register it for resume.
+
+    Stores extracted checkpoint under /checkpoints/{owner}/{checkpoint_id}/ with metadata.json.
+    Returns a checkpoint identifier usable by load_state/create_model_from_state.
+    """
+    import json
+    import tempfile
+
+    user_id = _get_user_id(http_request)
+    owner_dir = user_id or "anonymous"
+
+    checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
+    parent_dir = os.path.join(CHECKPOINTS_DIR, owner_dir)
+    final_dir = os.path.join(parent_dir, checkpoint_id)
+    tmp_dir = final_dir + ".tmp"
+    tmp_archive: str | None = None
+
+    os.makedirs(parent_dir, exist_ok=True)
+    if os.path.exists(final_dir):
+        raise HTTPException(status_code=409, detail="Checkpoint already exists")
+
+    try:
+        os.makedirs(tmp_dir, exist_ok=False)
+
+        fd, tmp_archive = tempfile.mkstemp(
+            dir=parent_dir,
+            prefix=f"upload_{checkpoint_id}_",
+            suffix=".tar.gz",
+        )
+        os.close(fd)
+
+        chunk_size = 8 * 1024 * 1024
+        with open(tmp_archive, "wb") as out:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+
+        safe_extract_checkpoint_archive(tmp_archive, tmp_dir)
+        validate_checkpoint_dir(tmp_dir)
+
+        # Optional metadata extraction from checkpoint files
+        model_id = None
+        model_name = None
+        step = None
+        try:
+            meta_path = os.path.join(tmp_dir, "training_meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                step = meta.get("current_step", step)
+        except Exception:
+            pass
+        try:
+            adapter_cfg_path = os.path.join(tmp_dir, "adapter_config.json")
+            if os.path.exists(adapter_cfg_path):
+                with open(adapter_cfg_path) as f:
+                    cfg = json.load(f)
+                model_name = cfg.get("base_model_name_or_path") or cfg.get("base_model") or model_name
+        except Exception:
+            pass
+        try:
+            existing_meta_path = os.path.join(tmp_dir, "metadata.json")
+            if os.path.exists(existing_meta_path):
+                with open(existing_meta_path) as f:
+                    existing = json.load(f)
+                model_id = existing.get("model_id") or model_id
+                model_name = existing.get("model_name") or model_name
+                step = existing.get("step") if step is None else step
+        except Exception:
+            pass
+
+        metadata = {
+            "checkpoint_id": checkpoint_id,
+            "owner_id": user_id,
+            "model_id": model_id,
+            "model_name": model_name,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "step": step,
+            "type": "training",
+        }
+        with open(os.path.join(tmp_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        os.rename(tmp_dir, final_dir)
+        return CheckpointUploadResponse(checkpoint_id=checkpoint_id, path=checkpoint_id)
+    except ValueError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        if tmp_archive is not None:
+            try:
+                os.unlink(tmp_archive)
+            except OSError:
+                pass
 
 
 # =============================================================================
