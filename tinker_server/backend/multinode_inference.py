@@ -886,6 +886,11 @@ class MultiNodeInferenceEngine:
         self.engine = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        # Avoid queueing multiple Ray tasks to the detached MultiNodeVLLMEngine actor.
+        # Empirically, multinode vLLM can wedge when multiple generate() calls are
+        # submitted concurrently (even if the actor serializes internally). Gate
+        # submission at the server-side wrapper so only one Ray task is in-flight.
+        self._submit_generate_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Initialize the multi-node vLLM engine."""
@@ -1333,46 +1338,47 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        ref = self.engine.generate.remote(
-            prompt_ids=prompt_ids,
-            request_id=request_id,
-            lora_int_id=lora_id,
-            lora_path=lora_path,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            logprobs=logprobs,
-        )
-        try:
-            if ray_get_timeout_s > 0:
-                result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-            else:
-                result = await asyncio.to_thread(ray.get, ref)
-        except ray.exceptions.GetTimeoutError as e:
-            # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
-            # Try aborting just this request, then fail loud to the client.
+        async with self._submit_generate_lock:
+            ref = self.engine.generate.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+            )
             try:
-                abort_ref = self.engine.abort_request.remote(request_id)
-                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
-            ) from e
-        except Exception as e:
-            try:
-                ray_kill.kill(
-                    self.engine,
-                    reason="multinode_vllm_ray_get_failed",
-                    actor_name=self.actor_name,
-                    namespace=PERSISTENT_NAMESPACE,
-                    no_restart=True,
-                    timeout_s=10,
-                )
-            except Exception:
-                pass
-            raise e
+                if ray_get_timeout_s > 0:
+                    result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+                else:
+                    result = await asyncio.to_thread(ray.get, ref)
+            except ray.exceptions.GetTimeoutError as e:
+                # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
+                # Try aborting just this request, then fail loud to the client.
+                try:
+                    abort_ref = self.engine.abort_request.remote(request_id)
+                    await asyncio.to_thread(ray.get, abort_ref, timeout=10)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
+                ) from e
+            except Exception as e:
+                try:
+                    ray_kill.kill(
+                        self.engine,
+                        reason="multinode_vllm_ray_get_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        timeout_s=10,
+                    )
+                except Exception:
+                    pass
+                raise e
 
         return GenerateResult(
             token_ids=result["token_ids"],
@@ -1409,45 +1415,46 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        ref = self.engine.generate.remote(
-            prompt_ids=prompt_ids,
-            request_id=request_id,
-            lora_int_id=lora_id,
-            lora_path=lora_path,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            logprobs=logprobs,
-            n=num_samples,
-        )
-        try:
-            if ray_get_timeout_s > 0:
-                raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-            else:
-                raw = await asyncio.to_thread(ray.get, ref)
-        except ray.exceptions.GetTimeoutError as e:
+        async with self._submit_generate_lock:
+            ref = self.engine.generate.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+                n=num_samples,
+            )
             try:
-                abort_ref = self.engine.abort_request.remote(request_id)
-                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
-            ) from e
-        except Exception as e:
-            try:
-                ray_kill.kill(
-                    self.engine,
-                    reason="multinode_vllm_ray_get_failed",
-                    actor_name=self.actor_name,
-                    namespace=PERSISTENT_NAMESPACE,
-                    no_restart=True,
-                    timeout_s=10,
-                )
-            except Exception:
-                pass
-            raise e
+                if ray_get_timeout_s > 0:
+                    raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
+                else:
+                    raw = await asyncio.to_thread(ray.get, ref)
+            except ray.exceptions.GetTimeoutError as e:
+                try:
+                    abort_ref = self.engine.abort_request.remote(request_id)
+                    await asyncio.to_thread(ray.get, abort_ref, timeout=10)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
+                ) from e
+            except Exception as e:
+                try:
+                    ray_kill.kill(
+                        self.engine,
+                        reason="multinode_vllm_ray_get_failed",
+                        actor_name=self.actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        no_restart=True,
+                        timeout_s=10,
+                    )
+                except Exception:
+                    pass
+                raise e
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
