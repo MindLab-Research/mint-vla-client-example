@@ -216,6 +216,7 @@ def _create_multinode_vllm_actor(
             self._timing = _env_flag("MINT_VLLM_REQUEST_TIMING", default=False)
             self._serialize_prompt_logprobs = _env_flag("MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE", default=False)
             self._prompt_logprobs_lock = asyncio.Lock() if self._serialize_prompt_logprobs else None
+            self._generate_lock = asyncio.Lock()
 
         @asynccontextmanager
         async def _lock_read(self):
@@ -424,29 +425,30 @@ def _create_multinode_vllm_actor(
             t0 = time.perf_counter()
             first_tok_s: float | None = None
             # Get final response
-            async with self._lock_read():
-                t1 = time.perf_counter()
-                generator = self.engine.generate(
-                    prompt=prompt,
-                    sampling_params=sampling_params,
-                    request_id=request_id,
-                    lora_request=lora_request,
-                )
-                if sampling_params.n == 1:
-                    final_res = None
-                    async for output in generator:
-                        if first_tok_s is None:
-                            first_tok_s = time.perf_counter() - t0
-                        final_res = output
-                    assert final_res is not None
-                else:
-                    by_index: dict[int, Any] = {}
-                    async for output in generator:
-                        if first_tok_s is None:
-                            first_tok_s = time.perf_counter() - t0
-                        for out in output.outputs:
-                            by_index[int(out.index)] = out
-                    final_res = None
+            async with self._generate_lock:
+                async with self._lock_read():
+                    t1 = time.perf_counter()
+                    generator = self.engine.generate(
+                        prompt=prompt,
+                        sampling_params=sampling_params,
+                        request_id=request_id,
+                        lora_request=lora_request,
+                    )
+                    if sampling_params.n == 1:
+                        final_res = None
+                        async for output in generator:
+                            if first_tok_s is None:
+                                first_tok_s = time.perf_counter() - t0
+                            final_res = output
+                        assert final_res is not None
+                    else:
+                        by_index: dict[int, Any] = {}
+                        async for output in generator:
+                            if first_tok_s is None:
+                                first_tok_s = time.perf_counter() - t0
+                            for out in output.outputs:
+                                by_index[int(out.index)] = out
+                        final_res = None
             t2 = time.perf_counter()
             if self._timing:
                 print(

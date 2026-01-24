@@ -123,22 +123,36 @@ async def _flush_coalesced_group(key: tuple, delay_s: float) -> None:
         return
 
     try:
-        results = await g["engine"].generate_many(
-            sampling_session_id=g["sampling_session_id"],
-            prompt_ids=g["prompt_ids"],
-            request_id=f"{g['leader_request_id']}_coalesced",
-            num_samples=len(waiters),
-            max_tokens=g["max_tokens"],
-            temperature=g["temperature"],
-            top_k=g["top_k"],
-            top_p=g["top_p"],
-            logprobs=True,
-        )
-        if len(results) != len(waiters):
-            raise RuntimeError(f"coalesce: got {len(results)} results for {len(waiters)} waiters")
-        for fut, res in zip(waiters, results):
-            if not fut.done():
-                fut.set_result(res)
+        if len(waiters) == 1:
+            res = await g["engine"].generate(
+                sampling_session_id=g["sampling_session_id"],
+                prompt_ids=g["prompt_ids"],
+                request_id=g["leader_request_id"],
+                max_tokens=g["max_tokens"],
+                temperature=g["temperature"],
+                top_k=g["top_k"],
+                top_p=g["top_p"],
+                logprobs=True,
+            )
+            if not waiters[0].done():
+                waiters[0].set_result(res)
+        else:
+            results = await g["engine"].generate_many(
+                sampling_session_id=g["sampling_session_id"],
+                prompt_ids=g["prompt_ids"],
+                request_id=f"{g['leader_request_id']}_coalesced",
+                num_samples=len(waiters),
+                max_tokens=g["max_tokens"],
+                temperature=g["temperature"],
+                top_k=g["top_k"],
+                top_p=g["top_p"],
+                logprobs=True,
+            )
+            if len(results) != len(waiters):
+                raise RuntimeError(f"coalesce: got {len(results)} results for {len(waiters)} waiters")
+            for fut, res in zip(waiters, results):
+                if not fut.done():
+                    fut.set_result(res)
     except Exception as e:
         for fut in waiters:
             if not fut.done():
