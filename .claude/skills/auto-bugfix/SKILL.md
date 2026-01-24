@@ -32,7 +32,7 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
-- Both the bugfixer and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
+- Orchestrator, bugfixer, and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
   If the issue references another issue/PR for context, read that too before acting.
 - Static-only reproductions/tests are forbidden. Do not close an issue based on source inspection (grep/AST/string checks).
 - Mock-only or stub-only "runtime" is not an acceptable substitute for an integrated repro when an integrated repro is feasible.
@@ -59,7 +59,10 @@ Hard rules:
     - Always run `python scripts/tools/smoke.py service` against the issue-scoped dev server after the fix (proves the server still boots and basic
       HTTP flows work).
     - Treat this as the baseline Ray connectivity sanity check (create_session must succeed).
-    - If the change touches sampling/inference: also run `python scripts/tools/smoke.py service --create-sampling-session`.
+    - If the change touches sampling/inference/vLLM:
+      - Also run `python scripts/tools/smoke.py service --create-sampling-session`.
+      - Do not accept "create_sampling_session succeeded" as sufficient evidence. Execute at least one end-to-end sample through the running system
+        (submit `/api/v1/asample`, then poll `/api/v1/retrieve_future` until ready) and assert on the returned payload (prefer: in `reproduce_issue_<N>.py`).
     - If the change touches training/checkpointing: run a minimal end-to-end call that exercises that path (issue-specific repro is preferred).
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
   - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.

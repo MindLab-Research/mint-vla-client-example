@@ -18,6 +18,8 @@ Non-negotiable rules:
   to real Ray (no stubs, no bypassing Ray).
 - For actor lifecycle / resource scheduling / placement-group bugs: a repro that only asserts on computed resource numbers / GPU counts is partial. The repro
   must create the affected session/engine in Ray and complete at least one request that uses it (e.g. create_sampling_session + asample + retrieve_future).
+- For sampling/inference/vLLM changes: do not treat "create_sampling_session succeeded" as sufficient. Your repro must submit a sample via `/api/v1/asample`
+  and retrieve it via `/api/v1/retrieve_future`, asserting on the returned payload (end-to-end through the running system).
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - Use issue-specific `TINKER_RAY_NAMESPACE` to isolate Ray actor state.
 - Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.
