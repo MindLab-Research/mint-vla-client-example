@@ -489,7 +489,8 @@ async def _do_sample(
                     request.topk_prompt_logprobs,
                 )
 
-            future_store.resolve(request_id, response.model_dump())
+            # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
+            future_store.resolve(request_id, response.model_dump(exclude={"type"}))
             logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
 
             # Log usage - separate prefill and sampling tokens
@@ -635,7 +636,8 @@ async def _do_compute_logprobs(
             )
 
         response = ComputeLogprobsResponse(logprobs=logprobs)
-        future_store.resolve(request_id, response.model_dump())
+        # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
+        future_store.resolve(request_id, response.model_dump(exclude={"type"}))
         logger.debug(
             f"Request {request_id} computed {len(logprobs)} logprobs"
         )
