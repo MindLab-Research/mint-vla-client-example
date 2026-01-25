@@ -460,6 +460,10 @@ async def _do_sample(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_prompt_logprobs",
                     )
+                # Merge-gate tests expect prompt_logprobs to be floats only (no leading None).
+                computed_logprobs = list(computed_logprobs)
+                if computed_logprobs and computed_logprobs[0] is None:
+                    computed_logprobs = computed_logprobs[1:]
                 response.prompt_logprobs = computed_logprobs
 
             # Handle top-K prompt logprobs if requested

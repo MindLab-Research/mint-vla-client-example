@@ -6,9 +6,7 @@ Pass criteria: DPO loss computes correctly, chosen logprobs > rejected logprobs.
 
 This test collects training curves and saves plots for visual inspection.
 
-NOTE: DPO loss function is NOT implemented in Mint server.
-Supported loss functions: cross_entropy, importance_sampling, ppo, cispo, dro.
-This test is SKIPPED until DPO is implemented.
+NOTE: Requires server-side loss_fn="dpo" support.
 """
 
 import numpy as np
@@ -174,7 +172,6 @@ def compute_dpo_metrics(result: dict) -> dict:
     }
 
 
-@pytest.mark.skip(reason="DPO loss function not implemented in Mint server")
 class TestDenseDPO:
     """Dense model DPO training tests."""
 
