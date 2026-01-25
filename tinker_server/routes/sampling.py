@@ -57,6 +57,47 @@ _SAMPLE_COALESCE_MAX_SAMPLES = int(os.environ.get("TINKER_SAMPLE_COALESCE_MAX_SA
 _sample_coalesce_lock = asyncio.Lock()
 _sample_coalesce_groups: dict[tuple, dict] = {}
 
+_lora_load_locks_guard = asyncio.Lock()
+_lora_load_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
+    async with _lora_load_locks_guard:
+        lock = _lora_load_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _lora_load_locks[session_id] = lock
+        return lock
+
+
+async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
+    if session_manager is None:
+        raise RuntimeError("Session manager not initialized")
+
+    lora_rank = session_manager.get_session_lora_rank(session_id)
+    if not lora_rank or int(lora_rank) <= 0:
+        return
+
+    if session_manager.is_session_lora_loaded(session_id):
+        return
+
+    adapter_path = session_manager.get_session_adapter_path(session_id)
+    if not adapter_path:
+        raise RuntimeError(f"Session {session_id} has lora_rank={lora_rank} but no adapter_path")
+
+    lock = await _get_lora_load_lock(session_id)
+    async with lock:
+        if session_manager.is_session_lora_loaded(session_id):
+            return
+
+        # Prefer path-based loading to avoid sending large tensors through Ray.
+        add_from_path = getattr(engine, "add_lora_for_session_from_path", None)
+        if add_from_path is None:
+            raise RuntimeError(f"Engine for session {session_id} does not support add_lora_for_session_from_path()")
+
+        await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
+        session_manager.mark_session_lora_loaded(session_id, True)
+
 
 def _prompt_fingerprint(token_ids: list[int]) -> bytes:
     # 32k token prompts are common; collisions must be negligible but hashing cost is amortized by prefill.
@@ -359,6 +400,8 @@ async def _do_sample(
                 engine = await session_manager.get_engine_for_session(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
+
+                await _ensure_session_lora_loaded(engine, session_id)
 
                 gen_many = getattr(engine, "generate_many", None)
                 can_coalesce = (

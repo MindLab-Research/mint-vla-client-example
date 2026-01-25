@@ -41,6 +41,7 @@ class SessionInfo:
     uses_base_model: bool = False  # True if multi-LoRA without any LoRA adapter
     base_model: str | None = None  # Base model name for multi-model support
     adapter_path: str | None = None  # Optional (ephemeral) adapter directory to cleanup
+    lora_loaded: bool = True  # For multi-LoRA sessions: whether LoRA is loaded into vLLM
     inflight_requests: int = 0  # Prevent cleanup while requests are running
 
 
@@ -492,6 +493,8 @@ class SessionManager:
         base_model: str,
         lora_rank: int = 32,
         adapter_path: str | None = None,
+        *,
+        lora_loaded: bool = True,
     ) -> None:
         """Register a sampling session that uses the shared multi-LoRA engine.
 
@@ -518,10 +521,39 @@ class SessionManager:
             uses_multi_lora=True,
             base_model=base_model,
             adapter_path=adapter_path,
+            lora_loaded=bool(lora_loaded),
         )
         logger.info(
             f"Registered multi-LoRA session {session_id} (model={base_model}, lora_rank={lora_rank})"
         )
+
+    def get_session_lora_rank(self, session_id: str) -> int | None:
+        info = self._sessions.get(session_id)
+        if info is None:
+            return None
+        info.last_activity = time.time()
+        return int(info.lora_rank)
+
+    def get_session_adapter_path(self, session_id: str) -> str | None:
+        info = self._sessions.get(session_id)
+        if info is None:
+            return None
+        info.last_activity = time.time()
+        return info.adapter_path
+
+    def is_session_lora_loaded(self, session_id: str) -> bool:
+        info = self._sessions.get(session_id)
+        if info is None:
+            return False
+        info.last_activity = time.time()
+        return bool(info.lora_loaded)
+
+    def mark_session_lora_loaded(self, session_id: str, loaded: bool = True) -> None:
+        info = self._sessions.get(session_id)
+        if info is None:
+            return
+        info.last_activity = time.time()
+        info.lora_loaded = bool(loaded)
 
     def is_multi_lora_session(self, session_id: str) -> bool:
         """Check if a session uses multi-LoRA mode.

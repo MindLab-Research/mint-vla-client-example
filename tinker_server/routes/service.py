@@ -10,7 +10,9 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import uuid
 from typing import TYPE_CHECKING
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # In-memory session storage
 sessions: dict[str, dict] = {}
@@ -226,26 +229,32 @@ async def create_sampling_session(
         return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id_remote)
 
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
-    multi_lora_engine = await session_manager.get_engine_for_model(base_model)
+    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
+    # Warm vLLM in the background; /asample work will await readiness.
+    async def _warm_engine() -> None:
+        try:
+            await session_manager.get_engine_for_model(base_model)
+        except Exception as e:
+            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
+
+    asyncio.create_task(_warm_engine())
 
     if request.model_path:
-        # Load LoRA weights from path into multi-LoRA engine
-        # Resolve path (file://, tinker://localhost, or absolute path)
+        # Resolve adapter directory (file://, mint://, absolute path).
         adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
 
-        # Load adapter weights and config from disk
-        state_dict, peft_config = _load_adapter_from_path(adapter_path, request.lora_rank)
+        # Fast validation: ensure weights exist; loading happens on first /asample.
+        weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+        if not os.path.exists(weights_path):
+            raise HTTPException(status_code=400, detail=f"Adapter weights not found: {weights_path}")
 
-        # Add LoRA to engine and register session
-        await multi_lora_engine.add_lora_for_session(
-            sampling_session_id=sampling_session_id,
-            state_dict=state_dict,
-            peft_config=peft_config,
-        )
+        # Register session now; LoRA will be loaded lazily on first /asample.
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,
             base_model=base_model,
             lora_rank=request.lora_rank,
+            adapter_path=adapter_path,
+            lora_loaded=False,
         )
     else:
         # Base model (no LoRA): register session directly
