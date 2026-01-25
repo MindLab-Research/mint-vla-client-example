@@ -1468,59 +1468,27 @@ class MultiNodeInferenceEngine:
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
 
-        try:
-            # Newer vLLM actors support multi-sample `n` in a single request.
-            ref = self.engine.generate.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                n=num_samples,
-            )
-            refs = ref
-            use_multi_sample = True
-        except TypeError as e:
-            # Backward-compat: older persistent vLLM actors may not accept `n`.
-            if "unexpected keyword argument 'n'" not in str(e):
-                raise
-            sub_request_ids = [f"{request_id}_s{i}" for i in range(int(num_samples))]
-            refs = [
-                self.engine.generate.remote(
-                    prompt_ids=prompt_ids,
-                    request_id=sub_id,
-                    lora_int_id=lora_id,
-                    lora_path=lora_path,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    logprobs=logprobs,
-                )
-                for sub_id in sub_request_ids
-            ]
-            use_multi_sample = False
+        ref = self.engine.generate.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            logprobs=logprobs,
+            n=num_samples,
+        )
         try:
             if ray_get_timeout_s > 0:
-                raw = await asyncio.to_thread(ray.get, refs, timeout=ray_get_timeout_s)
+                raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
             else:
-                raw = await asyncio.to_thread(ray.get, refs)
+                raw = await asyncio.to_thread(ray.get, ref)
         except ray.exceptions.GetTimeoutError as e:
             try:
-                if use_multi_sample:
-                    abort_ref = self.engine.abort_request.remote(request_id)
-                    await asyncio.to_thread(ray.get, abort_ref, timeout=10)
-                else:
-                    for sub_id in sub_request_ids:
-                        try:
-                            abort_ref = self.engine.abort_request.remote(sub_id)
-                            await asyncio.to_thread(ray.get, abort_ref, timeout=10)
-                        except Exception:
-                            pass
+                abort_ref = self.engine.abort_request.remote(request_id)
+                await asyncio.to_thread(ray.get, abort_ref, timeout=10)
             except Exception:
                 pass
             raise RuntimeError(
