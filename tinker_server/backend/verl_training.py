@@ -2585,7 +2585,6 @@ class DenseTrainerPool:
                 from tinker_server.backend.resource_pool import get_resource_pool, ActorType
 
                 resource_pool = get_resource_pool()
-                resource_pool.ensure_gpus_available(num_gpus)
 
                 actor = None
                 need_create = True
@@ -2635,6 +2634,7 @@ class DenseTrainerPool:
                         logger.warning(f"[DenseTrainerPool] Could not kill unhealthy actor: {kill_err}")
 
                 if need_create:
+                    resource_pool.ensure_gpus_available(num_gpus)
                     runtime_env = {
                         "env_vars": {
                             "PYTHONPATH": PFS_PYTHONPATH_DENSE,

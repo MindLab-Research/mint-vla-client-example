@@ -1,3 +1,9 @@
+"""Checkpoint path and archive helpers shared across routes.
+
+Issue #86: training resume failed due to inconsistent checkpoint directory defaults and
+checkpoint path resolvers between routes.
+"""
+
 from __future__ import annotations
 
 import glob
@@ -8,10 +14,11 @@ import tarfile
 from pathlib import Path
 
 DEFAULT_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/code/tinker-server/checkpoints"
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_CHECKPOINTS_DIR)
 
 
 def get_checkpoints_dir() -> str:
-    return os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_CHECKPOINTS_DIR)
+    return CHECKPOINTS_DIR
 
 
 def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
@@ -163,3 +170,7 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
         owner_dir = user_id or "anonymous"
         return os.path.join(checkpoints_dir, owner_dir, path_part)
     return uri
+
+
+def resolve_checkpoint_path(state_uri: str, *, user_id: str | None = None) -> str:
+    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR, user_id=user_id)

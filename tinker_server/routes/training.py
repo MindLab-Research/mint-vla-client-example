@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
+from ..checkpoints import CHECKPOINTS_DIR, resolve_checkpoint_path
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateModelFromStateRequest,
@@ -37,6 +38,7 @@ from ..models.types import (
     ForwardRequest,
     GetInfoRequest,
     GetInfoResponse,
+    LoRAConfig,
     ModelData,
     OptimStepRequest,
     ResetExpertBiasRequest,
@@ -82,6 +84,54 @@ def _get_webhook_url(request: Request) -> str | None:
     if user_data:
         return user_data.get("webhook_url")
     return None
+
+
+def _restore_training_session(model_id: str):
+    """Best-effort restore of a training session after API process restart."""
+    if training_engine is None or training_manager is None:
+        return None
+    try:
+        import ray
+        from ..backend.training_session_store import get_training_session_info
+
+        info = get_training_session_info(model_id)
+        if not isinstance(info, dict):
+            return None
+
+        lora_cfg = None
+        if info.get("lora_config"):
+            lora_cfg = LoRAConfig(**info["lora_config"])
+
+        session = training_manager.get_session(model_id)
+        if session is None:
+            session = training_manager.create_session(
+                model_id=model_id,
+                session_id=str(info.get("session_id", "")),
+                model_seq_id=int(info.get("model_seq_id", 0)),
+                base_model=str(info.get("base_model", "")),
+                lora_config=lora_cfg,
+                user_metadata=info.get("user_metadata") or {},
+                learning_rate=float(info.get("learning_rate", 1e-4)),
+            )
+
+        session.backend = str(info.get("backend", session.backend))
+        try:
+            session.current_step = int(info.get("current_step", session.current_step))
+        except Exception:
+            pass
+        session.is_active = True
+
+        actor_name = info.get("actor_name")
+        if actor_name:
+            namespace = str(info.get("namespace") or os.environ.get("MINT_RAY_NAMESPACE", "tinker"))
+            worker = ray.get_actor(actor_name, namespace=namespace)
+            getattr(training_engine, "_workers", {})[model_id] = worker
+            getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
+
+        return session
+    except Exception as e:
+        logger.exception(f"[{model_id}] restore_training_session failed: {e}")
+        return None
 
 
 def _generate_model_id(session_id: str, model_seq_id: int) -> str:
@@ -229,6 +279,25 @@ async def _do_create_model(
         # Create Ray actor - if this fails, session will be cleaned up in except block
         await training_engine.create_training_session(session)
 
+        try:
+            from ..backend.training_session_store import upsert_training_session
+
+            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+            upsert_training_session({
+                "model_id": model_id,
+                "session_id": request.session_id,
+                "model_seq_id": request.model_seq_id,
+                "base_model": request.base_model,
+                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "user_metadata": request.user_metadata or {},
+                "learning_rate": session.learning_rate,
+                "backend": session.backend,
+                "actor_name": actor_name,
+                "namespace": os.environ.get("MINT_RAY_NAMESPACE", "tinker"),
+            })
+        except Exception:
+            pass
+
         response = CreateModelResponse(
             request_id=request_id,
             model_id=model_id,
@@ -282,26 +351,8 @@ async def _do_create_model(
 # create_model_from_state - async (composes create_model + load_state)
 # =============================================================================
 
-# Checkpoint directory (shared filesystem required for distributed deployments)
-from ..checkpoints import get_checkpoints_dir
-
-CHECKPOINTS_DIR = get_checkpoints_dir()
-
-
 def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
-    """Convert mint://{model_id}/name or file:// to filesystem path.
-
-    Args:
-        state_uri: URI like tinker://{uuid}/..., mint://{uuid}/..., file://..., or absolute path.
-
-    Returns:
-        Filesystem path.
-    """
-    from ..checkpoints import resolve_checkpoint_uri
-
-    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR, user_id=user_id)
-
-
+    return resolve_checkpoint_path(state_uri, user_id=user_id)
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
@@ -414,6 +465,25 @@ async def _do_create_model_from_state(
             load_optimizer=request.load_optimizer,
         )
 
+        try:
+            from ..backend.training_session_store import upsert_training_session
+
+            actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(model_id)
+            upsert_training_session({
+                "model_id": model_id,
+                "session_id": request.session_id,
+                "model_seq_id": request.model_seq_id,
+                "base_model": request.base_model,
+                "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "user_metadata": request.user_metadata or {},
+                "learning_rate": session.learning_rate,
+                "backend": session.backend,
+                "actor_name": actor_name,
+                "namespace": os.environ.get("MINT_RAY_NAMESPACE", "tinker"),
+            })
+        except Exception:
+            pass
+
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
             f"(step={session.current_step})"
@@ -438,6 +508,12 @@ async def _do_create_model_from_state(
             except Exception:
                 pass  # Ignore cleanup errors
             training_manager.delete_session(model_id)
+        try:
+            from ..backend.training_session_store import delete_training_session
+
+            delete_training_session(model_id)
+        except Exception:
+            pass
         future_store.fail(request_id, str(e))
 
 
@@ -493,9 +569,9 @@ async def forward_backward(
 
     session = training_manager.get_session(request.model_id)
     if session is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{request.model_id}' not found"
-        )
+        session = _restore_training_session(request.model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     max_model_len = _get_max_model_len(session.base_model)
     if max_model_len is not None:
@@ -511,7 +587,51 @@ async def forward_backward(
 
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
-    background_tasks.add_task(_do_forward_backward, request_id, session, request, user_id)
+
+    try:
+        if training_engine is None:
+            raise RuntimeError("Training engine not initialized")
+
+        worker = getattr(training_engine, "_workers", {}).get(session.model_id)
+        if worker is None:
+            raise RuntimeError(f"Training worker not found for model_id={session.model_id}")
+
+        batch = request.forward_backward_input.data
+        token_count, max_seq_len = _compute_token_stats(batch)
+        msg = (
+            f"[{session.model_id}] forward_backward submit request_id={request_id} "
+            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
+            f"loss_fn={request.forward_backward_input.loss_fn}"
+        )
+        print(msg, flush=True)
+        logger.info(msg)
+
+        data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        loss_fn = request.forward_backward_input.loss_fn
+        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+
+        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(session.model_id)
+        future_store.submit(
+            request_id,
+            worker,
+            "forward_backward",
+            [data_items, loss_fn, loss_fn_config, session.model_id],
+            meta={"actor_name": actor_name, "model_id": session.model_id, "op": "forward_backward"},
+        )
+
+        if user_id:
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="forward_backward",
+                model_name=session.base_model,
+                token_count=token_count,
+                session_id=session.model_id,
+                request_id=request_id,
+            )
+    except Exception as e:
+        logger.exception(f"[forward_backward] submit failed: {e}")
+        future_store.fail(request_id, str(e))
+
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -573,9 +693,9 @@ async def train_step(
 
     session = training_manager.get_session(request.model_id)
     if session is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{request.model_id}' not found"
-        )
+        session = _restore_training_session(request.model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     max_model_len = _get_max_model_len(session.base_model)
     if max_model_len is not None:
@@ -654,6 +774,8 @@ async def forward(
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     session = training_manager.get_session(request.model_id)
+    if session is None:
+        session = _restore_training_session(request.model_id)
     if session is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
@@ -745,12 +867,39 @@ async def optim_step(
 
     session = training_manager.get_session(request.model_id)
     if session is None:
+        session = _restore_training_session(request.model_id)
+    if session is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
     request_id = future_store.create()
-    background_tasks.add_task(_do_optim_step, request_id, session, request)
+
+    try:
+        if training_engine is None:
+            raise RuntimeError("Training engine not initialized")
+
+        worker = getattr(training_engine, "_workers", {}).get(session.model_id)
+        if worker is None:
+            raise RuntimeError(f"Training worker not found for model_id={session.model_id}")
+
+        lr = request.adam_params.learning_rate if request.adam_params else None
+        msg = f"[{session.model_id}] optim_step submit request_id={request_id} lr={lr}"
+        print(msg, flush=True)
+        logger.info(msg)
+
+        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(session.model_id)
+        future_store.submit(
+            request_id,
+            worker,
+            "optim_step",
+            [lr, session.model_id],
+            meta={"actor_name": actor_name, "model_id": session.model_id, "op": "optim_step"},
+        )
+    except Exception as e:
+        logger.exception(f"[optim_step] submit failed: {e}")
+        future_store.fail(request_id, str(e))
+
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -799,6 +948,8 @@ async def reset_expert_bias(
 
     session = training_manager.get_session(request.model_id)
     if session is None:
+        session = _restore_training_session(request.model_id)
+    if session is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
@@ -830,6 +981,8 @@ async def save_weights_for_sampler(
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     session = training_manager.get_session(request.model_id)
+    if session is None:
+        session = _restore_training_session(request.model_id)
     if session is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
@@ -1032,9 +1185,9 @@ async def get_model_info(model_id: str):
 
     session = training_manager.get_session(model_id)
     if session is None:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{model_id}' not found"
-        )
+        session = _restore_training_session(model_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
     return {
         "model_id": session.model_id,
@@ -1059,6 +1212,8 @@ async def get_info(request: GetInfoRequest) -> GetInfoResponse:
         raise HTTPException(status_code=503, detail="Training manager not initialized")
 
     session = training_manager.get_session(request.model_id)
+    if session is None:
+        session = _restore_training_session(request.model_id)
     if session is None:
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
@@ -1119,6 +1274,12 @@ async def delete_model(model_id: str):
 
     await training_engine.shutdown_session(session)
     training_manager.delete_session(model_id)
+    try:
+        from ..backend.training_session_store import delete_training_session
+
+        delete_training_session(model_id)
+    except Exception:
+        pass
     # Clear ResourcePool session tracking even if shutdown_session couldn't find a worker
     # (e.g., deletion races with create_training_session still in-flight).
     try:

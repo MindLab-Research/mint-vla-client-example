@@ -22,7 +22,12 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, Up
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
-from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri, safe_extract_checkpoint_archive, validate_checkpoint_dir
+from ..checkpoints import (
+    CHECKPOINTS_DIR,
+    resolve_checkpoint_path,
+    safe_extract_checkpoint_archive,
+    validate_checkpoint_dir,
+)
 from ..models.types import (
     CheckpointInfo,
     CheckpointUploadResponse,
@@ -45,10 +50,6 @@ router = APIRouter()
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
-
-# Checkpoint directory (shared filesystem required for distributed deployments)
-# Must be an absolute path on shared storage for all Ray workers to access.
-CHECKPOINTS_DIR = get_checkpoints_dir()
 
 
 def _get_user_data(request: Request) -> dict | None:
@@ -85,7 +86,7 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
     Returns:
         Filesystem path.
     """
-    return resolve_checkpoint_uri(mint_uri, CHECKPOINTS_DIR, user_id=user_id)
+    return resolve_checkpoint_path(mint_uri, user_id=user_id)
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:

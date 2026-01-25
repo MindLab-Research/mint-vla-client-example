@@ -87,6 +87,25 @@ async def retrieve_future(
         return payload
 
     if status == FutureStatus.PENDING:
+        meta = None
+        try:
+            meta = future_store.get_meta(body.request_id)
+        except Exception:
+            meta = None
+        if isinstance(meta, dict):
+            actor_name = meta.get("actor_name")
+            session_id = meta.get("model_id")
+            if actor_name:
+                try:
+                    from ..backend.resource_pool import get_resource_pool
+
+                    rp = get_resource_pool()
+                    rp.touch(actor_name)
+                    if session_id:
+                        rp.set_session(actor_name, session_id)
+                except Exception:
+                    pass
+
         # Tinker client expects HTTP 408 for pending
         pending = pending_future_http_response()
         response.status_code = pending.status_code
