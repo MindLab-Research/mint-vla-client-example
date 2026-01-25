@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default inactivity timeout: 5 minutes
-DEFAULT_INACTIVITY_TIMEOUT = 300
+# Default inactivity timeout: 30 minutes
+DEFAULT_INACTIVITY_TIMEOUT = 1800
 
 # Reserved session ID for shared engine
 SHARED_ENGINE_SESSION_ID = "__shared__"
