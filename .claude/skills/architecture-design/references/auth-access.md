@@ -11,15 +11,16 @@ There are two authentication methods, checked in order:
    - Compared with constant-time string comparison.
    - On match: request is marked privileged with `request.state.user_data = {"user_id": "admin"}`.
 
-2. User tokens (`sk-...`, encrypted)
+2. User tokens (`sk-mint-...` or legacy `sk-...`, encrypted)
    - Enabled when `TINKER_TOKEN_SECRET_KEY` is set.
-   - Client sends an `sk-...` token that encodes user information.
+   - Client sends an encrypted token that encodes user information.
    - Server decrypts it via `TokenEncryptor` and stores the decoded dict into `request.state.user_data`.
 
 Headers supported:
 - `X-API-Key: ...` (preferred)
 - `Authorization: Bearer ...`
-- `Authorization: sk-...` (direct token)
+- `Authorization: sk-mint-...` (direct token)
+- `Authorization: sk-...` (legacy direct token)
 
 Privilege boundary:
 - `/api/v1/retrieve_future` hides detailed exception text unless the caller is privileged (admin).

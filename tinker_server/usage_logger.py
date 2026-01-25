@@ -174,21 +174,22 @@ class UsageLogger:
             user_id: User ID to summarize
 
         Returns:
-            Summary dict with total_tokens and operation_counts
+            Summary dict with total_tokens and operation_counts (token totals by operation type).
         """
         logs, _, _ = self.query_logs(user_id=user_id, limit=1_000_000)
 
         total_tokens = 0
-        operation_counts: dict[str, int] = {}
+        token_counts_by_type: dict[str, int] = {}
 
         for log in logs:
-            total_tokens += log.get("token_count", 0)
+            token_count = int(log.get("token_count", 0) or 0)
+            total_tokens += token_count
             op_type = log.get("operation_type", "unknown")
-            operation_counts[op_type] = operation_counts.get(op_type, 0) + 1
+            token_counts_by_type[op_type] = token_counts_by_type.get(op_type, 0) + token_count
 
         return {
             "total_tokens": total_tokens,
-            "operation_counts": operation_counts,
+            "operation_counts": token_counts_by_type,
         }
 
 

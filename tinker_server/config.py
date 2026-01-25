@@ -4,6 +4,10 @@ import os
 import secrets
 from dataclasses import dataclass
 
+# Ray namespace for all server-owned actors (vLLM, Megatron, trainer pools).
+# Override for concurrent dev runs on a shared Ray cluster.
+RAY_NAMESPACE = os.environ.get("TINKER_RAY_NAMESPACE", "tinker")
+
 # PFS paths for Ray worker runtime_env
 # NOTE: vLLM 0.12.0 requires PyTorch 2.9.0, which requires NCCL 2.21+
 # System has NCCL 2.x (older) - cannot use PFS PyTorch 2.9.0

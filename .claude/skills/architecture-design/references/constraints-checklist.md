@@ -3,7 +3,7 @@
 ## Design constraints that affect architecture
 
 - Ray actors keep the code they started with. If you change actor code, you must recreate the actor to observe the change.
-- Ray "GPU availability" is scheduling-level, not CUDA-memory-level. The server does extra placement logic (node-affinity, `ResourcePool`) to avoid placing vLLM on nodes with fragmented/held CUDA memory.
+- Ray "GPU availability" is scheduling-level, not CUDA-memory-level. Mint relies on `ResourcePool` eviction plus placement groups (Megatron + multi-node vLLM) to keep large GPU reservations schedulable.
 - Detached actors survive API restarts. Startup must reconcile: kill dead actors, register alive ones, and accept that in-process mappings (sessions, LoRA registries) may be lost.
 
 ## Architecture change checklist (project-specific)
@@ -25,4 +25,3 @@
 - Changing weight transfer
   - Choose Ray object store vs shared-path load based on tensor count and payload size.
   - Preserve Tinker semantics: sampling sessions expect frozen weights per `sampling_session_id`.
-

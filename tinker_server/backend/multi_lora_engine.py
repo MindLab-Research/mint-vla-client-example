@@ -11,13 +11,13 @@ import asyncio
 import logging
 import os
 import time
-from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import ray
 
 from . import ray_kill
+from .lora_registry import LoRARegistry, LoRASlotInfo
 
 if TYPE_CHECKING:
     pass
@@ -31,11 +31,13 @@ DEFAULT_MAX_LORA_RANK = 64  # Maximum supported rank
 
 # Well-known name for persistent vLLM actor
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
-# Fixed namespace for persistent actors (without this, each process gets random namespace)
-PERSISTENT_NAMESPACE = "tinker"
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.ray_utils import init_ray
+
+# Fixed namespace for persistent actors (without this, each process gets random namespace)
+PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
 # Import model registry
 from tinker_server.backend.model_registry import get_model_config
@@ -60,131 +62,6 @@ def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
     except Exception as e:
         logger.debug(f"Could not get node_id for actor: {e}")
     return None
-
-
-@dataclass
-class LoRASlotInfo:
-    """Metadata for a loaded LoRA adapter."""
-
-    lora_int_id: int
-    sampling_session_id: str
-    loaded_at: float = field(default_factory=time.time)
-    last_used: float = field(default_factory=time.time)
-
-
-class LoRARegistry:
-    """Maps sampling_session_id to lora_int_id with LRU tracking.
-
-    Each sampling session gets a unique lora_int_id for frozen weights.
-    Tracks usage for LRU eviction when GPU slots are exhausted.
-    """
-
-    def __init__(self):
-        self._session_to_id: dict[str, int] = {}
-        self._id_to_session: dict[int, str] = {}
-        self._slot_info: dict[int, LoRASlotInfo] = {}
-        self._lru_order: OrderedDict[int, None] = OrderedDict()  # LRU at front
-        self._next_id: int = 1
-        self._lock = asyncio.Lock()
-
-    async def allocate(self, sampling_session_id: str) -> int:
-        """Allocate a unique lora_int_id for a sampling session.
-
-        Args:
-            sampling_session_id: Unique identifier for the sampling session.
-
-        Returns:
-            Unique lora_int_id for this session.
-
-        Raises:
-            ValueError: If session already has an allocated ID.
-        """
-        async with self._lock:
-            if sampling_session_id in self._session_to_id:
-                raise ValueError(
-                    f"Session {sampling_session_id} already has lora_int_id "
-                    f"{self._session_to_id[sampling_session_id]}"
-                )
-
-            lora_id = self._next_id
-            self._next_id += 1
-
-            self._session_to_id[sampling_session_id] = lora_id
-            self._id_to_session[lora_id] = sampling_session_id
-            self._slot_info[lora_id] = LoRASlotInfo(
-                lora_int_id=lora_id,
-                sampling_session_id=sampling_session_id,
-            )
-            self._lru_order[lora_id] = None
-
-            logger.debug(
-                f"Allocated lora_int_id={lora_id} for session {sampling_session_id}"
-            )
-            return lora_id
-
-    async def get_lora_id(self, sampling_session_id: str) -> int | None:
-        """Get lora_int_id for a sampling session and update LRU.
-
-        Args:
-            sampling_session_id: The sampling session identifier.
-
-        Returns:
-            The lora_int_id if session exists, None otherwise.
-        """
-        async with self._lock:
-            lora_id = self._session_to_id.get(sampling_session_id)
-            if lora_id is not None:
-                # Update LRU order (move to end = most recently used)
-                self._lru_order.move_to_end(lora_id)
-                # Update last_used timestamp
-                if lora_id in self._slot_info:
-                    self._slot_info[lora_id].last_used = time.time()
-            return lora_id
-
-    async def get_lru_candidates(self, count: int) -> list[int]:
-        """Get the least recently used lora_int_ids for eviction.
-
-        Args:
-            count: Number of candidates to return.
-
-        Returns:
-            List of lora_int_ids in LRU order (oldest first).
-        """
-        async with self._lock:
-            candidates = []
-            for lora_id in self._lru_order:
-                if len(candidates) >= count:
-                    break
-                candidates.append(lora_id)
-            return candidates
-
-    async def remove(self, lora_id: int) -> str | None:
-        """Remove a lora_int_id from the registry.
-
-        Args:
-            lora_id: The lora_int_id to remove.
-
-        Returns:
-            The sampling_session_id that was removed, or None if not found.
-        """
-        async with self._lock:
-            session_id = self._id_to_session.pop(lora_id, None)
-            if session_id:
-                self._session_to_id.pop(session_id, None)
-                self._slot_info.pop(lora_id, None)
-                self._lru_order.pop(lora_id, None)
-                logger.debug(f"Removed lora_int_id={lora_id} (session {session_id})")
-            return session_id
-
-    async def count(self) -> int:
-        """Get the number of registered sessions."""
-        async with self._lock:
-            return len(self._session_to_id)
-
-    async def list_sessions(self) -> list[str]:
-        """List all registered sampling session IDs."""
-        async with self._lock:
-            return list(self._session_to_id.keys())
 
 
 @dataclass
@@ -253,7 +130,11 @@ class MultiLoRAInferenceEngine:
 
             if not ray.is_initialized():
                 # Use fixed namespace so detached actors can be found across process restarts
-                ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+                init_ray(
+                    address="auto",
+                    namespace=PERSISTENT_NAMESPACE,
+                    ignore_reinit_error=True,
+                )
 
             # Try to get existing persistent actor
             # Note: ray.get_actor succeeds even for dead actors (name still registered)
@@ -486,6 +367,7 @@ class MultiLoRAInferenceEngine:
                 name=self.actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 lifetime="detached",
+                max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 runtime_env={
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH,
@@ -817,6 +699,74 @@ class MultiLoRAInferenceEngine:
             stop_reason=result.get("stop_reason"),
         )
 
+    async def generate_many(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        num_samples: int,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = -1,
+        top_p: float = 1.0,
+        logprobs: bool = True,
+    ) -> list[GenerateResult]:
+        """Generate multiple sequences for the same prompt in a single vLLM request."""
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1 (got {num_samples})")
+
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
+
+        # Look up LoRA ID for this session (None = base model)
+        lora_id = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+
+        if lora_id is not None:
+            raw = await self.server.generate_with_lora.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                lora_int_id=lora_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+                n=num_samples,
+            )
+        else:
+            raw = await self.server.generate_base.remote(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                logprobs=logprobs,
+                n=num_samples,
+            )
+
+        if isinstance(raw, dict):
+            raw_list: list[dict] = [raw]
+        else:
+            raw_list = list(raw)
+
+        return [
+            GenerateResult(
+                token_ids=r["token_ids"],
+                logprobs=r.get("logprobs"),
+                stop_reason=r.get("stop_reason"),
+            )
+            for r in raw_list
+        ]
+
     async def compute_logprobs(
         self,
         sampling_session_id: str | None,
@@ -917,14 +867,14 @@ class MultiLoRAInferenceEngine:
         prompt_ids: list[int],
         request_id: str,
         k: int = 10,
-    ) -> list[dict[int, float] | None]:
+    ) -> list[list[tuple[int, float]] | None]:
         """Compute top-K tokens using session-specific LoRA or base model.
 
         If sampling_session_id is None or has no registered LoRA, uses base model.
 
         Returns a list of length len(prompt_ids), where:
         - topk[0] is None (first token has no conditioning context)
-        - topk[i] is a dict of token_id -> logprob for token i's distribution (i >= 1)
+        - topk[i] is a list of (token_id, logprob) pairs for token i's distribution (i >= 1)
 
         Args:
             sampling_session_id: The sampling session to use, or None for base model.
@@ -933,7 +883,7 @@ class MultiLoRAInferenceEngine:
             k: Number of top tokens to return.
 
         Returns:
-            List of dicts mapping token_id to logprob, length = len(prompt_ids).
+            List of per-position top-k lists, length = len(prompt_ids).
         """
         if not self._initialized:
             raise RuntimeError("Engine not initialized")
@@ -1139,7 +1089,14 @@ class MultiModelInferenceManager:
                             f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
                         )
                         del self._engines[model_name]
-                    except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                    except ray.exceptions.GetTimeoutError:
+                        # Actor tasks can queue behind long-running generations/logprobs.
+                        # A short timeout here is not evidence of death.
+                        logger.warning(
+                            f"Cached vLLM engine for {model_name} is busy during is_alive check; reusing cached engine"
+                        )
+                        return engine
+                    except ray.exceptions.RayActorError:
                         # Actor is dead, remove from cache and recreate
                         logger.warning(
                             f"Cached vLLM engine for {model_name} has dead actor, recreating"
@@ -1168,8 +1125,21 @@ class MultiModelInferenceManager:
                 model_max_loras = 1  # Default for MoE: minimal LoRA support
             else:
                 model_max_loras = self.max_loras
-            # Disable CPU LoRA cache if LoRA is disabled or MoE model
-            model_max_cpu_loras = 0 if model_max_loras == 0 or config.is_moe else self.max_cpu_loras
+
+            # Determine max_cpu_loras:
+            # - per-model override (if set)
+            # - LoRA disabled -> 0
+            # - MoE default -> vLLM default (None => max_cpu_loras=max_loras)
+            # - dense default -> global default
+            model_max_cpu_loras_override = getattr(config, "max_cpu_loras", None)
+            if model_max_cpu_loras_override is not None:
+                model_max_cpu_loras: int | None = int(model_max_cpu_loras_override)
+            elif model_max_loras == 0:
+                model_max_cpu_loras = 0
+            elif config.is_moe:
+                model_max_cpu_loras = None
+            else:
+                model_max_cpu_loras = self.max_cpu_loras
 
             # Use per-model max_lora_rank override if specified (K2 needs rank 8 to fit).
             # Large MoE models have huge LoRA buffers: 384 experts × rank × hidden_size.
@@ -1196,7 +1166,11 @@ class MultiModelInferenceManager:
             # vLLM v1 multiprocess TP has repeatedly failed to initialize for MoE TP>=4
             # (worker subprocess dies before emitting a root-cause stack trace). Use vLLM's
             # Ray distributed executor backend instead, even when the model fits on one node.
-            needs_multinode = config.total_gpus > 8 or (config.is_moe and config.total_gpus >= 4)
+            multinode_min_gpus = int(os.environ.get("MINT_MULTINODE_MIN_GPUS", "8"))
+            moe_multinode_min_gpus = int(os.environ.get("MINT_MOE_MULTINODE_MIN_GPUS", "4"))
+            needs_multinode = (config.total_gpus > multinode_min_gpus) or (
+                config.is_moe and config.total_gpus >= moe_multinode_min_gpus
+            )
 
             if needs_multinode:
                 # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
@@ -1226,6 +1200,7 @@ class MultiModelInferenceManager:
                     gpu_memory_utilization=model_gpu_util,
                     max_model_len=model_max_model_len,
                     max_loras=model_max_loras,
+                    max_cpu_loras=model_max_cpu_loras,
                     max_lora_rank=model_max_lora_rank,
                     max_num_seqs=model_max_num_seqs,
                     max_num_batched_tokens=config.max_num_batched_tokens,
@@ -1249,7 +1224,7 @@ class MultiModelInferenceManager:
                     max_model_len=model_max_model_len,
                     max_num_seqs=model_max_num_seqs,
                     max_loras=model_max_loras,
-                    max_cpu_loras=model_max_cpu_loras,
+                    max_cpu_loras=self.max_cpu_loras if model_max_cpu_loras is None else int(model_max_cpu_loras),
                     max_lora_rank=model_max_lora_rank,
                     actor_name=actor_name,
                     quantization=quantization,
@@ -1305,7 +1280,11 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
     from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        init_ray(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+        )
 
     resource_pool = get_resource_pool()
 
@@ -1385,7 +1364,11 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
     from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
     if not ray.is_initialized():
-        ray.init(address="auto", namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+        init_ray(
+            address="auto",
+            namespace=PERSISTENT_NAMESPACE,
+            ignore_reinit_error=True,
+        )
 
     def _is_actor_ready(actor) -> bool:
         """Return True if actor responds and (if supported) its engine is healthy.

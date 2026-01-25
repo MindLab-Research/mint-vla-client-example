@@ -80,8 +80,6 @@ State the problem precisely. Include:
 
 Omit anything that doesn't help fix the bug. No boilerplate headers. No padding.
 
-Quote the original user report at the end.
-
 ### Create
 
 ```bash

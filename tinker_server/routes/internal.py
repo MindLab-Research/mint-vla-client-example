@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from ..usage_logger import get_usage_logger
 
 # Checkpoint directory (shared filesystem)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "./checkpoints")
+CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
 
 router = APIRouter()
 
@@ -56,7 +56,7 @@ class UsageSummaryResponse(BaseModel):
     """Response for usage summary."""
 
     total_tokens: int
-    operation_counts: dict[str, int]
+    operation_counts: dict[str, int]  # token totals by operation type
 
 
 class HealthResponse(BaseModel):

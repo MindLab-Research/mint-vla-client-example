@@ -46,6 +46,7 @@ description: |
 - **NEVER** use `volcano-tinker-auth` unison profile - that's production
 - **NEVER** use `mint-prod-*.yaml` Ray configs - that's production
 - **NEVER** use `tinker-server-auth` directory - that's production
+- **NEVER** sync to `/vePFS-Mindverse/share/code/tinker-server` (shared; causes devs to clobber each other)
 - **NEVER** set `TINKER_PORT` - not needed for dev (uses default 8000)
 
 If user asks for production operations, **stop and invoke mint-prod skill instead**.
@@ -59,11 +60,42 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 | SSH Host | `volcano` |
 | Port | 8000 |
 | Code Directory | `tinker-server` |
-| PFS Path | `/vePFS-Mindverse/share/code/tinker-server` |
-| Unison Profile | `volcano-tinker` |
+| PFS Path | Required: `/vePFS-Mindverse/share/code/$USER/tinker-server` |
+| Unison Profile | Required: `volcano-tinker-$USER` |
 | Ray Configs | `mint-dev-head.yaml`, `mint-dev-worker.yaml` |
 | API Key | Not required (auth disabled when `TINKER_API_KEY` unset) |
 | Log File | `/tmp/tinker_server.log` |
+
+---
+
+## Concurrent Dev Runs (Issue #83)
+
+Goal: isolate code + detached Ray actor state across developers sharing the same dev Ray cluster.
+
+Required env vars:
+- `TINKER_RAY_NAMESPACE`: Ray namespace for all server-owned actors (default `tinker`)
+- `PFS_TINKER_PATH`: PFS code root used in Ray worker `runtime_env` `PYTHONPATH`
+
+### Unison Profile (Per-Developer)
+
+Create a per-developer profile (no shared PFS root):
+
+```bash
+mkdir -p ~/.unison
+sed "s/__PFS_USER__/$USER/g" .claude/skills/mint-dev/configs/volcano-tinker.prf > ~/.unison/volcano-tinker-$USER.prf
+
+# Start unison in background (explicit nohup)
+nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &
+```
+
+### Volcano Symlink (Per-Developer)
+
+Point the server working tree at the same per-developer PFS directory:
+
+```bash
+ssh volcano "rm -rf /root/tinker_project/tinker-server && \
+  ln -s /vePFS-Mindverse/share/code/$USER/tinker-server /root/tinker_project/tinker-server"
+```
 
 ---
 
@@ -110,34 +142,35 @@ curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 > **CRITICAL: ALWAYS USE DAEMON MODE (`-repeat watch`)**
 >
-> **NEVER** run one-off `unison volcano-tinker -batch` commands. This causes stale code on workers.
+> **NEVER** run one-off `unison volcano-tinker-$USER -batch` commands. This causes stale code on workers.
 
 > **PRE-FLIGHT CHECK:** Before ANY dev work, verify unison daemon is running:
 > ```bash
-> pgrep -af "unison.*volcano-tinker" || echo "WARNING: unison not running - server has outdated code!"
+> pgrep -af "unison.*volcano-tinker-$USER" || echo "WARNING: unison not running - server has outdated code!"
 > ```
-> If not running, start it first: `unison volcano-tinker -repeat watch`
+> If not running, start it first (explicit nohup): `nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &`
 
 ```bash
 # Start daemon (run first, keep running)
-unison volcano-tinker -repeat watch
+nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &
 
 # Check if running
-pgrep -af "unison.*volcano-tinker"
+pgrep -af "unison.*volcano-tinker-$USER"
 
 # Stop daemon
-pkill -f "unison.*volcano-tinker"
+pkill -f "[u]nison.*volcano-tinker-$USER" || true
 ```
 
 **First-time setup:**
 ```bash
-cp .claude/skills/mint-dev/configs/volcano-tinker.prf ~/.unison/
+mkdir -p ~/.unison
+sed "s/__PFS_USER__/$USER/g" .claude/skills/mint-dev/configs/volcano-tinker.prf > ~/.unison/volcano-tinker-$USER.prf
 ```
 
 **SSH server symlink setup** (one-time):
 ```bash
 ssh volcano "rm -rf /root/tinker_project/tinker-server && \
-  ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server"
+  ln -s /vePFS-Mindverse/share/code/$USER/tinker-server /root/tinker_project/tinker-server"
 ```
 
 ---
@@ -151,6 +184,15 @@ export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
+export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+# For concurrent dev runs, set this to a unique value (example: tinker_$USER).
+# export TINKER_RAY_NAMESPACE=tinker
+
+# MoE vLLM placement mode:
+# - Default: MINT_MOE_MULTINODE_MIN_GPUS=4, so Qwen3-30B (TP=4) uses MultiNodeInferenceEngine
+#   (Ray distributed executor, can spread TP across nodes; slower but schedules under GPU fragmentation).
+# - Set to 16 to force single-node MultiLoRAInferenceEngine for Qwen3-30B (requires 4 GPUs on one node).
+# export MINT_MOE_MULTINODE_MIN_GPUS=16
 ```
 
 **Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
@@ -158,17 +200,25 @@ export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
 ### Start Server
 
 ```bash
-ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
-  "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
+  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
-   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   TINKER_RAY_NAMESPACE=tinker_$USER \
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Stop Server
 
 ```bash
-ssh volcano 'pkill -f "python scripts/run_server.py"'
+ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+
+# If multiple server processes remain, force kill:
+ssh volcano 'pkill -9 -f "python scripts/run_server.py" 2>/dev/null || true'
+
+# Verify:
+ssh volcano 'ps aux | grep run_server | grep -v grep'
 ```
 
 ### Check Status
@@ -240,7 +290,7 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 > **Actor naming convention:**
 > - vLLM: `tinker_vllm_{model_name}` (e.g., `tinker_vllm_kimi-k2-thinking`)
 > - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi-k2-thinking`)
-> - Namespace: `tinker`
+> - Namespace: `TINKER_RAY_NAMESPACE` (default `tinker`)
 >
 > **When to kill actors:**
 > - Implementation code changed (actors cache old code)
@@ -250,10 +300,12 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ```bash
 # Kill vLLM actor for K2
 ssh volcano 'python3 -c "
+import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
-    actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=\"tinker\")
+    ns = os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\")
+    actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed vLLM actor\")
 except ValueError as e:
@@ -262,10 +314,12 @@ except ValueError as e:
 
 # Kill Megatron actor for K2
 ssh volcano 'python3 -c "
+import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
-    actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=\"tinker\")
+    ns = os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\")
+    actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed Megatron actor\")
 except ValueError as e:
@@ -274,11 +328,12 @@ except ValueError as e:
 
 # List all actors in tinker namespace (to find actor names)
 ssh volcano 'python3 -c "
+import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 actors = ray.util.list_named_actors(all_namespaces=True)
 for a in actors:
-    if \"tinker\" in str(a):
+    if os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\") in str(a):
         print(a)
 "'
 ```
@@ -294,12 +349,13 @@ for a in actors:
 ### Fast Restart (no vLLM changes)
 
 ```bash
-ssh volcano 'pkill -f "run_server" 2>/dev/null'
-ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
-  "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
+  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
-   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Full Restart (vLLM changes)
@@ -309,12 +365,13 @@ ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Restart server
-ssh volcano 'pkill -f "run_server" 2>/dev/null'
-ssh volcano 'cd /root/tinker_project/tinker-server && nohup bash -c \
-  "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
+  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
-   python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 
 # Wait for vLLM init (~80s)
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
@@ -435,7 +492,7 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 
 > **CRITICAL: Test Scripts Run LOCALLY, Not on Server**
 >
-> Test scripts that use HTTP API (pytest, test_client.py, etc.) run on your LOCAL machine.
+> Test scripts that use HTTP API (pytest, `scripts/tools/smoke.py service`, etc.) run on your LOCAL machine.
 > Local machine has internet access for downloading tokenizers from HuggingFace Hub.
 >
 > **Do NOT:**
@@ -451,7 +508,7 @@ ssh -f -N -L 8000:localhost:8000 volcano
 
 # Run test script LOCALLY (downloads tokenizer from HuggingFace)
 # CRITICAL: Always set TINKER_TELEMETRY=0 to prevent log flooding
-TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python scripts/test_client.py
+TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python scripts/tools/smoke.py service
 
 # Run merge gate tests LOCALLY
 TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m pytest .claude/skills/merge-gate/tests/ -v
@@ -519,7 +576,7 @@ ssh volcano 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
 
 | Symptom | Fix |
 |---------|-----|
-| Unison not running | `pgrep -af "unison.*volcano-tinker"` then restart daemon |
+| Unison not running | `pgrep -af "unison.*volcano-tinker-$USER"` then restart daemon |
 | Symlink broken | Re-run symlink setup command |
 | Server won't start | Check logs: `tail -100 /tmp/tinker_server.log` |
 | Can't connect | Check SSH tunnel, Ray cluster connection |

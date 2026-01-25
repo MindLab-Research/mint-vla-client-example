@@ -11,7 +11,7 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - Inference architecture (vLLM, multi-LoRA): `inference.md`
 - Training architecture (dense vs Megatron): `training.md`
 - Training multi-tenancy (state swap): `training-multitenancy.md`
-- Ray placement groups (Megatron worker groups): `placement-groups.md`
+- Ray placement groups (Megatron, multi-node vLLM, dense pool): `placement-groups.md`
 - Weights and checkpoints: `weights-checkpoints.md`
 - Auto eviction and GPU allocation: `eviction.md`
 - Authentication and model access: `auth-access.md`

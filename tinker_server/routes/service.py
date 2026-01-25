@@ -31,6 +31,7 @@ from ..models.types import (
     TelemetryRequest,
     TelemetryResponse,
 )
+from ..server_info import get_server_info
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -50,6 +51,13 @@ def _get_user_data(request: Request) -> dict | None:
     return getattr(request.state, "user_data", None)
 
 
+def _get_user_id(request: Request) -> str | None:
+    user_data = _get_user_data(request)
+    if user_data:
+        return user_data.get("user_id")
+    return None
+
+
 @router.get("/healthz")
 async def healthz() -> dict:
     """Health check endpoint."""
@@ -57,14 +65,73 @@ async def healthz() -> dict:
 
 
 @router.get("/get_server_capabilities")
-async def get_server_capabilities() -> dict:
+async def get_server_capabilities(http_request: Request) -> dict:
     """Return server capabilities for tinker client."""
-    from ..backend.model_registry import list_supported_models
+    from ..backend.model_registry import get_model_config, list_supported_models
+    from ..gateway import get_gateway_config, get_upstream_capabilities, upstream_for_model
 
-    supported = list_supported_models()
+    supported_local = list_supported_models()
+    cfg = get_gateway_config()
+
+    if cfg is None or not cfg.model_to_upstream:
+        supported = supported_local
+        return {
+            "supported_models": [
+                {
+                    "model_name": m,
+                    "max_context_length": get_model_config(m).max_model_len,
+                }
+                for m in supported
+            ],
+        }
+
+    incoming_headers = dict(http_request.headers)
+    remote_models = list(cfg.model_to_upstream.keys())
+
+    # Fetch capabilities once per upstream alias that has at least one routed model.
+    alias_to_caps: dict[str, dict[str, int]] = {}
+    for alias in set(cfg.model_to_upstream.values()):
+        upstream = cfg.upstreams.get(alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {alias!r}")
+        try:
+            alias_to_caps[alias] = await get_upstream_capabilities(
+                upstream=upstream, incoming_headers=incoming_headers
+            )
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"Upstream {alias!r} capabilities unavailable")
+
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for m in supported_local + remote_models:
+        if m in seen:
+            continue
+        seen.add(m)
+
+        if m in cfg.model_to_upstream:
+            upstream = upstream_for_model(m)
+            if upstream is None:
+                continue
+            caps = alias_to_caps.get(upstream.alias, {})
+            if m not in caps:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gateway misconfig: model {m!r} not present in upstream {upstream.alias!r} capabilities",
+                )
+            max_len = int(caps[m])
+        else:
+            max_len = int(get_model_config(m).max_model_len)
+
+        merged.append({"model_name": m, "max_context_length": max_len})
+
     return {
-        "supported_models": [{"model_name": m} for m in supported],
+        "supported_models": merged,
     }
+
+
+@router.get("/server_info")
+async def server_info() -> dict:
+    return get_server_info()
 
 
 @router.post("/create_session")
@@ -99,12 +166,13 @@ async def create_sampling_session(
         raise HTTPException(status_code=503, detail="Session manager not initialized")
 
     sampling_session_id = str(uuid.uuid4())
+    user_id = _get_user_id(http_request)
 
     # Determine base_model from request or infer from model_path
     base_model = request.base_model
     if not base_model and request.model_path:
         # Try to infer base_model from adapter_config.json
-        adapter_path = _resolve_model_path(request.model_path)
+        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
         base_model = _infer_base_model_from_adapter(adapter_path)
 
     if not base_model:
@@ -121,13 +189,49 @@ async def create_sampling_session(
             detail=get_access_denied_error(base_model)
         )
 
+    # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
+    # return upstream sampling_session_id (tracking it for subsequent asample routing).
+    from ..gateway import forward_json, register_remote_sampling_session, upstream_for_model
+
+    upstream = upstream_for_model(base_model)
+    if upstream is not None:
+        payload = request.model_dump()
+        payload["base_model"] = base_model
+        try:
+            resp = await forward_json(
+                upstream=upstream,
+                method="POST",
+                path="/api/v1/create_sampling_session",
+                incoming_headers=dict(http_request.headers),
+                json_body=payload,
+                timeout_s=90.0,
+            )
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"Upstream {upstream.alias!r} create_sampling_session failed")
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+        sampling_session_id_remote = data.get("sampling_session_id")
+        if not isinstance(sampling_session_id_remote, str) or not sampling_session_id_remote:
+            raise HTTPException(
+                status_code=502, detail="Upstream create_sampling_session returned invalid sampling_session_id"
+            )
+
+        register_remote_sampling_session(
+            sampling_session_id=sampling_session_id_remote,
+            upstream_alias=upstream.alias,
+            base_model=base_model,
+        )
+        return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id_remote)
+
     # Get or create engine for this model (dynamically creates vLLM actor if needed)
     multi_lora_engine = await session_manager.get_engine_for_model(base_model)
 
     if request.model_path:
         # Load LoRA weights from path into multi-LoRA engine
         # Resolve path (file://, tinker://localhost, or absolute path)
-        adapter_path = _resolve_model_path(request.model_path)
+        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
 
         # Load adapter weights and config from disk
         state_dict, peft_config = _load_adapter_from_path(adapter_path, request.lora_rank)
@@ -153,7 +257,7 @@ async def create_sampling_session(
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
 
-def _resolve_model_path(model_path: str) -> str:
+def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     """Resolve model_path URI to filesystem path.
 
     Args:
@@ -162,25 +266,19 @@ def _resolve_model_path(model_path: str) -> str:
     Returns:
         Absolute filesystem path to adapter directory.
     """
-    # Get checkpoint base directory
-    checkpoint_dir = os.environ.get(
-        "TINKER_CHECKPOINT_DIR",
-        os.path.join(os.getcwd(), "checkpoints")
-    )
+    from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 
-    if model_path.startswith("file://"):
-        return model_path[7:]  # Strip file:// prefix
-    elif model_path.startswith("tinker://"):
-        # tinker://{model_id}/{checkpoint_name}
-        path_part = model_path[len("tinker://"):]
-        return os.path.join(checkpoint_dir, path_part)
-    elif model_path.startswith("mint://"):
-        # Legacy mint://{model_id}/{checkpoint_name}
-        path_part = model_path[len("mint://"):]
-        return os.path.join(checkpoint_dir, path_part)
-    else:
-        # Assume absolute path
-        return model_path
+    checkpoint_dir = get_checkpoints_dir()
+    resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
+    if user_id and user_id != "admin":
+        resolved_real = os.path.realpath(resolved)
+        checkpoints_real = os.path.realpath(checkpoint_dir)
+        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, user_id))
+        if resolved_real.startswith(checkpoints_real + os.sep) and not resolved_real.startswith(
+            allowed_real + os.sep
+        ):
+            raise HTTPException(status_code=403, detail="Access denied")
+    return resolved
 
 
 def _infer_base_model_from_adapter(adapter_path: str) -> str | None:

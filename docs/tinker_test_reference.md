@@ -303,16 +303,13 @@ for i, topk in enumerate(sample_response.topk_prompt_logprobs):
 Output:
 ```
 Top-k Prompt Logprobs:
-
-
-TypeError: 'NoneType' object is not iterable
----------------------------------------------------------------------------
-TypeError                                 Traceback (most recent call last)
+Pos 0: None
+Pos 1: [(token_id, logprob), ...]
+Pos 2: [(token_id, logprob), ...]
 ...
-TypeError: 'NoneType' object is not iterable
 ```
 
-**Note:** `topk_prompt_logprobs` returns None - this appears to be unimplemented in the official Tinker server.
+For each position `i >= 1`, this returns up to `k` `(token_id, logprob)` pairs for the top-k most likely tokens at that position.
 
 ---
 
@@ -446,4 +443,4 @@ loss = -np.dot(logprobs, weights) / weights.sum()
 | Loss reduction | ~76% |
 | Sampling output | Pig Latin-like text |
 | prompt_logprobs[0] | 0.0 (no prior for first token) |
-| topk_prompt_logprobs | None (unimplemented) |
+| topk_prompt_logprobs | list[Optional[list[tuple[int, float]]]] (len=prompt length, first entry None) |

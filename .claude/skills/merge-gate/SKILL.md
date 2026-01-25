@@ -15,7 +15,7 @@ description: |
 
 ## Overview
 
-The merge gate validates that code on `develop` is ready to merge to `main`. It runs comprehensive tests covering all supported training modes (SFT, RL, DPO) on both Dense and MoE models.
+The merge gate validates that code on `develop` is ready to merge to `main`. It runs comprehensive tests covering Dense/MoE SFT+RL and API behavior. A DPO test exists but is skipped until server-side DPO is implemented.
 
 **Location:** `.claude/skills/merge-gate/tests/`
 
@@ -39,7 +39,7 @@ The merge gate runs in **two phases** with different cluster configurations:
 
 **Phase 1: Functional Tests (8 GPUs - one 8-GPU worker)**
 1. Start cluster with 8 GPUs
-2. Run ALL functional tests: Dense SFT/RL/DPO/API, MoE SFT/RL/API, Stress
+2. Run ALL functional tests: Dense SFT/RL/API, MoE SFT/RL/API, Stress
 3. **Do NOT kill actors between tests** - Dense and MoE coexist (Dense uses 1 GPU, MoE uses 4)
 4. Validates normal concurrent operation with shared GPU resources
 
@@ -137,7 +137,7 @@ curl -s http://localhost:8000/api/v1/healthz
 |------|-------------|---------------|----------|
 | **dense_sft** | Pig Latin translation (from tinker_test.ipynb) | Loss decreases >70% over 10 iterations | 3 min |
 | **dense_rl** | Arithmetic RL with PPO loss | Reward improves, ratio ~1.0 | 3 min |
-| **dense_dpo** | DPO on preference pairs | DPO loss computes, chosen > rejected | 2 min |
+| **dense_dpo** | DPO on preference pairs | SKIP (DPO loss not implemented) | 0 |
 | **dense_api** | Sampling, logprobs, checkpoint | All API operations succeed | 2 min |
 
 ### Phase 2: MoE Model Tests (Qwen3-30B-A3B-Instruct-2507)
@@ -187,14 +187,14 @@ The system supports multiple model variants. All variants of the same base model
 ```bash
 # Useful for rapid development testing
 TINKER_BASE_URL=http://localhost:8000 \
-python scripts/test_qwen3_06b.py
+python scripts/tools/smoke.py dense-train
 ```
 
 Stress test configurations (using Qwen3 models):
 - Client 1: Qwen3-0.6B, SFT, rank=16
 - Client 2: Qwen3-0.6B, RL, rank=32
 - Client 3: Qwen3-4B, SFT, rank=64
-- Client 4: Qwen3-8B, DPO, rank=32
+- Client 4: Qwen3-8B, SFT, rank=32
 - Client 5: Qwen3-0.6B, SFT, rank=16
 
 ---
@@ -236,7 +236,7 @@ ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-
   nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 MINT_MIN_ACTOR_AGE=0 \
-  python scripts/run_server.py" > /tmp/tinker_server.log 2>&1 &'
+  python scripts/run_server.py" >> /tmp/tinker_server.log 2>&1 &'
 
 # Wait for server to start
 sleep 10 && curl http://localhost:8000/api/v1/healthz
@@ -299,8 +299,7 @@ Chosen: "Short answer."
 Rejected: "Very long verbose answer with unnecessary details..."
 ```
 
-Uses DPO loss with beta=0.1.
-Expected: Chosen logprobs > rejected logprobs
+SKIP: DPO loss is not implemented server-side; `test_dense_dpo.py` is marked skipped.
 
 ### MoE SFT
 
@@ -461,7 +460,7 @@ This PR merges develop to main with the following changes:
 Merge gate passed (2025-12-15):
 - Dense SFT: PASS (loss 2.45 → 0.52, 79% reduction)
 - Dense RL: PASS (reward +0.23, ratio 1.02)
-- Dense DPO: PASS (chosen-rejected margin 0.15)
+- Dense DPO: SKIP (DPO loss not implemented)
 - Dense API: PASS
 - MoE SFT: PASS (loss 0.48 → 0.28, 42% reduction)
 - MoE RL: PASS
@@ -603,4 +602,3 @@ a pattern worth reviewing, but analysis shows implementation is correct.
 - Loss doesn't decrease but training runs without error (data or hyperparameters)
 - Timeout on operation that normally succeeds (timeout too short)
 - Anomaly flagged but pattern matches expected behavior
-

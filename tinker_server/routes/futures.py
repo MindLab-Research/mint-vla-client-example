@@ -7,6 +7,7 @@ Endpoints:
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..backend.future_store import FutureStatus, future_store
+from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
 
 router = APIRouter()
@@ -40,10 +41,50 @@ async def retrieve_future(
     try:
         status = future_store.get_status(body.request_id)
     except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown request_id: {body.request_id}",
+        from ..gateway import decode_request_id, forward_json, upstream_for_alias
+
+        decoded = decode_request_id(body.request_id)
+        if decoded is None:
+            raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
+
+        upstream_alias, upstream_request_id = decoded
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+        upstream_resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/retrieve_future",
+            incoming_headers=dict(http_request.headers),
+            json_body={"request_id": upstream_request_id},
+            timeout_s=30.0,
         )
+
+        response.status_code = upstream_resp.status_code
+        for k, v in upstream_resp.headers.items():
+            lk = k.lower()
+            if lk.startswith("x-") or lk == "retry-after":
+                response.headers[k] = v
+        try:
+            payload = upstream_resp.json()
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
+            )
+
+        # If the gateway uses an upstream credential (static_api_key), the upstream may treat
+        # the request as privileged. Preserve local error-masking semantics based on the caller.
+        if (
+            upstream_resp.status_code == 200
+            and isinstance(payload, dict)
+            and "error" in payload
+            and not _is_privileged(http_request)
+        ):
+            payload = dict(payload)
+            payload["error"] = GENERIC_ERROR_MESSAGE
+        return payload
 
     if status == FutureStatus.PENDING:
         meta = None
@@ -66,8 +107,10 @@ async def retrieve_future(
                     pass
 
         # Tinker client expects HTTP 408 for pending
-        response.status_code = 408
-        return {"queue_state": "active"}
+        pending = pending_future_http_response()
+        response.status_code = pending.status_code
+        response.headers.update(pending.headers)
+        return pending.body
     elif status == FutureStatus.FAILED:
         error = future_store.get_error(body.request_id)
         # Only expose full error details to privileged users

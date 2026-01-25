@@ -50,7 +50,7 @@ Implications:
 
 - `tinker_server/backend/multi_lora_engine.py`
   - Multi-tenant inference: one detached vLLM actor per base model, with many LoRA adapters loaded and selected by `lora_int_id`.
-  - Places vLLM actors onto nodes with actually-available GPUs (Ray availability does not account for CUDA memory held by other actors).
+  - Selects between single-node vLLM and `MultiNodeInferenceEngine` (Ray distributed vLLM) based on model config.
 
 - `tinker_server/backend/verl_inference.py`
   - vLLM-backed inference actor implementation and weight loading.

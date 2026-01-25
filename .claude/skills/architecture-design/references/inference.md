@@ -7,7 +7,6 @@
 3. `MultiLoRAInferenceEngine.initialize()` connects to an existing detached vLLM actor or creates a new one:
    - `namespace="tinker"` so actors can be rediscovered across server restarts.
    - detached lifetime so actors survive API server restarts.
-   - node-affinity scheduling to avoid co-locating with training actors that hold large CUDA allocations.
    - registers the actor in `ResourcePool` for LRU eviction and GPU accounting.
 4. If a LoRA adapter is provided, the server loads weights and registers them for the session:
    - Small/medium adapters: tensors transferred via Ray object store (`add_lora_with_id`).
@@ -16,13 +15,21 @@
    - `generate_with_lora` when `sampling_session_id` resolves to a `lora_int_id`
    - `generate_base` when no LoRA is registered for the session
 
-## Multi-node inference (TP > 8)
+## Multi-node inference (multi-node TP or MoE TP>=4)
 
-`MultiModelInferenceManager.get_engine()` selects a different engine implementation when a model requires more than one 8-GPU node:
-- `MultiNodeInferenceEngine` (in `tinker_server/backend/multinode_inference.py`) for `config.total_gpus > 8`.
+`MultiModelInferenceManager.get_engine()` selects a different engine implementation when vLLM must run via Ray distributed execution:
+- `MultiNodeInferenceEngine` (in `tinker_server/backend/multinode_inference.py`) for:
+  - `config.total_gpus > 8` (true multi-node TP), or
+  - `(config.is_moe and config.total_gpus >= 4)` (route MoE TP>=4 through the same engine even if it fits on one node).
 - `MultiLoRAInferenceEngine` otherwise.
 
-The multi-node engine is still a detached actor, but it relies on vLLM's Ray distributed backend to manage GPU workers, so the actor itself is created with `num_gpus=0`.
+Mechanics (MultiNodeInferenceEngine):
+- vLLM's Ray backend spawns 1-GPU worker actors and needs a controller process with CUDA visibility.
+- Mint creates:
+  - a detached placement group with `total_required_gpus = worker_gpus + 1` bundles (strategy `PACK`)
+  - a detached controller actor with `num_gpus=1`, pinned to the last bundle index
+  - child vLLM workers captured into the same placement group (`placement_group_capture_child_tasks=True`)
+- `ResourcePool` accounts for the full `total_required_gpus` so eviction decisions reflect the real cluster footprint.
 
 ## Why multi-LoRA is central
 

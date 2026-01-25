@@ -1,12 +1,18 @@
 # Unison profile: bidirectional sync between local and PFS
-# Install: cp volcano-tinker.prf ~/.unison/
-# Usage: unison volcano-tinker -repeat watch
+# Template: generate a per-user profile (no shared PFS root)
+# Install:
+#   mkdir -p ~/.unison
+#   sed "s/__PFS_USER__/$USER/g" volcano-tinker.prf > ~/.unison/volcano-tinker-$USER.prf
+# Usage (background; explicit nohup):
+#   nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &
+#
+# Remote root must be per-user: /vePFS-Mindverse/share/code/<user>/tinker-server
 #
 # PFS is single source of truth. Edit on either local machine or server.
 # Unison keeps both in sync, preferring newer changes.
 
 root = /home/yiwen/tinker_project/tinker-server
-root = ssh://volcano//vePFS-Mindverse/share/code/tinker-server
+root = ssh://volcano//vePFS-Mindverse/share/code/__PFS_USER__/tinker-server
 
 # Sync options
 auto = true

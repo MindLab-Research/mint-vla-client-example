@@ -31,7 +31,8 @@ from . import ray_kill
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.ray_utils import init_ray
 
 
 # =====================================================================
@@ -495,8 +496,8 @@ class TrainingWorker:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
                 - loss_fn_inputs.weights: per-token weights (float)
-                  For SFT: binary mask (0.0 or 1.0)
-                  For custom loss backward: negative gradients from client
+                  Interpreted as token-level coefficients applied to -logp (typically a 0/1 mask for SFT).
+                  Negative weights require loss_fn_config={"weights_are_coeffs": 1.0} (explicit; no sign-based inference).
                 For RL losses (importance_sampling, ppo), also needs:
                 - loss_fn_inputs.logprobs: old policy logprobs
                 - loss_fn_inputs.advantages: advantage estimates
@@ -514,8 +515,16 @@ class TrainingWorker:
         if session_id:
             self._ensure_session_loaded(session_id)
 
-        self.model.train()
         loss_fn_config = loss_fn_config or {}
+
+        # Custom vs standard must be explicit: never infer from weight sign.
+        # When weights are client-provided coefficients/gradients, callers should set
+        # loss_fn_config={"weights_are_coeffs": 1.0} so forward_backward matches forward()'s eval() mode.
+        weights_are_coeffs = bool(loss_fn_config.get("weights_are_coeffs", 0.0) >= 0.5)
+        if weights_are_coeffs:
+            self.model.eval()
+        else:
+            self.model.train()
 
         total_loss = 0.0
         total_tokens = 0
@@ -531,12 +540,20 @@ class TrainingWorker:
             model_input = item.get("model_input", {})
             loss_fn_inputs = item.get("loss_fn_inputs", {})
 
-            # Extract input token IDs from model_input.chunks[0].tokens
+            # Extract input token IDs from ALL chunks (not just chunks[0])
             chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                input_ids = chunks[0]["tokens"]
+            if chunks:
+                # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
+                input_ids = []
+                for chunk in chunks:
+                    if chunk.get("type") == "encoded_text" and "tokens" in chunk:
+                        input_ids.extend(chunk["tokens"])
+
+                if not input_ids:
+                    logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                    continue
             else:
-                logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
+                logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
                 continue
 
             # Extract target tokens and weights/mask
@@ -610,43 +627,26 @@ class TrainingWorker:
             targets_flat = target_ids_t.squeeze(0)  # [seq_len]
             weights_flat = weights_t.squeeze(0)  # [seq_len]
 
-            # Determine if this is custom loss backward (weights has negative values)
-            # or standard SFT/RL (weights are non-negative mask)
-            has_negative_weights = (weights_flat < 0).any().item()
+            if not weights_are_coeffs and (weights_flat < 0).any().item():
+                raise ValueError(
+                    "Negative weights require explicit loss_fn_config={\"weights_are_coeffs\": 1.0}; "
+                    "do not infer custom vs standard semantics from weight sign."
+                )
 
-            # For standard loss: average over non-zero weights
-            # For custom loss backward: sum without averaging (weights encode gradients)
-            if has_negative_weights:
-                # Custom loss backward: sum(ce * weights) without averaging
-                num_weighted = 1.0  # No averaging
-            else:
-                # Standard SFT/RL: average over weighted tokens
-                num_weighted = weights_flat.sum()
+            # Target logprobs are needed for all supported loss_fns.
+            log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)  # [seq_len, vocab]
+            target_logprobs = torch.gather(
+                log_probs, dim=-1, index=targets_flat.unsqueeze(-1)
+            ).squeeze(-1)  # [seq_len]
+
+            token_count = float((weights_flat != 0).sum().item())
 
             if loss_fn == "cross_entropy":
-                # Cross-entropy loss
-                ce_loss = torch.nn.functional.cross_entropy(
-                    logits_flat, targets_flat, reduction="none"
-                )  # [seq_len]
-                weighted_loss = ce_loss * weights_flat
-
-                if has_negative_weights:
-                    # Custom loss backward: sum without averaging
-                    loss = weighted_loss.sum()
-                elif num_weighted > 0:
-                    # Standard: average over weighted tokens
-                    loss = weighted_loss.sum() / num_weighted
-                else:
-                    loss = weighted_loss.sum()
-
+                # Contract: loss = sum(-logp * weight). Weights may be real-valued (including negative).
+                loss = -(target_logprobs * weights_flat).sum()
                 loss.backward()
+
                 item_loss = loss.item()
-
-                # Compute logprobs for training metrics (cookbook expects this)
-                # logprobs = log_softmax(logits)[targets]
-                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)
-                target_logprobs = log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
-
                 logprobs_list = target_logprobs.detach().tolist()
                 loss_fn_outputs.append({
                     "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
@@ -654,7 +654,7 @@ class TrainingWorker:
                 })
 
             elif loss_fn in ("importance_sampling", "ppo"):
-                # RL losses require old logprobs and advantages
+                # RL losses require old logprobs and advantages.
                 old_logprobs_data = loss_fn_inputs.get("logprobs", {})
                 advantages_data = loss_fn_inputs.get("advantages", {})
 
@@ -670,26 +670,17 @@ class TrainingWorker:
                 old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=self.device)
                 advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
 
-                # Compute new logprobs from current policy
-                log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)  # [seq_len, vocab]
-                new_logprobs = torch.gather(
-                    log_probs, dim=-1, index=targets_flat.unsqueeze(-1)
-                ).squeeze(-1)  # [seq_len]
+                new_logprobs = target_logprobs
 
-                # Compute importance ratio: exp(new_logprobs - old_logprobs)
-                # Clamp for numerical stability
+                # Compute importance ratio: exp(new_logprobs - old_logprobs).
+                # Clamp for numerical stability.
                 log_ratio = new_logprobs - old_logprobs_t
                 log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
                 ratio = torch.exp(log_ratio)
 
                 if loss_fn == "importance_sampling":
-                    # Policy gradient with importance sampling
-                    # loss = -ratio * advantages * weights
-                    pg_loss = -ratio * advantages_t * weights_flat
-                    if num_weighted > 0:
-                        loss = pg_loss.sum() / num_weighted
-                    else:
-                        loss = pg_loss.sum()
+                    # loss = -sum(ratio * advantages * weights)
+                    loss = (-ratio * advantages_t * weights_flat).sum()
 
                 else:  # ppo
                     # PPO with clipping
@@ -697,32 +688,28 @@ class TrainingWorker:
                     clip_low = loss_fn_config.get("clip_low", 1.0 - epsilon)
                     clip_high = loss_fn_config.get("clip_high", 1.0 + epsilon)
 
-                    # Unclipped objective
+                    # Unclipped objective (negated for minimization)
                     pg_loss1 = -advantages_t * ratio
 
-                    # Clipped objective
+                    # Clipped objective (negated for minimization)
                     clipped_ratio = torch.clamp(ratio, clip_low, clip_high)
                     pg_loss2 = -advantages_t * clipped_ratio
 
-                    # PPO objective: max(unclipped, clipped) for positive advantages
-                    # This prevents too large policy updates
-                    pg_loss = torch.maximum(pg_loss1, pg_loss2) * weights_flat
+                    # PPO loss is negative of objective: max(negated_unclipped, negated_clipped)
+                    loss = (torch.maximum(pg_loss1, pg_loss2) * weights_flat).sum()
 
-                    if num_weighted > 0:
-                        loss = pg_loss.sum() / num_weighted
-                    else:
-                        loss = pg_loss.sum()
-
-                    # Track clip fraction
+                    # Track clip fraction (fraction of masked tokens that were clipped).
                     clipped = ((ratio < clip_low) | (ratio > clip_high)).float() * weights_flat
-                    clipfrac = clipped.sum() / max(num_weighted, 1)
+                    denom = max(token_count, 1.0)
+                    clipfrac = clipped.sum() / denom
                     total_clipfrac += clipfrac.item()
 
                 loss.backward()
                 item_loss = loss.item()
 
                 # Track RL metrics
-                masked_ratio = (ratio * weights_flat).sum() / max(num_weighted, 1)
+                denom = max(token_count, 1.0)
+                masked_ratio = (ratio * weights_flat).sum() / denom
                 total_ratio += masked_ratio.item()
                 num_rl_samples += 1
 
@@ -735,10 +722,8 @@ class TrainingWorker:
             else:
                 raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-            # For metrics tracking: use absolute sum of weights for token count
-            effective_tokens = weights_flat.abs().sum().item() if has_negative_weights else num_weighted.item()
-            total_loss += item_loss * effective_tokens
-            total_tokens += effective_tokens
+            total_loss += item_loss
+            total_tokens += token_count
 
         avg_loss = total_loss / max(total_tokens, 1)
 
@@ -790,6 +775,10 @@ class TrainingWorker:
         if session_id:
             self._ensure_session_loaded(session_id)
 
+        # CRITICAL: Use eval() mode for deterministic forward pass
+        # In train() mode, dropout causes non-deterministic behavior, which breaks
+        # forward_backward_custom: the logprobs computed here differ from those
+        # recomputed in forward_backward(), causing gradient mismatch.
         self.model.eval()
 
         total_loss = 0.0
@@ -802,12 +791,20 @@ class TrainingWorker:
                 model_input = item.get("model_input", {})
                 loss_fn_inputs = item.get("loss_fn_inputs", {})
 
-                # Extract input token IDs from model_input.chunks[0].tokens
+                # Extract input token IDs from ALL chunks (not just chunks[0])
                 chunks = model_input.get("chunks", [])
-                if chunks and "tokens" in chunks[0]:
-                    input_ids = chunks[0]["tokens"]
+                if chunks:
+                    # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
+                    input_ids = []
+                    for chunk in chunks:
+                        if chunk.get("type") == "encoded_text" and "tokens" in chunk:
+                            input_ids.extend(chunk["tokens"])
+
+                    if not input_ids:
+                        logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                        continue
                 else:
-                    logger.warning("[TrainingWorker] No tokens in model_input, skipping item")
+                    logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
                     continue
 
                 # Extract target tokens and weights/mask
@@ -1408,7 +1405,11 @@ class VerlTrainingEngine:
         """Initialize Ray connection."""
         if not ray.is_initialized():
             # Use fixed namespace for persistent vLLM actor support
-            ray.init(address="auto", namespace="tinker", ignore_reinit_error=True)
+            init_ray(
+                address="auto",
+                namespace=RAY_NAMESPACE,
+                ignore_reinit_error=True,
+            )
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
     def _kill_session_actor(self, session: "TrainingSession") -> None:
@@ -1422,7 +1423,7 @@ class VerlTrainingEngine:
                     worker,
                     reason="session_timeout",
                     actor_name=actor_name,
-                    namespace="tinker",
+                    namespace=RAY_NAMESPACE,
                     no_restart=True,
                     model_id=model_id,
                 )
@@ -1434,7 +1435,7 @@ class VerlTrainingEngine:
         if not actor_name:
             return
         try:
-            actor = ray.get_actor(actor_name, namespace="tinker")
+            actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
         except Exception:
             return
         try:
@@ -1442,7 +1443,7 @@ class VerlTrainingEngine:
                 actor,
                 reason="session_timeout",
                 actor_name=actor_name,
-                namespace="tinker",
+                namespace=RAY_NAMESPACE,
                 no_restart=True,
                 model_id=model_id,
             )
@@ -1544,7 +1545,7 @@ class VerlTrainingEngine:
     async def create_training_session(self, session: TrainingSession) -> None:
         """Create Ray actor for session.
 
-        Routes MoE models to MegatronTrainingWorker, dense models to TrainingWorker.
+        Routes MoE models to MegatronWorkerGroup, dense models to DenseTrainerPool.
         Blocks until GPU is available (Ray queuing).
 
         Args:
@@ -1626,12 +1627,12 @@ class VerlTrainingEngine:
 
                 actor_name = _make_megatron_actor_name(base_model or requested_model or "")
                 try:
-                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
                     ray_kill.kill(
                         actor,
                         reason="megatron_create_timeout",
                         actor_name=actor_name,
-                        namespace="tinker",
+                        namespace=RAY_NAMESPACE,
                         no_restart=True,
                         model_id=model_id,
                         timeout_s=megatron_timeout_s,
@@ -2172,7 +2173,7 @@ class VerlTrainingEngine:
                         worker,
                         reason="shutdown_session",
                         actor_name=actor_name,
-                        namespace="tinker",
+                        namespace=RAY_NAMESPACE,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -2183,12 +2184,12 @@ class VerlTrainingEngine:
                 # in that case the worker isn't registered in self._workers yet, but we
                 # still want to kill the actor to unblock the pending create_model.
                 try:
-                    actor = ray.get_actor(actor_name, namespace="tinker")
+                    actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
                     ray_kill.kill(
                         actor,
                         reason="shutdown_session_race_no_worker",
                         actor_name=actor_name,
-                        namespace="tinker",
+                        namespace=RAY_NAMESPACE,
                         no_restart=True,
                         model_id=model_id,
                     )
@@ -2212,11 +2213,11 @@ class VerlTrainingEngine:
 # =====================================================================
 
 # Persistent actor naming
-PERSISTENT_DENSE_NAMESPACE = "tinker"
+PERSISTENT_DENSE_NAMESPACE = RAY_NAMESPACE
 PERSISTENT_DENSE_ACTOR_PREFIX = "dense_trainer_pool_"
 
 # PFS PYTHONPATH for worker processes
-PFS_PYTHONPATH_DENSE = "/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/vllm"
+PFS_PYTHONPATH_DENSE = PFS_PYTHONPATH
 
 
 @dataclass

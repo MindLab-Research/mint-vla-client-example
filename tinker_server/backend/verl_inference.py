@@ -28,7 +28,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.ray_utils import init_ray
 
 # Import model registry
 from tinker_server.backend.model_registry import get_model_config
@@ -77,10 +78,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             """Initialize with VLLMHijack applied first."""
             # Set PYTHONPATH in OS environment so vLLM's TP workers inherit it
             # Ray's runtime_env only sets it for this process, not multiprocessing children
-            # NOTE: Hardcode path since we can't import config before setting up path
             import os
             import sys
-            pfs_pythonpath = "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/tinker-server:/vePFS-Mindverse/share/huggingface/modules"
+            pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
                 if p and p not in sys.path:
@@ -99,6 +99,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             super().__init__(*args, **kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
+            self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
 
         async def is_engine_ready(self) -> bool:
             """Check if vLLM engine is properly initialized.
@@ -335,7 +342,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_k: int = -1,
             top_p: float = 1.0,
             logprobs: bool = True,
-        ) -> dict:
+            n: int = 1,
+        ) -> dict | list[dict]:
             """Generate with a specific LoRA adapter.
 
             For multi-LoRA: routes request to session-specific adapter.
@@ -349,6 +357,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k: Top-k sampling parameter.
                 top_p: Top-p sampling parameter.
                 logprobs: Whether to return log probabilities.
+                n: Number of sequences to sample for the same prompt.
 
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
@@ -375,6 +384,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
+                n=max(1, int(n)),
                 # EOS token handling for Qwen
                 stop_token_ids=[151645, 151643],
             )
@@ -401,31 +411,90 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Get final response
-            final_res = None
+            if sampling_params.n == 1:
+                t0 = time.perf_counter()
+                first_tok_s: float | None = None
+                final_res = None
+                async for output in generator:
+                    if first_tok_s is None:
+                        first_tok_s = time.perf_counter() - t0
+                    final_res = output
+                assert final_res is not None
+                if self._timing:
+                    print(
+                        f"[vLLM timing] generate_with_lora req={request_id} prompt_len={len(prompt_ids)} "
+                        f"max_tokens={max_tokens} n={sampling_params.n} lora_id={lora_int_id} "
+                        f"total_s={time.perf_counter() - t0:.3f} first_tok_s={first_tok_s}"
+                        ,
+                        flush=True,
+                    )
+
+                token_ids = list(final_res.outputs[0].token_ids)
+                log_probs = None
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                    log_probs = [
+                        logprobs[token_ids[i]].logprob
+                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                    ]
+
+                # Determine stop reason
+                stop_reason = "length"
+                if final_res.outputs[0].finish_reason == "stop":
+                    stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                    stop_reason = "stop"
+
+                return {
+                    "token_ids": token_ids,
+                    "logprobs": log_probs,
+                    "stop_reason": stop_reason,
+                }
+
+            t0 = time.perf_counter()
+            first_tok_s: float | None = None
+            by_index: dict[int, Any] = {}
             async for output in generator:
-                final_res = output
-            assert final_res is not None
+                if first_tok_s is None:
+                    first_tok_s = time.perf_counter() - t0
+                for out in output.outputs:
+                    by_index[int(out.index)] = out
+            if self._timing:
+                print(
+                    f"[vLLM timing] generate_with_lora req={request_id} prompt_len={len(prompt_ids)} "
+                    f"max_tokens={max_tokens} n={sampling_params.n} lora_id={lora_int_id} "
+                    f"total_s={time.perf_counter() - t0:.3f} first_tok_s={first_tok_s}"
+                    ,
+                    flush=True,
+                )
 
-            token_ids = list(final_res.outputs[0].token_ids)
-            log_probs = None
-            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+            if len(by_index) != sampling_params.n:
+                raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
 
-            # Determine stop reason
-            stop_reason = "length"
-            if final_res.outputs[0].finish_reason == "stop":
-                stop_reason = "stop"
-            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
-                stop_reason = "stop"
+            outs: list[dict] = []
+            for idx in range(sampling_params.n):
+                out = by_index[idx]
+                out_token_ids = list(out.token_ids)
+                out_log_probs = None
+                if sampling_params.logprobs is not None and out.logprobs:
+                    out_log_probs = [
+                        lp[out_token_ids[i]].logprob
+                        for i, lp in enumerate(out.logprobs)
+                    ]
 
-            return {
-                "token_ids": token_ids,
-                "logprobs": log_probs,
-                "stop_reason": stop_reason,
-            }
+                out_stop_reason = "length"
+                if out.finish_reason == "stop":
+                    out_stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                    out_stop_reason = "stop"
+
+                outs.append(
+                    {
+                        "token_ids": out_token_ids,
+                        "logprobs": out_log_probs,
+                        "stop_reason": out_stop_reason,
+                    }
+                )
+            return outs
 
         async def generate_base(
             self,
@@ -436,7 +505,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_k: int = -1,
             top_p: float = 1.0,
             logprobs: bool = True,
-        ) -> dict:
+            n: int = 1,
+        ) -> dict | list[dict]:
             """Generate using base model without any LoRA adapter.
 
             For multi-LoRA engine: generates with base model weights only.
@@ -449,6 +519,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k: Top-k sampling parameter.
                 top_p: Top-p sampling parameter.
                 logprobs: Whether to return log probabilities.
+                n: Number of sequences to sample for the same prompt.
 
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
@@ -474,6 +545,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
+                n=max(1, int(n)),
                 # EOS token handling for Qwen
                 stop_token_ids=[151645, 151643],
             )
@@ -489,31 +561,90 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Get final response
-            final_res = None
+            if sampling_params.n == 1:
+                t0 = time.perf_counter()
+                first_tok_s: float | None = None
+                final_res = None
+                async for output in generator:
+                    if first_tok_s is None:
+                        first_tok_s = time.perf_counter() - t0
+                    final_res = output
+                assert final_res is not None
+                if self._timing:
+                    print(
+                        f"[vLLM timing] generate_base req={request_id} prompt_len={len(prompt_ids)} "
+                        f"max_tokens={max_tokens} n={sampling_params.n} total_s={time.perf_counter() - t0:.3f} "
+                        f"first_tok_s={first_tok_s}"
+                        ,
+                        flush=True,
+                    )
+
+                token_ids = list(final_res.outputs[0].token_ids)
+                log_probs = None
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
+                    log_probs = [
+                        logprobs[token_ids[i]].logprob
+                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+                    ]
+
+                # Determine stop reason
+                stop_reason = "length"
+                if final_res.outputs[0].finish_reason == "stop":
+                    stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                    stop_reason = "stop"
+
+                return {
+                    "token_ids": token_ids,
+                    "logprobs": log_probs,
+                    "stop_reason": stop_reason,
+                }
+
+            t0 = time.perf_counter()
+            first_tok_s: float | None = None
+            by_index: dict[int, Any] = {}
             async for output in generator:
-                final_res = output
-            assert final_res is not None
+                if first_tok_s is None:
+                    first_tok_s = time.perf_counter() - t0
+                for out in output.outputs:
+                    by_index[int(out.index)] = out
+            if self._timing:
+                print(
+                    f"[vLLM timing] generate_base req={request_id} prompt_len={len(prompt_ids)} "
+                    f"max_tokens={max_tokens} n={sampling_params.n} total_s={time.perf_counter() - t0:.3f} "
+                    f"first_tok_s={first_tok_s}"
+                    ,
+                    flush=True,
+                )
 
-            token_ids = list(final_res.outputs[0].token_ids)
-            log_probs = None
-            if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+            if len(by_index) != sampling_params.n:
+                raise RuntimeError(f"vLLM returned {len(by_index)} sequences for n={sampling_params.n}")
 
-            # Determine stop reason
-            stop_reason = "length"
-            if final_res.outputs[0].finish_reason == "stop":
-                stop_reason = "stop"
-            elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
-                stop_reason = "stop"
+            outs: list[dict] = []
+            for idx in range(sampling_params.n):
+                out = by_index[idx]
+                out_token_ids = list(out.token_ids)
+                out_log_probs = None
+                if sampling_params.logprobs is not None and out.logprobs:
+                    out_log_probs = [
+                        lp[out_token_ids[i]].logprob
+                        for i, lp in enumerate(out.logprobs)
+                    ]
 
-            return {
-                "token_ids": token_ids,
-                "logprobs": log_probs,
-                "stop_reason": stop_reason,
-            }
+                out_stop_reason = "length"
+                if out.finish_reason == "stop":
+                    out_stop_reason = "stop"
+                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                    out_stop_reason = "stop"
+
+                outs.append(
+                    {
+                        "token_ids": out_token_ids,
+                        "logprobs": out_log_probs,
+                        "stop_reason": out_stop_reason,
+                    }
+                )
+            return outs
 
         async def generate(
             self,
@@ -688,12 +819,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
-        ) -> list[dict[int, float] | None]:
+        ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens and logprobs at each prompt position.
 
-            Returns topk[i] = dict of {token_id: logprob} for top-K tokens
-            at position i (predicting token i+1 given tokens 0..i).
+            Returns topk[i] = list of (token_id, logprob) pairs for position i.
             Output length is len(prompt_ids), with topk[0]=None.
+            Each non-None entry is sorted by logprob descending and truncated to <= k.
 
             Args:
                 prompt_ids: Input token IDs.
@@ -701,7 +832,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 k: Number of top tokens to return (default 10).
 
             Returns:
-                List of dicts, each mapping token_id to logprob.
+                List of per-position top-k lists.
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -717,6 +848,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return []
             if len(prompt_ids) == 1:
                 return [None]
+            if k <= 0:
+                return [None] * len(prompt_ids)
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -757,15 +890,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
 
-            result: list[dict[int, float] | None] = [None]
+            result: list[list[tuple[int, float]] | None] = [None]
             for i in range(1, len(prompt_ids)):
                 if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
                     result.append(None)
                     continue
-                pos_dict: dict[int, float] = {}
-                for token_id, logprob_obj in prompt_logprobs[i].items():
-                    pos_dict[token_id] = logprob_obj.logprob
-                result.append(pos_dict)
+                pos = [(int(token_id), float(lp.logprob)) for token_id, lp in prompt_logprobs[i].items()]
+                pos.sort(key=lambda x: x[1], reverse=True)
+                result.append(pos[:k])
 
             return result
 
@@ -853,11 +985,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             request_id: str,
             lora_int_id: int,
             k: int = 10,
-        ) -> list[dict[int, float] | None]:
+        ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens with specific LoRA adapter.
 
-            Returns topk[i] = dict of {token_id: logprob} for position i.
+            Returns topk[i] = list of (token_id, logprob) pairs for position i.
             Output length is len(prompt_ids), with topk[0]=None.
+            Each non-None entry is sorted by logprob descending and truncated to <= k.
 
             Args:
                 prompt_ids: Input token IDs.
@@ -866,7 +999,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 k: Number of top tokens to return.
 
             Returns:
-                List of dicts mapping token_id to logprob.
+                List of per-position top-k lists.
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -876,6 +1009,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return []
             if len(prompt_ids) == 1:
                 return [None]
+            if k <= 0:
+                return [None] * len(prompt_ids)
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -913,15 +1048,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
 
-            result: list[dict[int, float] | None] = [None]
+            result: list[list[tuple[int, float]] | None] = [None]
             for i in range(1, len(prompt_ids)):
                 if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
                     result.append(None)
                     continue
-                pos_dict: dict[int, float] = {}
-                for token_id, logprob_obj in prompt_logprobs[i].items():
-                    pos_dict[token_id] = logprob_obj.logprob
-                result.append(pos_dict)
+                pos = [(int(token_id), float(lp.logprob)) for token_id, lp in prompt_logprobs[i].items()]
+                pos.sort(key=lambda x: x[1], reverse=True)
+                result.append(pos[:k])
 
             return result
 
@@ -992,7 +1126,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
-        ) -> list[dict[int, float] | None]:
+        ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens using base model without any LoRA adapter.
 
             For multi-LoRA engine: computes top-K with base model weights only.
@@ -1003,7 +1137,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 k: Number of top tokens to return.
 
             Returns:
-                List of dicts mapping token_id to logprob.
+                List of per-position top-k lists.
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -1012,6 +1146,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return []
             if len(prompt_ids) == 1:
                 return [None]
+            if k <= 0:
+                return [None] * len(prompt_ids)
 
             sampling_params = SamplingParams(
                 max_tokens=1,
@@ -1038,15 +1174,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
 
-            result: list[dict[int, float] | None] = [None]
+            result: list[list[tuple[int, float]] | None] = [None]
             for i in range(1, len(prompt_ids)):
                 if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
                     result.append(None)
                     continue
-                pos_dict: dict[int, float] = {}
-                for token_id, logprob_obj in prompt_logprobs[i].items():
-                    pos_dict[token_id] = logprob_obj.logprob
-                result.append(pos_dict)
+                pos = [(int(token_id), float(lp.logprob)) for token_id, lp in prompt_logprobs[i].items()]
+                pos.sort(key=lambda x: x[1], reverse=True)
+                result.append(pos[:k])
 
             return result
 
@@ -1254,14 +1389,15 @@ class VerlInferenceEngine:
         from verl.workers.config import HFModelConfig, RolloutConfig
         from verl.workers.rollout.replica import RolloutMode
 
-        # Use our extended server with add_lora support
-        ExtendedVLLMHttpServer = _create_extended_server_class()
-
         if not ray.is_initialized():
             # Use 'auto' to connect to existing cluster if available
             # If no cluster, this falls back to starting a local Ray instance
             # Use fixed namespace for persistent vLLM actor support
-            ray.init(address='auto', namespace="tinker", ignore_reinit_error=True)
+            init_ray(
+                address="auto",
+                namespace=RAY_NAMESPACE,
+                ignore_reinit_error=True,
+            )
 
         # Compute total GPUs needed for MoE models
         # For EP (expert parallelism), total_gpus = TP * DP
@@ -1281,6 +1417,19 @@ class VerlInferenceEngine:
 
         # Use model registry as single source of truth for memory constraints.
         cfg = get_model_config(self.model_path)
+        if cfg.max_loras is not None:
+            max_loras = int(cfg.max_loras)
+        else:
+            max_loras = 1 if cfg.is_moe else 64
+        if cfg.max_cpu_loras is not None:
+            max_cpu_loras = int(cfg.max_cpu_loras)
+        else:
+            max_cpu_loras = max_loras
+        # Use our extended server with add_lora support
+        ExtendedVLLMHttpServer = _create_extended_server_class(
+            max_loras=max_loras,
+            max_cpu_loras=max_cpu_loras,
+        )
         max_model_len = cfg.max_model_len
         max_num_seqs = cfg.max_num_seqs or 256
         gpu_util = cfg.gpu_memory_utilization or self.gpu_memory_utilization
@@ -1343,6 +1492,7 @@ class VerlInferenceEngine:
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
         self.server = ExtendedVLLMHttpServer.options(
             num_gpus=total_gpus,
+            max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
             runtime_env={
                 "env_vars": {
                     "PYTHONPATH": PFS_PYTHONPATH,
@@ -1479,7 +1629,7 @@ class VerlInferenceEngine:
     async def shutdown(self) -> None:
         """Cleanup Ray actors."""
         if self.server:
-            ray_kill.kill(self.server, reason="verl_inference_shutdown", namespace="tinker")
+            ray_kill.kill(self.server, reason="verl_inference_shutdown", namespace=RAY_NAMESPACE)
             self.server = None
         self._initialized = False
         logger.info("VerlInferenceEngine shutdown")

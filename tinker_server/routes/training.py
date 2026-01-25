@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
-from ..checkpoints import resolve_checkpoint_path
+from ..checkpoints import CHECKPOINTS_DIR, resolve_checkpoint_path
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateModelFromStateRequest,
@@ -177,9 +177,6 @@ async def create_model(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(request.base_model, user_data):
@@ -187,6 +184,45 @@ async def create_model(
             status_code=403,
             detail=get_access_denied_error(request.base_model)
         )
+
+    # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
+    # return a gateway-encoded request_id so /retrieve_future can route it.
+    from ..gateway import (
+        encode_request_id,
+        forward_json,
+        register_remote_training_model,
+        upstream_for_model,
+    )
+
+    upstream = upstream_for_model(request.base_model)
+    if upstream is not None:
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/create_model",
+            incoming_headers=dict(http_request.headers),
+            json_body=request.model_dump(),
+            timeout_s=30.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream create_model returned invalid request_id")
+
+        model_id = _generate_model_id(request.session_id, request.model_seq_id)
+        register_remote_training_model(
+            model_id=model_id,
+            upstream_alias=upstream.alias,
+            base_model=request.base_model,
+        )
+        return UntypedAPIFuture(
+            request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
+        )
+
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
 
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
@@ -315,6 +351,8 @@ async def _do_create_model(
 # create_model_from_state - async (composes create_model + load_state)
 # =============================================================================
 
+def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
+    return resolve_checkpoint_path(state_uri, user_id=user_id)
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
@@ -326,9 +364,6 @@ async def create_model_from_state(
     Composes create_model + load_state into single operation.
     Useful for resuming training from a saved checkpoint.
     """
-    if training_engine is None or training_manager is None:
-        raise HTTPException(status_code=503, detail="Training engine not initialized")
-
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(request.base_model, user_data):
@@ -337,13 +372,51 @@ async def create_model_from_state(
             detail=get_access_denied_error(request.base_model)
         )
 
+    from ..gateway import (
+        encode_request_id,
+        forward_json,
+        register_remote_training_model,
+        upstream_for_model,
+    )
+
+    upstream = upstream_for_model(request.base_model)
+    if upstream is not None:
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/create_model_from_state",
+            incoming_headers=dict(http_request.headers),
+            json_body=request.model_dump(),
+            timeout_s=30.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream create_model_from_state returned invalid request_id")
+
+        model_id = _generate_model_id(request.session_id, request.model_seq_id)
+        register_remote_training_model(
+            model_id=model_id,
+            upstream_alias=upstream.alias,
+            base_model=request.base_model,
+        )
+        return UntypedAPIFuture(
+            request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
+        )
+
+    if training_engine is None or training_manager is None:
+        raise HTTPException(status_code=503, detail="Training engine not initialized")
+
     request_id = future_store.create()
-    background_tasks.add_task(_do_create_model_from_state, request_id, request)
+    user_id = _get_user_id(http_request)
+    background_tasks.add_task(_do_create_model_from_state, request_id, request, user_id)
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_create_model_from_state(
-    request_id: str, request: CreateModelFromStateRequest
+    request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
     try:
@@ -351,6 +424,19 @@ async def _do_create_model_from_state(
             raise RuntimeError("Training engine not initialized")
 
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
+
+        # Resolve state path (before creating a session/actor)
+        load_path = _resolve_state_path(request.state_path, user_id=user_id)
+        if user_id and user_id != "admin":
+            load_real = os.path.realpath(load_path)
+            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
+            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
+                allowed_real + os.sep
+            ):
+                raise PermissionError("Access denied")
+        if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(load_path):
+            raise FileNotFoundError(f"Checkpoint not found: {request.state_path}")
 
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
@@ -371,9 +457,6 @@ async def _do_create_model_from_state(
 
         # Create Ray actor
         await training_engine.create_training_session(session)
-
-        # Resolve state path
-        load_path = resolve_checkpoint_path(request.state_path)
 
         # Load checkpoint into the newly created model
         await training_engine.load_weights(
@@ -446,6 +529,41 @@ async def forward_backward(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform forward + backward pass on training data."""
+    from ..gateway import (
+        encode_request_id,
+        forward_json,
+        remote_training_model,
+        upstream_for_alias,
+    )
+
+    remote = remote_training_model(request.model_id)
+    if remote is not None:
+        upstream_alias, base_model = remote
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+        user_data = _get_user_data(http_request)
+        if not can_access_model(base_model, user_data):
+            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/forward_backward",
+            incoming_headers=dict(http_request.headers),
+            json_body=request.model_dump(),
+            timeout_s=300.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream forward_backward returned invalid request_id")
+        return UntypedAPIFuture(
+            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+        )
+
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
@@ -705,8 +823,45 @@ async def _do_forward(
 async def optim_step(
     request: OptimStepRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform optimizer step to update weights."""
+    from ..gateway import (
+        encode_request_id,
+        forward_json,
+        remote_training_model,
+        upstream_for_alias,
+    )
+
+    remote = remote_training_model(request.model_id)
+    if remote is not None:
+        upstream_alias, base_model = remote
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+        user_data = _get_user_data(http_request)
+        if not can_access_model(base_model, user_data):
+            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/optim_step",
+            incoming_headers=dict(http_request.headers),
+            json_body=request.model_dump(),
+            timeout_s=300.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream optim_step returned invalid request_id")
+        return UntypedAPIFuture(
+            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+        )
+
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
@@ -854,11 +1009,9 @@ async def _do_save_weights_for_sampler(
         if training_engine is None:
             raise RuntimeError("Training engine not initialized")
 
-        # Get checkpoint directory from environment or default
-        checkpoint_dir = os.environ.get(
-            "TINKER_CHECKPOINT_DIR",
-            os.path.join(os.getcwd(), "checkpoints")
-        )
+        from ..checkpoints import get_checkpoints_dir
+
+        checkpoint_dir = get_checkpoints_dir()
 
         # Determine checkpoint name
         if request.path is not None:

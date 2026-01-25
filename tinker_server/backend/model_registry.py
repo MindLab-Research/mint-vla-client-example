@@ -1,6 +1,10 @@
 """Model configuration registry for hardware requirements."""
 
-from dataclasses import dataclass
+import logging
+import os
+from dataclasses import dataclass, replace
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,6 +31,7 @@ class ModelConfig:
     Memory configuration:
         - gpu_memory_utilization: Override for vLLM memory utilization (None = use global default 0.85).
         - max_loras: Override max number of LoRAs (None = use default, 0 = disable LoRA).
+        - max_cpu_loras: Override vLLM CPU LoRA cache size (None = vLLM default).
         - max_lora_rank: Override max LoRA rank for inference (None = use global default).
         - max_model_len: vLLM context limit (required for all models).
 
@@ -46,6 +51,7 @@ class ModelConfig:
     # vLLM memory settings
     gpu_memory_utilization: float | None = None  # None = use global default (0.85), or override for large models
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
+    max_cpu_loras: int | None = None  # None = vLLM default (max_cpu_loras=max_loras)
     max_lora_rank: int | None = None  # None = use global default, or override for large models
     max_model_len: int  # vLLM context limit (required - no fallback)
     max_num_seqs: int | None = None  # None = use default (256), or lower for large MoE models with KV cache constraints
@@ -123,8 +129,17 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,  # 40K context - full model capability
-        max_num_seqs=8,  # Constrain KV cache; prompt_logprobs needs headroom at long context
+        # NOTE: vLLM's `max_num_seqs` caps the total number of *active sequences*,
+        # not the number of HTTP requests. When sampling uses `SamplingParams(n=8)`,
+        # a single prompt consumes up to 8 sequence slots. With `max_num_seqs=8`,
+        # the engine effectively runs prompts sequentially (no cross-prompt batching).
+        # With 32K prompts and SamplingParams(n=8), c=2 uses 16 active sequences.
+        # Keep headroom above that to avoid scheduler edge cases at the cap.
+        max_num_seqs=24,
         max_num_batched_tokens=1024,  # Avoid multi-GB logits buffers during prompt_logprobs
+        gpu_memory_utilization=0.90,  # Increase KV cache headroom for long-context concurrency
+        max_loras=8,
+        max_cpu_loras=16,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
@@ -286,9 +301,35 @@ def get_model_config(model_name: str) -> ModelConfig:
     Raises:
         ValueError: If model is not in the supported list
     """
+    def _int_env(name: str) -> int | None:
+        v = os.environ.get(name)
+        if v is None or v.strip() == "":
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            logger.warning(f"Ignoring invalid {name}={v!r} (expected int)")
+            return None
+
     # Normalize path to model name
     normalized = normalize_model_name(model_name)
-    return MODEL_CONFIGS[normalized]
+    cfg = MODEL_CONFIGS[normalized]
+
+    overrides: dict[str, int] = {}
+    for field, env_name in (
+        ("max_num_seqs", "MINT_VLLM_MAX_NUM_SEQS"),
+        ("max_num_batched_tokens", "MINT_VLLM_MAX_NUM_BATCHED_TOKENS"),
+        ("max_loras", "MINT_VLLM_MAX_LORAS"),
+        ("max_cpu_loras", "MINT_VLLM_MAX_CPU_LORAS"),
+        ("max_lora_rank", "MINT_VLLM_MAX_LORA_RANK"),
+    ):
+        v = _int_env(env_name)
+        if v is not None:
+            overrides[field] = v
+
+    if overrides:
+        cfg = replace(cfg, **overrides)
+    return cfg
 
 
 def get_training_parallelism(model_name: str) -> tuple[int, int, int, int]:

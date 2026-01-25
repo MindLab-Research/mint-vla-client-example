@@ -85,7 +85,8 @@ class SampleResponse(BaseModel):
     # Tinker SDK: first entry is None (first token has no conditioning context).
     prompt_logprobs: list[float | None] | None = None
     # Tinker SDK: first entry is None (no prior context for token 0).
-    topk_prompt_logprobs: list[dict[int, float] | None] | None = None
+    # Each subsequent entry is a list of (token_id, logprob) pairs.
+    topk_prompt_logprobs: list[list[tuple[int, float]] | None] | None = None
     type: Literal["sample"] = "sample"
 
 
@@ -435,6 +436,13 @@ class CheckpointsListResponse(BaseModel):
 
     model_id: str | None = None  # None for list-all endpoint
     checkpoints: list[CheckpointInfo]
+
+
+class CheckpointUploadResponse(BaseModel):
+    """Response from uploading a checkpoint archive."""
+
+    checkpoint_id: str
+    path: str
 
 
 class CreateModelFromStateRequest(BaseModel):

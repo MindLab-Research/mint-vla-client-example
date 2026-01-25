@@ -54,7 +54,7 @@ Idle behavior:
 ## MoE training: shared MegatronWorkerGroup with per-session isolation
 
 Actors:
-- MoE training uses a `MegatronWorkerGroup` (detached, num_gpus=0) that owns:
+- MoE training uses a `MegatronWorkerGroup` (detached controller actor, `num_gpus=0`) that owns:
   - a Ray placement group
   - N `MegatronRankWorker` actors, each with `num_gpus=1`
 

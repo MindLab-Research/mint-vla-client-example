@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run the tinker-server.
+"""Run the tinker-server (server-side).
 
 Usage:
     python scripts/run_server.py

@@ -1,11 +1,12 @@
-"""MegatronTrainingWorker - MoE training via verl's Megatron backend.
+"""Shared Megatron training utilities and deprecated MegatronTrainingWorker.
 
-This module provides Tinker API compatibility for MoE model training using
-verl's MegatronEngine, which handles:
-- Expert Parallelism (EP) for MoE layers
-- Tensor/Pipeline/Context Parallelism
-- LoRA via Megatron-Bridge
-- Offloading for memory efficiency
+This module provides:
+- Tinker Datum -> verl TensorDict conversion
+- Loss functions (SFT/PPO/logprobs)
+- is_moe_model() routing helper
+
+MegatronTrainingWorker remains for legacy single-process training and is not used by
+VerlTrainingEngine (which uses megatron_distributed.MegatronWorkerGroup).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     pass
 
 from tinker_server.backend.model_registry import get_model_config
+from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +145,8 @@ def tinker_to_tensordict(
         loss_fn_inputs = item.get("loss_fn_inputs", {})
 
         # Extract input tokens
-        chunks = model_input.get("chunks", [])
-        if chunks and "tokens" in chunks[0]:
-            tokens = chunks[0]["tokens"]
-        else:
+        tokens = flatten_encoded_text_chunks(model_input)
+        if not tokens:
             continue
 
         tokens_len = len(tokens)
@@ -867,9 +867,8 @@ class MegatronTrainingWorker:
         seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
-            chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                tokens = chunks[0]["tokens"]
+            tokens = flatten_encoded_text_chunks(model_input)
+            if tokens:
                 valid_items.append(item)
                 valid_indices.append(item_index)
                 seq_lengths.append(len(tokens))
@@ -1074,9 +1073,8 @@ class MegatronTrainingWorker:
         seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
-            chunks = model_input.get("chunks", [])
-            if chunks and "tokens" in chunks[0]:
-                tokens = chunks[0]["tokens"]
+            tokens = flatten_encoded_text_chunks(model_input)
+            if tokens:
                 valid_items.append(item)
                 valid_indices.append(item_index)
                 seq_lengths.append(len(tokens))
