@@ -90,13 +90,57 @@ RUN python -m pip install --no-cache-dir \
 ARG VLLM_WHEEL_URL=https://wheels.vllm.ai/811cdf5197acb4d6ab42250a5b0f822887d1190a/vllm-0.13.0rc2.dev207%2Bg811cdf519-cp38-abi3-manylinux_2_31_x86_64.whl
 RUN python -m pip install --no-cache-dir --upgrade "${VLLM_WHEEL_URL}"
 
+# vLLM MoE expert LoRA: patch LoRAModel.from_local_checkpoint unexpected-module check.
+RUN python - <<'PY'
+import pathlib
+
+import vllm
+
+p = pathlib.Path(vllm.__file__).resolve().parent / "lora" / "lora_model.py"
+content = p.read_text()
+
+old = """                if \".experts\" in module_name:
+                    expert_idx = module_name.find(\".experts\")
+                    expert_suffix = module_name[expert_idx + 1 :]
+                    if expert_suffix not in expected_lora_modules:
+                        unexpected_modules.append(module_name)
+"""
+
+new = """                if \".experts\" in module_name:
+                    # Handle expert patterns like: experts.0.gate_proj, experts.1.down_proj
+                    # Extract the module name after experts.{N}.
+                    import re
+                    VALID_EXPERT_SUFFIXES = {\"gate_proj\", \"up_proj\", \"down_proj\", \"w1\", \"w2\", \"w3\"}
+                    expert_match = re.search(r\"\\.experts\\.(\\d+)\\.(\\w+)$\", module_name)
+                    if expert_match:
+                        expert_module = expert_match.group(2)
+                        if expert_module not in VALID_EXPERT_SUFFIXES and \\
+                           expert_module not in expected_lora_modules and \\
+                           \"experts\" not in expected_lora_modules:
+                            unexpected_modules.append(module_name)
+                    else:
+                        if \"experts\" not in expected_lora_modules:
+                            unexpected_modules.append(module_name)
+"""
+
+if "VALID_EXPERT_SUFFIXES" in content:
+    print("vLLM MoE LoRA patch: already applied", p)
+elif old not in content:
+    raise RuntimeError(f"vLLM MoE LoRA patch: pattern not found in {p}")
+else:
+    p.write_text(content.replace(old, new))
+    print("vLLM MoE LoRA patch: applied", p)
+PY
+
 # Megatron-LM + Megatron-Bridge + verl: install from pinned commits (clean, no local dirty state).
 ARG MEGATRON_LM_REPO=https://github.com/NVIDIA/Megatron-LM.git
 ARG MEGATRON_LM_COMMIT=aa4ec99205a52187adead37cabceb678a2b6b975
-ARG MEGATRON_BRIDGE_REPO=https://github.com/HollowMan6/Megatron-Bridge.git
-ARG MEGATRON_BRIDGE_COMMIT=b2bb00a0e01112c2738b1865ca6e7cb65ae2f5c4
+ARG MEGATRON_BRIDGE_REPO=https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+# Includes HollowMan6 PRs (e.g. #1811, #1834) without requiring newer Megatron-LM experimental specs.
+ARG MEGATRON_BRIDGE_COMMIT=2e73984734ca17658b834633995a15b2536e1911
 ARG VERL_REPO=https://github.com/volcengine/verl.git
-ARG VERL_COMMIT=38246890efb50e60d2471ac2518cb512ba8361ba
+# Includes vLLM LoRA import compatibility for vllm>=0.13 (vllm.lora.lora_model).
+ARG VERL_COMMIT=2bb42bae6078359c3fdc56ba6c7533e76fc05407
 RUN mkdir -p /workspace \
   && git clone "${MEGATRON_LM_REPO}" /workspace/Megatron-LM \
   && git -C /workspace/Megatron-LM checkout "${MEGATRON_LM_COMMIT}" \
