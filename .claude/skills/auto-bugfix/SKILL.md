@@ -27,6 +27,11 @@ Responsibility split:
 - Bugfixer subagent: all reproduction, troubleshooting, debugging, code edits, and dev-server operations needed to make reproduction pass.
 - Reviewer subagent: independent review and a PR comment; no code changes.
 
+SOP step ownership (remove ambiguity):
+- Orchestrator runs: 3a-3c, 3h-3k.
+- Bugfixer runs: 3d-3g.
+- Reviewer runs: 3j (and blocks merge if evidence or explanation is missing).
+
 Hard rules:
 - Production is read-only. Use `mint-prod` skill if production reads are required.
 - Never substitute requirements. If reproduction fails, fix the real failure.
@@ -252,7 +257,7 @@ Bugfixer deliverable back to orchestrator:
 - the exact dev-server start/stop/log commands used (if relevant to troubleshooting)
 - any required updates to `.claude/skills/architecture-design/**`
 
-### 3d) Reproduce issue
+### 3d) Bugfixer: Reproduce issue
 
 Use the `bugfix` workflow:
 - Read the entire issue thread (body + all comments) before writing the repro.
@@ -265,7 +270,7 @@ Use the `bugfix` workflow:
   - `TINKER_BASE_URL=http://localhost:$TINKER_PORT TINKER_API_KEY=dummy python scripts/tools/smoke.py service`
 - Post the reproduction command(s) and observed output in the PR (so review does not rely on trust).
 
-### 3e) Fix issue
+### 3e) Bugfixer: Fix issue
 
 Implement the minimal root-cause fix.
 
@@ -274,17 +279,17 @@ After code changes:
 2) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
 3) confirm health endpoint
 
-### 3f) Re-run reproduction script
+### 3f) Bugfixer: Re-run reproduction script
 
 Re-run the exact reproduction script from 3d.
 
-### 3g) Update architecture docs if outdated
+### 3g) Bugfixer: Update architecture docs if outdated
 
 If behavior or operator workflow changed, update:
 - `.claude/skills/architecture-design/SKILL.md`
 - any affected `.claude/skills/architecture-design/references/*.md`
 
-### 3h) Commit (mindlab-bot identity) and push
+### 3h) Orchestrator: Commit (mindlab-bot identity) and push
 
 ```bash
 ISSUE=123
@@ -296,18 +301,48 @@ git -c user.name='mindlab-bot' -c user.email='contact@mindlab.ltd' \
 git push -u origin HEAD
 ```
 
-### 3i) Create PR (base=`develop`)
+### 3i) Orchestrator: Create PR (base=`develop`)
 
 Prefer including `Fixes #<NUMBER>` in the PR body so the linkage is explicit.
+
+PR body requirements (for accountability and reviewability):
+- Must explain the fix at idea level: what failed, why it failed, what changed conceptually.
+- Must not be only "Fixes #123" or "fixed #123".
+- Must not be a diff walkthrough ("changed A, changed B, changed C").
+- Use code snippets sparingly (only for a central invariant); keep snippets short.
+- Must include executable evidence: the exact repro command(s) and observed FAIL before / PASS after, plus smoke and `pytest -q`.
+
+Recommended PR body outline (Markdown):
+- Problem (1 paragraph)
+- Root cause (1 paragraph)
+- Fix (1-2 paragraphs, mention invariants and failure modes handled)
+- Evidence (bullets: commands and PASS/FAIL lines)
+- `Fixes #<NUMBER>` (last line)
 
 ```bash
 ISSUE=123
 BRANCH="bot/issue-$ISSUE"
 TITLE="$(gh issue view $ISSUE --json title -q .title)"
 
-PR_URL="$(gh pr create --base develop --head "$BRANCH" \
-  --title "Fix #$ISSUE: $TITLE" \
-  --body "Fixes #$ISSUE")"
+BODY="$(mktemp /tmp/pr-body.issue-$ISSUE.XXXXXX.md)"
+cat > "$BODY" <<'MD'
+Problem:
+<1 paragraph>
+
+Root cause:
+<1 paragraph>
+
+Fix:
+<1-2 paragraphs>
+
+Evidence:
+- <command> -> <FAIL/PASS line(s)>
+
+Fixes #ISSUE_NUMBER
+MD
+
+sed -i "s/#ISSUE_NUMBER/#$ISSUE/g" "$BODY"
+PR_URL="$(gh pr create --base develop --head "$BRANCH" --title "Fix #$ISSUE: $TITLE" --body-file "$BODY")"
 echo "$PR_URL"
 ```
 

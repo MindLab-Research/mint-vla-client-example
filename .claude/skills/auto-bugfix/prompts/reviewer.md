@@ -33,6 +33,8 @@ Inputs you will be given by the orchestrator:
 
 Review checklist:
 0) Did you review every hunk in the PR diff (not just the report/test results)?
+0a) Does the PR description explain the fix at idea level (problem, root cause, fix, evidence), without a diff walkthrough?
+    - If missing or too thin ("Fixes #123" only), recommendation must be iterate (request a rewritten PR body).
 1) Does the PR actually fix the issue described (not a workaround or requirement substitution)?
 2) Does the reproduction script actually exercise the running system (integrated HTTP to the issue-scoped dev server, with real deps), not source
    inspection and not direct handler calls with stubs?
@@ -88,6 +90,7 @@ Report content requirements:
 - Include a short issue digest (3-8 bullets) citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
 - The digest MUST include explicit acceptance criteria extracted from the issue/comments (expected behavior, required endpoints, required integrated flows).
 - Say whether the PR matches the issue scope (and where it does not).
+- Evaluate the PR description quality (accountability): does it explain problem, root cause, fix, and evidence without a diff walkthrough?
 - Include diff-driven review notes with file paths and line numbers / hunk headers (to demonstrate full diff coverage).
 - List concrete technical concerns with file paths and line numbers to inspect.
 - State what evidence is missing if the reproduction proof is incomplete.
