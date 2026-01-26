@@ -99,29 +99,33 @@ import vllm
 p = pathlib.Path(vllm.__file__).resolve().parent / "lora" / "lora_model.py"
 content = p.read_text()
 
-old = """                if \".experts\" in module_name:
-                    expert_idx = module_name.find(\".experts\")
-                    expert_suffix = module_name[expert_idx + 1 :]
-                    if expert_suffix not in expected_lora_modules:
-                        unexpected_modules.append(module_name)
-"""
+old = "\n".join([
+    '                if ".experts" in module_name:',
+    '                    expert_idx = module_name.find(".experts")',
+    '                    expert_suffix = module_name[expert_idx + 1 :]',
+    '                    if expert_suffix not in expected_lora_modules:',
+    '                        unexpected_modules.append(module_name)',
+    '',
+])
 
-new = """                if \".experts\" in module_name:
-                    # Handle expert patterns like: experts.0.gate_proj, experts.1.down_proj
-                    # Extract the module name after experts.{N}.
-                    import re
-                    VALID_EXPERT_SUFFIXES = {\"gate_proj\", \"up_proj\", \"down_proj\", \"w1\", \"w2\", \"w3\"}
-                    expert_match = re.search(r\"\\.experts\\.(\\d+)\\.(\\w+)$\", module_name)
-                    if expert_match:
-                        expert_module = expert_match.group(2)
-                        if expert_module not in VALID_EXPERT_SUFFIXES and \\
-                           expert_module not in expected_lora_modules and \\
-                           \"experts\" not in expected_lora_modules:
-                            unexpected_modules.append(module_name)
-                    else:
-                        if \"experts\" not in expected_lora_modules:
-                            unexpected_modules.append(module_name)
-"""
+new = "\n".join([
+    '                if ".experts" in module_name:',
+    '                    # Handle expert patterns like: experts.0.gate_proj, experts.1.down_proj',
+    '                    # Extract the module name after experts.{N}.',
+    '                    import re',
+    '                    VALID_EXPERT_SUFFIXES = {"gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"}',
+    '                    expert_match = re.search(r"\\.experts\\.(\\d+)\\.(\\w+)$", module_name)',
+    '                    if expert_match:',
+    '                        expert_module = expert_match.group(2)',
+    '                        if expert_module not in VALID_EXPERT_SUFFIXES and \\',
+    '                           expert_module not in expected_lora_modules and \\',
+    '                           "experts" not in expected_lora_modules:',
+    '                            unexpected_modules.append(module_name)',
+    '                    else:',
+    '                        if "experts" not in expected_lora_modules:',
+    '                            unexpected_modules.append(module_name)',
+    '',
+])
 
 if "VALID_EXPERT_SUFFIXES" in content:
     print("vLLM MoE LoRA patch: already applied", p)
