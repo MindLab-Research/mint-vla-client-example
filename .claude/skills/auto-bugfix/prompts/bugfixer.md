@@ -44,6 +44,7 @@ Process:
 9) Provide the orchestrator:
    - a short issue digest (3-8 bullets) citing specific issue comment(s) (URL or quoted detail). If the issue has 2+ comments, cite at least 2 comments.
      The digest MUST include explicit acceptance criteria extracted from the issue/comments (expected behavior, required endpoints, required integrated flows).
+   - a PR-ready explanation (high-level, no diff walkthrough): problem, root cause, fix strategy, and any remaining risk/unverified behavior
    - the exact reproduction command used
    - the smoke command used (and output)
    - the exact dev-server start/stop/log commands used (if relevant)
