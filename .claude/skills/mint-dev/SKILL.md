@@ -63,6 +63,7 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 | PFS Path | Required: `/vePFS-Mindverse/share/code/$USER/tinker-server` |
 | Unison Profile | Required: `volcano-tinker-$USER` |
 | Ray Configs | `mint-dev-head.yaml`, `mint-dev-worker.yaml` |
+| Dev GPU Queue | `q-20260124095758-ngkg7` (24 GPUs total) |
 | API Key | Not required (auth disabled when `TINKER_API_KEY` unset) |
 | Log File | `/tmp/tinker_server.log` |
 

@@ -60,7 +60,8 @@ http://<RAY_HEAD_IP>:8265
 | Queue ID | Type | Use Case |
 |----------|------|----------|
 | `q-20251225183621-m2297` | CPU | Ray head node (CPU-only instances) |
-| `q-20251126180002-26lwz` | GPU | GPU workers (A800 instances) |
+| `q-20260124095758-ngkg7` | GPU | Dev GPU workers (A800 instances, 24 GPUs total) |
+| `q-20251126180002-26lwz` | GPU | Prod GPU workers (A800 instances, 128 GPUs total) |
 
 **IMPORTANT:** CPU-only instances (ml.g2a.xlarge) MUST use the CPU queue. GPU instances MUST use the GPU queue.
 
