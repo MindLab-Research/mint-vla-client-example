@@ -78,6 +78,16 @@ print("torch.version.cuda:", torch.version.cuda)
 assert (torch.version.cuda or "").startswith("12.9"), f"expected CUDA 12.9.*, got {torch.version.cuda}"
 PY
 
+# Optional override: install a specific vLLM wheel (nightly or internal build).
+# If unset, keep the vLLM version resolved via uv.lock.
+ARG VLLM_WHEEL_URL=
+ARG VLLM_VERSION=0.13.0
+RUN if [[ -n "${VLLM_WHEEL_URL}" ]]; then \
+      python -m pip install --no-cache-dir --upgrade "${VLLM_WHEEL_URL}"; \
+    else \
+      python -m pip install --no-cache-dir --upgrade "vllm==${VLLM_VERSION}"; \
+    fi
+
 # vLLM patch for MoE expert LoRA support (idempotent).
 RUN python patches/apply_vllm_patch.py
 
@@ -103,4 +113,3 @@ RUN git clone "${VERL_REPO}" /root/verl \
 
 # Default command is intentionally minimal; Ray task YAMLs and server ops override this.
 CMD ["bash", "-lc", "python -c 'import torch; import vllm; print(torch.__version__, torch.version.cuda); print(vllm.__version__)' && sleep infinity"]
-
