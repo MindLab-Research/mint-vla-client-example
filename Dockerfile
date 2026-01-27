@@ -15,6 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # System deps: match volcano host baseline (Ubuntu 22.04) + build deps for python wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    aria2 \
     ca-certificates \
     curl \
     git \
@@ -40,16 +41,27 @@ RUN python -m pip install --no-cache-dir --upgrade \
   setuptools \
   wheel
 
-# Install torch/cu129 from PyTorch index.
+# Install torch/cu129 from PyTorch index (use PyPI for non-torch deps).
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu129
 ARG TORCH_VERSION=2.9.0+cu129
 ARG TORCHVISION_VERSION=0.24.0+cu129
 ARG TORCHAUDIO_VERSION=2.9.0+cu129
+# Work around a hash mismatch between the PyTorch simple index fragment and served bytes
+# for torch==2.9.0+cu129 (observed on 2026-01-27). Install torch via a direct wheel URL
+# and verify against a pinned sha256.
+ARG TORCH_WHEEL_URL=https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp310-cp310-manylinux_2_28_x86_64.whl
+ARG TORCH_WHEEL_SHA256=ad65507bb786c77693ecbab43dcb764019bab53f916d675780d1aa7a6c08d63e
+RUN set -euo pipefail \
+  && aria2c -x 8 -s 8 -k 1M -o torch.whl -d /tmp "${TORCH_WHEEL_URL}" \
+  && echo "${TORCH_WHEEL_SHA256}  /tmp/torch.whl" | sha256sum -c - \
+  && python -m pip install --no-cache-dir /tmp/torch.whl \
+  && rm -f /tmp/torch.whl
+
 RUN python -m pip install --no-cache-dir \
-    --index-url "${TORCH_INDEX_URL}" \
-    "torch==${TORCH_VERSION}" \
-    "torchvision==${TORCHVISION_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}"
+  --index-url https://pypi.org/simple \
+  --extra-index-url "${TORCH_INDEX_URL}" \
+  "torchvision==${TORCHVISION_VERSION}" \
+  "torchaudio==${TORCHAUDIO_VERSION}"
 
 # Verify torch CUDA build + critical CUDA user-space package versions.
 # (Do not override torch's pinned nvidia-* deps: mismatched versions can silently break runtime.)
