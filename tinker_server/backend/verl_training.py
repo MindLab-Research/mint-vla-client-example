@@ -495,7 +495,7 @@ class TrainingWorker:
             data_items: List of serialized Datum dicts with:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
-                - loss_fn_inputs.weights: per-token weights (float)
+                - loss_fn_inputs.weights: per-token loss coefficients (float, can be positive, negative, or zero)
                   Interpreted as token-level coefficients applied to -logp (typically a 0/1 mask for SFT).
                 For RL losses (importance_sampling, ppo), also needs:
                 - loss_fn_inputs.logprobs: old policy logprobs
