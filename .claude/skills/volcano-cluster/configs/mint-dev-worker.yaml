@@ -24,12 +24,12 @@ Entrypoint: |
   ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=8 && sleep infinity
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
-ResourceQueueID: "q-20251126180002-26lwz"  # GPU queue for workers
+ResourceQueueID: "q-20260124095758-ngkg7"  # GPU queue for dev workers
 Framework: "Custom"
 
 TaskRoleSpecs:
     - RoleName: "worker"
-      RoleReplicas: 1  # 1 replica = 8 GPUs. Adjust as needed.
+      RoleReplicas: 3  # 3 replicas = 24 GPUs (fills dev GPU queue). Adjust as needed.
       Flavor: "ml.hpcpni2l.28xlarge"  # 8x A800 80GB (RDMA)
 
 # No timeout (0 = unlimited)

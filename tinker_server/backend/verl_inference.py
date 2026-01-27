@@ -338,6 +338,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             request_id: str,
             lora_int_id: int,
             max_tokens: int,
+            stop: object | None = None,
             temperature: float = 1.0,
             top_k: int = -1,
             top_p: float = 1.0,
@@ -365,6 +366,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
+            from .vllm_stop import vllm_stop_kwargs
 
             # Compute effective max_tokens
             verl_max_tokens = self.config.max_model_len - len(prompt_ids)
@@ -385,8 +387,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
                 n=max(1, int(n)),
-                # EOS token handling for Qwen
-                stop_token_ids=[151645, 151643],
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -501,6 +502,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             max_tokens: int,
+            stop: object | None = None,
             temperature: float = 1.0,
             top_k: int = -1,
             top_p: float = 1.0,
@@ -526,6 +528,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             """
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
+            from .vllm_stop import vllm_stop_kwargs
 
             # Compute effective max_tokens
             verl_max_tokens = self.config.max_model_len - len(prompt_ids)
@@ -546,8 +549,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
                 n=max(1, int(n)),
-                # EOS token handling for Qwen
-                stop_token_ids=[151645, 151643],
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -1521,6 +1523,7 @@ class VerlInferenceEngine:
         prompt_ids: list[int],
         request_id: str,
         max_tokens: int,
+        stop: object | None = None,
         temperature: float = 1.0,
         top_k: int = -1,
         top_p: float = 1.0,
@@ -1543,6 +1546,8 @@ class VerlInferenceEngine:
         if not self._initialized:
             await self.initialize()
 
+        from .vllm_stop import vllm_stop_kwargs
+
         # Pass max_tokens to our overridden generate() in ExtendedVLLMHttpServer
         # which uses min(user_max_tokens, max_model_len - prompt_len)
         sampling_params = {
@@ -1551,8 +1556,8 @@ class VerlInferenceEngine:
             "top_k": top_k,
             "top_p": top_p,
             "logprobs": logprobs,
-            "stop_token_ids": [151645, 151643],  # <|im_end|>, <|endoftext|> for Qwen2.5
         }
+        sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]))
 
         # Call the Ray actor's generate method
         result = await self.server.generate.remote(

@@ -188,7 +188,7 @@ export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
 
 # Persistent actors (server startup prewarm; eviction-protected)
 # Configure these in `.secrets.env` and restart the server to apply.
-export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
+export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,moonshotai/Kimi-K2-Thinking"
 export MINT_PERSISTENT_TRAIN_LORA_RANK=16
 export MINT_PERSISTENT_TRAIN_LR=5e-5
 export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600

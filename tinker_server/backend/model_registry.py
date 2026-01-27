@@ -361,9 +361,9 @@ def requires_fp8(model_name: str) -> bool:
 def list_supported_models() -> list[str]:
     """Return list of supported model names."""
     allowed = [
-        "Qwen/Qwen3-235B-A22B-Instruct-2507",
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
+        "moonshotai/Kimi-K2-Thinking",
     ]
     return [m for m in MODEL_CONFIGS.keys() if m in allowed]

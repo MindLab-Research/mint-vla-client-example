@@ -496,6 +496,7 @@ class TrainingWorker:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
                 - loss_fn_inputs.weights: per-token loss coefficients (float, can be positive, negative, or zero)
+                  Interpreted as token-level coefficients applied to -logp (typically a 0/1 mask for SFT).
                 For RL losses (importance_sampling, ppo), also needs:
                 - loss_fn_inputs.logprobs: old policy logprobs
                 - loss_fn_inputs.advantages: advantage estimates
@@ -515,6 +516,8 @@ class TrainingWorker:
 
         loss_fn_config = loss_fn_config or {}
 
+        # Training path always runs in train() mode.
+        # forward() temporarily switches to eval() for deterministic logprobs and restores state.
         self.model.train()
 
         total_loss = 0.0
@@ -760,101 +763,100 @@ class TrainingWorker:
         if session_id:
             self._ensure_session_loaded(session_id)
 
-        # CRITICAL: Use eval() mode for deterministic forward pass
-        # In train() mode, dropout causes non-deterministic behavior, which breaks
-        # forward_backward_custom: the logprobs computed here differ from those
-        # recomputed in forward_backward(), causing gradient mismatch.
+        # Use eval() mode for deterministic logprobs, but do not leak mode to later calls.
+        prev_training = self.model.training
         self.model.eval()
 
         total_loss = 0.0
         total_tokens = 0
         loss_fn_outputs = []
 
-        with torch.no_grad():
-            for item in data_items:
-                # Parse tinker Datum format
-                model_input = item.get("model_input", {})
-                loss_fn_inputs = item.get("loss_fn_inputs", {})
+        try:
+            with torch.no_grad():
+                for item in data_items:
+                    # Parse tinker Datum format
+                    model_input = item.get("model_input", {})
+                    loss_fn_inputs = item.get("loss_fn_inputs", {})
 
-                # Extract input token IDs from ALL chunks (not just chunks[0])
-                chunks = model_input.get("chunks", [])
-                if chunks:
-                    # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
-                    input_ids = []
-                    for chunk in chunks:
-                        if chunk.get("type") == "encoded_text" and "tokens" in chunk:
-                            input_ids.extend(chunk["tokens"])
+                    # Extract input token IDs from ALL chunks (not just chunks[0])
+                    chunks = model_input.get("chunks", [])
+                    if chunks:
+                        # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
+                        input_ids = []
+                        for chunk in chunks:
+                            if chunk.get("type") == "encoded_text" and "tokens" in chunk:
+                                input_ids.extend(chunk["tokens"])
 
-                    if not input_ids:
-                        logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                        if not input_ids:
+                            logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                            continue
+                    else:
+                        logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
                         continue
-                else:
-                    logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
-                    continue
 
-                # Extract target tokens and weights/mask
-                # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
-                target_data = loss_fn_inputs.get("target_tokens", {})
-                weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
+                    # Extract target tokens and weights/mask
+                    # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
+                    target_data = loss_fn_inputs.get("target_tokens", {})
+                    weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
 
-                target_tokens = target_data.get("data", [])
-                weights = weights_data.get("data", []) if weights_data else []
+                    target_tokens = target_data.get("data", [])
+                    weights = weights_data.get("data", []) if weights_data else []
 
-                if not target_tokens:
-                    logger.warning("[TrainingWorker] Missing target_tokens, skipping item")
-                    continue
+                    if not target_tokens:
+                        logger.warning("[TrainingWorker] Missing target_tokens, skipping item")
+                        continue
 
-                # For forward-only, weights are optional - default to all 1s
-                if not weights:
-                    weights = [1.0] * len(target_tokens)
+                    # For forward-only, weights are optional - default to all 1s
+                    if not weights:
+                        weights = [1.0] * len(target_tokens)
 
-                # Convert to tensors
-                input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
-                target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
-                weights_t = torch.tensor([weights], dtype=torch.float32, device=self.device)
+                    # Convert to tensors
+                    input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+                    target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
+                    weights_t = torch.tensor([weights], dtype=torch.float32, device=self.device)
 
-                # Forward pass - get logits
-                outputs = self.model(input_ids=input_ids_t)
-                logits = outputs.logits  # [1, seq_len, vocab_size]
+                    # Forward pass - get logits
+                    outputs = self.model(input_ids=input_ids_t)
+                    logits = outputs.logits  # [1, seq_len, vocab_size]
 
-                # Compute log probabilities
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [1, seq_len, vocab]
+                    # Compute log probabilities
+                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [1, seq_len, vocab]
 
-                # Get logprobs for target tokens
-                # log_probs: [1, seq_len, vocab], target_ids_t: [1, seq_len]
-                # Gather logprobs at target token indices
-                target_logprobs = torch.gather(
-                    log_probs.squeeze(0),  # [seq_len, vocab]
-                    dim=-1,
-                    index=target_ids_t.squeeze(0).unsqueeze(-1),  # [seq_len, 1]
-                ).squeeze(-1)  # [seq_len]
+                    # Gather logprobs at target token indices
+                    target_logprobs = torch.gather(
+                        log_probs.squeeze(0),  # [seq_len, vocab]
+                        dim=-1,
+                        index=target_ids_t.squeeze(0).unsqueeze(-1),  # [seq_len, 1]
+                    ).squeeze(-1)  # [seq_len]
 
-                # Apply weights
-                weights_flat = weights_t.squeeze(0)  # [seq_len]
+                    # Compute cross-entropy loss (for metrics)
+                    weights_flat = weights_t.squeeze(0)  # [seq_len]
+                    logits_flat = logits.squeeze(0)
+                    targets_flat = target_ids_t.squeeze(0)
+                    ce_loss = torch.nn.functional.cross_entropy(
+                        logits_flat, targets_flat, reduction="none"
+                    )
+                    weighted_loss = ce_loss * weights_flat
+                    num_weighted = weights_flat.sum()
+                    if num_weighted > 0:
+                        loss = weighted_loss.sum() / num_weighted
+                    else:
+                        loss = weighted_loss.sum()
 
-                # Compute cross-entropy loss (for metrics)
-                logits_flat = logits.squeeze(0)
-                targets_flat = target_ids_t.squeeze(0)
-                ce_loss = torch.nn.functional.cross_entropy(
-                    logits_flat, targets_flat, reduction="none"
-                )
-                weighted_loss = ce_loss * weights_flat
-                num_weighted = weights_flat.sum()
-                if num_weighted > 0:
-                    loss = weighted_loss.sum() / num_weighted
-                else:
-                    loss = weighted_loss.sum()
+                    item_loss = loss.item()
+                    total_loss += item_loss * num_weighted.item()
+                    total_tokens += num_weighted.item()
 
-                item_loss = loss.item()
-                total_loss += item_loss * num_weighted.item()
-                total_tokens += num_weighted.item()
-
-                # Return logprobs in loss_fn_outputs (TensorData format required by Tinker SDK)
-                logprobs_list = target_logprobs.tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                })
+                    logprobs_list = target_logprobs.tolist()
+                    loss_fn_outputs.append({
+                        "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
+                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
+                    })
+        finally:
+            if prev_training:
+                self.model.train()
+            else:
+                self.model.eval()
 
         avg_loss = total_loss / max(total_tokens, 1)
 

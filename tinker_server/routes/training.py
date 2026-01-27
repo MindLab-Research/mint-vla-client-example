@@ -975,6 +975,7 @@ async def reset_expert_bias(
 async def save_weights_for_sampler(
     request: SaveWeightsForSamplerRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ) -> UntypedAPIFuture:
     """Save model weights for inference use."""
     if training_engine is None or training_manager is None:
@@ -989,14 +990,15 @@ async def save_weights_for_sampler(
         )
 
     request_id = future_store.create()
+    user_id = _get_user_id(http_request)
     background_tasks.add_task(
-        _do_save_weights_for_sampler, request_id, session, request
+        _do_save_weights_for_sampler, request_id, session, request, user_id
     )
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_save_weights_for_sampler(
-    request_id: str, session, request: SaveWeightsForSamplerRequest
+    request_id: str, session, request: SaveWeightsForSamplerRequest, user_id: str | None
 ) -> None:
     """Background task for save_weights_for_sampler.
 
@@ -1011,7 +1013,9 @@ async def _do_save_weights_for_sampler(
 
         from ..checkpoints import get_checkpoints_dir
 
-        checkpoint_dir = get_checkpoints_dir()
+        checkpoints_root = get_checkpoints_dir()
+        owner_dir = None if user_id == "admin" else (user_id or "anonymous")
+        checkpoint_dir = checkpoints_root if owner_dir is None else os.path.join(checkpoints_root, owner_dir)
 
         # Determine checkpoint name
         if request.path is not None:

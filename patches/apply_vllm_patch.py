@@ -1,10 +1,35 @@
 #!/usr/bin/env python3
-"""Patch vLLM models.py to support MoE expert LoRA weights."""
+"""Patch vLLM models.py to support MoE expert LoRA weights.
+
+Supports:
+- vLLM installed from wheels (site-packages)
+- vLLM source checkout (override via env var)
+"""
 
 import re
 import sys
+import os
+from pathlib import Path
 
-VLLM_MODELS_PATH = "/root/tinker_project/vllm/vllm/lora/models.py"
+DEFAULT_VLLM_MODELS_PATH = "/root/tinker_project/vllm/vllm/lora/models.py"
+
+
+def _resolve_vllm_models_path() -> str:
+    override = os.environ.get("VLLM_MODELS_PATH")
+    if override:
+        return override
+
+    try:
+        import vllm  # type: ignore
+
+        pkg_dir = Path(vllm.__file__).resolve().parent
+        candidate = pkg_dir / "lora" / "models.py"
+        if candidate.exists():
+            return str(candidate)
+    except Exception:
+        pass
+
+    return DEFAULT_VLLM_MODELS_PATH
 
 # The old code block to replace
 OLD_CODE = '''                # Case for expert lora weights
@@ -36,21 +61,27 @@ NEW_CODE = '''                # Case for expert lora weights
 
 
 def main():
+    vllm_models_path = _resolve_vllm_models_path()
     # Read the original file
-    with open(VLLM_MODELS_PATH, "r") as f:
-        content = f.read()
+    try:
+        with open(vllm_models_path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        print(f"ERROR: vLLM models.py not found at {vllm_models_path}")
+        return 1
 
     if OLD_CODE in content:
         content = content.replace(OLD_CODE, NEW_CODE)
-        with open(VLLM_MODELS_PATH, "w") as f:
+        with open(vllm_models_path, "w") as f:
             f.write(content)
-        print("SUCCESS: Patched vLLM models.py for MoE expert LoRA support")
+        print(f"SUCCESS: Patched vLLM models.py for MoE expert LoRA support ({vllm_models_path})")
         return 0
     elif "VALID_EXPERT_SUFFIXES" in content:
-        print("INFO: Patch already applied")
+        print(f"INFO: Patch already applied ({vllm_models_path})")
         return 0
     else:
         print("ERROR: Could not find the expected code block to patch")
+        print(f"Path: {vllm_models_path}")
         # Try to find partial matches for debugging
         if "expert_suffix = module_name[expert_idx + 1 :]" in content:
             print("Found expert_suffix line but context differs")

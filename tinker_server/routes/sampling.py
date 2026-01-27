@@ -57,11 +57,68 @@ _SAMPLE_COALESCE_MAX_SAMPLES = int(os.environ.get("TINKER_SAMPLE_COALESCE_MAX_SA
 _sample_coalesce_lock = asyncio.Lock()
 _sample_coalesce_groups: dict[tuple, dict] = {}
 
+_lora_load_locks_guard = asyncio.Lock()
+_lora_load_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
+    async with _lora_load_locks_guard:
+        lock = _lora_load_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _lora_load_locks[session_id] = lock
+        return lock
+
+
+async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
+    if session_manager is None:
+        raise RuntimeError("Session manager not initialized")
+
+    lora_rank = session_manager.get_session_lora_rank(session_id)
+    if not lora_rank or int(lora_rank) <= 0:
+        return
+
+    if session_manager.is_session_lora_loaded(session_id):
+        return
+
+    adapter_path = session_manager.get_session_adapter_path(session_id)
+    if not adapter_path:
+        raise RuntimeError(f"Session {session_id} has lora_rank={lora_rank} but no adapter_path")
+
+    lock = await _get_lora_load_lock(session_id)
+    async with lock:
+        if session_manager.is_session_lora_loaded(session_id):
+            return
+
+        # Prefer path-based loading to avoid sending large tensors through Ray.
+        add_from_path = getattr(engine, "add_lora_for_session_from_path", None)
+        if add_from_path is None:
+            raise RuntimeError(f"Engine for session {session_id} does not support add_lora_for_session_from_path()")
+
+        await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
+        session_manager.mark_session_lora_loaded(session_id, True)
+
 
 def _prompt_fingerprint(token_ids: list[int]) -> bytes:
     # 32k token prompts are common; collisions must be negligible but hashing cost is amortized by prefill.
     a = array.array("I", token_ids)
     return hashlib.blake2b(a.tobytes(), digest_size=16).digest()
+
+
+def _stop_key(stop: object | None) -> object:
+    if stop is None:
+        return None
+    if isinstance(stop, str):
+        return ("s", stop)
+    if isinstance(stop, list):
+        if not stop:
+            return ("empty",)
+        if all(isinstance(x, int) for x in stop):
+            return ("ti", tuple(int(x) for x in stop))
+        if all(isinstance(x, str) for x in stop):
+            return ("ts", tuple(str(x) for x in stop))
+        raise ValueError(f"stop must be list[int] or list[str], got mixed: {stop!r}")
+    raise TypeError(f"stop must be None, str, list[str], or list[int]; got {type(stop)}")
 
 
 async def _coalesced_generate(
@@ -72,6 +129,7 @@ async def _coalesced_generate(
     request_id: str,
     num_samples: int,
     max_tokens: int,
+    stop: object | None,
     temperature: float,
     top_k: int,
     top_p: float,
@@ -82,6 +140,7 @@ async def _coalesced_generate(
         sampling_session_id,
         _prompt_fingerprint(prompt_ids),
         int(max_tokens),
+        _stop_key(stop),
         float(temperature),
         int(top_k),
         float(top_p),
@@ -102,6 +161,7 @@ async def _coalesced_generate(
                 "sampling_session_id": sampling_session_id,
                 "prompt_ids": prompt_ids,
                 "max_tokens": max_tokens,
+                "stop": stop,
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
@@ -127,6 +187,7 @@ async def _coalesced_generate(
                 "sampling_session_id": sampling_session_id,
                 "prompt_ids": prompt_ids,
                 "max_tokens": max_tokens,
+                "stop": stop,
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
@@ -164,6 +225,7 @@ async def _flush_group(g: dict) -> None:
                 prompt_ids=g["prompt_ids"],
                 request_id=g["leader_request_id"],
                 max_tokens=g["max_tokens"],
+                stop=g.get("stop"),
                 temperature=g["temperature"],
                 top_k=g["top_k"],
                 top_p=g["top_p"],
@@ -180,6 +242,7 @@ async def _flush_group(g: dict) -> None:
             request_id=f"{g['leader_request_id']}_coalesced",
             num_samples=total,
             max_tokens=g["max_tokens"],
+            stop=g.get("stop"),
             temperature=g["temperature"],
             top_k=g["top_k"],
             top_p=g["top_p"],
@@ -360,6 +423,8 @@ async def _do_sample(
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
 
+                await _ensure_session_lora_loaded(engine, session_id)
+
                 gen_many = getattr(engine, "generate_many", None)
                 can_coalesce = (
                     _SAMPLE_COALESCE
@@ -377,6 +442,7 @@ async def _do_sample(
                         request_id=request_id,
                         num_samples=request.num_samples,
                         max_tokens=request.sampling_params.max_tokens,
+                        stop=request.sampling_params.stop,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
                         top_p=request.sampling_params.top_p,
@@ -388,6 +454,7 @@ async def _do_sample(
                             prompt_ids=token_ids,
                             request_id=request_id,
                             max_tokens=request.sampling_params.max_tokens,
+                            stop=request.sampling_params.stop,
                             temperature=request.sampling_params.temperature,
                             top_k=request.sampling_params.top_k,
                             top_p=request.sampling_params.top_p,
@@ -403,6 +470,7 @@ async def _do_sample(
                         request_id=request_id,
                         num_samples=request.num_samples,
                         max_tokens=request.sampling_params.max_tokens,
+                        stop=request.sampling_params.stop,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
                         top_p=request.sampling_params.top_p,
@@ -419,6 +487,7 @@ async def _do_sample(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_{i}",
                         max_tokens=request.sampling_params.max_tokens,
+                        stop=request.sampling_params.stop,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
                         top_p=request.sampling_params.top_p,
@@ -489,7 +558,8 @@ async def _do_sample(
                     request.topk_prompt_logprobs,
                 )
 
-            future_store.resolve(request_id, response.model_dump())
+            # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
+            future_store.resolve(request_id, response.model_dump(exclude={"type"}))
             logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
 
             # Log usage - separate prefill and sampling tokens
@@ -635,7 +705,8 @@ async def _do_compute_logprobs(
             )
 
         response = ComputeLogprobsResponse(logprobs=logprobs)
-        future_store.resolve(request_id, response.model_dump())
+        # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
+        future_store.resolve(request_id, response.model_dump(exclude={"type"}))
         logger.debug(
             f"Request {request_id} computed {len(logprobs)} logprobs"
         )
