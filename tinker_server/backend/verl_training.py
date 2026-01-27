@@ -495,9 +495,7 @@ class TrainingWorker:
             data_items: List of serialized Datum dicts with:
                 - model_input.chunks[0].tokens: input token IDs
                 - loss_fn_inputs.target_tokens: target token IDs (shifted by 1)
-                - loss_fn_inputs.weights: per-token weights (float)
-                  Interpreted as token-level coefficients applied to -logp (typically a 0/1 mask for SFT).
-                  Negative weights require loss_fn_config={"weights_are_coeffs": 1.0} (explicit; no sign-based inference).
+                - loss_fn_inputs.weights: per-token loss coefficients (float, can be positive, negative, or zero)
                 For RL losses (importance_sampling, ppo), also needs:
                 - loss_fn_inputs.logprobs: old policy logprobs
                 - loss_fn_inputs.advantages: advantage estimates
@@ -517,14 +515,7 @@ class TrainingWorker:
 
         loss_fn_config = loss_fn_config or {}
 
-        # Custom vs standard must be explicit: never infer from weight sign.
-        # When weights are client-provided coefficients/gradients, callers should set
-        # loss_fn_config={"weights_are_coeffs": 1.0} so forward_backward matches forward()'s eval() mode.
-        weights_are_coeffs = bool(loss_fn_config.get("weights_are_coeffs", 0.0) >= 0.5)
-        if weights_are_coeffs:
-            self.model.eval()
-        else:
-            self.model.train()
+        self.model.train()
 
         total_loss = 0.0
         total_tokens = 0
@@ -626,12 +617,6 @@ class TrainingWorker:
             logits_flat = logits.squeeze(0)  # [seq_len, vocab]
             targets_flat = target_ids_t.squeeze(0)  # [seq_len]
             weights_flat = weights_t.squeeze(0)  # [seq_len]
-
-            if not weights_are_coeffs and (weights_flat < 0).any().item():
-                raise ValueError(
-                    "Negative weights require explicit loss_fn_config={\"weights_are_coeffs\": 1.0}; "
-                    "do not infer custom vs standard semantics from weight sign."
-                )
 
             # Target logprobs are needed for all supported loss_fns.
             log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)  # [seq_len, vocab]
