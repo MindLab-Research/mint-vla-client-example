@@ -105,6 +105,22 @@ def _prompt_fingerprint(token_ids: list[int]) -> bytes:
     return hashlib.blake2b(a.tobytes(), digest_size=16).digest()
 
 
+def _stop_key(stop: object | None) -> object:
+    if stop is None:
+        return None
+    if isinstance(stop, str):
+        return ("s", stop)
+    if isinstance(stop, list):
+        if not stop:
+            return ("empty",)
+        if all(isinstance(x, int) for x in stop):
+            return ("ti", tuple(int(x) for x in stop))
+        if all(isinstance(x, str) for x in stop):
+            return ("ts", tuple(str(x) for x in stop))
+        raise ValueError(f"stop must be list[int] or list[str], got mixed: {stop!r}")
+    raise TypeError(f"stop must be None, str, list[str], or list[int]; got {type(stop)}")
+
+
 async def _coalesced_generate(
     *,
     engine,
@@ -113,6 +129,7 @@ async def _coalesced_generate(
     request_id: str,
     num_samples: int,
     max_tokens: int,
+    stop: object | None,
     temperature: float,
     top_k: int,
     top_p: float,
@@ -123,6 +140,7 @@ async def _coalesced_generate(
         sampling_session_id,
         _prompt_fingerprint(prompt_ids),
         int(max_tokens),
+        _stop_key(stop),
         float(temperature),
         int(top_k),
         float(top_p),
@@ -143,6 +161,7 @@ async def _coalesced_generate(
                 "sampling_session_id": sampling_session_id,
                 "prompt_ids": prompt_ids,
                 "max_tokens": max_tokens,
+                "stop": stop,
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
@@ -168,6 +187,7 @@ async def _coalesced_generate(
                 "sampling_session_id": sampling_session_id,
                 "prompt_ids": prompt_ids,
                 "max_tokens": max_tokens,
+                "stop": stop,
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
@@ -205,6 +225,7 @@ async def _flush_group(g: dict) -> None:
                 prompt_ids=g["prompt_ids"],
                 request_id=g["leader_request_id"],
                 max_tokens=g["max_tokens"],
+                stop=g.get("stop"),
                 temperature=g["temperature"],
                 top_k=g["top_k"],
                 top_p=g["top_p"],
@@ -221,6 +242,7 @@ async def _flush_group(g: dict) -> None:
             request_id=f"{g['leader_request_id']}_coalesced",
             num_samples=total,
             max_tokens=g["max_tokens"],
+            stop=g.get("stop"),
             temperature=g["temperature"],
             top_k=g["top_k"],
             top_p=g["top_p"],
@@ -420,6 +442,7 @@ async def _do_sample(
                         request_id=request_id,
                         num_samples=request.num_samples,
                         max_tokens=request.sampling_params.max_tokens,
+                        stop=request.sampling_params.stop,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
                         top_p=request.sampling_params.top_p,
@@ -431,6 +454,7 @@ async def _do_sample(
                             prompt_ids=token_ids,
                             request_id=request_id,
                             max_tokens=request.sampling_params.max_tokens,
+                            stop=request.sampling_params.stop,
                             temperature=request.sampling_params.temperature,
                             top_k=request.sampling_params.top_k,
                             top_p=request.sampling_params.top_p,
@@ -446,6 +470,7 @@ async def _do_sample(
                         request_id=request_id,
                         num_samples=request.num_samples,
                         max_tokens=request.sampling_params.max_tokens,
+                        stop=request.sampling_params.stop,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
                         top_p=request.sampling_params.top_p,
@@ -462,6 +487,7 @@ async def _do_sample(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_{i}",
                         max_tokens=request.sampling_params.max_tokens,
+                        stop=request.sampling_params.stop,
                         temperature=request.sampling_params.temperature,
                         top_k=request.sampling_params.top_k,
                         top_p=request.sampling_params.top_p,
