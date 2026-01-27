@@ -257,7 +257,7 @@ async def _do_save_state(
             "path": tinker_path,
             "mint_path": mint_path,
             "filesystem_path": save_path,
-            "type": "save_state",
+            "type": "save_weights",
             "sampling_registered": sampling_registered,
         })
 
