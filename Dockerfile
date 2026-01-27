@@ -7,7 +7,7 @@
 # This Dockerfile must not assume the build context contains tinker-server code.
 # (The platform build environment may only provide this Dockerfile.)
 
-ARG CUDA_IMAGE=nvidia/cuda:12.9.0-cudnn9-devel-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.9.0-cudnn-devel-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
 SHELL ["/bin/bash", "-lc"]
@@ -51,27 +51,21 @@ RUN python -m pip install --no-cache-dir \
     "torchvision==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}"
 
-# Pin CUDA 12.9 user-space libs used by torch.
-ARG NVIDIA_CUDA_RUNTIME_CU12=12.9.79
-ARG NVIDIA_CUDA_CUPTI_CU12=12.9.79
-ARG NVIDIA_CUDA_NVRTC_CU12=12.9.86
-ARG NVIDIA_NVJITLINK_CU12=12.9.86
-ARG NVIDIA_NVTX_CU12=12.9.79
-ARG NVIDIA_CUBLAS_CU12=12.9.1.4
-ARG NVIDIA_NCCL_CU12=2.29.2
-RUN python -m pip install --no-cache-dir --upgrade \
-    "nvidia-cuda-runtime-cu12==${NVIDIA_CUDA_RUNTIME_CU12}" \
-    "nvidia-cuda-cupti-cu12==${NVIDIA_CUDA_CUPTI_CU12}" \
-    "nvidia-cuda-nvrtc-cu12==${NVIDIA_CUDA_NVRTC_CU12}" \
-    "nvidia-nvjitlink-cu12==${NVIDIA_NVJITLINK_CU12}" \
-    "nvidia-nvtx-cu12==${NVIDIA_NVTX_CU12}" \
-    "nvidia-cublas-cu12==${NVIDIA_CUBLAS_CU12}" \
-    "nvidia-nccl-cu12==${NVIDIA_NCCL_CU12}" \
-  && python - <<'PY'
+# Verify torch CUDA build + critical CUDA user-space package versions.
+# (Do not override torch's pinned nvidia-* deps: mismatched versions can silently break runtime.)
+RUN python - <<'PY'
+import importlib.metadata as im
+
 import torch
+
 print("torch.__version__:", torch.__version__)
 print("torch.version.cuda:", torch.version.cuda)
 assert (torch.version.cuda or "").startswith("12.9"), f"expected CUDA 12.9.*, got {torch.version.cuda}"
+
+print("nvidia-cuda-nvrtc-cu12:", im.version("nvidia-cuda-nvrtc-cu12"))
+print("nvidia-nvjitlink-cu12:", im.version("nvidia-nvjitlink-cu12"))
+assert im.version("nvidia-cuda-nvrtc-cu12") == "12.9.86"
+assert im.version("nvidia-nvjitlink-cu12") == "12.9.86"
 PY
 
 # Core runtime deps used by the API server and Ray workers (versions from `ssh volcano` baseline).
