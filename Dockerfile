@@ -84,52 +84,6 @@ RUN python -m pip install --no-cache-dir \
 ARG VLLM_WHEEL_URL=https://wheels.vllm.ai/811cdf5197acb4d6ab42250a5b0f822887d1190a/vllm-0.13.0rc2.dev207%2Bg811cdf519-cp38-abi3-manylinux_2_31_x86_64.whl
 RUN python -m pip install --no-cache-dir --upgrade "${VLLM_WHEEL_URL}"
 
-# vLLM MoE expert LoRA: patch LoRAModel.from_local_checkpoint unexpected-module check.
-RUN python - <<'PY'
-import pathlib
-
-import vllm
-
-p = pathlib.Path(vllm.__file__).resolve().parent / "lora" / "lora_model.py"
-content = p.read_text()
-
-old = "\n".join([
-    '                if ".experts" in module_name:',
-    '                    expert_idx = module_name.find(".experts")',
-    '                    expert_suffix = module_name[expert_idx + 1 :]',
-    '                    if expert_suffix not in expected_lora_modules:',
-    '                        unexpected_modules.append(module_name)',
-    '',
-])
-
-new = "\n".join([
-    '                if ".experts" in module_name:',
-    '                    # Handle expert patterns like: experts.0.gate_proj, experts.1.down_proj',
-    '                    # Extract the module name after experts.{N}.',
-    '                    import re',
-    '                    VALID_EXPERT_SUFFIXES = {"gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"}',
-    '                    expert_match = re.search(r"\\.experts\\.(\\d+)\\.(\\w+)$", module_name)',
-    '                    if expert_match:',
-    '                        expert_module = expert_match.group(2)',
-    '                        if expert_module not in VALID_EXPERT_SUFFIXES and \\',
-    '                           expert_module not in expected_lora_modules and \\',
-    '                           "experts" not in expected_lora_modules:',
-    '                            unexpected_modules.append(module_name)',
-    '                    else:',
-    '                        if "experts" not in expected_lora_modules:',
-    '                            unexpected_modules.append(module_name)',
-    '',
-])
-
-if "VALID_EXPERT_SUFFIXES" in content:
-    print("vLLM MoE LoRA patch: already applied", p)
-elif old not in content:
-    raise RuntimeError(f"vLLM MoE LoRA patch: pattern not found in {p}")
-else:
-    p.write_text(content.replace(old, new))
-    print("vLLM MoE LoRA patch: applied", p)
-PY
-
 # Megatron-LM + Megatron-Bridge + verl: install from pinned commits (clean, no local dirty state).
 ARG MEGATRON_LM_REPO=https://github.com/NVIDIA/Megatron-LM.git
 ARG MEGATRON_LM_COMMIT=aa4ec99205a52187adead37cabceb678a2b6b975
