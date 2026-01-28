@@ -6,17 +6,37 @@ TaskName: "mint-prod-head"
 Description: "MINT PRODUCTION - Ray head node - DO NOT USE FOR DEV"
 
 Entrypoint: |
-  # Start Ray head first to get the internal cluster IP
-  ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-cpus=4 --num-gpus=0
+  set -euo pipefail
 
-  # Get the internal IP that Ray is using (from Ray's output)
-  INTERNAL_IP=$(ray status 2>/dev/null | grep -oP 'node:\K[0-9.]+' | head -1 || hostname -i)
-  echo "${INTERNAL_IP}" > /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt
-  echo "MINT Production Ray head IP: ${INTERNAL_IP}"
+  # Note: mint:6 Ray CLI crashes on startup; start Ray via Python internals.
+  # Note: dashboard is disabled (mint:6 image missing dashboard deps like aiohttp_cors).
+  python3 - <<'PY'
+  import time
 
-  sleep infinity
+  import ray
+  from ray._private.node import Node
+  from ray._private.parameter import RayParams
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
+  ip = ray.util.get_node_ip_address()
+  print(f"Local node IP: {ip}", flush=True)
+
+  ray_params = RayParams(
+      num_cpus=4,
+      num_gpus=0,
+      include_dashboard=False,
+      gcs_server_port=6379,
+  )
+  node = Node(ray_params, head=True, shutdown_at_exit=False, spawn_reaper=False)
+
+  with open("/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt", "w") as f:
+      f.write(ip)
+
+  print(f"MINT Production Ray head IP: {ip}", flush=True)
+  while True:
+      time.sleep(3600)
+  PY
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:6"
 ResourceQueueID: "q-20251225183621-m2297"  # CPU queue for head node
 Framework: "Custom"
 

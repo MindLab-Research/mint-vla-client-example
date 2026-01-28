@@ -2,8 +2,8 @@
 # This cluster is for production deployment only.
 #
 # Before submitting:
-#   1. Get Ray head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
-#   2. Replace <RAY_HEAD_IP> with the actual IP address
+#   - Ensure mint-prod-head is running and has written ray_head_ip.txt
+#   - (Optional) Verify head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
 #
 # Submit with: volc ml_task submit -c mint-prod-worker.yaml --output json
 
@@ -38,10 +38,34 @@ Entrypoint: |
   fi
   echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
 
-  # Start Ray worker
-  ray start --address="${RAY_HEAD_IP}:6379" --num-gpus=8 && sleep infinity
+  # Note: mint:6 Ray CLI crashes on startup; start Ray via Python internals.
+  set -euo pipefail
+  python3 - <<'PY'
+  import os
+  import time
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
+  import ray
+  from ray._private.node import Node
+  from ray._private.parameter import RayParams
+
+  head = os.environ.get("RAY_HEAD_IP", "")
+  if not head:
+      raise SystemExit("RAY_HEAD_IP env var is empty")
+  head = f"{head}:6379"
+
+  ip = ray.util.get_node_ip_address()
+  print(f"Local node IP: {ip}", flush=True)
+
+  ray_params = RayParams(
+      gcs_address=head,
+      num_gpus=8,
+  )
+  node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
+  while True:
+      time.sleep(3600)
+  PY
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:6"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 
