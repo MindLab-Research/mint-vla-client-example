@@ -421,11 +421,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         first_tok_s = time.perf_counter() - t0
                     final_res = output
                 assert final_res is not None
+                total_s = time.perf_counter() - t0
                 if self._timing:
                     print(
                         f"[vLLM timing] generate_with_lora req={request_id} prompt_len={len(prompt_ids)} "
                         f"max_tokens={max_tokens} n={sampling_params.n} lora_id={lora_int_id} "
-                        f"total_s={time.perf_counter() - t0:.3f} first_tok_s={first_tok_s}"
+                        f"total_s={total_s:.3f} first_tok_s={first_tok_s}"
                         ,
                         flush=True,
                     )
@@ -449,6 +450,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     "token_ids": token_ids,
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
+                    "_timing_total_s": float(total_s),
+                    "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                 }
 
             t0 = time.perf_counter()
@@ -459,11 +462,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     first_tok_s = time.perf_counter() - t0
                 for out in output.outputs:
                     by_index[int(out.index)] = out
+            total_s = time.perf_counter() - t0
             if self._timing:
                 print(
                     f"[vLLM timing] generate_with_lora req={request_id} prompt_len={len(prompt_ids)} "
                     f"max_tokens={max_tokens} n={sampling_params.n} lora_id={lora_int_id} "
-                    f"total_s={time.perf_counter() - t0:.3f} first_tok_s={first_tok_s}"
+                    f"total_s={total_s:.3f} first_tok_s={first_tok_s}"
                     ,
                     flush=True,
                 )
@@ -493,6 +497,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
+                        "_timing_total_s": float(total_s),
+                        "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                     }
                 )
             return outs
@@ -572,10 +578,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         first_tok_s = time.perf_counter() - t0
                     final_res = output
                 assert final_res is not None
+                total_s = time.perf_counter() - t0
                 if self._timing:
                     print(
                         f"[vLLM timing] generate_base req={request_id} prompt_len={len(prompt_ids)} "
-                        f"max_tokens={max_tokens} n={sampling_params.n} total_s={time.perf_counter() - t0:.3f} "
+                        f"max_tokens={max_tokens} n={sampling_params.n} total_s={total_s:.3f} "
                         f"first_tok_s={first_tok_s}"
                         ,
                         flush=True,
@@ -600,6 +607,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     "token_ids": token_ids,
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
+                    "_timing_total_s": float(total_s),
+                    "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                 }
 
             t0 = time.perf_counter()
@@ -610,10 +619,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     first_tok_s = time.perf_counter() - t0
                 for out in output.outputs:
                     by_index[int(out.index)] = out
+            total_s = time.perf_counter() - t0
             if self._timing:
                 print(
                     f"[vLLM timing] generate_base req={request_id} prompt_len={len(prompt_ids)} "
-                    f"max_tokens={max_tokens} n={sampling_params.n} total_s={time.perf_counter() - t0:.3f} "
+                    f"max_tokens={max_tokens} n={sampling_params.n} total_s={total_s:.3f} "
                     f"first_tok_s={first_tok_s}"
                     ,
                     flush=True,
@@ -644,6 +654,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
+                        "_timing_total_s": float(total_s),
+                        "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                     }
                 )
             return outs

@@ -198,7 +198,7 @@ async def _coalesced_generate(
             }
             _sample_coalesce_groups[key] = g
 
-        g["waiters"].append((fut, need))
+        g["waiters"].append((fut, need, request_id))
         g["total_samples"] = int(g["total_samples"]) + need
         do_flush_now = (len(g["waiters"]) >= _SAMPLE_COALESCE_MAX_BATCH) or (int(g["total_samples"]) >= _SAMPLE_COALESCE_MAX_SAMPLES)
         if g["flush_task"] is None:
@@ -218,7 +218,7 @@ async def _flush_group(g: dict) -> None:
     if not waiters:
         return
     try:
-        total = sum(int(ns) for _fut, ns in waiters)
+        total = sum(int(ns) for _fut, ns, _rid in waiters)
         if total == 1 and int(waiters[0][1]) == 1:
             res = await g["engine"].generate(
                 sampling_session_id=g["sampling_session_id"],
@@ -231,15 +231,21 @@ async def _flush_group(g: dict) -> None:
                 top_p=g["top_p"],
                 logprobs=True,
             )
-            fut0, _ns0 = waiters[0]
+            fut0, _ns0, _rid0 = waiters[0]
             if not fut0.done():
                 fut0.set_result([res])
             return
 
+        vllm_request_id = f"{g['leader_request_id']}_coalesced"
+        rid_ns = ",".join(f"{rid}:{int(ns)}" for _fut, ns, rid in waiters)
+        logger.info(
+            f"[coalesce flush] leader={g['leader_request_id']} vllm_req={vllm_request_id} "
+            f"waiters={len(waiters)} total_samples={total} rid_ns={rid_ns}"
+        )
         results = await g["engine"].generate_many(
             sampling_session_id=g["sampling_session_id"],
             prompt_ids=g["prompt_ids"],
-            request_id=f"{g['leader_request_id']}_coalesced",
+            request_id=vllm_request_id,
             num_samples=total,
             max_tokens=g["max_tokens"],
             stop=g.get("stop"),
@@ -252,14 +258,14 @@ async def _flush_group(g: dict) -> None:
             raise RuntimeError(f"coalesce: got {len(results)} results for total_samples={total}")
 
         cur = 0
-        for fut, ns in waiters:
+        for fut, ns, _rid in waiters:
             n = int(ns)
             chunk = results[cur : cur + n]
             cur += n
             if not fut.done():
                 fut.set_result(chunk)
     except Exception as e:
-        for fut, _ns in waiters:
+        for fut, _ns, _rid in waiters:
             if not fut.done():
                 fut.set_exception(e)
 

@@ -696,6 +696,20 @@ class MultiLoRAInferenceEngine:
                 logprobs=logprobs,
             )
 
+        timing_total_s = result.get("_timing_total_s")
+        if timing_total_s is not None:
+            try:
+                total_s = float(timing_total_s)
+            except (TypeError, ValueError):
+                total_s = None
+            if total_s is not None:
+                first_tok_s = result.get("_timing_first_tok_s")
+                lora_tag = f"lora_id={lora_id}" if lora_id is not None else "lora_id=None"
+                logger.info(
+                    f"[vLLM timing] generate req={request_id} prompt_len={len(prompt_ids)} "
+                    f"max_tokens={max_tokens} {lora_tag} total_s={total_s:.3f} first_tok_s={first_tok_s}"
+                )
+
         return GenerateResult(
             token_ids=result["token_ids"],
             logprobs=result.get("logprobs"),
@@ -763,6 +777,22 @@ class MultiLoRAInferenceEngine:
             raw_list: list[dict] = [raw]
         else:
             raw_list = list(raw)
+
+        if raw_list:
+            timing_total_s = raw_list[0].get("_timing_total_s")
+            if timing_total_s is not None:
+                try:
+                    total_s = float(timing_total_s)
+                except (TypeError, ValueError):
+                    total_s = None
+                if total_s is not None:
+                    first_tok_s = raw_list[0].get("_timing_first_tok_s")
+                    lora_tag = f"lora_id={lora_id}" if lora_id is not None else "lora_id=None"
+                    logger.info(
+                        f"[vLLM timing] generate_many req={request_id} prompt_len={len(prompt_ids)} "
+                        f"max_tokens={max_tokens} num_samples={num_samples} {lora_tag} "
+                        f"total_s={total_s:.3f} first_tok_s={first_tok_s}"
+                    )
 
         return [
             GenerateResult(
