@@ -1,12 +1,40 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 StopReason = Literal["length", "stop", "eos"]
 
 DEFAULT_EOS_TOKENS: frozenset[int] = frozenset({151645, 151643})
 
 from .models.types import SampledSequence
+
+
+def normalize_prompt_logprobs_for_tinker(
+    prompt_logprobs: Sequence[float | None], *, prompt_len: int
+) -> list[float | None]:
+    """Normalize prompt_logprobs to official Tinker semantics.
+
+    Required invariants:
+    - len(prompt_logprobs) == prompt_len
+    - prompt_logprobs[0] is None for prompt_len > 0
+    """
+    if prompt_len < 0:
+        raise ValueError(f"prompt_len must be >= 0, got {prompt_len}")
+
+    xs = list(prompt_logprobs)
+    if prompt_len == 0:
+        if xs:
+            raise ValueError(f"Expected 0 prompt_logprobs for empty prompt, got {len(xs)}")
+        return []
+
+    if len(xs) == prompt_len:
+        xs[0] = None
+        return xs
+
+    if len(xs) == prompt_len - 1:
+        return [None, *xs]
+
+    raise ValueError(f"Expected {prompt_len} or {prompt_len - 1} prompt_logprobs, got {len(xs)}")
 
 
 def resolve_stop_reason(

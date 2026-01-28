@@ -26,7 +26,7 @@ from ..models.types import (
     SampleResponse,
     UntypedAPIFuture,
 )
-from ..sampling_utils import sampled_sequence_from_result
+from ..sampling_utils import normalize_prompt_logprobs_for_tinker, sampled_sequence_from_result
 from ..usage_logger import get_usage_logger
 
 if TYPE_CHECKING:
@@ -535,11 +535,9 @@ async def _do_sample(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_prompt_logprobs",
                     )
-                # Merge-gate tests expect prompt_logprobs to be floats only (no leading None).
-                computed_logprobs = list(computed_logprobs)
-                if computed_logprobs and computed_logprobs[0] is None:
-                    computed_logprobs = computed_logprobs[1:]
-                response.prompt_logprobs = computed_logprobs
+                response.prompt_logprobs = normalize_prompt_logprobs_for_tinker(
+                    computed_logprobs, prompt_len=len(token_ids)
+                )
 
             # Handle top-K prompt logprobs if requested
             if request.topk_prompt_logprobs > 0:
@@ -710,6 +708,7 @@ async def _do_compute_logprobs(
                 request_id=request_id,
             )
 
+        logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
         future_store.resolve(request_id, response.model_dump(exclude={"type"}))
