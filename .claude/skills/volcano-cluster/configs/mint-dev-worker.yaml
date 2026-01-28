@@ -21,15 +21,34 @@ Entrypoint: |
   ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
 
   # Connect to Ray head - REPLACE <RAY_HEAD_IP> before submitting
-  ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=8 && sleep infinity
+  set -euo pipefail
+  python3 - <<'PY'
+  import time
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
+  import ray
+  from ray._private.node import Node
+  from ray._private.parameter import RayParams
+
+  head = "<RAY_HEAD_IP>:6379"
+  ip = ray.util.get_node_ip_address()
+  print(f"Local node IP: {ip}", flush=True)
+
+  ray_params = RayParams(
+      gcs_address=head,
+      num_gpus=8,
+  )
+  node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
+  while True:
+      time.sleep(3600)
+  PY
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:6"
 ResourceQueueID: "q-20260124095758-ngkg7"  # GPU queue for dev workers
 Framework: "Custom"
 
 TaskRoleSpecs:
     - RoleName: "worker"
-      RoleReplicas: 3  # 3 replicas = 24 GPUs (fills dev GPU queue). Adjust as needed.
+      RoleReplicas: 2  # 2 replicas = 16 GPUs. Adjust as needed.
       Flavor: "ml.hpcpni2l.28xlarge"  # 8x A800 80GB (RDMA)
 
 # No timeout (0 = unlimited)

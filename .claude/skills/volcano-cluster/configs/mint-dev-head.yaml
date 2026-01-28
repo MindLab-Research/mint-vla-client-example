@@ -5,9 +5,29 @@ TaskName: "ray-head"
 Description: "Ray head node - CPU only, long-running"
 
 Entrypoint: |
-  ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-cpus=4 --num-gpus=0 && sleep infinity
+  set -euo pipefail
+  python3 - <<'PY'
+  import time
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:4"
+  import ray
+  from ray._private.node import Node
+  from ray._private.parameter import RayParams
+
+  ip = ray.util.get_node_ip_address()
+  print(f"Local node IP: {ip}", flush=True)
+
+  ray_params = RayParams(
+      num_cpus=4,
+      num_gpus=0,
+      include_dashboard=False,
+      gcs_server_port=6379,
+  )
+  node = Node(ray_params, head=True, shutdown_at_exit=False, spawn_reaper=False)
+  while True:
+      time.sleep(3600)
+  PY
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:6"
 ResourceQueueID: "q-20251225183621-m2297"  # CPU queue
 Framework: "Custom"
 
