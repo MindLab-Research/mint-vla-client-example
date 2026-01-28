@@ -37,6 +37,7 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
+- Do not modify git config (no `git config ...`). Commit identity must be set per command.
 - Orchestrator, bugfixer, and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
   If the issue references another issue/PR for context, read that too before acting.
 - Static-only reproductions/tests are forbidden. Do not close an issue based on source inspection (grep/AST/string checks).
@@ -296,8 +297,9 @@ ISSUE=123
 TITLE="$(gh issue view $ISSUE --json title -q .title)"
 
 git add -A
-git -c user.name='mindlab-bot' -c user.email='contact@mindlab.ltd' \
-  commit -m "Fix #$ISSUE: $TITLE"
+GIT_AUTHOR_NAME='mindlab-bot' GIT_AUTHOR_EMAIL='contact@mindlab.ltd' \
+GIT_COMMITTER_NAME='mindlab-bot' GIT_COMMITTER_EMAIL='contact@mindlab.ltd' \
+  git commit -m "Fix #$ISSUE: $TITLE"
 git push -u origin HEAD
 ```
 
