@@ -152,14 +152,24 @@ def _get_or_create_ray_actor():
             if meta is not None:
                 self._meta[request_id] = dict(meta)
 
-        def submit(self, request_id: str, target_actor: Any, method_name: str, args: list[Any], meta: dict[str, Any] | None = None) -> None:
+        def submit(
+            self,
+            request_id: str,
+            target_actor: Any,
+            method_name: str,
+            args: list[Any] | dict[str, Any],
+            meta: dict[str, Any] | None = None,
+        ) -> None:
             self._prune()
             self._pending.add(request_id)
             self._created_at[request_id] = time.time()
             if meta is not None:
                 self._meta[request_id] = dict(meta)
             method = getattr(target_actor, method_name)
-            self._refs[request_id] = method.remote(*args)
+            if isinstance(args, dict):
+                self._refs[request_id] = method.remote(**args)
+            else:
+                self._refs[request_id] = method.remote(*args)
 
         def resolve(self, request_id: str, result: Any) -> None:
             self._prune()
@@ -343,7 +353,14 @@ class FutureStore:
 
         ray.get(actor.attach_ref.remote(request_id, ref, meta))
 
-    def submit(self, request_id: str, target_actor: Any, method_name: str, args: list[Any], meta: dict[str, Any] | None = None) -> None:
+    def submit(
+        self,
+        request_id: str,
+        target_actor: Any,
+        method_name: str,
+        args: list[Any] | dict[str, Any],
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         actor = self._get_ray_actor()
         if actor is None:
             raise RuntimeError("Ray not initialized: FutureStore.submit requires Ray")

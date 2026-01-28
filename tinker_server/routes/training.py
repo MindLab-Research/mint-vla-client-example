@@ -615,7 +615,12 @@ async def forward_backward(
             request_id,
             worker,
             "forward_backward",
-            [data_items, loss_fn, loss_fn_config, session.model_id],
+            {
+                "data_items": data_items,
+                "loss_fn": loss_fn,
+                "loss_fn_config": loss_fn_config,
+                "session_id": session.model_id,
+            },
             meta={"actor_name": actor_name, "model_id": session.model_id, "op": "forward_backward"},
         )
 
@@ -893,7 +898,7 @@ async def optim_step(
             request_id,
             worker,
             "optim_step",
-            [lr, session.model_id],
+            {"learning_rate": lr, "session_id": session.model_id},
             meta={"actor_name": actor_name, "model_id": session.model_id, "op": "optim_step"},
         )
     except Exception as e:
