@@ -201,9 +201,28 @@ print(dst)
 PY
 
 test -n "$UNISON_PROFILE" || { echo "error: UNISON_PROFILE is empty"; exit 1; }
-pkill -f "[u]nison.*$UNISON_PROFILE" 2>/dev/null || true
-nohup unison "$UNISON_PROFILE" -repeat watch > "/tmp/unison-$UNISON_PROFILE.log" 2>&1 &
-pgrep -af "unison.*$UNISON_PROFILE"
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/unison@.service <<'EOF'
+[Unit]
+Description=Unison (%i) watch
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/unison %i -repeat watch -ui text
+Restart=always
+RestartSec=2
+StandardOutput=append:/tmp/unison-%i.log
+StandardError=append:/tmp/unison-%i.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+loginctl enable-linger "$USER" || true
+systemctl --user enable --now "unison@$UNISON_PROFILE.service"
+systemctl --user status "unison@$UNISON_PROFILE.service" --no-pager
+tail -n 200 "/tmp/unison-$UNISON_PROFILE.log"
 ```
 
 Issue-specific server root on volcano:

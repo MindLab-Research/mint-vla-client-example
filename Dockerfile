@@ -97,15 +97,43 @@ RUN python -m pip install --no-cache-dir \
     "transformers==4.57.1" \
     "accelerate==1.11.0" \
     "omegaconf==2.3.0" \
+    "codetiming==1.4.0" \
+    "torchdata==0.11.0" \
+    "datasets==4.4.2" \
     "tensordict" \
     "peft==0.18.0"
+
+# NVIDIA ModelOpt (import name: modelopt).
+ARG NVIDIA_MODELOPT_VERSION=0.41.0
+RUN python -m pip install --no-cache-dir \
+  --index-url "${NVIDIA_PYPI_INDEX}/simple" \
+  --extra-index-url https://pypi.org/simple \
+  --retries 10 \
+  --timeout 60 \
+  "nvidia-modelopt==${NVIDIA_MODELOPT_VERSION}"
 
 # Build deps for editable Megatron installs (avoid PEP 517 build isolation re-downloading torch).
 RUN python -m pip install --no-cache-dir "pybind11"
 
+# Transformer Engine (Megatron dependency): install from NVIDIA index and verify the torch extension loads.
+ARG TRANSFORMER_ENGINE_VERSION=2.11.0
+RUN python -m pip install --no-cache-dir \
+  --index-url https://pypi.org/simple \
+  --extra-index-url "${NVIDIA_PYPI_INDEX}" \
+  --no-build-isolation \
+  "transformer-engine[pytorch,core_cu12]==${TRANSFORMER_ENGINE_VERSION}"
+RUN python -c "import transformer_engine; import transformer_engine.pytorch as te; print('transformer_engine.__version__:', getattr(transformer_engine, '__version__', 'unknown')); print('transformer_engine.pytorch:', te)"
+
 # vLLM: use a specific prebuilt wheel (matches volcano override commit g811cdf519).
 ARG VLLM_WHEEL_URL=https://wheels.vllm.ai/811cdf5197acb4d6ab42250a5b0f822887d1190a/vllm-0.13.0rc2.dev207%2Bg811cdf519-cp38-abi3-manylinux_2_31_x86_64.whl
 RUN python -m pip install --no-cache-dir --upgrade "${VLLM_WHEEL_URL}"
+
+# FlashAttention (optional accel used by some inference/training stacks).
+# Prefer a matching prebuilt wheel to avoid compiling CUDA extensions in the Docker build.
+ARG FLASH_ATTN_VERSION=2.8.3
+ARG FLASH_ATTN_WHEEL_URL=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3%2Bcu129torch2.9-cp310-cp310-linux_x86_64.whl
+RUN python -m pip install --no-cache-dir "${FLASH_ATTN_WHEEL_URL}"
+RUN python -c "import flash_attn; import flash_attn.flash_attn_interface; print('flash_attn', getattr(flash_attn, '__version__', 'unknown'))"
 
 # Megatron-LM + Megatron-Bridge + verl: install from pinned commits (clean, no local dirty state).
 ARG MEGATRON_LM_REPO=https://github.com/NVIDIA/Megatron-LM.git
@@ -128,4 +156,5 @@ RUN mkdir -p /workspace \
   && python -m pip install --no-cache-dir --no-build-isolation --no-deps -e /workspace/verl
 
 # Default command is intentionally minimal; Ray task YAMLs and server ops override this.
+RUN python -c "import onnxscript, modelopt; print('onnxscript', getattr(onnxscript, '__version__', 'unknown')); print('modelopt', getattr(modelopt, '__version__', 'unknown'))"
 CMD ["bash", "-lc", "python -c 'import torch, vllm; print(torch.__version__, torch.version.cuda); print(vllm.__version__)' && sleep infinity"]

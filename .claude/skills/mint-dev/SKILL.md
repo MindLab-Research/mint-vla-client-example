@@ -85,8 +85,27 @@ Create a per-developer profile (no shared PFS root):
 mkdir -p ~/.unison
 sed "s/__PFS_USER__/$USER/g" .claude/skills/mint-dev/configs/volcano-tinker.prf > ~/.unison/volcano-tinker-$USER.prf
 
-# Start unison in background (explicit nohup)
-nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &
+# Start unison as a persistent daemon (systemd --user)
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/unison@.service <<'EOF'
+[Unit]
+Description=Unison (%i) watch
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/unison %i -repeat watch -ui text
+Restart=always
+RestartSec=2
+StandardOutput=append:/tmp/unison-%i.log
+StandardError=append:/tmp/unison-%i.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+loginctl enable-linger "$USER" || true
+systemctl --user enable --now "unison@volcano-tinker-$USER.service"
 ```
 
 ### Volcano Symlink (Per-Developer)
@@ -147,19 +166,22 @@ curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 > **PRE-FLIGHT CHECK:** Before ANY dev work, verify unison daemon is running:
 > ```bash
-> pgrep -af "unison.*volcano-tinker-$USER" || echo "WARNING: unison not running - server has outdated code!"
+> systemctl --user is-active --quiet "unison@volcano-tinker-$USER.service" || echo "WARNING: unison not running - server has outdated code!"
 > ```
-> If not running, start it first (explicit nohup): `nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &`
+> If not running: `systemctl --user enable --now "unison@volcano-tinker-$USER.service"`
 
 ```bash
-# Start daemon (run first, keep running)
-nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$USER.log 2>&1 &
+# Start daemon (keep running)
+systemctl --user enable --now "unison@volcano-tinker-$USER.service"
 
-# Check if running
-pgrep -af "unison.*volcano-tinker-$USER"
+# Check status
+systemctl --user status "unison@volcano-tinker-$USER.service" --no-pager
+
+# Logs
+tail -n 200 "/tmp/unison-volcano-tinker-$USER.log"
 
 # Stop daemon
-pkill -f "[u]nison.*volcano-tinker-$USER" || true
+systemctl --user stop "unison@volcano-tinker-$USER.service"
 ```
 
 **First-time setup:**
