@@ -14,6 +14,20 @@ router = APIRouter()
 
 GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persists."
 
+_SAFE_ERROR_PREFIXES = (
+    "Access denied",
+    "Checkpoint not found:",
+)
+
+
+def _public_error(error: str | None) -> str:
+    if not isinstance(error, str) or not error:
+        return GENERIC_ERROR_MESSAGE
+    for p in _SAFE_ERROR_PREFIXES:
+        if error.startswith(p):
+            return error
+    return GENERIC_ERROR_MESSAGE
+
 
 def _is_privileged(request: Request) -> bool:
     """Check if request is from privileged user (admin API key)."""
@@ -99,7 +113,7 @@ async def retrieve_future(
             and not _is_privileged(http_request)
         ):
             payload = dict(payload)
-            payload["error"] = GENERIC_ERROR_MESSAGE
+            payload["error"] = _public_error(payload.get("error"))
         return payload
 
     if status == FutureStatus.PENDING:
@@ -133,7 +147,7 @@ async def retrieve_future(
         if _is_privileged(http_request):
             payload = {"error": error, "category": "system"}
         else:
-            payload = {"error": GENERIC_ERROR_MESSAGE, "category": "system"}
+            payload = {"error": _public_error(error), "category": "system"}
         future_store.cleanup(body.request_id)
         return payload
     else:
