@@ -77,6 +77,7 @@ Goal: isolate code + detached Ray actor state across developers sharing the same
 Required env vars:
 - `TINKER_RAY_NAMESPACE`: Ray namespace for all server-owned actors (default `tinker`)
 - `PFS_TINKER_PATH`: PFS code root used in Ray worker `runtime_env` `PYTHONPATH`
+Hard rule: never create/get/kill Ray actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
 
 ### Unison Profile (Per-Developer)
 
@@ -316,6 +317,8 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 > - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi-k2-thinking`)
 > - Namespace: `TINKER_RAY_NAMESPACE` (default `tinker`)
 >
+> Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests it.
+>
 > **When to kill actors:**
 > - Implementation code changed (actors cache old code)
 > - OOM or stuck state
@@ -323,43 +326,44 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 
 ```bash
 # Kill vLLM actor for K2
-ssh mint-dev 'python3 -c "
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
-    ns = os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\")
+    ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
     actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed vLLM actor\")
 except ValueError as e:
     print(f\"Actor not found: {e}\")
-"'
+\""
 
 # Kill Megatron actor for K2
-ssh mint-dev 'python3 -c "
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
-    ns = os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\")
+    ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
     actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed Megatron actor\")
 except ValueError as e:
     print(f\"Actor not found: {e}\")
-"'
+\""
 
-# List all actors in tinker namespace (to find actor names)
-ssh mint-dev 'python3 -c "
+# List all actors in current namespace (to find actor names)
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
+ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
 actors = ray.util.list_named_actors(all_namespaces=True)
 for a in actors:
-    if os.environ.get(\"TINKER_RAY_NAMESPACE\", \"tinker\") in str(a):
+    if a.get(\"namespace\") == ns:
         print(a)
-"'
+\""
 ```
 
 ### Legacy Reference (do not use these names directly)

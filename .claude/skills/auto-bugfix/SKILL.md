@@ -11,9 +11,9 @@ description: |
      spawn an independent reviewer subagent, then merge to `develop` if review passes.
 
   Refers to:
-- `bugfix` skill for reproduction discipline
-- `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
-- `architecture-design` skill for architecture docs alignment
+  - `bugfix` skill for reproduction discipline
+  - `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
+  - `architecture-design` skill for architecture docs alignment
 
   Triggers: "auto-bugfix", "bot queue", "assign-to-bot"
 ---
@@ -37,6 +37,7 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
+- Never create/get/kill Ray actors outside the active `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
 - Do not modify git config (no `git config ...`). Commit identity must be set per command.
 - Orchestrator, bugfixer, and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
   If the issue references another issue/PR for context, read that too before acting.
@@ -159,16 +160,42 @@ fi
 
 Use `mint-dev` for shared dev constraints and definitions. Do not reuse its start/stop/log commands because this skill must not stop or replace the default dev server.
 
-Namespace goal: isolate Ray actor state per issue (avoid collisions across concurrent dev runs).
+Namespace goal: isolate Ray actor state per issue while requiring post-issue cleanup so detached actors do not proliferate.
 `mint-dev` documents `TINKER_RAY_NAMESPACE` for this.
+Hard rules:
+- Do not kill or manipulate actors in other namespaces to "free GPUs" unless the user explicitly requests it.
+- Use issue-specific `TINKER_RAY_NAMESPACE` (do not reuse across issues).
+- Kill all actors in the issue namespace at the end of the issue (and before starting the issue-scoped server if rerunning) so detached actors do not accumulate.
 
-Example namespace + issue-specific PFS path:
+Example issue-specific namespace + issue-specific PFS path:
 ```bash
 export ISSUE=123
 export TINKER_RAY_NAMESPACE="tinker_${USER}_issue_${ISSUE}"
 export PFS_TINKER_PATH="/vePFS-Mindverse/share/code/$USER/tinker-server-issue-$ISSUE"
 export UNISON_PROFILE="volcano-tinker-$USER-issue-$ISSUE"
 export TINKER_PORT="$((10000 + ISSUE % 5000))"
+```
+
+Namespace cleanup (run before starting the issue-scoped server, and after finishing the issue):
+```bash
+# Pass `TINKER_RAY_NAMESPACE` explicitly (ssh does not forward local env by default).
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+import os
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
+actors = ray.util.list_named_actors(all_namespaces=True)
+killed = 0
+for a in actors:
+    if a.get(\"namespace\") != ns:
+        continue
+    try:
+        ray.kill(ray.get_actor(a[\"name\"], namespace=ns))
+        killed += 1
+    except Exception as e:
+        print(f\"kill_failed name={a.get('name')!r} namespace={ns!r} err={e!r}\")
+print(f\"killed={killed} namespace={ns}\")
+\""
 ```
 
 Issue-specific code sync (do not manually sync; use unison daemon mode):
