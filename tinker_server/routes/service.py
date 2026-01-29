@@ -450,6 +450,37 @@ async def vllm_status(request: Request, model_name: str | None = None) -> dict:
     alive = check_persistent_vllm_actor(model_name)
     actors = list_vllm_actors()
 
+    # Augment actor entries with Ray placement group info (when available).
+    #
+    # Issue #82 requires verifying GPU reservation at Ray scheduling level. Resource pool
+    # tracking is not sufficient evidence if it diverges from placement-group bundles.
+    try:
+        import ray
+        from ..config import RAY_NAMESPACE
+        from ..ray_utils import init_ray
+
+        if not ray.is_initialized():
+            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+        for a in actors:
+            if not isinstance(a, dict):
+                continue
+            name = a.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            pg_name = f"{name}_pg"
+            try:
+                pg = ray.util.get_placement_group(pg_name)
+                bundles = getattr(pg, "bundle_specs", None)
+                if isinstance(bundles, list):
+                    a["pg_name"] = pg_name
+                    a["pg_bundle_count"] = len(bundles)
+                    a["pg_total_gpus"] = sum(int(b.get("GPU", 0) or 0) for b in bundles if isinstance(b, dict))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return {"alive": alive, "actors": actors, "query_model_name": model_name}
 
 
