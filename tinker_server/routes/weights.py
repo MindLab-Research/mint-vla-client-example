@@ -327,9 +327,10 @@ async def _do_save_state(
             except Exception as reg_err:
                 logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
-        # Use tinker:// URI format (official contract), keep mint:// as legacy alias.
-        tinker_path = f"tinker://{session.model_id}/{checkpoint_name}"
+        # Primary URI for MinT clients: mint://{model_id}/{checkpoint_name}
+        # Keep tinker:// as a compatibility alias.
         mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        tinker_path = f"tinker://{session.model_id}/{checkpoint_name}"
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
@@ -337,8 +338,9 @@ async def _do_save_state(
 
         future_store.resolve(request_id, {
             "checkpoint_id": checkpoint_name,
-            "path": tinker_path,
+            "path": mint_path,
             "mint_path": mint_path,
+            "tinker_path": tinker_path,
             "filesystem_path": save_path,
             "type": "save_weights",
             "sampling_registered": sampling_registered,
