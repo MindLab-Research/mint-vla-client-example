@@ -139,6 +139,12 @@ def main() -> int:
         if not path.startswith("mint://"):
             return _fail(f"save_state returned non-mint path={path!r} mint_path={out.get('mint_path')!r}")
 
+        tinker_path = out.get("tinker_path")
+        if not isinstance(tinker_path, str) or not tinker_path:
+            return _fail(f"save_state response missing tinker_path payload_keys={sorted(out.keys())!r}")
+        if not tinker_path.startswith("tinker://"):
+            return _fail(f"save_state returned invalid tinker_path={tinker_path!r}")
+
         print("PASS")
         return 0
     except Exception as e:
@@ -153,4 +159,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
