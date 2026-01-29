@@ -49,8 +49,9 @@ async def retrieve_future(
         - HTTP 200 with {"error": "..."}: operation failed
         - HTTP 200 with result: operation completed
 
-    Error details are only exposed to privileged users (admin API key).
-    Regular users receive a generic error message.
+    Error details are only exposed to privileged users (admin API key), except for
+    a small allowlist of safe, user-actionable errors (e.g. permission/ownership).
+    Regular users receive a generic error message for other failures.
     """
     try:
         status = future_store.get_status(body.request_id)
