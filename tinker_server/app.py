@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .backend.multi_lora_engine import MultiModelInferenceManager
-from .backend.session_manager import SessionManager
+from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
@@ -472,6 +472,9 @@ async def lifespan(app: FastAPI):
         data_parallel_size=config.data_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
+        inactivity_timeout=config.session_inactivity_timeout_s
+        if config.session_inactivity_timeout_s is not None
+        else DEFAULT_INACTIVITY_TIMEOUT,
     )
 
     # Make session manager available to routes
