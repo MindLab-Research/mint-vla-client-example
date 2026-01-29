@@ -13,23 +13,45 @@ RAY_NAMESPACE = os.environ.get("TINKER_RAY_NAMESPACE", "tinker")
 # System has NCCL 2.x (older) - cannot use PFS PyTorch 2.9.0
 # MoE LoRA blocked until Docker image upgraded with newer CUDA stack
 #
-# Default to the production code path so Ray actors use the same code as the
-# API server deployment.
-PFS_TINKER_PATH = os.environ.get("PFS_TINKER_PATH", "/vePFS-Mindverse/share/code/tinker-server-auth")
+# Default to the *current* repo root so Ray actors use the same code as the
+# running API server deployment (dev/prod/aliyun).
+#
+# Historical default hard-coded `/vePFS-Mindverse/share/code/tinker-server-auth`, which breaks
+# non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
+# to a non-existent code directory.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PFS_TINKER_PATH = os.environ.get("PFS_TINKER_PATH", _REPO_ROOT)
 
 # PFS verl path with _mutable_fields patch for LoRA config assignment
-PFS_VERL_PATH = "/vePFS-Mindverse/share/code/verl"
+PFS_VERL_PATH = os.environ.get("PFS_VERL_PATH", "/vePFS-Mindverse/share/code/verl")
 
 # PFS vLLM 0.13.0 with raw logits dump instrumentation
-PFS_VLLM_PATH = "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg"
+PFS_VLLM_PATH = os.environ.get("PFS_VLLM_PATH", "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg")
+
+# Some deployments rely on the in-image vLLM wheel (with compiled `vllm._C`).
+# Avoid shadowing it with an incomplete CPFS checkout that lacks the extension module.
+def _pfs_vllm_path_is_usable(path: str) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    import glob
+
+    return bool(glob.glob(os.path.join(path, "vllm", "_C*.so")))
+
+PFS_VLLM_PATH_EFFECTIVE = PFS_VLLM_PATH if _pfs_vllm_path_is_usable(PFS_VLLM_PATH) else ""
 
 # PFS megatron-bridge path for MoE LoRA ETP fix (PR #1380)
 # Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-PFS_MEGATRON_BRIDGE_PATH = "/vePFS-Mindverse/share/code/megatron-bridge/src"
+PFS_MEGATRON_BRIDGE_PATH = os.environ.get(
+    "PFS_MEGATRON_BRIDGE_PATH",
+    "/vePFS-Mindverse/share/code/megatron-bridge/src",
+)
 
 # HollowMan fork with export_adapter_weights API for LoRA export
 # Clone from: https://github.com/HollowMan6/Megatron-Bridge.git branch merged
-PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
+PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = os.environ.get(
+    "PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH",
+    "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src",
+)
 
 # Toggle to use HollowMan fork of Megatron-Bridge (affects training forward pass)
 # Default: true - HollowMan fork fixes train-inference KL divergence (verified 2026-01-07)
@@ -40,14 +62,36 @@ USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").low
 
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
-PFS_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
+PFS_HF_MODULES_PATH = os.environ.get(
+    "PFS_HF_MODULES_PATH",
+    "/vePFS-Mindverse/share/huggingface/modules",
+)
 
 # PYTHONPATH for Ray actors - vLLM first (for instrumentation), then megatron-bridge, verl, tinker-server, HF modules
 # USE_HOLLOWMAN_MBRIDGE controls which megatron-bridge version is used
+def _join_pythonpath(*paths: str) -> str:
+    return ":".join([p for p in paths if p])
+
+PFS_EXTRA_PYTHONPATH = os.environ.get("PFS_EXTRA_PYTHONPATH", "").strip()
+
 if USE_HOLLOWMAN_MBRIDGE:
-    PFS_PYTHONPATH = f"{PFS_VLLM_PATH}:{PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+    PFS_PYTHONPATH = _join_pythonpath(
+        PFS_EXTRA_PYTHONPATH,
+        PFS_VLLM_PATH_EFFECTIVE,
+        PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH,
+        PFS_VERL_PATH,
+        PFS_TINKER_PATH,
+        PFS_HF_MODULES_PATH,
+    )
 else:
-    PFS_PYTHONPATH = f"{PFS_VLLM_PATH}:{PFS_MEGATRON_BRIDGE_PATH}:{PFS_VERL_PATH}:{PFS_TINKER_PATH}:{PFS_HF_MODULES_PATH}"
+    PFS_PYTHONPATH = _join_pythonpath(
+        PFS_EXTRA_PYTHONPATH,
+        PFS_VLLM_PATH_EFFECTIVE,
+        PFS_MEGATRON_BRIDGE_PATH,
+        PFS_VERL_PATH,
+        PFS_TINKER_PATH,
+        PFS_HF_MODULES_PATH,
+    )
 
 
 @dataclass

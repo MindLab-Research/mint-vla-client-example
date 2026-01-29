@@ -15,9 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
-import torch
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+torch = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from .training_session_manager import TrainingSession
@@ -38,6 +36,15 @@ from tinker_server.ray_utils import init_ray
 # =====================================================================
 # Session State Manager - Per-iteration state persistence for stateless trainers
 # =====================================================================
+
+def _get_torch():
+    global torch
+    if torch is None:
+        import torch as _torch  # type: ignore
+
+        torch = _torch
+    return torch
+
 
 class SessionStateManager:
     """Manages session state (LoRA weights + optimizer + gradients) for stateless trainers.
@@ -108,6 +115,7 @@ class SessionStateManager:
         import json
         import os
 
+        torch = _get_torch()
         from peft.utils.save_and_load import get_peft_model_state_dict
         from safetensors.torch import save_file
 
@@ -172,6 +180,7 @@ class SessionStateManager:
         import json
         import os
 
+        torch = _get_torch()
         from peft.utils.save_and_load import set_peft_model_state_dict
         from safetensors.torch import load_file
 
@@ -265,6 +274,7 @@ class TrainingWorker:
             idle_timeout: Seconds of inactivity before self-termination.
                           Set to 0 to disable auto-termination.
         """
+        torch = _get_torch()
         self.device = torch.device("cuda")
         self._base_model = base_model  # Store for get_lora_config()
 
@@ -286,6 +296,9 @@ class TrainingWorker:
         logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
 
         self._configure_attention_backends()
+
+        from peft import LoraConfig, TaskType, get_peft_model
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -358,6 +371,7 @@ class TrainingWorker:
         """Enable memory-efficient SDP where available."""
         if os.getenv("TINKER_ENABLE_SDP", "1") != "1":
             return
+        torch = _get_torch()
         try:
             if hasattr(torch.backends, "cuda"):
                 if hasattr(torch.backends.cuda, "enable_flash_sdp"):
@@ -1538,8 +1552,8 @@ class VerlTrainingEngine:
         Args:
             session: TrainingSession with configuration.
         """
-        from .megatron_training import is_moe_model
         from .megatron_distributed import async_get_or_create_megatron_worker_group, DistributedConfig
+        from .model_registry import get_model_config
 
         model_id = session.model_id
 
@@ -1551,7 +1565,7 @@ class VerlTrainingEngine:
         )
 
         # Check if this is an MoE model requiring Megatron backend
-        use_megatron = is_moe_model(requested_model or "")
+        use_megatron = get_model_config(requested_model or "").is_moe
 
         # Resolve model path based on backend
         if requested_model and not requested_model.startswith("/"):
@@ -1577,16 +1591,17 @@ class VerlTrainingEngine:
             from .model_registry import get_training_parallelism, requires_fp8
 
             # Get model-specific parallelism and FP8 config from registry
-            train_tp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or "")
+            train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or "")
             use_fp8 = requires_fp8(requested_model or "")
             distributed_config = DistributedConfig(
                 tensor_parallel_size=train_tp,
+                pipeline_parallel_size=train_pp,
                 expert_parallel_size=train_ep,
                 context_parallel_size=train_cp,
                 expert_tensor_parallel_size=train_etp,
                 use_fp8=use_fp8,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
+            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -1883,7 +1898,7 @@ class VerlTrainingEngine:
         Returns:
             Dict with loss_fn_outputs, metrics, and optimizer results.
         """
-        from .megatron_training import is_moe_model
+        from .model_registry import get_model_config
 
         model_id = session.model_id
         worker = self._workers[model_id]
@@ -1897,8 +1912,14 @@ class VerlTrainingEngine:
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
         lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
 
-        # Check if this is an MoE model (uses MegatronWorkerGroup with train_step)
-        use_train_step = session.backend == "megatron" and is_moe_model(session.base_model or "")
+        # Only MoE models use the combined MegatronWorkerGroup.train_step path.
+        # Avoid importing megatron_training on CPU-only API hosts (Aliyun gateway).
+        is_moe = False
+        try:
+            is_moe = bool(get_model_config(session.base_model or "").is_moe)
+        except Exception:
+            is_moe = False
+        use_train_step = session.backend == "megatron" and is_moe
 
         if use_train_step:
             # MoE: Use combined train_step to keep gradients in same context

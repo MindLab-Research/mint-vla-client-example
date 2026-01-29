@@ -20,8 +20,8 @@ description: |
 >
 > | Task | Command |
 > |------|---------|
-> | SSH to server | `ssh volcano` (NOT direct IP) |
-> | Server logs | `ssh volcano "tail -50 /tmp/tinker_server.log"` |
+> | SSH to server | `ssh mint-dev` (NOT direct IP) |
+> | Server logs | `ssh mint-dev "tail -50 /tmp/tinker_server.log"` |
 > | Health check | `curl http://localhost:8000/api/v1/healthz` |
 > | Restart server | See "Start Server" section below |
 > | Kill vLLM | `curl -X POST http://localhost:8000/api/v1/kill_vllm` |
@@ -31,17 +31,18 @@ description: |
 > **CRITICAL: RESTART SERVER AFTER CODE CHANGES**
 >
 > Python servers do NOT hot-reload. After ANY code change:
-> 1. Verify code synced: `ssh volcano 'grep "your_change" /path/to/file'`
+> 1. Verify code synced: `ssh mint-dev 'grep "your_change" /path/to/file'`
 > 2. **RESTART SERVER** (see section 2 below)
-> 3. Verify new process: `ssh volcano 'ps aux | grep run_server'`
+> 3. Verify new process: `ssh mint-dev 'ps aux | grep run_server'`
 >
 > **Server running old code = your fix does not exist.** This has wasted hours of debugging.
 
 ---
 
-## NEVER Do These (Production Belongs to mint-prod)
+## NEVER Do These (Production Belongs to mint-prod-volcano / mint-prod-aliyun)
 
-- **NEVER** `ssh mint-prod` - that's production
+- **NEVER** `ssh mint-prod-volcano` - that's production (router)
+- **NEVER** `ssh mint-prod-aliyun` - that's production (upstream)
 - **NEVER** use port `18000` - that's production
 - **NEVER** use `volcano-tinker-auth` unison profile - that's production
 - **NEVER** use `mint-prod-*.yaml` Ray configs - that's production
@@ -57,7 +58,7 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 
 | Property | Value |
 |----------|-------|
-| SSH Host | `volcano` |
+| SSH Host | `mint-dev` |
 | Port | 8000 |
 | Code Directory | `tinker-server` |
 | PFS Path | Required: `/vePFS-Mindverse/share/code/$USER/tinker-server` |
@@ -94,7 +95,7 @@ nohup unison volcano-tinker-$USER -repeat watch > /tmp/unison-volcano-tinker-$US
 Point the server working tree at the same per-developer PFS directory:
 
 ```bash
-ssh volcano "rm -rf /root/tinker_project/tinker-server && \
+ssh mint-dev "rm -rf /root/tinker_project/tinker-server && \
   ln -s /vePFS-Mindverse/share/code/$USER/tinker-server /root/tinker_project/tinker-server"
 ```
 
@@ -106,10 +107,10 @@ ssh volcano "rm -rf /root/tinker_project/tinker-server && \
 
 ```bash
 # Find server process
-ssh volcano 'ps aux | grep run_server | grep -v grep'
+ssh mint-dev 'ps aux | grep run_server | grep -v grep'
 
 # Check where stdout goes (actual log file)
-ssh volcano 'ls -la /proc/<PID>/fd/1'
+ssh mint-dev 'ls -la /proc/<PID>/fd/1'
 
 # Example output: /proc/12345/fd/1 -> /tmp/tinker_server.log
 ```
@@ -122,13 +123,13 @@ The log file is typically `/tmp/tinker_server.log`, but verify with the above if
 
 ```bash
 # SSH tunnel
-ssh -f -N -L 8000:localhost:8000 volcano
+ssh -f -N -L 8000:localhost:8000 mint-dev
 
 # Health check
 curl http://localhost:8000/api/v1/healthz
 
 # Server logs
-ssh volcano "tail -50 /tmp/tinker_server.log"
+ssh mint-dev "tail -50 /tmp/tinker_server.log"
 
 # vLLM status
 curl http://localhost:8000/api/v1/vllm_status
@@ -170,7 +171,7 @@ sed "s/__PFS_USER__/$USER/g" .claude/skills/mint-dev/configs/volcano-tinker.prf 
 
 **SSH server symlink setup** (one-time):
 ```bash
-ssh volcano "rm -rf /root/tinker_project/tinker-server && \
+ssh mint-dev "rm -rf /root/tinker_project/tinker-server && \
   ln -s /vePFS-Mindverse/share/code/$USER/tinker-server /root/tinker_project/tinker-server"
 ```
 
@@ -201,7 +202,7 @@ export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 ### Start Server
 
 ```bash
-ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
+ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
@@ -213,19 +214,19 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
 ### Stop Server
 
 ```bash
-ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 
 # If multiple server processes remain, force kill:
-ssh volcano 'pkill -9 -f "python scripts/run_server.py" 2>/dev/null || true'
+ssh mint-dev 'pkill -9 -f "python scripts/run_server.py" 2>/dev/null || true'
 
 # Verify:
-ssh volcano 'ps aux | grep run_server | grep -v grep'
+ssh mint-dev 'ps aux | grep run_server | grep -v grep'
 ```
 
 ### Check Status
 
 ```bash
-ssh volcano "ps aux | grep run_server | grep -v grep"
+ssh mint-dev "ps aux | grep run_server | grep -v grep"
 ```
 
 ---
@@ -240,7 +241,7 @@ ssh volcano "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API (preferred)
+# Via API (MUST use API endpoint; do not kill random processes)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Kill specific model's vLLM actor
@@ -300,7 +301,7 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 
 ```bash
 # Kill vLLM actor for K2
-ssh volcano 'python3 -c "
+ssh mint-dev 'python3 -c "
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -314,7 +315,7 @@ except ValueError as e:
 "'
 
 # Kill Megatron actor for K2
-ssh volcano 'python3 -c "
+ssh mint-dev 'python3 -c "
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -328,7 +329,7 @@ except ValueError as e:
 "'
 
 # List all actors in tinker namespace (to find actor names)
-ssh volcano 'python3 -c "
+ssh mint-dev 'python3 -c "
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -350,8 +351,8 @@ for a in actors:
 ### Fast Restart (no vLLM changes)
 
 ```bash
-ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
-ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
+ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
@@ -366,8 +367,8 @@ ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Restart server
-ssh volcano 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
-ssh volcano "cd /root/tinker_project/tinker-server && nohup bash -c \
+ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
@@ -394,7 +395,7 @@ volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 
 **Connect SSH server to cluster:**
 ```bash
-ssh volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+ssh mint-dev "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
 ```
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
@@ -426,7 +427,7 @@ Before starting any MoE test, run:
 
 ```bash
 # Quick status command (MANDATORY before any work)
-ssh volcano 'python3 << "PYEOF"
+ssh mint-dev 'python3 << "PYEOF"
 import ray
 ray.init(address="auto", ignore_reinit_error=True)
 r = ray.available_resources()
@@ -442,8 +443,8 @@ for a in actors:
         print(f"{name}: ALIVE")
 PYEOF'
 
-# Check pending placement groups (should be empty)
-ssh volcano "ray status 2>/dev/null | grep -A5 'Pending Demands'"
+# Check pending placement groups (MUST be empty)
+ssh mint-dev "ray status 2>/dev/null | grep -A5 'Pending Demands'"
 ```
 
 **Required for Qwen3-30B-A3B tests:** At least 8 available GPUs and no pending placement groups.
@@ -469,7 +470,7 @@ If placement groups are pending (blocking GPUs):
 # Kill vLLM actor (see "Kill Actors" section above for commands)
 
 # Verify resources freed
-ssh volcano "ray status 2>/dev/null | head -20"
+ssh mint-dev "ray status 2>/dev/null | head -20"
 ```
 
 ---
@@ -478,13 +479,13 @@ ssh volcano "ray status 2>/dev/null | head -20"
 
 ```bash
 # Error search
-ssh volcano "grep -i 'error\|exception\|traceback' /tmp/tinker_server.log | tail -20"
+ssh mint-dev "grep -i 'error\\|exception\\|traceback' /tmp/tinker_server.log | tail -20"
 
 # Training worker logs
-ssh volcano "grep 'TrainingWorker' /tmp/tinker_server.log | tail -20"
+ssh mint-dev "grep 'TrainingWorker' /tmp/tinker_server.log | tail -20"
 
 # Forward/backward issues
-ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
+ssh mint-dev "grep 'loss_fn_inputs\\|Missing' /tmp/tinker_server.log | tail -10"
 ```
 
 ---
@@ -500,12 +501,12 @@ ssh volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server.log | tail -10"
 > - Run test scripts on the server (no internet for tokenizer downloads)
 > - Set `HF_HUB_OFFLINE=1` or `HF_HOME=/vePFS-...` for test scripts
 >
-> **Server commands** (ssh volcano '...') need HF_HUB_OFFLINE because the server has no internet.
+> **Server commands** (ssh mint-dev '...') need HF_HUB_OFFLINE because the server has no internet.
 > **Test commands** run locally and download tokenizers automatically.
 
 ```bash
 # Ensure SSH tunnel is active
-ssh -f -N -L 8000:localhost:8000 volcano
+ssh -f -N -L 8000:localhost:8000 mint-dev
 
 # Run test script LOCALLY (downloads tokenizer from HuggingFace)
 # CRITICAL: Always set TINKER_TELEMETRY=0 to prevent log flooding
@@ -531,10 +532,10 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbo
 
 ```bash
 # List all actors - this shows actual names and states
-ssh volcano 'ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
+ssh mint-dev 'ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
 
 # Or list with full details
-ssh volcano 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
+ssh mint-dev 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
 ```
 
 ### Check Specific Actor Status
@@ -543,7 +544,7 @@ ssh volcano 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
 # WRONG: Guessing actor name and concluding "DEAD" if not found
 # RIGHT: List first, then check with exact name from list
 
-ssh volcano 'python3 -c "
+ssh mint-dev 'python3 -c "
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 
@@ -559,16 +560,16 @@ for a in actors:
 
 ```bash
 # Get actor ID from ray list actors output, then:
-ssh volcano 'ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
+ssh mint-dev 'ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
 
 # Example with actual ID:
-ssh volcano 'ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
+ssh mint-dev 'ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
 ```
 
 ### List Dead Actors (for crash investigation)
 
 ```bash
-ssh volcano 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
+ssh mint-dev 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
 ```
 
 ---

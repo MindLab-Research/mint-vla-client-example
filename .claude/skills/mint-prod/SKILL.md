@@ -20,11 +20,11 @@ description: |
 >
 > | Task | Command |
 > |------|---------|
-> | SSH to server | `ssh mint-prod` (NOT `volcano`, NOT direct IP) |
-> | Server logs | `ssh mint-prod "tail -50 /tmp/tinker_server_auth.log"` |
+> | SSH to server | `ssh mint-prod-volcano` (NOT `mint-dev`, NOT direct IP) |
+> | Server logs | `ssh mint-prod-volcano "tail -50 /tmp/tinker_server_auth.log"` |
 > | Health check | `curl http://localhost:18000/api/v1/healthz` |
-> | Restart server | `ssh mint-prod 'supervisorctl restart tinker-server-auth'` |
-> | Stop server (fallback) | `ssh mint-prod 'fuser -k 18000/tcp'` (NOT pkill) |
+> | Restart server | `ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'` |
+> | Stop server (fallback) | `ssh mint-prod-volcano 'fuser -k 18000/tcp'` (NOT pkill) |
 > | Kill vLLM | `curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
@@ -33,7 +33,7 @@ description: |
 
 ## NEVER Do These (Development Belongs to mint-dev)
 
-- **NEVER** `ssh volcano` - that's development
+- **NEVER** `ssh mint-dev` - that's development
 - **NEVER** use port `8000` - that's development
 - **NEVER** use unison for production sync - use rsync (unidirectional)
 - **NEVER** use `mint-dev-*.yaml` Ray configs - that's development
@@ -50,7 +50,7 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 
 | Property | Value |
 |----------|-------|
-| SSH Host | `mint-prod` |
+| SSH Host | `mint-prod-volcano` |
 | Port | 18000 |
 | External URL | `https://mint.macaron.im` |
 | Code Directory | `tinker-server-auth` |
@@ -71,10 +71,10 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 
 ```bash
 # Find server process
-ssh mint-prod 'ps aux | grep run_server | grep -v grep'
+ssh mint-prod-volcano 'ps aux | grep run_server | grep -v grep'
 
 # Check where stdout goes (actual log file)
-ssh mint-prod 'ls -la /proc/<PID>/fd/1'
+ssh mint-prod-volcano 'ls -la /proc/<PID>/fd/1'
 
 # Example output: /proc/31501/fd/1 -> /tmp/tinker_server_auth.log
 ```
@@ -87,13 +87,13 @@ The log file is typically `/tmp/tinker_server_auth.log`, but verify with the abo
 
 ```bash
 # SSH tunnel
-ssh -f -N -L 18000:localhost:18000 mint-prod
+ssh -f -N -L 18000:localhost:18000 mint-prod-volcano
 
 # Health check (no auth needed)
 curl http://localhost:18000/api/v1/healthz
 
 # Server logs
-ssh mint-prod "tail -50 /tmp/tinker_server_auth.log"
+ssh mint-prod-volcano "tail -50 /tmp/tinker_server_auth.log"
 
 # vLLM status (auth required)
 curl -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_status
@@ -118,39 +118,43 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 
 # Sync local code to production server (dry-run first)
 rsync -avz --dry-run --delete \
+  --exclude='.git' \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='.env' \
   --exclude='.secrets.env' \
   --exclude='LOG.md' \
   --exclude='PROMPT.md' \
   --exclude='ray_head_ip.txt' \
   --exclude='.claude' \
-  ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
+  ./ mint-prod-volcano:/vePFS-Mindverse/share/code/tinker-server-auth/
 
 # Execute sync (remove --dry-run)
 rsync -avz --delete \
+  --exclude='.git' \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
+  --exclude='.env' \
   --exclude='.secrets.env' \
   --exclude='LOG.md' \
   --exclude='PROMPT.md' \
   --exclude='ray_head_ip.txt' \
   --exclude='.claude' \
-  ./ mint-prod:/vePFS-Mindverse/share/code/tinker-server-auth/
+  ./ mint-prod-volcano:/vePFS-Mindverse/share/code/tinker-server-auth/
 ```
 
 **Verify sync succeeded:**
 ```bash
 # Compare specific file
-ssh mint-prod "head -5 /vePFS-Mindverse/share/code/tinker-server-auth/tinker_server/backend/model_registry.py"
+ssh mint-prod-volcano "head -5 /vePFS-Mindverse/share/code/tinker-server-auth/tinker_server/backend/model_registry.py"
 
 # Check git commit on server
-ssh mint-prod "cd /vePFS-Mindverse/share/code/tinker-server-auth && git log -1 --oneline"
+ssh mint-prod-volcano "cd /vePFS-Mindverse/share/code/tinker-server-auth && git log -1 --oneline"
 ```
 
 **SSH server symlink setup** (one-time):
 ```bash
-ssh mint-prod "rm -rf /root/tinker_project/tinker-server-auth && \
+ssh mint-prod-volcano "rm -rf /root/tinker_project/tinker-server-auth && \
   ln -s /vePFS-Mindverse/share/code/tinker-server-auth /root/tinker_project/tinker-server-auth"
 ```
 
@@ -162,18 +166,17 @@ ssh mint-prod "rm -rf /root/tinker_project/tinker-server-auth && \
 
 **Prod runs under supervisord and sources `/root/tinker_project/tinker-server-auth/.secrets.env`.**
 
-**Update secrets on prod (recommended):**
+**Update secrets on prod (required when rotating credentials):**
 ```bash
-# Copy local secrets to prod and restart (supervisord sources this file at boot)
-scp /home/yiwen/tinker_project/tinker-server-prod/.secrets.env \
-  mint-prod:/root/tinker_project/tinker-server-auth/.secrets.env
-ssh mint-prod 'chmod 600 /root/tinker_project/tinker-server-auth/.secrets.env'
-ssh mint-prod 'supervisorctl restart tinker-server-auth'
+# From repo root: copy local `.secrets.env` to prod and restart
+rsync -av .secrets.env mint-prod-volcano:/root/tinker_project/tinker-server-auth/.secrets.env
+ssh mint-prod-volcano 'chmod 600 /root/tinker_project/tinker-server-auth/.secrets.env'
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ```
 
 **Load secrets locally (for auth-required curl):**
 ```bash
-source /home/yiwen/tinker_project/tinker-server-prod/.secrets.env
+source .secrets.env
 ```
 
 ```bash
@@ -194,6 +197,77 @@ export MINT_PERSISTENT_TRAIN_LR=5e-5
 export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 ```
 
+### Multi-target Model Routing (Gateway)
+
+Prod can run as a gateway/router that forwards selected base models to other tinker-server deployments.
+
+Deployment targets (current plan):
+- `mint-prod-volcano` (this server): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`, `moonshotai/Kimi-K2-Thinking`
+- `mint-prod-aliyun`: `Qwen/Qwen3-235B-A22B-Instruct-2507`
+
+Router config (set on `mint-prod-volcano` only):
+```bash
+export TINKER_GATEWAY_CONFIG_JSON='
+{
+  "model_to_upstream": {
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": "mint-prod-aliyun"
+  },
+  "upstreams": {
+    "mint-prod-aliyun": {
+      "base_url": "http://<mint-prod-aliyun-host>:18000",
+      "auth_mode": "pass_through"
+    }
+  }
+}
+'
+```
+
+Current Aliyun deployment (example):
+```bash
+export TINKER_GATEWAY_CONFIG_JSON='{"model_to_upstream":{"Qwen/Qwen3-235B-A22B-Instruct-2507":"mint-prod-aliyun"},"upstreams":{"mint-prod-aliyun":{"base_url":"http://123.57.26.97:18000","auth_mode":"pass_through"}}}'
+```
+
+Verify the gateway advertises the routed model (MUST include `Qwen/Qwen3-235B-A22B-Instruct-2507`):
+```bash
+source .secrets.env
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/get_server_capabilities | python3 -m json.tool
+```
+
+Smoke test remote 235B training model creation (gateway forwards to Aliyun):
+```bash
+source .secrets.env
+python3 - <<'PY'
+import json, os, subprocess, time
+api_key=os.environ["TINKER_API_KEY"]
+hdr=["-H", f"X-API-Key: {api_key}", "-H", "Content-Type: application/json"]
+def post(path, body):
+    out=subprocess.check_output(["curl","-s","-w","\\n%{http_code}",*hdr,"-d",json.dumps(body),f"http://localhost:18000{path}"], text=True)
+    payload, code_s = out.rsplit("\\n", 1)
+    return int(code_s), payload
+code, payload = post("/api/v1/create_session", {})
+sid=json.loads(payload)["session_id"]
+code, payload = post("/api/v1/create_model", {"session_id": sid, "model_seq_id": 0, "base_model": "Qwen/Qwen3-235B-A22B-Instruct-2507", "user_metadata": {}, "lora_config": {"rank": 16}})
+req_id=json.loads(payload)["request_id"]
+for _ in range(240):
+    code, payload = post("/api/v1/retrieve_future", {"request_id": req_id})
+    if code == 408:
+        time.sleep(1); continue
+    print(payload); break
+PY
+```
+
+Upstream (remote) server config requirements:
+- Set `MINT_SUPPORTED_MODELS` on each deployment to the models it MUST advertise.
+- If `get_server_capabilities` on the upstream does not include a routed model, the gateway treats it as misconfiguration and fails requests for that model.
+
+GPU-aware tuning knobs:
+- GPU types: Volcano uses A800 80GB; Aliyun uses L20X 140GB.
+- Tune per-model TP/EP/CP and vLLM memory caps in `tinker_server/backend/model_registry.py`.
+- For environment-specific tuning without code changes, set `MINT_MODEL_CONFIG_OVERRIDES_JSON`:
+  ```bash
+  export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16}}'
+  ```
+
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
 
 **Note:** No default model is configured. Clients specify models per-request. Model paths are resolved via `_resolve_model_path()` in `multi_lora_engine.py`.
@@ -201,7 +275,7 @@ export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 ### Restart Server (supervisord)
 
 ```bash
-ssh mint-prod 'supervisorctl restart tinker-server-auth'
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ```
 
 ### Stop Server
@@ -209,13 +283,13 @@ ssh mint-prod 'supervisorctl restart tinker-server-auth'
 **Use `fuser` to kill only port 18000. Do NOT use `pkill` - it may kill dev server too.**
 
 ```bash
-ssh mint-prod 'fuser -k 18000/tcp'
+ssh mint-prod-volcano 'fuser -k 18000/tcp'
 ```
 
 ### Check Status
 
 ```bash
-ssh mint-prod "ps aux | grep run_server | grep -v grep"
+ssh mint-prod-volcano "ps aux | grep run_server | grep -v grep"
 ```
 
 ---
@@ -297,7 +371,7 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 ### Fast Restart (no vLLM changes)
 
 ```bash
-ssh mint-prod 'supervisorctl restart tinker-server-auth'
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ```
 
 ### Full Restart (vLLM changes)
@@ -307,7 +381,7 @@ ssh mint-prod 'supervisorctl restart tinker-server-auth'
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
 # Restart server
-ssh mint-prod 'supervisorctl restart tinker-server-auth'
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 
 # Wait for vLLM init (~80s)
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
@@ -319,7 +393,7 @@ sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 
 **Connect SSH server to cluster:**
 ```bash
-ssh mint-prod "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+ssh mint-prod-volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
 ```
 
 **Get Ray head IP from PFS:**
@@ -366,7 +440,7 @@ Production worker replica size: 8 GPUs (`.claude/skills/volcano-cluster/configs/
 
 ```bash
 # Quick status command (MANDATORY before any work)
-ssh mint-prod 'python3 << "PYEOF"
+ssh mint-prod-volcano 'python3 << "PYEOF"
 import ray
 ray.init(address="auto", ignore_reinit_error=True)
 r = ray.available_resources()
@@ -389,13 +463,13 @@ PYEOF'
 
 ```bash
 # Error search
-ssh mint-prod "grep -i 'error\|exception\|traceback' /tmp/tinker_server_auth.log | tail -20"
+ssh mint-prod-volcano "grep -i 'error\|exception\|traceback' /tmp/tinker_server_auth.log | tail -20"
 
 # Training worker logs
-ssh mint-prod "grep 'TrainingWorker' /tmp/tinker_server_auth.log | tail -20"
+ssh mint-prod-volcano "grep 'TrainingWorker' /tmp/tinker_server_auth.log | tail -20"
 
 # Forward/backward issues
-ssh mint-prod "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.log | tail -10"
+ssh mint-prod-volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.log | tail -10"
 ```
 
 ---

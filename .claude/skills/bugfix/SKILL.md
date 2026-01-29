@@ -60,8 +60,8 @@ python scripts/tools/reproduce_issue_<NUMBER>.py
 
 ```bash
 # SSH to prod server to READ logs only
-ssh mint-prod "tail -100 /tmp/tinker_server_auth.log"
-ssh mint-prod "grep -i 'error\|exception' /tmp/tinker_server_auth.log | tail -30"
+ssh mint-prod-volcano "tail -100 /tmp/tinker_server_auth.log"
+ssh mint-prod-volcano "grep -i 'error\|exception' /tmp/tinker_server_auth.log | tail -30"
 ```
 
 > **WARNING: DO NOT run any commands that modify state on mint-prod.**
@@ -111,14 +111,14 @@ python scripts/tools/reproduce_issue_<NUMBER>.py
 2. Make code changes
 3. **Restart dev server** (code changes require server restart):
    ```bash
-   ssh volcano 'pkill -f "tinker-server.*run_server"'
+   ssh mint-dev 'pkill -f "tinker-server.*run_server"'
    # Then start server using mint-dev skill
    ```
 
 ### 2.4 Verify Fix
 
 ```bash
-# Run reproduction script - should now pass
+# Run reproduction script - MUST now pass
 python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
 
@@ -171,8 +171,8 @@ Examples that usually require doc updates:
 |------|---------|
 | Reproduce on prod | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
 | Reproduce on dev | `python scripts/tools/reproduce_issue_X.py` |
-| Prod logs (READ-ONLY) | `ssh mint-prod "tail -100 /tmp/tinker_server_auth.log"` |
-| Dev logs | `ssh volcano "tail -100 /tmp/tinker_server.log"` |
+| Prod logs (READ-ONLY) | `ssh mint-prod-volcano "tail -100 /tmp/tinker_server_auth.log"` |
+| Dev logs | `ssh mint-dev "tail -100 /tmp/tinker_server.log"` |
 | Health check | `curl http://localhost:8000/api/v1/healthz` |
 
 ---

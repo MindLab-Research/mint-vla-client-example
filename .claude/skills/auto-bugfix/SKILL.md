@@ -11,9 +11,9 @@ description: |
      spawn an independent reviewer subagent, then merge to `develop` if review passes.
 
   Refers to:
-  - `bugfix` skill for reproduction discipline
-  - `mint-dev` skill for dev environment constraints (volcano host; default port 8000)
-  - `architecture-design` skill for architecture docs alignment
+- `bugfix` skill for reproduction discipline
+- `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
+- `architecture-design` skill for architecture docs alignment
 
   Triggers: "auto-bugfix", "bot queue", "assign-to-bot"
 ---
@@ -33,7 +33,7 @@ SOP step ownership (remove ambiguity):
 - Reviewer runs: 3j (and blocks merge if evidence or explanation is missing).
 
 Hard rules:
-- Production is read-only. Use `mint-prod` skill if production reads are required.
+- Production is read-only. Use the `mint-prod` skill (ssh host `mint-prod-volcano`) if production reads are required.
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
@@ -47,7 +47,7 @@ Hard rules:
   - For server/runtime bugs: the reproduction must hit the issue-scoped dev server over HTTP and exercise the real dependency stack (FastAPI + Ray).
 - "Runtime" means the real runtime. If the production code path uses Ray, a "runtime test" that does not connect to real Ray is not a runtime test.
   - "Runtime without Ray" is a non-test for the server: do not accept it for Ray-backed endpoints, actor lifecycle, scheduling, vLLM, or Megatron paths.
-- Assume an integrated repro IS feasible by default. Use the issue-scoped server on volcano + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
+- Assume an integrated repro IS feasible by default. Use the issue-scoped server on `mint-dev` + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
 - For any change that touches scheduling / placement groups / GPU allocation / engine initialization:
   - A "repro" that only asserts on computed resource numbers / GPU counts is partial evidence.
   - Require an integrated repro that (1) creates the affected session/engine in Ray and (2) completes at least one request using it (e.g. create_sampling_session + asample + retrieve_future).
@@ -73,7 +73,7 @@ Hard rules:
         (prefer: in `reproduce_issue_<N>.py`).
       - Actor lifecycle / scheduling / placement-group changes: the issue-specific repro must also complete at least one request that uses the created
         session/engine (e.g. create_sampling_session + asample + retrieve_future).
-      - Training/checkpointing: the issue-specific repro should exercise that path end-to-end.
+      - Training/checkpointing: the issue-specific repro MUST exercise that path end-to-end.
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
   - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
 - If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.
@@ -192,7 +192,7 @@ if len(roots) != 2:
     raise SystemExit(f"expected 2 root lines, got {len(roots)}")
 
 lines[roots[0]] = f"root = {local_root}\n"
-lines[roots[1]] = f"root = ssh://volcano//vePFS-Mindverse/share/code/{user}/tinker-server-issue-{issue}\n"
+lines[roots[1]] = f"root = ssh://mint-dev//vePFS-Mindverse/share/code/{user}/tinker-server-issue-{issue}\n"
 out = "".join(lines).replace("__PFS_USER__", user)
 
 dst = Path.home() / ".unison" / f"{unison_profile}.prf"
@@ -206,14 +206,14 @@ nohup unison "$UNISON_PROFILE" -repeat watch > "/tmp/unison-$UNISON_PROFILE.log"
 pgrep -af "unison.*$UNISON_PROFILE"
 ```
 
-Issue-specific server root on volcano:
+Issue-specific server root on mint-dev:
 ```bash
-ssh volcano "mkdir -p $PFS_TINKER_PATH && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
+ssh mint-dev "mkdir -p $PFS_TINKER_PATH && ln -sfn $PFS_TINKER_PATH /root/tinker_project/tinker-server-issue-$ISSUE"
 ```
 
 Start an issue-scoped dev server (does not touch the default dev server on port 8000):
 ```bash
-ssh volcano "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c \
+ssh mint-dev "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server-issue-$ISSUE:\\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
@@ -226,18 +226,18 @@ ssh volcano "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -c
 
 Issue-scoped health check (via local SSH tunnel):
 ```bash
-ssh -f -N -L ${TINKER_PORT}:localhost:${TINKER_PORT} volcano
+ssh -f -N -L ${TINKER_PORT}:localhost:${TINKER_PORT} mint-dev
 curl http://localhost:$TINKER_PORT/api/v1/healthz
 ```
 
 Issue-scoped logs:
 ```bash
-ssh volcano "tail -50 /tmp/tinker_server_issue_$ISSUE.log"
+ssh mint-dev "tail -50 /tmp/tinker_server_issue_$ISSUE.log"
 ```
 
 Issue-scoped stop:
 ```bash
-ssh volcano "test -f /tmp/tinker_server_issue_$ISSUE.pid && xargs -r kill < /tmp/tinker_server_issue_$ISSUE.pid || true"
+ssh mint-dev "test -f /tmp/tinker_server_issue_$ISSUE.pid && xargs -r kill < /tmp/tinker_server_issue_$ISSUE.pid || true"
 ```
 
 ### 3c) Delegate the fix to a bugfixer subagent
@@ -276,7 +276,7 @@ Use the `bugfix` workflow:
 Implement the minimal root-cause fix.
 
 After code changes:
-1) verify code synced to volcano (unison)
+1) verify code synced to mint-dev (unison)
 2) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
 3) confirm health endpoint
 

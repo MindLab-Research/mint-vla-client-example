@@ -23,7 +23,7 @@ Non-negotiable:
 - For sampling/inference/vLLM changes: do not accept "create_sampling_session succeeded" as sufficient. Require an end-to-end sample via `/api/v1/asample`
   and `/api/v1/retrieve_future`, and verify the returned payload.
 - Missing runtime execution evidence is blocking: if you did not run the repro/tests (or cannot), recommendation must be iterate.
-  - Do not accept "not run (server not available)" as evidence. Bring up an issue-scoped dev server on volcano and tunnel, then run the repro.
+  - Do not accept "not run (server not available)" as evidence. Bring up an issue-scoped dev server on `mint-dev` and tunnel, then run the repro.
 
 Inputs you will be given by the orchestrator:
 - PR URL

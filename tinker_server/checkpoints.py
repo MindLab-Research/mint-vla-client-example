@@ -13,7 +13,7 @@ import shutil
 import tarfile
 from pathlib import Path
 
-DEFAULT_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/code/tinker-server/checkpoints"
+DEFAULT_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/tinker_checkpoints"
 CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_CHECKPOINTS_DIR)
 
 

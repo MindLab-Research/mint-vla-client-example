@@ -52,14 +52,17 @@ async def retrieve_future(
         if upstream is None:
             raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
 
-        upstream_resp = await forward_json(
-            upstream=upstream,
-            method="POST",
-            path="/api/v1/retrieve_future",
-            incoming_headers=dict(http_request.headers),
-            json_body={"request_id": upstream_request_id},
-            timeout_s=30.0,
-        )
+        try:
+            upstream_resp = await forward_json(
+                upstream=upstream,
+                method="POST",
+                path="/api/v1/retrieve_future",
+                incoming_headers=dict(http_request.headers),
+                json_body={"request_id": upstream_request_id},
+                timeout_s=30.0,
+            )
+        except Exception:
+            raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} retrieve_future failed")
 
         response.status_code = upstream_resp.status_code
         for k, v in upstream_resp.headers.items():
@@ -73,6 +76,19 @@ async def retrieve_future(
                 status_code=502,
                 detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
             )
+
+        # If this future corresponds to an ephemeral save_weights_for_sampler on an upstream,
+        # register the returned sampling_session_id so subsequent /asample routes correctly.
+        try:
+            from ..gateway import maybe_register_sampling_session_from_retrieve_future
+
+            maybe_register_sampling_session_from_retrieve_future(
+                upstream_alias=upstream_alias,
+                upstream_request_id=upstream_request_id,
+                payload=payload,
+            )
+        except Exception:
+            pass
 
         # If the gateway uses an upstream credential (static_api_key), the upstream may treat
         # the request as privileged. Preserve local error-masking semantics based on the caller.

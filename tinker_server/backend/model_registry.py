@@ -2,7 +2,9 @@
 
 import logging
 import os
+import types
 from dataclasses import dataclass, replace
+from typing import Any, get_args, get_origin
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ class ModelConfig:
 
     Training parallelism (Megatron):
         - train_tp: Tensor parallelism
+        - train_pp: Pipeline parallelism
         - train_ep: Expert parallelism (MoE only, 1 for dense)
         - train_cp: Context parallelism (shards sequence for long context)
         - train_etp: Expert tensor parallelism (None = use TP, 1 = no expert splitting)
@@ -44,6 +47,7 @@ class ModelConfig:
     inference_dp: int  # vLLM inference DP
     max_model_len: int  # vLLM context limit (required - no fallback)
     train_tp: int = 1  # Megatron training TP (attention/shared layers)
+    train_pp: int = 1  # Megatron training PP (pipeline parallelism)
     train_ep: int = 1  # Megatron training EP (MoE expert distribution, 1 for dense)
     train_cp: int = 1  # Megatron training CP (context parallelism for long sequences)
     train_etp: int | None = None  # Expert tensor parallelism (None = use TP, 1 = no expert splitting)
@@ -53,7 +57,6 @@ class ModelConfig:
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
     max_cpu_loras: int | None = None  # None = vLLM default (max_cpu_loras=max_loras)
     max_lora_rank: int | None = None  # None = use global default, or override for large models
-    max_model_len: int  # vLLM context limit (required - no fallback)
     max_num_seqs: int | None = None  # None = use default (256), or lower for large MoE models with KV cache constraints
     # prompt_logprobs/logits can spike memory; lower values reduce peak usage at the cost of speed.
     max_num_batched_tokens: int | None = None  # None = use engine default heuristic
@@ -81,13 +84,13 @@ class ModelConfig:
 
         if self.train_ep > self.train_tp and etp < self.train_tp:
             # MoE Parallel Folding with ETP: TP is subgroup within EP
-            return self.train_ep * self.train_cp
+            return self.train_ep * self.train_pp * self.train_cp
         elif self.train_ep > 1 and self.train_cp > 1:
             # CP/EP Folding: CP and EP share GPU ranks
-            return self.train_tp * max(self.train_ep, self.train_cp)
+            return self.train_tp * self.train_pp * max(self.train_ep, self.train_cp)
         else:
             # Traditional: all dimensions orthogonal
-            return self.train_tp * self.train_ep * self.train_cp
+            return self.train_tp * self.train_pp * self.train_ep * self.train_cp
 
 
 # Supported models - only these are allowed
@@ -159,15 +162,18 @@ MODEL_CONFIGS = {
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
     # Model config: num_attention_heads=64, num_key_value_heads=4 (GQA)
-    # vLLM DP placement requires DP ranks colocated on one node (8 GPUs/node),
-    # so DP=4 is not feasible. Use multi-node TP=16 instead (16 GPUs total).
-    # Training: TP=4, EP=8 => 32 GPUs total
+    #
+    # Aliyun (L20X 140GB, 3 nodes x 8 GPUs = 24 GPUs):
+    # - Inference: TP=8, DP=1 -> 1 replica on a single 8-GPU node (8 GPUs total).
+    # - Training: TP=4, PP=2, EP=2 -> 2 pipeline stages, 8 GPUs per stage (16 GPUs total).
+    # This split lets MINT_PERSISTENT_MODELS prewarm both trainer and inferencer concurrently (16+8=24).
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
         is_moe=True,
-        inference_tp=16,
+        inference_tp=8,
         inference_dp=1,
         train_tp=4,
-        train_ep=8,
+        train_pp=2,
+        train_ep=2,
         max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
         max_model_len=32768,  # 32K context
         max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
@@ -176,10 +182,11 @@ MODEL_CONFIGS = {
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
         is_moe=True,
-        inference_tp=16,
+        inference_tp=8,
         inference_dp=1,
         train_tp=4,
-        train_ep=8,
+        train_pp=2,
+        train_ep=2,
         max_lora_rank=16,
         max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
@@ -329,20 +336,72 @@ def get_model_config(model_name: str) -> ModelConfig:
 
     if overrides:
         cfg = replace(cfg, **overrides)
+
+    raw_overrides = (
+        os.environ.get("MINT_MODEL_CONFIG_OVERRIDES_JSON") or os.environ.get("TINKER_MODEL_CONFIG_OVERRIDES_JSON") or ""
+    ).strip()
+    if raw_overrides:
+        import json
+
+        data = json.loads(raw_overrides)
+        if not isinstance(data, dict):
+            raise ValueError("MINT_MODEL_CONFIG_OVERRIDES_JSON must be a JSON object mapping model_name to overrides")
+        model_override = data.get(normalized)
+        if model_override is not None:
+            if not isinstance(model_override, dict):
+                raise ValueError(f"MINT_MODEL_CONFIG_OVERRIDES_JSON[{normalized!r}] must be a JSON object")
+            allowed_fields = set(ModelConfig.__dataclass_fields__.keys())
+            unknown = sorted(set(model_override.keys()) - allowed_fields)
+            if unknown:
+                raise ValueError(f"MINT_MODEL_CONFIG_OVERRIDES_JSON[{normalized!r}] has unknown fields: {unknown}")
+
+            def _type_ok(field: str, v: Any) -> bool:
+                ann = ModelConfig.__annotations__.get(field)
+                if ann is None:
+                    return True
+
+                def _ok(value: Any, annotation: Any) -> bool:
+                    if annotation is Any:
+                        return True
+                    if annotation is type(None):
+                        return value is None
+                    origin = get_origin(annotation)
+                    if origin in (types.UnionType, getattr(__import__("typing"), "Union")):
+                        return any(_ok(value, a) for a in get_args(annotation))
+                    if annotation is bool:
+                        return isinstance(value, bool)
+                    if annotation is int:
+                        return isinstance(value, int) and not isinstance(value, bool)
+                    if annotation is float:
+                        return isinstance(value, (int, float)) and not isinstance(value, bool)
+                    if annotation is str:
+                        return isinstance(value, str)
+                    return True
+
+                return _ok(v, ann)
+
+            bad: list[str] = []
+            for k, v in model_override.items():
+                if not _type_ok(k, v):
+                    bad.append(f"{k}={v!r}")
+            if bad:
+                raise ValueError(f"MINT_MODEL_CONFIG_OVERRIDES_JSON[{normalized!r}] has invalid values: {bad}")
+
+            cfg = replace(cfg, **model_override)
     return cfg
 
 
-def get_training_parallelism(model_name: str) -> tuple[int, int, int, int]:
+def get_training_parallelism(model_name: str) -> tuple[int, int, int, int, int]:
     """Get Megatron training parallelism settings for a model.
 
     Args:
         model_name: HuggingFace model name (e.g., "Qwen/Qwen3-0.6B") or full path
 
     Returns:
-        Tuple of (train_tp, train_ep, train_cp, train_etp)
+        Tuple of (train_tp, train_pp, train_ep, train_cp, train_etp)
     """
     config = get_model_config(model_name)
-    return (config.train_tp, config.train_ep, config.train_cp, config.train_etp)
+    return (config.train_tp, config.train_pp, config.train_ep, config.train_cp, config.train_etp)
 
 
 def requires_fp8(model_name: str) -> bool:
@@ -360,10 +419,25 @@ def requires_fp8(model_name: str) -> bool:
 
 def list_supported_models() -> list[str]:
     """Return list of supported model names."""
+    raw = (os.environ.get("MINT_SUPPORTED_MODELS") or os.environ.get("TINKER_SUPPORTED_MODELS") or "").strip()
+    if raw:
+        items = [s.strip() for s in raw.split(",") if s.strip()]
+        seen: set[str] = set()
+        models: list[str] = []
+        for m in items:
+            if m in seen:
+                continue
+            seen.add(m)
+            models.append(m)
+        unknown = [m for m in models if m not in MODEL_CONFIGS]
+        if unknown:
+            raise ValueError(f"Unsupported models in MINT_SUPPORTED_MODELS: {unknown}")
+        return models
+
     allowed = [
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
         "moonshotai/Kimi-K2-Thinking",
     ]
-    return [m for m in MODEL_CONFIGS.keys() if m in allowed]
+    return [m for m in allowed if m in MODEL_CONFIGS]

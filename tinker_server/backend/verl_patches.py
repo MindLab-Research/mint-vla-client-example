@@ -611,9 +611,8 @@ def apply_verl_patches():
             provider.context_parallel_size = self.engine_config.context_parallel_size
             provider.sequence_parallel = self.engine_config.sequence_parallel
 
-            # PATCH: Use flash attention for MLA models (value padding makes it compatible)
-            # Previously tried fused, but TE disables it for thd format with MLA
-            # Value padding (128→192) makes head_dim_qk == head_dim_v, enabling FA2
+            # PATCH: MLA models require special handling: force flash attention + value padding.
+            # Non-MLA models should keep Megatron's default attention backend selection.
             from megatron.core.transformer.enums import AttnBackend
 
             is_mla = _is_mla_model(self.model_config.hf_config)
@@ -624,9 +623,6 @@ def apply_verl_patches():
                 print(f"[VERL_PATCH] qk_nope_head_dim: {getattr(self.model_config.hf_config, 'qk_nope_head_dim', 'N/A')}")
                 print(f"[VERL_PATCH] qk_rope_head_dim: {getattr(self.model_config.hf_config, 'qk_rope_head_dim', 'N/A')}")
                 print(f"[VERL_PATCH] v_head_dim: {getattr(self.model_config.hf_config, 'v_head_dim', 'N/A')}")
-            else:
-                provider.attention_backend = AttnBackend.flash
-                print(f"[VERL_PATCH] Non-MLA model, using AttnBackend.flash")
 
             provider.variable_seq_lengths = True
             provider.moe_token_dispatcher_type = "alltoall"

@@ -3504,6 +3504,9 @@ class MegatronWorkerGroup:
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
+                # Allow TE DotProductAttention backends; some images set these to 0 by default.
+                "NVTE_FUSED_ATTN": "1",
+                "NVTE_UNFUSED_ATTN": "1",
             },
         }
 
@@ -4852,7 +4855,10 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
             ray.get(actor.get_diagnostics.remote(), timeout=5)
             return True
-        except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError, Exception):
+        except ray.exceptions.GetTimeoutError:
+            # Actor is alive but busy; treat as running.
+            return True
+        except (ValueError, ray.exceptions.RayActorError, Exception):
             return False
     else:
         # Check for any Megatron actor from resource pool
@@ -4862,6 +4868,8 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)
+                    return True
+                except ray.exceptions.GetTimeoutError:
                     return True
                 except Exception:
                     pass

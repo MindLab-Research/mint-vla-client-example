@@ -87,7 +87,7 @@ assert im.version("nvidia-cuda-nvrtc-cu12") == "12.9.86"
 assert im.version("nvidia-nvjitlink-cu12") == "12.9.86"
 PY
 
-# Core runtime deps used by the API server and Ray workers (versions from `ssh volcano` baseline).
+# Core runtime deps used by the API server and Ray workers (versions from `ssh mint-dev` baseline).
 RUN python -m pip install --no-cache-dir \
     "ray==2.51.1" \
     "fastapi==0.121.2" \

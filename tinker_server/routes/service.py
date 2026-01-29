@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from safetensors.torch import load_file
 
 from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..model_access_control import can_access_model, get_access_denied_error
@@ -93,6 +92,7 @@ async def get_server_capabilities(http_request: Request) -> dict:
 
     # Fetch capabilities once per upstream alias that has at least one routed model.
     alias_to_caps: dict[str, dict[str, int]] = {}
+    unavailable_aliases: set[str] = set()
     for alias in set(cfg.model_to_upstream.values()):
         upstream = cfg.upstreams.get(alias)
         if upstream is None:
@@ -102,7 +102,8 @@ async def get_server_capabilities(http_request: Request) -> dict:
                 upstream=upstream, incoming_headers=incoming_headers
             )
         except Exception:
-            raise HTTPException(status_code=503, detail=f"Upstream {alias!r} capabilities unavailable")
+            logger.exception("Upstream capabilities unavailable: %s", alias)
+            unavailable_aliases.add(alias)
 
     merged: list[dict] = []
     seen: set[str] = set()
@@ -114,6 +115,8 @@ async def get_server_capabilities(http_request: Request) -> dict:
         if m in cfg.model_to_upstream:
             upstream = upstream_for_model(m)
             if upstream is None:
+                continue
+            if upstream.alias in unavailable_aliases:
                 continue
             caps = alias_to_caps.get(upstream.alias, {})
             if m not in caps:
@@ -323,7 +326,16 @@ def _load_adapter_from_path(adapter_path: str, lora_rank: int) -> tuple[dict, di
     import json
     import os
 
-    from safetensors.torch import load_file
+    try:
+        from safetensors.torch import load_file  # type: ignore
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Cannot load adapter_model.safetensors on this API host (missing torch-backed safetensors). "
+                "Load adapters via a GPU worker environment."
+            ),
+        ) from e
 
     # Load weights
     weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
