@@ -113,6 +113,25 @@ def _get_actor_gpus(actor_name: str) -> int | None:
     return None
 
 
+def _get_actor_pg_total_gpus(actor_name: str) -> int | None:
+    status = _get_json(f"/api/v1/vllm_status?model_name={actor_name}", timeout_s=30.0)
+    actors = status.get("actors")
+    if not isinstance(actors, list):
+        raise RuntimeError(f"vllm_status actors missing/invalid: {actors!r}")
+    for a in actors:
+        if not isinstance(a, dict):
+            continue
+        if a.get("name") != actor_name:
+            continue
+        v = a.get("pg_total_gpus")
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        return None
+    return None
+
+
 def _expected_gpus() -> int:
     if EXPECTED_GPUS_RAW is not None and EXPECTED_GPUS_RAW.strip():
         return int(EXPECTED_GPUS_RAW)
@@ -190,10 +209,17 @@ def main() -> int:
         actor_gpus = _get_actor_gpus(actor_name)
         if actor_gpus is None:
             return _fail(f"vLLM actor not found in status: {actor_name!r}")
-        if actor_gpus != expected_gpus:
+
+        pg_total_gpus = _get_actor_pg_total_gpus(actor_name)
+        if pg_total_gpus is None:
+            return _fail(f"placement group info missing for actor: {actor_name!r}")
+        if pg_total_gpus != expected_gpus:
             return _fail(
-                f"vLLM actor {actor_name} reserves {actor_gpus} GPUs (expected {expected_gpus})"
+                f"placement group reserves {pg_total_gpus} GPUs for {actor_name} (expected {expected_gpus})"
             )
+
+        if actor_gpus != expected_gpus:
+            return _fail(f"resource pool tracks {actor_gpus} GPUs for {actor_name} (expected {expected_gpus})")
 
         print("PASS")
         return 0
