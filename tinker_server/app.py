@@ -31,7 +31,7 @@ async def _cleanup_stale_actors() -> None:
 
     Detached actors survive server restarts and can block resources.
     This function:
-    1. Kills dead/unresponsive actors in the 'tinker' namespace
+    1. Kills dead/unresponsive actors in the configured Ray namespace
     2. Registers alive actors with ResourcePool for proper GPU tracking
     """
     import os
@@ -69,15 +69,15 @@ async def _cleanup_stale_actors() -> None:
                     return model_name, cfg
             return "", None
 
-        # Get all named actors in the tinker namespace
+        # Get all named actors in the configured namespace
         actors = ray.util.list_named_actors(all_namespaces=True)
         tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
 
         if not tinker_actors:
-            logger.info("No actors found in tinker namespace")
+            logger.info(f"No actors found in namespace {PERSISTENT_NAMESPACE}")
             return
 
-        logger.info(f"Found {len(tinker_actors)} actors in tinker namespace, checking status...")
+        logger.info(f"Found {len(tinker_actors)} actors in namespace {PERSISTENT_NAMESPACE}, checking status...")
 
         resource_pool = get_resource_pool()
         cleaned = 0

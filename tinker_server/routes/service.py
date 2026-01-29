@@ -551,11 +551,12 @@ async def clear_resource_pool(request: Request) -> dict:
 
 
 @router.post("/kill_all_actors")
-async def kill_all_actors() -> dict:
-    """Kill all actors and clear the resource pool.
+async def kill_all_actors(request: Request) -> dict:
+    """Kill all actors and clear the resource pool. Admin only.
 
     Use this to free all GPUs when actors are stuck or not being evicted properly.
     """
+    _require_admin(request)
     from ..backend.resource_pool import get_resource_pool
 
     pool = get_resource_pool()

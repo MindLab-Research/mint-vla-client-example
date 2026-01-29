@@ -41,3 +41,23 @@ def test_no_hardcoded_tinker_namespace_in_backends():
         assert 'namespace="tinker"' not in txt
         assert "namespace='tinker'" not in txt
 
+
+def test_detached_store_actors_use_tinker_ray_namespace(monkeypatch):
+    monkeypatch.setenv("TINKER_RAY_NAMESPACE", "ns_tinker")
+    monkeypatch.setenv("MINT_RAY_NAMESPACE", "ns_mint")
+
+    import importlib
+
+    future_store_mod = importlib.import_module("tinker_server.backend.future_store")
+    gateway_session_store_mod = importlib.import_module("tinker_server.backend.gateway_session_store")
+    training_session_store_mod = importlib.import_module("tinker_server.backend.training_session_store")
+
+    assert future_store_mod._ray_namespace() == "ns_tinker"
+    assert training_session_store_mod._ray_namespace() == "ns_tinker"
+    assert gateway_session_store_mod._ray_namespace() == "ns_tinker"
+
+
+def test_training_session_metadata_namespace_is_ray_namespace():
+    repo_root = Path(__file__).resolve().parents[1]
+    txt = (repo_root / "tinker_server/routes/training.py").read_text(encoding="utf-8")
+    assert "MINT_RAY_NAMESPACE" not in txt

@@ -27,6 +27,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, resolve_checkpoint_path
+from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateModelFromStateRequest,
@@ -123,7 +124,7 @@ def _restore_training_session(model_id: str):
 
         actor_name = info.get("actor_name")
         if actor_name:
-            namespace = str(info.get("namespace") or os.environ.get("MINT_RAY_NAMESPACE", "tinker"))
+            namespace = str(info.get("namespace") or RAY_NAMESPACE)
             worker = ray.get_actor(actor_name, namespace=namespace)
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -297,7 +298,7 @@ async def _do_create_model(
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
                 "actor_name": actor_name,
-                "namespace": os.environ.get("MINT_RAY_NAMESPACE", "tinker"),
+                "namespace": RAY_NAMESPACE,
             })
         except Exception:
             pass
@@ -487,7 +488,7 @@ async def _do_create_model_from_state(
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
                 "actor_name": actor_name,
-                "namespace": os.environ.get("MINT_RAY_NAMESPACE", "tinker"),
+                "namespace": RAY_NAMESPACE,
             })
         except Exception:
             pass

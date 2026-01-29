@@ -30,7 +30,7 @@ from . import ray_kill
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
@@ -3393,12 +3393,19 @@ class MegatronSessionStateManager:
             (LoRA weights saved via MegatronWorkerGroup.save_adapter_state)
     """
 
-    def __init__(self, base_path: str = "/vePFS-Mindverse/share/code/tinker-server/checkpoints/megatron_sessions"):
+    def __init__(self, base_path: str | None = None):
         """Initialize the session state manager.
 
         Args:
             base_path: Root directory for all session checkpoints.
         """
+        if base_path is None:
+            base_path = os.environ.get("MINT_MEGATRON_SESSIONS_BASE_PATH") or os.path.join(
+                PFS_TINKER_PATH,
+                "checkpoints",
+                "megatron_sessions",
+            )
+
         self.base_path = base_path
         os.makedirs(base_path, exist_ok=True)
         self._session_metadata: dict[str, dict] = {}  # session_id -> {step, lr, actual_rank}
