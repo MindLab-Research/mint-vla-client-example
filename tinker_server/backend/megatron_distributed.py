@@ -3500,6 +3500,14 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
 
         # Runtime env for workers
+        is_mla = False
+        try:
+            from .model_registry import get_model_config
+
+            is_mla = bool(get_model_config(self.base_model).is_mla)
+        except Exception:
+            is_mla = False
+
         runtime_env = {
             "env_vars": {
                 "PYTHONPATH": PFS_PYTHONPATH,
@@ -3511,9 +3519,9 @@ class MegatronWorkerGroup:
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
-                # Allow TE DotProductAttention backends; some images set these to 0 by default.
-                "NVTE_FUSED_ATTN": "1",
-                "NVTE_UNFUSED_ATTN": "1",
+                # Allow TE DotProductAttention backends; Megatron flash attention asserts these are 0.
+                "NVTE_FUSED_ATTN": "0" if is_mla else "1",
+                "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
             },
         }
 
