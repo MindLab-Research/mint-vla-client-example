@@ -96,15 +96,15 @@ def _require_model_in_caps(model_name: str) -> None:
 
 
 def _get_actor_gpus(actor_name: str) -> int | None:
-    status = _get_json(f"/api/v1/vllm_status?model_name={actor_name}", timeout_s=30.0)
+    status = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
     actors = status.get("actors")
     if not isinstance(actors, list):
-        raise RuntimeError(f"vllm_status actors missing/invalid: {actors!r}")
+        raise RuntimeError(f"actors missing/invalid: {actors!r}")
     for a in actors:
         if not isinstance(a, dict):
             continue
-        if a.get("name") == actor_name:
-            g = a.get("gpus")
+        if a.get("actor_name") == actor_name:
+            g = a.get("num_gpus")
             if isinstance(g, int):
                 return g
             if isinstance(g, float):
@@ -114,14 +114,14 @@ def _get_actor_gpus(actor_name: str) -> int | None:
 
 
 def _get_actor_pg_total_gpus(actor_name: str) -> int | None:
-    status = _get_json(f"/api/v1/vllm_status?model_name={actor_name}", timeout_s=30.0)
+    status = _get_json("/api/v1/actors?type=vllm", timeout_s=30.0)
     actors = status.get("actors")
     if not isinstance(actors, list):
-        raise RuntimeError(f"vllm_status actors missing/invalid: {actors!r}")
+        raise RuntimeError(f"actors missing/invalid: {actors!r}")
     for a in actors:
         if not isinstance(a, dict):
             continue
-        if a.get("name") != actor_name:
+        if a.get("actor_name") != actor_name:
             continue
         v = a.get("pg_total_gpus")
         if isinstance(v, int):
@@ -146,7 +146,7 @@ def _expected_gpus() -> int:
 
 def _try_kill_all_actors() -> None:
     try:
-        _post_json("/api/v1/kill_all_actors", {}, timeout_s=30.0)
+        _post_json("/api/v1/actors/kill", {"actor_type": "all"}, timeout_s=30.0)
     except Exception:
         return
 

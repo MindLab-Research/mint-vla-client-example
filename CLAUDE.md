@@ -127,8 +127,8 @@ Detached Ray actor surviving server restarts. First start ~80s, subsequent ~2s.
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/healthz` | GET | Health check |
-| `/api/v1/vllm_status` | GET | vLLM actor status |
-| `/api/v1/kill_vllm` | POST | Kill vLLM actor |
+| `/api/v1/actors` | GET | List actors (ResourcePool) |
+| `/api/v1/actors/kill` | POST | Kill actors by type |
 | `/api/v1/create_session` | POST | Create session |
 | `/api/v1/create_sampling_session` | POST | Create sampling session |
 | `/api/v1/asample` | POST | Submit async sample |
