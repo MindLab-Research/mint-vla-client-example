@@ -84,7 +84,7 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
 |------|---------|
 | `/vePFS-Mindverse/share/code/tinker-server/` | Dev code (synced via Unison) |
 | `/vePFS-Mindverse/share/code/tinker-server-auth/` | Prod code (synced via Unison) |
-| `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM package (PYTHONPATH override) |
+| `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` | vLLM package (PYTHONPATH override) |
 | `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
 | `/vePFS-Mindverse/share/models/` | Model checkpoints |
 | `/vePFS-Mindverse/share/dataset/` | Training datasets |
@@ -391,7 +391,7 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 | Package | Version | Path |
 |---------|---------|------|
 | PyTorch | 2.9.0 | `/vePFS-Mindverse/share/code/torch-2.9.0/` |
-| vLLM | 0.12.0 | `/vePFS-Mindverse/share/code/vllm-0.12.0/` |
+| vLLM | 0.13.0 | `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` |
 
 **PYTHONPATH order matters:** torch must come before vllm.
 

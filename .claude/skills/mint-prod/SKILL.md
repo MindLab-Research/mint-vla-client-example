@@ -347,6 +347,8 @@ The API server is a Python process. Ray actors are separate Python processes.
 
 Detached actors (vLLM, Megatron, DenseTrainerPool, stores) survive server restarts and keep running old code until killed.
 
+Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
+
 ### Kill criteria after code changes
 
 Always restart the server after code changes.

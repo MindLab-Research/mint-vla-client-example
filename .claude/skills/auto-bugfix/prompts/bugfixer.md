@@ -23,6 +23,7 @@ Non-negotiable rules:
 - For sampling/inference/vLLM changes: do not treat "create_sampling_session succeeded" as sufficient. Your repro must submit a sample via `/api/v1/asample`
   and retrieve it via `/api/v1/retrieve_future`, asserting on the returned payload (end-to-end through the running system).
 - Restart the issue-scoped dev server after code changes (no hot reload).
+- If uncertain whether a code change is used by a detached actor, run the namespace cleanup snippet (issue namespace makes this safe).
 - Use issue-specific `TINKER_RAY_NAMESPACE` and run the namespace cleanup snippet from `.claude/skills/auto-bugfix/SKILL.md` after finishing the issue so detached actors do not accumulate.
 - Ensure `MINT_RAY_NAMESPACE` matches `TINKER_RAY_NAMESPACE` so detached store actors are also issue-scoped.
 - Never create/get/kill Ray actors outside the provided `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.

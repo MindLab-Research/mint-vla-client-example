@@ -34,7 +34,7 @@ Storages:
 | Path | Purpose |
 |------|---------|
 | `/vePFS-Mindverse/share/code/tinker-server/` | Application code (synced via Unison) |
-| `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM package (for PYTHONPATH override) |
+| `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` | vLLM package (for PYTHONPATH override) |
 | `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
 | `/vePFS-Mindverse/share/models/` | Model checkpoints |
 | `/vePFS-Mindverse/share/dataset/` | Training datasets |

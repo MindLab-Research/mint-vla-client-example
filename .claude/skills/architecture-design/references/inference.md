@@ -24,10 +24,10 @@
 - `MultiLoRAInferenceEngine` otherwise.
 
 Mechanics (MultiNodeInferenceEngine):
-- vLLM's Ray backend spawns 1-GPU worker actors and needs a controller process with CUDA visibility.
+- vLLM's Ray backend spawns 1-GPU worker actors plus a CPU-only controller actor.
 - Mint creates:
-  - a detached placement group with `total_required_gpus = worker_gpus + 1` bundles (strategy `PACK`)
-  - a detached controller actor with `num_gpus=1`, pinned to the last bundle index
+  - a detached placement group with `total_required_gpus = worker_gpus` GPU bundles plus one CPU-only controller bundle (strategy `PACK`)
+  - a detached controller actor with `num_gpus=0`, pinned to the controller bundle index
   - child vLLM workers captured into the same placement group (`placement_group_capture_child_tasks=True`)
 - `ResourcePool` accounts for the full `total_required_gpus` so eviction decisions reflect the real cluster footprint.
 

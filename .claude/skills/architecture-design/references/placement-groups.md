@@ -27,9 +27,9 @@ Mint uses placement groups for:
 The key property is that Ray will not start the worker group unless it can reserve all bundles in the placement group.
 
 `tinker_server/backend/multinode_inference.py` (multi-node vLLM):
-- Creates a detached placement group named `{actor_name}_pg` with `total_required_gpus = worker_gpus + 1` bundles.
+- Creates a detached placement group named `{actor_name}_pg` with `total_required_gpus = worker_gpus` GPU bundles plus one CPU-only controller bundle.
 - Uses `strategy="PACK"` to keep 1-GPU workers from consuming 1 GPU on every node.
-- Schedules the controller actor into the last bundle index and enables `placement_group_capture_child_tasks=True` so vLLM worker actors land in the same group.
+- Schedules the controller actor into the controller bundle and enables `placement_group_capture_child_tasks=True` so vLLM worker actors land in the same group.
 
 `tinker_server/backend/verl_training.py` (DenseTrainerPool):
 - Creates a detached placement group named `{actor_name}_pg` for each pooled `TrainingWorker` actor.
