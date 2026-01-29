@@ -1022,6 +1022,7 @@ class TrainingWorker:
         import json
         import os
 
+        torch = _get_torch()
         from safetensors.torch import save_file
 
         os.makedirs(save_path, exist_ok=True)
@@ -1069,6 +1070,7 @@ class TrainingWorker:
         import json
         import os
 
+        torch = _get_torch()
         from safetensors.torch import load_file
 
         # 1. Load LoRA weights
