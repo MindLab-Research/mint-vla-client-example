@@ -17,12 +17,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
-import torch
-from omegaconf import OmegaConf
 
 from . import ray_kill
 
 if TYPE_CHECKING:
+    import torch
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 logger = logging.getLogger(__name__)
@@ -35,18 +34,10 @@ from tinker_server.ray_utils import init_ray
 from tinker_server.backend.model_registry import get_model_config
 
 # Apply verl's hijack for TensorLoRARequest support
-# Must be done before engine initialization
-def _apply_vllm_hijack():
-    """Apply verl's vLLM hijack for TensorLoRARequest support."""
-    try:
-        from verl.utils.vllm import VLLMHijack, is_version_ge
-        if is_version_ge(pkg="vllm", minver="0.7.3"):
-            VLLMHijack.hijack()
-            logger.info("Applied VLLMHijack for TensorLoRARequest support")
-    except Exception as e:
-        logger.warning(f"Could not apply VLLMHijack: {e}")
-
-_apply_vllm_hijack()
+# NOTE: Do not apply VLLM hijacks at module import time.
+# The API server can be CPU-only (no vLLM/verl installed), while Ray actors on GPU
+# nodes run inside `mint:8` and have the runtime available. We apply hijacks inside
+# the Ray actor process before engine initialization (see ExtendedVLLMHttpServer.__init__).
 
 
 # Extended vLLMHttpServer with add_lora support

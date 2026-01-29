@@ -152,14 +152,24 @@ def _get_or_create_ray_actor():
             if meta is not None:
                 self._meta[request_id] = dict(meta)
 
-        def submit(self, request_id: str, target_actor: Any, method_name: str, args: list[Any], meta: dict[str, Any] | None = None) -> None:
+        def submit(
+            self,
+            request_id: str,
+            target_actor: Any,
+            method_name: str,
+            args: list[Any] | dict[str, Any],
+            meta: dict[str, Any] | None = None,
+        ) -> None:
             self._prune()
             self._pending.add(request_id)
             self._created_at[request_id] = time.time()
             if meta is not None:
                 self._meta[request_id] = dict(meta)
             method = getattr(target_actor, method_name)
-            self._refs[request_id] = method.remote(*args)
+            if isinstance(args, dict):
+                self._refs[request_id] = method.remote(**args)
+            else:
+                self._refs[request_id] = method.remote(*args)
 
         def resolve(self, request_id: str, result: Any) -> None:
             self._prune()
@@ -289,7 +299,14 @@ class FutureStore:
 
         import ray
 
-        ray.get(actor.add_pending.remote(request_id))
+        try:
+            ray.get(actor.add_pending.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            ray.get(actor.add_pending.remote(request_id))
         return request_id
 
     def resolve(self, request_id: str, result: Any) -> None:
@@ -297,14 +314,32 @@ class FutureStore:
         if actor is None:
             self._local.resolve(request_id, result)
             return
-        actor.resolve.remote(request_id, result)
+        import ray
+
+        try:
+            actor.resolve.remote(request_id, result)
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            actor.resolve.remote(request_id, result)
 
     def fail(self, request_id: str, error: str) -> None:
         actor = self._get_ray_actor()
         if actor is None:
             self._local.fail(request_id, error)
             return
-        actor.fail.remote(request_id, error)
+        import ray
+
+        try:
+            actor.fail.remote(request_id, error)
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            actor.fail.remote(request_id, error)
 
     def get_status(self, request_id: str) -> FutureStatus:
         actor = self._get_ray_actor()
@@ -313,7 +348,14 @@ class FutureStore:
 
         import ray
 
-        status = ray.get(actor.get_status.remote(request_id))
+        try:
+            status = ray.get(actor.get_status.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            status = ray.get(actor.get_status.remote(request_id))
         return FutureStatus(status)
 
     def get_result(self, request_id: str) -> Any:
@@ -323,7 +365,14 @@ class FutureStore:
 
         import ray
 
-        return ray.get(actor.get_result.remote(request_id))
+        try:
+            return ray.get(actor.get_result.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            return ray.get(actor.get_result.remote(request_id))
 
     def get_error(self, request_id: str) -> str | None:
         actor = self._get_ray_actor()
@@ -332,7 +381,14 @@ class FutureStore:
 
         import ray
 
-        return ray.get(actor.get_error.remote(request_id))
+        try:
+            return ray.get(actor.get_error.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            return ray.get(actor.get_error.remote(request_id))
 
     def attach_ref(self, request_id: str, ref: Any, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
@@ -341,16 +397,37 @@ class FutureStore:
 
         import ray
 
-        ray.get(actor.attach_ref.remote(request_id, ref, meta))
+        try:
+            ray.get(actor.attach_ref.remote(request_id, ref, meta))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            ray.get(actor.attach_ref.remote(request_id, ref, meta))
 
-    def submit(self, request_id: str, target_actor: Any, method_name: str, args: list[Any], meta: dict[str, Any] | None = None) -> None:
+    def submit(
+        self,
+        request_id: str,
+        target_actor: Any,
+        method_name: str,
+        args: list[Any] | dict[str, Any],
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         actor = self._get_ray_actor()
         if actor is None:
             raise RuntimeError("Ray not initialized: FutureStore.submit requires Ray")
 
         import ray
 
-        ray.get(actor.submit.remote(request_id, target_actor, method_name, args, meta))
+        try:
+            ray.get(actor.submit.remote(request_id, target_actor, method_name, args, meta))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            ray.get(actor.submit.remote(request_id, target_actor, method_name, args, meta))
 
     def get_meta(self, request_id: str) -> dict[str, Any] | None:
         actor = self._get_ray_actor()
@@ -359,14 +436,30 @@ class FutureStore:
 
         import ray
 
-        return ray.get(actor.get_meta.remote(request_id))
+        try:
+            return ray.get(actor.get_meta.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            return ray.get(actor.get_meta.remote(request_id))
 
     def cleanup(self, request_id: str) -> None:
         actor = self._get_ray_actor()
         if actor is None:
             self._local.cleanup(request_id)
             return
-        actor.cleanup.remote(request_id)
+        import ray
+
+        try:
+            actor.cleanup.remote(request_id)
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            if actor is None:
+                raise
+            actor.cleanup.remote(request_id)
 
 
 future_store = FutureStore()

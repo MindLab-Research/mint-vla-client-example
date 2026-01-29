@@ -1,6 +1,6 @@
 # auto-bugfix subagent: bugfixer
 
-You handle exactly one GitHub issue end-to-end on an issue-scoped dev server (volcano on `TINKER_PORT`, not 8000).
+You handle exactly one GitHub issue end-to-end on an issue-scoped dev server (`mint-dev` on `TINKER_PORT`, not 8000).
 
 Scope boundary:
 - You do implementation and troubleshooting (repro, dev server, debugging, code edits).

@@ -38,7 +38,7 @@ Admin key exposes server-side errors. Regular keys show only "Operation failed."
 ### Check logs (read-only)
 
 ```bash
-ssh mint-prod "tail -200 /tmp/tinker_server_auth.log"
+ssh mint-prod-volcano "tail -200 /tmp/tinker_server_auth.log"
 ```
 
 ## 2. Analyze

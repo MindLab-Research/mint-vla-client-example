@@ -16,8 +16,8 @@ description: |
 
 ```bash
 # Volcano CLI is pre-installed and configured on the SSH bastions:
-# - Dev:  ssh volcano
-# - Prod: ssh mint-prod
+# - Dev:  ssh mint-dev
+# - Prod: ssh mint-prod-volcano
 #
 # Use the absolute path to avoid PATH mismatches:
 #   /root/.volc/bin/volc
@@ -29,13 +29,13 @@ description: |
 /root/.volc/bin/volc version
 
 # List all tasks
-ssh mint-prod '/root/.volc/bin/volc ml_task list --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json'
 
 # Cancel task
-ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
 
 # View task logs (find Ray IP here)
-ssh mint-prod '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
 
 # Ray dashboard
 http://<RAY_HEAD_IP>:8265
@@ -100,7 +100,7 @@ Always measure what is already running before submitting or canceling tasks.
 ### List Volcano jobs (from prod bastion)
 
 ```bash
-ssh mint-prod '/root/.volc/bin/volc ml_task list --output json --limit 200' | python3 - <<'PY'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json --limit 200' | python3 - <<'PY'
 import json, re, sys
 s=sys.stdin.read()
 m=re.search(r'[\[{]', s)
@@ -132,7 +132,7 @@ Conventions used by these configs:
 ### List Ray GPU nodes (no Volcano CLI required)
 
 ```bash
-ssh mint-prod python3 - <<'PY'
+ssh mint-prod-volcano python3 - <<'PY'
 import ray
 ray.init(address="auto")
 nodes=[n for n in ray.nodes() if n.get("Alive")]
@@ -140,7 +140,7 @@ gpu_nodes=[n for n in nodes if (n.get("Resources") or {}).get("GPU",0)]
 print("prod_gpu_nodes", len(gpu_nodes), "gpu_total", ray.cluster_resources().get("GPU"), "gpu_avail", ray.available_resources().get("GPU"))
 PY
 
-ssh volcano python3 - <<'PY'
+ssh mint-dev python3 - <<'PY'
 import ray
 ray.init(address="auto")
 nodes=[n for n in ray.nodes() if n.get("Alive")]
@@ -153,12 +153,12 @@ PY
 
 1. **Submit head:**
    ```bash
-   ssh volcano '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server/.claude/skills/volcano-cluster/configs/mint-dev-head.yaml --output json'
+   ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server/.claude/skills/volcano-cluster/configs/mint-dev-head.yaml --output json'
    ```
 
 2. **Get head IP from logs:**
    ```bash
-   ssh volcano '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
+   ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
    ```
 
 3. **Copy template and fill in head IP:**
@@ -169,12 +169,12 @@ PY
 
 4. **Submit worker from temp file:**
    ```bash
-   ssh volcano '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
+   ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
    ```
 
 5. **Connect SSH server to cluster:**
    ```bash
-   ssh volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+   ssh mint-dev "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
    ```
 
 ### Production Cluster
@@ -183,19 +183,19 @@ Prod head writes IP to PFS automatically. Workers read from PFS.
 
 1. **Submit head:**
    ```bash
-   ssh mint-prod '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-head.yaml --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-head.yaml --output json'
    ```
 
 2. **Wait for head to write IP to PFS:**
    ```bash
-   # Check PFS file (head should write on startup)
-   ssh mint-prod 'ls -la /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
+   # Check PFS file (head MUST write on startup)
+   ssh mint-prod-volcano 'ls -la /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
    ```
 
    If the file is missing but the Ray cluster is running, recover it from Ray and write it:
 
    ```bash
-   ssh mint-prod 'ip=$(python3 - <<\"PY\"
+ssh mint-prod-volcano 'ip=$(python3 - <<\"PY\"
 import ray
 ray.init(address=\"auto\")
 nodes=[n for n in ray.nodes() if n.get(\"Alive\")]
@@ -207,12 +207,12 @@ PY
 
 3. **Submit worker (reads head IP from PFS):**
    ```bash
-   ssh mint-prod '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml --output json'
    ```
 
 4. **Connect SSH server to cluster:**
    ```bash
-   ssh mint-prod "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+ssh mint-prod-volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
    ```
 
 ---
@@ -222,7 +222,7 @@ PY
 ### List Tasks
 
 ```bash
-ssh mint-prod '/root/.volc/bin/volc ml_task list --output json --limit 200'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json --limit 200'
 ```
 
 Look for task names containing your cluster identifier.
@@ -231,11 +231,11 @@ Look for task names containing your cluster identifier.
 
 ```bash
 # Cancel single task
-ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
 
 # Cancel multiple (run sequentially)
-ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <worker_task_id> --output json'
-ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <head_task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <worker_task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <head_task_id> --output json'
 ```
 
 **WARNING:** Production tasks include "prod" in names. Never cancel prod tasks for dev work.
@@ -244,10 +244,10 @@ ssh mint-prod '/root/.volc/bin/volc ml_task cancel --id <head_task_id> --output 
 
 ```bash
 # Dev
-ssh volcano "ray stop"
+ssh mint-dev "ray stop"
 
 # Prod
-ssh mint-prod "ray stop"
+ssh mint-prod-volcano "ray stop"
 ```
 
 ---
@@ -260,7 +260,7 @@ When actors become unresponsive (OOM, stuck, orphaned):
 
 ```bash
 # Dev cluster
-ssh volcano 'python3 << "PYEOF"
+ssh mint-dev 'python3 << "PYEOF"
 import ray
 ray.init(address="auto", ignore_reinit_error=True)
 r = ray.available_resources()
@@ -276,7 +276,7 @@ for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
         print(f"{name}: not running")
 PYEOF'
 
-# Prod cluster - use mint-prod instead of volcano
+# Prod cluster - use mint-prod-volcano instead of mint-dev
 ```
 
 ### Kill Actors
@@ -334,7 +334,7 @@ Shows: actors, tasks, resources, logs, errors.
 ### Task Logs
 
 ```bash
-ssh mint-prod '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
 ```
 
 ### Finding Ray Head IP
@@ -349,7 +349,7 @@ volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 # From logs
 volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
 
-# From PFS (preferred)
+# From PFS (MUST if present)
 cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt
 ```
 
@@ -361,13 +361,13 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 
 1. **Download on SSH server** (has proxy):
    ```bash
-   ssh volcano 'export http_proxy=http://localhost:1081 https_proxy=http://localhost:1081 && \
+   ssh mint-dev 'export http_proxy=http://localhost:1081 https_proxy=http://localhost:1081 && \
      pip download <package>==<version> --no-deps -d /tmp/wheels'
    ```
 
 2. **Install to PFS:**
    ```bash
-   ssh volcano 'pip install --target=/vePFS-Mindverse/share/code/<package>-<version> \
+   ssh mint-dev 'pip install --target=/vePFS-Mindverse/share/code/<package>-<version> \
      /tmp/wheels/<package>-*.whl --no-deps'
    ```
 

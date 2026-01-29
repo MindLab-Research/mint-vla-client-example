@@ -315,10 +315,11 @@ async def _prewarm_persistent_models(
                     async_get_or_create_megatron_worker_group,
                 )
 
-                train_tp, train_ep, train_cp, train_etp = get_training_parallelism(model_name)
+                train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_name)
                 use_fp8 = requires_fp8(model_name)
                 distributed_config = DistributedConfig(
                     tensor_parallel_size=train_tp,
+                    pipeline_parallel_size=train_pp,
                     expert_parallel_size=train_ep,
                     context_parallel_size=train_cp,
                     expert_tensor_parallel_size=train_etp,
@@ -327,7 +328,7 @@ async def _prewarm_persistent_models(
 
                 logger.info(
                     f"[prewarm] training create start model={model_name} backend=megatron "
-                    f"TP={train_tp} EP={train_ep} CP={train_cp} ETP={train_etp} world_size={distributed_config.world_size}"
+                    f"TP={train_tp} PP={train_pp} EP={train_ep} CP={train_cp} ETP={train_etp} world_size={distributed_config.world_size}"
                 )
                 actor = await async_get_or_create_megatron_worker_group(
                     base_model=base_model,

@@ -21,6 +21,12 @@ def init_ray(**kwargs: Any) -> Any:
     """
     import ray
 
+    addr = os.environ.get("RAY_ADDRESS", "").strip()
+    if addr:
+        current = kwargs.get("address")
+        if current is None or current == "" or current == "auto":
+            kwargs["address"] = addr
+
     for k, v in ray_log_to_driver_kwargs().items():
         kwargs.setdefault(k, v)
 

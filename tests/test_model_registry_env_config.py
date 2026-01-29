@@ -1,0 +1,52 @@
+import json
+
+
+def test_list_supported_models_env(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv(
+        "MINT_SUPPORTED_MODELS",
+        "Qwen/Qwen3-0.6B, Qwen/Qwen3-4B-Instruct-2507, Qwen/Qwen3-0.6B",
+    )
+    got = mr.list_supported_models()
+    assert got == ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B-Instruct-2507"]
+
+
+def test_list_supported_models_env_unknown_raises(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv("MINT_SUPPORTED_MODELS", "does/not-exist")
+    try:
+        mr.list_supported_models()
+    except ValueError as e:
+        assert "Unsupported models" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_model_config_overrides_json(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv(
+        "MINT_MODEL_CONFIG_OVERRIDES_JSON",
+        json.dumps({"Qwen/Qwen3-0.6B": {"inference_tp": 2, "gpu_memory_utilization": 0.91}}),
+    )
+    cfg = mr.get_model_config("Qwen/Qwen3-0.6B")
+    assert cfg.inference_tp == 2
+    assert cfg.gpu_memory_utilization == 0.91
+
+
+def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv(
+        "MINT_MODEL_CONFIG_OVERRIDES_JSON",
+        json.dumps({"Qwen/Qwen3-0.6B": {"not_a_field": 1}}),
+    )
+    try:
+        mr.get_model_config("Qwen/Qwen3-0.6B")
+    except ValueError as e:
+        assert "unknown fields" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+

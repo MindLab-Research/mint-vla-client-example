@@ -27,8 +27,8 @@
 # PFS is single source of truth. Edit on either local machine or server.
 # Unison keeps both in sync, preferring newer changes.
 
-root = /home/yiwen/tinker_project/tinker-server
-root = ssh://volcano//vePFS-Mindverse/share/code/__PFS_USER__/tinker-server
+root = /path/to/tinker-server
+root = ssh://mint-dev//vePFS-Mindverse/share/code/__PFS_USER__/tinker-server
 
 # Sync options
 auto = true
@@ -48,6 +48,11 @@ ignore = Name {venv}
 ignore = Name {.mypy_cache}
 ignore = Name {.pytest_cache}
 ignore = Name {*.egg-info}
+ignore = Name {.env}
+ignore = Name {.secrets.env}
+ignore = Name {LOG.md}
+ignore = Name {PROMPT.md}
+ignore = Name {.git}
 
 # SSH options - use the compiled unison on remote
 servercmd = /usr/local/bin/unison

@@ -65,7 +65,7 @@ pgrep -af "unison.*volcano-tinker" || echo "START: unison volcano-tinker -repeat
 ### 2. Verify Cluster Has Sufficient GPUs
 
 ```bash
-ssh volcano 'python3 << "PYEOF"
+ssh mint-dev 'python3 << "PYEOF"
 import ray
 ray.init(address="auto", ignore_reinit_error=True)
 r = ray.available_resources()
@@ -204,21 +204,21 @@ Stress test configurations (using Qwen3 models):
 > **CRITICAL: Tests Run LOCALLY, Not on Server**
 >
 > All pytest commands run on your LOCAL machine (which has internet access for tokenizer downloads).
-> Tests connect to the server via SSH tunnel (localhost:8000 → volcano:8000).
+> Tests connect to the server via SSH tunnel (localhost:8000 -> mint-dev:8000).
 >
 > **Do NOT:**
 > - Run pytest on the server (no internet for tokenizer downloads)
 > - Set `HF_HUB_OFFLINE=1` or `HF_HOME=/vePFS-...` for test scripts
 >
-> **Server commands** (ssh volcano '...') set HF_HUB_OFFLINE because the server has no internet.
+> **Server commands** (ssh mint-dev '...') set HF_HUB_OFFLINE because the server has no internet.
 > **Test commands** (python -m pytest) run locally and download tokenizers from HuggingFace Hub.
 
 ### Complete Merge Gate
 
 ```bash
 # Run from LOCAL machine (has internet for tokenizer downloads)
-# Ensure SSH tunnel is active: ssh -f -N -L 8000:localhost:8000 volcano
-cd /home/yiwen/tinker_project/tinker-server
+# Ensure SSH tunnel is active: ssh -f -N -L 8000:localhost:8000 mint-dev
+cd /path/to/tinker-server-prod
 
 # Run all functional tests (do NOT kill actors between)
 TINKER_BASE_URL=http://localhost:8000 \
@@ -232,11 +232,12 @@ To test LRU eviction with immediate actor replacement:
 ```bash
 # Restart server with MINT_MIN_ACTOR_AGE=0 to enable immediate eviction
 # (Production uses 300s to prevent thrashing; 0 for fast testing)
-ssh volcano 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-server && \
+ssh mint-dev 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-server && \
   nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
   PYTHONDONTWRITEBYTECODE=1 MINT_MIN_ACTOR_AGE=0 \
   python scripts/run_server.py" >> /tmp/tinker_server.log 2>&1 &'
+ 
 
 # Wait for server to start
 sleep 10 && curl http://localhost:8000/api/v1/healthz
@@ -385,10 +386,10 @@ Loss                           Loss
 **How to view plots:**
 ```bash
 # From local machine (plots saved to remote server)
-ssh volcano 'ls /root/tinker_project/tinker-server/.claude/skills/merge-gate/results/*.png'
+ssh mint-dev 'ls /root/tinker_project/tinker-server/.claude/skills/merge-gate/results/*.png'
 
 # Copy plots locally for viewing
-scp volcano:/root/tinker_project/tinker-server/.claude/skills/merge-gate/results/*.png /tmp/
+rsync -av mint-dev:/root/tinker_project/tinker-server/.claude/skills/merge-gate/results/ /tmp/merge-gate-results/
 
 # Or view JSON data directly
 cat .claude/skills/merge-gate/results/dense_sft_pig_latin_*.json | jq .losses
@@ -528,7 +529,7 @@ gh pr create --base main --head develop --title "Release: <version>" --body-file
 | Issue | Solution |
 |-------|----------|
 | Pre-flight fails: 0 GPUs | Kill stale actors (see mint-dev skill section 6) |
-| Pre-flight fails: cluster disconnected | Reconnect: `ssh volcano "ray start --address='<IP>:6379'"` |
+| Pre-flight fails: cluster disconnected | Reconnect: `ssh mint-dev "ray start --address='<IP>:6379'"` |
 | Dense tests timeout | Check server logs, restart server |
 | MoE tests fail to start | Need 8 GPUs (TP=4), add worker via volcano-cluster |
 | MoE tests OOM | Kill vLLM, restart with fresh actor |

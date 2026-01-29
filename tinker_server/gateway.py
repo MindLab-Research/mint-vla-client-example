@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 _GATEWAY_REQUEST_ID_PREFIX = "gw:"
 
@@ -38,9 +41,14 @@ def get_gateway_config() -> GatewayConfig | None:
         return None
 
     data = json.loads(raw)
-    model_to_upstream = dict(data.get("model_to_upstream") or {})
+    model_to_upstream = dict(
+        data.get("model_to_upstream")
+        or data.get("model_to_deployment_target")
+        or data.get("model_to_target")
+        or {}
+    )
 
-    upstreams_raw = data.get("upstreams") or {}
+    upstreams_raw = data.get("upstreams") or data.get("deployment_targets") or data.get("targets") or {}
     upstreams: dict[str, Upstream] = {}
     for alias, u in upstreams_raw.items():
         base_url = str(u.get("base_url") or "").rstrip("/")
@@ -100,15 +108,18 @@ def decode_request_id(request_id: str) -> tuple[str, str] | None:
 
 
 def _pick_auth_headers(*, incoming_headers: dict[str, str], upstream: Upstream) -> dict[str, str]:
+    incoming_lower = {k.lower(): v for k, v in incoming_headers.items()}
     if upstream.auth_mode == "none":
         return {}
     if upstream.auth_mode == "static_api_key":
         return {"X-API-Key": upstream.api_key or ""}
     if upstream.auth_mode == "pass_through":
-        if "X-API-Key" in incoming_headers and incoming_headers["X-API-Key"]:
-            return {"X-API-Key": incoming_headers["X-API-Key"]}
-        if "Authorization" in incoming_headers and incoming_headers["Authorization"]:
-            return {"Authorization": incoming_headers["Authorization"]}
+        api_key = (incoming_headers.get("X-API-Key") or incoming_lower.get("x-api-key") or "").strip()
+        if api_key:
+            return {"X-API-Key": api_key}
+        auth = (incoming_headers.get("Authorization") or incoming_lower.get("authorization") or "").strip()
+        if auth:
+            return {"Authorization": auth}
         return {}
     raise ValueError(
         f"TINKER_GATEWAY_CONFIG_JSON: unsupported auth_mode={upstream.auth_mode!r} for {upstream.alias!r}"
@@ -132,22 +143,120 @@ async def forward_json(
 
 _remote_sampling_sessions: dict[str, tuple[str, str]] = {}  # sampling_session_id -> (upstream_alias, base_model)
 _remote_training_models: dict[str, tuple[str, str]] = {}  # model_id -> (upstream_alias, base_model)
+_pending_save_weights_for_sampler: dict[tuple[str, str], tuple[float, str]] = {}  # (up_alias, up_req_id) -> (ts, base_model)
+
+
+def register_pending_save_weights_for_sampler_future(
+    *, upstream_alias: str, upstream_request_id: str, base_model: str
+) -> None:
+    """Record that a pending save_weights_for_sampler future will return a sampling_session_id."""
+    # Best-effort TTL cleanup.
+    now = time.time()
+    for k, (ts, _) in list(_pending_save_weights_for_sampler.items()):
+        if now - ts > 3600:
+            _pending_save_weights_for_sampler.pop(k, None)
+    _pending_save_weights_for_sampler[(upstream_alias, upstream_request_id)] = (now, base_model)
+
+
+def maybe_register_sampling_session_from_retrieve_future(
+    *, upstream_alias: str, upstream_request_id: str, payload: Any
+) -> None:
+    """If retrieve_future returns an ephemeral sampling_session_id, register it for /asample routing."""
+    if not isinstance(payload, dict):
+        return
+    if payload.get("type") != "save_weights_for_sampler":
+        return
+    sampling_session_id = payload.get("sampling_session_id")
+    if not isinstance(sampling_session_id, str) or not sampling_session_id:
+        return
+    key = (upstream_alias, upstream_request_id)
+    entry = _pending_save_weights_for_sampler.pop(key, None)
+    if entry is None:
+        return
+    _, base_model = entry
+    register_remote_sampling_session(
+        sampling_session_id=sampling_session_id,
+        upstream_alias=upstream_alias,
+        base_model=base_model,
+    )
 
 
 def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
     _remote_sampling_sessions[sampling_session_id] = (upstream_alias, base_model)
+    try:
+        from .backend import gateway_session_store
+
+        gateway_session_store.upsert_sampling_session(
+            sampling_session_id=sampling_session_id,
+            upstream_alias=upstream_alias,
+            base_model=base_model,
+        )
+    except Exception:
+        logger.exception("gateway_session_store.upsert_sampling_session failed")
 
 
 def remote_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
-    return _remote_sampling_sessions.get(sampling_session_id)
+    cached = _remote_sampling_sessions.get(sampling_session_id)
+    if cached is not None:
+        return cached
+    try:
+        from .backend import gateway_session_store
+
+        info = gateway_session_store.get_sampling_session(sampling_session_id)
+        if info is not None:
+            _remote_sampling_sessions[sampling_session_id] = info
+        return info
+    except Exception:
+        return None
+
+
+def unregister_remote_sampling_session(sampling_session_id: str) -> None:
+    _remote_sampling_sessions.pop(sampling_session_id, None)
+    try:
+        from .backend import gateway_session_store
+
+        gateway_session_store.delete_sampling_session(sampling_session_id)
+    except Exception:
+        pass
 
 
 def register_remote_training_model(*, model_id: str, upstream_alias: str, base_model: str) -> None:
     _remote_training_models[model_id] = (upstream_alias, base_model)
+    try:
+        from .backend import gateway_session_store
+
+        gateway_session_store.upsert_training_model(
+            model_id=model_id,
+            upstream_alias=upstream_alias,
+            base_model=base_model,
+        )
+    except Exception:
+        logger.exception("gateway_session_store.upsert_training_model failed")
 
 
 def remote_training_model(model_id: str) -> tuple[str, str] | None:
-    return _remote_training_models.get(model_id)
+    cached = _remote_training_models.get(model_id)
+    if cached is not None:
+        return cached
+    try:
+        from .backend import gateway_session_store
+
+        info = gateway_session_store.get_training_model(model_id)
+        if info is not None:
+            _remote_training_models[model_id] = info
+        return info
+    except Exception:
+        return None
+
+
+def unregister_remote_training_model(model_id: str) -> None:
+    _remote_training_models.pop(model_id, None)
+    try:
+        from .backend import gateway_session_store
+
+        gateway_session_store.delete_training_model(model_id)
+    except Exception:
+        pass
 
 
 _cap_cache: dict[str, tuple[float, dict[str, int]]] = {}  # upstream_alias -> (ts, model_name->max_len)
