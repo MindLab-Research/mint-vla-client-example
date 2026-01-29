@@ -90,7 +90,7 @@ Many actors are created as detached so they can survive an API server restart.
 Problem: after restart, server memory is empty, but actors still exist.
 
 Startup hook `tinker_server/app.py:_cleanup_stale_actors()`:
-- lists named actors in the `tinker` namespace
+- lists named actors in `tinker_server.config.RAY_NAMESPACE` (from `TINKER_RAY_NAMESPACE`)
 - health-checks them (`__ray_ready__`)
 - registers alive actors into `ResourcePool` and marks them ready
 - kills dead/unresponsive ones

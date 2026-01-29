@@ -7,7 +7,8 @@ description: |
 
   Triggers: "report issue", "user reported", "create issue", "file bug"
 
-  **CRITICAL: Production is READ-ONLY. Analyze and reproduce, never modify.**
+  **CRITICAL: Treat production as READ-ONLY unless the user explicitly requests production operations.**
+  For any production operations (restart/kill actors/logs on prod hosts), invoke `mint-prod`.
 ---
 
 # Issue Reporter
@@ -27,13 +28,9 @@ BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 ```
 
-### Run against production
+### Run against production (HTTP-only)
 
-```bash
-TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/reproduce_user_report.py
-```
-
-Admin key exposes server-side errors. Regular keys show only "Operation failed."
+Do not run any production-side kill/restart commands while triaging a report.
 
 ### Check logs (read-only)
 

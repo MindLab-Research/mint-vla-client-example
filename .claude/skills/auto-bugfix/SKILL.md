@@ -179,7 +179,7 @@ export TINKER_PORT="$((10000 + ISSUE % 5000))"
 Namespace cleanup (run before starting the issue-scoped server, and after finishing the issue):
 ```bash
 # Pass `TINKER_RAY_NAMESPACE` explicitly (ssh does not forward local env by default).
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -265,6 +265,7 @@ ssh mint-dev "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=$PFS_TINKER_PATH \
    TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
+   MINT_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
    TINKER_PORT=$TINKER_PORT \
    TINKER_USAGE_LOG_DIR=/tmp/tinker_usage_issue_$ISSUE \
    python scripts/run_server.py\" >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
@@ -323,8 +324,9 @@ Implement the minimal root-cause fix.
 
 After code changes:
 1) verify code synced to mint-dev (unison)
-2) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
-3) confirm health endpoint
+2) if the change touches detached actor code (vLLM/Megatron/dense training/stores), run the 3b "Namespace cleanup" snippet to kill the issue namespace actors so the next run loads new code
+3) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
+4) confirm health endpoint
 
 ### 3f) Bugfixer: Re-run reproduction script
 

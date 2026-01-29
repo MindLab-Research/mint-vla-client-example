@@ -212,6 +212,8 @@ export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 # For concurrent dev runs, set this to a unique value (example: tinker_$USER).
 # export TINKER_RAY_NAMESPACE=tinker
+# Also set this to the same value (used by detached metadata stores):
+# export MINT_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE
 
 # MoE vLLM placement mode:
 # - Default: MINT_MOE_MULTINODE_MIN_GPUS=4, so Qwen3-30B (TP=4) uses MultiNodeInferenceEngine
@@ -230,7 +232,8 @@ ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
-   TINKER_RAY_NAMESPACE=tinker_$USER \
+   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
@@ -264,7 +267,7 @@ ssh mint-dev "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API (MUST use API endpoint; do not kill random processes)
+# Via API (admin only when auth is enabled; do not kill random processes)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
 # Kill specific model's vLLM actor
@@ -293,7 +296,7 @@ curl -s http://localhost:8000/api/v1/vllm_status | jq
 # Megatron status
 curl -s http://localhost:8000/api/v1/megatron_status | jq
 
-# Kill all actors (nuclear option)
+# Kill all actors (nuclear option; admin only when auth is enabled)
 curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ```
 
@@ -301,20 +304,32 @@ curl -X POST http://localhost:8000/api/v1/kill_all_actors
 
 ## 4. Code Update SOP
 
-### Decision Matrix
+### Rule 0: server restart does not reload detached actors
 
-| Code Changed | Actors Running | Action |
-|--------------|----------------|--------|
-| `megatron_*.py`, `megatron_distributed.py` | Megatron alive | Kill Megatron + restart server |
-| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | vLLM alive | Kill vLLM + restart server |
-| Routes, middleware only | Any | Restart server only |
-| Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
+The API server is a Python process. Ray actors are separate Python processes.
+
+Detached actors (vLLM, Megatron, DenseTrainerPool, stores) survive server restarts and keep running old code until killed.
+
+### Kill criteria after code changes
+
+Always restart the server after code changes.
+
+Kill detached actors only if the change can be imported/executed inside that actor process:
+- vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
+- Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
+- Dense training pool: `tinker_server/backend/verl_training.py`
+- Detached stores: `tinker_server/backend/future_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
+- Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
+
+If none of the above changed: restart server only.
 
 ### Kill Actors
 
 > **Actor naming convention:**
 > - vLLM: `tinker_vllm_{model_name}` (e.g., `tinker_vllm_kimi-k2-thinking`)
-> - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi-k2-thinking`)
+> - Megatron: `megatron_{model_name}` (e.g., `megatron_kimi_k2_thinking`; model name is lowercased and `-`/`.` become `_`)
+> - Dense training pool: `dense_trainer_pool_{model_name}_maxr{rank}` (e.g., `dense_trainer_pool_qwen3_4b_instruct_2507_maxr64`)
+> - Stores: `tinker_future_store`, `tinker_training_session_store`, `tinker_gateway_session_store`
 > - Namespace: `TINKER_RAY_NAMESPACE` (default `tinker`)
 >
 > Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests it.
@@ -346,7 +361,7 @@ import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 try:
     ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
-    actor = ray.get_actor(\"megatron_kimi-k2-thinking\", namespace=ns)
+    actor = ray.get_actor(\"megatron_kimi_k2_thinking\", namespace=ns)
     ray.kill(actor)
     print(\"Killed Megatron actor\")
 except ValueError as e:
@@ -354,7 +369,7 @@ except ValueError as e:
 \""
 
 # List all actors in current namespace (to find actor names)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -364,17 +379,52 @@ for a in actors:
     if a.get(\"namespace\") == ns:
         print(a)
 \""
+
+# Kill all dense trainer pool actors in current namespace (prefix match)
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+import os
+import ray
+ray.init(address='auto', ignore_reinit_error=True)
+ns = os.environ['TINKER_RAY_NAMESPACE']
+actors = ray.util.list_named_actors(all_namespaces=True)
+killed = 0
+for a in actors:
+    if a.get('namespace') != ns:
+        continue
+    name = a.get('name') or ''
+    if not name.startswith('dense_trainer_pool_'):
+        continue
+    try:
+        ray.kill(ray.get_actor(name, namespace=ns))
+        killed += 1
+    except Exception as e:
+        print(f\"kill_failed name={name!r} namespace={ns!r} err={e!r}\")
+print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
+\""
+
+# Kill detached store actors in current namespace (name match)
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+import os
+import ray
+ray.init(address='auto', ignore_reinit_error=True)
+ns = os.environ['TINKER_RAY_NAMESPACE']
+names = ['tinker_future_store', 'tinker_training_session_store', 'tinker_gateway_session_store']
+killed = 0
+for name in names:
+    try:
+        ray.kill(ray.get_actor(name, namespace=ns))
+        killed += 1
+    except ValueError:
+        pass
+    except Exception as e:
+        print(f\"kill_failed name={name!r} namespace={ns!r} err={e!r}\")
+print(f\"killed={killed} kind='stores' namespace={ns}\")
+\""
 ```
 
-### Legacy Reference (do not use these names directly)
+### Restart Server
 
-| Changed Code | Required Actions |
-|--------------|------------------|
-| `megatron_*.py`, `megatron_distributed.py` | Kill Megatron actor + restart server |
-| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | Kill vLLM actor + restart server |
-| Route handlers, middleware, other server code | Restart server only |
-
-### Fast Restart (no vLLM changes)
+Use this after server-only code changes. If you killed any actors, restart the server after the kill so in-process caches are cleared.
 
 ```bash
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
@@ -383,25 +433,64 @@ ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
-### Full Restart (vLLM changes)
+### Restart after killing vLLM
+
+Use this after vLLM actor code changes, OOM, or switching base model.
 
 ```bash
-# Kill vLLM
 curl -X POST http://localhost:8000/api/v1/kill_vllm
-
-# Restart server
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+sleep 80 && curl -s http://localhost:8000/api/v1/healthz
+```
 
-# Wait for vLLM init (~80s)
+### Restart after killing Megatron
+
+Use this after Megatron actor code changes, OOM, or switching base model.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/kill_megatron
+ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
+  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+curl -s http://localhost:8000/api/v1/healthz
+```
+
+### Restart after killing all tracked GPU actors
+
+Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
+
+Note: `/api/v1/kill_all_actors` kills ResourcePool-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/kill_all_actors
+ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
+ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
+  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+   HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
+   PYTHONDONTWRITEBYTECODE=1 \
+   PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
+   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 ```
 

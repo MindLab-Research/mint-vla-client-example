@@ -5,9 +5,9 @@
 1. `POST /api/v1/create_sampling_session` validates access and chooses `base_model`.
 2. `SessionManager.get_engine_for_model(base_model)` selects/creates a `MultiLoRAInferenceEngine` via `MultiModelInferenceManager`.
 3. `MultiLoRAInferenceEngine.initialize()` connects to an existing detached vLLM actor or creates a new one:
-   - `namespace="tinker"` so actors can be rediscovered across server restarts.
-   - detached lifetime so actors survive API server restarts.
-   - registers the actor in `ResourcePool` for LRU eviction and GPU accounting.
+  - `namespace=tinker_server.config.RAY_NAMESPACE` (from `TINKER_RAY_NAMESPACE`) so actors can be rediscovered across server restarts.
+  - detached lifetime so actors survive API server restarts.
+  - registers the actor in `ResourcePool` for LRU eviction and GPU accounting.
 4. If a LoRA adapter is provided, the server loads weights and registers them for the session:
    - Small/medium adapters: tensors transferred via Ray object store (`add_lora_with_id`).
    - Very large adapters (MoE with many tensors): path-based load (`add_lora_from_path`) to avoid Ray serialization overhead.

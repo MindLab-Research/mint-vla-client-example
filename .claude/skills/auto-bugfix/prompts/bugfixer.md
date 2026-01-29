@@ -24,6 +24,7 @@ Non-negotiable rules:
   and retrieve it via `/api/v1/retrieve_future`, asserting on the returned payload (end-to-end through the running system).
 - Restart the issue-scoped dev server after code changes (no hot reload).
 - Use issue-specific `TINKER_RAY_NAMESPACE` and run the namespace cleanup snippet from `.claude/skills/auto-bugfix/SKILL.md` after finishing the issue so detached actors do not accumulate.
+- Ensure `MINT_RAY_NAMESPACE` matches `TINKER_RAY_NAMESPACE` so detached store actors are also issue-scoped.
 - Never create/get/kill Ray actors outside the provided `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
 - Use issue-specific `PFS_TINKER_PATH` so Ray workers import the intended code snapshot.
 
