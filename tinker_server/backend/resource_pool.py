@@ -6,7 +6,6 @@ idle actors are evicted regardless of type.
 """
 
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -15,6 +14,7 @@ from typing import Callable
 
 import ray
 
+from ..config import config as server_config
 from . import ray_kill
 
 logger = logging.getLogger(__name__)
@@ -123,12 +123,8 @@ class ResourcePool:
         # This prevents race conditions where multiple concurrent requests
         # both think they have enough GPUs available
         self._pending_gpus: int = 0
-        # Read MIN_ACTOR_AGE at init time (not class definition time)
-        # Set MINT_MIN_ACTOR_AGE=0 for testing to allow immediate eviction
-        self.MIN_ACTOR_AGE = int(os.environ.get("MINT_MIN_ACTOR_AGE", "300"))
-        # Session idle timeout: after this period of inactivity, session is considered stale
-        # Set MINT_SESSION_IDLE_TIMEOUT=0 for testing to allow immediate eviction
-        self.SESSION_IDLE_TIMEOUT = int(os.environ.get("MINT_SESSION_IDLE_TIMEOUT", "300"))
+        self.MIN_ACTOR_AGE = int(server_config.resource_pool_min_actor_age_s)
+        self.SESSION_IDLE_TIMEOUT = int(server_config.resource_pool_session_idle_timeout_s)
         logger.info(f"[ResourcePool] Initialized with MIN_ACTOR_AGE={self.MIN_ACTOR_AGE}, SESSION_IDLE_TIMEOUT={self.SESSION_IDLE_TIMEOUT}")
         self._initialized = True
 

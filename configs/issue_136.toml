@@ -1,0 +1,13 @@
+[server]
+# Non-default values to make config-file loading observable via /api/v1/server_info.
+max_loras = 13
+max_cpu_loras = 19
+max_lora_rank = 23
+
+[sampling]
+max_inflight_sample_tasks = 7
+max_concurrent_samples_per_request = 3
+sample_coalesce = true
+sample_coalesce_window_ms = 3.5
+sample_coalesce_max_batch = 11
+sample_coalesce_max_samples = 15

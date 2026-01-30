@@ -4,6 +4,9 @@
 Usage:
     python scripts/run_server.py
 
+Optional:
+    python scripts/run_server.py --config /path/to/config.toml
+
 Environment variables:
     TINKER_HOST: Server host (default: 0.0.0.0)
     TINKER_PORT: Server port (default: 8000)
@@ -18,17 +21,14 @@ Parallelism is auto-detected from the model registry when engines are created.
 
 import logging
 import pathlib
+import argparse
+import os
 import sys
 import traceback
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-import uvicorn
-
-from tinker_server.app import app
-from tinker_server.config import config
 
 
 def crash_handler(exc_type, exc_value, exc_tb):
@@ -57,12 +57,32 @@ class PollingLogFilter(logging.Filter):
         return True
 
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="Path to tinker-server TOML config file (sets TINKER_CONFIG_PATH before import).",
+    )
+    return p.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = _parse_args(sys.argv[1:])
+    if args.config_path:
+        os.environ["TINKER_CONFIG_PATH"] = str(args.config_path)
+
     # Configure logging early
     logging.basicConfig(level=logging.INFO)
 
     # Suppress noisy 408 polling logs
     logging.getLogger("uvicorn.access").addFilter(PollingLogFilter())
+
+    import uvicorn
+
+    from tinker_server.app import app
+    from tinker_server.config import config
 
     uvicorn.run(
         app,

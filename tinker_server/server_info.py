@@ -73,6 +73,7 @@ def get_server_info() -> dict:
         "process": {"pid": os.getpid(), "argv": sys.argv},
         "logging": {"stdout": _fd_info(1), "stderr": _fd_info(2)},
         "config": {
+            "config_path": server_config.config_path,
             "host": server_config.host,
             "port": server_config.port,
             "tensor_parallel_size": server_config.tensor_parallel_size,
@@ -83,6 +84,8 @@ def get_server_info() -> dict:
             "max_loras": server_config.max_loras,
             "max_cpu_loras": server_config.max_cpu_loras,
             "max_lora_rank": server_config.max_lora_rank,
+            "sampling_max_inflight_sample_tasks": server_config.sampling_max_inflight_sample_tasks,
+            "sampling_max_concurrent_samples_per_request": server_config.sampling_max_concurrent_samples_per_request,
             "auth_enabled": server_config.auth_enabled,
         },
     }

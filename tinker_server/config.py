@@ -4,12 +4,38 @@ import os
 import secrets
 from dataclasses import dataclass
 
+from .config_file import TinkerConfigFile, load_tinker_config_file
+
+
+def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
+    v = environ.get(name)
+    if v is None:
+        return None
+    v = str(v).strip()
+    return v or None
+
+
+def _parse_bool(s: str) -> bool:
+    return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
+
+
+def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, TinkerConfigFile | None]:
+    path = _env_nonempty(environ, "TINKER_CONFIG_PATH")
+    if not path:
+        return None, None
+    return path, load_tinker_config_file(path)
+
+
+_CONFIG_PATH, _CONFIG_FILE = _load_config_file_for_process(os.environ)
+
 # Ray namespace for all server-owned actors (vLLM, Megatron, trainer pools).
 # Override for concurrent dev runs on a shared Ray cluster.
 #
 # `MINT_RAY_NAMESPACE` is a legacy alias still used in some scripts; prefer
 # `TINKER_RAY_NAMESPACE` but accept the alias as a fallback.
-RAY_NAMESPACE = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker"
+_env_ray_ns = _env_nonempty(os.environ, "TINKER_RAY_NAMESPACE") or _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
+_file_ray_ns = _CONFIG_FILE.ray.namespace if _CONFIG_FILE is not None else None
+RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 
 # PFS paths for Ray worker runtime_env
 # NOTE: vLLM requires PyTorch 2.9.0, which requires NCCL 2.21+
@@ -23,13 +49,18 @@ RAY_NAMESPACE = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_R
 # non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
 # to a non-existent code directory.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PFS_TINKER_PATH = os.environ.get("PFS_TINKER_PATH", _REPO_ROOT)
+_file_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
+PFS_TINKER_PATH = _env_nonempty(os.environ, "PFS_TINKER_PATH") or _file_pfs_tinker_path or _REPO_ROOT
 
 # PFS verl path with _mutable_fields patch for LoRA config assignment
-PFS_VERL_PATH = os.environ.get("PFS_VERL_PATH", "/vePFS-Mindverse/share/code/verl")
+_file_pfs_verl_path = _CONFIG_FILE.paths.pfs_verl_path if _CONFIG_FILE is not None else None
+PFS_VERL_PATH = _env_nonempty(os.environ, "PFS_VERL_PATH") or _file_pfs_verl_path or "/vePFS-Mindverse/share/code/verl"
 
 # PFS vLLM 0.13.0 with raw logits dump instrumentation
-PFS_VLLM_PATH = os.environ.get("PFS_VLLM_PATH", "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg")
+_file_pfs_vllm_path = _CONFIG_FILE.paths.pfs_vllm_path if _CONFIG_FILE is not None else None
+PFS_VLLM_PATH = (
+    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg"
+)
 
 # Some deployments rely on the in-image vLLM wheel (with compiled `vllm._C`).
 # Avoid shadowing it with an incomplete CPFS checkout that lacks the extension module.
@@ -44,30 +75,48 @@ PFS_VLLM_PATH_EFFECTIVE = PFS_VLLM_PATH if _pfs_vllm_path_is_usable(PFS_VLLM_PAT
 
 # PFS megatron-bridge path for MoE LoRA ETP fix (PR #1380)
 # Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-PFS_MEGATRON_BRIDGE_PATH = os.environ.get(
-    "PFS_MEGATRON_BRIDGE_PATH",
-    "/vePFS-Mindverse/share/code/megatron-bridge/src",
+_file_pfs_megatron_bridge_path = _CONFIG_FILE.paths.pfs_megatron_bridge_path if _CONFIG_FILE is not None else None
+PFS_MEGATRON_BRIDGE_PATH = (
+    _env_nonempty(os.environ, "PFS_MEGATRON_BRIDGE_PATH")
+    or _file_pfs_megatron_bridge_path
+    or "/vePFS-Mindverse/share/code/megatron-bridge/src"
 )
 
 # HollowMan fork with export_adapter_weights API for LoRA export
 # Clone from: https://github.com/HollowMan6/Megatron-Bridge.git branch merged
-PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = os.environ.get(
-    "PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH",
-    "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src",
+_file_pfs_megatron_bridge_hollowman_path = (
+    _CONFIG_FILE.paths.pfs_megatron_bridge_hollowman_path if _CONFIG_FILE is not None else None
+)
+PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = (
+    _env_nonempty(os.environ, "PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH")
+    or _file_pfs_megatron_bridge_hollowman_path
+    or "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
 )
 
 # Toggle to use HollowMan fork of Megatron-Bridge (affects training forward pass)
 # Default: true - HollowMan fork fixes train-inference KL divergence (verified 2026-01-07)
-USE_HOLLOWMAN_MBRIDGE = os.environ.get("USE_HOLLOWMAN_MBRIDGE", "true").lower() in ("true", "1", "yes")
+_file_use_hollowman = _CONFIG_FILE.megatron_bridge.use_hollowman_mbridge if _CONFIG_FILE is not None else None
+_env_use_hollowman = _env_nonempty(os.environ, "USE_HOLLOWMAN_MBRIDGE")
+USE_HOLLOWMAN_MBRIDGE = (
+    _parse_bool(_env_use_hollowman)
+    if _env_use_hollowman is not None
+    else (bool(_file_use_hollowman) if _file_use_hollowman is not None else True)
+)
 
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
-USE_MBRIDGE_LORA_EXPORT = os.environ.get("USE_MBRIDGE_LORA_EXPORT", "false").lower() in ("true", "1", "yes")
+_file_use_lora_export = _CONFIG_FILE.megatron_bridge.use_mbridge_lora_export if _CONFIG_FILE is not None else None
+_env_use_lora_export = _env_nonempty(os.environ, "USE_MBRIDGE_LORA_EXPORT")
+USE_MBRIDGE_LORA_EXPORT = (
+    _parse_bool(_env_use_lora_export)
+    if _env_use_lora_export is not None
+    else (bool(_file_use_lora_export) if _file_use_lora_export is not None else False)
+)
 
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
-PFS_HF_MODULES_PATH = os.environ.get(
-    "PFS_HF_MODULES_PATH",
-    "/vePFS-Mindverse/share/huggingface/modules",
+_file_pfs_hf_modules_path = _CONFIG_FILE.paths.pfs_hf_modules_path if _CONFIG_FILE is not None else None
+PFS_HF_MODULES_PATH = (
+    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or "/vePFS-Mindverse/share/huggingface/modules"
 )
 
 # PYTHONPATH for Ray actors - vLLM first (for instrumentation), then megatron-bridge, verl, tinker-server, HF modules
@@ -76,6 +125,8 @@ def _join_pythonpath(*paths: str) -> str:
     return ":".join([p for p in paths if p])
 
 PFS_EXTRA_PYTHONPATH = os.environ.get("PFS_EXTRA_PYTHONPATH", "").strip()
+if not PFS_EXTRA_PYTHONPATH and _CONFIG_FILE is not None and _CONFIG_FILE.paths.pfs_extra_pythonpath:
+    PFS_EXTRA_PYTHONPATH = str(_CONFIG_FILE.paths.pfs_extra_pythonpath).strip()
 
 if USE_HOLLOWMAN_MBRIDGE:
     PFS_PYTHONPATH = _join_pythonpath(
@@ -111,6 +162,7 @@ class ServerConfig:
 
     # Usage logging
     usage_log_dir: str = "/tmp/tinker_usage"  # Directory to store usage logs
+    skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
 
     # Model settings (no default model - clients specify per-request)
     tensor_parallel_size: int = 1
@@ -125,35 +177,243 @@ class ServerConfig:
     max_cpu_loras: int = 1024  # CPU cache for evicted adapters
     max_lora_rank: int = 64  # Maximum supported LoRA rank
 
+    # Sampling settings (routes/sampling.py)
+    sampling_max_inflight_sample_tasks: int = 64
+    sampling_max_concurrent_samples_per_request: int = 8
+    sampling_sample_coalesce: bool = True
+    sampling_sample_coalesce_window_ms: float = 2.0
+    sampling_sample_coalesce_max_batch: int = 32
+    sampling_sample_coalesce_max_samples: int = 16
+
+    # ResourcePool settings (backend/resource_pool.py)
+    resource_pool_min_actor_age_s: int = 300
+    resource_pool_session_idle_timeout_s: int = 300
+
+    # Future store settings (backend/future_store.py)
+    future_store_actor_name: str = "tinker_future_store"
+    future_store_ttl_s: float = 86400.0
+    future_store_done_ttl_s: float = 300.0
+
+    # Training settings (backend/verl_training.py)
+    training_force_grad_checkpointing: bool = True
+    training_enable_sdp: bool = True
+    training_megatron_create_timeout_s: float = 1800.0
+    training_dense_get_or_create_timeout_s: float = 1800.0
+    training_reinit_lora_timeout_s: float = 120.0
+    training_actor_ready_timeout_s: float | None = None
+
+    # Persistent-prewarm settings (app.py)
+    prewarm_persistent_models_csv: str = ""
+    prewarm_train_lora_rank: int = 16
+    prewarm_train_lr: float = 5e-5
+    prewarm_megatron_ready_timeout_s: float = 3600.0
+
+    # Docs / internal paths
+    doc_path: str | None = None  # MINT_DOC_PATH
+    checkpoint_dir: str = "/vePFS-Mindverse/share/code/tinker-server/checkpoints"  # TINKER_CHECKPOINT_DIR
+
+    # Config file (TINKER_CONFIG_PATH)
+    config_path: str | None = None
+
     @classmethod
     def from_env(cls) -> "ServerConfig":
-        """Load configuration from environment variables."""
-        api_key = os.environ.get("TINKER_API_KEY", "")
-        token_secret_key = os.environ.get("TINKER_TOKEN_SECRET_KEY", "")
+        return cls.from_sources(environ=os.environ, config_path=None, config_file=None)
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        environ: dict[str, str],
+        config_path: str | None,
+        config_file: TinkerConfigFile | None,
+    ) -> "ServerConfig":
+        """Load configuration from env vars + optional config file (env wins)."""
+        api_key = environ.get("TINKER_API_KEY", "")
+        token_secret_key = environ.get("TINKER_TOKEN_SECRET_KEY", "")
         # Auth disabled (dev mode) if neither api_key nor token_secret_key is set
-        inactivity_s = os.environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or os.environ.get(
-            "TINKER_INACTIVITY_TIMEOUT_S"
+        inactivity_s = environ.get("TINKER_SESSION_INACTIVITY_TIMEOUT_S") or environ.get("TINKER_INACTIVITY_TIMEOUT_S")
+        file_server = config_file.server if config_file is not None else None
+        file_sampling = config_file.sampling if config_file is not None else None
+        file_resource_pool = config_file.resource_pool if config_file is not None else None
+        file_future_store = config_file.future_store if config_file is not None else None
+        file_training = config_file.training if config_file is not None else None
+        file_prewarm = config_file.prewarm if config_file is not None else None
+        file_docs = config_file.docs if config_file is not None else None
+        file_internal = config_file.internal if config_file is not None else None
+
+        def _pick_str(name: str, file_value: str | None, default: str) -> str:
+            v = _env_nonempty(environ, name)
+            return v if v is not None else (file_value if file_value is not None else default)
+
+        def _pick_int(name: str, file_value: int | None, default: int) -> int:
+            v = _env_nonempty(environ, name)
+            return int(v) if v is not None else (int(file_value) if file_value is not None else int(default))
+
+        def _pick_float(name: str, file_value: float | None, default: float) -> float:
+            v = _env_nonempty(environ, name)
+            return float(v) if v is not None else (float(file_value) if file_value is not None else float(default))
+
+        def _pick_bool(name: str, file_value: bool | None, default: bool) -> bool:
+            v = _env_nonempty(environ, name)
+            return _parse_bool(v) if v is not None else (bool(file_value) if file_value is not None else bool(default))
+
+        max_model_len_env = _env_nonempty(environ, "TINKER_MAX_MODEL_LEN")
+        max_model_len = int(max_model_len_env) if max_model_len_env is not None else (file_server.max_model_len if file_server is not None else None)
+
+        inactivity_from_file = file_server.session_inactivity_timeout_s if file_server is not None else None
+        actor_ready_timeout_env = _env_nonempty(environ, "MINT_ACTOR_READY_TIMEOUT_S")
+        actor_ready_timeout_s = (
+            float(actor_ready_timeout_env)
+            if actor_ready_timeout_env is not None
+            else (float(file_training.actor_ready_timeout_s) if file_training is not None and file_training.actor_ready_timeout_s is not None else None)
         )
 
         return cls(
-            host=os.environ.get("TINKER_HOST", "0.0.0.0"),
-            port=int(os.environ.get("TINKER_PORT", "8000")),
+            host=_pick_str("TINKER_HOST", file_server.host if file_server is not None else None, "0.0.0.0"),
+            port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
             token_secret_key=token_secret_key,
-            usage_log_dir=os.environ.get("TINKER_USAGE_LOG_DIR", "/tmp/tinker_usage"),
-            tensor_parallel_size=int(os.environ.get("TINKER_TP_SIZE", "1")),
-            data_parallel_size=int(os.environ.get("TINKER_DP_SIZE", "1")),
-            gpu_memory_utilization=float(os.environ.get("TINKER_GPU_MEM_UTIL", "0.85")),
-            max_model_len=int(os.environ["TINKER_MAX_MODEL_LEN"])
-            if os.environ.get("TINKER_MAX_MODEL_LEN")
-            else None,
-            session_inactivity_timeout_s=float(inactivity_s) if inactivity_s else None,
+            usage_log_dir=_pick_str(
+                "TINKER_USAGE_LOG_DIR", file_server.usage_log_dir if file_server is not None else None, "/tmp/tinker_usage"
+            ),
+            skip_actor_cleanup=_pick_bool(
+                "MINT_SKIP_ACTOR_CLEANUP", file_server.skip_actor_cleanup if file_server is not None else None, False
+            ),
+            tensor_parallel_size=_pick_int("TINKER_TP_SIZE", file_server.tensor_parallel_size if file_server is not None else None, 1),
+            data_parallel_size=_pick_int("TINKER_DP_SIZE", file_server.data_parallel_size if file_server is not None else None, 1),
+            gpu_memory_utilization=_pick_float(
+                "TINKER_GPU_MEM_UTIL", file_server.gpu_memory_utilization if file_server is not None else None, 0.85
+            ),
+            max_model_len=max_model_len,
+            session_inactivity_timeout_s=float(inactivity_s)
+            if inactivity_s
+            else (float(inactivity_from_file) if inactivity_from_file is not None else None),
             # Multi-LoRA settings
-            enable_multi_lora=os.environ.get("TINKER_ENABLE_MULTI_LORA", "true").lower()
-            in ("true", "1", "yes"),
-            max_loras=int(os.environ.get("TINKER_MAX_LORAS", "64")),
-            max_cpu_loras=int(os.environ.get("TINKER_MAX_CPU_LORAS", "1024")),
-            max_lora_rank=int(os.environ.get("TINKER_MAX_LORA_RANK", "64")),
+            enable_multi_lora=_pick_bool(
+                "TINKER_ENABLE_MULTI_LORA", file_server.enable_multi_lora if file_server is not None else None, True
+            ),
+            max_loras=_pick_int("TINKER_MAX_LORAS", file_server.max_loras if file_server is not None else None, 64),
+            max_cpu_loras=_pick_int(
+                "TINKER_MAX_CPU_LORAS", file_server.max_cpu_loras if file_server is not None else None, 1024
+            ),
+            max_lora_rank=_pick_int("TINKER_MAX_LORA_RANK", file_server.max_lora_rank if file_server is not None else None, 64),
+            # Sampling settings
+            sampling_max_inflight_sample_tasks=_pick_int(
+                "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
+                file_sampling.max_inflight_sample_tasks if file_sampling is not None else None,
+                64,
+            ),
+            sampling_max_concurrent_samples_per_request=_pick_int(
+                "TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST",
+                file_sampling.max_concurrent_samples_per_request if file_sampling is not None else None,
+                8,
+            ),
+            sampling_sample_coalesce=_pick_bool(
+                "TINKER_SAMPLE_COALESCE",
+                file_sampling.sample_coalesce if file_sampling is not None else None,
+                True,
+            ),
+            sampling_sample_coalesce_window_ms=_pick_float(
+                "TINKER_SAMPLE_COALESCE_WINDOW_MS",
+                file_sampling.sample_coalesce_window_ms if file_sampling is not None else None,
+                2.0,
+            ),
+            sampling_sample_coalesce_max_batch=_pick_int(
+                "TINKER_SAMPLE_COALESCE_MAX_BATCH",
+                file_sampling.sample_coalesce_max_batch if file_sampling is not None else None,
+                32,
+            ),
+            sampling_sample_coalesce_max_samples=_pick_int(
+                "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
+                file_sampling.sample_coalesce_max_samples if file_sampling is not None else None,
+                16,
+            ),
+            # ResourcePool settings
+            resource_pool_min_actor_age_s=_pick_int(
+                "MINT_MIN_ACTOR_AGE",
+                file_resource_pool.min_actor_age_s if file_resource_pool is not None else None,
+                300,
+            ),
+            resource_pool_session_idle_timeout_s=_pick_int(
+                "MINT_SESSION_IDLE_TIMEOUT",
+                file_resource_pool.session_idle_timeout_s if file_resource_pool is not None else None,
+                300,
+            ),
+            # Future store settings
+            future_store_actor_name=_pick_str(
+                "MINT_FUTURE_STORE_ACTOR_NAME",
+                file_future_store.actor_name if file_future_store is not None else None,
+                "tinker_future_store",
+            ),
+            future_store_ttl_s=_pick_float(
+                "MINT_FUTURE_TTL_S",
+                file_future_store.ttl_s if file_future_store is not None else None,
+                86400.0,
+            ),
+            future_store_done_ttl_s=_pick_float(
+                "MINT_FUTURE_DONE_TTL_S",
+                file_future_store.done_ttl_s if file_future_store is not None else None,
+                300.0,
+            ),
+            # Training settings
+            training_force_grad_checkpointing=_pick_bool(
+                "TINKER_FORCE_GRAD_CHECKPOINTING",
+                file_training.force_grad_checkpointing if file_training is not None else None,
+                True,
+            ),
+            training_enable_sdp=_pick_bool(
+                "TINKER_ENABLE_SDP",
+                file_training.enable_sdp if file_training is not None else None,
+                True,
+            ),
+            training_megatron_create_timeout_s=_pick_float(
+                "MINT_MEGATRON_CREATE_TIMEOUT_S",
+                file_training.megatron_create_timeout_s if file_training is not None else None,
+                1800.0,
+            ),
+            training_dense_get_or_create_timeout_s=_pick_float(
+                "MINT_DENSE_GET_OR_CREATE_TIMEOUT_S",
+                file_training.dense_get_or_create_timeout_s if file_training is not None else None,
+                1800.0,
+            ),
+            training_reinit_lora_timeout_s=_pick_float(
+                "MINT_REINIT_LORA_TIMEOUT_S",
+                file_training.reinit_lora_timeout_s if file_training is not None else None,
+                120.0,
+            ),
+            training_actor_ready_timeout_s=actor_ready_timeout_s,
+            # Persistent prewarm settings
+            prewarm_persistent_models_csv=_pick_str(
+                "MINT_PERSISTENT_MODELS",
+                file_prewarm.persistent_models_csv if file_prewarm is not None else None,
+                "",
+            ),
+            prewarm_train_lora_rank=_pick_int(
+                "MINT_PERSISTENT_TRAIN_LORA_RANK",
+                file_prewarm.train_lora_rank if file_prewarm is not None else None,
+                16,
+            ),
+            prewarm_train_lr=_pick_float(
+                "MINT_PERSISTENT_TRAIN_LR",
+                file_prewarm.train_lr if file_prewarm is not None else None,
+                5e-5,
+            ),
+            prewarm_megatron_ready_timeout_s=_pick_float(
+                "MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S",
+                file_prewarm.megatron_ready_timeout_s if file_prewarm is not None else None,
+                3600.0,
+            ),
+            doc_path=_pick_str(
+                "MINT_DOC_PATH",
+                file_docs.doc_path if file_docs is not None else None,
+                "",
+            ) or None,
+            checkpoint_dir=_pick_str(
+                "TINKER_CHECKPOINT_DIR",
+                file_internal.checkpoint_dir if file_internal is not None else None,
+                "/vePFS-Mindverse/share/code/tinker-server/checkpoints",
+            ),
+            config_path=config_path,
         )
 
     @property
@@ -168,4 +428,4 @@ class ServerConfig:
         return secrets.compare_digest(self.api_key, provided_key)
 
 # Global config instance
-config = ServerConfig.from_env()
+config = ServerConfig.from_sources(environ=os.environ, config_path=_CONFIG_PATH, config_file=_CONFIG_FILE)
