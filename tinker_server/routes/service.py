@@ -474,15 +474,6 @@ def _kill_dense_actors(base_model: str | None) -> int:
         if e.actor_type == ActorType.DENSE and (base_model is None or e.base_model == base_model)
     ]
 
-    if not targets and base_model is not None:
-        # Fallback in case DenseTrainerPool and ResourcePool diverged.
-        try:
-            from ..backend.verl_training import get_dense_trainer_pool
-
-            return 1 if get_dense_trainer_pool().remove(base_model, kill_actor=True) else 0
-        except Exception:
-            return 0
-
     killed = 0
     try:
         import ray
@@ -510,12 +501,6 @@ def _kill_dense_actors(base_model: str | None) -> int:
             try:
                 pg = ray.util.get_placement_group(f"{e.actor_name}_pg")
                 ray.util.remove_placement_group(pg)
-            except Exception:
-                pass
-            try:
-                from ..backend.verl_training import get_dense_trainer_pool
-
-                get_dense_trainer_pool().remove(e.base_model, kill_actor=False)
             except Exception:
                 pass
             killed += 1

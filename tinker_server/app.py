@@ -431,17 +431,21 @@ async def _prewarm_persistent_models(
     # Dense training pools (deferred)
     # -------------------------
     if deferred_dense_training:
-        from tinker_server.backend.verl_training import (
-            PERSISTENT_DENSE_ACTOR_PREFIX,
-            get_dense_trainer_pool,
-        )
+        from tinker_server.backend.dense_trainer import get_or_create_dense_trainer
+        from tinker_server.backend.verl_training import TrainingWorker
 
-        pool = get_dense_trainer_pool()
         for model_name, base_model in deferred_dense_training:
             try:
                 logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
-                entry = await asyncio.to_thread(pool.get_or_create, base_model, lora_rank, learning_rate, None)
-                actor_name = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
+                dense = await asyncio.to_thread(
+                    get_or_create_dense_trainer,
+                    training_worker_cls=TrainingWorker,
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    learning_rate=learning_rate,
+                    session_id=None,
+                )
+                actor_name = dense.actor_name
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
