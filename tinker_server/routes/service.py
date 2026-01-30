@@ -187,6 +187,10 @@ async def create_sampling_session(
             detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
         )
 
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
+
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(base_model, user_data):
