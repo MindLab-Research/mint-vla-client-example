@@ -101,10 +101,9 @@ def _find_training_actors() -> list[dict[str, Any]]:
         bm = a.get("base_model")
         if t not in ("dense", "megatron"):
             continue
-        if not isinstance(bm, str) or not bm:
-            continue
-        if not _matches_model(bm, MODEL):
-            continue
+        if isinstance(bm, str) and bm:
+            if not _matches_model(bm, MODEL):
+                continue
         out.append(a)
     return out
 
@@ -145,8 +144,15 @@ def _wait_for_prewarm_training_actor() -> dict[str, Any]:
     while True:
         acts = _find_training_actors()
         if acts:
-            # Prefer ready actors.
-            acts.sort(key=lambda a: (bool(a.get("creating")), a.get("actor_name", "")))
+            # Prefer matching base_model when available, then prefer ready actors.
+            def _score(a: dict[str, Any]) -> tuple[int, int, str]:
+                bm = a.get("base_model")
+                matches = 0
+                if isinstance(bm, str) and bm:
+                    matches = 1 if _matches_model(bm, MODEL) else 0
+                return (0 if matches else 1, 1 if bool(a.get("creating")) else 0, str(a.get("actor_name") or ""))
+
+            acts.sort(key=_score)
             a = acts[0]
             actor_name = a.get("actor_name")
             actor_type = a.get("actor_type")
