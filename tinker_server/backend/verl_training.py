@@ -30,6 +30,7 @@ DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 
 
@@ -319,7 +320,7 @@ class TrainingWorker:
         # Enable gradient checkpointing for large dense models (trades compute for memory)
         # Must be done before PEFT wrapping to properly set up the model
         from .model_registry import get_model_config
-        force_grad_ckpt = os.getenv("TINKER_FORCE_GRAD_CHECKPOINTING", "1") == "1"
+        force_grad_ckpt = bool(server_config.training_force_grad_checkpointing)
         try:
             use_grad_ckpt = get_model_config(base_model).gradient_checkpointing or force_grad_ckpt
         except ValueError:
@@ -369,7 +370,7 @@ class TrainingWorker:
     @staticmethod
     def _configure_attention_backends() -> None:
         """Enable memory-efficient SDP where available."""
-        if os.getenv("TINKER_ENABLE_SDP", "1") != "1":
+        if not bool(server_config.training_enable_sdp):
             return
         torch = _get_torch()
         try:
@@ -1609,7 +1610,7 @@ class VerlTrainingEngine:
             # Uses detached Ray actor pattern like vLLM for crash resilience
             # Use async version to avoid blocking uvicorn event loop
             # Issue #44: Pass model_id for unique session state isolation
-            megatron_timeout_s = float(os.environ.get("MINT_MEGATRON_CREATE_TIMEOUT_S", "1800"))
+            megatron_timeout_s = float(server_config.training_megatron_create_timeout_s)
             print(
                 f"[DEBUG {model_id}] megatron get_or_create start: timeout_s={megatron_timeout_s}",
                 flush=True,
@@ -1660,7 +1661,7 @@ class VerlTrainingEngine:
             logger.info(f"[{model_id}] Using DenseTrainerPool for dense model (base={base_model}, lora_rank={lora_rank})")
 
             import asyncio
-            dense_get_timeout_s = float(os.environ.get("MINT_DENSE_GET_OR_CREATE_TIMEOUT_S", "1800"))
+            dense_get_timeout_s = float(server_config.training_dense_get_or_create_timeout_s)
             pool = get_dense_trainer_pool()
             print(
                 f"[DEBUG {model_id}] dense get_or_create start: timeout_s={dense_get_timeout_s}",
@@ -1688,7 +1689,7 @@ class VerlTrainingEngine:
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
             logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
-            reinit_timeout_s = float(os.environ.get("MINT_REINIT_LORA_TIMEOUT_S", "120"))
+            reinit_timeout_s = float(server_config.training_reinit_lora_timeout_s)
             print(
                 f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={reinit_timeout_s}",
                 flush=True,
@@ -1732,8 +1733,12 @@ class VerlTrainingEngine:
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
-        default_ready_timeout_s = "3600" if session.backend == "megatron" else "900"
-        ready_timeout_s = float(os.environ.get("MINT_ACTOR_READY_TIMEOUT_S", default_ready_timeout_s))
+        default_ready_timeout_s = 3600.0 if session.backend == "megatron" else 900.0
+        ready_timeout_s = (
+            float(server_config.training_actor_ready_timeout_s)
+            if server_config.training_actor_ready_timeout_s is not None
+            else default_ready_timeout_s
+        )
         print(
             f"[DEBUG {model_id}] __ray_ready__ start: timeout_s={ready_timeout_s}",
             flush=True,

@@ -34,10 +34,8 @@ async def _cleanup_stale_actors() -> None:
     1. Kills dead/unresponsive actors in the configured Ray namespace
     2. Registers alive actors with ResourcePool for proper GPU tracking
     """
-    import os
-
     # Skip cleanup if disabled (useful for debugging)
-    if os.environ.get("MINT_SKIP_ACTOR_CLEANUP", "").lower() in ("1", "true"):
+    if config.skip_actor_cleanup:
         logger.info("Skipping actor cleanup (MINT_SKIP_ACTOR_CLEANUP=1)")
         return
 
@@ -243,7 +241,7 @@ async def _prewarm_persistent_models(
 
     and marks them as ResourcePool protected to prevent LRU eviction.
     """
-    models_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+    models_csv = (config.prewarm_persistent_models_csv or "").strip()
     if not models_csv:
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
         return
@@ -253,9 +251,9 @@ async def _prewarm_persistent_models(
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS parsed empty); skipping prewarm")
         return
 
-    lora_rank = int(os.environ.get("MINT_PERSISTENT_TRAIN_LORA_RANK", "16"))
-    learning_rate = float(os.environ.get("MINT_PERSISTENT_TRAIN_LR", "5e-5"))
-    megatron_ready_timeout_s = float(os.environ.get("MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S", "3600"))
+    lora_rank = int(config.prewarm_train_lora_rank)
+    learning_rate = float(config.prewarm_train_lr)
+    megatron_ready_timeout_s = float(config.prewarm_megatron_ready_timeout_s)
 
     from tinker_server.backend.model_registry import (
         get_model_config,
@@ -682,8 +680,8 @@ async def docs_slash_redirect():
 
 
 # Mount documentation static files
-# Use MINT_DOC_PATH env var to override the default path
-_doc_path = os.environ.get("MINT_DOC_PATH", str(Path(__file__).parent.parent / "mint-doc" / "out"))
+# Use MINT_DOC_PATH / config-file docs.doc_path to override the default path
+_doc_path = config.doc_path or str(Path(__file__).parent.parent / "mint-doc" / "out")
 if Path(_doc_path).exists():
     app.mount("/doc", StaticFiles(directory=_doc_path, html=True), name="documentation")
     logger.info(f"Documentation mounted at /doc from {_doc_path}")

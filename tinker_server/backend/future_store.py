@@ -18,6 +18,7 @@ import uuid
 from enum import Enum
 from typing import Any
 
+from ..config import config as server_config
 
 class FutureStatus(Enum):
     PENDING = "pending"
@@ -64,25 +65,29 @@ class _InMemoryFutureStore:
 
 
 def _ray_namespace() -> str:
-    return (
-        os.environ.get("TINKER_RAY_NAMESPACE")
-        or os.environ.get("MINT_RAY_NAMESPACE")
-        or "tinker"
-    )
+    v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    if v:
+        return v
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "tinker"
 
 
 def _ray_future_store_actor_name() -> str:
-    return os.environ.get("MINT_FUTURE_STORE_ACTOR_NAME", "tinker_future_store")
+    return str(server_config.future_store_actor_name)
 
 
 def _ray_future_ttl_s() -> float:
     # Safety net for leaked futures when clients never retrieve.
-    return float(os.environ.get("MINT_FUTURE_TTL_S", "86400"))
+    return float(server_config.future_store_ttl_s)
 
 
 def _ray_future_done_ttl_s() -> float:
     # Keep DONE/FAILED entries briefly for idempotent retries.
-    return float(os.environ.get("MINT_FUTURE_DONE_TTL_S", "300"))
+    return float(server_config.future_store_done_ttl_s)
 
 
 def _get_or_create_ray_actor():
