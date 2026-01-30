@@ -124,6 +124,16 @@ def get_or_create_dense_trainer(
             actor_name = _make_actor_name(base_model, effective_max_rank)
 
             pool = get_resource_pool()
+            from .model_registry import normalize_model_name
+
+            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+            persistent_models = {s.strip() for s in persistent_csv.split(",") if s.strip()} if persistent_csv else set()
+            is_persistent = False
+            if persistent_models:
+                try:
+                    is_persistent = normalize_model_name(base_model) in persistent_models
+                except Exception:
+                    is_persistent = base_model in persistent_models
 
             try:
                 actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)
@@ -209,6 +219,7 @@ def get_or_create_dense_trainer(
                 namespace=PERSISTENT_DENSE_NAMESPACE,
                 base_model=base_model,
                 session_id=session_id,
+                protected=is_persistent,
                 metadata={"max_lora_rank": effective_max_rank, "actual_rank": int(lora_rank)},
             )
             pool.mark_ready(actor_name)
@@ -261,4 +272,3 @@ def remove_dense_trainers(*, base_model: str, kill_actor: bool = True) -> int:
         pool.unregister(e.actor_name)
         killed += 1
     return killed
-
