@@ -523,6 +523,7 @@ class TrainingWorker:
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        torch = _get_torch()
         self._touch()
 
         # Stateless trainer: load session state if session_id provided
@@ -772,6 +773,7 @@ class TrainingWorker:
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
         """
+        torch = _get_torch()
         self._touch()
 
         # Stateless trainer: load session state if session_id provided
@@ -917,6 +919,7 @@ class TrainingWorker:
         Returns:
             Dict with metrics.
         """
+        torch = _get_torch()
         self._touch()
 
         # Stateless trainer: ensure session state is loaded
@@ -1371,6 +1374,7 @@ class TrainingWorker:
 
     def shutdown(self) -> None:
         """Release GPU resources and stop watchdog thread."""
+        torch = _get_torch()
         logger.info("[TrainingWorker] Shutting down")
         # Stop watchdog thread
         self._shutdown_requested = True
