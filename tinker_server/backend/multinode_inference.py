@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import ray
 
 from . import ray_kill
+from .ray_keepalive import ray_get_with_resource_pool_keepalive
 
 if TYPE_CHECKING:
     pass
@@ -1419,11 +1420,9 @@ class MultiNodeInferenceEngine:
             logprobs=logprobs,
         )
         try:
-            if ray_get_timeout_s > 0:
-                result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-            else:
-                result = await asyncio.to_thread(ray.get, ref)
-        except ray.exceptions.GetTimeoutError as e:
+            timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
+            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+        except asyncio.TimeoutError as e:
             # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
             # Try aborting just this request, then fail loud to the client.
             try:
@@ -1498,11 +1497,9 @@ class MultiNodeInferenceEngine:
             n=num_samples,
         )
         try:
-            if ray_get_timeout_s > 0:
-                raw = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-            else:
-                raw = await asyncio.to_thread(ray.get, ref)
-        except ray.exceptions.GetTimeoutError as e:
+            timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
+            raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+        except asyncio.TimeoutError as e:
             try:
                 abort_ref = self.engine.abort_request.remote(request_id)
                 await asyncio.to_thread(ray.get, abort_ref, timeout=10)
@@ -1566,11 +1563,9 @@ class MultiNodeInferenceEngine:
             lora_path=lora_path,
         )
         try:
-            if ray_get_timeout_s > 0:
-                result = await asyncio.to_thread(ray.get, ref, timeout=ray_get_timeout_s)
-            else:
-                result = await asyncio.to_thread(ray.get, ref)
-        except ray.exceptions.GetTimeoutError as e:
+            timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
+            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+        except asyncio.TimeoutError as e:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e

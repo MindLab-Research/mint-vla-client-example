@@ -1,5 +1,9 @@
 import uuid
 
+import pytest
+
+pytest.importorskip("ray")
+
 from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
 
@@ -28,4 +32,3 @@ def test_resource_pool_list_actors_includes_metadata() -> None:
     assert pool.get(actor_name).current_session is None
 
     pool.unregister(actor_name)
-
