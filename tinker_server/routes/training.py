@@ -178,6 +178,11 @@ async def create_model(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
+    request = request.model_copy(update={"base_model": base_model})
+
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(request.base_model, user_data):
@@ -369,6 +374,11 @@ async def create_model_from_state(
     Composes create_model + load_state into single operation.
     Useful for resuming training from a saved checkpoint.
     """
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
+    request = request.model_copy(update={"base_model": base_model})
+
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(request.base_model, user_data):

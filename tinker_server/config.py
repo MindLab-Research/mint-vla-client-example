@@ -147,6 +147,9 @@ else:
         PFS_HF_MODULES_PATH,
     )
 
+# When false (default), reject requests for base_model not in list_supported_models().
+ALLOW_UNSUPPORTED_MODELS = _parse_bool(_env_nonempty(os.environ, "ALLOW_UNSUPPORTED_MODELS") or "false")
+
 
 @dataclass
 class ServerConfig:
