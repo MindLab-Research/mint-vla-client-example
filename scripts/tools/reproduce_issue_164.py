@@ -18,6 +18,7 @@ INFER_MODEL = os.environ.get("TINKER_INFER_MODEL", "Qwen/Qwen3-0.6B")
 POLL_TIMEOUT_S = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "120"))
 HTTP_TIMEOUT_S = float(os.environ.get("TINKER_HTTP_TIMEOUT_S", "30"))
 IDLE_WAIT_S = float(os.environ.get("TINKER_IDLE_WAIT_S", "2.0"))
+EXPECTED_IDLE_TIMEOUT_S = float(os.environ.get("TINKER_EXPECT_IDLE_TIMEOUT_S", "300"))
 
 MAX_TOKENS = int(os.environ.get("TINKER_MAX_TOKENS", "2048"))
 
@@ -69,17 +70,32 @@ def _poll_future(request_id: str, *, timeout_s: float) -> tuple[int, dict[str, A
         time.sleep(0.5)
 
 
-def _get_vllm_actor_entry() -> dict[str, Any] | None:
-    status, data = _get_json(f"/api/v1/actors?type=vllm&model_name={INFER_MODEL}")
+def _list_vllm_actors() -> list[dict[str, Any]]:
+    status, data = _get_json("/api/v1/actors?type=vllm")
     if status != 200:
         raise RuntimeError(f"GET /actors returned {status}: {data!r}")
     actors = data.get("actors")
     if not isinstance(actors, list):
         raise RuntimeError(f"GET /actors missing actors list: {data!r}")
+    out: list[dict[str, Any]] = []
     for a in actors:
-        if isinstance(a, dict) and a.get("base_model") == INFER_MODEL:
+        if isinstance(a, dict):
+            out.append(a)
+    return out
+
+
+def _get_vllm_actor_entry(*, actor_name: str) -> dict[str, Any] | None:
+    for a in _list_vllm_actors():
+        if a.get("actor_name") == actor_name:
             return a
     return None
+
+
+def _expected_vllm_actor_name(model_name: str) -> str:
+    # Must match tinker_server.backend.multi_lora_engine._model_to_actor_name().
+    model_part = model_name.split("/")[-1] if "/" in model_name else model_name
+    safe_name = model_part.lower().replace(" ", "_")
+    return f"tinker_vllm_{safe_name}"
 
 
 def _create_sampling_session() -> str:
@@ -126,6 +142,8 @@ def _asample(sampling_session_id: str, *, request_id: str, max_tokens: int) -> s
 
 
 def _assert_busy_vllm_actor_not_idle_while_future_pending(sampling_session_id: str) -> None:
+    before_names = {a.get("actor_name") for a in _list_vllm_actors() if isinstance(a.get("actor_name"), str)}
+
     # Warmup: force vLLM actor creation.
     warm_rid = _asample(sampling_session_id, request_id=f"repro-164-warm-{uuid.uuid4()}", max_tokens=1)
     status, data = _poll_future(warm_rid, timeout_s=POLL_TIMEOUT_S)
@@ -133,15 +151,28 @@ def _assert_busy_vllm_actor_not_idle_while_future_pending(sampling_session_id: s
         raise RuntimeError(f"warmup sample failed status={status} body={data!r}")
 
     # Ensure the vLLM actor exists and is considered idle under a short idle timeout.
-    a = _get_vllm_actor_entry()
+    after_actors = _list_vllm_actors()
+    after_names = {a.get("actor_name") for a in after_actors if isinstance(a.get("actor_name"), str)}
+    new_names = [n for n in sorted(after_names - before_names) if isinstance(n, str)]
+    expected = _expected_vllm_actor_name(INFER_MODEL)
+    if expected in after_names:
+        actor_name = expected
+    elif new_names:
+        actor_name = new_names[0]
+    else:
+        # Some environments may already have multiple vLLM actors in the namespace; if we
+        # cannot identify the expected actor, require a new actor to appear.
+        raise RuntimeError(f"no new vLLM actor detected after warmup (vllm_actor_count={len(after_actors)})")
+
+    a = _get_vllm_actor_entry(actor_name=actor_name)
     if a is None:
-        raise RuntimeError(f"vLLM actor not found for base_model={INFER_MODEL!r} (after warmup)")
-    print(f"[warmup] actor_name={a.get('actor_name')} idle={a.get('idle')} idle_time={a.get('idle_time')}", flush=True)
+        raise RuntimeError(f"vLLM actor {actor_name!r} missing after warmup")
+    print(f"[warmup] actor_name={actor_name} idle={a.get('idle')} idle_time={a.get('idle_time')}", flush=True)
 
     time.sleep(IDLE_WAIT_S)
-    a = _get_vllm_actor_entry()
+    a = _get_vllm_actor_entry(actor_name=actor_name)
     if a is None:
-        raise RuntimeError(f"vLLM actor missing after idle wait base_model={INFER_MODEL!r}")
+        raise RuntimeError(f"vLLM actor {actor_name!r} missing after idle wait")
     print(f"[pre] idle_wait_s={IDLE_WAIT_S} idle={a.get('idle')} idle_time={a.get('idle_time')}", flush=True)
 
     # Start a request that should take > idle_timeout_s, then verify the actor
@@ -158,16 +189,19 @@ def _assert_busy_vllm_actor_not_idle_while_future_pending(sampling_session_id: s
         st, fut = _post_json("/api/v1/retrieve_future", {"request_id": infer_rid})
         if st == 408:
             saw_pending = True
-            a = _get_vllm_actor_entry()
+            a = _get_vllm_actor_entry(actor_name=actor_name)
             if a is None:
                 raise RuntimeError("vLLM actor missing while inference future pending")
             idle = a.get("idle")
             idle_time = a.get("idle_time")
             print(f"[pending] dt_s={elapsed:.1f} idle={idle} idle_time={idle_time}", flush=True)
-            if idle is True:
+            # Allow brief startup lag where a request is pending but the vLLM call has not started yet.
+            # The bug is that the actor stays "idle" long enough to cross the idle timeout while the
+            # request remains pending.
+            if idle is True and elapsed > (EXPECTED_IDLE_TIMEOUT_S + 1.0):
                 raise RuntimeError(
                     "ResourcePool marks vLLM actor idle while inference is in-flight "
-                    f"(idle_time={idle_time}, infer_request_id={infer_rid})"
+                    f"(dt_s={elapsed:.1f}, idle_time={idle_time}, infer_request_id={infer_rid})"
                 )
             time.sleep(0.5)
             continue
