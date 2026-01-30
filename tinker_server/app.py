@@ -564,13 +564,11 @@ app = FastAPI(
     title="MinT",
     description="Mind Lab Toolkit - Training API for LLMs",
     version="0.1.0",
-    docs_url=None,  # Disable built-in Swagger UI, /docs redirects to /doc/
+    docs_url=None,  # Disable built-in Swagger UI
 )
 
 # Paths that don't require authentication
-UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/", "/docs", "/docs/"}
-# Path prefixes that don't require authentication
-UNAUTHENTICATED_PREFIXES = ("/doc/", "/doc")
+UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
 
 # Token encryptor for sk- token validation (initialized lazily)
 _token_encryptor: TokenEncryptor | None = None
@@ -602,10 +600,6 @@ async def api_key_auth_middleware(request: Request, call_next):
 
     # Skip auth for specific paths
     if path in UNAUTHENTICATED_PATHS:
-        return await call_next(request)
-
-    # Skip auth for paths with unauthenticated prefixes (e.g., /doc)
-    if path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
 
     # Try X-API-Key header first, then Authorization header
@@ -654,43 +648,9 @@ app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
-# Redirects to documentation (must be defined BEFORE mount)
 @app.get("/")
 async def root():
-    """Redirect root to documentation."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=302)
-
-
-@app.get("/doc")
-async def doc_redirect():
-    """Redirect /doc to /doc/ for consistent behavior."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=301)
-
-
-@app.get("/docs")
-async def docs_redirect():
-    """Alias /docs to /doc."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=302)
-
-
-@app.get("/docs/")
-async def docs_slash_redirect():
-    """Alias /docs/ to /doc/."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=302)
-
-
-# Mount documentation static files
-# Use MINT_DOC_PATH / config-file docs.doc_path to override the default path
-_doc_path = config.doc_path or str(Path(__file__).parent.parent / "mint-doc" / "out")
-if Path(_doc_path).exists():
-    app.mount("/doc", StaticFiles(directory=_doc_path, html=True), name="documentation")
-    logger.info(f"Documentation mounted at /doc from {_doc_path}")
-else:
-    logger.warning(f"Documentation directory not found at {_doc_path}, /doc will not be available")
+    return {"status": "ready", "healthz": "/api/v1/healthz"}
 
 
 if __name__ == "__main__":

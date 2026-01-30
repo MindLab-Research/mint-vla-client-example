@@ -142,7 +142,7 @@ async def health_check():
 
 
 # =============================================================================
-# Checkpoint API (per spec: docs/checkpoint-download-api.md)
+# Checkpoint API (per spec: .claude/skills/architecture-design/references/checkpoint-download-api.md)
 # =============================================================================
 
 

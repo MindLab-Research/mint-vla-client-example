@@ -50,6 +50,10 @@ Goal: avoid running scripts in the wrong place.
 
 When needing details about the official Tinker API (types, methods, loss functions, data formats), use the `tinker-official-reference` skill and read `.claude/skills/tinker-official-reference/references/tinker_official_reference.txt`.
 
+## Documentation
+
+Engineering notes/specs live under `.claude/skills/architecture-design/references/`. Do not add a top-level `docs/` directory.
+
 ## Architecture
 
 ```

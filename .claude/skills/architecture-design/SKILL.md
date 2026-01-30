@@ -12,6 +12,8 @@ description: |
 
 # Architecture design (tinker-server)
 
+Engineering docs/specs live under `.claude/skills/architecture-design/references/` (not `docs/`).
+
 Read `references/architecture.md` first (index). For design intent, read `references/overview.md`. Then open the relevant topic file:
 - Overview (design decisions): `references/overview.md`
 - System boundary and code map: `references/system.md`
