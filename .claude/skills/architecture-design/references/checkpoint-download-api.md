@@ -42,7 +42,7 @@ Returns all checkpoints belonging to the authenticated user.
 ### Fields
 
 | Field | Type | Description |
-|-------|------|-------------|
+|------|------|-------------|
 | `checkpoint_id` | string | Unique checkpoint identifier |
 | `model_name` | string | Base model name (e.g., `Qwen/Qwen3-30B-A3B`) |
 | `created_at` | string | ISO 8601 timestamp |
@@ -108,78 +108,6 @@ Checkpoint Storage (PFS)
 
 ---
 
-## Implementation
-
-```python
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-import tarfile
-import io
-import os
-
-router = APIRouter(prefix="/internal/v1")
-
-
-class CheckpointInfo(BaseModel):
-    checkpoint_id: str
-    model_name: str
-    created_at: str
-    type: str  # "training" | "inference"
-    size_bytes: int
-
-
-class CheckpointsListResponse(BaseModel):
-    checkpoints: list[CheckpointInfo]
-
-
-@router.get("/checkpoints", response_model=CheckpointsListResponse)
-async def list_checkpoints(request: Request):
-    user_id = get_user_id(request)
-    if user_id is None:
-        raise HTTPException(401, "Authentication required")
-
-    checkpoints = query_checkpoints_by_owner(user_id)
-    return CheckpointsListResponse(checkpoints=checkpoints)
-
-
-@router.get("/checkpoints/{checkpoint_id}/archive")
-async def download_checkpoint(checkpoint_id: str, request: Request):
-    user_id = get_user_id(request)
-    if user_id is None:
-        raise HTTPException(401, "Authentication required")
-
-    checkpoint = get_checkpoint(checkpoint_id)
-    if checkpoint is None:
-        raise HTTPException(404, "Checkpoint not found")
-    if checkpoint.owner_id != user_id:
-        raise HTTPException(403, "Access denied")
-
-    def stream_tar():
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
-            tar.add(checkpoint.path, arcname=checkpoint_id)
-        buffer.seek(0)
-        yield buffer.read()
-
-    return StreamingResponse(
-        stream_tar(),
-        media_type="application/gzip",
-        headers={"Content-Disposition": f"attachment; filename={checkpoint_id}.tar.gz"}
-    )
-
-
-def get_dir_size(path: str) -> int:
-    """Calculate total size of directory."""
-    total = 0
-    for dirpath, _, filenames in os.walk(path):
-        for f in filenames:
-            total += os.path.getsize(os.path.join(dirpath, f))
-    return total
-```
-
----
-
 ## Storage Schema
 
 One directory per user. Ownership implicit from path.
@@ -207,7 +135,3 @@ One directory per user. Ownership implicit from path.
   "step": 100
 }
 ```
-
-List checkpoints = `os.listdir(f"/checkpoints/{user_id}")`
-
-No index needed. Ownership check = path validation.
