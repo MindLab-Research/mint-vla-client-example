@@ -18,6 +18,7 @@ import ray
 
 from . import ray_kill
 from .lora_registry import LoRARegistry, LoRASlotInfo
+from .ray_keepalive import ray_get_with_resource_pool_keepalive
 
 if TYPE_CHECKING:
     pass
@@ -672,7 +673,7 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Generate with session-specific LoRA
-            result = await self.server.generate_with_lora.remote(
+            ref = self.server.generate_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 lora_int_id=lora_id,
@@ -685,7 +686,7 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Generate with base model (no LoRA)
-            result = await self.server.generate_base.remote(
+            ref = self.server.generate_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 max_tokens=max_tokens,
@@ -695,6 +696,8 @@ class MultiLoRAInferenceEngine:
                 top_p=top_p,
                 logprobs=logprobs,
             )
+
+        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
         timing_total_s = result.get("_timing_total_s")
         if timing_total_s is not None:
@@ -748,7 +751,7 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
 
         if lora_id is not None:
-            raw = await self.server.generate_with_lora.remote(
+            ref = self.server.generate_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 lora_int_id=lora_id,
@@ -761,7 +764,7 @@ class MultiLoRAInferenceEngine:
                 n=num_samples,
             )
         else:
-            raw = await self.server.generate_base.remote(
+            ref = self.server.generate_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 max_tokens=max_tokens,
@@ -772,6 +775,8 @@ class MultiLoRAInferenceEngine:
                 logprobs=logprobs,
                 n=num_samples,
             )
+
+        raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
@@ -842,11 +847,12 @@ class MultiLoRAInferenceEngine:
         if lora_id is not None:
             # Compute logprobs with session-specific LoRA
             try:
-                result = await self.server.compute_prompt_logprobs_with_lora.remote(
+                ref = self.server.compute_prompt_logprobs_with_lora.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                     lora_int_id=lora_id,
                 )
+                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
@@ -870,10 +876,11 @@ class MultiLoRAInferenceEngine:
         else:
             # Compute logprobs with base model (no LoRA)
             try:
-                result = await self.server.compute_prompt_logprobs_base.remote(
+                ref = self.server.compute_prompt_logprobs_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                 )
+                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
@@ -937,7 +944,7 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Compute top-K with session-specific LoRA
-            result = await self.server.compute_prompt_topk_with_lora.remote(
+            ref = self.server.compute_prompt_topk_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 lora_int_id=lora_id,
@@ -945,11 +952,13 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Compute top-K with base model (no LoRA)
-            result = await self.server.compute_prompt_topk_base.remote(
+            ref = self.server.compute_prompt_topk_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 k=k,
             )
+
+        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
         return list(result)
 
