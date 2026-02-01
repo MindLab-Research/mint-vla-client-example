@@ -13,7 +13,11 @@ from typing import Any
 
 
 def _ray_namespace() -> str:
-    return os.environ.get("MINT_RAY_NAMESPACE", "tinker")
+    return (
+        os.environ.get("TINKER_RAY_NAMESPACE")
+        or os.environ.get("MINT_RAY_NAMESPACE")
+        or "tinker"
+    )
 
 
 def _actor_name() -> str:

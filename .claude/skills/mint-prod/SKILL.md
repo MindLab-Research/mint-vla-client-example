@@ -304,7 +304,7 @@ ssh mint-prod-volcano "ps aux | grep run_server | grep -v grep"
 ### Kill vLLM Actor
 
 ```bash
-# Via API (requires auth)
+# Via API (admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
 # Kill specific model's vLLM actor
@@ -333,7 +333,7 @@ curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/vllm_statu
 # Megatron status
 curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/megatron_status | jq
 
-# Kill all actors (nuclear option)
+# Kill all actors (nuclear option; admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_all_actors
 ```
 
@@ -341,49 +341,118 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 
 ## 4. Code Update SOP
 
-### Decision Matrix
+### Rule 0: server restart does not reload detached actors
 
-| Code Changed | Actors Running | Action |
-|--------------|----------------|--------|
-| `megatron_*.py`, `megatron_distributed.py` | Megatron alive | Kill Megatron + restart server |
-| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | vLLM alive | Kill vLLM + restart server |
-| Routes, middleware only | Any | Restart server only |
-| Any | 0 GPUs available | Kill idle actors first, free GPUs, then proceed |
+The API server is a Python process. Ray actors are separate Python processes.
+
+Detached actors (vLLM, Megatron, DenseTrainerPool, stores) survive server restarts and keep running old code until killed.
+
+Hard rule: never create/get/kill actors outside `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
+
+### Kill criteria after code changes
+
+Always restart the server after code changes.
+
+Kill detached actors only if the change can be imported/executed inside that actor process:
+- vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
+- Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
+- Dense training pool: `tinker_server/backend/verl_training.py`
+- Detached stores: `tinker_server/backend/future_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
+- Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
+
+If none of the above changed: restart server only.
 
 ### Kill Actors
 
-See "Kill vLLM Actor" and "Kill Megatron Actor" sections above for API commands.
+Preferred: use the HTTP endpoints documented above (auth required) for vLLM and Megatron.
 
 ```bash
-# Quick reference (requires auth)
+# Quick reference (admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 ```
 
-### Legacy Reference
+No dedicated endpoints exist for dense trainer pool actors or detached store actors. Use Ray name lookup on the API host:
 
-| Changed Code | Required Actions |
-|--------------|------------------|
-| `megatron_*.py`, `megatron_distributed.py` | Kill Megatron actor + restart server |
-| `verl_inference.py`, `multi_lora_engine.py`, `vllm_*.py` | Kill vLLM actor + restart server |
-| Route handlers, middleware, other server code | Restart server only |
+```bash
+# Kill dense trainer pool actors in current namespace (prefix match)
+ssh mint-prod-volcano "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' python3 -c \"
+import os
+import ray
+ray.init(address='auto', ignore_reinit_error=True)
+ns = os.environ.get('TINKER_RAY_NAMESPACE', 'tinker')
+actors = ray.util.list_named_actors(all_namespaces=True)
+killed = 0
+for a in actors:
+    if a.get('namespace') != ns:
+        continue
+    name = a.get('name') or ''
+    if not name.startswith('dense_trainer_pool_'):
+        continue
+    try:
+        ray.kill(ray.get_actor(name, namespace=ns))
+        killed += 1
+    except Exception as e:
+        print(f\"kill_failed name={name!r} namespace={ns!r} err={e!r}\")
+print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
+\""
 
-### Fast Restart (no vLLM changes)
+# Kill detached store actors in current namespace (name match)
+ssh mint-prod-volcano "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:-tinker}' python3 -c \"
+import os
+import ray
+ray.init(address='auto', ignore_reinit_error=True)
+ns = os.environ.get('TINKER_RAY_NAMESPACE', 'tinker')
+names = ['tinker_future_store', 'tinker_training_session_store', 'tinker_gateway_session_store']
+killed = 0
+for name in names:
+    try:
+        ray.kill(ray.get_actor(name, namespace=ns))
+        killed += 1
+    except ValueError:
+        pass
+    except Exception as e:
+        print(f\"kill_failed name={name!r} namespace={ns!r} err={e!r}\")
+print(f\"killed={killed} kind='stores' namespace={ns}\")
+\""
+```
+
+### Restart Server
 
 ```bash
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ```
 
-### Full Restart (vLLM changes)
+### Restart after killing vLLM
 
 ```bash
-# Kill vLLM (requires auth)
+# Kill vLLM (admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
 # Restart server
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 
 # Wait for vLLM init (~80s)
+sleep 80 && curl -s http://localhost:18000/api/v1/healthz
+```
+
+### Restart after killing Megatron
+
+```bash
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
+curl -s http://localhost:18000/api/v1/healthz
+```
+
+### Restart after killing all tracked GPU actors
+
+Use this after shared actor code changes (for example `tinker_server/backend/model_registry.py`) or when GPUs are exhausted.
+
+Note: `/api/v1/kill_all_actors` kills ResourcePool-tracked GPU actors (vLLM, Megatron, dense trainer pool). It does not kill detached store actors.
+
+```bash
+curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_all_actors
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 ```
 

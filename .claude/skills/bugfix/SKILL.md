@@ -7,14 +7,15 @@ description: |
 
   Triggers: "fix issue", "reproduce bug", "test bugfix", "issue #X"
 
-  **CRITICAL: Production server is READ-ONLY. Never restart, modify, or touch prod server.**
+  **CRITICAL: Treat production as READ-ONLY unless the user explicitly requests production operations.**
+  For any production operations (restart/kill actors/logs on prod hosts), invoke `mint-prod`.
 ---
 
 # Bugfix Workflow
 
 > **ABSOLUTE RULES**
 >
-> 1. **PRODUCTION IS READ-ONLY**: You may only READ logs. NEVER restart, kill, or modify prod server.
+> 1. **PRODUCTION IS READ-ONLY BY DEFAULT**: Do not restart/kill/modify production unless the user explicitly requests it. Use `mint-prod` for any production operations.
 > 2. **NEVER SUBSTITUTE REQUIREMENTS**: If an issue is complex, solve it. Don't simplify the problem.
 > 3. **VERIFY WITH REPRODUCTION SCRIPT**: A fix is not complete until the reproduction script passes.
 
@@ -41,20 +42,11 @@ API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 - Clearly prints success/failure
 - Defines issue scope (what fails, what works)
 
-### 1.2 Reproduce on Production (Optional)
+### 1.2 Reproduce on Production (Optional, HTTP-only)
 
 If the bug was reported from production, verify it exists:
 
-```bash
-# Use admin API key to see full server-side errors
-TINKER_BASE_URL=https://mint.macaron.im \
-TINKER_API_KEY=<admin_key> \
-python scripts/tools/reproduce_issue_<NUMBER>.py
-```
-
-> **Admin API Key Benefit**: When using the admin API key, server-side error details
-> are included in the response. Regular users only see generic error messages.
-> This makes reproduction more targeted.
+Do not run any production-side kill/restart commands during reproduction. Use HTTP only.
 
 ### 1.3 Check Production Logs (READ-ONLY)
 

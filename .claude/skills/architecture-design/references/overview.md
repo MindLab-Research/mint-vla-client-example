@@ -24,7 +24,7 @@ Boundaries and tradeoffs:
 - The mapping `sampling_session_id` to `lora_int_id` is in server memory. After a server restart, the vLLM actor may still have LoRAs loaded, but the server no longer knows which session maps to which adapter without additional reconciliation.
 - Small and medium adapters go through the Ray object store. Very large MoE adapters use path-based loading on a shared filesystem to avoid serializing thousands of tensors.
 - Detached actors reduce warmup cost for repeated use but keep holding GPU memory until evicted.
-- Inference engine selection is per-model. Models that require Ray-distributed vLLM execution use `MultiNodeInferenceEngine` and reserve an additional "controller GPU" beyond `tensor_parallel_size` (see `inference.md` and `placement-groups.md`).
+- Inference engine selection is per-model. Models that require Ray-distributed vLLM execution use `MultiNodeInferenceEngine` and add a CPU-only controller actor (no extra GPU reservation) (see `inference.md` and `placement-groups.md`).
 
 ## Multi-tenant training: time-sliced state swap
 

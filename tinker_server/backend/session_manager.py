@@ -98,6 +98,10 @@ class SessionManager:
             for sid, info in self._sessions.items()
             if info.inflight_requests == 0
             if now - info.last_activity > self.inactivity_timeout
+            # Base-model sessions are purely logical routing entries (no per-session engine or
+            # per-session adapter resources). Evicting them breaks clients that cache the
+            # sampling_session_id across idle gaps, while providing no resource relief.
+            if not info.uses_base_model
             # Keep shared engine sessions unless they are multi-LoRA registrations
             # (multi-LoRA uses per-session LoRA IDs and must be GC'd to avoid leaks).
             and (not info.is_shared or info.uses_multi_lora)

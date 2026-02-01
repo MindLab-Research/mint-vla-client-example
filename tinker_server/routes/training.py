@@ -27,6 +27,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, resolve_checkpoint_path
+from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateModelFromStateRequest,
@@ -123,7 +124,7 @@ def _restore_training_session(model_id: str):
 
         actor_name = info.get("actor_name")
         if actor_name:
-            namespace = str(info.get("namespace") or os.environ.get("MINT_RAY_NAMESPACE", "tinker"))
+            namespace = str(info.get("namespace") or RAY_NAMESPACE)
             worker = ray.get_actor(actor_name, namespace=namespace)
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -177,6 +178,11 @@ async def create_model(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
+    request = request.model_copy(update={"base_model": base_model})
+
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(request.base_model, user_data):
@@ -297,7 +303,7 @@ async def _do_create_model(
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
                 "actor_name": actor_name,
-                "namespace": os.environ.get("MINT_RAY_NAMESPACE", "tinker"),
+                "namespace": RAY_NAMESPACE,
             })
         except Exception:
             pass
@@ -368,6 +374,11 @@ async def create_model_from_state(
     Composes create_model + load_state into single operation.
     Useful for resuming training from a saved checkpoint.
     """
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
+    request = request.model_copy(update={"base_model": base_model})
+
     # Check model access permissions
     user_data = _get_user_data(http_request)
     if not can_access_model(request.base_model, user_data):
@@ -487,7 +498,7 @@ async def _do_create_model_from_state(
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
                 "actor_name": actor_name,
-                "namespace": os.environ.get("MINT_RAY_NAMESPACE", "tinker"),
+                "namespace": RAY_NAMESPACE,
             })
         except Exception:
             pass

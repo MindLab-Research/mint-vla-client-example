@@ -6,15 +6,15 @@ idle actors are evicted regardless of type.
 """
 
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable
 
 import ray
 
+from ..config import config as server_config
 from . import ray_kill
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ class ActorEntry:
     creating: bool = True
     # If True, actor is never evicted by ResourcePool LRU.
     protected: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def touch(self):
         """Update last_accessed timestamp."""
@@ -123,12 +124,8 @@ class ResourcePool:
         # This prevents race conditions where multiple concurrent requests
         # both think they have enough GPUs available
         self._pending_gpus: int = 0
-        # Read MIN_ACTOR_AGE at init time (not class definition time)
-        # Set MINT_MIN_ACTOR_AGE=0 for testing to allow immediate eviction
-        self.MIN_ACTOR_AGE = int(os.environ.get("MINT_MIN_ACTOR_AGE", "300"))
-        # Session idle timeout: after this period of inactivity, session is considered stale
-        # Set MINT_SESSION_IDLE_TIMEOUT=0 for testing to allow immediate eviction
-        self.SESSION_IDLE_TIMEOUT = int(os.environ.get("MINT_SESSION_IDLE_TIMEOUT", "300"))
+        self.MIN_ACTOR_AGE = int(server_config.resource_pool_min_actor_age_s)
+        self.SESSION_IDLE_TIMEOUT = int(server_config.resource_pool_session_idle_timeout_s)
         logger.info(f"[ResourcePool] Initialized with MIN_ACTOR_AGE={self.MIN_ACTOR_AGE}, SESSION_IDLE_TIMEOUT={self.SESSION_IDLE_TIMEOUT}")
         self._initialized = True
 
@@ -143,6 +140,7 @@ class ResourcePool:
         session_id: str | None = None,
         node_id: str | None = None,
         protected: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> ActorEntry:
         """Register an actor with the pool.
 
@@ -172,6 +170,8 @@ class ResourcePool:
                     entry.node_id = node_id
                 if protected:
                     entry.protected = True
+                if metadata:
+                    entry.metadata.update(dict(metadata))
                 logger.info(f"[ResourcePool] Updated existing entry: {actor_name}")
             else:
                 entry = ActorEntry(
@@ -184,6 +184,7 @@ class ResourcePool:
                     current_session=session_id,
                     node_id=node_id,
                     protected=protected,
+                    metadata=dict(metadata) if metadata else {},
                 )
                 self._entries[actor_name] = entry
                 logger.info(
@@ -234,27 +235,6 @@ class ResourcePool:
         with self._pool_lock:
             entry = self._entries.get(actor_name)
             return bool(entry and entry.protected)
-
-    def clear_session(self, session_id: str) -> int:
-        """Clear session tracking entries matching session_id.
-
-        Used when a training session is deleted while actor creation/session
-        initialization is still in-flight, to avoid permanently pinning an
-        actor as non-idle due to a stale current_session value.
-
-        Returns:
-            Number of actor entries updated.
-        """
-        cleared = 0
-        with self._pool_lock:
-            for entry in self._entries.values():
-                if entry.current_session == session_id:
-                    entry.current_session = None
-                    entry.touch()
-                    cleared += 1
-        if cleared:
-            logger.info(f"[ResourcePool] Cleared current_session={session_id} for {cleared} actor(s)")
-        return cleared
 
     def touch(self, actor_name: str) -> bool:
         """Update last_accessed timestamp to mark actor as recently used.
@@ -543,6 +523,7 @@ class ResourcePool:
                     "node_id": e.node_id,
                     "creating": e.creating,
                     "protected": e.protected,
+                    "metadata": e.metadata,
                     "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
                     "idle_time": e.idle_time(),
                     "age": e.age(),
@@ -558,6 +539,29 @@ class ResourcePool:
         """
         with self._pool_lock:
             return list(self._entries.values())
+
+    def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
+        """Clear current_session pointers for entries matching session_id.
+
+        Returns:
+            Number of entries updated.
+        """
+        cleared = 0
+        with self._pool_lock:
+            for e in self._entries.values():
+                if actor_type is not None and e.actor_type != actor_type:
+                    continue
+                if e.current_session != session_id:
+                    continue
+                e.current_session = None
+                e.touch()
+                cleared += 1
+        if cleared:
+            logger.info(
+                f"[ResourcePool] Cleared current_session={session_id} for {cleared} actor(s) "
+                f"(actor_type={actor_type.value if actor_type else 'any'})"
+            )
+        return cleared
 
     def total_gpus_used(self) -> int:
         """Total GPUs used by all tracked actors."""

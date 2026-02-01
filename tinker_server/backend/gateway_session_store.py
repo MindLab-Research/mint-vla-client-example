@@ -12,7 +12,11 @@ from typing import Any
 
 
 def _ray_namespace() -> str:
-    return os.environ.get("MINT_RAY_NAMESPACE", "tinker")
+    return (
+        os.environ.get("TINKER_RAY_NAMESPACE")
+        or os.environ.get("MINT_RAY_NAMESPACE")
+        or "tinker"
+    )
 
 
 def _actor_name() -> str:
@@ -80,10 +84,17 @@ def _ensure_ray_initialized() -> None:
         addr = (os.environ.get("RAY_ADDRESS") or "").strip()
         if not addr:
             # Volcano head writes the canonical GCS IP to PFS.
-            for p in (
-                "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
-                "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
-            ):
+            candidates: list[str] = []
+            pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
+            if pfs_tinker_path:
+                candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
+            candidates.extend(
+                [
+                    "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
+                    "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
+                ]
+            )
+            for p in candidates:
                 try:
                     ip = open(p, "r", encoding="utf-8").read().strip()
                 except OSError:

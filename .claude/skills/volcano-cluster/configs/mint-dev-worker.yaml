@@ -42,7 +42,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:6"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:12"
 ResourceQueueID: "q-20260124095758-ngkg7"  # GPU queue for dev workers
 Framework: "Custom"
 

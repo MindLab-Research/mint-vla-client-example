@@ -141,6 +141,11 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
         resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=owner_dir)
         if resolved is None and user_id == "admin":
             resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=None)
+        # If a non-admin tries to use a checkpoint_id they don't own, resolve the real
+        # path so callers can raise PermissionError("Access denied") instead of a
+        # misleading FileNotFoundError.
+        if resolved is None and user_id and user_id != "admin":
+            resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=None)
         return resolved or uri
 
     if uri.startswith("tinker://"):

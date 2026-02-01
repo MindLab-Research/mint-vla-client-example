@@ -38,7 +38,7 @@ Entrypoint: |
   fi
   echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
 
-  # Note: mint:6 Ray CLI crashes on startup; start Ray via Python internals.
+  # Note: Ray CLI crashes on startup; start Ray via Python internals.
   set -euo pipefail
   python3 - <<'PY'
   import os
@@ -65,7 +65,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:6"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:12"
 ResourceQueueID: "q-20251126180002-26lwz"
 Framework: "Custom"
 

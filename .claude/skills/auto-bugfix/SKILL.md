@@ -11,9 +11,9 @@ description: |
      spawn an independent reviewer subagent, then merge to `develop` if review passes.
 
   Refers to:
-- `bugfix` skill for reproduction discipline
-- `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
-- `architecture-design` skill for architecture docs alignment
+  - `bugfix` skill for reproduction discipline
+  - `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
+  - `architecture-design` skill for architecture docs alignment
 
   Triggers: "auto-bugfix", "bot queue", "assign-to-bot"
 ---
@@ -37,6 +37,7 @@ Hard rules:
 - Never substitute requirements. If reproduction fails, fix the real failure.
 - Restart the issue-scoped dev server after code changes (Python server does not hot-reload).
 - Do not stop/replace the default dev server. Auto-bugfix runs on an issue-specific port and issue-specific server root.
+- Never create/get/kill Ray actors outside the active `TINKER_RAY_NAMESPACE` unless the user explicitly requests cross-namespace action.
 - Do not modify git config (no `git config ...`). Commit identity must be set per command.
 - Orchestrator, bugfixer, and reviewer MUST read the entire issue thread (body + all comments) before coding/reviewing.
   If the issue references another issue/PR for context, read that too before acting.
@@ -159,16 +160,42 @@ fi
 
 Use `mint-dev` for shared dev constraints and definitions. Do not reuse its start/stop/log commands because this skill must not stop or replace the default dev server.
 
-Namespace goal: isolate Ray actor state per issue (avoid collisions across concurrent dev runs).
+Namespace goal: isolate Ray actor state per issue while requiring post-issue cleanup so detached actors do not proliferate.
 `mint-dev` documents `TINKER_RAY_NAMESPACE` for this.
+Hard rules:
+- Do not kill or manipulate actors in other namespaces to "free GPUs" unless the user explicitly requests it.
+- Use issue-specific `TINKER_RAY_NAMESPACE` (do not reuse across issues).
+- Kill all actors in the issue namespace at the end of the issue (and before starting the issue-scoped server if rerunning) so detached actors do not accumulate.
 
-Example namespace + issue-specific PFS path:
+Example issue-specific namespace + issue-specific PFS path:
 ```bash
 export ISSUE=123
 export TINKER_RAY_NAMESPACE="tinker_${USER}_issue_${ISSUE}"
 export PFS_TINKER_PATH="/vePFS-Mindverse/share/code/$USER/tinker-server-issue-$ISSUE"
 export UNISON_PROFILE="volcano-tinker-$USER-issue-$ISSUE"
 export TINKER_PORT="$((10000 + ISSUE % 5000))"
+```
+
+Namespace cleanup (run before starting the issue-scoped server, and after finishing the issue):
+```bash
+# Pass `TINKER_RAY_NAMESPACE` explicitly (ssh does not forward local env by default).
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+import os
+import ray
+ray.init(address=\"auto\", ignore_reinit_error=True)
+ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
+actors = ray.util.list_named_actors(all_namespaces=True)
+killed = 0
+for a in actors:
+    if a.get(\"namespace\") != ns:
+        continue
+    try:
+        ray.kill(ray.get_actor(a[\"name\"], namespace=ns))
+        killed += 1
+    except Exception as e:
+        print(f\"kill_failed name={a.get('name')!r} namespace={ns!r} err={e!r}\")
+print(f\"killed={killed} namespace={ns}\")
+\""
 ```
 
 Issue-specific code sync (do not manually sync; use unison daemon mode):
@@ -201,9 +228,28 @@ print(dst)
 PY
 
 test -n "$UNISON_PROFILE" || { echo "error: UNISON_PROFILE is empty"; exit 1; }
-pkill -f "[u]nison.*$UNISON_PROFILE" 2>/dev/null || true
-nohup unison "$UNISON_PROFILE" -repeat watch > "/tmp/unison-$UNISON_PROFILE.log" 2>&1 &
-pgrep -af "unison.*$UNISON_PROFILE"
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/unison@.service <<'EOF'
+[Unit]
+Description=Unison (%i) watch
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/unison %i -repeat watch -ui text
+Restart=always
+RestartSec=2
+StandardOutput=append:/tmp/unison-%i.log
+StandardError=append:/tmp/unison-%i.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+loginctl enable-linger "$USER" || true
+systemctl --user enable --now "unison@$UNISON_PROFILE.service"
+systemctl --user status "unison@$UNISON_PROFILE.service" --no-pager
+tail -n 200 "/tmp/unison-$UNISON_PROFILE.log"
 ```
 
 Issue-specific server root on mint-dev:
@@ -219,6 +265,7 @@ ssh mint-dev "cd /root/tinker_project/tinker-server-issue-$ISSUE && nohup bash -
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=$PFS_TINKER_PATH \
    TINKER_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
+   MINT_RAY_NAMESPACE=$TINKER_RAY_NAMESPACE \
    TINKER_PORT=$TINKER_PORT \
    TINKER_USAGE_LOG_DIR=/tmp/tinker_usage_issue_$ISSUE \
    python scripts/run_server.py\" >> /tmp/tinker_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/tinker_server_issue_$ISSUE.pid"
@@ -277,8 +324,15 @@ Implement the minimal root-cause fix.
 
 After code changes:
 1) verify code synced to mint-dev (unison)
-2) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
-3) confirm health endpoint
+2) if the change touches code that can be imported/executed inside detached actors, run the 3b "Namespace cleanup" snippet to kill the issue namespace actors so the next run loads new code:
+   - vLLM: `tinker_server/backend/verl_inference.py`, `tinker_server/backend/multi_lora_engine.py`, `tinker_server/backend/multinode_inference.py`, `tinker_server/backend/vllm_*.py`
+   - Megatron: `tinker_server/backend/megatron_distributed.py`, `tinker_server/backend/megatron_training.py`, `tinker_server/backend/verl_patches.py`
+   - Dense training pool: `tinker_server/backend/verl_training.py`
+   - Detached stores: `tinker_server/backend/future_store.py`, `tinker_server/backend/training_session_store.py`, `tinker_server/backend/gateway_session_store.py`
+   - Shared (kills required for all GPU actor types): `tinker_server/config.py`, `tinker_server/ray_utils.py`, `tinker_server/backend/ray_kill.py`, `tinker_server/backend/model_registry.py`
+   - If uncertain: run namespace cleanup (issue namespace makes this safe).
+3) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
+4) confirm health endpoint
 
 ### 3f) Bugfixer: Re-run reproduction script
 

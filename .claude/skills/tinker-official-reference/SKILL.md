@@ -12,6 +12,14 @@ description: |
 
 # Tinker official reference
 
-Open `references/tinker_official_reference.txt` for the canonical Tinker API contract used by Mint.
+Primary reference: section files under `references/upstream/` (docs pages and api-reference pages).
 
 When updating routes or `tinker_server/models/types.py`, treat this reference as the source of truth for client-visible semantics.
+
+## Upstream source and updates
+
+Upstream documentation URL (single-file docs):
+- `https://tinker-docs.thinkingmachines.ai/llms-full.txt`
+
+Update section files by running:
+- `python .claude/skills/tinker-official-reference/scripts/update_reference.py`

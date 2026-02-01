@@ -16,9 +16,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..usage_logger import get_usage_logger
+from ..config import config as server_config
 
 # Checkpoint directory (shared filesystem)
-CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", "/vePFS-Mindverse/share/code/tinker-server/checkpoints")
+CHECKPOINTS_DIR = server_config.checkpoint_dir
 
 router = APIRouter()
 
@@ -141,7 +142,7 @@ async def health_check():
 
 
 # =============================================================================
-# Checkpoint API (per spec: docs/checkpoint-download-api.md)
+# Checkpoint API (per spec: .claude/skills/architecture-design/references/checkpoint-download-api.md)
 # =============================================================================
 
 

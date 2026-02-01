@@ -10,12 +10,12 @@ from __future__ import annotations
 import asyncio
 import array
 import hashlib
-import os
 import logging
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
+from ..config import config as server_config
 from ..backend.future_store import future_store
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -40,20 +40,14 @@ router = APIRouter()
 session_manager: SessionManager | None = None
 
 _SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
-_MAX_INFLIGHT_SAMPLE_TASKS = int(os.environ.get("TINKER_MAX_INFLIGHT_SAMPLE_TASKS", "64"))
-_MAX_CONCURRENT_SAMPLES_PER_REQUEST = int(os.environ.get("TINKER_MAX_CONCURRENT_SAMPLES_PER_REQUEST", "8"))
+_MAX_INFLIGHT_SAMPLE_TASKS = int(server_config.sampling_max_inflight_sample_tasks)
+_MAX_CONCURRENT_SAMPLES_PER_REQUEST = int(server_config.sampling_max_concurrent_samples_per_request)
 _inflight_sample_tasks = 0
 
-_SAMPLE_COALESCE = os.environ.get("TINKER_SAMPLE_COALESCE", "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-)
-_SAMPLE_COALESCE_WINDOW_MS = float(os.environ.get("TINKER_SAMPLE_COALESCE_WINDOW_MS", "2.0"))
-_SAMPLE_COALESCE_MAX_BATCH = int(os.environ.get("TINKER_SAMPLE_COALESCE_MAX_BATCH", "32"))
-_SAMPLE_COALESCE_MAX_SAMPLES = int(os.environ.get("TINKER_SAMPLE_COALESCE_MAX_SAMPLES", "16"))
+_SAMPLE_COALESCE = bool(server_config.sampling_sample_coalesce)
+_SAMPLE_COALESCE_WINDOW_MS = float(server_config.sampling_sample_coalesce_window_ms)
+_SAMPLE_COALESCE_MAX_BATCH = int(server_config.sampling_sample_coalesce_max_batch)
+_SAMPLE_COALESCE_MAX_SAMPLES = int(server_config.sampling_sample_coalesce_max_samples)
 _sample_coalesce_lock = asyncio.Lock()
 _sample_coalesce_groups: dict[tuple, dict] = {}
 

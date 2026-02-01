@@ -17,7 +17,7 @@ import os
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..backend.session_heartbeat_store import session_heartbeat_store
@@ -186,6 +186,10 @@ async def create_sampling_session(
             status_code=422,
             detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
         )
+
+    from ..supported_models_gate import enforce_base_model_allowed
+
+    base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -386,11 +390,8 @@ async def send_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 
 
 # =============================================================================
-# Admin endpoints for vLLM management
+# Admin endpoints for actor management
 # =============================================================================
-
-
-
 def _require_admin(request: Request) -> None:
     """Raise 403 if not admin user."""
     from ..config import config as server_config
@@ -401,163 +402,152 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Admin access required")
 
 
-class KillVllmRequest(BaseModel):
-    """Request to kill vLLM actor(s)."""
+def _augment_with_placement_groups(actors: list[dict]) -> None:
+    try:
+        import ray
+        from ..config import RAY_NAMESPACE
+        from ..ray_utils import init_ray
 
-    model_name: str | None = None  # Kill specific model's actor, or all if None
+        if not ray.is_initialized():
+            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+        for a in actors:
+            name = a.get("actor_name")
+            if not isinstance(name, str) or not name:
+                continue
+            pg_name = f"{name}_pg"
+            try:
+                pg = ray.util.get_placement_group(pg_name)
+                bundles = getattr(pg, "bundle_specs", None)
+                if isinstance(bundles, list):
+                    a["pg_name"] = pg_name
+                    a["pg_bundle_count"] = len(bundles)
+                    a["pg_total_gpus"] = sum(int(b.get("GPU", 0) or 0) for b in bundles if isinstance(b, dict))
+            except Exception:
+                continue
+    except Exception:
+        return
 
 
-@router.post("/kill_vllm")
-async def kill_vllm(request: Request, body: KillVllmRequest | None = None) -> dict:
-    """Kill vLLM inference actor(s). Admin only.
+@router.get("/actors")
+async def list_actors(
+    request: Request,
+    actor_type: str | None = Query(None, alias="type"),
+    model_name: str | None = None,
+) -> dict:
+    """List actors in the unified ResourcePool. Admin only when auth enabled.
 
-    Args:
-        model_name: If provided, kill actor for this specific model.
-                   If None/omitted, kill ALL vLLM actors.
-
-    Use this to force a full restart of the vLLM engine.
-    The next request that needs vLLM will create a new actor (~80s init).
+    Query params:
+        type: Optional filter ("vllm" | "megatron" | "dense")
+        model_name: Optional filter on ActorEntry.base_model
     """
     _require_admin(request)
-    from ..backend.multi_lora_engine import kill_persistent_vllm_actor
-
-    model_name = body.model_name if body else None
-    killed = kill_persistent_vllm_actor(model_name)
-
-    if model_name:
-        msg = f"Killed vLLM actor for {model_name}" if killed else f"No vLLM actor found for {model_name}"
-    else:
-        msg = "All vLLM actors killed" if killed else "No vLLM actors found"
-
-    return {"killed": killed, "message": msg}
-
-
-@router.get("/vllm_status")
-async def vllm_status(request: Request, model_name: str | None = None) -> dict:
-    """Check if vLLM actor(s) exist. Admin only.
-
-    Args:
-        model_name: If provided, check for this specific model's actor.
-                   If None, check for ANY running vLLM actor.
-
-    Returns:
-        alive: True if matching actor exists and is alive
-        actors: List of running vLLM actors from resource pool
-    """
-    _require_admin(request)
-    from ..backend.multi_lora_engine import check_persistent_vllm_actor, list_vllm_actors
-
-    alive = check_persistent_vllm_actor(model_name)
-    actors = list_vllm_actors()
-
-    return {"alive": alive, "actors": actors, "query_model_name": model_name}
-
-
-class KillMegatronRequest(BaseModel):
-    """Request to kill Megatron actor(s)."""
-
-    base_model: str | None = None  # Kill specific model's actor, or all if None
-
-
-@router.post("/kill_megatron")
-async def kill_megatron(request: Request, body: KillMegatronRequest | None = None) -> dict:
-    """Kill Megatron training actor(s). Admin only.
-
-    Args:
-        base_model: If provided, kill actor for this specific model.
-                   If None/omitted, kill ALL Megatron actors.
-
-    Use this to force a full restart of the Megatron worker group.
-    The next training request will create a new actor.
-    """
-    _require_admin(request)
-    from ..backend.megatron_distributed import kill_megatron_actor
-
-    base_model = body.base_model if body else None
-    killed = kill_megatron_actor(base_model)
-
-    if base_model:
-        msg = f"Killed Megatron actor for {base_model}" if killed else f"No Megatron actor found for {base_model}"
-    else:
-        msg = "All Megatron actors killed" if killed else "No Megatron actors found"
-
-    return {"killed": killed, "message": msg}
-
-
-
-@router.get("/megatron_status")
-async def megatron_status(request: Request, base_model: str | None = None) -> dict:
-    """Check if Megatron actor(s) exist. Admin only.
-
-    Args:
-        base_model: If provided, check for this specific model's actor.
-                   If None, check for ANY running Megatron actor.
-
-    Returns:
-        alive: True if matching actor exists and is alive
-        actors: List of running Megatron actors from resource pool
-    """
-    _require_admin(request)
-    from ..backend.megatron_distributed import is_megatron_actor_running
     from ..backend.resource_pool import ActorType, get_resource_pool
 
-    alive = is_megatron_actor_running(base_model)
+    pool = get_resource_pool()
+    actors = pool.list_actors()
 
-    # Get list of all Megatron actors
-    resource_pool = get_resource_pool()
-    actors = [
-        {"name": e["actor_name"], "gpus": e["num_gpus"], "base_model": e["base_model"]}
-        for e in resource_pool.list_actors()
-        if e.get("actor_type") == ActorType.MEGATRON.value
+    if actor_type is not None:
+        t = actor_type.strip().lower()
+        allowed = {x.value for x in ActorType}
+        if t not in allowed:
+            raise HTTPException(status_code=422, detail=f"Invalid type {actor_type!r}; expected one of {sorted(allowed)}")
+        actors = [a for a in actors if a.get("actor_type") == t]
+
+    if model_name is not None:
+        actors = [a for a in actors if a.get("base_model") == model_name]
+
+    _augment_with_placement_groups(actors)
+    return {"actors": actors, "total_gpus_used": pool.total_gpus_used()}
+
+
+class KillActorsRequest(BaseModel):
+    """Request to kill actor(s)."""
+
+    actor_type: str  # "vllm" | "megatron" | "dense" | "all"
+    model_name: str | None = None  # optional per-type model filter
+
+
+def _kill_dense_actors(base_model: str | None) -> int:
+    from ..backend.resource_pool import ActorType, get_resource_pool
+
+    pool = get_resource_pool()
+    targets = [
+        e
+        for e in pool.iter_entries()
+        if e.actor_type == ActorType.DENSE and (base_model is None or e.base_model == base_model)
     ]
 
-    return {"alive": alive, "actors": actors, "query_base_model": base_model}
+    killed = 0
+    try:
+        import ray
+        from ..backend import ray_kill
+        from ..config import RAY_NAMESPACE
+        from ..ray_utils import init_ray
+
+        if not ray.is_initialized():
+            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+        for e in targets:
+            try:
+                actor = ray.get_actor(e.actor_name, namespace=e.namespace)
+                ray_kill.kill(
+                    actor,
+                    reason="dense_kill_by_api",
+                    actor_name=e.actor_name,
+                    namespace=e.namespace,
+                    base_model=e.base_model,
+                    no_restart=True,
+                )
+            except Exception:
+                pass
+            pool.unregister(e.actor_name)
+            try:
+                pg = ray.util.get_placement_group(f"{e.actor_name}_pg")
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
+            killed += 1
+    except Exception:
+        for e in targets:
+            pool.unregister(e.actor_name)
+            killed += 1
+    return killed
 
 
-
-@router.get("/resource_pool")
-async def resource_pool_status(request: Request) -> dict:
-    """Get unified resource pool status. Admin only.
-
-    Returns:
-        actors: List of all tracked actors with LRU info
-        total_gpus: Total GPUs used
-        min_actor_age: Minimum actor age before eviction eligible
-    """
+@router.post("/actors/kill")
+async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
+    """Kill actor(s) by type. Admin only when auth enabled."""
     _require_admin(request)
-    from ..backend.resource_pool import get_resource_pool
 
-    pool = get_resource_pool()
+    t = body.actor_type.strip().lower()
+    model_name = body.model_name
+
+    killed_by_type: dict[str, int] = {"vllm": 0, "megatron": 0, "dense": 0}
+
+    if t in ("vllm", "all"):
+        from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+
+        if t == "vllm":
+            killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(model_name) else 0
+        else:
+            killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(None) else 0
+
+    if t in ("megatron", "all"):
+        from ..backend.megatron_distributed import kill_megatron_actor
+
+        if t == "megatron":
+            killed_by_type["megatron"] = 1 if kill_megatron_actor(model_name) else 0
+        else:
+            killed_by_type["megatron"] = 1 if kill_megatron_actor(None) else 0
+
+    if t in ("dense", "all"):
+        killed_by_type["dense"] = _kill_dense_actors(model_name if t == "dense" else None)
+
+    if t not in ("vllm", "megatron", "dense", "all"):
+        raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
+
     return {
-        "actors": pool.list_actors(),
-        "total_gpus_used": pool.total_gpus_used(),
-        "min_actor_age": pool.MIN_ACTOR_AGE,
+        "killed": int(sum(killed_by_type.values())),
+        "killed_by_type": killed_by_type,
     }
-
-
-@router.post("/clear_resource_pool")
-async def clear_resource_pool(request: Request) -> dict:
-    """Clear all entries from the resource pool. Admin only.
-
-    Used for debugging when pool has stale entries after actors are killed externally.
-    Does NOT kill actors - just clears the tracking entries.
-    """
-    _require_admin(request)
-    from ..backend.resource_pool import get_resource_pool
-
-    pool = get_resource_pool()
-    count = pool.clear(kill_actors=False)
-    return {"cleared": count, "message": f"Cleared {count} entries from resource pool"}
-
-
-@router.post("/kill_all_actors")
-async def kill_all_actors() -> dict:
-    """Kill all actors and clear the resource pool.
-
-    Use this to free all GPUs when actors are stuck or not being evicted properly.
-    """
-    from ..backend.resource_pool import get_resource_pool
-
-    pool = get_resource_pool()
-    count = pool.clear(kill_actors=True)
-    return {"killed": count, "message": f"Killed {count} actors and freed GPUs"}

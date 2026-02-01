@@ -84,7 +84,7 @@ Workers must use packages pre-installed in image or via PFS PYTHONPATH.
 |------|---------|
 | `/vePFS-Mindverse/share/code/tinker-server/` | Dev code (synced via Unison) |
 | `/vePFS-Mindverse/share/code/tinker-server-auth/` | Prod code (synced via Unison) |
-| `/vePFS-Mindverse/share/code/vllm-0.12.0/` | vLLM package (PYTHONPATH override) |
+| `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` | vLLM package (PYTHONPATH override) |
 | `/vePFS-Mindverse/share/huggingface/` | HuggingFace cache (models, tokenizers) |
 | `/vePFS-Mindverse/share/models/` | Model checkpoints |
 | `/vePFS-Mindverse/share/dataset/` | Training datasets |
@@ -261,6 +261,7 @@ When actors become unresponsive (OOM, stuck, orphaned):
 ```bash
 # Dev cluster
 ssh mint-dev 'python3 << "PYEOF"
+import os
 import ray
 ray.init(address="auto", ignore_reinit_error=True)
 r = ray.available_resources()
@@ -268,12 +269,19 @@ t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
 gpu_total = t.get("GPU", 0)
 print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
-for name in ["persistent_megatron_worker_group_v2", "tinker_vllm_server"]:
-    try:
-        ray.get_actor(name, namespace="tinker")
+ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker"
+actors = ray.util.list_named_actors(all_namespaces=True)
+for a in actors:
+    if a.get("namespace") != ns:
+        continue
+    name = a.get("name", "")
+    if (
+        name.startswith("tinker_vllm_")
+        or name.startswith("multinode_vllm_")
+        or name.startswith("megatron_")
+        or name.startswith("dense_trainer_pool_")
+    ):
         print(f"{name}: ALIVE")
-    except ValueError:
-        print(f"{name}: not running")
 PYEOF'
 
 # Prod cluster - use mint-prod-volcano instead of mint-dev
@@ -285,16 +293,16 @@ PYEOF'
 # Kill Megatron (dev)
 curl -X POST http://localhost:8000/api/v1/kill_megatron
 
-# Kill Megatron (prod - requires auth)
+# Kill Megatron (prod - admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_megatron
 
 # Kill vLLM (dev)
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 
-# Kill vLLM (prod - requires auth)
+# Kill vLLM (prod - admin only when auth is enabled)
 curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_vllm
 
-# Kill all actors (dev)
+# Kill all actors (dev; admin only when auth is enabled)
 curl -X POST http://localhost:8000/api/v1/kill_all_actors
 
 # Check status
@@ -306,10 +314,15 @@ curl -s http://localhost:8000/api/v1/vllm_status | jq
 
 | Actor | Name Pattern | Namespace |
 |-------|--------------|-----------|
-| Megatron | `megatron_{model_name}` (e.g., `megatron_kimi_k2_thinking`) | `tinker` |
-| vLLM | `vllm_{model_name}` (e.g., `vllm_kimi_k2_thinking`) | `tinker` |
+| Megatron | `megatron_{model_name}` (example: `megatron_kimi_k2_thinking`) | `TINKER_RAY_NAMESPACE` |
+| vLLM (single-node) | `tinker_vllm_{model_part}` (example: `tinker_vllm_kimi-k2-thinking`) | `TINKER_RAY_NAMESPACE` |
+| vLLM (multi-node) | `multinode_vllm_{model_part}` | `TINKER_RAY_NAMESPACE` |
+| Dense trainer pool | `dense_trainer_pool_{model_part}_maxr{rank}` | `TINKER_RAY_NAMESPACE` |
+| Stores | `tinker_future_store`, `tinker_training_session_store`, `tinker_gateway_session_store` | `MINT_RAY_NAMESPACE` (defaults to `TINKER_RAY_NAMESPACE` if set) |
 
-Model name is derived from HuggingFace model ID: lowercase, replace `-` and `.` with `_`, take last component.
+Model name normalization differs by subsystem:
+- Megatron: last component, lowercase, replace `-` and `.` with `_`.
+- vLLM: last component, lowercase, replace spaces with `_` (hyphens/dots preserved).
 
 ### Nuclear Option
 
@@ -378,7 +391,7 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 | Package | Version | Path |
 |---------|---------|------|
 | PyTorch | 2.9.0 | `/vePFS-Mindverse/share/code/torch-2.9.0/` |
-| vLLM | 0.12.0 | `/vePFS-Mindverse/share/code/vllm-0.12.0/` |
+| vLLM | 0.13.0 | `/vePFS-Mindverse/share/code/vllm-0.13.0-pkg/` |
 
 **PYTHONPATH order matters:** torch must come before vllm.
 

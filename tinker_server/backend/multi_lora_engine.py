@@ -18,6 +18,7 @@ import ray
 
 from . import ray_kill
 from .lora_registry import LoRARegistry, LoRASlotInfo
+from .ray_keepalive import ray_get_with_resource_pool_keepalive
 
 if TYPE_CHECKING:
     pass
@@ -672,7 +673,7 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Generate with session-specific LoRA
-            result = await self.server.generate_with_lora.remote(
+            ref = self.server.generate_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 lora_int_id=lora_id,
@@ -685,7 +686,7 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Generate with base model (no LoRA)
-            result = await self.server.generate_base.remote(
+            ref = self.server.generate_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 max_tokens=max_tokens,
@@ -695,6 +696,8 @@ class MultiLoRAInferenceEngine:
                 top_p=top_p,
                 logprobs=logprobs,
             )
+
+        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
         timing_total_s = result.get("_timing_total_s")
         if timing_total_s is not None:
@@ -748,7 +751,7 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
 
         if lora_id is not None:
-            raw = await self.server.generate_with_lora.remote(
+            ref = self.server.generate_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 lora_int_id=lora_id,
@@ -761,7 +764,7 @@ class MultiLoRAInferenceEngine:
                 n=num_samples,
             )
         else:
-            raw = await self.server.generate_base.remote(
+            ref = self.server.generate_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 max_tokens=max_tokens,
@@ -772,6 +775,8 @@ class MultiLoRAInferenceEngine:
                 logprobs=logprobs,
                 n=num_samples,
             )
+
+        raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
@@ -842,11 +847,12 @@ class MultiLoRAInferenceEngine:
         if lora_id is not None:
             # Compute logprobs with session-specific LoRA
             try:
-                result = await self.server.compute_prompt_logprobs_with_lora.remote(
+                ref = self.server.compute_prompt_logprobs_with_lora.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                     lora_int_id=lora_id,
                 )
+                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
@@ -870,10 +876,11 @@ class MultiLoRAInferenceEngine:
         else:
             # Compute logprobs with base model (no LoRA)
             try:
-                result = await self.server.compute_prompt_logprobs_base.remote(
+                ref = self.server.compute_prompt_logprobs_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                 )
+                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
@@ -937,7 +944,7 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Compute top-K with session-specific LoRA
-            result = await self.server.compute_prompt_topk_with_lora.remote(
+            ref = self.server.compute_prompt_topk_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 lora_int_id=lora_id,
@@ -945,11 +952,13 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Compute top-K with base model (no LoRA)
-            result = await self.server.compute_prompt_topk_base.remote(
+            ref = self.server.compute_prompt_topk_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 k=k,
             )
+
+        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
         return list(result)
 
@@ -1303,6 +1312,20 @@ class MultiModelInferenceManager:
         return list(self._engines.keys())
 
 
+def _list_named_vllm_actor_names(*, namespace: str) -> list[str]:
+    """List vLLM actor names by Ray named actor registry (fallback when ResourcePool is stale)."""
+    names: list[str] = []
+    for a in ray.util.list_named_actors(all_namespaces=True):
+        if a.get("namespace") != namespace:
+            continue
+        name = a.get("name") or ""
+        if not name:
+            continue
+        if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
+            names.append(name)
+    return sorted(set(names))
+
+
 def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
     """Kill persistent vLLM actor(s).
 
@@ -1383,7 +1406,31 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 except Exception as e:
                     logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
         if not killed_any:
-            logger.info("No vLLM actors found in resource pool")
+            # ResourcePool can be stale if startup reconciliation failed or code changed in-flight.
+            # Fall back to Ray named actor registry.
+            for actor_name in _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE):
+                try:
+                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                    ray_kill.kill(
+                        actor,
+                        reason="vllm_kill_by_name_fallback",
+                        actor_name=actor_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                    )
+                    logger.info(f"Killed vLLM actor (fallback): {actor_name}")
+                    resource_pool.unregister(actor_name)
+                    try:
+                        pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
+                    killed_any = True
+                except ValueError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error killing vLLM actor {actor_name} (fallback): {e}")
+            if not killed_any:
+                logger.info("No vLLM actors found (resource pool and Ray named actors)")
         return killed_any
 
 
@@ -1450,6 +1497,13 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         return True
                 except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     continue
+        for actor_name in _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE):
+            try:
+                actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                if _is_actor_ready(actor):
+                    return True
+            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+                continue
         return False
 
 
@@ -1462,11 +1516,17 @@ def list_vllm_actors() -> list[dict]:
     from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 
     resource_pool = get_resource_pool()
-    return [
+    out = [
         {"name": e.actor_name, "gpus": e.num_gpus, "base_model": e.base_model}
         for e in resource_pool.iter_entries()
         if e.actor_type == ActorType.VLLM
     ]
+    seen = {a["name"] for a in out}
+    for name in _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE):
+        if name in seen:
+            continue
+        out.append({"name": name, "gpus": 0, "base_model": ""})
+    return out
 
 
 # Global instance (initialized in app lifespan)

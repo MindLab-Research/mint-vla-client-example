@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .backend.multi_lora_engine import MultiModelInferenceManager
-from .backend.session_manager import SessionManager
+from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
@@ -31,13 +31,11 @@ async def _cleanup_stale_actors() -> None:
 
     Detached actors survive server restarts and can block resources.
     This function:
-    1. Kills dead/unresponsive actors in the 'tinker' namespace
+    1. Kills dead/unresponsive actors in the configured Ray namespace
     2. Registers alive actors with ResourcePool for proper GPU tracking
     """
-    import os
-
     # Skip cleanup if disabled (useful for debugging)
-    if os.environ.get("MINT_SKIP_ACTOR_CLEANUP", "").lower() in ("1", "true"):
+    if config.skip_actor_cleanup:
         logger.info("Skipping actor cleanup (MINT_SKIP_ACTOR_CLEANUP=1)")
         return
 
@@ -69,15 +67,15 @@ async def _cleanup_stale_actors() -> None:
                     return model_name, cfg
             return "", None
 
-        # Get all named actors in the tinker namespace
+        # Get all named actors in the configured namespace
         actors = ray.util.list_named_actors(all_namespaces=True)
         tinker_actors = [a for a in actors if a.get("namespace") == PERSISTENT_NAMESPACE]
 
         if not tinker_actors:
-            logger.info("No actors found in tinker namespace")
+            logger.info(f"No actors found in namespace {PERSISTENT_NAMESPACE}")
             return
 
-        logger.info(f"Found {len(tinker_actors)} actors in tinker namespace, checking status...")
+        logger.info(f"Found {len(tinker_actors)} actors in namespace {PERSISTENT_NAMESPACE}, checking status...")
 
         resource_pool = get_resource_pool()
         cleaned = 0
@@ -243,7 +241,7 @@ async def _prewarm_persistent_models(
 
     and marks them as ResourcePool protected to prevent LRU eviction.
     """
-    models_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+    models_csv = (config.prewarm_persistent_models_csv or "").strip()
     if not models_csv:
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
         return
@@ -253,9 +251,9 @@ async def _prewarm_persistent_models(
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS parsed empty); skipping prewarm")
         return
 
-    lora_rank = int(os.environ.get("MINT_PERSISTENT_TRAIN_LORA_RANK", "16"))
-    learning_rate = float(os.environ.get("MINT_PERSISTENT_TRAIN_LR", "5e-5"))
-    megatron_ready_timeout_s = float(os.environ.get("MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S", "3600"))
+    lora_rank = int(config.prewarm_train_lora_rank)
+    learning_rate = float(config.prewarm_train_lr)
+    megatron_ready_timeout_s = float(config.prewarm_megatron_ready_timeout_s)
 
     from tinker_server.backend.model_registry import (
         get_model_config,
@@ -433,17 +431,21 @@ async def _prewarm_persistent_models(
     # Dense training pools (deferred)
     # -------------------------
     if deferred_dense_training:
-        from tinker_server.backend.verl_training import (
-            PERSISTENT_DENSE_ACTOR_PREFIX,
-            get_dense_trainer_pool,
-        )
+        from tinker_server.backend.dense_trainer import get_or_create_dense_trainer
+        from tinker_server.backend.verl_training import TrainingWorker
 
-        pool = get_dense_trainer_pool()
         for model_name, base_model in deferred_dense_training:
             try:
                 logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
-                entry = await asyncio.to_thread(pool.get_or_create, base_model, lora_rank, learning_rate, None)
-                actor_name = f"{PERSISTENT_DENSE_ACTOR_PREFIX}{base_model.split('/')[-1].replace('-', '_').lower()}_maxr{entry.max_lora_rank}"
+                dense = await asyncio.to_thread(
+                    get_or_create_dense_trainer,
+                    training_worker_cls=TrainingWorker,
+                    base_model=base_model,
+                    lora_rank=lora_rank,
+                    learning_rate=learning_rate,
+                    session_id=None,
+                )
+                actor_name = dense.actor_name
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
@@ -472,6 +474,9 @@ async def lifespan(app: FastAPI):
         data_parallel_size=config.data_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
+        inactivity_timeout=config.session_inactivity_timeout_s
+        if config.session_inactivity_timeout_s is not None
+        else DEFAULT_INACTIVITY_TIMEOUT,
     )
 
     # Make session manager available to routes
@@ -559,13 +564,11 @@ app = FastAPI(
     title="MinT",
     description="Mind Lab Toolkit - Training API for LLMs",
     version="0.1.0",
-    docs_url=None,  # Disable built-in Swagger UI, /docs redirects to /doc/
+    docs_url=None,  # Disable built-in Swagger UI
 )
 
 # Paths that don't require authentication
-UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/", "/doc", "/doc/", "/docs", "/docs/"}
-# Path prefixes that don't require authentication
-UNAUTHENTICATED_PREFIXES = ("/doc/", "/doc")
+UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
 
 # Token encryptor for sk- token validation (initialized lazily)
 _token_encryptor: TokenEncryptor | None = None
@@ -597,10 +600,6 @@ async def api_key_auth_middleware(request: Request, call_next):
 
     # Skip auth for specific paths
     if path in UNAUTHENTICATED_PATHS:
-        return await call_next(request)
-
-    # Skip auth for paths with unauthenticated prefixes (e.g., /doc)
-    if path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
 
     # Try X-API-Key header first, then Authorization header
@@ -649,43 +648,9 @@ app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
-# Redirects to documentation (must be defined BEFORE mount)
 @app.get("/")
 async def root():
-    """Redirect root to documentation."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=302)
-
-
-@app.get("/doc")
-async def doc_redirect():
-    """Redirect /doc to /doc/ for consistent behavior."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=301)
-
-
-@app.get("/docs")
-async def docs_redirect():
-    """Alias /docs to /doc."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=302)
-
-
-@app.get("/docs/")
-async def docs_slash_redirect():
-    """Alias /docs/ to /doc/."""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/doc/", status_code=302)
-
-
-# Mount documentation static files
-# Use MINT_DOC_PATH env var to override the default path
-_doc_path = os.environ.get("MINT_DOC_PATH", str(Path(__file__).parent.parent / "mint-doc" / "out"))
-if Path(_doc_path).exists():
-    app.mount("/doc", StaticFiles(directory=_doc_path, html=True), name="documentation")
-    logger.info(f"Documentation mounted at /doc from {_doc_path}")
-else:
-    logger.warning(f"Documentation directory not found at {_doc_path}, /doc will not be available")
+    return {"status": "ready", "healthz": "/api/v1/healthz"}
 
 
 if __name__ == "__main__":

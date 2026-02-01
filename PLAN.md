@@ -148,7 +148,6 @@ Architectural design documents for internal reference:
 
 | Path | Purpose |
 |------|---------|
-| `mint-doc/` | NextJS documentation site (API reference, guides) |
 | `../mint-quickstart` | Quickstart notebooks and examples |
 | `../mindlab-toolkit` | Client-side utilities |
 
