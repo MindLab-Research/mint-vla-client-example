@@ -512,6 +512,46 @@ def _enable_megatron_determinism(seed: int = 42):
     os.environ["NCCL_DETERMINISTIC"] = "1"
     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"  # Critical for FlashAttention
 
+    # TransformerEngine uses `importlib.metadata.version("flash-attn")` which returns a version
+    # string with a local suffix (e.g. "2.8.3+cu129torch2.9"). It compares that strictly against
+    # max_version="2.8.3" and disables FlashAttention, leaving `flash_attn_func=None` and later
+    # crashing with "TypeError: 'NoneType' object is not callable".
+    #
+    # Patch importlib.metadata.version early, before any TransformerEngine attention modules import it.
+    try:
+        import importlib.metadata as _imd
+
+        _orig_version = getattr(_imd, "version", None)
+        if callable(_orig_version) and not getattr(_orig_version, "_tinker_flash_attn_version_patch", False):
+            def _patched_version(dist_name: str) -> str:
+                v = _orig_version(dist_name)
+                if dist_name in ("flash-attn", "flash-attn-3") and isinstance(v, str) and "+" in v:
+                    return v.split("+", 1)[0]
+                return v
+
+            _patched_version._tinker_flash_attn_version_patch = True  # type: ignore[attr-defined]
+            _imd.version = _patched_version  # type: ignore[assignment]
+    except Exception as e:
+        logger.warning(f"Failed to patch importlib.metadata.version for flash-attn: {e}")
+
+    # TransformerEngine disables FlashAttention when the installed flash-attn distribution
+    # version contains a local suffix (e.g. "2.8.3+cu129torch2.9") and is compared strictly
+    # against max_version="2.8.3". That forces a fallback to O(seq^2) attention and OOMs at
+    # long context.
+    #
+    # Force-enable FlashAttention by normalizing TE's cached version object before Megatron
+    # imports initialize TE attention modules.
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils, PkgVersion
+        te_ver = str(getattr(FlashAttentionUtils, "version", ""))
+        if "+" in te_ver:
+            base = te_ver.split("+", 1)[0]
+            FlashAttentionUtils.version = PkgVersion(base)
+            print(f"[VERL_PATCH] Normalized TransformerEngine FlashAttentionUtils.version {te_ver} -> {base}")
+        FlashAttentionUtils.set_flash_attention_version()
+    except Exception as e:
+        logger.warning(f"Failed to force-enable TransformerEngine FlashAttention: {e}")
+
     # Set random seeds
     random.seed(seed)
     np.random.seed(seed)

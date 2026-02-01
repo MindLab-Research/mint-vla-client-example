@@ -15,6 +15,8 @@ import requests
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 
+DEFAULT_POLL_TIMEOUT_S = int(os.environ.get("MINT_MERGE_GATE_POLL_TIMEOUT_S", "900"))
+
 DENSE_MODEL = "Qwen/Qwen3-0.6B"  # Primary dense test model (Phase 1)
 DENSE_SMALL_MODEL = DENSE_MODEL  # Alias used by some tests for clarity
 DENSE_MEDIUM_MODEL = "Qwen/Qwen3-4B"  # Medium dense model (Phase 3 stress tests)
@@ -51,7 +53,7 @@ def poll_future(request_id: str, timeout: int = 300, request_timeout: int = 120)
             continue
         else:
             resp.raise_for_status()
-    raise TimeoutError(f"Operation did not complete within {timeout}s")
+    raise TimeoutError(f"Operation request_id={request_id} did not complete within {timeout}s")
 
 
 def create_session(base_model: str, lora_rank: int = 32, lr: float = 1e-4) -> tuple[str, str]:
@@ -67,7 +69,7 @@ def create_session(base_model: str, lora_rank: int = 32, lr: float = 1e-4) -> tu
     }
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=300)
     resp.raise_for_status()
-    result = poll_future(resp.json().get("request_id"), timeout=300)
+    result = poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
     if "error" in result:
         raise RuntimeError(f"Session creation failed: {result['error']}")
     return session_id, result.get("model_id")
@@ -86,7 +88,7 @@ def forward_backward(model_id: str, data: list, loss_fn: str = "cross_entropy",
 
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=300)
+    return poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
 
 
 def optim_step(model_id: str, lr: float = 1e-4) -> dict:
@@ -111,7 +113,7 @@ def train_step(model_id: str, data: list, lr: float = 1e-4, loss_fn: str = "cros
     }
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=300)
+    return poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
 
 
 def save_weights(model_id: str, name: str = "test") -> dict:
@@ -125,7 +127,11 @@ def save_weights(model_id: str, name: str = "test") -> dict:
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
     # MoE models need longer timeout for vLLM engine + CUDA graph capture
-    return poll_future(resp.json().get("request_id"), timeout=300, request_timeout=180)
+    return poll_future(
+        resp.json().get("request_id"),
+        timeout=DEFAULT_POLL_TIMEOUT_S,
+        request_timeout=180,
+    )
 
 
 def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,

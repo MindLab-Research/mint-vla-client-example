@@ -98,14 +98,19 @@ class TestMoEAPI:
         # prompt_logprobs is at root level of response
         prompt_logprobs = result.get("prompt_logprobs", [])
 
-        # Should have logprobs for each prompt token (except first)
-        expected_len = len(prompt_tokens) - 1
-        assert len(prompt_logprobs) >= expected_len - 1, (
-            f"Expected ~{expected_len} prompt logprobs, got {len(prompt_logprobs)}"
+        # Per Tinker docs, the first prompt logprob is None (first token has no prefix).
+        # Subsequent entries are float32 logprobs (<= 0).
+        assert len(prompt_logprobs) in {len(prompt_tokens), len(prompt_tokens) - 1}, (
+            f"Expected {len(prompt_tokens)} or {len(prompt_tokens) - 1} prompt logprobs, got {len(prompt_logprobs)}"
         )
+        if len(prompt_logprobs) == len(prompt_tokens):
+            assert prompt_logprobs[0] is None, f"Expected prompt_logprobs[0] is None, got: {prompt_logprobs[0]!r}"
+            start = 1
+        else:
+            start = 0
 
-        # Logprobs should be negative
-        for i, lp in enumerate(prompt_logprobs):
+        for i, lp in enumerate(prompt_logprobs[start:], start=start):
+            assert lp is not None, f"Logprob at position {i} is None"
             assert lp <= 0, f"Logprob at position {i} is positive: {lp}"
 
         print(f"Prompt tokens: {len(prompt_tokens)}")

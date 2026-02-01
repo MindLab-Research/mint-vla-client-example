@@ -907,6 +907,12 @@ class MegatronRankWorker:
             optimizer_offload=True,
             grad_offload=use_grad_offload,
             dtype="bfloat16",  # Base dtype, FP8 handled via override_transformer_config
+            # THD ("remove padding") path in TransformerEngine disables FlashAttention when there is
+            # any padding between sequences; verl's THD preprocessing pads sequences for alignment,
+            # causing long-context training to fall back to O(seq^2) softmax and OOM at ~38K tokens.
+            #
+            # Disable remove-padding for non-MLA models so FlashAttention can be selected in BSHD.
+            use_remove_padding=has_mla_attention,
             use_mbridge=True,
             vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
             use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
@@ -3516,6 +3522,11 @@ class MegatronWorkerGroup:
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
+                # Fix flash-attn / TransformerEngine dynamic loading:
+                # flash_attn_2_cuda fails to import when libc10.so is not on the loader path,
+                # which leaves TE's flash_attn_func / flash_attn_varlen_func as None and crashes
+                # with "TypeError: 'NoneType' object is not callable".
+                "LD_LIBRARY_PATH": "/opt/venv/lib/python3.10/site-packages/torch/lib:/usr/local/cuda/lib64",
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",

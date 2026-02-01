@@ -18,7 +18,13 @@ GPU Requirements:
 
 import time
 import numpy as np
+import os
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("MINT_RUN_MOONLIGHT") != "1",
+    reason="Moonlight tests require a dedicated >=12-GPU run; set MINT_RUN_MOONLIGHT=1 to enable.",
+)
 
 from .conftest import (
     MOONLIGHT_MODEL,
