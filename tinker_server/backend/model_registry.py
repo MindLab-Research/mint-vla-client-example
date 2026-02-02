@@ -238,13 +238,13 @@ MODEL_CONFIGS = {
     ),
     # Moonlight-16B-A3B - smaller DeepSeek V3 MLA model (64 experts, 27 layers)
     # Merge gate settings:
-    # - Megatron: TP=2, EP=4 (8 GPUs)
+    # - Megatron: TP=1, EP=4 (4 GPUs)
     # - vLLM: TP=4 (4 GPUs)
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
         is_moe=True,
         inference_tp=4,
         inference_dp=1,
-        train_tp=2,
+        train_tp=1,
         train_ep=4,
         train_cp=1,
         quantization=None,  # BF16, no quantization needed

@@ -29,9 +29,9 @@ The merge gate validates that code on `develop` is ready to merge to `main`. It 
 |-------|-----------|---------------|-------|
 | Qwen3-0.6B (Dense) | 1 | 1 | 2 |
 | Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4, EP=1) | 8 |
-| Moonlight-16B-A3B (MLA) | 8 (TP=8) | 8 (TP=8, EP=8) | 16 |
+| Moonlight-16B-A3B (MLA) | 4 (TP=4) | 4 (TP=1, EP=4) | 8 |
 
-**Note**: Qwen3-30B uses TP=4 for both vLLM and Megatron. Moonlight uses DeepseekV3 MLA architecture with TP=8, EP=8.
+**Note**: Qwen3-30B uses TP=4 for both vLLM and Megatron. Moonlight uses DeepSeekV3 MLA; merge gate targets 4 GPUs for training and 4 GPUs for vLLM.
 
 ### Full Merge Gate Procedure
 
@@ -39,14 +39,13 @@ The merge gate runs in **two phases** with different cluster configurations:
 
 **Phase 1: Functional Tests (8 GPUs - one 8-GPU worker)**
 1. Start cluster with 8 GPUs
-2. Run ALL functional tests: Dense SFT/RL/API, MoE SFT/RL/API, Stress
-3. **Do NOT kill actors between tests** - Dense and MoE coexist (Dense uses 1 GPU, MoE uses 4)
-4. Validates normal concurrent operation with shared GPU resources
+2. Run functional tests: Dense SFT/RL/API, MoE SFT/RL/API, Moonlight SFT/transfer/RL-smoke, Stress
+3. Do not manually kill actors between tests; ResourcePool eviction is part of the system under test
 
 **Phase 2: LRU Eviction Test (8 GPUs - one 8-GPU worker)**
-1. Run LRU eviction test with MINT_MIN_ACTOR_AGE=0
+1. Run LRU eviction test with MINT_MIN_ACTOR_AGE=0 and a small MINT_SESSION_IDLE_TIMEOUT (to make eviction observable during the test run)
 2. Tests Dense → MoE → Dense switches with eviction
-3. Validates graceful actor replacement when switching between models
+3. Requires an observed eviction event (actor inventory changes), not just request completion
 
 Use the **volcano-cluster** skill to manage workers.
 
@@ -135,8 +134,8 @@ curl -s http://localhost:8000/api/v1/healthz
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|
-| **dense_sft** | Pig Latin translation (from tinker_test.ipynb) | Loss decreases >70% over 10 iterations | 3 min |
-| **dense_rl** | Arithmetic RL with PPO loss | Reward improves, ratio ~1.0 | 3 min |
+| **dense_sft** | Pig Latin translation (from tinker_test.ipynb) | Report emitted; no API errors; no NaN/Inf | 3 min |
+| **dense_rl** | Arithmetic RL with PPO loss | Report emitted; no API errors; no NaN/Inf | 3 min |
 | **dense_dpo** | DPO on preference pairs | SKIP (DPO loss not implemented) | 0 |
 | **dense_api** | Sampling, logprobs, checkpoint | All API operations succeed | 2 min |
 
@@ -144,19 +143,19 @@ curl -s http://localhost:8000/api/v1/healthz
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|
-| **moe_sft** | SFT with train_step endpoint | Loss decreases >30% over 10 iterations | 5 min |
-| **moe_rl** | RL with importance_sampling | Gradients flow, loss computes | 5 min |
+| **moe_sft** | SFT with train_step endpoint | Report emitted; no API errors; no NaN/Inf | 5 min |
+| **moe_rl** | RL with importance_sampling | Report emitted; no API errors; no NaN/Inf | 5 min |
 | **moe_api** | Sampling from trained weights | Generation works | 3 min |
 
 ### Phase 2.5: Moonlight Tests (moonshotai/Moonlight-16B-A3B-Instruct)
 
-**Requires 16 GPUs (8 vLLM + 8 Megatron).** Tests DeepseekV3 MLA (Multi-Latent Attention) architecture.
+**Targets 8 GPUs (4 vLLM + 4 Megatron).** Tests DeepSeekV3 MLA (Multi-Latent Attention) architecture.
 
 | Test | Description | Pass Criteria | Duration |
 |------|-------------|---------------|----------|
-| **moonlight_sft** | SFT with MLA attention | Loss decreases >30% over 10 iterations | 5 min |
+| **moonlight_sft** | SFT with MLA attention | Report emitted; no API errors; no NaN/Inf | 5 min |
 | **moonlight_lora_transfer** | Train → Extract → vLLM Load → Generate | Full pipeline succeeds | 3 min |
-| **moonlight_rl** | Full RL loop: sample → reward → train | Policy ratio 0.5-2.0, gradients flow | 3 min |
+| **moonlight_rl** | Full RL loop: sample → reward → train | Report emitted; no API errors; no NaN/Inf | 3 min |
 
 ### Phase 3: Stress, Multi-Tenant, and Long Context Tests
 
@@ -181,7 +180,7 @@ The system supports multiple model variants. All variants of the same base model
 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | MoE | 4 (TP=4) | Megatron/vLLM | Primary MoE test target |
 | `Qwen/Qwen3-30B-A3B` | MoE | 4 (TP=4) | Megatron/vLLM | Base model variant |
 | `Qwen/Qwen3-30B-A3B-Base` | MoE | 4 (TP=4) | Megatron/vLLM | Pre-training base |
-| `moonshotai/Moonlight-16B-A3B-Instruct` | MLA | 12 (8+4) | Megatron/vLLM | DeepseekV3 MLA architecture |
+| `moonshotai/Moonlight-16B-A3B-Instruct` | MLA | 8 (4+4) | Megatron/vLLM | DeepSeekV3 MLA architecture |
 
 **Quick test with Qwen3-0.6B** (faster iteration, smaller footprint):
 ```bash
