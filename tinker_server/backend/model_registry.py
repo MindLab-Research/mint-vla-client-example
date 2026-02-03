@@ -4,7 +4,7 @@ import logging
 import os
 import types
 from dataclasses import dataclass, replace
-from typing import Any, get_args, get_origin
+from typing import Any, Literal, get_args, get_origin
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,14 @@ class ModelConfig:
     kv_cache_dtype: str | None = None  # None = use model's default, "fp8_e5m2" halves KV cache memory
     gradient_checkpointing: bool = False  # Enable for large dense models to reduce VRAM usage
     is_mla: bool = False  # Uses Multi-Latent Attention (DeepSeek V3 architecture)
+    # vLLM engine selection:
+    # - "verl_http": verl's single-node HTTP-style vLLM server (default; used for 1-GPU small models)
+    # - "async": direct vLLM AsyncLLMEngine wrapper (supports multi-GPU TP and per-token logprobs)
+    vllm_engine: Literal["verl_http", "async"] = "verl_http"
+    # Only used when vllm_engine="async":
+    # - "mp": single-node multiprocessing TP (avoid Ray compiled DAG)
+    # - "ray": Ray distributed executor (uses Ray compiled DAG; keep for K2)
+    vllm_distributed_executor_backend: Literal["mp", "ray"] = "mp"
 
     @property
     def total_gpus(self) -> int:
@@ -144,6 +152,8 @@ MODEL_CONFIGS = {
         max_loras=8,
         max_cpu_loras=16,
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
@@ -179,6 +189,8 @@ MODEL_CONFIGS = {
         max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
         max_num_batched_tokens=512,  # prompt_logprobs memory spike at 32K
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
         is_moe=True,
@@ -190,6 +202,8 @@ MODEL_CONFIGS = {
         max_lora_rank=16,
         max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
@@ -214,6 +228,8 @@ MODEL_CONFIGS = {
         max_lora_rank=16,  # Rank 16: matches training lora_rank
         max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
+        vllm_engine="async",
+        vllm_distributed_executor_backend="ray",
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -235,6 +251,8 @@ MODEL_CONFIGS = {
         max_lora_rank=16,  # Rank 16: matches training lora_rank
         max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
+        vllm_engine="async",
+        vllm_distributed_executor_backend="ray",
     ),
     # Moonlight-16B-A3B - smaller DeepSeek V3 MLA model (64 experts, 27 layers)
     # Merge gate settings:

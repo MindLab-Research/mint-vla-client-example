@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import time
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -44,6 +45,56 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str, Any]:
+    """Optional single-node pinning for vLLM actors (mp backend).
+
+    Use-case: pack MoE inference+training on the same 8-GPU node during prewarm.
+    Controlled by env var:
+      - MINT_VLLM_PINNED_NODE_IP_JSON='{"<model_name>":"<node_ip>"}'
+    """
+    if not model_name:
+        return {}
+    mapping_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
+    if not mapping_json:
+        return {}
+
+    try:
+        mapping = json.loads(mapping_json)
+    except Exception:
+        return {}
+    if not isinstance(mapping, dict):
+        return {}
+    pinned_ip = mapping.get(model_name)
+    if not isinstance(pinned_ip, str) or not pinned_ip.strip():
+        return {}
+    pinned_ip = pinned_ip.strip()
+
+    node_res = f"node:{pinned_ip}"
+    try:
+        if node_res not in (ray.cluster_resources() or {}):
+            return {}
+    except Exception:
+        return {}
+
+    logger.info(f"multinode_vllm_pin model={model_name} resources={node_res!r}")
+    return {"resources": {node_res: 0.001}}
+
+
+def _raise_serializable_vllm_error(*, where: str, request_id: str, extra: dict[str, Any]) -> None:
+    # Do not chain the original exception object (it may not be picklable across Ray).
+    tb = traceback.format_exc()
+    extra_str = " ".join(f"{k}={v!r}" for k, v in sorted(extra.items()))
+    raise RuntimeError(f"{where} request_id={request_id} {extra_str}\n{tb}") from None
+
+
+def _raise_serializable_vllm_engine_error(
+    *, where: str, request_id: str, extra: dict[str, Any]
+) -> None:
+    # Same as _raise_serializable_vllm_error, but semantically used inside the vLLM Ray actor
+    # to avoid propagating non-picklable vLLM exception objects back to the CPU driver.
+    _raise_serializable_vllm_error(where=where, request_id=request_id, extra=extra)
 
 
 @dataclass
@@ -274,6 +325,9 @@ def _create_multinode_vllm_actor(
             self._active_seq_slots = 0
             self._seq_slots_cond = asyncio.Condition()
 
+        def get_node_ip(self) -> str:
+            return ray.util.get_node_ip_address()
+
         @asynccontextmanager
         async def _reserve_seq_slots(self, n_req: int):
             if (not self._admission_control) or (self.max_num_seqs is None):
@@ -361,10 +415,9 @@ def _create_multinode_vllm_actor(
             if self._initialized:
                 return
 
-            # Force vLLM v0 engine BEFORE importing vLLM
-            # v1's multiprocess architecture requires coordinator to have GPU
             import os
-            os.environ["VLLM_USE_V1"] = "0"
+            distributed_executor_backend = os.environ.get("MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "ray").strip().lower()
+            os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
             # disable to fall back to torch.distributed collectives.
             os.environ["VLLM_DISABLE_PYNCCL"] = "1"
@@ -380,6 +433,11 @@ def _create_multinode_vllm_actor(
             max_num_batched_tokens = int(os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_num_batched_tokens)))
             enable_chunked_prefill = _env_flag("MINT_VLLM_ENABLE_CHUNKED_PREFILL", default=True)
             enable_prefix_caching = _env_flag("MINT_VLLM_ENABLE_PREFIX_CACHING", default=True)
+            if distributed_executor_backend not in ("ray", "mp"):
+                raise ValueError(
+                    f"Invalid MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND={distributed_executor_backend!r} "
+                    f"(expected 'ray' or 'mp')"
+                )
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -387,7 +445,7 @@ def _create_multinode_vllm_actor(
                 data_parallel_size=self.data_parallel_size,
                 data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
                 enable_expert_parallel=self.enable_expert_parallel,
-                distributed_executor_backend="ray",  # Key: use Ray for multi-node
+                distributed_executor_backend=distributed_executor_backend,
                 disable_custom_all_reduce=True,  # Avoid PyNcclCommunicator issues in multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 dtype="auto",
@@ -412,7 +470,7 @@ def _create_multinode_vllm_actor(
                 f"Creating AsyncLLMEngine: "
                 f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
-                f"backend=ray, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
+                f"backend={distributed_executor_backend}, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
                 f"chunked_prefill={enable_chunked_prefill}, max_num_batched_tokens={max_num_batched_tokens}, "
                 f"prefix_caching={enable_prefix_caching}"
             )
@@ -663,62 +721,104 @@ def _create_multinode_vllm_actor(
                                 # Serialize only the enqueue (add_request) call, then allow
                                 # concurrent in-flight requests to progress.
                                 if self._add_request_lock is None:
-                                    collector = await self.engine.add_request(
-                                        request_id=request_id,
-                                        prompt=prompt,
-                                        params=sampling_params,
-                                        lora_request=lora_request,
-                                    )
-                                else:
-                                    async with self._add_request_lock:
+                                    try:
                                         collector = await self.engine.add_request(
                                             request_id=request_id,
                                             prompt=prompt,
                                             params=sampling_params,
                                             lora_request=lora_request,
                                         )
+                                    except Exception:
+                                        _raise_serializable_vllm_error(
+                                            request_id=request_id,
+                                            where="vllm_add_request_failed",
+                                            extra={
+                                                "prompt_len": len(prompt_ids),
+                                                "max_tokens": effective_max_tokens,
+                                                "n": n_req,
+                                                "model_path": self.model_path,
+                                                "tp": self.tensor_parallel_size,
+                                                "pp": self.pipeline_parallel_size,
+                                            },
+                                        )
+                                else:
+                                    async with self._add_request_lock:
+                                        try:
+                                            collector = await self.engine.add_request(
+                                                request_id=request_id,
+                                                prompt=prompt,
+                                                params=sampling_params,
+                                                lora_request=lora_request,
+                                            )
+                                        except Exception:
+                                            _raise_serializable_vllm_error(
+                                                request_id=request_id,
+                                                where="vllm_add_request_failed",
+                                                extra={
+                                                    "prompt_len": len(prompt_ids),
+                                                    "max_tokens": effective_max_tokens,
+                                                    "n": n_req,
+                                                    "model_path": self.model_path,
+                                                    "tp": self.tensor_parallel_size,
+                                                    "pp": self.pipeline_parallel_size,
+                                                },
+                                            )
 
                                 final_res = None
                                 by_index: dict[int, Any] | None = {} if n_req > 1 else None
                                 deadline = None
                                 if self._generate_timeout_s > 0:
                                     deadline = time.perf_counter() + self._generate_timeout_s
-                                while True:
-                                    try:
-                                        if deadline is None:
-                                            remaining = None
-                                        else:
-                                            remaining = deadline - time.perf_counter()
-                                            if remaining <= 0:
-                                                raise asyncio.TimeoutError()
-
-                                        if remaining is None:
-                                            out = collector.get_nowait() or await collector.get()
-                                        else:
-                                            out = collector.get_nowait() or await asyncio.wait_for(
-                                                collector.get(),
-                                                timeout=remaining,
-                                            )
-                                    except asyncio.TimeoutError as e:
+                                try:
+                                    while True:
                                         try:
-                                            await self.engine.abort(request_id)
-                                        except Exception:
-                                            pass
-                                        raise RuntimeError(
-                                            f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
-                                        ) from e
-                                    if first_tok_s is None:
-                                        first_tok_s = time.perf_counter() - t0
-                                    if by_index is not None:
-                                        for oo in out.outputs:
+                                            if deadline is None:
+                                                remaining = None
+                                            else:
+                                                remaining = deadline - time.perf_counter()
+                                                if remaining <= 0:
+                                                    raise asyncio.TimeoutError()
+
+                                            if remaining is None:
+                                                out = collector.get_nowait() or await collector.get()
+                                            else:
+                                                out = collector.get_nowait() or await asyncio.wait_for(
+                                                    collector.get(),
+                                                    timeout=remaining,
+                                                )
+                                        except asyncio.TimeoutError as e:
                                             try:
-                                                idx = int(getattr(oo, "index"))
+                                                await self.engine.abort(request_id)
                                             except Exception:
-                                                idx = -1
-                                            by_index[idx] = oo
-                                    final_res = out
-                                    if out.finished:
-                                        break
+                                                pass
+                                            raise RuntimeError(
+                                                f"vllm_generate_timeout_s={self._generate_timeout_s} request_id={request_id}"
+                                            ) from e
+                                        if first_tok_s is None:
+                                            first_tok_s = time.perf_counter() - t0
+                                        if by_index is not None:
+                                            for oo in out.outputs:
+                                                try:
+                                                    idx = int(getattr(oo, "index"))
+                                                except Exception:
+                                                    idx = -1
+                                                by_index[idx] = oo
+                                        final_res = out
+                                        if out.finished:
+                                            break
+                                except Exception:
+                                    _raise_serializable_vllm_engine_error(
+                                        request_id=request_id,
+                                        where="vllm_generate_collect_failed",
+                                        extra={
+                                            "prompt_len": len(prompt_ids),
+                                            "max_tokens": effective_max_tokens,
+                                            "n": n_req,
+                                            "model_path": self.model_path,
+                                            "tp": self.tensor_parallel_size,
+                                            "pp": self.pipeline_parallel_size,
+                                        },
+                                    )
                         assert final_res is not None
                     finally:
                         await self._register_generate_end()
@@ -850,18 +950,42 @@ def _create_multinode_vllm_actor(
             async with self._maybe_prompt_logprobs_lock():
                 async with self._lock_read():
                     t1 = time.perf_counter()
-                    collector = await self.engine.add_request(
-                        request_id=request_id,
-                        prompt=prompt,
-                        params=sampling_params,
-                        lora_request=lora_request,
-                    )
+                    try:
+                        collector = await self.engine.add_request(
+                            request_id=request_id,
+                            prompt=prompt,
+                            params=sampling_params,
+                            lora_request=lora_request,
+                        )
+                    except Exception:
+                        _raise_serializable_vllm_error(
+                            request_id=request_id,
+                            where="vllm_prompt_logprobs_add_request_failed",
+                            extra={
+                                "prompt_len": len(prompt_ids),
+                                "model_path": self.model_path,
+                                "tp": self.tensor_parallel_size,
+                                "pp": self.pipeline_parallel_size,
+                            },
+                        )
                     final_res = None
-                    while True:
-                        out = await collector.get()
-                        final_res = out
-                        if out.finished:
-                            break
+                    try:
+                        while True:
+                            out = await collector.get()
+                            final_res = out
+                            if out.finished:
+                                break
+                    except Exception:
+                        _raise_serializable_vllm_engine_error(
+                            request_id=request_id,
+                            where="vllm_prompt_logprobs_collect_failed",
+                            extra={
+                                "prompt_len": len(prompt_ids),
+                                "model_path": self.model_path,
+                                "tp": self.tensor_parallel_size,
+                                "pp": self.pipeline_parallel_size,
+                            },
+                        )
                     assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
@@ -931,6 +1055,7 @@ class MultiNodeInferenceEngine:
         kv_cache_dtype: str | None = None,
         actor_name: str | None = None,
         shared_adapter_dir: str = "/vePFS-Mindverse/share/tinker_adapters",
+        distributed_executor_backend: str = "ray",
     ):
         self.model_path = model_path
         self.model_name = model_name
@@ -949,6 +1074,11 @@ class MultiNodeInferenceEngine:
         self.kv_cache_dtype = kv_cache_dtype
         self.actor_name = actor_name or f"multinode_vllm_{model_path.split('/')[-1].lower()}"
         self.shared_adapter_dir = shared_adapter_dir
+        self.distributed_executor_backend = distributed_executor_backend.strip().lower()
+        if self.distributed_executor_backend not in ("ray", "mp"):
+            raise ValueError(
+                f"distributed_executor_backend must be one of: 'ray', 'mp' (got {distributed_executor_backend!r})"
+            )
 
         self.registry = MultiNodeLoRARegistry()
         self.engine = None
@@ -976,15 +1106,26 @@ class MultiNodeInferenceEngine:
                 * self.pipeline_parallel_size
                 * self.data_parallel_size
             )
-            resources = compute_multinode_engine_resources(worker_gpus)
-            controller_gpus = resources.controller_gpus
-            controller_cpus = resources.controller_cpus
-            total_required_gpus = resources.total_required_gpus
+            distributed_executor_backend = self.distributed_executor_backend
+            if distributed_executor_backend == "mp":
+                # vLLM runs locally (single-node) inside this Ray actor and needs direct GPU access.
+                # Reserve all GPUs on a single node for this actor. vLLM will spawn local processes
+                # for TP and communicate via NCCL (no Ray compiled DAG).
+                controller_gpus = int(worker_gpus)
+                controller_cpus = 1
+                total_required_gpus = int(worker_gpus)
+                resources = None
+            else:
+                resources = compute_multinode_engine_resources(worker_gpus)
+                controller_gpus = resources.controller_gpus
+                controller_cpus = resources.controller_cpus
+                total_required_gpus = resources.total_required_gpus
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
-                or "1800"
+                or "300"
             )
+            logger.info(f"multinode_vllm_init actor={self.actor_name} RAY_CGRAPH_get_timeout={ray_cgraph_get_timeout}")
 
             is_persistent = False
             persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
@@ -1100,30 +1241,32 @@ class MultiNodeInferenceEngine:
             # like "Free memory on device ... is less than desired GPU memory utilization".
             from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-            pg_name = f"{self.actor_name}_pg"
-            try:
-                pg = ray.util.get_placement_group(pg_name)
-            except Exception:
-                pg_bundles = resources.pg_bundles
-                pg = ray.util.placement_group(
-                    pg_bundles,
-                    # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
-                    # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
-                    # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
-                    strategy="PACK",
-                    name=pg_name,
-                    lifetime="detached",
-                )
-            try:
-                await asyncio.to_thread(ray.get, pg.ready())
-            except SystemExit as e:
-                if getattr(e, "code", None) == 15:
-                    raise
+            pg = None
+            if distributed_executor_backend == "ray":
+                pg_name = f"{self.actor_name}_pg"
                 try:
-                    ray.util.remove_placement_group(pg)
+                    pg = ray.util.get_placement_group(pg_name)
                 except Exception:
-                    pass
-                raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
+                    pg_bundles = resources.pg_bundles
+                    pg = ray.util.placement_group(
+                        pg_bundles,
+                        # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
+                        # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
+                        # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
+                        strategy="PACK",
+                        name=pg_name,
+                        lifetime="detached",
+                    )
+                try:
+                    await asyncio.to_thread(ray.get, pg.ready())
+                except SystemExit as e:
+                    if getattr(e, "code", None) == 15:
+                        raise
+                    try:
+                        ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
 
             # Create new engine actor
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
@@ -1134,16 +1277,20 @@ class MultiNodeInferenceEngine:
                 max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
-            scheduling_opts = {
-                "scheduling_strategy": PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
-                    # Place the controller into a CPU-only bundle to avoid reserving an extra GPU
-                    # while keeping child task capture for vLLM's Ray worker actors.
-                    placement_group_bundle_index=resources.controller_bundle_index,
-                    placement_group_capture_child_tasks=True,
-                )
-            }
+            if distributed_executor_backend == "ray":
+                scheduling_opts = {
+                    "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
+                        # Place the controller into a CPU-only bundle to avoid reserving an extra GPU
+                        # while keeping child task capture for vLLM's Ray worker actors.
+                        placement_group_bundle_index=resources.controller_bundle_index,
+                        placement_group_capture_child_tasks=True,
+                    )
+                }
+            else:
+                # mp backend: no Ray child actors; schedule this actor directly onto 1 node with all GPUs.
+                scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
@@ -1152,13 +1299,27 @@ class MultiNodeInferenceEngine:
                 # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
                 # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
-                # Force vLLM v0 engine - v1's multiprocess architecture
-                # conflicts with Ray distributed executor backend
-                "VLLM_USE_V1": "0",
+                "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
+                # mp backend requires local multiprocessing; force v1 there.
+                "VLLM_USE_V1": "1" if distributed_executor_backend == "mp" else "0",
                 "VLLM_DISABLE_PYNCCL": "1",
             }
             for k in (
+                # Ray compiled DAG knobs (driver-side env; propagated via runtime_env).
+                "RAY_CGRAPH_submit_timeout",
+                "RAY_CGRAPH_teardown_timeout",
+                "RAY_CGRAPH_read_iteration_timeout_s",
+                "RAY_CGRAPH_buffer_size_bytes",
+                "RAY_CGRAPH_max_inflight_executions",
+                "RAY_CGRAPH_max_buffered_results",
+                "RAY_CGRAPH_overlap_gpu_communication",
+                "RAY_CGRAPH_ENABLE_DETECT_DEADLOCK",
+                "RAY_CGRAPH_ENABLE_PROFILING",
+                "RAY_CGRAPH_ENABLE_NVTX_PROFILING",
+                "RAY_CGRAPH_ENABLE_TORCH_PROFILING",
+                "RAY_CGRAPH_VISUALIZE_SCHEDULE",
                 "MINT_VLLM_LOG_STATS",
+                "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
@@ -1172,6 +1333,10 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENABLE_PREFIX_CACHING",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
+                "VLLM_USE_RAY_WRAPPED_PP_COMM",
+                "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM",
+                "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
+                "MINT_FAULTHANDLER_SIGUSR1",
             ):
                 v = os.environ.get(k)
                 if v is not None:
@@ -1238,7 +1403,8 @@ class MultiNodeInferenceEngine:
                 except Exception:
                     pass
                 try:
-                    ray.util.remove_placement_group(pg)
+                    if pg is not None:
+                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None
@@ -1254,7 +1420,8 @@ class MultiNodeInferenceEngine:
                     timeout_s=init_timeout,
                 )
                 try:
-                    ray.util.remove_placement_group(pg)
+                    if pg is not None:
+                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None
@@ -1272,7 +1439,8 @@ class MultiNodeInferenceEngine:
                 except Exception:
                     pass
                 try:
-                    ray.util.remove_placement_group(pg)
+                    if pg is not None:
+                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None
@@ -1433,7 +1601,15 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                "multinode_vllm_ray_get_failed generate actor=%s request_id=%s sampling_session_id=%s prompt_len=%s max_tokens=%s",
+                self.actor_name,
+                request_id,
+                sampling_session_id,
+                len(prompt_ids),
+                max_tokens,
+            )
             try:
                 ray_kill.kill(
                     self.engine,
@@ -1445,7 +1621,7 @@ class MultiNodeInferenceEngine:
                 )
             except Exception:
                 pass
-            raise e
+            raise
 
         return GenerateResult(
             token_ids=result["token_ids"],
@@ -1508,7 +1684,16 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                "multinode_vllm_ray_get_failed generate_many actor=%s request_id=%s sampling_session_id=%s prompt_len=%s num_samples=%s max_tokens=%s",
+                self.actor_name,
+                request_id,
+                sampling_session_id,
+                len(prompt_ids),
+                num_samples,
+                max_tokens,
+            )
             try:
                 ray_kill.kill(
                     self.engine,
@@ -1520,7 +1705,7 @@ class MultiNodeInferenceEngine:
                 )
             except Exception:
                 pass
-            raise e
+            raise
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
@@ -1569,7 +1754,14 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                "multinode_vllm_ray_get_failed compute_logprobs actor=%s request_id=%s sampling_session_id=%s prompt_len=%s",
+                self.actor_name,
+                request_id,
+                sampling_session_id,
+                len(prompt_ids),
+            )
             try:
                 ray_kill.kill(
                     self.engine,
@@ -1581,7 +1773,7 @@ class MultiNodeInferenceEngine:
                 )
             except Exception:
                 pass
-            raise e
+            raise
 
         return list(result)
 

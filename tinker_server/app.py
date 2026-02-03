@@ -1,8 +1,10 @@
 """FastAPI application for tinker-server."""
 
 import asyncio
+import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -266,6 +268,16 @@ async def _prewarm_persistent_models(
     resource_pool = get_resource_pool()
     import ray
 
+    pinned_vllm_node_ip: dict[str, str] = {}
+    pinned_vllm_node_ip_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
+    if pinned_vllm_node_ip_json:
+        try:
+            parsed = json.loads(pinned_vllm_node_ip_json)
+            if isinstance(parsed, dict):
+                pinned_vllm_node_ip = {str(k): str(v) for k, v in parsed.items()}
+        except Exception:
+            pinned_vllm_node_ip = {}
+
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
         f"megatron_ready_timeout_s={megatron_ready_timeout_s}"
@@ -340,6 +352,40 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
+                if (
+                    cfg.vllm_engine == "async"
+                    and cfg.vllm_distributed_executor_backend == "mp"
+                    and (cfg.train_gpus + cfg.total_gpus) <= 8
+                ):
+                    try:
+                        pg_name = f"{actor_name}_pg"
+                        node_id = None
+                        deadline = time.monotonic() + 30.0
+                        while time.monotonic() < deadline and not node_id:
+                            pg_table = ray.util.placement_group_table()
+                            for info in pg_table.values():
+                                if info.get("state") != "CREATED":
+                                    continue
+                                if info.get("name") != pg_name:
+                                    continue
+                                node_id = (info.get("bundles_to_node_id") or {}).get(0)
+                                if node_id:
+                                    break
+                            if not node_id:
+                                await asyncio.sleep(0.5)
+                        if node_id:
+                            for n in ray.nodes():
+                                if n.get("NodeID") == node_id:
+                                    ip = n.get("NodeManagerAddress")
+                                    if isinstance(ip, str) and ip.strip():
+                                        pinned_vllm_node_ip[model_name] = ip.strip()
+                                        logger.info(
+                                            f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
+                                        )
+                                    break
+                    except Exception as pin_err:
+                        logger.warning(f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}")
+
                 async def _await_ready(
                     actor=actor,
                     actor_name=actor_name,
@@ -382,6 +428,10 @@ async def _prewarm_persistent_models(
 
     if multi_model_manager is None:
         return
+
+    if pinned_vllm_node_ip:
+        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
+        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
 
     def _infer_gpus(model_name: str) -> int:
         try:
