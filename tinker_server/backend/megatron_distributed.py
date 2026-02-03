@@ -808,14 +808,20 @@ class MegatronRankWorker:
             # moe_router_topk = num_experts_per_tok (active experts per token)
             num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 2)
             override_tf_config["moe_router_topk"] = num_experts_per_tok
-            # Disable permute fusion due to Triton version incompatibility
-            # (triton 3.5.0 + transformer_engine 2.9.0 causes get_int_dtype error)
-            override_tf_config["moe_permute_fusion"] = False
+            # need TE 2.1+
+            override_tf_config["moe_permute_fusion"] = True
+            override_tf_config["moe_shared_expert_overlap"] = True
+            override_tf_config["moe_grouped_gemm"] = True
             logger.info(
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
-                f"top-{num_experts_per_tok} routing, permute_fusion=False"
+                f"top-{num_experts_per_tok} routing, permute_fusion=True"
             )
 
+        override_tf_config["deallocate_pipeline_outputs"] = True
+        override_tf_config["gradient_accumulation_fusion"] = True
+        override_tf_config["persist_layer_norm"] = True
+        override_tf_config["bias_activation_fusion"] = True
+        override_tf_config["bias_dropout_fusion"] = True
         # For LoRA training, disable grad_offload to keep gradient buffers allocated.
         # The distributed optimizer needs gradient storage, but offloading resizes it to 0.
         # LoRA adapter grads are small so grad_offload isn't needed for memory.

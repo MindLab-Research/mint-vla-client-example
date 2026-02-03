@@ -195,9 +195,9 @@ MODEL_CONFIGS = {
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
     # Uses MLA (Multi-Latent Attention) from DeepSeek V3 architecture
     # PROMPT.md settings for K2-Instruct (same as K2-Thinking):
-    # - Megatron: TP=16, EP=64, ETP=1, lora_rank=16 (64 GPUs)
+    # - Megatron: TP=16, EP=64, ETP=1, CP=2, lora_rank=16 (128 GPUs)
     # - vLLM: TP=32, max_lora_rank=16 (32 GPUs)
-    # - Total: 96 GPUs
+    # - Total: 192 GPUs
     # MoE Parallel Folding: world_size = EP = 64 GPUs (TP folds into EP)
     # 384 experts / 64 GPUs = 6 experts per GPU
     "moonshotai/Kimi-K2-Instruct": ModelConfig(
@@ -206,14 +206,15 @@ MODEL_CONFIGS = {
         inference_dp=1,
         train_tp=16,  # Training: TP=16 (folds into EP)
         train_ep=64,  # Training: EP=64 (64 GPUs total)
-        train_cp=1,  # Training: CP=1 (no context parallelism)
+        train_cp=2,  # Training: CP=2 (context parallelism)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
         quantization=None,  # Let vLLM auto-detect from config.json
         gpu_memory_utilization=0.98,  # K2 uses 77 GiB/79 GiB, need high utilization
         max_loras=1,  # LoRA REQUIRED for weight transfer
         max_lora_rank=16,  # Rank 16: matches training lora_rank
-        max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
+        max_model_len=32768,  # Reduced from 64K to 32K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
+        gradient_checkpointing=True,  # Required to fit model with long context
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -221,20 +222,21 @@ MODEL_CONFIGS = {
         inference_dp=1,
         train_tp=16,  # Training: TP=16 (PROMPT.md: lora_rank=16 requires TP<=16)
         train_ep=64,  # Training: EP=64 (64 GPUs total)
-        train_cp=1,  # Training: CP=1 (no context parallelism)
+        train_cp=2,  # Training: CP=2 (context parallelism)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
         # PROMPT.md settings:
-        # - Megatron: TP=16, EP=64, ETP=1, lora_rank=16 (64 GPUs)
+        # - Megatron: TP=16, EP=64, ETP=1, lora_rank=16 (128 GPUs)
         # - vLLM: TP=32, max_lora_rank=16 (32 GPUs)
-        # - Total: 96 GPUs
+        # - Total: 192 GPUs
         # MoE Parallel Folding: world_size = EP = 64 GPUs
         # 384 experts / 64 GPUs = 6 experts per GPU
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
         gpu_memory_utilization=0.98,  # K2 uses 77 GiB/79 GiB, need high utilization
         max_loras=1,  # LoRA for weight transfer
         max_lora_rank=16,  # Rank 16: matches training lora_rank
-        max_model_len=10240,  # Reduced from 64K to save GPU memory (train uses 8K)
+        max_model_len=32768,  # Reduced from 64K to 32K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
+        gradient_checkpointing=True,  # Required to fit model with long context
     ),
     # Moonlight-16B-A3B - smaller DeepSeek V3 MLA model (64 experts, 27 layers)
     # Merge gate settings:
@@ -252,6 +254,7 @@ MODEL_CONFIGS = {
         max_lora_rank=32,
         max_model_len=8192,  # 8K context
         is_mla=True,  # DeepSeek V3 MLA architecture
+        gradient_checkpointing=True,
     ),
 }
 
