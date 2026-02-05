@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 class ModelConfig:
     """Hardware configuration for a model.
 
+    Model parameters:
+        - num_parameters: Total parameter count in billions (e.g., 30.0 for 30B model)
+
     Inference parallelism (vLLM):
         - inference_tp: Tensor parallelism (shards weights)
         - inference_dp: Data parallelism (replicas)
@@ -42,6 +45,7 @@ class ModelConfig:
         - is_mla: Uses Multi-Latent Attention (DeepSeek V3/Moonlight/K2)
     """
 
+    num_parameters: float  # Total parameter count in billions
     is_moe: bool
     inference_tp: int  # vLLM inference TP
     inference_dp: int  # vLLM inference DP
@@ -106,23 +110,27 @@ MODEL_CONFIGS = {
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
     # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
+        num_parameters=7.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
         max_num_seqs=32,  # Leave vLLM headroom for 32K prompt_logprobs
         gradient_checkpointing=True,  # Required for sequences >5000 tokens
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
+        num_parameters=0.6,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
         max_num_seqs=64,  # Leave headroom for long-context prompt_logprobs
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
+        num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
+        num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
         max_num_seqs=32,  # Leave headroom for long-context prompt_logprobs
@@ -130,6 +138,7 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     "Qwen/Qwen3-8B": ModelConfig(
+        num_parameters=8.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
         gradient_checkpointing=True,
@@ -138,6 +147,7 @@ MODEL_CONFIGS = {
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,  # 40K context - full model capability
         # NOTE: vLLM's `max_num_seqs` caps the total number of *active sequences*,
@@ -156,16 +166,19 @@ MODEL_CONFIGS = {
         vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
@@ -178,6 +191,7 @@ MODEL_CONFIGS = {
     # - Training: TP=4, PP=2, EP=2 -> 2 pipeline stages, 8 GPUs per stage (16 GPUs total).
     # This split lets MINT_PERSISTENT_MODELS prewarm both trainer and inferencer concurrently (16+8=24).
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
+        num_parameters=235.0,
         is_moe=True,
         inference_tp=8,
         inference_dp=1,
@@ -193,6 +207,7 @@ MODEL_CONFIGS = {
         vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
+        num_parameters=235.0,
         is_moe=True,
         inference_tp=8,
         inference_dp=1,
@@ -215,6 +230,7 @@ MODEL_CONFIGS = {
     # MoE Parallel Folding: world_size = EP = 64 GPUs (TP folds into EP)
     # 384 experts / 64 GPUs = 6 experts per GPU
     "moonshotai/Kimi-K2-Instruct": ModelConfig(
+        num_parameters=1040.0,
         is_moe=True,
         inference_tp=32,  # Inference: TP=32 (PROMPT.md spec)
         inference_dp=1,
@@ -232,6 +248,7 @@ MODEL_CONFIGS = {
         vllm_distributed_executor_backend="ray",
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
+        num_parameters=1040.0,
         is_moe=True,
         inference_tp=32,  # Inference: TP=32 (PROMPT.md spec)
         inference_dp=1,
@@ -259,6 +276,7 @@ MODEL_CONFIGS = {
     # - Megatron: TP=1, EP=4 (4 GPUs)
     # - vLLM: TP=4 (4 GPUs)
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
+        num_parameters=16.0,
         is_moe=True,
         inference_tp=4,
         inference_dp=1,
