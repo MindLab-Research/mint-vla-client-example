@@ -1,8 +1,8 @@
 """Weight and state routes for saving/loading model weights and checkpoints.
 
 Endpoints:
-- POST /save_weights: Save LoRA weights for sampling (Tinker SDK: save_weights_for_sampler)
-- POST /save_state: Save full checkpoint (LoRA + optimizer + metadata) for training resume
+- POST /save_weights: Save model weights (currently LoRA-only; legacy)
+- POST /save_state: Save checkpoint for training resume (currently LoRA-only; optimizer saving not implemented)
 - POST /load_state: Load checkpoint to resume training
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
@@ -96,12 +96,11 @@ def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
 
 
 # =============================================================================
-# POST /save_weights, /save_weights_for_sampler - async (SDK compatibility)
+# POST /save_weights - async (legacy)
 # =============================================================================
 
 
 @router.post("/save_weights", response_model=UntypedAPIFuture)
-@router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)  # SDK alias
 async def save_weights(
     request: SaveStateRequest,
     background_tasks: BackgroundTasks,
@@ -111,13 +110,10 @@ async def save_weights(
 
     Saves LoRA weights and registers them for multi-LoRA sampling.
 
-    SDK compatibility:
-    - /save_weights: Called by SDK save_state() - should save optimizer but doesn't (TODO)
-    - /save_weights_for_sampler: Called by SDK save_weights_for_sampler()
+    CURRENT BEHAVIOR: Saves LoRA weights only.
 
-    TEMPORARY WORKAROUND: Both endpoints currently save only LoRA weights, not optimizer
-    state. True training resume with preserved optimizer momentum is not supported.
-    See GitHub issue #67 for optimizer state saving implementation.
+    INTENDED BEHAVIOR: Should save weights + optimizer state for true training resume
+    with preserved momentum. See GitHub issue #67.
     """
     from ..gateway import (
         encode_request_id,
@@ -170,8 +166,12 @@ async def save_weights(
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
-    # Reuse _do_save_state - both endpoints save weights and register for sampling
-    background_tasks.add_task(_do_save_state, request_id, session, request, user_id, webhook_url)
+    from ..client_compat import prefer_tinker_uri
+
+    prefer_tinker = prefer_tinker_uri(http_request)
+    background_tasks.add_task(
+        _do_save_state, request_id, session, request, user_id, webhook_url, prefer_tinker
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -244,7 +244,12 @@ async def save_state(
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
-    background_tasks.add_task(_do_save_state, request_id, session, request, user_id, webhook_url)
+    from ..client_compat import prefer_tinker_uri
+
+    prefer_tinker = prefer_tinker_uri(http_request)
+    background_tasks.add_task(
+        _do_save_state, request_id, session, request, user_id, webhook_url, prefer_tinker
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -254,6 +259,7 @@ async def _do_save_state(
     request: SaveStateRequest,
     user_id: str | None = None,
     webhook_url: str | None = None,
+    prefer_tinker: bool = False,
 ) -> None:
     """Background task to save state.
 
@@ -327,10 +333,13 @@ async def _do_save_state(
             except Exception as reg_err:
                 logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
-        # Primary URI for MinT clients: mint://{model_id}/{checkpoint_name}
-        # Keep tinker:// as a compatibility alias.
+        from ..client_compat import checkpoint_uri
+
         mint_path = _to_mint_path(session.model_id, checkpoint_name)
-        tinker_path = f"tinker://{session.model_id}/{checkpoint_name}"
+        tinker_path = checkpoint_uri(session.model_id, checkpoint_name, prefer_tinker=True)
+        selected_path = checkpoint_uri(
+            session.model_id, checkpoint_name, prefer_tinker=prefer_tinker
+        )
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
         # Keys are JSON-serializable, tensors are not
@@ -338,7 +347,7 @@ async def _do_save_state(
 
         future_store.resolve(request_id, {
             "checkpoint_id": checkpoint_name,
-            "path": mint_path,
+            "path": selected_path,
             "mint_path": mint_path,
             "tinker_path": tinker_path,
             "filesystem_path": save_path,
@@ -603,6 +612,9 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     """
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
+    from ..client_compat import checkpoint_uri, prefer_tinker_uri
+
+    prefer_tinker = prefer_tinker_uri(request)
 
     candidate_paths: list[str] = [
         os.path.join(CHECKPOINTS_DIR, owner_dir, model_id),
@@ -664,7 +676,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoints.append(
                 CheckpointInfo(
                     checkpoint_id=name,
-                    path=_to_mint_path(model_id, name),
+                    path=checkpoint_uri(model_id, name, prefer_tinker=prefer_tinker),
                     step=step,
                     created_at=created_at,
                 )
@@ -711,7 +723,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoints.append(
                 CheckpointInfo(
                     checkpoint_id=name,
-                    path=_to_mint_path(model_id, name),
+                    path=checkpoint_uri(model_id, name, prefer_tinker=prefer_tinker),
                     step=None,
                     created_at=created_at,
                 )

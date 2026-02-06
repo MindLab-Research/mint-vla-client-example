@@ -1179,14 +1179,21 @@ async def save_weights_for_sampler(
 
     request_id = future_store.create()
     user_id = _get_user_id(http_request)
+    from ..client_compat import prefer_tinker_uri
+
+    prefer_tinker = prefer_tinker_uri(http_request)
     background_tasks.add_task(
-        _do_save_weights_for_sampler, request_id, session, request, user_id
+        _do_save_weights_for_sampler, request_id, session, request, user_id, prefer_tinker
     )
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_save_weights_for_sampler(
-    request_id: str, session, request: SaveWeightsForSamplerRequest, user_id: str | None
+    request_id: str,
+    session,
+    request: SaveWeightsForSamplerRequest,
+    user_id: str | None,
+    prefer_tinker: bool,
 ) -> None:
     """Background task for save_weights_for_sampler.
 
@@ -1234,9 +1241,9 @@ async def _do_save_weights_for_sampler(
         )
         print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
-        # Use tinker:// URI format (matches client SDK expectation)
-        # Format: tinker://{model_id}/{checkpoint_name}
-        path_uri = f"tinker://{session.model_id}/{checkpoint_name}"
+        tinker_uri = f"tinker://{session.model_id}/{checkpoint_name}"
+        mint_uri = f"mint://{session.model_id}/{checkpoint_name}"
+        path_uri = tinker_uri if prefer_tinker else mint_uri
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately

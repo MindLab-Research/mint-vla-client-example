@@ -135,7 +135,7 @@ class CreateSamplingSessionRequest(BaseModel):
     session_id: str
     sampling_session_seq_id: int | None = None  # Sequence within session
     base_model: str | None = None
-    model_path: str | None = None  # mint:// or file:// path to weights
+    model_path: str | None = None  # tinker://, mint://, or file:// path to weights
     lora_rank: int = 32  # LoRA rank for per-session adapter
 
 
@@ -375,7 +375,7 @@ class SaveWeightsForSamplerRequest(BaseModel):
 class SaveWeightsForSamplerResponse(BaseModel):
     """Response from save weights for sampler."""
 
-    path: str | None = None  # file:// or mint:// URI (None for ephemeral)
+    path: str | None = None  # tinker://, mint://, or file:// URI (None for ephemeral)
     sampling_session_id: str | None = None  # For ephemeral flow
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
@@ -399,7 +399,7 @@ class SaveStateRequest(BaseModel):
 class SaveStateResponse(BaseModel):
     """Response from saving state."""
 
-    path: str  # mint:// URI
+    path: str  # tinker:// or mint:// URI
     type: Literal["save_weights"] = "save_weights"
 
 
@@ -409,7 +409,7 @@ class LoadStateRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     model_id: str
-    path: str  # mint:// or file:// path
+    path: str  # tinker://, mint://, or file:// path
     optimizer: bool = True  # whether to restore optimizer state
     seq_id: int | None = None
     type: Literal["load_weights"] = "load_weights"
@@ -426,7 +426,7 @@ class CheckpointInfo(BaseModel):
     """Information about a checkpoint."""
 
     checkpoint_id: str  # directory name, e.g. "checkpoint-100"
-    path: str  # mint://{model_id}/{checkpoint_id}
+    path: str  # tinker://{model_id}/{checkpoint_id} or mint://{model_id}/{checkpoint_id}
     step: int | None = None  # parsed from checkpoint name if available
     created_at: str  # ISO timestamp
 
