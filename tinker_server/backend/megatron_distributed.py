@@ -3486,8 +3486,13 @@ class MegatronWorkerGroup:
         self._current_session: str | None = None  # Phase 6: session tracking
         self._actual_rank: int | None = None  # Phase 7: actual LoRA rank for current session
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
+        self._master_addr: str | None = None
+        self._master_port: int | None = None
 
         self._initialize()
+
+    def get_master_addr(self) -> str | None:
+        return self._master_addr
 
     def _initialize(self):
         """Create placement group, spawn workers, then initialize them all together."""
@@ -3497,10 +3502,16 @@ class MegatronWorkerGroup:
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
-        self.placement_group = ray.util.placement_group(
-            bundles,
-            strategy="PACK",
-        )
+        pg_name = f"{_make_megatron_actor_name(self.base_model)}_pg"
+        try:
+            self.placement_group = ray.util.get_placement_group(pg_name)
+        except Exception:
+            self.placement_group = ray.util.placement_group(
+                bundles,
+                strategy="PACK",
+                name=pg_name,
+                lifetime="detached",
+            )
         ray.get(self.placement_group.ready())
 
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
@@ -3548,6 +3559,8 @@ class MegatronWorkerGroup:
         )
 
         logger.info(f"[MegatronWorkerGroup] Master: {master_addr}:{master_port}")
+        self._master_addr = master_addr
+        self._master_port = int(master_port)
 
         # Spawn workers - __init__ is lightweight, no distributed init yet
         for rank in range(world_size):

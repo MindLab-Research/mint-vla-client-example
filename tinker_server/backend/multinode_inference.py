@@ -46,6 +46,35 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str, Any]:
+    if not model_name:
+        return {}
+    mapping_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
+    if not mapping_json:
+        return {}
+
+    try:
+        mapping = json.loads(mapping_json)
+    except Exception:
+        return {}
+    if not isinstance(mapping, dict):
+        return {}
+    pinned_ip = mapping.get(model_name)
+    if not isinstance(pinned_ip, str) or not pinned_ip.strip():
+        return {}
+    pinned_ip = pinned_ip.strip()
+
+    node_res = f"node:{pinned_ip}"
+    try:
+        if node_res not in (ray.cluster_resources() or {}):
+            return {}
+    except Exception:
+        return {}
+
+    logger.info(f"multinode_vllm_pin model={model_name} resources={node_res!r}")
+    return {"resources": {node_res: 0.001}}
+
+
 @dataclass
 class MultiNodeLoRASlot:
     """Metadata for a loaded LoRA adapter in multi-node engine."""
@@ -274,6 +303,9 @@ def _create_multinode_vllm_actor(
             self._active_seq_slots = 0
             self._seq_slots_cond = asyncio.Condition()
 
+        def get_node_ip(self) -> str:
+            return ray.util.get_node_ip_address()
+
         @asynccontextmanager
         async def _reserve_seq_slots(self, n_req: int):
             if (not self._admission_control) or (self.max_num_seqs is None):
@@ -361,10 +393,14 @@ def _create_multinode_vllm_actor(
             if self._initialized:
                 return
 
-            # Force vLLM v0 engine BEFORE importing vLLM
-            # v1's multiprocess architecture requires coordinator to have GPU
             import os
-            os.environ["VLLM_USE_V1"] = "0"
+            distributed_executor_backend = os.environ.get("MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "ray").strip().lower()
+            if distributed_executor_backend not in ("ray", "mp"):
+                raise ValueError(
+                    f"Invalid MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND={distributed_executor_backend!r} "
+                    "(expected 'ray' or 'mp')"
+                )
+            os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
             # disable to fall back to torch.distributed collectives.
             os.environ["VLLM_DISABLE_PYNCCL"] = "1"
@@ -387,7 +423,7 @@ def _create_multinode_vllm_actor(
                 data_parallel_size=self.data_parallel_size,
                 data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
                 enable_expert_parallel=self.enable_expert_parallel,
-                distributed_executor_backend="ray",  # Key: use Ray for multi-node
+                distributed_executor_backend=distributed_executor_backend,
                 disable_custom_all_reduce=True,  # Avoid PyNcclCommunicator issues in multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 dtype="auto",
@@ -412,7 +448,7 @@ def _create_multinode_vllm_actor(
                 f"Creating AsyncLLMEngine: "
                 f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
-                f"backend=ray, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
+                f"backend={distributed_executor_backend}, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
                 f"chunked_prefill={enable_chunked_prefill}, max_num_batched_tokens={max_num_batched_tokens}, "
                 f"prefix_caching={enable_prefix_caching}"
             )
@@ -931,6 +967,7 @@ class MultiNodeInferenceEngine:
         kv_cache_dtype: str | None = None,
         actor_name: str | None = None,
         shared_adapter_dir: str = "/vePFS-Mindverse/share/tinker_adapters",
+        distributed_executor_backend: str = "ray",
     ):
         self.model_path = model_path
         self.model_name = model_name
@@ -949,6 +986,11 @@ class MultiNodeInferenceEngine:
         self.kv_cache_dtype = kv_cache_dtype
         self.actor_name = actor_name or f"multinode_vllm_{model_path.split('/')[-1].lower()}"
         self.shared_adapter_dir = shared_adapter_dir
+        self.distributed_executor_backend = distributed_executor_backend.strip().lower()
+        if self.distributed_executor_backend not in ("ray", "mp"):
+            raise ValueError(
+                f"distributed_executor_backend must be one of: 'ray', 'mp' (got {distributed_executor_backend!r})"
+            )
 
         self.registry = MultiNodeLoRARegistry()
         self.engine = None
@@ -976,15 +1018,26 @@ class MultiNodeInferenceEngine:
                 * self.pipeline_parallel_size
                 * self.data_parallel_size
             )
-            resources = compute_multinode_engine_resources(worker_gpus)
-            controller_gpus = resources.controller_gpus
-            controller_cpus = resources.controller_cpus
-            total_required_gpus = resources.total_required_gpus
+            distributed_executor_backend = self.distributed_executor_backend
+            if distributed_executor_backend == "mp":
+                # vLLM runs locally (single-node) inside this Ray actor and needs direct GPU access.
+                # Reserve all GPUs on a single node for this actor. vLLM will spawn local processes
+                # for TP and communicate via NCCL (no Ray compiled DAG).
+                controller_gpus = int(worker_gpus)
+                controller_cpus = 1
+                total_required_gpus = int(worker_gpus)
+                resources = None
+            else:
+                resources = compute_multinode_engine_resources(worker_gpus)
+                controller_gpus = resources.controller_gpus
+                controller_cpus = resources.controller_cpus
+                total_required_gpus = resources.total_required_gpus
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
-                or "1800"
+                or "300"
             )
+            logger.info(f"multinode_vllm_init actor={self.actor_name} RAY_CGRAPH_get_timeout={ray_cgraph_get_timeout}")
 
             is_persistent = False
             persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
@@ -1100,30 +1153,33 @@ class MultiNodeInferenceEngine:
             # like "Free memory on device ... is less than desired GPU memory utilization".
             from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-            pg_name = f"{self.actor_name}_pg"
-            try:
-                pg = ray.util.get_placement_group(pg_name)
-            except Exception:
-                pg_bundles = resources.pg_bundles
-                pg = ray.util.placement_group(
-                    pg_bundles,
-                    # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
-                    # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
-                    # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
-                    strategy="PACK",
-                    name=pg_name,
-                    lifetime="detached",
-                )
-            try:
-                await asyncio.to_thread(ray.get, pg.ready())
-            except SystemExit as e:
-                if getattr(e, "code", None) == 15:
-                    raise
+            pg = None
+            if distributed_executor_backend == "ray":
+                pg_name = f"{self.actor_name}_pg"
                 try:
-                    ray.util.remove_placement_group(pg)
+                    pg = ray.util.get_placement_group(pg_name)
                 except Exception:
-                    pass
-                raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
+                    pg_bundles = resources.pg_bundles
+                    pg = ray.util.placement_group(
+                        pg_bundles,
+                        # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
+                        # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
+                        # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
+                        strategy="PACK",
+                        name=pg_name,
+                        lifetime="detached",
+                    )
+                try:
+                    await asyncio.to_thread(ray.get, pg.ready())
+                except SystemExit as e:
+                    if getattr(e, "code", None) == 15:
+                        raise
+                    try:
+                        if pg is not None:
+                            ray.util.remove_placement_group(pg)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
 
             # Create new engine actor
             MultiNodeVLLMEngine = _create_multinode_vllm_actor(
@@ -1134,16 +1190,19 @@ class MultiNodeInferenceEngine:
                 max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
-            scheduling_opts = {
-                "scheduling_strategy": PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
-                    # Place the controller into a CPU-only bundle to avoid reserving an extra GPU
-                    # while keeping child task capture for vLLM's Ray worker actors.
-                    placement_group_bundle_index=resources.controller_bundle_index,
-                    placement_group_capture_child_tasks=True,
-                )
-            }
+            if distributed_executor_backend == "ray":
+                scheduling_opts = {
+                    "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        # vLLM's Ray backend places worker ranks into bundles [0..TP-1] by index.
+                        # Place the controller into a CPU-only bundle to avoid reserving an extra GPU
+                        # while keeping child task capture for vLLM's Ray worker actors.
+                        placement_group_bundle_index=resources.controller_bundle_index,
+                        placement_group_capture_child_tasks=True,
+                    )
+                }
+            else:
+                scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
@@ -1152,9 +1211,8 @@ class MultiNodeInferenceEngine:
                 # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
                 # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
-                # Force vLLM v0 engine - v1's multiprocess architecture
-                # conflicts with Ray distributed executor backend
-                "VLLM_USE_V1": "0",
+                "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
+                "VLLM_USE_V1": "1" if distributed_executor_backend == "mp" else "0",
                 "VLLM_DISABLE_PYNCCL": "1",
             }
             for k in (
@@ -1238,7 +1296,8 @@ class MultiNodeInferenceEngine:
                 except Exception:
                     pass
                 try:
-                    ray.util.remove_placement_group(pg)
+                    if pg is not None:
+                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None
@@ -1254,7 +1313,8 @@ class MultiNodeInferenceEngine:
                     timeout_s=init_timeout,
                 )
                 try:
-                    ray.util.remove_placement_group(pg)
+                    if pg is not None:
+                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None
@@ -1272,7 +1332,8 @@ class MultiNodeInferenceEngine:
                 except Exception:
                     pass
                 try:
-                    ray.util.remove_placement_group(pg)
+                    if pg is not None:
+                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None

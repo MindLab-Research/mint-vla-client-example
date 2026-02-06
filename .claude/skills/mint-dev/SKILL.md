@@ -64,11 +64,13 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 | PFS Path | Required: `/vePFS-Mindverse/share/code/$USER/tinker-server` |
 | Unison Profile | Required: `volcano-tinker-$USER` |
 | Ray Configs | `mint-dev-head.yaml`, `mint-dev-worker.yaml` |
-| Dev GPU Queue | `q-20260124095758-ngkg7` (24 GPUs total) |
+| Dev GPU Queue | Prefer `a800-mindverse-B` (`q-20260124095758-ngkg7`). Do not hard-code; confirm availability or ask user before submitting workers. |
 | API Key | Not required (auth disabled when `TINKER_API_KEY` unset) |
 | Log File | `/tmp/tinker_server.log` |
 
 ---
+
+**Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. Set it explicitly before submitting any new dev worker tasks.
 
 ## Concurrent Dev Runs (Issue #83)
 

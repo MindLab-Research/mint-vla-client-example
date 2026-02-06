@@ -32,7 +32,7 @@ description: |
 ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json'
 
 # Cancel task
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id>'
 
 # View task logs (find Ray IP here)
 ssh mint-prod-volcano '/root/.volc/bin/volc ml_task logs -t <task_id> -i worker_0'
@@ -43,6 +43,7 @@ http://<RAY_HEAD_IP>:8265
 
 **IMPORTANT:** Use `--output json` to avoid interactive TUI mode.
 **IMPORTANT:** `volc ml_task list --output json` emits a banner before the JSON payload.
+**NOTE:** `volc ml_task cancel` does not support `--output json` on the current CLI version.
 
 ---
 
@@ -57,13 +58,64 @@ http://<RAY_HEAD_IP>:8265
 
 ## 1.1 Resource Queues
 
-| Queue ID | Type | Use Case |
-|----------|------|----------|
-| `q-20251225183621-m2297` | CPU | Ray head node (CPU-only instances) |
-| `q-20260124095758-ngkg7` | GPU | Dev GPU workers (A800 instances, 24 GPUs total) |
-| `q-20251126180002-26lwz` | GPU | Prod GPU workers (A800 instances, 128 GPUs total) |
+| Queue Name | Queue ID | Type | Default Use |
+|------------|----------|------|-------------|
+| `cpu-mindverse` | `q-20251225183621-m2297` | CPU | Ray head nodes (CPU-only) |
+| `a800-mindverse-B` | `q-20260124095758-ngkg7` | GPU | Dev GPU workers (preferred) |
+| `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Prod GPU workers (preferred) |
+| `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Prod GPU workers (fallback) |
 
-**IMPORTANT:** CPU-only instances (ml.g2a.xlarge) MUST use the CPU queue. GPU instances MUST use the GPU queue.
+**IMPORTANT:** CPU-only instances (ml.g2a.xlarge) MUST use the CPU queue. GPU instances MUST use a GPU queue.
+
+## 1.2 Queue Availability (CLI)
+
+`volc ml_task submit` supports selecting a queue via `--resource_queue_id` / `--resource_queue_name`, but this CLI does not appear to provide a "show free GPUs per queue" command (only task listing). Use the Volcano console for queue capacity (used/total) and treat the CLI as "tasks demand and state".
+
+If you need a CLI-only estimate of current demand per queue, aggregate non-terminal tasks by `ResourceQueueId` and multiply `RoleReplicas` by GPUs-per-flavor:
+
+```bash
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task list --output json --limit 200' | python3 - <<'PY'
+import json, re, sys
+s=sys.stdin.read()
+m=re.search(r'[\[{]', s)
+if not m:
+    raise SystemExit("no JSON in volc output")
+j=json.loads(s[m.start():])
+
+flavor_gpus = {
+    "ml.hpcpni2l.28xlarge": 8,
+    "ml.hpcpni2l.14xlarge": 4,
+    "ml.hpcpni2l.7xlarge": 2,
+    "ml.g2a.xlarge": 0,
+}
+
+def task_gpus(t):
+    g = 0
+    for spec in t.get("TaskRoleSpecs") or []:
+        reps = spec.get("RoleReplicas") or 0
+        flavor = spec.get("ResourceSpecId") or (spec.get("ResourceSpec") or {}).get("FlavorID")
+        g += reps * flavor_gpus.get(flavor, 0)
+    return g
+
+by_queue = {}
+for t in j:
+    q = t.get("ResourceQueueId") or ""
+    st = t.get("Status") or ""
+    if st not in ("Queue", "Staging", "Running", "Killing", "Initialized"):
+        continue
+    by_queue.setdefault(q, {"Running": 0, "Queue": 0, "Other": 0})
+    g = task_gpus(t)
+    if st == "Running":
+        by_queue[q]["Running"] += g
+    elif st == "Queue":
+        by_queue[q]["Queue"] += g
+    else:
+        by_queue[q]["Other"] += g
+
+for q, v in sorted(by_queue.items(), key=lambda kv: (-(kv[1]["Running"]+kv[1]["Queue"]), kv[0])):
+    print(q, "running_gpus", v["Running"], "queued_gpus", v["Queue"], "other_gpus", v["Other"])
+PY
+```
 
 ---
 
@@ -161,10 +213,11 @@ PY
    ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0 | grep \"Local node IP\"'
    ```
 
-3. **Copy template and fill in head IP:**
+3. **Copy template and fill in head IP + choose GPU queue:**
    ```bash
    cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
    sed -i "s/<RAY_HEAD_IP>/<actual_ip>/g" /tmp/mint-dev-worker.yaml
+   sed -i "s/<GPU_QUEUE_ID>/q-20260124095758-ngkg7/g" /tmp/mint-dev-worker.yaml  # prefer a800-mindverse-B for dev
    ```
 
 4. **Submit worker from temp file:**
@@ -205,9 +258,13 @@ PY
 ); test -n \"$ip\" && echo \"$ip\" > /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt && cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt'
    ```
 
-3. **Submit worker (reads head IP from PFS):**
+3. **Copy template, choose GPU queue, submit worker (reads head IP from PFS):**
    ```bash
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml --output json'
+   # Prefer a800-mindverse-C1 or a800-mindverse-C2 for prod workers.
+   ssh mint-prod-volcano 'tmp=/tmp/mint-prod-worker.yaml && \
+     cp /vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml "$tmp" && \
+     sed -i "s/<GPU_QUEUE_ID>/q-20251126180002-26lwz/g" "$tmp" && \
+     /root/.volc/bin/volc ml_task submit -c "$tmp" --output json'
    ```
 
 4. **Connect SSH server to cluster:**
@@ -231,11 +288,11 @@ Look for task names containing your cluster identifier.
 
 ```bash
 # Cancel single task
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <task_id>'
 
 # Cancel multiple (run sequentially)
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <worker_task_id> --output json'
-ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <head_task_id> --output json'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <worker_task_id>'
+ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <head_task_id>'
 ```
 
 **WARNING:** Production tasks include "prod" in names. Never cancel prod tasks for dev work.
@@ -410,9 +467,44 @@ Workers cannot install packages (no internet). To upgrade without rebuilding ima
 
 ## Troubleshooting
 
+### Queued even though the queue has free GPUs
+
+Sometimes a large worker submit stays in `Queue` even when the resource queue has enough free GPUs (as shown in the Volcano console). In that case, split one big task into multiple smaller tasks (fewer `RoleReplicas` per task). Example: if `RoleReplicas: 10` is queued, try `4 + 4 + 2`.
+
+This reduces scheduler coupling: each task is an independent allocation request, so partial capacity can be used immediately instead of waiting for one big request to fit.
+
+**Prod example (split 10 replicas into 4+4+2):**
+```bash
+ssh mint-prod-volcano 'set -euo pipefail
+base=/vePFS-Mindverse/share/code/tinker-server-auth/.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml
+queue_id=q-20251126180002-26lwz  # a800-mindverse-C1 (set explicitly)
+
+tmp4a=/tmp/mint-prod-worker-scale4a-$(date +%Y%m%d%H%M%S).yaml
+cp "$base" "$tmp4a"
+sed -i "s/^TaskName: \\\"mint-prod-worker\\\"/TaskName: \\\"mint-prod-worker-scale4a\\\"/" "$tmp4a"
+sed -i "s/^\\s*RoleReplicas: 1/      RoleReplicas: 4/" "$tmp4a"
+sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp4a"
+/root/.volc/bin/volc ml_task submit -c "$tmp4a" --output json
+
+tmp4b=/tmp/mint-prod-worker-scale4b-$(date +%Y%m%d%H%M%S).yaml
+cp "$base" "$tmp4b"
+sed -i "s/^TaskName: \\\"mint-prod-worker\\\"/TaskName: \\\"mint-prod-worker-scale4b\\\"/" "$tmp4b"
+sed -i "s/^\\s*RoleReplicas: 1/      RoleReplicas: 4/" "$tmp4b"
+sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp4b"
+/root/.volc/bin/volc ml_task submit -c "$tmp4b" --output json
+
+tmp2=/tmp/mint-prod-worker-scale2-$(date +%Y%m%d%H%M%S).yaml
+cp "$base" "$tmp2"
+sed -i "s/^TaskName: \\\"mint-prod-worker\\\"/TaskName: \\\"mint-prod-worker-scale2\\\"/" "$tmp2"
+sed -i "s/^\\s*RoleReplicas: 1/      RoleReplicas: 2/" "$tmp2"
+sed -i "s/<GPU_QUEUE_ID>/$queue_id/g" "$tmp2"
+/root/.volc/bin/volc ml_task submit -c "$tmp2" --output json
+'
+```
+
 | Symptom | Fix |
 |---------|-----|
-| Task stuck in Queue | Check queue capacity, try different queue |
+| Task stuck in Queue | Check queue capacity. If capacity is sufficient but still queued, split into multiple tasks with smaller `RoleReplicas` (example: `4 + 4 + 2`) and unique `TaskName`s. |
 | Worker fails to join | Verify HEAD_IP correct, check network, same image version |
 | Out of memory | Reduce batch size, enable gradient checkpointing |
 | Stale actors | Kill via API or tear down cluster |
