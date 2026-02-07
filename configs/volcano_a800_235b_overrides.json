@@ -1,0 +1,18 @@
+{
+  "Qwen/Qwen3-235B-A22B-Instruct-2507": {
+    "inference_tp": 16,
+    "inference_dp": 1,
+    "train_tp": 4,
+    "train_pp": 2,
+    "train_ep": 4,
+    "vllm_distributed_executor_backend": "ray"
+  },
+  "Qwen/Qwen3-235B-A22B-Thinking-2507": {
+    "inference_tp": 16,
+    "inference_dp": 1,
+    "train_tp": 4,
+    "train_pp": 2,
+    "train_ep": 4,
+    "vllm_distributed_executor_backend": "ray"
+  }
+}
