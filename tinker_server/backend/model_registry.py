@@ -171,12 +171,9 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
-    # Model config: num_attention_heads=64, num_key_value_heads=4 (GQA)
-    #
-    # Aliyun (L20X 140GB, 3 nodes x 8 GPUs = 24 GPUs):
-    # - Inference: TP=8, DP=1 -> 1 replica on a single 8-GPU node (8 GPUs total).
-    # - Training: TP=4, PP=2, EP=2 -> 2 pipeline stages, 8 GPUs per stage (16 GPUs total).
-    # This split lets MINT_PERSISTENT_MODELS prewarm both trainer and inferencer concurrently (16+8=24).
+    # Default profile is kept for H200-style deployment.
+    # For Volcano A800 profile, use MINT_MODEL_CONFIG_OVERRIDES_JSON with:
+    # `configs/volcano_a800_235b_overrides.json`.
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
         is_moe=True,
         inference_tp=8,

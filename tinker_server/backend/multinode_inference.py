@@ -75,6 +75,50 @@ def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str
     return {"resources": {node_res: 0.001}}
 
 
+def _preferred_worker_node_ips_for_model(model_name: str | None) -> list[str]:
+    if not model_name:
+        return []
+    raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.warning("MINT_MODEL_NODE_IPS_JSON is not valid JSON; ignoring")
+        return []
+    if not isinstance(data, dict):
+        logger.warning("MINT_MODEL_NODE_IPS_JSON must be a JSON object; ignoring")
+        return []
+
+    candidates = []
+    for key in (model_name, model_name.lower()):
+        value = data.get(key)
+        if value is not None:
+            candidates = value
+            break
+    if not isinstance(candidates, list):
+        return []
+
+    cleaned = [str(ip).strip() for ip in candidates if str(ip).strip()]
+    if not cleaned:
+        return []
+
+    try:
+        cluster = ray.cluster_resources() or {}
+    except Exception:
+        cluster = {}
+    usable = [ip for ip in cleaned if f"node:{ip}" in cluster]
+    if not usable:
+        logger.warning(f"multinode_vllm_node_pin model={model_name} has no usable node IPs")
+        return []
+    if len(usable) < len(cleaned):
+        skipped = [ip for ip in cleaned if ip not in usable]
+        logger.warning(f"multinode_vllm_node_pin model={model_name} skipped_missing_nodes={skipped}")
+    logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={usable}")
+    return usable
+
+
 @dataclass
 class MultiNodeLoRASlot:
     """Metadata for a loaded LoRA adapter in multi-node engine."""
@@ -1028,7 +1072,11 @@ class MultiNodeInferenceEngine:
                 total_required_gpus = int(worker_gpus)
                 resources = None
             else:
-                resources = compute_multinode_engine_resources(worker_gpus)
+                preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
+                resources = compute_multinode_engine_resources(
+                    worker_gpus,
+                    preferred_node_ips=preferred_node_ips,
+                )
                 controller_gpus = resources.controller_gpus
                 controller_cpus = resources.controller_cpus
                 total_required_gpus = resources.total_required_gpus
@@ -1230,6 +1278,9 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENABLE_PREFIX_CACHING",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
+                "VLLM_DISABLE_RAY_COMPILED_DAG",
+                "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
+                "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM",
             ):
                 v = os.environ.get(k)
                 if v is not None:

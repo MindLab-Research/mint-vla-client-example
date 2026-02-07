@@ -9,6 +9,7 @@ Shared loss functions and Tinker Datum conversion utilities live in megatron_tra
 from __future__ import annotations  # Allow forward references in type hints
 
 import os
+import json
 import math
 import socket
 import logging
@@ -56,6 +57,59 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _model_key_from_base_model(base_model: str) -> str:
+    import re
+
+    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
+    match = re.search(hf_cache_pattern, base_model)
+    if match:
+        org, model = match.groups()
+        return f"{org}/{model}"
+    return base_model
+
+
+def _preferred_worker_node_ips_for_model(base_model: str) -> list[str]:
+    raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.warning("MINT_MODEL_NODE_IPS_JSON is not valid JSON; ignoring")
+        return []
+    if not isinstance(data, dict):
+        logger.warning("MINT_MODEL_NODE_IPS_JSON must be a JSON object; ignoring")
+        return []
+
+    model_key = _model_key_from_base_model(base_model)
+    candidates = None
+    for key in (model_key, model_key.lower(), base_model, base_model.lower()):
+        value = data.get(key)
+        if value is not None:
+            candidates = value
+            break
+    if not isinstance(candidates, list):
+        return []
+
+    cleaned = [str(ip).strip() for ip in candidates if str(ip).strip()]
+    if not cleaned:
+        return []
+
+    try:
+        cluster = ray.cluster_resources() or {}
+    except Exception:
+        cluster = {}
+    usable = [ip for ip in cleaned if f"node:{ip}" in cluster]
+    if not usable:
+        logger.warning(f"[MegatronWorkerGroup] node pinning has no usable node IPs for model={model_key}")
+        return []
+    if len(usable) < len(cleaned):
+        skipped = [ip for ip in cleaned if ip not in usable]
+        logger.warning(f"[MegatronWorkerGroup] node pinning skipped missing nodes for model={model_key}: {skipped}")
+    logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {usable}")
+    return usable
 
 
 def _make_megatron_actor_name(base_model: str) -> str:
@@ -273,7 +327,9 @@ class MegatronRankWorker:
 
         total_norm = total_norm_sq ** 0.5
         if self.rank == 0:
-            print(f"[Rank {self.rank}] _capture_gradients: {len(grads)} buffers, total_norm={total_norm:.6f}", flush=True)
+            logger.debug(
+                f"[Rank {self.rank}] _capture_gradients: {len(grads)} buffers, total_norm={total_norm:.6f}"
+            )
         logger.debug(f"[Rank {self.rank}] Captured {len(grads)} gradient buffers")
         return grads
 
@@ -301,7 +357,9 @@ class MegatronRankWorker:
 
         total_norm = total_norm_sq ** 0.5
         if self.rank == 0:
-            print(f"[Rank {self.rank}] _restore_gradients: restored {idx} buffers, total_norm={total_norm:.6f}", flush=True)
+            logger.debug(
+                f"[Rank {self.rank}] _restore_gradients: restored {idx} buffers, total_norm={total_norm:.6f}"
+            )
         logger.debug(f"[Rank {self.rank}] Restored {idx} gradient buffers")
 
     def _capture_optimizer_state(self) -> dict:
@@ -1264,16 +1322,22 @@ class MegatronRankWorker:
 
             # DEBUG: Log result structure
             if result:
-                print(f"[Rank {self.rank} DEBUG] forward_backward_batch result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}", flush=True)
+                logger.debug(
+                    f"[Rank {self.rank} DEBUG] forward_backward_batch result keys: "
+                    f"{list(result.keys()) if isinstance(result, dict) else type(result)}"
+                )
                 if isinstance(result, dict):
                     losses = result.get("loss", [])
-                    print(f"[Rank {self.rank} DEBUG] losses: {losses}", flush=True)
+                    logger.debug(f"[Rank {self.rank} DEBUG] losses: {losses}")
                     metrics = result.get("metrics", {})
-                    print(f"[Rank {self.rank} DEBUG] metrics keys: {list(metrics.keys())}", flush=True)
+                    logger.debug(f"[Rank {self.rank} DEBUG] metrics keys: {list(metrics.keys())}")
                     log_probs_list = metrics.get("log_probs", [])
-                    print(f"[Rank {self.rank} DEBUG] log_probs_list len: {len(log_probs_list)}, first is None: {log_probs_list[0] is None if log_probs_list else 'empty'}", flush=True)
+                    logger.debug(
+                        f"[Rank {self.rank} DEBUG] log_probs_list len: {len(log_probs_list)}, "
+                        f"first is None: {log_probs_list[0] is None if log_probs_list else 'empty'}"
+                    )
             else:
-                print(f"[Rank {self.rank} DEBUG] forward_backward_batch returned empty/None result", flush=True)
+                logger.debug(f"[Rank {self.rank} DEBUG] forward_backward_batch returned empty/None result")
 
             # Log memory after forward-backward (peak usage during training)
             self.log_memory_breakdown("after_forward_backward")
@@ -1446,7 +1510,7 @@ class MegatronRankWorker:
             debug_metrics = {}
             if result and isinstance(result, dict):
                 metrics = result.get("metrics", {})
-                print(f"[Rank {self.rank} DEBUG] Available metric keys: {list(metrics.keys())}", flush=True)
+                logger.debug(f"[Rank {self.rank} DEBUG] Available metric keys: {list(metrics.keys())}")
 
                 # Debug metrics are stored as lists (one per micro-batch)
                 # Take the last value from each list (most recent micro-batch)
@@ -1455,7 +1519,7 @@ class MegatronRankWorker:
                            "training/rollout_actor_probs_pearson_corr"]:
                     if key in metrics:
                         values = metrics[key]
-                        print(f"[Rank {self.rank} DEBUG] Found {key}: {values}", flush=True)
+                        logger.debug(f"[Rank {self.rank} DEBUG] Found {key}: {values}")
                         # metrics[key] is a list, take the last (or average)
                         if isinstance(values, list) and values:
                             # Average debug metrics across micro-batches
@@ -1474,9 +1538,9 @@ class MegatronRankWorker:
                             if values is not None and isinstance(values, (int, float)):
                                 debug_metrics[f"{key}:mean"] = float(values)
                     else:
-                        print(f"[Rank {self.rank} DEBUG] Key {key} NOT found in metrics", flush=True)
+                        logger.debug(f"[Rank {self.rank} DEBUG] Key {key} NOT found in metrics")
 
-            print(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}", flush=True)
+            logger.debug(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}")
 
             # Return CPU-safe scalars and loss_fn_outputs
             result_dict = {
@@ -1491,9 +1555,9 @@ class MegatronRankWorker:
             # Add debug metrics if present
             if debug_metrics:
                 result_dict["debug_metrics"] = debug_metrics
-                print(f"[Rank {self.rank}] Debug metrics: {debug_metrics}", flush=True)
+                logger.debug(f"[Rank {self.rank}] Debug metrics: {debug_metrics}")
             else:
-                print(f"[Rank {self.rank} DEBUG] No debug metrics to add!", flush=True)
+                logger.debug(f"[Rank {self.rank} DEBUG] No debug metrics to add!")
             return result_dict
         return {}
 
@@ -3499,7 +3563,14 @@ class MegatronWorkerGroup:
         world_size = self.config.world_size
 
         # Create placement group with N GPU bundles
-        bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
+        preferred_node_ips = _preferred_worker_node_ips_for_model(self.base_model)
+        if preferred_node_ips:
+            bundles = []
+            for rank in range(world_size):
+                ip = preferred_node_ips[rank % len(preferred_node_ips)]
+                bundles.append({"GPU": 1, "CPU": 1, f"node:{ip}": 0.001})
+        else:
+            bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
         pg_name = f"{_make_megatron_actor_name(self.base_model)}_pg"
@@ -4724,6 +4795,9 @@ def get_or_create_megatron_worker_group(
             timing = os.environ.get("MINT_TIMING_DIAG")
             if timing is not None:
                 runtime_env["env_vars"]["MINT_TIMING_DIAG"] = timing
+            node_pin_json = os.environ.get("MINT_MODEL_NODE_IPS_JSON")
+            if node_pin_json:
+                runtime_env["env_vars"]["MINT_MODEL_NODE_IPS_JSON"] = node_pin_json
 
             # Create detached Ray actor with per-model name
             try:
