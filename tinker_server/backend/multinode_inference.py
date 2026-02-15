@@ -1320,19 +1320,8 @@ class MultiNodeInferenceEngine:
                 if v is not None:
                     env_vars[k] = v
 
-            # K2: vLLM prefix caching with LoRA has intermittently crashed with Triton
-            # illegal memory access on successive long-context requests. Keep it
-            # disabled by default (opt-in via env) to preserve engine liveness.
-            if self.model_name in ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16"):
-                env_vars.setdefault("MINT_VLLM_ENABLE_PREFIX_CACHING", "0")
-                # K2: FusedMoE grouped-topk kernels have been unstable (CUDA illegal
-                # memory access) in long-context LoRA sampling runs. Disable by
-                # default for engine liveness; allow opt-in via env.
-                env_vars.setdefault("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
-                # K2: Ray compiled DAG has repeatedly deadlocked mid-prefill
-                # (RayChannelTimeoutError: timed out acquiring the read lock).
-                # Disable it for this engine to avoid EngineCore death.
-                env_vars.setdefault("VLLM_DISABLE_RAY_COMPILED_DAG", "1")
+            # Performance defaults: do not disable prefix caching, grouped-topk, or
+            # Ray compiled DAG in code. If stability requires toggling, do it via env.
 
             # Expose selected vLLM debug/perf knobs via API host env without code deploys.
             for k in (

@@ -1340,7 +1340,14 @@ def _install_import_patches() -> None:
             return
     sys.meta_path.insert(0, _PatchFinder())
 
+def _env_flag(name: str, *, default: str = "0") -> bool:
+    try:
+        return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        return False
 
-_install_import_patches()
+
+if _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default="0"):
+    _install_import_patches()
 
 _maybe_set_vllm_host_ip()

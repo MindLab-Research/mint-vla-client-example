@@ -59,7 +59,7 @@ PFS_VERL_PATH = _env_nonempty(os.environ, "PFS_VERL_PATH") or _file_pfs_verl_pat
 # PFS vLLM 0.13.0 with raw logits dump instrumentation
 _file_pfs_vllm_path = _CONFIG_FILE.paths.pfs_vllm_path if _CONFIG_FILE is not None else None
 PFS_VLLM_PATH = (
-    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg"
+    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or ""
 )
 
 # Some deployments rely on the in-image vLLM wheel (with compiled `vllm._C`).
