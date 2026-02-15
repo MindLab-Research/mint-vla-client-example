@@ -59,6 +59,77 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
+## Queue Placement SOP (C1/C2)
+
+### Queue IDs (prod)
+
+| Alias | ResourceQueueId | Intended use |
+|------|------------------|--------------|
+| C1 | `q-20251126180002-26lwz` | Default GPU queue |
+| C2 | `q-20260203101340-www2h` | K2 multinode vLLM queue |
+
+### Routing policy (must hold)
+
+| Actor/workload | Queue |
+|----------------|-------|
+| K2 Megatron (`moonshotai/Kimi-K2-Instruct`) | C1 |
+| K2 vLLM (`moonshotai/Kimi-K2-Instruct`) | C2 |
+| Everything else | C1 |
+
+### Query placement (authoritative procedure)
+
+1) Query actor inventory:
+```bash
+source .secrets.env
+curl -s -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/actors | jq '.actors[] | {actor_name,actor_type,base_model,idle,current_session,num_gpus}'
+```
+
+2) Query queue-to-node IP mapping:
+```bash
+ssh mint-prod-volcano "cd /vePFS-Mindverse/share/code/tinker-server-auth && python3 - <<'PY'
+from tinker_server.backend.volc_placement import list_node_ips_for_resource_queue
+queues = {
+    'C1': 'q-20251126180002-26lwz',
+    'C2': 'q-20260203101340-www2h',
+}
+for name, rq in queues.items():
+    ips = sorted(list_node_ips_for_resource_queue(resource_queue_id=rq))
+    print(name, rq, len(ips), ','.join(ips))
+PY"
+```
+
+3) Validate K2 Megatron run placement by run window (model_id-scoped):
+```bash
+mid='<k2_model_id>'
+start_line=$(ssh mint-prod-volcano "rg -n '\\[$mid\\] Creating MegatronWorkerGroup' /tmp/tinker_server_auth.log | tail -n1 | cut -d: -f1")
+ssh mint-prod-volcano "printf 'c2_megatron_lines='; tail -n +${start_line} /tmp/tinker_server_auth.log | rg '\\(MegatronRankWorker pid=[0-9]+, ip=192\\.168\\.33\\.(163|164|165|166|167|168|169|170)\\)' | wc -l"
+ssh mint-prod-volcano "printf 'c1_megatron_lines='; tail -n +${start_line} /tmp/tinker_server_auth.log | rg '\\(MegatronRankWorker pid=[0-9]+, ip=192\\.168\\.33\\.(43|45|47|48|50|51|55|56|57|58|59|60|142|144|146|147)\\)' | wc -l"
+```
+
+Expected for K2 Megatron: `c2_megatron_lines=0`, `c1_megatron_lines>0`.
+
+### Ensure placement (configuration + recycle actors)
+
+Set queue env vars in prod `.secrets.env`:
+```bash
+MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
+MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID=q-20260203101340-www2h
+```
+
+Apply and recycle K2 actors:
+```bash
+source .secrets.env
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
+curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"actor_type":"megatron","model_name":"moonshotai/Kimi-K2-Instruct"}' \
+  http://localhost:18000/api/v1/actors/kill
+curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"actor_type":"vllm","model_name":"moonshotai/Kimi-K2-Instruct"}' \
+  http://localhost:18000/api/v1/actors/kill
+```
+
+Then recreate actors as needed and re-run placement checks above.
+
 **Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint.macaron.im`. No additional setup required.
 
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
@@ -191,10 +262,11 @@ export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
 
 # Persistent actors (server startup prewarm; eviction-protected)
 # Configure these in `.secrets.env` and restart the server to apply.
-export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,moonshotai/Kimi-K2-Thinking"
+export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,moonshotai/Kimi-K2-Instruct"
 export MINT_PERSISTENT_TRAIN_LORA_RANK=16
 export MINT_PERSISTENT_TRAIN_LR=5e-5
 export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
+export MINT_MEGATRON_EVICT_PROTECTED=1  # allow full-cluster Megatron to preempt idle protected actors
 ```
 
 ### Multi-target Model Routing (Gateway)
@@ -202,7 +274,7 @@ export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 Prod can run as a gateway/router that forwards selected base models to other tinker-server deployments.
 
 Deployment targets (current plan):
-- `mint-prod-volcano` (this server): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`, `moonshotai/Kimi-K2-Thinking`
+- `mint-prod-volcano` (this server): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`, `moonshotai/Kimi-K2-Instruct`
 - `mint-prod-aliyun`: `Qwen/Qwen3-235B-A22B-Instruct-2507`
 
 Router config (set on `mint-prod-volcano` only):

@@ -1595,11 +1595,12 @@ class VerlTrainingEngine:
         if use_megatron:
             import asyncio
             # MoE models need tensor/expert parallelism from model registry
-            from .model_registry import get_training_parallelism, requires_fp8
+            from .model_registry import get_training_parallelism, get_model_config
 
             # Get model-specific parallelism and FP8 config from registry
-            train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or "")
-            use_fp8 = requires_fp8(requested_model or "")
+            cfg = get_model_config(requested_model or base_model or "")
+            train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or base_model or "")
+            use_fp8 = bool(getattr(cfg, "train_use_fp8", False))
             distributed_config = DistributedConfig(
                 tensor_parallel_size=train_tp,
                 pipeline_parallel_size=train_pp,
@@ -1788,10 +1789,24 @@ class VerlTrainingEngine:
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
 
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+
         # Remote call - pass session_id for stateless trainer pattern
-        pending = worker.forward_backward.remote(
-            data_items, loss_fn, loss_fn_config, session.model_id
-        )
+        if session.backend == "megatron":
+            pending = worker.forward_backward.remote(
+                data_items,
+                loss_fn,
+                loss_fn_config,
+                session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        else:
+            pending = worker.forward_backward.remote(data_items, loss_fn, loss_fn_config, session.model_id)
         result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
@@ -1824,8 +1839,22 @@ class VerlTrainingEngine:
         # ForwardRequest uses forward_input (not forward_backward_input)
         data_items = [item.model_dump() for item in request.forward_input.data]
 
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+
         # Remote call - pass session_id for stateless trainer pattern
-        pending = worker.forward.remote(data_items, session.model_id)
+        if session.backend == "megatron":
+            pending = worker.forward.remote(
+                data_items,
+                session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        else:
+            pending = worker.forward.remote(data_items, session.model_id)
         result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         logger.info(f"[{model_id}] forward completed")
@@ -1873,8 +1902,22 @@ class VerlTrainingEngine:
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
 
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+
         # Remote call - pass session_id for stateless trainer pattern
-        pending = worker.optim_step.remote(lr, session.model_id)
+        if session.backend == "megatron":
+            pending = worker.optim_step.remote(
+                lr,
+                session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        else:
+            pending = worker.optim_step.remote(lr, session.model_id)
         result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
@@ -1919,6 +1962,11 @@ class VerlTrainingEngine:
         loss_fn_config = request.forward_backward_input.loss_fn_config or {}
         lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
 
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+
         # Only MoE models use the combined MegatronWorkerGroup.train_step path.
         # Avoid importing megatron_training on CPU-only API hosts (Aliyun gateway).
         is_moe = False
@@ -1936,16 +1984,37 @@ class VerlTrainingEngine:
                 loss_fn_config,
                 lr,
                 session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
             result = await self._await_with_keepalive(pending, session, interval_s=30.0)
         else:
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
-            fb_pending = worker.forward_backward.remote(
-                data_items, loss_fn, loss_fn_config, session.model_id
-            )
+            if session.backend == "megatron":
+                fb_pending = worker.forward_backward.remote(
+                    data_items,
+                    loss_fn,
+                    loss_fn_config,
+                    session.model_id,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+            else:
+                fb_pending = worker.forward_backward.remote(data_items, loss_fn, loss_fn_config, session.model_id)
             fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
-            opt_pending = worker.optim_step.remote(lr, session.model_id)
+            if session.backend == "megatron":
+                opt_pending = worker.optim_step.remote(
+                    lr,
+                    session.model_id,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+            else:
+                opt_pending = worker.optim_step.remote(lr, session.model_id)
             opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
 
             # Merge results
@@ -2036,7 +2105,85 @@ class VerlTrainingEngine:
         import os
 
         save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        if session.backend == "megatron":
+            return await self.save_lora_weights_for_sampler(
+                session, save_path, use_per_expert_lora=use_per_expert_lora
+            )
         return await self.save_weights(session, save_path, use_per_expert_lora=use_per_expert_lora)
+
+    async def save_lora_weights_for_sampler(
+        self,
+        session: TrainingSession,
+        save_path: str,
+        use_per_expert_lora: bool = False,
+    ) -> str:
+        """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
+        import asyncio
+        import os
+
+        import ray
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+        abs_path = os.path.abspath(save_path)
+
+        try:
+            from .model_registry import get_model_config
+
+            train_gpus = get_model_config(session.base_model).train_gpus
+        except Exception:
+            train_gpus = 1
+
+        if train_gpus >= 32:
+            default_timeout_s = 3600
+        elif train_gpus >= 16:
+            default_timeout_s = 1800
+        elif train_gpus >= 4:
+            default_timeout_s = 600
+        else:
+            default_timeout_s = 300
+        timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
+
+        loop = asyncio.get_running_loop()
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        try:
+            meta_ref = worker.save_lora_weights.remote(
+                abs_path,
+                use_per_expert_lora=use_per_expert_lora,
+                session_id=session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        except TypeError:
+            meta_ref = worker.save_lora_weights.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
+        except AttributeError:
+            # Backward-compat: existing detached Megatron actors may be running older code
+            # without save_lora_weights(). Fall back to save_checkpoint() so callers can
+            # still export weights without killing the actor.
+            logger.warning(
+                f"[{model_id}] save_lora_weights_for_sampler: actor missing save_lora_weights; "
+                "falling back to save_checkpoint()"
+            )
+            try:
+                meta_ref = worker.save_checkpoint.remote(
+                    abs_path,
+                    use_per_expert_lora=use_per_expert_lora,
+                    session_id=session.model_id,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+            except TypeError:
+                meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
+        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
+        session.current_step = meta.get("current_step", session.current_step)
+
+        logger.info(f"[{model_id}] save_lora_weights_for_sampler: {abs_path}")
+        return abs_path
 
     async def save_weights(
         self,

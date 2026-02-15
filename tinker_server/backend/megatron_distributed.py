@@ -122,7 +122,7 @@ class DistributedConfig:
         if etp is None:
             etp = self.tensor_parallel_size
 
-        if self.expert_parallel_size > self.tensor_parallel_size and etp < self.tensor_parallel_size:
+        if self.expert_parallel_size >= self.tensor_parallel_size and etp < self.tensor_parallel_size:
             # MoE Parallel Folding with ETP: TP is subgroup within EP
             return (
                 self.expert_parallel_size
@@ -665,6 +665,7 @@ class MegatronRankWorker:
     def _initialize_distributed(self):
         """Initialize torch.distributed with NCCL backend."""
         import torch
+        from datetime import timedelta
 
         logger.info(f"[Rank {self.rank}] _initialize_distributed starting...")
 
@@ -683,11 +684,19 @@ class MegatronRankWorker:
             f"master={master_addr}:{master_port}, world_size={self.world_size}"
         )
 
+        # K2 / multi-node runs can spend >10 minutes in HF->Megatron weight loading before the
+        # first NCCL communicator is fully established. torch.distributed defaults (10 min) can
+        # time out during the initial collectives, causing the whole worker group to die.
+        #
+        # Keep a per-worker override so operators can tune without code changes.
+        timeout_s = int(os.environ.get("MINT_TORCH_DIST_TIMEOUT_S") or (3600 if self.world_size >= 32 else 600))
+
         torch.distributed.init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_addr}:{master_port}",
             world_size=self.world_size,
             rank=self.rank,
+            timeout=timedelta(seconds=timeout_s),
         )
 
         logger.info(f"[Rank {self.rank}] torch.distributed initialized")
@@ -818,7 +827,19 @@ class MegatronRankWorker:
             )
 
         override_tf_config["deallocate_pipeline_outputs"] = True
-        override_tf_config["gradient_accumulation_fusion"] = True
+        grad_accum_fusion_available = False
+        try:
+            import fused_weight_gradient_mlp_cuda  # noqa: F401
+
+            grad_accum_fusion_available = True
+        except Exception:
+            grad_accum_fusion_available = False
+        override_tf_config["gradient_accumulation_fusion"] = grad_accum_fusion_available
+        if not grad_accum_fusion_available:
+            logger.info(
+                f"[Rank {self.rank}] fused_weight_gradient_mlp_cuda not found; "
+                "gradient_accumulation_fusion=False"
+            )
         override_tf_config["persist_layer_norm"] = True
         override_tf_config["bias_activation_fusion"] = True
         override_tf_config["bias_dropout_fusion"] = True
@@ -833,6 +854,14 @@ class MegatronRankWorker:
         # FP8 is configured via override_transformer_config (not override_mcore_model_config)
         # because TransformerConfig.fp8 and .fp8_param control FP8 during model creation
         if self.config.use_fp8:
+            import torch
+
+            major, minor = torch.cuda.get_device_capability()
+            if (major, minor) < (8, 9):
+                raise ValueError(
+                    f"FP8 requested (train_use_fp8=True) but GPU compute capability is {major}.{minor}. "
+                    "TransformerEngine FP8 requires compute capability >= 8.9."
+                )
             # Use e4m3 format for FP8 (8-bit floating point with 4-bit exponent, 3-bit mantissa)
             # fp8_param=True stores parameters in FP8 precision for memory savings
             # use_cpu_initialization=True initializes on CPU first, then converts to FP8 before GPU transfer
@@ -1703,7 +1732,14 @@ class MegatronRankWorker:
             }
         return {}
 
-    def optim_step(self, learning_rate: float, session_id: str | None = None) -> dict:
+    def optim_step(
+        self,
+        learning_rate: float,
+        session_id: str | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
         """Run optimizer step (synchronized across ranks).
 
         Restores session's cached gradients before applying optimizer step.
@@ -1714,6 +1750,10 @@ class MegatronRankWorker:
         BEFORE forward_backward/optim_step. This method only needs to restore
         this session's cached gradients from the most recent forward_backward.
         """
+        train_attn = True if train_attn is None else bool(train_attn)
+        train_mlp = True if train_mlp is None else bool(train_mlp)
+        train_unembed = True if train_unembed is None else bool(train_unembed)
+
         # Use train_mode context to ensure model/gradients are on GPU (required for param_offload)
         # IMPORTANT: verl zeros gradients on train_mode entry.
         # We must restore cached gradients before optimizer_step.
@@ -1749,6 +1789,20 @@ class MegatronRankWorker:
             # 2. Apply gradients
             grad_norm = self.engine.optimizer_step()
             current_lr = self.engine.lr_scheduler_step()
+
+            # Enforce disabled LoRA targets as exact zero. This keeps train/inference behavior
+            # consistent even though the optimizer state includes all LoRA params.
+            try:
+                from verl.utils.megatron_utils import unwrap_model
+
+                model = unwrap_model(self.engine.module)
+                while isinstance(model, list):
+                    model = model[0]
+                self._zero_disabled_lora_params(
+                    model, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+                )
+            except Exception:
+                pass
 
             # Log memory after optimizer step
             self.log_memory_breakdown("after_optim_step")
@@ -1810,27 +1864,185 @@ class MegatronRankWorker:
 
             When use_per_expert_lora=True, we expand the shared weights to per-expert format
             by replicating the shared weights for each expert. This ensures train-inference
-            consistency but may use more memory during inference.
+        consistency but may use more memory during inference.
         """
+        import os
+
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
 
         # ========== Try HollowMan Megatron-Bridge export_adapter_weights API ==========
         # This is enabled via USE_MBRIDGE_LORA_EXPORT=true environment variable which
         # prepends HollowMan fork to PYTHONPATH
         bridge = getattr(self.engine, 'bridge', None)
-        if bridge is not None and hasattr(bridge, 'export_adapter_weights'):
+        try:
+            model_is_moe = get_model_config(self.base_model).is_moe
+        except Exception:
+            model_is_moe = False
+
+        # For MoE models when we are NOT exporting per-expert LoRA (train_mlp=False),
+        # avoid export_adapter_weights: it materializes the entire MLP LoRA tree
+        # (hundreds of thousands of tensors) even though we will filter it out.
+        if model_is_moe and not use_per_expert_lora and bridge is not None and hasattr(bridge, 'export_adapter_weights'):
+            logger.info(
+                f"[Rank {self.rank}] Skipping Megatron-Bridge export_adapter_weights API (MoE attention-only export)"
+            )
+        if bridge is not None and hasattr(bridge, 'export_adapter_weights') and not (model_is_moe and not use_per_expert_lora):
             logger.info(f"[Rank {self.rank}] Using Megatron-Bridge export_adapter_weights API")
             adapter_state = {}
+
+            shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+            shared_export = (
+                bool(model_is_moe)
+                and bool(use_per_expert_lora)
+                and shared_mode not in {"0", "false", "no"}
+            )
+            import re
+
+            expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
 
             with self.engine.eval_mode():
                 for name, tensor in bridge.export_adapter_weights(self.engine.module, cpu=True, show_progress=False):
                     if self.rank == 0:
+                        if shared_export:
+                            m = expert_pat.search(name)
+                            if m is not None and int(m.group(1)) != 0:
+                                continue
                         adapter_state[name] = tensor.clone()
 
             # Non-rank-0 workers return empty dict
             if self.rank != 0:
                 logger.info(f"[Rank {self.rank}] get_lora_state_dict: returning empty dict (non-rank-0)")
                 return {}
+
+            if model_is_moe and not use_per_expert_lora:
+                before = len(adapter_state)
+                adapter_state = {
+                    k: v
+                    for k, v in adapter_state.items()
+                    if (".mlp." not in k and ".experts." not in k)
+                }
+                logger.info(f"[Rank 0] Filtered {before - len(adapter_state)} MLP/expert params (export_adapter_weights)")
+
+            # For MoE models exporting per-expert LoRA, the full per-expert tree can be
+            # extremely large (K2: ~140k tensors, ~77GB). In current Megatron-Bridge
+            # integration, expert LoRA weights are shared within each EP shard; exporting
+            # only one representative expert per EP shard is sufficient for vLLM, and
+            # vLLM will fill missing experts (patched via sitecustomize).
+            if model_is_moe and use_per_expert_lora:
+                import os
+                import re
+
+                if os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0":
+                    # Determine EP size.
+                    try:
+                        from megatron.core import parallel_state as mpu
+
+                        ep_size = int(mpu.get_expert_model_parallel_world_size())
+                    except Exception:
+                        ep_size = 1
+
+                    # Determine num_experts.
+                    num_experts = 0
+                    if ep_size > 1:
+                        try:
+                            from transformers import AutoConfig
+
+                            hf_config = AutoConfig.from_pretrained(
+                                self.base_model, trust_remote_code=True
+                            )
+                            num_experts = int(
+                                getattr(hf_config, "num_experts", None)
+                                or getattr(hf_config, "n_routed_experts", 0)
+                                or 0
+                            )
+                        except Exception:
+                            num_experts = 0
+
+                    if ep_size > 1 and num_experts > 0:
+                        base = num_experts // ep_size
+                        rem = num_experts % ep_size
+                        reps = {
+                            (r * base + min(r, rem))
+                            for r in range(ep_size)
+                            if (base + (1 if r < rem else 0)) > 0
+                        }
+
+                        # Keep all non-expert keys + only representative expert keys.
+                        expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
+                        before = len(adapter_state)
+                        dropped = 0
+                        filtered = {}
+                        for k, v in adapter_state.items():
+                            m = expert_pat.search(k)
+                            if m is None:
+                                filtered[k] = v
+                                continue
+                            idx = int(m.group(1))
+                            if idx in reps:
+                                filtered[k] = v
+                            else:
+                                dropped += 1
+
+                        adapter_state = filtered
+                        logger.info(
+                            f"[Rank 0] Sparse expert export (export_adapter_weights): "
+                            f"ep_size={ep_size} num_experts={num_experts} kept_experts={len(reps)} "
+                            f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
+                        )
+
+                # If expert LoRA weights are globally shared (all experts identical),
+                # exporting per-expert keys is pure duplication (K2 can be tens of GB).
+                # Keep only expert 0 and rely on vLLM to broadcast missing experts
+                # (patched via sitecustomize) to avoid OOM during LoRA hot-load.
+                mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+                if mode not in {"0", "false", "no"}:
+                    do_shared_export = mode in {"1", "true", "yes"}
+                    if not do_shared_export and mode in {"auto", ""}:
+                        try:
+                            import torch
+
+                            checks = 0
+                            shared = True
+                            for k, v in adapter_state.items():
+                                if ".mlp.experts.0." not in k and ".mlp.shared_experts.0." not in k:
+                                    continue
+                                k1 = (
+                                    k.replace(".mlp.experts.0.", ".mlp.experts.1.")
+                                    .replace(".mlp.shared_experts.0.", ".mlp.shared_experts.1.")
+                                )
+                                if k1 not in adapter_state:
+                                    continue
+                                v1 = adapter_state[k1]
+                                if v.shape != v1.shape or v.dtype != v1.dtype or not torch.equal(v, v1):
+                                    shared = False
+                                    break
+                                checks += 1
+                                if checks >= 5:
+                                    break
+                            do_shared_export = shared and checks > 0
+                        except Exception:
+                            do_shared_export = False
+
+                    if do_shared_export:
+                        expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+                        before = len(adapter_state)
+                        dropped = 0
+                        filtered = {}
+                        for k, v in adapter_state.items():
+                            m = expert_pat.search(k)
+                            if m is None:
+                                filtered[k] = v
+                                continue
+                            idx = int(m.group(1))
+                            if idx == 0:
+                                filtered[k] = v
+                            else:
+                                dropped += 1
+                        adapter_state = filtered
+                        logger.info(
+                            f"[Rank 0] Shared-expert export (export_adapter_weights): kept_expert=0 "
+                            f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
+                        )
 
             logger.info(f"[Rank 0] export_adapter_weights returned {len(adapter_state)} params")
             return adapter_state
@@ -1940,14 +2152,11 @@ class MegatronRankWorker:
             tensor = tensor.to(device) if not tensor.is_cuda else tensor
 
             if split_dim == 0:
-                # Gather along first dimension (ColumnParallel lora_B)
-                # Output shape: [tp_size * local_size, ...]
-                local_shape = list(tensor.shape)
-                gathered_shape = local_shape.copy()
-                gathered_shape[0] *= tp_size
-                output = torch.empty(gathered_shape, dtype=tensor.dtype, device=device)
-                dist.all_gather_into_tensor(output, tensor.contiguous(), group=tp_group)
-                return output
+                # Prefer list-based all_gather over all_gather_into_tensor: the latter
+                # has been observed to hang in large EP-folded configurations.
+                gathered_list = [torch.empty_like(tensor) for _ in range(tp_size)]
+                dist.all_gather(gathered_list, tensor.contiguous(), group=tp_group)
+                return torch.cat(gathered_list, dim=0)
             else:
                 # Gather along other dimension (RowParallel lora_A, fused lora_B)
                 # Need to use all_gather then cat
@@ -2038,6 +2247,12 @@ class MegatronRankWorker:
             model_is_moe = False
 
         skip_mlp_params = model_is_moe and not use_per_expert_lora
+        if self.rank == 0:
+            print(
+                f"[Rank 0] get_lora_state_dict groups: tp_size={tp_size} etp_size={etp_size} "
+                f"ep_size={ep_size} use_per_expert_lora={use_per_expert_lora} skip_mlp={skip_mlp_params}",
+                flush=True,
+            )
 
         import os
 
@@ -2093,6 +2308,7 @@ class MegatronRankWorker:
 
                 all_param_names = []
                 lora_param_names = []
+                lora_seen = 0
 
                 for name, param in unwrapped.named_parameters():
                     all_param_names.append(name)
@@ -2100,6 +2316,12 @@ class MegatronRankWorker:
                     name_lower = name.lower()
                     if '.adapter.' in name_lower or 'lora_a' in name_lower or 'lora_b' in name_lower:
                         lora_param_names.append(name)
+                        lora_seen += 1
+                        if self.rank == 0 and (lora_seen == 1 or lora_seen % 500 == 0):
+                            print(
+                                f"[Rank 0] get_lora_state_dict progress: lora_seen={lora_seen} last={name}",
+                                flush=True,
+                            )
                         original_shape = list(param.data.shape)
                         do_debug_param = debug_lora_export and (len(lora_param_names) <= debug_lora_export_max_params)
 
@@ -2297,10 +2519,41 @@ class MegatronRankWorker:
         mlp_filtered_count = 0
         mlp_expanded_count = 0
 
-        # Calculate experts per EP rank (for EP-indexed expansion)
-        experts_per_ep_rank = num_experts // ep_size if ep_size > 1 and num_experts > 0 else num_experts
+        import os
 
-        logger.info(f"[Rank 0] Processing {len(adapter_state)} params from adapter_state (ep_size={ep_size}, experts_per_ep_rank={experts_per_ep_rank})")
+        def _ep_rank_to_expert_range(ep_rank_idx: int, *, ep_size: int, num_experts: int) -> tuple[int, int]:
+            """Map an EP rank to its contiguous expert ID range (linear placement).
+
+            Mirrors vLLM's `determine_expert_map(..., expert_placement_strategy='linear')`.
+            """
+            if ep_size <= 1:
+                return 0, num_experts
+            base = num_experts // ep_size
+            rem = num_experts % ep_size
+            start = ep_rank_idx * base + min(ep_rank_idx, rem)
+            local = base + 1 if ep_rank_idx < rem else base
+            end = min(num_experts, start + local)
+            return start, end
+
+        sparse_expert_export = (
+            bool(model_is_moe)
+            and bool(use_per_expert_lora)
+            and num_experts > 0
+            and ep_size > 1
+            and os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0"
+        )
+        expert_representatives = []
+        if sparse_expert_export:
+            for i in range(ep_size):
+                s, e = _ep_rank_to_expert_range(i, ep_size=ep_size, num_experts=num_experts)
+                if s < e:
+                    expert_representatives.append(s)
+
+        logger.info(
+            f"[Rank 0] Processing {len(adapter_state)} params from adapter_state "
+            f"(ep_size={ep_size}, sparse_expert_export={sparse_expert_export}, "
+            f"expert_representatives={len(expert_representatives)})"
+        )
 
         # First pass: group EP-indexed keys by base name
         ep_grouped_params = {}  # base_name -> {ep_rank: tensor}
@@ -2339,9 +2592,11 @@ class MegatronRankWorker:
 
                         # Expand with correct EP rank -> expert index mapping
                         for ep_rank_idx, tensor in ep_tensors.items():
-                            # Calculate expert range for this EP rank
-                            expert_start = ep_rank_idx * experts_per_ep_rank
-                            expert_end = min(expert_start + experts_per_ep_rank, num_experts)
+                            expert_start, expert_end = _ep_rank_to_expert_range(
+                                ep_rank_idx, ep_size=ep_size, num_experts=num_experts
+                            )
+                            if expert_start >= expert_end:
+                                continue
 
                             if '.lora_A.' in peft_name:
                                 gate_tensor = tensor
@@ -2353,22 +2608,33 @@ class MegatronRankWorker:
                             else:
                                 continue
 
-                            # Assign to specific expert indices
-                            for expert_idx in range(expert_start, expert_end):
-                                gate_expert_name = gate_peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
-                                up_expert_name = up_peft_name.replace('.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.')
+                            rep_experts = [expert_start] if sparse_expert_export else range(expert_start, expert_end)
+                            for expert_idx in rep_experts:
+                                gate_expert_name = gate_peft_name.replace(
+                                    '.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.'
+                                )
+                                up_expert_name = up_peft_name.replace(
+                                    '.mlp.up_proj.', f'.mlp.experts.{expert_idx}.up_proj.'
+                                )
                                 lora_state_dict[gate_expert_name] = gate_tensor.clone()
                                 lora_state_dict[up_expert_name] = up_tensor.clone()
                                 mlp_expanded_count += 2
 
-                        logger.info(f"[Rank 0] EP-expanded fused MLP LoRA to {len(ep_tensors) * experts_per_ep_rank * 2} per-expert weights")
+                        logger.info(
+                            f"[Rank 0] EP-expanded fused MLP LoRA for {len(ep_tensors)} EP shards "
+                            f"(sparse={sparse_expert_export})"
+                        )
                     else:
                         # Non-fused modules with EP-aware expansion
                         for ep_rank_idx, tensor in ep_tensors.items():
-                            expert_start = ep_rank_idx * experts_per_ep_rank
-                            expert_end = min(expert_start + experts_per_ep_rank, num_experts)
+                            expert_start, expert_end = _ep_rank_to_expert_range(
+                                ep_rank_idx, ep_size=ep_size, num_experts=num_experts
+                            )
+                            if expert_start >= expert_end:
+                                continue
 
-                            for expert_idx in range(expert_start, expert_end):
+                            rep_experts = [expert_start] if sparse_expert_export else range(expert_start, expert_end)
+                            for expert_idx in rep_experts:
                                 # Insert expert index into path
                                 if '.mlp.gate_proj.' in peft_name:
                                     expert_peft_name = peft_name.replace('.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.')
@@ -2381,7 +2647,9 @@ class MegatronRankWorker:
                                 lora_state_dict[expert_peft_name] = tensor.clone()
                                 mlp_expanded_count += 1
 
-                        logger.info(f"[Rank 0] EP-expanded MLP LoRA: {base_name} -> {num_experts} experts")
+                        logger.info(
+                            f"[Rank 0] EP-expanded MLP LoRA: {base_name} (sparse={sparse_expert_export})"
+                        )
                 elif is_shared_expert:
                     # Shared expert (EP rank 0 only for shared experts)
                     if 0 in ep_tensors:
@@ -2442,7 +2710,11 @@ class MegatronRankWorker:
                         else:
                             # Routed experts: expand both gate and up to per-expert format
                             for proj_name, proj_tensor in [(gate_peft_name, gate_tensor), (up_peft_name, up_tensor)]:
-                                expanded_names = self._expand_shared_to_per_expert(proj_name, num_experts)
+                                expanded_names = self._expand_shared_to_per_expert(
+                                    proj_name,
+                                    num_experts,
+                                    expert_indices=expert_representatives if sparse_expert_export else None,
+                                )
                                 for expanded_name in expanded_names:
                                     lora_state_dict[expanded_name] = proj_tensor.clone()
                                     mlp_expanded_count += 1
@@ -2455,7 +2727,11 @@ class MegatronRankWorker:
                             logger.info(f"[Rank 0] Added shared_expert MLP LoRA: {peft_name}")
                         else:
                             # Routed experts: expand to per-expert
-                            expanded_names = self._expand_shared_to_per_expert(peft_name, num_experts)
+                            expanded_names = self._expand_shared_to_per_expert(
+                                peft_name,
+                                num_experts,
+                                expert_indices=expert_representatives if sparse_expert_export else None,
+                            )
                             for expanded_name in expanded_names:
                                 lora_state_dict[expanded_name] = tensor.clone()
                                 mlp_expanded_count += 1
@@ -2514,6 +2790,60 @@ class MegatronRankWorker:
             for key in list(lora_state_dict.keys())[:10]:
                 tensor = lora_state_dict[key]
                 logger.info(f"[Rank 0] FINAL PEFT {key}: shape={list(tensor.shape)}")
+
+        if model_is_moe and use_per_expert_lora and lora_state_dict:
+            import os
+            import re
+
+            mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+            if mode not in {"0", "false", "no"}:
+                do_shared_export = mode in {"1", "true", "yes"}
+                if not do_shared_export and mode in {"auto", ""}:
+                    try:
+                        import torch
+
+                        checks = 0
+                        shared = True
+                        for k, v in lora_state_dict.items():
+                            if ".mlp.experts.0." not in k and ".mlp.shared_experts.0." not in k:
+                                continue
+                            k1 = (
+                                k.replace(".mlp.experts.0.", ".mlp.experts.1.")
+                                .replace(".mlp.shared_experts.0.", ".mlp.shared_experts.1.")
+                            )
+                            if k1 not in lora_state_dict:
+                                continue
+                            v1 = lora_state_dict[k1]
+                            if v.shape != v1.shape or v.dtype != v1.dtype or not torch.equal(v, v1):
+                                shared = False
+                                break
+                            checks += 1
+                            if checks >= 5:
+                                break
+                        do_shared_export = shared and checks > 0
+                    except Exception:
+                        do_shared_export = False
+
+                if do_shared_export:
+                    expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+                    before = len(lora_state_dict)
+                    dropped = 0
+                    filtered = {}
+                    for k, v in lora_state_dict.items():
+                        m = expert_pat.search(k)
+                        if m is None:
+                            filtered[k] = v
+                            continue
+                        idx = int(m.group(1))
+                        if idx == 0:
+                            filtered[k] = v
+                        else:
+                            dropped += 1
+                    lora_state_dict = filtered
+                    logger.info(
+                        f"[Rank 0] Shared-expert export (custom extract): kept_expert=0 "
+                        f"dropped_keys={dropped} before={before} after={len(lora_state_dict)}"
+                    )
 
         return lora_state_dict
 
@@ -2637,7 +2967,9 @@ class MegatronRankWorker:
         peft_name = f"base_model.model.model.layers.{layer_num}.{target}.{lora_type}.weight"
         return peft_name
 
-    def _expand_shared_to_per_expert(self, peft_name: str, num_experts: int) -> list[str]:
+    def _expand_shared_to_per_expert(
+        self, peft_name: str, num_experts: int, *, expert_indices: list[int] | None = None
+    ) -> list[str]:
         """Expand shared MLP LoRA to per-expert format for vLLM FusedMoEWithLoRA.
 
         Megatron-Bridge exports shared LoRA (single adapter for all experts):
@@ -2674,7 +3006,8 @@ class MegatronRankWorker:
             # Insert experts.{i}. after .mlp.
             prefix = peft_name[:mlp_match.end(1)]  # ...mlp.
             suffix = peft_name[mlp_match.end(1):]  # gate_proj.lora_A.weight
-            return [f"{prefix}experts.{i}.{suffix}" for i in range(num_experts)]
+            idxs = expert_indices if expert_indices is not None else list(range(num_experts))
+            return [f"{prefix}experts.{i}.{suffix}" for i in idxs]
 
         # If already has experts in path, just return the original
         if '.experts.' in peft_name:
@@ -2845,7 +3178,13 @@ class MegatronRankWorker:
             "non_lora_names": non_lora_names,
         }
 
-    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+    def reinit_lora_weights(
+        self,
+        learning_rate: float | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.
 
         Uses verl's default initialization:
@@ -2869,7 +3208,14 @@ class MegatronRankWorker:
         import torch.nn.init as init
         from megatron.core.optimizer import ChainedOptimizer
 
-        logger.info(f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate})")
+        train_attn = True if train_attn is None else bool(train_attn)
+        train_mlp = True if train_mlp is None else bool(train_mlp)
+        train_unembed = True if train_unembed is None else bool(train_unembed)
+
+        logger.info(
+            f"[Rank {self.rank}] reinit_lora_weights: ENTRY (lr={learning_rate}, "
+            f"train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
+        )
 
         # NOTE: Do NOT clear _session_gradients or _session_optimizer_states here!
         # Those contain saved state for OTHER sessions that must persist.
@@ -2888,8 +3234,11 @@ class MegatronRankWorker:
             while isinstance(model, list):
                 model = model[0]
 
-            # Find and reinitialize all LoRA parameters
-            skipped = []
+            # Keep only LoRA/adapter params trainable (stable optimizer param ordering across sessions).
+            self._freeze_non_lora_params(model)
+
+            # Find and reinitialize trainable LoRA parameters
+            skipped: list[str] = []
             for name, param in model.named_parameters():
                 name_lower = name.lower()
                 if 'lora' not in name_lower and 'adapter' not in name_lower:
@@ -2913,8 +3262,12 @@ class MegatronRankWorker:
                 else:
                     skipped.append(name)
 
-            # Ensure only LoRA parameters are trainable
-            self._freeze_non_lora_params(model)
+            # Keep disabled LoRA targets at exact zero so they do not affect forward passes.
+            zeroed = self._zero_disabled_lora_params(
+                model, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+            )
+            if self.rank == 0 and zeroed:
+                print(f"[Rank 0] reinit_lora_weights: zeroed_disabled_lora_params={zeroed}", flush=True)
 
             # Zero gradients
             if hasattr(self.engine, 'optimizer') and self.engine.optimizer is not None:
@@ -3011,22 +3364,79 @@ class MegatronRankWorker:
             )
         return {"status": "ok", "reinit_count": reinit_count, "opt_state_reset": opt_state_reset_count, "lr_updated": lr_updated, "learning_rate": learning_rate}
 
+    @staticmethod
+    def _classify_lora_param_target(name_lower: str) -> str:
+        # MLP / experts
+        if ".mlp." in name_lower or "linear_fc1" in name_lower or "linear_fc2" in name_lower:
+            return "mlp"
+        # Attention
+        if (
+            "self_attention" in name_lower
+            or "self_attn" in name_lower
+            or ".attn." in name_lower
+            or "attention" in name_lower
+        ):
+            return "attn"
+        # Unembed / output head
+        if "lm_head" in name_lower or "output_layer" in name_lower or "unembed" in name_lower:
+            return "unembed"
+        return "other"
+
     def _freeze_non_lora_params(self, model) -> None:
-        """Ensure only LoRA/adapter parameters are trainable."""
-        trainable = 0
+        """Ensure only LoRA/adapter parameters are trainable.
+
+        Keep the optimizer param ordering stable across sessions by leaving all LoRA/adapter
+        params trainable. Train-target masking is enforced by projecting disabled LoRA params
+        back to zero (see _zero_disabled_lora_params).
+        """
+        lora_trainable = 0
         non_lora_trainable = 0
         for name, param in model.named_parameters():
             name_lower = name.lower()
-            if 'lora' in name_lower or 'adapter' in name_lower:
+            if "lora" in name_lower or "adapter" in name_lower:
                 param.requires_grad_(True)
                 if param.requires_grad:
-                    trainable += 1
+                    lora_trainable += 1
             else:
                 param.requires_grad_(False)
                 if param.requires_grad:
                     non_lora_trainable += 1
         if self.rank == 0:
-            print(f"[Rank {self.rank}] _freeze_non_lora_params: trainable={trainable}, non_lora_trainable={non_lora_trainable}", flush=True)
+            print(
+                f"[Rank {self.rank}] _freeze_non_lora_params: "
+                f"lora_trainable={lora_trainable}, non_lora_trainable={non_lora_trainable}",
+                flush=True,
+            )
+
+    def _zero_disabled_lora_params(
+        self,
+        model,
+        *,
+        train_attn: bool,
+        train_mlp: bool,
+        train_unembed: bool,
+    ) -> int:
+        zeroed = 0
+        for name, param in model.named_parameters():
+            name_lower = name.lower()
+            if "lora" not in name_lower and "adapter" not in name_lower:
+                continue
+            tgt = self._classify_lora_param_target(name_lower)
+            if tgt == "attn":
+                disable = not train_attn
+            elif tgt == "mlp":
+                disable = not train_mlp
+            elif tgt == "unembed":
+                disable = not train_unembed
+            else:
+                disable = False
+            if disable:
+                try:
+                    param.data.zero_()
+                    zeroed += 1
+                except Exception:
+                    pass
+        return zeroed
 
     def get_optimizer_info(self) -> dict:
         """Return detailed info about optimizer structure for debugging."""
@@ -3080,6 +3490,29 @@ class MegatronRankWorker:
             info["optimizer_details"].append(opt_info)
 
         return info
+
+    @staticmethod
+    def _infer_target_modules_from_state_dict(
+        state_dict: dict,
+        fallback_modules: list[str],
+    ) -> list[str]:
+        import re
+
+        pat = re.compile(
+            r"\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\.lora_[AB]\.weight$"
+        )
+        present: set[str] = set()
+        for key in state_dict.keys():
+            m = pat.search(str(key))
+            if m is not None:
+                present.add(m.group(1))
+
+        if not present:
+            return fallback_modules
+
+        ordered = [name for name in fallback_modules if name in present]
+        extras = sorted(present.difference(set(fallback_modules)))
+        return ordered + extras
 
     def save_checkpoint(
         self,
@@ -3140,15 +3573,24 @@ class MegatronRankWorker:
         # 2. LoRA config
         # Use actual session rank (Phase 7) or fall back to max_lora_rank
         try:
-            model_is_mla = get_model_config(self.base_model).is_mla
+            cfg = get_model_config(self.base_model)
+            model_is_mla = cfg.is_mla
+            model_is_moe = cfg.is_moe
         except ValueError:
             model_is_mla = False
+            model_is_moe = False
         target_modules = [
             "q_proj", "k_proj", "v_proj", "o_proj",
         ] if not model_is_mla else [
             "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
         ]
-        target_modules += ["gate_proj", "up_proj", "down_proj"]
+        # MoE: include MLP/expert targets only when exporting per-expert LoRA.
+        if (not model_is_moe) or use_per_expert_lora:
+            target_modules += ["gate_proj", "up_proj", "down_proj"]
+        target_modules = self._infer_target_modules_from_state_dict(
+            state_dict=state_dict,
+            fallback_modules=target_modules,
+        )
         # Include attention modules; add MLP modules only when trained
         config = {
             "r": effective_rank,
@@ -3174,6 +3616,73 @@ class MegatronRankWorker:
 
         # Note: state_dict NOT included in return value to avoid OOM on API server
         # when transferring 37k+ MoE LoRA tensors through Ray. vLLM loads from path.
+        return meta
+
+    def save_lora_weights(
+        self,
+        save_path: str,
+        step_count: int = 0,
+        actual_rank: int | None = None,
+        use_per_expert_lora: bool = False,
+    ) -> dict:
+        """Save LoRA weights in PEFT format for sampling (no optimizer/resume artifacts).
+
+        This is the minimal export required by `save_weights_for_sampler` to hot-load LoRA in vLLM.
+        It intentionally avoids saving per-rank adapter shards and optimizer shards, because those
+        are not required for sampling and can exceed memory/time budgets on large MoE models.
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        # ALL ranks must call get_lora_state_dict - it uses NCCL collectives.
+        state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
+
+        os.makedirs(save_path, exist_ok=True)
+
+        if self.rank != 0:
+            return {}
+
+        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        try:
+            cfg = get_model_config(self.base_model)
+            model_is_mla = cfg.is_mla
+            model_is_moe = cfg.is_moe
+        except ValueError:
+            model_is_mla = False
+            model_is_moe = False
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+        ] if not model_is_mla else [
+            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
+        ]
+        # MoE: include MLP/expert targets only when exporting per-expert LoRA.
+        if (not model_is_moe) or use_per_expert_lora:
+            target_modules += ["gate_proj", "up_proj", "down_proj"]
+        target_modules = self._infer_target_modules_from_state_dict(
+            state_dict=state_dict,
+            fallback_modules=target_modules,
+        )
+        config = {
+            "r": effective_rank,
+            "lora_alpha": effective_rank * 2,
+            "target_modules": target_modules,
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": self.base_model,
+        }
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        meta = {"current_step": step_count, "learning_rate": self.learning_rate}
+        with open(os.path.join(save_path, "training_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        abs_path = os.path.abspath(save_path)
+        logger.info(f"[MegatronRankWorker] Saved LoRA weights to {abs_path} (step={step_count})")
         return meta
 
     def load_optimizer_state(self, checkpoint_path: str) -> dict:
@@ -3202,7 +3711,13 @@ class MegatronRankWorker:
     # ========================================================================
 
     def load_adapter_state(
-        self, checkpoint_path: str, actual_rank: int | None = None, trainer_rank: int | None = None
+        self,
+        checkpoint_path: str,
+        actual_rank: int | None = None,
+        trainer_rank: int | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> dict:
         """Load LoRA adapter weights from checkpoint.
 
@@ -3260,8 +3775,15 @@ class MegatronRankWorker:
             if unexpected:
                 logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
 
-            # Ensure only LoRA parameters are trainable after load
+            train_attn = True if train_attn is None else bool(train_attn)
+            train_mlp = True if train_mlp is None else bool(train_mlp)
+            train_unembed = True if train_unembed is None else bool(train_unembed)
+
+            # Keep only LoRA/adapter params trainable; then project disabled targets to zero.
             self._freeze_non_lora_params(unwrapped)
+            self._zero_disabled_lora_params(
+                unwrapped, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+            )
 
         logger.info(f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path}")
 
@@ -3501,6 +4023,23 @@ class MegatronWorkerGroup:
 
         # Create placement group with N GPU bundles
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(world_size)]
+        from .volc_placement import parse_csv
+
+        allowed_ips = parse_csv(os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", ""))
+        if allowed_ips:
+            from .volc_placement import build_node_affinity_gpu_bundles, select_free_nodes_from_allowed_ips
+
+            node_ips, gpus_per_node = select_free_nodes_from_allowed_ips(
+                allowed_node_ips=allowed_ips,
+                required_gpus=world_size,
+            )
+            bundles = build_node_affinity_gpu_bundles(
+                node_ips=node_ips,
+                gpus_per_node=gpus_per_node,
+                required_gpus=world_size,
+                cpu_per_gpu=1,
+            )
+            logger.info(f"[MegatronWorkerGroup] Volcano placement allowlist nodes={node_ips}")
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
         self.placement_group = ray.util.placement_group(
@@ -3513,12 +4052,16 @@ class MegatronWorkerGroup:
 
         # Runtime env for workers
         is_mla = False
+        disable_nccl_ib = False
         try:
             from .model_registry import get_model_config
 
-            is_mla = bool(get_model_config(self.base_model).is_mla)
+            cfg = get_model_config(self.base_model)
+            is_mla = bool(cfg.is_mla)
+            disable_nccl_ib = bool(getattr(cfg, "train_nccl_ib_disable", False))
         except Exception:
             is_mla = False
+            disable_nccl_ib = False
 
         runtime_env = {
             "env_vars": {
@@ -3541,6 +4084,18 @@ class MegatronWorkerGroup:
                 "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
             },
         }
+        if disable_nccl_ib or os.environ.get("MINT_NCCL_IB_DISABLE", "0") == "1":
+            runtime_env["env_vars"]["NCCL_IB_DISABLE"] = "1"
+            # Volcano images can set an external NCCL net plugin (e.g. RDMA/SHARP) via env.
+            # When `train_nccl_ib_disable` is requested, force socket transport to avoid
+            # multi-node NCCL init instability.
+            runtime_env["env_vars"]["NCCL_NET"] = "Socket"
+            runtime_env["env_vars"]["NCCL_NET_PLUGIN"] = "none"
+        else:
+            # Explicitly enable IB transport for distributed training. This overrides any
+            # inherited env from the worker pods (defaults should be IB when available).
+            runtime_env["env_vars"]["NCCL_IB_DISABLE"] = "0"
+            runtime_env["env_vars"]["NCCL_NET"] = "IB"
 
         # Get master address from first bundle's node
         master_addr, master_port = ray.get(
@@ -3651,7 +4206,14 @@ class MegatronWorkerGroup:
         ray.get(futures)
         logger.info(f"[MegatronWorkerGroup] Session state swapped on all workers")
 
-    def _ensure_session_loaded(self, session_id: str | None) -> None:
+    def _ensure_session_loaded(
+        self,
+        session_id: str | None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> None:
         """Ensure the specified session's state is loaded (LoRA + optimizer + gradients).
 
         If a different session is currently loaded, this saves its state first,
@@ -3675,6 +4237,10 @@ class MegatronWorkerGroup:
             # Already loaded
             logger.debug(f"[MegatronWorkerGroup] Session {session_id} already loaded")
             return
+
+        train_attn = True if train_attn is None else bool(train_attn)
+        train_mlp = True if train_mlp is None else bool(train_mlp)
+        train_unembed = True if train_unembed is None else bool(train_unembed)
 
         timing = _env_flag("MINT_TIMING_DIAG", default=False)
         t0 = time.perf_counter() if timing else 0.0
@@ -3728,7 +4294,13 @@ class MegatronWorkerGroup:
             meta = self._session_manager.get_metadata(session_id)
             actual_rank = meta.get("actual_rank") if meta else None
             logger.info(f"[MegatronWorkerGroup] Loading session {session_id} from {new_path}")
-            self.load_adapter_state(new_path, actual_rank=actual_rank)
+            self.load_adapter_state(
+                new_path,
+                actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
             # Restore metadata
             if meta:
                 self._step_count = meta.get("step", 0)
@@ -3737,7 +4309,11 @@ class MegatronWorkerGroup:
         else:
             # New session: reinitialize LoRA weights
             logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
-            self.reinit_lora_weights()
+            self.reinit_lora_weights(
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
             self._step_count = 0
             self._actual_rank = self.lora_rank
         t_load1 = time.perf_counter() if timing else 0.0
@@ -3783,6 +4359,10 @@ class MegatronWorkerGroup:
         loss_fn_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> dict:
         """Run forward-backward on all workers.
 
@@ -3806,7 +4386,12 @@ class MegatronWorkerGroup:
         # Issue #44: Ensure correct session's LoRA weights are loaded before training
         # This saves outgoing session state and loads incoming session state
         effective_session_id = session_id or self._current_session
-        self._ensure_session_loaded(effective_session_id)
+        self._ensure_session_loaded(
+            effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         t1 = time.perf_counter() if timing else 0.0
 
         # Send raw data_items to workers (TensorDict created locally on each worker
@@ -3913,6 +4498,10 @@ class MegatronWorkerGroup:
         loss_fn_config: dict | None = None,
         learning_rate: float | None = None,
         session_id: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> dict:
         """Combined forward_backward + optim_step in a single actor call.
 
@@ -3938,10 +4527,19 @@ class MegatronWorkerGroup:
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
             session_id=effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
         )
 
         lr = learning_rate if learning_rate is not None else self.learning_rate
-        opt_result = self.optim_step(lr, session_id=effective_session_id)
+        opt_result = self.optim_step(
+            lr,
+            session_id=effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         metrics = dict(fb_result.get("metrics", {}))
         metrics.update(opt_result.get("metrics", {}))
@@ -3953,6 +4551,10 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
         reset_bias: bool | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> dict:
         """Run forward pass only on all workers. Returns per-token logprobs.
 
@@ -3971,7 +4573,12 @@ class MegatronWorkerGroup:
         """
         # Issue #44: Ensure correct session's LoRA weights are loaded before forward
         effective_session_id = session_id or self._current_session
-        self._ensure_session_loaded(effective_session_id)
+        self._ensure_session_loaded(
+            effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
@@ -4051,6 +4658,10 @@ class MegatronWorkerGroup:
         self,
         learning_rate: float,
         session_id: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> dict:
         """Run optimizer step on all workers.
 
@@ -4069,11 +4680,25 @@ class MegatronWorkerGroup:
 
         # Issue #44: Ensure correct session's LoRA weights are loaded before optim step
         effective_session_id = session_id or self._current_session
-        self._ensure_session_loaded(effective_session_id)
+        self._ensure_session_loaded(
+            effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         t1 = time.perf_counter() if timing else 0.0
 
         t2 = time.perf_counter() if timing else 0.0
-        futures = [w.optim_step.remote(learning_rate, effective_session_id) for w in self.workers]
+        futures = [
+            w.optim_step.remote(
+                learning_rate,
+                effective_session_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+            for w in self.workers
+        ]
         results = ray.get(futures)
         t3 = time.perf_counter() if timing else 0.0
         if timing:
@@ -4235,7 +4860,16 @@ class MegatronWorkerGroup:
             "pad_token_id": tokenizer.pad_token_id,
         }
 
-    def reinit_lora_weights(self, learning_rate: float | None = None, actual_rank: int | None = None, new_session_id: str | None = None) -> dict:
+    def reinit_lora_weights(
+        self,
+        learning_rate: float | None = None,
+        actual_rank: int | None = None,
+        new_session_id: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
         """Reinitialize LoRA weights to fresh random state on all workers.
 
         This must be called when reusing an actor for a new session to ensure
@@ -4270,10 +4904,21 @@ class MegatronWorkerGroup:
             except Exception as e:
                 logger.warning(f"[MegatronWorkerGroup] reinit_lora_weights: failed to save session {self._current_session}: {e}")
 
-        logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers (lr={learning_rate}, actual_rank={actual_rank})")
+        logger.info(
+            f"[MegatronWorkerGroup] reinit_lora_weights: reinitializing on all workers "
+            f"(lr={learning_rate}, actual_rank={actual_rank}, train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
+        )
 
         # Call reinit on all workers (required for distributed sync)
-        futures = [w.reinit_lora_weights.remote(learning_rate) for w in self.workers]
+        futures = [
+            w.reinit_lora_weights.remote(
+                learning_rate,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+            for w in self.workers
+        ]
         results = ray.get(futures)
 
         # Aggregate results
@@ -4356,7 +5001,16 @@ class MegatronWorkerGroup:
         return {"status": "no_adapter_files", "path": load_path}
 
 
-    def save_checkpoint(self, save_path: str, use_per_expert_lora: bool = False) -> dict:
+    def save_checkpoint(
+        self,
+        save_path: str,
+        use_per_expert_lora: bool = False,
+        *,
+        session_id: str | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
         """Save checkpoint using all workers (rank 0 saves, others participate in NCCL).
 
         IMPORTANT: Must call ALL workers because MegatronRankWorker.save_checkpoint
@@ -4370,7 +5024,19 @@ class MegatronWorkerGroup:
         Returns:
             Dict with training metadata (from rank 0).
         """
-        logger.info(f"[MegatronWorkerGroup] save_checkpoint: {save_path} (actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})")
+        effective_session_id = session_id or self._current_session
+        if effective_session_id is not None:
+            self._ensure_session_loaded(
+                effective_session_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+
+        logger.info(
+            f"[MegatronWorkerGroup] save_checkpoint: {save_path} "
+            f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})"
+        )
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
         futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora) for w in self.workers]
@@ -4387,6 +5053,52 @@ class MegatronWorkerGroup:
         results = ray.get(futures, timeout=timeout_s)
         result = results[0]  # Only rank 0 returns actual data
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
+        return result
+
+    def save_lora_weights(
+        self,
+        save_path: str,
+        use_per_expert_lora: bool = False,
+        *,
+        session_id: str | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
+        """Save PEFT LoRA weights for sampling (no optimizer/resume artifacts).
+
+        Must call ALL workers because get_lora_state_dict uses NCCL collectives.
+        """
+        effective_session_id = session_id or self._current_session
+        if effective_session_id is not None:
+            self._ensure_session_loaded(
+                effective_session_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+
+        logger.info(
+            f"[MegatronWorkerGroup] save_lora_weights: {save_path} "
+            f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})"
+        )
+        futures = [
+            w.save_lora_weights.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora)
+            for w in self.workers
+        ]
+        world_size = len(self.workers)
+        if world_size >= 32:
+            default_timeout_s = 3600
+        elif world_size >= 16:
+            default_timeout_s = 1800
+        elif world_size >= 4:
+            default_timeout_s = 600
+        else:
+            default_timeout_s = 300
+        timeout_s = int(os.environ.get("MINT_MEGATRON_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
+        results = ray.get(futures, timeout=timeout_s)
+        result = results[0]
+        logger.info(f"[MegatronWorkerGroup] save_lora_weights: completed, step={result.get('current_step', 'unknown')}")
         return result
 
     def get_diagnostics(self) -> dict:
@@ -4408,7 +5120,13 @@ class MegatronWorkerGroup:
     # ========================================================================
 
     def load_adapter_state(
-        self, checkpoint_path: str, actual_rank: int | None = None
+        self,
+        checkpoint_path: str,
+        actual_rank: int | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
     ) -> dict:
         """Load LoRA adapter weights from checkpoint on all workers.
 
@@ -4427,11 +5145,16 @@ class MegatronWorkerGroup:
         """
         logger.info(
             f"[MegatronWorkerGroup] Loading adapter state from {checkpoint_path} "
-            f"(actual_rank={actual_rank}, trainer_rank={self.lora_rank})"
+            f"(actual_rank={actual_rank}, trainer_rank={self.lora_rank}, train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
         )
         futures = [
             w.load_adapter_state.remote(
-                checkpoint_path, actual_rank=actual_rank, trainer_rank=self.lora_rank
+                checkpoint_path,
+                actual_rank=actual_rank,
+                trainer_rank=self.lora_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
             for w in self.workers
         ]
@@ -4695,8 +5418,11 @@ def get_or_create_megatron_worker_group(
             # Actor doesn't exist, create new one
             logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
-        # Check available GPUs and evict LRU actors if necessary
-        resource_pool.ensure_gpus_available(num_gpus)
+        # Check available GPUs and evict LRU actors if necessary.
+        # For large, full-cluster Megatron jobs, allow preempting idle protected actors
+        # (e.g., inference "always-on" actors) to avoid deadlocking on a fixed-size cluster.
+        allow_evict_protected = os.environ.get("MINT_MEGATRON_EVICT_PROTECTED", "0") == "1"
+        resource_pool.ensure_gpus_available(num_gpus, allow_evict_protected=allow_evict_protected)
 
         # Reserve GPUs to prevent race conditions with concurrent requests
         # This must be done AFTER ensure_gpus_available and BEFORE actor creation
@@ -4714,6 +5440,15 @@ def get_or_create_megatron_worker_group(
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                 }
             }
+            volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+            if volc_rq:
+                from .volc_placement import list_node_ips_for_resource_queue
+
+                node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
+                if not node_ips:
+                    raise RuntimeError(f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}")
+                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
+
             timing = os.environ.get("MINT_TIMING_DIAG")
             if timing is not None:
                 runtime_env["env_vars"]["MINT_TIMING_DIAG"] = timing

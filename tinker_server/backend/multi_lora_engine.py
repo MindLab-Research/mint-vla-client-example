@@ -1222,10 +1222,11 @@ class MultiModelInferenceManager:
                 from .multinode_inference import MultiNodeInferenceEngine
 
                 total_gpus = config.total_gpus
+                pipeline_parallel_size = getattr(config, "inference_pp", 1)
                 enable_expert_parallel = config.is_moe and config.inference_dp > 1
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
-                    f"actor={actor_name}, TP={config.inference_tp}, DP={config.inference_dp}, "
+                    f"actor={actor_name}, TP={config.inference_tp}, PP={pipeline_parallel_size}, DP={config.inference_dp}, "
                     f"expert_parallel={enable_expert_parallel}, total_gpus={total_gpus}, "
                     f"gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
@@ -1240,6 +1241,7 @@ class MultiModelInferenceManager:
                     model_path=model_path,
                     model_name=model_name,
                     tensor_parallel_size=config.inference_tp,
+                    pipeline_parallel_size=pipeline_parallel_size,
                     data_parallel_size=config.inference_dp,
                     enable_expert_parallel=enable_expert_parallel,
                     gpu_memory_utilization=model_gpu_util,

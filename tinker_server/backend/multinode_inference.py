@@ -380,6 +380,16 @@ def _create_multinode_vllm_actor(
             max_num_batched_tokens = int(os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_num_batched_tokens)))
             enable_chunked_prefill = _env_flag("MINT_VLLM_ENABLE_CHUNKED_PREFILL", default=True)
             enable_prefix_caching = _env_flag("MINT_VLLM_ENABLE_PREFIX_CACHING", default=True)
+            # vLLM fused-MoE + LoRA has crashed in Volcano deployments when fully-sharded LoRAs are enabled
+            # (assert in vllm/lora/layers/fused_moe.py:_slice_w13_a during engine init/profile run).
+            # Keep this opt-in so we can toggle it without a code deploy.
+            fully_sharded_loras = (
+                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False)
+                and self.enable_lora
+                and self.max_lora_rank is not None
+                and self.tensor_parallel_size >= 32
+                and self.max_lora_rank % self.tensor_parallel_size == 0
+            )
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -406,6 +416,7 @@ def _create_multinode_vllm_actor(
                 max_loras=self.max_loras if self.enable_lora else None,
                 max_lora_rank=self.max_lora_rank if self.enable_lora else None,
                 max_cpu_loras=self.max_cpu_loras if self.enable_lora else None,
+                fully_sharded_loras=fully_sharded_loras if self.enable_lora else False,
             )
 
             logger.info(
@@ -413,7 +424,8 @@ def _create_multinode_vllm_actor(
                 f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
                 f"backend=ray, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
-                f"chunked_prefill={enable_chunked_prefill}, max_num_batched_tokens={max_num_batched_tokens}, "
+                f"fully_sharded_loras={fully_sharded_loras}, chunked_prefill={enable_chunked_prefill}, "
+                f"max_num_batched_tokens={max_num_batched_tokens}, "
                 f"prefix_caching={enable_prefix_caching}"
             )
 
@@ -503,6 +515,18 @@ def _create_multinode_vllm_actor(
                 async with self._lock_read():
                     return await self.engine.list_loras()
 
+        async def get_debug_env_info(self) -> dict:
+            import os
+            import sys
+            import vllm
+
+            return {
+                "pythonpath": os.environ.get("PYTHONPATH", ""),
+                "pfs_vllm_path": os.environ.get("PFS_VLLM_PATH", ""),
+                "vllm_file": vllm.__file__,
+                "sys_path_first_8": sys.path[:8],
+            }
+
         async def abort_request(self, request_id: str) -> None:
             """Abort an in-flight request in vLLM."""
             try:
@@ -551,6 +575,8 @@ def _create_multinode_vllm_actor(
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            import math
+
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -627,7 +653,9 @@ def _create_multinode_vllm_actor(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                logprobs=0 if logprobs else None,
+                # vLLM multi-node engine returns `None` logprob entries when logprobs=0.
+                # Use a positive value so per-token logprobs are populated.
+                logprobs=1 if logprobs else None,
                 n=n_req,
                 **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
             )
@@ -738,10 +766,51 @@ def _create_multinode_vllm_actor(
                 token_ids = list(final_res.outputs[0].token_ids)  # type: ignore[union-attr]
                 log_probs = None
                 if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:  # type: ignore[union-attr]
-                    log_probs = [
-                        logprobs[token_ids[i]].logprob
-                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)  # type: ignore[union-attr]
-                    ]
+                    log_probs = []
+                    non_finite_count = 0
+                    non_finite_samples: list[tuple[int, int, float]] = []
+                    for i, lps in enumerate(final_res.outputs[0].logprobs):  # type: ignore[union-attr]
+                        tid = token_ids[i]
+                        getter = getattr(lps, "get", None)
+                        lp_obj = getter(tid) if callable(getter) else None
+                        if lp_obj is None:
+                            raise RuntimeError(
+                                f"vLLM missing sampled-token logprob: request_id={request_id} idx={i} token_id={tid}"
+                            )
+                        if isinstance(lp_obj, (float, int)):
+                            lp_f = float(lp_obj)
+                            if not math.isfinite(lp_f):
+                                non_finite_count += 1
+                                if len(non_finite_samples) < 3:
+                                    non_finite_samples.append((i, tid, lp_f))
+                                lp_f = -1e9
+                            log_probs.append(lp_f)
+                            continue
+                        lp_val = getattr(lp_obj, "logprob", None)
+                        if lp_val is None and isinstance(lp_obj, dict):
+                            lp_val = lp_obj.get("logprob")
+                        if lp_val is None:
+                            raise RuntimeError(
+                                f"vLLM returned None sampled-token logprob: request_id={request_id} idx={i} token_id={tid}"
+                            )
+                        lp_f = float(lp_val)
+                        if not math.isfinite(lp_f):
+                            non_finite_count += 1
+                            if len(non_finite_samples) < 3:
+                                non_finite_samples.append((i, tid, lp_f))
+                            lp_f = -1e9
+                        log_probs.append(lp_f)
+
+                    if non_finite_count:
+                        token_preview = {
+                            "head": token_ids[:8],
+                            "tail": token_ids[-8:] if len(token_ids) > 8 else token_ids[:],
+                        }
+                        logger.warning(
+                            f"Non-finite sampled-token logprobs clamped: request_id={request_id} "
+                            f"count={non_finite_count} samples(idx,token,lp)={non_finite_samples} "
+                            f"token_preview={token_preview}"
+                        )
 
                 # Determine stop reason
                 stop_reason = "length"
@@ -782,14 +851,55 @@ def _create_multinode_vllm_actor(
                     outs = [o for _, o in sorted(zip(indices, outs, strict=True))]
 
             multi_results: list[dict] = []
-            for out in outs:
+            non_finite_count = 0
+            non_finite_samples: list[tuple[int, int, int, float]] = []
+            affected_seq_preview: dict[int, dict[str, list[int]]] = {}
+            for seq_i, out in enumerate(outs):
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
                 if sampling_params.logprobs is not None and out.logprobs:
-                    out_log_probs = [
-                        lp[out_token_ids[i]].logprob
-                        for i, lp in enumerate(out.logprobs)
-                    ]
+                    out_log_probs = []
+                    for i, lps in enumerate(out.logprobs):
+                        tid = out_token_ids[i]
+                        getter = getattr(lps, "get", None)
+                        lp_obj = getter(tid) if callable(getter) else None
+                        if lp_obj is None:
+                            raise RuntimeError(
+                                f"vLLM missing sampled-token logprob: request_id={request_id} idx={i} token_id={tid}"
+                            )
+                        if isinstance(lp_obj, (float, int)):
+                            lp_f = float(lp_obj)
+                            if not math.isfinite(lp_f):
+                                non_finite_count += 1
+                                if len(non_finite_samples) < 3:
+                                    non_finite_samples.append((seq_i, i, tid, lp_f))
+                                if seq_i not in affected_seq_preview and len(affected_seq_preview) < 3:
+                                    affected_seq_preview[seq_i] = {
+                                        "head": out_token_ids[:8],
+                                        "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
+                                    }
+                                lp_f = -1e9
+                            out_log_probs.append(lp_f)
+                            continue
+                        lp_val = getattr(lp_obj, "logprob", None)
+                        if lp_val is None and isinstance(lp_obj, dict):
+                            lp_val = lp_obj.get("logprob")
+                        if lp_val is None:
+                            raise RuntimeError(
+                                f"vLLM returned None sampled-token logprob: request_id={request_id} idx={i} token_id={tid}"
+                            )
+                        lp_f = float(lp_val)
+                        if not math.isfinite(lp_f):
+                            non_finite_count += 1
+                            if len(non_finite_samples) < 3:
+                                non_finite_samples.append((seq_i, i, tid, lp_f))
+                            if seq_i not in affected_seq_preview and len(affected_seq_preview) < 3:
+                                affected_seq_preview[seq_i] = {
+                                    "head": out_token_ids[:8],
+                                    "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
+                                }
+                            lp_f = -1e9
+                        out_log_probs.append(lp_f)
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
@@ -803,6 +913,13 @@ def _create_multinode_vllm_actor(
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
                     }
+                )
+
+            if non_finite_count:
+                logger.warning(
+                    f"Non-finite sampled-token logprobs clamped: request_id={request_id} "
+                    f"count={non_finite_count} samples(seq,idx,token,lp)={non_finite_samples} "
+                    f"seq_token_preview={affected_seq_preview}"
                 )
 
             return multi_results
@@ -983,7 +1100,7 @@ class MultiNodeInferenceEngine:
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
-                or "1800"
+                or "300"
             )
 
             is_persistent = False
@@ -1033,25 +1150,9 @@ class MultiNodeInferenceEngine:
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
             except ray.exceptions.GetTimeoutError:
-                # Actor might be busy (queued tasks) rather than dead.
-                # Do not kill on timeout; reuse and allow requests to queue.
-                logger.warning(f"Actor {self.actor_name} is_ready timed out; assuming busy and reusing actor")
-                self.engine = existing_actor
-                self._initialized = True
-                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-
-                resource_pool = get_resource_pool()
-                resource_pool.register(
-                    actor_name=self.actor_name,
-                    actor_type=ActorType.VLLM,
-                    num_gpus=total_required_gpus,
-                    actor_handle=self.engine,
-                    namespace=PERSISTENT_NAMESPACE,
-                    base_model=self.model_path,
-                    protected=is_persistent,
-                )
-                resource_pool.mark_ready(self.actor_name)
-                return
+                # Do not assume readiness if we cannot run the readiness RPC.
+                # Reusing a half-initialized actor can surface as 'engine is None' in generate().
+                logger.warning(f"Actor {self.actor_name} is_ready timed out; treating as not-ready and recreating")
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -1078,6 +1179,40 @@ class MultiNodeInferenceEngine:
                             break  # Actor name is available
                 except Exception as e:
                     logger.warning(f"Error killing actor {self.actor_name}: {e}")
+
+            node_ips: list[str] | None = None
+            gpus_per_node = 8
+            k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
+            if self.model_name in k2_models:
+                volc_rq = os.environ.get("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                if not volc_rq:
+                    raise RuntimeError(
+                        "K2 multinode inference requires MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID to be set "
+                        "(expected to pin vLLM workers to queue C2)"
+                    )
+            else:
+                volc_rq = (
+                    os.environ.get("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                    or os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                )
+
+            if volc_rq:
+                from .volc_placement import select_free_nodes_for_resource_queue
+
+                node_ips, gpus_per_node = select_free_nodes_for_resource_queue(
+                    resource_queue_id=volc_rq,
+                    required_gpus=worker_gpus,
+                )
+                logger.info(
+                    f"[MultiNodeInferenceEngine] Volcano placement model={self.model_name} "
+                    f"rq={volc_rq} nodes={node_ips}"
+                )
+                resources = compute_multinode_engine_resources(
+                    worker_gpus, node_ips=node_ips, gpus_per_node=gpus_per_node
+                )
+                controller_gpus = resources.controller_gpus
+                controller_cpus = resources.controller_cpus
+                total_required_gpus = resources.total_required_gpus
 
             # Ensure shared adapter directory exists
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
@@ -1170,12 +1305,65 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_IS_READY_TIMEOUT_S",
                 "MINT_VLLM_ENABLE_CHUNKED_PREFILL",
                 "MINT_VLLM_ENABLE_PREFIX_CACHING",
+                "MINT_VLLM_FULLY_SHARDED_LORAS",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
+                "MINT_VLLM_PREFLIGHT_FINITE_GATE",
+                "MINT_VLLM_TRACE_STAGE_STATS",
+                "MINT_VLLM_TRACE_STAGE_STATS_REQ_SUFFIX",
+                "MINT_VLLM_TRACE_NONFINITE",
+                "MINT_VLLM_DISABLE_PACK_MOE_PATCH",
+                "MINT_VLLM_DISABLE_PUNICA_PATCH",
+                "MINT_VLLM_SANITIZE_W13_AFTER_EXPAND",
             ):
                 v = os.environ.get(k)
                 if v is not None:
                     env_vars[k] = v
+
+            # K2: vLLM prefix caching with LoRA has intermittently crashed with Triton
+            # illegal memory access on successive long-context requests. Keep it
+            # disabled by default (opt-in via env) to preserve engine liveness.
+            if self.model_name in ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16"):
+                env_vars.setdefault("MINT_VLLM_ENABLE_PREFIX_CACHING", "0")
+                # K2: FusedMoE grouped-topk kernels have been unstable (CUDA illegal
+                # memory access) in long-context LoRA sampling runs. Disable by
+                # default for engine liveness; allow opt-in via env.
+                env_vars.setdefault("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
+                # K2: Ray compiled DAG has repeatedly deadlocked mid-prefill
+                # (RayChannelTimeoutError: timed out acquiring the read lock).
+                # Disable it for this engine to avoid EngineCore death.
+                env_vars.setdefault("VLLM_DISABLE_RAY_COMPILED_DAG", "1")
+
+            # Expose selected vLLM debug/perf knobs via API host env without code deploys.
+            for k in (
+                "VLLM_ATTENTION_BACKEND",
+                "VLLM_USE_FLASHINFER_SAMPLER",
+                "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING",
+                "VLLM_FUSED_MOE_CHUNK_SIZE",
+                "VLLM_USE_FUSED_MOE_GROUPED_TOPK",
+                "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
+                "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    env_vars[k] = v
+
+            # Default generate timeout: prevents hung /asample futures when EngineCore dies
+            # (e.g. Triton illegal memory access) but the Ray actor stays alive.
+            if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
+                env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
+
+            # K2 MoE per-expert LoRA is too large to replicate across TP ranks
+            # (e.g., 384 experts * hidden * rank). Enable fully-sharded LoRA by
+            # default for large-TP engines unless explicitly overridden.
+            if "MINT_VLLM_FULLY_SHARDED_LORAS" not in env_vars:
+                if (
+                    self.max_loras > 0
+                    and self.max_lora_rank is not None
+                    and self.tensor_parallel_size >= 32
+                    and self.max_lora_rank % self.tensor_parallel_size == 0
+                ):
+                    env_vars["MINT_VLLM_FULLY_SHARDED_LORAS"] = "1"
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
@@ -1380,6 +1568,18 @@ class MultiNodeInferenceEngine:
             f"(lora_int_id={lora_id}, path={lora_path}, load_time={load_time:.3f}s)"
         )
         return lora_id
+
+    async def abort_request(self, request_id: str) -> None:
+        """Best-effort abort for an in-flight vLLM request."""
+        if not self._initialized:
+            return
+        import ray
+
+        try:
+            ref = self.engine.abort_request.remote(request_id)
+            await asyncio.to_thread(ray.get, ref, timeout=10)
+        except Exception as e:
+            logger.warning(f"MultiNodeInferenceEngine.abort_request failed: {type(e).__name__}: {e}")
 
     async def generate(
         self,

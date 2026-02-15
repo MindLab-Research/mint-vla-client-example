@@ -149,10 +149,8 @@ async def retrieve_future(
             payload = {"error": error, "category": "system"}
         else:
             payload = {"error": _public_error(error), "category": "system"}
-        future_store.cleanup(body.request_id)
         return payload
     else:
         # DONE - return the result
         result = future_store.get_result(body.request_id)
-        future_store.cleanup(body.request_id)
         return result

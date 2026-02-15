@@ -90,6 +90,40 @@ def _ray_future_done_ttl_s() -> float:
     return float(server_config.future_store_done_ttl_s)
 
 
+def _infer_ray_address() -> str | None:
+    """Infer Ray GCS address for remote clusters.
+
+    Prefer explicit RAY_ADDRESS. Fall back to ray_head_ip.txt on shared storage
+    (Volcano writes the canonical head IP there).
+    """
+    addr = (os.environ.get("RAY_ADDRESS") or "").strip()
+    if addr:
+        return addr
+
+    candidates: list[str] = []
+    pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
+    if pfs_tinker_path:
+        candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
+    candidates.extend(
+        [
+            # Common prod/dev code roots on PFS
+            "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
+            "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
+            # Local repo fallback (useful for workstation tunnels)
+            os.path.join(os.getcwd(), "ray_head_ip.txt"),
+        ]
+    )
+
+    for p in candidates:
+        try:
+            ip = open(p, "r", encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if ip:
+            return f"{ip}:6379"
+    return None
+
+
 def _get_or_create_ray_actor():
     import ray
 
@@ -286,11 +320,29 @@ class FutureStore:
         self._local = _InMemoryFutureStore()
         self._ray_actor = None
 
+    def _local_get_status(self, request_id: str) -> FutureStatus | None:
+        try:
+            return self._local.get_status(request_id)
+        except KeyError:
+            return None
+
     def _get_ray_actor(self):
         try:
             import ray
         except Exception:
             return None
+
+        if not ray.is_initialized():
+            # Sampling routes use the FutureStore even before any Ray-backed code path
+            # runs in a given process. Opportunistically connect to Ray so we use the
+            # detached actor store and avoid per-process in-memory request_id loss.
+            try:
+                from ..ray_utils import init_ray
+
+                addr = _infer_ray_address()
+                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+            except Exception:
+                return None
 
         if not ray.is_initialized():
             return None
@@ -327,12 +379,16 @@ class FutureStore:
 
         try:
             actor.resolve.remote(request_id, result)
+            # If the request was created before Ray was available, it may live in the
+            # local store. Avoid leaking a stale local pending entry.
+            self._local.cleanup(request_id)
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
             if actor is None:
                 raise
             actor.resolve.remote(request_id, result)
+            self._local.cleanup(request_id)
 
     def fail(self, request_id: str, error: str) -> None:
         actor = self._get_ray_actor()
@@ -343,12 +399,14 @@ class FutureStore:
 
         try:
             actor.fail.remote(request_id, error)
+            self._local.cleanup(request_id)
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
             if actor is None:
                 raise
             actor.fail.remote(request_id, error)
+            self._local.cleanup(request_id)
 
     def get_status(self, request_id: str) -> FutureStatus:
         actor = self._get_ray_actor()
@@ -365,6 +423,19 @@ class FutureStore:
             if actor is None:
                 raise
             status = ray.get(actor.get_status.remote(request_id))
+        except ray.exceptions.RayTaskError as e:
+            # Ray wraps KeyError from the detached actor. Some requests may have been
+            # created before Ray was available and live in the local store. Prefer
+            # returning local status over reporting a spurious "unknown request_id".
+            msg = str(e)
+            cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
+            is_unknown = "Unknown request_id:" in msg or isinstance(cause, KeyError)
+            if is_unknown:
+                local = self._local_get_status(request_id)
+                if local is not None:
+                    return local
+                raise KeyError(f"Unknown request_id: {request_id}") from None
+            raise
         return FutureStatus(status)
 
     def get_result(self, request_id: str) -> Any:
@@ -382,6 +453,16 @@ class FutureStore:
             if actor is None:
                 raise
             return ray.get(actor.get_result.remote(request_id))
+        except ray.exceptions.RayTaskError as e:
+            msg = str(e)
+            cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
+            is_unknown = "Unknown request_id:" in msg or isinstance(cause, KeyError)
+            if is_unknown:
+                local = self._local_get_status(request_id)
+                if local is not None:
+                    return self._local.get_result(request_id)
+                raise KeyError(f"Unknown request_id: {request_id}") from None
+            raise
 
     def get_error(self, request_id: str) -> str | None:
         actor = self._get_ray_actor()
@@ -398,6 +479,16 @@ class FutureStore:
             if actor is None:
                 raise
             return ray.get(actor.get_error.remote(request_id))
+        except ray.exceptions.RayTaskError as e:
+            msg = str(e)
+            cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
+            is_unknown = "Unknown request_id:" in msg or isinstance(cause, KeyError)
+            if is_unknown:
+                local = self._local_get_status(request_id)
+                if local is not None:
+                    return self._local.get_error(request_id)
+                raise KeyError(f"Unknown request_id: {request_id}") from None
+            raise
 
     def attach_ref(self, request_id: str, ref: Any, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()

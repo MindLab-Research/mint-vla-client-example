@@ -119,12 +119,13 @@ async def get_server_capabilities(http_request: Request) -> dict:
             if upstream.alias in unavailable_aliases:
                 continue
             caps = alias_to_caps.get(upstream.alias, {})
-            if m not in caps:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Gateway misconfig: model {m!r} not present in upstream {upstream.alias!r} capabilities",
-                )
-            max_len = int(caps[m])
+            if m in caps:
+                max_len = int(caps[m])
+            else:
+                # Some upstream deployments run with ALLOW_UNSUPPORTED_MODELS=1 and therefore may not
+                # advertise every routable model. Keep routing functional by falling back to the
+                # local registry's max_model_len for that model.
+                max_len = int(get_model_config(m).max_model_len)
         else:
             max_len = int(get_model_config(m).max_model_len)
 
@@ -255,11 +256,34 @@ async def create_sampling_session(
         if not os.path.exists(weights_path):
             raise HTTPException(status_code=400, detail=f"Adapter weights not found: {weights_path}")
 
+        # The MinT SDK `create_sampling_client(model_path=...)` does not expose lora_rank.
+        # Use adapter_config.json (if present) as the source of truth to avoid
+        # registering a mismatched rank (e.g., default 32 vs adapter r=64).
+        lora_rank = request.lora_rank
+        config_path = os.path.join(adapter_path, "adapter_config.json")
+        try:
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    adapter_config = json.load(f)
+                inferred_rank = adapter_config.get("r")
+                if isinstance(inferred_rank, int) and inferred_rank > 0:
+                    if int(lora_rank) != inferred_rank:
+                        logger.info(
+                            f"[create_sampling_session] overriding lora_rank={lora_rank} "
+                            f"with adapter_config.r={inferred_rank} for {adapter_path}"
+                        )
+                    lora_rank = inferred_rank
+        except Exception as e:
+            logger.warning(
+                f"[create_sampling_session] failed to infer lora_rank from {config_path}: "
+                f"{type(e).__name__}: {e}"
+            )
+
         # Register session now; LoRA will be loaded lazily on first /asample.
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,
             base_model=base_model,
-            lora_rank=request.lora_rank,
+            lora_rank=lora_rank,
             adapter_path=adapter_path,
             lora_loaded=False,
         )
@@ -377,6 +401,9 @@ async def session_heartbeat(
     Accepts heartbeat and returns acknowledgment. Session validation not implemented.
     """
     session_heartbeat_store.update(request.session_id)
+    if session_manager is not None:
+        # Keep sampling sessions alive during long training phases between sample calls.
+        session_manager.mark_session_inflight(request.session_id, 0)
     return SessionHeartbeatResponse()
 
 

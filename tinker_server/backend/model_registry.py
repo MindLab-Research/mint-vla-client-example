@@ -15,6 +15,7 @@ class ModelConfig:
 
     Inference parallelism (vLLM):
         - inference_tp: Tensor parallelism (shards weights)
+        - inference_pp: Pipeline parallelism (stages)
         - inference_dp: Data parallelism (replicas)
 
     Training parallelism (Megatron):
@@ -40,18 +41,23 @@ class ModelConfig:
 
     Architecture flags:
         - is_mla: Uses Multi-Latent Attention (DeepSeek V3/Moonlight/K2)
+    NCCL flags:
+        - train_nccl_ib_disable: Set NCCL_IB_DISABLE=1 for Megatron ranks (multi-node stability).
     """
 
     is_moe: bool
     inference_tp: int  # vLLM inference TP
     inference_dp: int  # vLLM inference DP
     max_model_len: int  # vLLM context limit (required - no fallback)
+    inference_pp: int = 1  # vLLM inference PP
     train_tp: int = 1  # Megatron training TP (attention/shared layers)
     train_pp: int = 1  # Megatron training PP (pipeline parallelism)
     train_ep: int = 1  # Megatron training EP (MoE expert distribution, 1 for dense)
     train_cp: int = 1  # Megatron training CP (context parallelism for long sequences)
     train_etp: int | None = None  # Expert tensor parallelism (None = use TP, 1 = no expert splitting)
     quantization: str | None = None  # vLLM quantization: None (auto-detect), "fp8", "compressed-tensors", etc.
+    train_use_fp8: bool = False  # Enable FP8 params during Megatron init (memory savings)
+    train_nccl_ib_disable: bool = False  # Set NCCL_IB_DISABLE=1 for Megatron ranks
     # vLLM memory settings
     gpu_memory_utilization: float | None = None  # None = use global default (0.85), or override for large models
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
@@ -67,14 +73,14 @@ class ModelConfig:
     @property
     def total_gpus(self) -> int:
         """Total GPUs for inference."""
-        return self.inference_tp * self.inference_dp
+        return self.inference_tp * self.inference_pp * self.inference_dp
 
     @property
     def train_gpus(self) -> int:
         """Total GPUs for training.
 
         MoE Parallel Folding cases:
-        1. EP > TP with ETP < TP: world_size = EP
+        1. EP >= TP with ETP < TP: world_size = EP
            (TP is a subgroup for attention within EP dimension)
         2. CP > 1 and EP > 1: world_size = TP * max(EP, CP)
            (CP and EP share GPU ranks)
@@ -82,7 +88,7 @@ class ModelConfig:
         """
         etp = self.train_etp if self.train_etp is not None else self.train_tp
 
-        if self.train_ep > self.train_tp and etp < self.train_tp:
+        if self.train_ep >= self.train_tp and etp < self.train_tp:
             # MoE Parallel Folding with ETP: TP is subgroup within EP
             return self.train_ep * self.train_pp * self.train_cp
         elif self.train_ep > 1 and self.train_cp > 1:
@@ -194,27 +200,58 @@ MODEL_CONFIGS = {
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
     # Uses MLA (Multi-Latent Attention) from DeepSeek V3 architecture
-    # PROMPT.md settings for K2-Instruct (same as K2-Thinking):
-    # - Megatron: TP=16, EP=64, ETP=1, CP=2, lora_rank=16 (128 GPUs)
-    # - vLLM: TP=32, max_lora_rank=16 (32 GPUs)
-    # - Total: 192 GPUs
-    # MoE Parallel Folding: world_size = EP = 64 GPUs (TP folds into EP)
-    # 384 experts / 64 GPUs = 6 experts per GPU
+    # mint-prod deployment target:
+    # - vLLM inference: TP=64, PP=1, DP=1 (64 GPUs total)
+    # - Megatron training: TP=64, EP=64, CP=2, ETP=1 (128 GPUs total; EP-fold + CP)
+    # Notes:
+    # - vLLM DP>1 has failed on Volcano with "Not enough resources to allocate 2 DP ranks on DP master node".
+    # - vLLM PP>1 for K2 has hit an init-time KeyError in vllm/config/vllm.py (forward_context lookup).
+    # - LoRA rank must be divisible by TP (adapter sharding); keep max_lora_rank=64.
+    # With 384 experts: EP=64 => 6 experts per GPU.
     "moonshotai/Kimi-K2-Instruct": ModelConfig(
         is_moe=True,
-        inference_tp=32,  # Inference: TP=32 (PROMPT.md spec)
+        inference_tp=64,
+        inference_pp=1,
         inference_dp=1,
-        train_tp=16,  # Training: TP=16 (folds into EP)
-        train_ep=64,  # Training: EP=64 (64 GPUs total)
-        train_cp=2,  # Training: CP=2 (context parallelism)
+        train_tp=64,
+        train_ep=64,
+        train_cp=2,
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
         quantization=None,  # Let vLLM auto-detect from config.json
-        gpu_memory_utilization=0.98,  # K2 uses 77 GiB/79 GiB, need high utilization
+        train_use_fp8=False,
+        train_nccl_ib_disable=False,
+        # Leave headroom for vLLM MoE LoRA buffers (fused_moe creates weights at engine init).
+        # Observed OOM at 0.96 during LoRA weight creation (alloc 336 MiB with ~58 MiB free).
+        gpu_memory_utilization=0.95,
         max_loras=1,  # LoRA REQUIRED for weight transfer
-        max_lora_rank=16,  # Rank 16: matches training lora_rank
-        max_model_len=32768,  # Reduced from 64K to 32K to save GPU memory (train uses 8K)
+        max_lora_rank=64,
+        # Reduce from 32K to leave VRAM headroom for MoE LoRA buffers at max_lora_rank=64.
+        max_model_len=32000,
+        max_num_seqs=8,  # Must be >= default SamplingParams(n=8)
+        max_num_batched_tokens=1024,  # Cap logits/prefill peak allocations at long context
         is_mla=True,  # DeepSeek V3 MLA architecture
         gradient_checkpointing=True,  # Required to fit model with long context
+    ),
+    "unsloth/Kimi-K2-Instruct-0905-BF16": ModelConfig(
+        is_moe=True,
+        inference_tp=64,
+        inference_pp=1,
+        inference_dp=1,
+        train_tp=64,
+        train_ep=64,
+        train_cp=2,
+        train_etp=1,
+        quantization=None,
+        train_use_fp8=False,
+        train_nccl_ib_disable=False,
+        gpu_memory_utilization=0.95,
+        max_loras=1,
+        max_lora_rank=64,
+        max_model_len=32000,
+        max_num_seqs=8,
+        max_num_batched_tokens=1024,
+        is_mla=True,
+        gradient_checkpointing=True,
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
         is_moe=True,
@@ -225,12 +262,14 @@ MODEL_CONFIGS = {
         train_cp=2,  # Training: CP=2 (context parallelism)
         train_etp=1,  # Expert tensor parallelism = 1 (each expert on 1 GPU)
         # PROMPT.md settings:
-        # - Megatron: TP=16, EP=64, ETP=1, lora_rank=16 (128 GPUs)
+        # - Megatron: TP=16, EP=64, CP=2, ETP=1, lora_rank=16 (128 GPUs)
         # - vLLM: TP=32, max_lora_rank=16 (32 GPUs)
         # - Total: 192 GPUs
         # MoE Parallel Folding: world_size = EP = 64 GPUs
         # 384 experts / 64 GPUs = 6 experts per GPU
         quantization=None,  # INT4 compressed-tensors, vLLM auto-detects
+        train_use_fp8=False,
+        train_nccl_ib_disable=True,
         gpu_memory_utilization=0.98,  # K2 uses 77 GiB/79 GiB, need high utilization
         max_loras=1,  # LoRA for weight transfer
         max_lora_rank=16,  # Rank 16: matches training lora_rank
@@ -441,6 +480,6 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
-        "moonshotai/Kimi-K2-Thinking",
+        "moonshotai/Kimi-K2-Instruct",
     ]
     return [m for m in allowed if m in MODEL_CONFIGS]
