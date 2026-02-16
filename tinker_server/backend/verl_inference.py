@@ -26,6 +26,78 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# vLLM MoE LoRA support: tolerate missing expert adapters.
+#
+# vLLM's PackedLoRALayerWeights.pack_moe currently asserts that every expert has
+# (w1,w2,w3) LoRA weights present. Our adapter export can be sparse across
+# experts (e.g. only one representative expert per layer), which is semantically
+# equivalent to zero delta for missing experts.
+#
+# We patch pack_moe inside vLLM TP worker processes via EngineCore.collective_rpc.
+def _mint_vllm_patch_pack_moe_sparse_ok() -> str:
+    import torch
+    from vllm.lora import lora_weights as lw  # type: ignore
+
+    Packed = getattr(lw, "PackedLoRALayerWeights", None)
+    LoRALayerWeights = getattr(lw, "LoRALayerWeights", None)
+    if Packed is None or LoRALayerWeights is None:
+        raise RuntimeError("vLLM lora_weights types missing; cannot patch pack_moe")
+
+    current = getattr(Packed, "pack_moe", None)
+    if getattr(current, "__mint_sparse_ok__", False):
+        return "ok:already"
+
+    orig_cm = Packed.__dict__.get("pack_moe")
+    orig_fn = getattr(orig_cm, "__func__", None)
+    if orig_fn is None:
+        raise RuntimeError("vLLM pack_moe not found; cannot patch")
+
+    def _zero_like(base: Any, module_name: str) -> Any:
+        return LoRALayerWeights(
+            module_name=str(getattr(base, "module_name", module_name)),
+            rank=int(getattr(base, "rank", 0)),
+            lora_alpha=int(getattr(base, "lora_alpha", 1)),
+            lora_a=torch.zeros_like(getattr(base, "lora_a")),
+            lora_b=torch.zeros_like(getattr(base, "lora_b")),
+            scaling=1.0,
+        )
+
+    def pack_moe_sparse_ok(cls, loras, module_name: str):  # type: ignore[no-untyped-def]
+        if not loras or (len(loras) % 3) != 0:
+            return orig_fn(cls, loras, module_name)
+
+        n_experts = len(loras) // 3
+        base_w1 = next(
+            (loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None),
+            None,
+        )
+        base_w2 = next(
+            (loras[i * 3 + 1] for i in range(n_experts) if loras[i * 3 + 1] is not None),
+            None,
+        )
+        base_w3 = next(
+            (loras[i * 3 + 2] for i in range(n_experts) if loras[i * 3 + 2] is not None),
+            None,
+        )
+        if base_w1 is None or base_w2 is None or base_w3 is None:
+            raise RuntimeError("MoE LoRA pack_moe missing base weights; cannot fill zeros")
+
+        filled = list(loras)
+        for eid in range(n_experts):
+            i = eid * 3
+            if filled[i] is None:
+                filled[i] = _zero_like(base_w1, module_name)
+            if filled[i + 1] is None:
+                filled[i + 1] = _zero_like(base_w2, module_name)
+            if filled[i + 2] is None:
+                filled[i + 2] = _zero_like(base_w3, module_name)
+        return orig_fn(cls, filled, module_name)
+
+    pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
+    Packed.pack_moe = classmethod(pack_moe_sparse_ok)
+    return "ok:patched"
+
+
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.ray_utils import init_ray
@@ -71,6 +143,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             # Ray's runtime_env only sets it for this process, not multiprocessing children
             import os
             import sys
+            # Allow EngineCoreClient to send function objects for collective_rpc.
+            # This is used only for internal worker patching and never exposed via HTTP.
+            os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
@@ -97,6 +172,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "y",
                 "on",
             )
+            self._mint_pack_moe_patched = False
 
         async def is_engine_ready(self) -> bool:
             """Check if vLLM engine is properly initialized.
@@ -112,6 +188,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return True
             except Exception:
                 return False
+
+        async def _ensure_pack_moe_patched(self) -> None:
+            if self._mint_pack_moe_patched:
+                return
+            engine_core = getattr(self.engine, "engine_core", None)
+            rpc = getattr(engine_core, "collective_rpc_async", None)
+            if rpc is None:
+                raise RuntimeError("vLLM engine_core.collective_rpc_async missing; cannot patch workers")
+            results = await rpc(_mint_vllm_patch_pack_moe_sparse_ok)
+            if not results or any((not isinstance(r, str)) or (not r.startswith("ok:")) for r in results):
+                raise RuntimeError(f"vLLM worker pack_moe patch failed: {results}")
+            self._mint_pack_moe_patched = True
 
         def _patch_lora_args(self, args):
             """Patch args Namespace with multi-LoRA config.
@@ -288,6 +376,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Add to engine (no need to remove - this is a new unique ID)
+            await self._ensure_pack_moe_patched()
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -317,6 +406,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 lora_path=lora_path,
             )
 
+            await self._ensure_pack_moe_patched()
             await self.engine.add_lora(lora_request)
 
             # Track path for generate_with_lora (needed for GPU/CPU swap)
