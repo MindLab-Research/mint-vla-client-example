@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # equivalent to zero delta for missing experts.
 #
 # We patch pack_moe inside vLLM TP worker processes via EngineCore.collective_rpc.
-def _mint_vllm_patch_pack_moe_sparse_ok() -> str:
+def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
     import torch
     from vllm.lora import lora_weights as lw  # type: ignore
 
