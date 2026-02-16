@@ -1293,6 +1293,7 @@ class MultiNodeInferenceEngine:
                 "VLLM_DISABLE_PYNCCL": "1",
             }
             for k in (
+                "MINT_ENABLE_VLLM_IMPORT_PATCHES",
                 "MINT_VLLM_LOG_STATS",
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",

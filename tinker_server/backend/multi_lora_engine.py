@@ -363,6 +363,23 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+            env_vars = {
+                "PYTHONPATH": PFS_PYTHONPATH,
+                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                "HF_HUB_OFFLINE": "1",
+            }
+            for k in (
+                # vLLM import-time patching (sitecustomize meta_path hook)
+                # Required for MoE LoRA loading in some vLLM versions.
+                "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+                # Allow disabling specific patches without a code deploy.
+                "MINT_VLLM_DISABLE_PACK_MOE_PATCH",
+                "MINT_VLLM_DISABLE_PUNICA_PATCH",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    env_vars[k] = v
+
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=self.actor_name,
@@ -371,9 +388,7 @@ class MultiLoRAInferenceEngine:
                 max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 runtime_env={
                     "env_vars": {
-                        "PYTHONPATH": PFS_PYTHONPATH,
-                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                        "HF_HUB_OFFLINE": "1",
+                        **env_vars,
                     }
                 },
             ).remote(
