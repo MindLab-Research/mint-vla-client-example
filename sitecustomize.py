@@ -1347,7 +1347,9 @@ def _env_flag(name: str, *, default: str = "0") -> bool:
         return False
 
 
-if _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default="0"):
+# Default to enabled so vLLM multiprocessing workers (spawned from Ray actors)
+# apply the MoE LoRA import-time patches even if env propagation is incomplete.
+if _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default="1"):
     _install_import_patches()
 
 _maybe_set_vllm_host_ip()
