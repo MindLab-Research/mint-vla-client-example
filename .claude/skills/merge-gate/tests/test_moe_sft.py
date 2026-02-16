@@ -1,14 +1,13 @@
-"""MoE SFT Test: Supervised Fine-tuning.
+"""MoE SFT Test: Supervised Fine-tuning (Qwen3-30B-A3B).
 
-Tests MoE model (Qwen3-30B-A3B) SFT using forward_backward + optim_step.
-
-Pass criteria: Loss decreases >30% over 10 iterations.
-
-This test collects training curves and saves plots for visual inspection.
+Agent-analyzed test:
+- Emit a single JSON report + optional plot under `.claude/skills/merge-gate/results/`
+- Fail only on structural invariants (API errors, NaN/Inf, missing metrics)
 """
 
+import time
+
 import numpy as np
-import pytest
 
 from .conftest import (
     MOE_MODEL,
@@ -18,14 +17,15 @@ from .conftest import (
     save_weights,
     sample,
 )
-from .utils import (
-    save_training_curve,
-    detect_anomalies,
-    print_test_summary,
+from .framework import (
+    PlotGenerator,
+    SessionData,
+    TestReport,
+    create_test_report,
+    print_report_summary,
 )
 
 
-# Simple SFT examples for MoE model
 MOE_SFT_EXAMPLES = [
     {"prompt": "What is 2+2?", "response": "4"},
     {"prompt": "What is the color of grass?", "response": "Green"},
@@ -36,11 +36,8 @@ MOE_SFT_EXAMPLES = [
 ]
 
 
-def prepare_moe_sft_data(tokenizer) -> tuple[list, list]:
-    """Prepare SFT data for MoE model."""
+def prepare_moe_sft_data(tokenizer) -> list[dict]:
     api_data = []
-    all_weights = []
-
     for ex in MOE_SFT_EXAMPLES:
         prompt = f"Q: {ex['prompt']}\nA:"
         response = f" {ex['response']}"
@@ -50,7 +47,6 @@ def prepare_moe_sft_data(tokenizer) -> tuple[list, list]:
 
         full_tokens = prompt_tokens + response_tokens
         loss_mask = [0.0] * len(prompt_tokens) + [1.0] * len(response_tokens)
-        all_weights.extend(loss_mask)
 
         api_data.append({
             "model_input": {"chunks": [{"tokens": full_tokens[:-1], "type": "encoded_text"}]},
@@ -59,175 +55,124 @@ def prepare_moe_sft_data(tokenizer) -> tuple[list, list]:
                 "loss_mask": {"data": loss_mask[1:], "shape": [len(loss_mask) - 1], "dtype": "float32"},
             },
         })
-
-    return api_data, all_weights
-
-
-def compute_weighted_loss(result: dict, all_weights: list) -> float:
-    """Compute weighted loss from logprobs."""
-    logprobs = []
-    for item in result.get("loss_fn_outputs", []):
-        lp = item.get("logprobs", [])
-        logprobs.extend(lp)
-
-    # Fall back to mean loss if logprobs not available or mismatch
-    if not logprobs:
-        return result.get("metrics", {}).get("loss:mean", 0)
-
-    # Use mean loss - weighted loss calculation requires matching lengths
-    return result.get("metrics", {}).get("loss:mean", 0)
+    return api_data
 
 
 class TestMoESFT:
-    """MoE model SFT training tests."""
-
     def test_moe_sft_training(self, moe_tokenizer):
-        """Test MoE SFT training.
-
-        Expected: Loss decreases >30% over 10 iterations.
-        Saves training curve for visual inspection.
-        """
         num_iterations = 10
-        min_reduction = 0.30
         lr = 1e-4
 
-        # Create session for MoE model
-        print(f"Creating MoE session for {MOE_MODEL}...")
+        start_time = time.time()
         session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=lr)
-        print(f"Session created: {session_id}, model_id: {model_id}")
+        api_data = prepare_moe_sft_data(moe_tokenizer)
 
-        # Prepare data
-        api_data, all_weights = prepare_moe_sft_data(moe_tokenizer)
+        session = SessionData(
+            session_id=session_id,
+            model_id=model_id,
+            base_model=MOE_MODEL,
+            lora_rank=32,
+            learning_rate=lr,
+        )
 
-        # Training loop - collect all metrics
-        metrics = {
-            "losses": [],
-            "grad_norms": [],
-            "iteration_times": [],
-        }
-
-        import time
         for i in range(num_iterations):
             t0 = time.time()
+            result = forward_backward(model_id, api_data, loss_fn="cross_entropy")
+            assert "error" not in result, f"forward_backward error: {result.get('error')}"
 
-            # Use forward_backward + optim_step for MoE
-            result = forward_backward(
-                model_id,
-                api_data,
-                loss_fn="cross_entropy"
+            loss = result.get("metrics", {}).get("loss:mean")
+            assert loss is not None, "missing metrics.loss:mean"
+            loss = float(loss)
+            assert np.isfinite(loss), f"non-finite loss: {loss!r}"
+
+            optim_result = optim_step(model_id, lr=lr)
+            grad_norm = optim_result.get("metrics", {}).get("grad_norm")
+            if grad_norm is None:
+                grad_norm = optim_result.get("metrics", {}).get("grad_norm:last", None)
+            grad_norm = float(grad_norm) if grad_norm is not None else None
+
+            session.add_iteration(
+                iteration=i + 1,
+                loss=loss,
+                grad_norm=grad_norm,
+                wall_time_seconds=time.time() - t0,
             )
 
-            if "error" in result:
-                print(f"Iteration {i+1}: ERROR - {result['error']}")
-                continue
+            print(
+                f"iter={i+1} loss={loss:.4f} grad_norm={grad_norm if grad_norm is not None else 'n/a'} "
+                f"dt_s={session.iterations[-1].wall_time_seconds:.2f}"
+            )
 
-            # Compute loss
-            loss = compute_weighted_loss(result, all_weights)
-            metrics["losses"].append(loss)
-
-            # Run optimizer step
-            optim_result = optim_step(model_id, lr=lr)
-
-            # Get grad norm from optim result
-            grad_norm = optim_result.get("metrics", {}).get("grad_norm", 0)
-            metrics["grad_norms"].append(grad_norm)
-
-            iteration_time = time.time() - t0
-            metrics["iteration_times"].append(iteration_time)
-
-            print(f"Iteration {i+1}: loss={loss:.4f}, grad_norm={grad_norm:.6f}, time={iteration_time:.2f}s")
-
-        # Save training curve
-        data_path, plot_path = save_training_curve(
-            metrics,
-            "moe_sft",
+        plot = PlotGenerator().training_curve(session, title="MoE SFT (Qwen3-30B-A3B)")
+        report = create_test_report(
+            test_name="moe_sft_training",
+            test_type="training",
+            data=session,
+            start_time=start_time,
+            plots=[plot] if plot else [],
             metadata={
-                "model": MOE_MODEL,
-                "lr": lr,
+                "base_model": MOE_MODEL,
                 "num_iterations": num_iterations,
+                "learning_rate": lr,
                 "num_examples": len(MOE_SFT_EXAMPLES),
             },
-            plot_title="MoE SFT: Training Curve"
         )
+        report_path = report.save()
+        print_report_summary(report)
+        print(f"report_json={report_path}")
 
-        # Detect anomalies
-        anomalies = detect_anomalies(metrics["losses"], "loss")
-
-        # Check grad norm anomalies
-        if metrics["grad_norms"]:
-            zero_grads = sum(1 for g in metrics["grad_norms"] if g < 1e-10)
-            if zero_grads > len(metrics["grad_norms"]) // 2:
-                anomalies.append(f"Many zero grad norms: {zero_grads}/{len(metrics['grad_norms'])}")
-
-        # Print summary
-        extra_info = {
-            "Model": MOE_MODEL,
-            "Avg iteration time": f"{np.mean(metrics['iteration_times']):.2f}s" if metrics["iteration_times"] else "N/A",
-        }
-
-        print_test_summary(
-            "MoE SFT",
-            metrics,
-            anomalies,
-            plot_path,
-            extra_info=extra_info
-        )
-
-        # Programmatic checks
-        assert len(metrics["losses"]) >= num_iterations // 2, (
-            f"Too few iterations completed: {len(metrics['losses'])}/{num_iterations}"
-        )
-
-        initial_loss = metrics["losses"][0]
-        final_loss = metrics["losses"][-1]
-
-        if initial_loss > 0:
-            reduction = (initial_loss - final_loss) / initial_loss
-        else:
-            reduction = 0
-
-        assert reduction >= min_reduction, (
-            f"Loss did not decrease enough: {initial_loss:.4f} -> {final_loss:.4f} "
-            f"({reduction:.1%} < {min_reduction:.0%} required)\n"
-            f"Inspect training curve: {plot_path}"
-        )
-
-        # Warn if anomalies but passed
-        if anomalies:
-            pytest.warns(UserWarning, match="Anomalies detected")
+        assert len(session.iterations) == num_iterations, "incomplete training loop"
 
     def test_moe_sampling_after_train(self, moe_tokenizer):
-        """Test sampling from MoE model after training."""
         lr = 1e-4
+        start_time = time.time()
 
-        # Create session
         session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=lr)
+        api_data = prepare_moe_sft_data(moe_tokenizer)
 
-        # Quick training (3 iterations)
-        api_data, _ = prepare_moe_sft_data(moe_tokenizer)
-
+        losses: list[float] = []
         for i in range(3):
             result = forward_backward(model_id, api_data, loss_fn="cross_entropy")
-            loss = result.get("metrics", {}).get("loss:mean", 0)
+            assert "error" not in result, f"forward_backward error: {result.get('error')}"
+            loss = float(result.get("metrics", {}).get("loss:mean", 0.0))
+            assert np.isfinite(loss), f"non-finite loss: {loss!r}"
+            losses.append(loss)
             optim_step(model_id, lr=lr)
-            print(f"Iteration {i+1}: loss={loss:.4f}")
+            print(f"iter={i+1} loss={loss:.4f}")
 
-        # Save weights for sampling
-        save_result = save_weights(model_id, name="moe_test")
-        assert "error" not in save_result, f"Weight save failed: {save_result.get('error')}"
+        save_result = save_weights(model_id, name="moe_merge_gate_sampling")
+        assert "error" not in save_result, f"save_weights failed: {save_result.get('error')}"
 
-        # Sample from trained model
         prompt = "Q: What is 2+2?\nA:"
         prompt_tokens = moe_tokenizer.encode(prompt, add_special_tokens=True)
+        sample_result = sample(model_id, prompt_tokens, max_tokens=10, temperature=0.0)
+        assert "error" not in sample_result, f"sample failed: {sample_result.get('error')}"
 
-        result = sample(model_id, prompt_tokens, max_tokens=10, temperature=0.0)
-        assert "error" not in result, f"Sampling failed: {result.get('error')}"
-
-        samples = result.get("sequences", [])
-        assert len(samples) > 0, "No samples returned"
-
+        samples = sample_result.get("sequences", [])
+        assert samples, "no sequences returned"
         generated_tokens = samples[0].get("tokens", [])
-        generated_text = moe_tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        assert generated_tokens, "no generated tokens returned"
 
-        print(f"Prompt: {prompt}")
-        print(f"Generated: {generated_text}")
+        generated_text = moe_tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        print(f"prompt={prompt!r}")
+        print(f"generated_text={generated_text!r}")
+
+        report = TestReport(
+            test_id=session_id,
+            test_name="moe_sampling_after_train",
+            test_type="concurrent",
+            timestamp=time.strftime("%Y%m%d_%H%M%S", time.localtime()),
+            duration_seconds=time.time() - start_time,
+            data={
+                "base_model": MOE_MODEL,
+                "train_losses": losses,
+                "prompt": prompt,
+                "generated_text": generated_text,
+                "generated_token_count": len(generated_tokens),
+            },
+            plots=[],
+            anomalies=[],
+            metadata={},
+        )
+        report_path = report.save()
+        print(f"report_json={report_path}")

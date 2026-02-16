@@ -118,6 +118,7 @@ ipython_config.py
 .pdm-build/
 
 # pixi
+
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 #pixi.lock
 #   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
@@ -135,8 +136,6 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-PROMPT.md
-LOG.md
 .env
 .envrc
 .secrets.env
@@ -201,9 +200,6 @@ cython_debug/
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
 
-# Codex CLI scratch files (do not commit)
-PROMPT.md
-LOG.md
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
@@ -217,10 +213,10 @@ __marimo__/
 .serena/
 checkpoints/
 
-# Current prompt
+# Codex task files (do not commit)
 PROMPT.md
-.PROMPT.md
 LOG.md
+.PROMPT.md
 transcript.txt
 results/
 

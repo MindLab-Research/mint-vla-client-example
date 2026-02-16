@@ -4708,9 +4708,11 @@ def get_or_create_megatron_worker_group(
         Ray actor handle to MegatronWorkerGroup.
     """
     from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+    from .model_registry import is_persistent_model
 
     config = distributed_config or DistributedConfig()
     num_gpus = config.world_size
+    is_persistent = is_persistent_model(base_model)
 
     if not ray.is_initialized():
         init_ray(
@@ -4762,6 +4764,7 @@ def get_or_create_megatron_worker_group(
                 actor_handle=actor,
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=base_model,
+                protected=is_persistent,
             )
             # Existing actor is already ready
             resource_pool.mark_ready(actor_name)
@@ -4833,6 +4836,7 @@ def get_or_create_megatron_worker_group(
                 namespace=PERSISTENT_NAMESPACE,
                 base_model=base_model,
                 session_id=session_id,
+                protected=is_persistent,
             )
             return actor
         finally:
