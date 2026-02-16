@@ -554,9 +554,14 @@ def detect_training_anomalies(session: SessionData) -> list[str]:
 
     # Check for loss spikes (>10% increase)
     for i in range(1, len(losses)):
-        if losses[i] > losses[i-1] * 1.1:
-            pct = (losses[i] / losses[i-1] - 1) * 100
-            anomalies.append(f"Loss spike at iter {i+1}: {losses[i-1]:.4f} -> {losses[i]:.4f} (+{pct:.1f}%)")
+        prev = losses[i - 1]
+        cur = losses[i]
+        if cur > prev * 1.1:
+            if prev > 0:
+                pct = (cur / prev - 1) * 100
+                anomalies.append(f"Loss spike at iter {i+1}: {prev:.4f} -> {cur:.4f} (+{pct:.1f}%)")
+            else:
+                anomalies.append(f"Loss spike at iter {i+1}: {prev:.4f} -> {cur:.4f} (+inf%)")
 
     # Check for plateau
     if len(losses) >= 3:
