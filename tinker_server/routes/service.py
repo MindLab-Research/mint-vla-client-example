@@ -77,14 +77,17 @@ async def get_server_capabilities(http_request: Request) -> dict:
 
     if cfg is None or not cfg.model_to_upstream:
         supported = supported_local
+        models = [
+            {
+                "model_name": m,
+                "max_context_length": get_model_config(m).max_model_len,
+                "num_parameters": get_model_config(m).num_parameters,
+            }
+            for m in supported
+        ]
+        models.sort(key=lambda x: x["num_parameters"])
         return {
-            "supported_models": [
-                {
-                    "model_name": m,
-                    "max_context_length": get_model_config(m).max_model_len,
-                }
-                for m in supported
-            ],
+            "supported_models": models,
         }
 
     incoming_headers = dict(http_request.headers)
@@ -119,17 +122,37 @@ async def get_server_capabilities(http_request: Request) -> dict:
             if upstream.alias in unavailable_aliases:
                 continue
             caps = alias_to_caps.get(upstream.alias, {})
+            config = None
+            try:
+                config = get_model_config(m)
+            except (ValueError, KeyError):
+                config = None
+
             if m in caps:
                 max_len = int(caps[m])
-            else:
+            elif config is not None:
                 # Some upstream deployments run with ALLOW_UNSUPPORTED_MODELS=1 and therefore may not
                 # advertise every routable model. Keep routing functional by falling back to the
                 # local registry's max_model_len for that model.
-                max_len = int(get_model_config(m).max_model_len)
+                max_len = int(config.max_model_len)
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gateway misconfig: model {m!r} not present in upstream {upstream.alias!r} capabilities",
+                )
+            num_params = config.num_parameters if config is not None else None
         else:
-            max_len = int(get_model_config(m).max_model_len)
+            config = get_model_config(m)
+            max_len = int(config.max_model_len)
+            num_params = config.num_parameters
 
-        merged.append({"model_name": m, "max_context_length": max_len})
+        entry = {"model_name": m, "max_context_length": max_len}
+        if num_params is not None:
+            entry["num_parameters"] = num_params
+        merged.append(entry)
+
+    # Sort by num_parameters (models without num_parameters go last)
+    merged.sort(key=lambda x: (x.get("num_parameters") is None, x.get("num_parameters", float("inf"))))
 
     return {
         "supported_models": merged,

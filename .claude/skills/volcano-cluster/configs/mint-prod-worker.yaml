@@ -4,6 +4,7 @@
 # Before submitting:
 #   - Ensure mint-prod-head is running and has written ray_head_ip.txt
 #   - (Optional) Verify head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "MINT Production Ray head IP"
+#   - Replace <GPU_QUEUE_ID> below with the desired GPU queue id (prod prefers C1 or C2)
 #
 # Submit with: volc ml_task submit -c mint-prod-worker.yaml --output json
 
@@ -66,7 +67,7 @@ Entrypoint: |
   PY
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:12"
-ResourceQueueID: "q-20251126180002-26lwz"
+ResourceQueueID: "<GPU_QUEUE_ID>"  # Prod prefers a800-mindverse-C1 (q-20251126180002-26lwz) or C2 (q-20260203101340-www2h). Set explicitly before submit.
 Framework: "Custom"
 
 TaskRoleSpecs:

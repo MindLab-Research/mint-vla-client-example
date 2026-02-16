@@ -155,6 +155,22 @@ def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
     return poll_future(resp.json().get("request_id"), timeout=120)
 
 
+def list_actors(actor_type: str | None = None, model_name: str | None = None) -> dict:
+    """List ResourcePool actors via server endpoint.
+
+    Used by merge-gate eviction sentries to observe real eviction events.
+    """
+    url = f"{BASE_URL}/api/v1/actors"
+    params: dict[str, str] = {}
+    if actor_type is not None:
+        params["type"] = actor_type
+    if model_name is not None:
+        params["model_name"] = model_name
+    resp = requests.get(url, params=params, headers=get_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================

@@ -223,7 +223,10 @@ def tinker_to_tensordict(
             _ensure_len("target_tokens", target_tokens, tokens_len, item_index)
             has_external_labels = True
             target_tokens_list.append(target_tokens)
-            print(f"[tinker_to_tensordict] Extracted target_tokens, len={len(target_tokens)}", flush=True)
+            logger.debug(
+                "[tinker_to_tensordict] Extracted target_tokens, len=%d",
+                len(target_tokens),
+            )
         else:
             has_full_external_labels = False
             target_tokens_list.append(None)
@@ -316,10 +319,9 @@ def tinker_to_tensordict(
             target_tokens_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in target_tokens_list]
             td["target"] = torch.nested.as_nested_tensor(target_tokens_tensors, layout=torch.jagged)
             td.set_non_tensor("use_external_label", True)
-            print(
-                f"[tinker_to_tensordict] Added external labels (key='target', no roll), "
-                f"batch_size={len(target_tokens_list)}",
-                flush=True,
+            logger.debug(
+                "[tinker_to_tensordict] Added external labels (key='target', no roll), batch_size=%d",
+                len(target_tokens_list),
             )
         else:
             logger.warning(
@@ -574,19 +576,24 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
             "response_mask": response_mask.bool(),  # Mask for valid positions
             "responses": data.get("responses"),  # For computing response_length
         }
-        print(f"[PPO_LOSS DEBUG] Shapes: rollout={batch_for_metrics['log_probs'].shape}, "
-              f"actor={batch_for_metrics['old_log_probs'].shape}, "
-              f"mask={batch_for_metrics['response_mask'].shape}", flush=True)
+        import os
+        debug_enabled = os.environ.get("MINT_PPO_LOSS_DEBUG", "0") == "1"
+        if debug_enabled:
+            print(f"[PPO_LOSS DEBUG] Shapes: rollout={batch_for_metrics['log_probs'].shape}, "
+                  f"actor={batch_for_metrics['old_log_probs'].shape}, "
+                  f"mask={batch_for_metrics['response_mask'].shape}", flush=True)
         debug_metrics = calculate_debug_metrics(batch_for_metrics)
-        print(f"[PPO_LOSS DEBUG] Got debug_metrics: {debug_metrics}", flush=True)
+        if debug_enabled:
+            print(f"[PPO_LOSS DEBUG] Got debug_metrics: {debug_metrics}", flush=True)
         if debug_metrics:
             metrics.update(debug_metrics)
-            print(f"[PPO_LOSS DEBUG] Updated metrics, keys now: {list(metrics.keys())}", flush=True)
+            if debug_enabled:
+                print(f"[PPO_LOSS DEBUG] Updated metrics, keys now: {list(metrics.keys())}", flush=True)
 
         # DEBUG: Print tokens with very negative logprobs
         # Note: response_log_probs and old_log_probs may be 2D [batch, seq] or 1D [total_tokens]
         diff = (response_log_probs - old_log_probs).abs() * response_mask.float()
-        if diff.numel() > 0 and diff.max() > 10.0:  # Large difference threshold
+        if debug_enabled and diff.numel() > 0 and diff.max() > 10.0:  # Large difference threshold
             import torch.distributed as dist
             if not dist.is_initialized() or dist.get_rank() == 0:
                 max_idx = diff.argmax()

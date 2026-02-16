@@ -183,6 +183,8 @@ def _apply_external_label_patch():
         # Capture actual sequence lengths from input_ids (nested tensor) for padding mask
         # input_ids.offsets() gives cumulative lengths, diff() gives per-sequence lengths
         actual_seq_lens = input_ids.offsets().diff().tolist()
+        import os
+        debug_enabled = os.environ.get("MINT_VERL_DIAGNOSTICS", "0") == "1"
 
         def logits_processor(logits, temperature, **label_kwargs):
             """Process logits to compute log_probs."""

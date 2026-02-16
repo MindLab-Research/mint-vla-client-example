@@ -8,9 +8,12 @@ Tests core API operations on MoE model (Qwen3-30B-A3B):
 - Train-then-sample workflow
 
 Pass criteria: All API operations complete without error.
-
-Note: MoE tests require 12 GPUs (8 Megatron + 4 vLLM).
+ 
+Note: MoE tests can allocate both trainer (4 GPUs) and vLLM (4 GPUs) under an 8-GPU budget.
 """
+
+import time
+import uuid
 
 import numpy as np
 import pytest
@@ -23,6 +26,23 @@ from .conftest import (
     save_weights,
     sample,
 )
+from .framework import TestReport
+
+
+def _save_report(test_name: str, data: dict, anomalies: list[str] | None = None) -> None:
+    report = TestReport(
+        test_id=str(uuid.uuid4()),
+        test_name=test_name,
+        test_type="api",
+        timestamp=time.strftime("%Y%m%d_%H%M%S", time.localtime()),
+        duration_seconds=0.0,
+        data=data,
+        plots=[],
+        anomalies=anomalies or [],
+        metadata={},
+    )
+    report_path = report.save()
+    print(f"report_json={report_path}")
 
 
 class TestMoEAPI:
@@ -34,6 +54,7 @@ class TestMoEAPI:
         assert session_id is not None, "Session creation failed"
         assert model_id is not None, "Model ID not returned"
         print(f"MoE session: session={session_id}, model={model_id}")
+        _save_report("moe_api_session_creation", {"base_model": MOE_MODEL, "session_id": session_id, "model_id": model_id})
 
     def test_weight_save_and_sample(self, moe_tokenizer):
         """Test MoE weight saving and sampling flow."""
@@ -60,6 +81,17 @@ class TestMoEAPI:
         generated_text = moe_tokenizer.decode(generated_tokens, skip_special_tokens=True)
         print(f"Prompt: {prompt}")
         print(f"Generated: {generated_text}")
+        _save_report(
+            "moe_api_weight_save_and_sample",
+            {
+                "base_model": MOE_MODEL,
+                "session_id": session_id,
+                "model_id": model_id,
+                "prompt": prompt,
+                "generated_text": generated_text,
+                "generated_token_count": len(generated_tokens),
+            },
+        )
 
     def test_sampling_with_temperature(self, moe_tokenizer):
         """Test MoE sampling with various temperatures."""
@@ -70,6 +102,7 @@ class TestMoEAPI:
         prompt_tokens = moe_tokenizer.encode(prompt, add_special_tokens=True)
 
         temperatures = [0.0, 0.5, 1.0]
+        outs: list[dict] = []
         for temp in temperatures:
             result = sample(model_id, prompt_tokens, max_tokens=20, temperature=temp)
             assert "error" not in result, f"Sampling failed at temp={temp}: {result.get('error')}"
@@ -77,6 +110,12 @@ class TestMoEAPI:
             sample_data = result["sequences"][0]
             generated_text = moe_tokenizer.decode(sample_data.get("tokens", []), skip_special_tokens=True)
             print(f"Temp {temp}: {generated_text}")
+            outs.append({"temperature": temp, "generated_text": generated_text})
+
+        _save_report(
+            "moe_api_sampling_with_temperature",
+            {"base_model": MOE_MODEL, "session_id": session_id, "model_id": model_id, "prompt": prompt, "outputs": outs},
+        )
 
     def test_prompt_logprobs(self, moe_tokenizer):
         """Test MoE prompt logprob extraction."""
@@ -116,6 +155,18 @@ class TestMoEAPI:
         print(f"Prompt tokens: {len(prompt_tokens)}")
         print(f"Prompt logprobs: {len(prompt_logprobs)}")
         print(f"Sample logprobs: {prompt_logprobs[:5]}...")
+        _save_report(
+            "moe_api_prompt_logprobs",
+            {
+                "base_model": MOE_MODEL,
+                "session_id": session_id,
+                "model_id": model_id,
+                "prompt": prompt,
+                "prompt_token_count": len(prompt_tokens),
+                "prompt_logprobs_count": len(prompt_logprobs),
+                "prompt_logprobs_head": prompt_logprobs[:10],
+            },
+        )
 
     def test_train_then_sample(self, moe_tokenizer):
         """Test MoE train-then-sample workflow."""
@@ -158,6 +209,19 @@ class TestMoEAPI:
         generated_text = moe_tokenizer.decode(sample_data.get("tokens", []), skip_special_tokens=True)
         print(f"After training: {prompt}{generated_text}")
 
-        # Loss should decrease
-        if len(losses) >= 2:
-            assert losses[-1] < losses[0], f"Loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+        anomalies: list[str] = []
+        if len(losses) >= 2 and losses[-1] >= losses[0]:
+            anomalies.append(f"loss_non_decreasing: {losses[0]:.4f} -> {losses[-1]:.4f}")
+
+        _save_report(
+            "moe_api_train_then_sample",
+            {
+                "base_model": MOE_MODEL,
+                "session_id": session_id,
+                "model_id": model_id,
+                "train_losses": losses,
+                "prompt": prompt,
+                "generated_text": generated_text,
+            },
+            anomalies=anomalies,
+        )

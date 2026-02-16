@@ -54,7 +54,7 @@ Storages:
 ```bash
 volc ml_task list --output json                 # List tasks
 volc ml_task submit -c config.yaml --output json  # Submit new task
-volc ml_task cancel --id TASK_ID --output json  # Cancel task
+volc ml_task cancel --id TASK_ID                # Cancel task (no --output json support on current CLI)
 volc ml_task logs -t TASK_ID -i worker_0        # View logs (find Ray IP here)
 ```
 

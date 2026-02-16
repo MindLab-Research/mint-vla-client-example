@@ -162,7 +162,17 @@ class TestReport:
     """Complete test report with all data and metadata."""
     test_id: str
     test_name: str
-    test_type: Literal["training", "isolation", "accumulation", "eviction", "checkpoint", "concurrent"]
+    test_type: Literal[
+        "training",
+        "isolation",
+        "accumulation",
+        "eviction",
+        "checkpoint",
+        "concurrent",
+        "api",
+        "long_context",
+        "stress",
+    ]
     timestamp: str
     duration_seconds: float = 0.0
     data: Any = None  # Test-specific data (SessionData, GradientIsolationData, etc.)
@@ -268,6 +278,70 @@ class PlotGenerator:
         filename = filename or f"training_{session.session_id[:8]}_{timestamp}.png"
         filepath = self.results_dir / filename
         self.plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        self.plt.close()
+
+        return filepath
+
+    def rl_training_curves(
+        self,
+        session: SessionData,
+        title: str | None = None,
+        filename: str | None = None,
+    ) -> Path | None:
+        """Generate RL training plots (loss/reward/accuracy/ratio)."""
+        if not self.available:
+            return None
+
+        iterations = list(range(1, len(session.iterations) + 1))
+        losses = session.losses
+        rewards = [it.reward for it in session.iterations]
+        accuracies = [it.accuracy for it in session.iterations]
+        ratios = [it.ratio_mean for it in session.iterations]
+
+        fig, axes = self.plt.subplots(2, 2, figsize=(14, 10))
+
+        ax = axes[0, 0]
+        ax.plot(iterations, losses, "b-o", linewidth=2, markersize=6)
+        ax.set_title("Loss")
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[0, 1]
+        if any(r is not None for r in rewards):
+            ax.plot(iterations, rewards, "g-o", linewidth=2, markersize=6)
+        else:
+            ax.text(0.5, 0.5, "No reward data", transform=ax.transAxes, ha="center", va="center", color="gray")
+        ax.set_title("Reward")
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 0]
+        if any(a is not None for a in accuracies):
+            ax.plot(iterations, accuracies, "orange", linewidth=2, marker="o", markersize=6)
+            ax.set_ylim(0.0, 1.0)
+        else:
+            ax.text(0.5, 0.5, "No accuracy data", transform=ax.transAxes, ha="center", va="center", color="gray")
+        ax.set_title("Accuracy")
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 1]
+        if any(r is not None for r in ratios):
+            ax.plot(iterations, ratios, "purple", linewidth=2, marker="o", markersize=6)
+            ax.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+        else:
+            ax.text(0.5, 0.5, "No ratio data", transform=ax.transAxes, ha="center", va="center", color="gray")
+        ax.set_title("Policy Ratio Mean")
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+        fig.suptitle(title or f"RL Curves: {session.base_model}", fontsize=12)
+        self.plt.tight_layout()
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = filename or f"rl_{session.session_id[:8]}_{timestamp}.png"
+        filepath = self.results_dir / filename
+        self.plt.savefig(filepath, dpi=150, bbox_inches="tight")
         self.plt.close()
 
         return filepath
@@ -480,9 +554,14 @@ def detect_training_anomalies(session: SessionData) -> list[str]:
 
     # Check for loss spikes (>10% increase)
     for i in range(1, len(losses)):
-        if losses[i] > losses[i-1] * 1.1:
-            pct = (losses[i] / losses[i-1] - 1) * 100
-            anomalies.append(f"Loss spike at iter {i+1}: {losses[i-1]:.4f} -> {losses[i]:.4f} (+{pct:.1f}%)")
+        prev = losses[i - 1]
+        cur = losses[i]
+        if cur > prev * 1.1:
+            if prev > 0:
+                pct = (cur / prev - 1) * 100
+                anomalies.append(f"Loss spike at iter {i+1}: {prev:.4f} -> {cur:.4f} (+{pct:.1f}%)")
+            else:
+                anomalies.append(f"Loss spike at iter {i+1}: {prev:.4f} -> {cur:.4f} (+inf%)")
 
     # Check for plateau
     if len(losses) >= 3:

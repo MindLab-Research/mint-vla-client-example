@@ -56,6 +56,7 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
 | Ray Configs | `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`, `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` |
+| Prod GPU Queues | Prefer `a800-mindverse-C1` (`q-20251126180002-26lwz`) or `a800-mindverse-C2` (`q-20260203101340-www2h`). Do not hard-code; confirm availability or ask user before submitting workers. |
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
@@ -135,6 +136,8 @@ Then recreate actors as needed and re-run placement checks above.
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
 
 ---
+
+**Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. Set it explicitly before submitting any new prod worker tasks.
 
 ## Finding the Server Process
 

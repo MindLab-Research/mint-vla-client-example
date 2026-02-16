@@ -21,8 +21,8 @@ class MultiNodeEngineResources:
 
 def compute_multinode_engine_resources(
     worker_gpus: int,
+    preferred_node_ips: list[str] | None = None,
     *,
-    node_ips: list[str] | None = None,
     gpus_per_node: int = 8,
 ) -> MultiNodeEngineResources:
     if int(worker_gpus) <= 0:
@@ -33,13 +33,16 @@ def compute_multinode_engine_resources(
     controller_cpus = 1
 
     total_required_gpus = int(worker_gpus)
+    cleaned = [ip.strip() for ip in (preferred_node_ips or []) if isinstance(ip, str) and ip.strip()]
+    node_ips: list[str] = list(dict.fromkeys(cleaned))
+
     if node_ips:
         if int(gpus_per_node) <= 0:
             raise ValueError(f"gpus_per_node must be > 0, got {gpus_per_node!r}")
         nodes_needed = (total_required_gpus + int(gpus_per_node) - 1) // int(gpus_per_node)
         if len(node_ips) < nodes_needed:
             raise ValueError(
-                f"node_ips too short: need {nodes_needed} nodes for worker_gpus={worker_gpus}, got {len(node_ips)}"
+                f"preferred_node_ips too short: need {nodes_needed} nodes for worker_gpus={worker_gpus}, got {len(node_ips)}"
             )
 
         pg_bundles: list[dict[str, int | float]] = []

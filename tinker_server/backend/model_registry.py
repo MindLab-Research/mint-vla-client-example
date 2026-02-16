@@ -4,7 +4,7 @@ import logging
 import os
 import types
 from dataclasses import dataclass, replace
-from typing import Any, get_args, get_origin
+from typing import Any, Literal, get_args, get_origin
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     """Hardware configuration for a model.
+
+    Model parameters:
+        - num_parameters: Total parameter count in billions (e.g., 30.0 for 30B model)
 
     Inference parallelism (vLLM):
         - inference_tp: Tensor parallelism (shards weights)
@@ -45,6 +48,7 @@ class ModelConfig:
         - train_nccl_ib_disable: Set NCCL_IB_DISABLE=1 for Megatron ranks (multi-node stability).
     """
 
+    num_parameters: float  # Total parameter count in billions
     is_moe: bool
     inference_tp: int  # vLLM inference TP
     inference_dp: int  # vLLM inference DP
@@ -69,6 +73,14 @@ class ModelConfig:
     kv_cache_dtype: str | None = None  # None = use model's default, "fp8_e5m2" halves KV cache memory
     gradient_checkpointing: bool = False  # Enable for large dense models to reduce VRAM usage
     is_mla: bool = False  # Uses Multi-Latent Attention (DeepSeek V3 architecture)
+    # vLLM engine selection:
+    # - "verl_http": verl's single-node HTTP-style vLLM server (default; used for 1-GPU small models)
+    # - "async": direct vLLM AsyncLLMEngine wrapper (supports multi-GPU TP and per-token logprobs)
+    vllm_engine: Literal["verl_http", "async"] = "verl_http"
+    # Only used when vllm_engine="async":
+    # - "mp": single-node multiprocessing TP (avoid Ray compiled DAG)
+    # - "ray": Ray distributed executor (uses Ray compiled DAG; keep for K2)
+    vllm_distributed_executor_backend: Literal["mp", "ray"] = "mp"
 
     @property
     def total_gpus(self) -> int:
@@ -104,23 +116,27 @@ MODEL_CONFIGS = {
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
     # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
+        num_parameters=7.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
         max_num_seqs=32,  # Leave vLLM headroom for 32K prompt_logprobs
         gradient_checkpointing=True,  # Required for sequences >5000 tokens
     ),
     "Qwen/Qwen3-0.6B": ModelConfig(
+        num_parameters=0.6,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
         max_num_seqs=64,  # Leave headroom for long-context prompt_logprobs
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
+        num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
+        num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
         max_num_seqs=32,  # Leave headroom for long-context prompt_logprobs
@@ -128,6 +144,7 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     "Qwen/Qwen3-8B": ModelConfig(
+        num_parameters=8.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=40960,  # 40K context
         gradient_checkpointing=True,
@@ -136,6 +153,7 @@ MODEL_CONFIGS = {
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,  # 40K context - full model capability
         # NOTE: vLLM's `max_num_seqs` caps the total number of *active sequences*,
@@ -150,30 +168,33 @@ MODEL_CONFIGS = {
         max_loras=8,
         max_cpu_loras=16,
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
+        num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=40960,
         gradient_checkpointing=True,
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
-    # Model config: num_attention_heads=64, num_key_value_heads=4 (GQA)
-    #
-    # Aliyun (L20X 140GB, 3 nodes x 8 GPUs = 24 GPUs):
-    # - Inference: TP=8, DP=1 -> 1 replica on a single 8-GPU node (8 GPUs total).
-    # - Training: TP=4, PP=2, EP=2 -> 2 pipeline stages, 8 GPUs per stage (16 GPUs total).
-    # This split lets MINT_PERSISTENT_MODELS prewarm both trainer and inferencer concurrently (16+8=24).
+    # Default profile is kept for H200-style deployment.
+    # For Volcano A800 profile, use MINT_MODEL_CONFIG_OVERRIDES_JSON with:
+    # `configs/volcano_a800_235b_overrides.json`.
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
+        num_parameters=235.0,
         is_moe=True,
         inference_tp=8,
         inference_dp=1,
@@ -185,8 +206,11 @@ MODEL_CONFIGS = {
         max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
         max_num_batched_tokens=512,  # prompt_logprobs memory spike at 32K
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
+        num_parameters=235.0,
         is_moe=True,
         inference_tp=8,
         inference_dp=1,
@@ -196,6 +220,8 @@ MODEL_CONFIGS = {
         max_lora_rank=16,
         max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
@@ -209,6 +235,7 @@ MODEL_CONFIGS = {
     # - LoRA rank must be divisible by TP (adapter sharding); keep max_lora_rank=64.
     # With 384 experts: EP=64 => 6 experts per GPU.
     "moonshotai/Kimi-K2-Instruct": ModelConfig(
+        num_parameters=1040.0,
         is_moe=True,
         inference_tp=64,
         inference_pp=1,
@@ -230,6 +257,8 @@ MODEL_CONFIGS = {
         max_num_seqs=8,  # Must be >= default SamplingParams(n=8)
         max_num_batched_tokens=1024,  # Cap logits/prefill peak allocations at long context
         is_mla=True,  # DeepSeek V3 MLA architecture
+        vllm_engine="async",
+        vllm_distributed_executor_backend="ray",
         gradient_checkpointing=True,  # Required to fit model with long context
     ),
     "unsloth/Kimi-K2-Instruct-0905-BF16": ModelConfig(
@@ -251,9 +280,12 @@ MODEL_CONFIGS = {
         max_num_seqs=8,
         max_num_batched_tokens=1024,
         is_mla=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="ray",
         gradient_checkpointing=True,
     ),
     "moonshotai/Kimi-K2-Thinking": ModelConfig(
+        num_parameters=1040.0,
         is_moe=True,
         inference_tp=32,  # Inference: TP=32 (PROMPT.md spec)
         inference_dp=1,
@@ -275,17 +307,20 @@ MODEL_CONFIGS = {
         max_lora_rank=16,  # Rank 16: matches training lora_rank
         max_model_len=32768,  # Reduced from 64K to 32K to save GPU memory (train uses 8K)
         is_mla=True,  # DeepSeek V3 MLA architecture
+        vllm_engine="async",
+        vllm_distributed_executor_backend="ray",
         gradient_checkpointing=True,  # Required to fit model with long context
     ),
     # Moonlight-16B-A3B - smaller DeepSeek V3 MLA model (64 experts, 27 layers)
     # Merge gate settings:
-    # - Megatron: TP=2, EP=4 (8 GPUs)
+    # - Megatron: TP=1, EP=4 (4 GPUs)
     # - vLLM: TP=4 (4 GPUs)
     "moonshotai/Moonlight-16B-A3B-Instruct": ModelConfig(
+        num_parameters=16.0,
         is_moe=True,
         inference_tp=4,
         inference_dp=1,
-        train_tp=2,
+        train_tp=1,
         train_ep=4,
         train_cp=1,
         quantization=None,  # BF16, no quantization needed
@@ -336,6 +371,48 @@ def normalize_model_name(model_name_or_path: str) -> str:
         f"Cannot identify model from: {model_name_or_path}. "
         f"Supported models: {list(MODEL_CONFIGS.keys())}"
     )
+
+
+def maybe_normalize_model_name(model_name_or_path: str) -> str | None:
+    """Best-effort normalization for persistent model matching.
+
+    Returns a supported HF model name if it can be identified from a name/path,
+    otherwise returns None.
+    """
+    if model_name_or_path in MODEL_CONFIGS:
+        return model_name_or_path
+
+    import re
+
+    match = re.search(r"models--([^/]+)--([^/]+)", model_name_or_path)
+    if match:
+        org, model = match.groups()
+        candidate = f"{org}/{model}"
+        if candidate in MODEL_CONFIGS:
+            return candidate
+
+    lower = model_name_or_path.lower()
+    for model_name in MODEL_CONFIGS:
+        if model_name.replace("/", "--").lower() in lower:
+            return model_name
+
+    return None
+
+
+def is_persistent_model(model_name_or_path: str) -> bool:
+    models_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+    if not models_csv:
+        return False
+
+    raw = {s.strip() for s in models_csv.split(",") if s.strip()}
+    normalized = {m for s in raw if (m := maybe_normalize_model_name(s)) is not None}
+    persistent_ids = raw | normalized
+
+    if model_name_or_path in persistent_ids:
+        return True
+
+    m = maybe_normalize_model_name(model_name_or_path)
+    return m in persistent_ids if m is not None else False
 
 
 def get_model_config(model_name: str) -> ModelConfig:

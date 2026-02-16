@@ -1217,24 +1217,8 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-            # Use MultiNodeInferenceEngine (vLLM AsyncLLMEngine + Ray executor backend)
-            # only when the model cannot fit on a single 8-GPU worker.
-            #
-            # For <=8 GPUs (e.g., Qwen3-30B TP=4), prefer the single-node
-            # MultiLoRAInferenceEngine to avoid vLLM's Ray executor multi-node
-            # networking constraints (e.g., VLLM_HOST_IP uniqueness checks).
-            # vLLM v1 multiprocess TP has repeatedly failed to initialize for MoE TP>=4
-            # (worker subprocess dies before emitting a root-cause stack trace). Use vLLM's
-            # Ray distributed executor backend instead, even when the model fits on one node.
-            multinode_min_gpus = int(os.environ.get("MINT_MULTINODE_MIN_GPUS", "8"))
-            moe_multinode_min_gpus = int(os.environ.get("MINT_MOE_MULTINODE_MIN_GPUS", "4"))
-            needs_multinode = (config.total_gpus > multinode_min_gpus) or (
-                config.is_moe and config.total_gpus >= moe_multinode_min_gpus
-            )
-
-            if needs_multinode:
-                # Use MultiNodeInferenceEngine with vLLM's native Ray distributed backend
-                from .multinode_inference import MultiNodeInferenceEngine
+                if config.vllm_engine == "async":
+                    from .multinode_inference import MultiNodeInferenceEngine
 
                 total_gpus = config.total_gpus
                 pipeline_parallel_size = getattr(config, "inference_pp", 1)
@@ -1242,16 +1226,13 @@ class MultiModelInferenceManager:
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
                     f"actor={actor_name}, TP={config.inference_tp}, PP={pipeline_parallel_size}, DP={config.inference_dp}, "
-                    f"expert_parallel={enable_expert_parallel}, total_gpus={total_gpus}, "
-                    f"gpu_util={model_gpu_util}, quant={quantization}, "
+                    f"backend={config.vllm_distributed_executor_backend}, expert_parallel={enable_expert_parallel}, "
+                    f"total_gpus={total_gpus}, gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
                     f"max_model_len={model_max_model_len}, max_num_seqs={model_max_num_seqs}, "
                     f"kv_cache_dtype={model_kv_cache_dtype}"
                 )
 
-                # MultiNodeInferenceEngine.initialize() handles:
-                # - reconnecting to existing detached actor (no extra GPUs needed)
-                # - creating a new actor (includes its own GPU availability checks)
                 engine = MultiNodeInferenceEngine(
                     model_path=model_path,
                     model_name=model_name,
@@ -1269,6 +1250,7 @@ class MultiModelInferenceManager:
                     quantization=quantization,
                     kv_cache_dtype=model_kv_cache_dtype,
                     actor_name=actor_name,
+                    distributed_executor_backend=config.vllm_distributed_executor_backend,
                 )
             else:
                 # Use standard MultiLoRAInferenceEngine for single-node models

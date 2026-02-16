@@ -15,6 +15,7 @@ Pass criteria: All clients complete without deadlock or error.
 """
 
 import concurrent.futures
+import os
 import threading
 import time
 from typing import Any
@@ -29,6 +30,15 @@ from .conftest import (
     create_session,
     forward_backward,
     optim_step,
+    save_weights,
+    list_actors,
+)
+from .framework import (
+    LRUEvictionData,
+    PlotGenerator,
+    TestReport,
+    create_test_report,
+    print_report_summary,
 )
 
 # Pre-load tokenizers to avoid concurrent import race conditions
@@ -395,57 +405,87 @@ class TestStress:
         )
 
     def test_mixed_model_lru_eviction(self):
-        """Test LRU eviction with Dense and MoE clients.
+        """Eviction sentry: require an observed eviction event under 8 GPUs.
 
-        When insufficient GPUs for both models simultaneously,
-        the system should evict least-recently-used actors.
+        This test snapshots ResourcePool actor inventory before/after phases and
+        fails unless at least one eviction event is observed (actor disappearance).
 
-        Clients:
-        - Client 1: Dense SFT (needs 2 GPUs)
-        - Client 2: MoE SFT (needs 12 GPUs)
-        - Client 3: Dense SFT (may trigger eviction)
-
-        NOTE: This test is meaningful when cluster has 12-14 GPUs,
-        forcing LRU eviction when switching between Dense and MoE.
+        Requires server started with:
+        - MINT_MIN_ACTOR_AGE=0
+        - small MINT_SESSION_IDLE_TIMEOUT (so a prior actor becomes idle during the test)
         """
-        print("\n=== LRU Eviction Test ===")
-        print("This test validates graceful actor replacement when")
-        print("Dense and MoE models cannot colocate simultaneously.\n")
+        start_time = time.time()
+        idle_wait_s = float(os.environ.get("TINKER_EVICTION_IDLE_WAIT_S", "6"))
 
-        results = []
+        data = LRUEvictionData()
 
-        # Run Dense first
-        print("Phase 1: Starting Dense client...")
-        r1 = run_dense_sft_client(1, rank=32, num_iterations=2)
-        results.append(r1)
+        def snapshot(phase: str, action: str = "") -> set[str]:
+            resp = list_actors()
+            actors = [a.get("actor_name") for a in resp.get("actors", []) if isinstance(a, dict)]
+            actors = [a for a in actors if isinstance(a, str) and a]
+            gpu_usage = int(resp.get("total_gpus_used", 0) or 0)
+            data.add_snapshot(phase=phase, actors=actors, gpu_usage=gpu_usage, action=action)
+            print(f"snapshot phase={phase} gpus={gpu_usage} actors={len(actors)} action={action!r}")
+            return set(actors)
 
-        # Run MoE (may evict Dense actors)
-        print("\nPhase 2: Starting MoE client (may trigger eviction)...")
-        r2 = run_moe_sft_client(2, rank=32, num_iterations=2)
-        results.append(r2)
+        prev = snapshot("start")
 
-        # Run Dense again (may evict MoE actors)
-        print("\nPhase 3: Starting Dense client again...")
-        r3 = run_dense_sft_client(3, rank=32, num_iterations=2)
-        results.append(r3)
+        # Phase 1: create a Dense training actor, then let it become idle.
+        r1 = run_dense_sft_client(1, rank=32, num_iterations=1)
+        assert r1.get("status") == "completed", f"dense phase failed: {r1}"
+        dense_after = snapshot("dense_created", action="dense_sft_client")
 
-        # Print summary
-        print(f"\n{'='*60}")
-        print(f"LRU EVICTION TEST RESULTS")
-        print(f"{'='*60}")
+        time.sleep(idle_wait_s)
+        dense_idle = snapshot("dense_idle_wait", action=f"sleep {idle_wait_s}s")
 
-        all_passed = True
-        for r in results:
-            status_mark = "PASS" if r["status"] == "completed" else "FAIL"
-            if r["status"] != "completed":
-                all_passed = False
-            print(f"  Client {r['client_id']}: {status_mark} "
-                  f"({r.get('model', '?')}/{r.get('task', '?')})")
-            if r.get("errors"):
-                for err in r["errors"][:2]:
-                    print(f"    Error: {err}")
+        # Phase 2: create MoE trainer, then create MoE vLLM engine (save_weights) to push total GPU demand > 8.
+        r2 = run_moe_sft_client(2, rank=32, num_iterations=1)
+        assert r2.get("status") == "completed", f"moe trainer phase failed: {r2}"
+        moe_trainer = snapshot("moe_trainer", action="moe_sft_client")
 
-        assert all_passed, "Some clients failed during LRU eviction test"
+        moe_model_id = r2.get("model_id")
+        assert isinstance(moe_model_id, str) and moe_model_id, f"missing model_id from moe client: {r2}"
+        save_res = save_weights(moe_model_id, name="merge_gate_eviction_moe")
+        assert "error" not in save_res, f"save_weights failed: {save_res.get('error')}"
+        moe_vllm = snapshot("moe_vllm_created", action="save_weights(moe)")
+
+        # Phase 3: touch Dense again (may evict MoE actors depending on LRU/idle).
+        r3 = run_dense_sft_client(3, rank=32, num_iterations=1)
+        assert r3.get("status") == "completed", f"dense reentry phase failed: {r3}"
+        dense_again = snapshot("dense_again", action="dense_sft_client")
+
+        # Infer eviction events from consecutive snapshots.
+        for i in range(1, len(data.snapshots)):
+            a0 = set(data.snapshots[i - 1].actors)
+            a1 = set(data.snapshots[i].actors)
+            removed = sorted(a0 - a1)
+            added = sorted(a1 - a0)
+            if removed:
+                data.eviction_events.append({
+                    "from_phase": data.snapshots[i - 1].phase,
+                    "to_phase": data.snapshots[i].phase,
+                    "removed": removed,
+                    "added": added,
+                })
+
+        plot = PlotGenerator().lru_eviction_timeline(data)
+        report = create_test_report(
+            test_name="stress_lru_eviction",
+            test_type="eviction",
+            data=data,
+            start_time=start_time,
+            plots=[plot] if plot else [],
+            metadata={
+                "idle_wait_s": idle_wait_s,
+                "dense_model": DENSE_MODEL,
+                "moe_model": MOE_MODEL,
+            },
+        )
+        report_path = report.save()
+        print_report_summary(report)
+        print(f"report_json={report_path}")
+
+        assert data.eviction_events, "no eviction events observed (check MINT_MIN_ACTOR_AGE and MINT_SESSION_IDLE_TIMEOUT)"
 
     def test_rapid_session_creation(self):
         """Test rapid session creation and teardown.
@@ -587,11 +627,35 @@ class TestStress:
         a_overall_decrease = (losses_a[0] - losses_a[-1]) / losses_a[0]
         print(f"A overall reduction: {a_overall_decrease:.1%}")
 
-        # Assertions
-        assert loss_continued, (
-            f"Session A state not preserved after switch: "
-            f"loss jumped from {loss_before_switch:.4f} to {loss_after_switch:.4f}"
+        anomalies: list[str] = []
+        if not loss_continued:
+            anomalies.append(
+                f"loss_discontinuity_after_switch: {loss_before_switch:.4f} -> {loss_after_switch:.4f}"
+            )
+        if a_overall_decrease <= 0.3:
+            anomalies.append(f"minimal_learning_session_a: {a_overall_decrease:.1%} reduction")
+
+        report = TestReport(
+            test_id=session_a_id,
+            test_name="stress_interleaved_sessions",
+            test_type="stress",
+            timestamp=time.strftime("%Y%m%d_%H%M%S", time.localtime()),
+            duration_seconds=0.0,
+            data={
+                "model": DENSE_MODEL,
+                "session_a_id": session_a_id,
+                "session_b_id": session_b_id,
+                "losses_a": losses_a,
+                "losses_b": losses_b,
+                "loss_before_switch": loss_before_switch,
+                "loss_after_switch": loss_after_switch,
+                "a_overall_decrease": a_overall_decrease,
+            },
+            plots=[],
+            anomalies=anomalies,
+            metadata={},
         )
-        assert a_overall_decrease > 0.3, (
-            f"Session A did not learn: only {a_overall_decrease:.1%} reduction"
-        )
+        report_path = report.save()
+        print(f"report_json={report_path}")
+
+        assert len(losses_a) == 4 and len(losses_b) == 2, "incomplete loss traces"

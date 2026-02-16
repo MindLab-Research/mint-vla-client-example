@@ -1353,3 +1353,19 @@ if _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default="1"):
     _install_import_patches()
 
 _maybe_set_vllm_host_ip()
+
+
+def _maybe_register_faulthandler_sigusr1() -> None:
+    if os.environ.get("MINT_FAULTHANDLER_SIGUSR1", "").strip() != "1":
+        return
+    try:
+        import faulthandler
+        import signal
+
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:
+        # Best-effort only; never break process startup from sitecustomize.
+        return
+
+
+_maybe_register_faulthandler_sigusr1()
