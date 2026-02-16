@@ -124,16 +124,9 @@ def get_or_create_dense_trainer(
             actor_name = _make_actor_name(base_model, effective_max_rank)
 
             pool = get_resource_pool()
-            from .model_registry import normalize_model_name
+            from .model_registry import is_persistent_model
 
-            persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
-            persistent_models = {s.strip() for s in persistent_csv.split(",") if s.strip()} if persistent_csv else set()
-            is_persistent = False
-            if persistent_models:
-                try:
-                    is_persistent = normalize_model_name(base_model) in persistent_models
-                except Exception:
-                    is_persistent = base_model in persistent_models
+            is_persistent = is_persistent_model(base_model)
 
             try:
                 actor = ray.get_actor(actor_name, namespace=PERSISTENT_DENSE_NAMESPACE)

@@ -296,6 +296,48 @@ def normalize_model_name(model_name_or_path: str) -> str:
     )
 
 
+def maybe_normalize_model_name(model_name_or_path: str) -> str | None:
+    """Best-effort normalization for persistent model matching.
+
+    Returns a supported HF model name if it can be identified from a name/path,
+    otherwise returns None.
+    """
+    if model_name_or_path in MODEL_CONFIGS:
+        return model_name_or_path
+
+    import re
+
+    match = re.search(r"models--([^/]+)--([^/]+)", model_name_or_path)
+    if match:
+        org, model = match.groups()
+        candidate = f"{org}/{model}"
+        if candidate in MODEL_CONFIGS:
+            return candidate
+
+    lower = model_name_or_path.lower()
+    for model_name in MODEL_CONFIGS:
+        if model_name.replace("/", "--").lower() in lower:
+            return model_name
+
+    return None
+
+
+def is_persistent_model(model_name_or_path: str) -> bool:
+    models_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
+    if not models_csv:
+        return False
+
+    raw = {s.strip() for s in models_csv.split(",") if s.strip()}
+    normalized = {m for s in raw if (m := maybe_normalize_model_name(s)) is not None}
+    persistent_ids = raw | normalized
+
+    if model_name_or_path in persistent_ids:
+        return True
+
+    m = maybe_normalize_model_name(model_name_or_path)
+    return m in persistent_ids if m is not None else False
+
+
 def get_model_config(model_name: str) -> ModelConfig:
     """Get config for a supported model.
 

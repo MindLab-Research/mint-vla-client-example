@@ -4613,18 +4613,11 @@ def get_or_create_megatron_worker_group(
         Ray actor handle to MegatronWorkerGroup.
     """
     from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-    from .model_registry import normalize_model_name
+    from .model_registry import is_persistent_model
 
     config = distributed_config or DistributedConfig()
     num_gpus = config.world_size
-    persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
-    persistent_models = {s.strip() for s in persistent_csv.split(",") if s.strip()} if persistent_csv else set()
-    is_persistent = False
-    if persistent_models:
-        try:
-            is_persistent = normalize_model_name(base_model) in persistent_models
-        except Exception:
-            is_persistent = base_model in persistent_models
+    is_persistent = is_persistent_model(base_model)
 
     if not ray.is_initialized():
         init_ray(
