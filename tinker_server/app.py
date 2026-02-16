@@ -108,10 +108,6 @@ async def _cleanup_stale_actors() -> None:
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
-                            # MultiNodeInferenceEngine reserves an additional controller GPU.
-                            # We route MoE TP>=4 through it even when the model fits on one node.
-                            if cfg.is_moe and cfg.total_gpus >= 4:
-                                num_gpus += 1
                     elif name.startswith("dense_trainer_pool_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -182,8 +178,6 @@ async def _cleanup_stale_actors() -> None:
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
-                                if cfg.is_moe and cfg.total_gpus >= 4:
-                                    num_gpus += 1
                         elif name.startswith("dense_trainer_pool_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -256,6 +250,8 @@ async def _prewarm_persistent_models(
     lora_rank = int(config.prewarm_train_lora_rank)
     learning_rate = float(config.prewarm_train_lr)
     megatron_ready_timeout_s = float(config.prewarm_megatron_ready_timeout_s)
+    prewarm_training = bool(config.prewarm_enable_training)
+    prewarm_inference = bool(config.prewarm_enable_inference)
 
     from tinker_server.backend.model_registry import (
         get_model_config,
@@ -280,7 +276,8 @@ async def _prewarm_persistent_models(
 
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
-        f"megatron_ready_timeout_s={megatron_ready_timeout_s}"
+        f"megatron_ready_timeout_s={megatron_ready_timeout_s} "
+        f"prewarm_training={prewarm_training} prewarm_inference={prewarm_inference}"
     )
 
     # Order by descending GPU footprint to avoid fragmenting the cluster before
@@ -308,49 +305,50 @@ async def _prewarm_persistent_models(
             logger.exception(f"[prewarm] unknown model in MINT_PERSISTENT_MODELS: {model_name}: {e}")
             continue
 
-        # -------------------------
-        # Training actor prewarm
-        # -------------------------
-        try:
-            base_model = model_name
-            if model_name and not model_name.startswith("/"):
-                base_model = train_engine._resolve_hf_model_path(model_name)
-                if not base_model:
-                    raise RuntimeError(f"HF cache path not found for {model_name}")
+        if prewarm_training:
+            # -------------------------
+            # Training actor prewarm
+            # -------------------------
+            try:
+                base_model = model_name
+                if model_name and not model_name.startswith("/"):
+                    base_model = train_engine._resolve_hf_model_path(model_name)
+                    if not base_model:
+                        raise RuntimeError(f"HF cache path not found for {model_name}")
 
-            if cfg.is_moe:
-                from tinker_server.backend.megatron_distributed import (
-                    DistributedConfig,
-                    _make_megatron_actor_name,
-                    async_get_or_create_megatron_worker_group,
-                )
+                if cfg.is_moe:
+                    from tinker_server.backend.megatron_distributed import (
+                        DistributedConfig,
+                        _make_megatron_actor_name,
+                        async_get_or_create_megatron_worker_group,
+                    )
 
-                train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_name)
-                use_fp8 = requires_fp8(model_name)
-                distributed_config = DistributedConfig(
-                    tensor_parallel_size=train_tp,
-                    pipeline_parallel_size=train_pp,
-                    expert_parallel_size=train_ep,
-                    context_parallel_size=train_cp,
-                    expert_tensor_parallel_size=train_etp,
-                    use_fp8=use_fp8,
-                )
+                    train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_name)
+                    use_fp8 = requires_fp8(model_name)
+                    distributed_config = DistributedConfig(
+                        tensor_parallel_size=train_tp,
+                        pipeline_parallel_size=train_pp,
+                        expert_parallel_size=train_ep,
+                        context_parallel_size=train_cp,
+                        expert_tensor_parallel_size=train_etp,
+                        use_fp8=use_fp8,
+                    )
 
-                logger.info(
-                    f"[prewarm] training create start model={model_name} backend=megatron "
-                    f"TP={train_tp} PP={train_pp} EP={train_ep} CP={train_cp} ETP={train_etp} world_size={distributed_config.world_size}"
-                )
-                actor = await async_get_or_create_megatron_worker_group(
-                    base_model=base_model,
-                    lora_rank=lora_rank,
-                    learning_rate=learning_rate,
-                    distributed_config=distributed_config,
-                    session_id=None,
-                )
-                actor_name = _make_megatron_actor_name(base_model or model_name)
-                # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
-                resource_pool.set_protected(actor_name, True)
-                logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
+                    logger.info(
+                        f"[prewarm] training create start model={model_name} backend=megatron "
+                        f"TP={train_tp} PP={train_pp} EP={train_ep} CP={train_cp} ETP={train_etp} world_size={distributed_config.world_size}"
+                    )
+                    actor = await async_get_or_create_megatron_worker_group(
+                        base_model=base_model,
+                        lora_rank=lora_rank,
+                        learning_rate=learning_rate,
+                        distributed_config=distributed_config,
+                        session_id=None,
+                    )
+                    actor_name = _make_megatron_actor_name(base_model or model_name)
+                    # Protect as soon as the actor is registered, so readiness timeouts don't leave it evictable.
+                    resource_pool.set_protected(actor_name, True)
+                    logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
                 if (
                     cfg.vllm_engine == "async"
@@ -406,14 +404,16 @@ async def _prewarm_persistent_models(
                             f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
                         )
 
-                asyncio.create_task(_await_ready())
-            else:
-                # Defer dense pool creation until after multi-node vLLM inference is initialized,
-                # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
-                deferred_dense_training.append((model_name, base_model))
-                logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
-        except Exception as e:
-            logger.exception(f"[prewarm] training failed model={model_name}: {e}")
+                    asyncio.create_task(_await_ready())
+                else:
+                    # Defer dense pool creation until after multi-node vLLM inference is initialized,
+                    # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
+                    deferred_dense_training.append((model_name, base_model))
+                    logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
+            except Exception as e:
+                logger.exception(f"[prewarm] training failed model={model_name}: {e}")
+        else:
+            logger.info(f"[prewarm] training skipped model={model_name} (MINT_PERSISTENT_PREWARM_TRAINING=0)")
 
         # -------------------------
         # Inference (vLLM) prewarm
@@ -425,6 +425,9 @@ async def _prewarm_persistent_models(
         # NOTE: prewarm inference is scheduled after training loop, ordered to avoid
         # multi-node vLLM initialization fragmenting the cluster before 4-GPU single-node vLLM
         # actors (e.g., Qwen3-30B TP=4) can be placed.
+
+    if not prewarm_inference:
+        return
 
     if multi_model_manager is None:
         return
@@ -468,8 +471,17 @@ async def _prewarm_persistent_models(
             actor_name = getattr(engine, "actor_name", None)
             if not actor_name:
                 raise RuntimeError("engine has no actor_name")
-            resource_pool.set_protected(actor_name, True)
-            logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
+            ok = resource_pool.set_protected(actor_name, True)
+            if not ok:
+                for _ in range(50):
+                    await asyncio.sleep(0.1)
+                    ok = resource_pool.set_protected(actor_name, True)
+                    if ok:
+                        break
+            if ok:
+                logger.info(f"[prewarm] inference ready+protected model={model_name} actor={actor_name}")
+            else:
+                logger.warning(f"[prewarm] inference ready (but not in ResourcePool) model={model_name} actor={actor_name}")
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
                 raise
@@ -480,7 +492,7 @@ async def _prewarm_persistent_models(
     # -------------------------
     # Dense training pools (deferred)
     # -------------------------
-    if deferred_dense_training:
+    if prewarm_training and deferred_dense_training:
         from tinker_server.backend.dense_trainer import get_or_create_dense_trainer
         from tinker_server.backend.verl_training import TrainingWorker
 

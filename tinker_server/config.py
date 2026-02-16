@@ -59,7 +59,7 @@ PFS_VERL_PATH = _env_nonempty(os.environ, "PFS_VERL_PATH") or _file_pfs_verl_pat
 # PFS vLLM 0.13.0 with raw logits dump instrumentation
 _file_pfs_vllm_path = _CONFIG_FILE.paths.pfs_vllm_path if _CONFIG_FILE is not None else None
 PFS_VLLM_PATH = (
-    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or "/vePFS-Mindverse/share/code/vllm-0.13.0-pkg"
+    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or ""
 )
 
 # Some deployments rely on the in-image vLLM wheel (with compiled `vllm._C`).
@@ -195,7 +195,7 @@ class ServerConfig:
     # Future store settings (backend/future_store.py)
     future_store_actor_name: str = "tinker_future_store"
     future_store_ttl_s: float = 86400.0
-    future_store_done_ttl_s: float = 300.0
+    future_store_done_ttl_s: float = 7200.0
 
     # Training settings (backend/verl_training.py)
     training_force_grad_checkpointing: bool = True
@@ -210,6 +210,8 @@ class ServerConfig:
     prewarm_train_lora_rank: int = 16
     prewarm_train_lr: float = 5e-5
     prewarm_megatron_ready_timeout_s: float = 3600.0
+    prewarm_enable_training: bool = True
+    prewarm_enable_inference: bool = True
 
     # Docs / internal paths
     doc_path: str | None = None  # MINT_DOC_PATH
@@ -356,7 +358,7 @@ class ServerConfig:
             future_store_done_ttl_s=_pick_float(
                 "MINT_FUTURE_DONE_TTL_S",
                 file_future_store.done_ttl_s if file_future_store is not None else None,
-                300.0,
+                7200.0,
             ),
             # Training settings
             training_force_grad_checkpointing=_pick_bool(
@@ -405,6 +407,16 @@ class ServerConfig:
                 "MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S",
                 file_prewarm.megatron_ready_timeout_s if file_prewarm is not None else None,
                 3600.0,
+            ),
+            prewarm_enable_training=_pick_bool(
+                "MINT_PERSISTENT_PREWARM_TRAINING",
+                None,
+                True,
+            ),
+            prewarm_enable_inference=_pick_bool(
+                "MINT_PERSISTENT_PREWARM_INFERENCE",
+                None,
+                True,
             ),
             doc_path=_pick_str(
                 "MINT_DOC_PATH",

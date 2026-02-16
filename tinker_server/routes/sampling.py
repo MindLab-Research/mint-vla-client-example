@@ -11,12 +11,14 @@ import asyncio
 import array
 import hashlib
 import logging
+import os
+import time
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from ..config import config as server_config
-from ..backend.future_store import future_store
+from ..backend.future_store import FutureStatus, future_store
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
@@ -50,6 +52,8 @@ _SAMPLE_COALESCE_MAX_BATCH = int(server_config.sampling_sample_coalesce_max_batc
 _SAMPLE_COALESCE_MAX_SAMPLES = int(server_config.sampling_sample_coalesce_max_samples)
 _sample_coalesce_lock = asyncio.Lock()
 _sample_coalesce_groups: dict[tuple, dict] = {}
+_coalesced_abort_aliases_guard = asyncio.Lock()
+_coalesced_abort_aliases: dict[str, str] = {}
 
 _lora_load_locks_guard = asyncio.Lock()
 _lora_load_locks: dict[str, asyncio.Lock] = {}
@@ -91,6 +95,93 @@ async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
 
         await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
         session_manager.mark_session_lora_loaded(session_id, True)
+
+
+async def _register_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:
+    async with _coalesced_abort_aliases_guard:
+        for _fut, _ns, request_id in waiters:
+            _coalesced_abort_aliases[request_id] = engine_request_id
+
+
+async def _unregister_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:
+    async with _coalesced_abort_aliases_guard:
+        for _fut, _ns, request_id in waiters:
+            if _coalesced_abort_aliases.get(request_id) == engine_request_id:
+                _coalesced_abort_aliases.pop(request_id, None)
+
+
+async def _resolve_abort_request_id(request_id: str) -> str:
+    async with _coalesced_abort_aliases_guard:
+        return _coalesced_abort_aliases.get(request_id, request_id)
+
+
+async def _abort_engine_request(engine, request_id: str) -> None:
+    if engine is None:
+        return
+    abort = getattr(engine, "abort_request", None)
+    if abort is None:
+        return
+    abort_request_id = await _resolve_abort_request_id(request_id)
+    try:
+        maybe_awaitable = abort(abort_request_id)
+        if asyncio.isfuture(maybe_awaitable) or asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
+    except Exception as e:
+        logger.warning(
+            f"Best-effort abort failed: request_id={request_id} abort_request_id={abort_request_id} "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable):
+    task = asyncio.create_task(awaitable)
+    started = time.monotonic()
+    last_log = started
+    await_timeout_s = float(os.environ.get("MINT_SAMPLE_AWAIT_TIMEOUT_S", "0"))
+    logger.info(f"[sample await start] request_id={request_id} await_timeout_s={await_timeout_s}")
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.5)
+            if done:
+                elapsed = time.monotonic() - started
+                logger.info(f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}")
+                return await task
+            try:
+                status = future_store.get_status(request_id)
+            except KeyError:
+                status = FutureStatus.PENDING
+            now = time.monotonic()
+            elapsed = now - started
+            if now - last_log >= 30.0:
+                logger.info(f"[sample await progress] request_id={request_id} elapsed_s={elapsed:.1f} future_status={status.value}")
+                last_log = now
+            if await_timeout_s > 0 and elapsed >= await_timeout_s:
+                await _abort_engine_request(engine, request_id)
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"request_id={request_id} timed out in _await_with_external_fail_abort "
+                    f"after {elapsed:.1f}s (MINT_SAMPLE_AWAIT_TIMEOUT_S={await_timeout_s})"
+                )
+            if status != FutureStatus.PENDING:
+                await _abort_engine_request(engine, request_id)
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass
+                raise RuntimeError(f"request_id={request_id} canceled due to future_status={status.value}")
+    except asyncio.CancelledError:
+        await _abort_engine_request(engine, request_id)
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+        raise
 
 
 def _prompt_fingerprint(token_ids: list[int]) -> bytes:
@@ -142,6 +233,8 @@ async def _coalesced_generate(
 
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
+    delay_s: float | None = None
+    do_flush_now = False
     async with _sample_coalesce_lock:
         g = _sample_coalesce_groups.get(key)
         need = int(num_samples)
@@ -198,6 +291,11 @@ async def _coalesced_generate(
         if g["flush_task"] is None:
             delay_s = 0.0 if do_flush_now else max(0.0, _SAMPLE_COALESCE_WINDOW_MS / 1000.0)
             g["flush_task"] = asyncio.create_task(_flush_coalesced_group(key, delay_s))
+        logger.info(
+            f"[coalesce queue] request_id={request_id} sampling_session_id={sampling_session_id} "
+            f"waiters={len(g['waiters'])} total_samples={int(g['total_samples'])} "
+            f"do_flush_now={do_flush_now} delay_s={delay_s if delay_s is not None else -1.0:.3f}"
+        )
 
     res = await fut
     if not isinstance(res, list):
@@ -211,6 +309,7 @@ async def _flush_group(g: dict) -> None:
     waiters = list(g.get("waiters") or [])
     if not waiters:
         return
+    vllm_request_id: str | None = None
     try:
         total = sum(int(ns) for _fut, ns, _rid in waiters)
         if total == 1 and int(waiters[0][1]) == 1:
@@ -236,18 +335,22 @@ async def _flush_group(g: dict) -> None:
             f"[coalesce flush] leader={g['leader_request_id']} vllm_req={vllm_request_id} "
             f"waiters={len(waiters)} total_samples={total} rid_ns={rid_ns}"
         )
-        results = await g["engine"].generate_many(
-            sampling_session_id=g["sampling_session_id"],
-            prompt_ids=g["prompt_ids"],
-            request_id=vllm_request_id,
-            num_samples=total,
-            max_tokens=g["max_tokens"],
-            stop=g.get("stop"),
-            temperature=g["temperature"],
-            top_k=g["top_k"],
-            top_p=g["top_p"],
-            logprobs=True,
-        )
+        await _register_coalesced_abort_aliases(waiters, vllm_request_id)
+        try:
+            results = await g["engine"].generate_many(
+                sampling_session_id=g["sampling_session_id"],
+                prompt_ids=g["prompt_ids"],
+                request_id=vllm_request_id,
+                num_samples=total,
+                max_tokens=g["max_tokens"],
+                stop=g.get("stop"),
+                temperature=g["temperature"],
+                top_k=g["top_k"],
+                top_p=g["top_p"],
+                logprobs=True,
+            )
+        finally:
+            await _unregister_coalesced_abort_aliases(waiters, vllm_request_id)
         if len(results) != total:
             raise RuntimeError(f"coalesce: got {len(results)} results for total_samples={total}")
 
@@ -259,6 +362,8 @@ async def _flush_group(g: dict) -> None:
             if not fut.done():
                 fut.set_result(chunk)
     except Exception as e:
+        if vllm_request_id is not None:
+            await _abort_engine_request(g.get("engine"), g["leader_request_id"])
         for fut, _ns, _rid in waiters:
             if not fut.done():
                 fut.set_exception(e)
@@ -270,7 +375,12 @@ async def _flush_coalesced_group(key: tuple, delay_s: float) -> None:
     async with _sample_coalesce_lock:
         g = _sample_coalesce_groups.pop(key, None)
     if g is None:
+        logger.warning(f"[coalesce flush task] missing group delay_s={delay_s:.3f}")
         return
+    logger.info(
+        f"[coalesce flush task] leader={g.get('leader_request_id')} waiters={len(g.get('waiters') or [])} "
+        f"total_samples={int(g.get('total_samples') or 0)} delay_s={delay_s:.3f}"
+    )
     await _flush_group(g)
 
 
@@ -382,6 +492,7 @@ async def _do_sample(
     """Background task to perform sampling."""
     global _inflight_sample_tasks
     session_id: str | None = None
+    engine = None
     try:
         try:
             if session_manager is None:
@@ -423,7 +534,12 @@ async def _do_sample(
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
 
+                logger.info(
+                    f"[sample path] request_id={request_id} session_id={session_id} "
+                    f"prompt_tokens={len(token_ids)} num_samples={request.num_samples} stage=before_lora_load"
+                )
                 await _ensure_session_lora_loaded(engine, session_id)
+                logger.info(f"[sample path] request_id={request_id} session_id={session_id} stage=after_lora_load")
 
                 gen_many = getattr(engine, "generate_many", None)
                 can_coalesce = (
@@ -434,22 +550,36 @@ async def _do_sample(
                     and gen_many is not None
                     and request.num_samples <= _SAMPLE_COALESCE_MAX_SAMPLES
                 )
+                logger.info(
+                    f"[sample path] request_id={request_id} session_id={session_id} "
+                    f"can_coalesce={can_coalesce} sample_coalesce={_SAMPLE_COALESCE} "
+                    f"want_prompt_logprobs={want_prompt_logprobs} topk_prompt_logprobs={request.topk_prompt_logprobs} "
+                    f"has_generate_many={gen_many is not None} num_samples={request.num_samples}"
+                )
                 if can_coalesce:
-                    results = await _coalesced_generate(
+                    logger.info(f"[sample path] request_id={request_id} branch=coalesced_generate")
+                    results = await _await_with_external_fail_abort(
                         engine=engine,
-                        sampling_session_id=session_id,
-                        prompt_ids=token_ids,
                         request_id=request_id,
-                        num_samples=request.num_samples,
-                        max_tokens=request.sampling_params.max_tokens,
-                        stop=request.sampling_params.stop,
-                        temperature=request.sampling_params.temperature,
-                        top_k=request.sampling_params.top_k,
-                        top_p=request.sampling_params.top_p,
+                        awaitable=_coalesced_generate(
+                            engine=engine,
+                            sampling_session_id=session_id,
+                            prompt_ids=token_ids,
+                            request_id=request_id,
+                            num_samples=request.num_samples,
+                            max_tokens=request.sampling_params.max_tokens,
+                            stop=request.sampling_params.stop,
+                            temperature=request.sampling_params.temperature,
+                            top_k=request.sampling_params.top_k,
+                            top_p=request.sampling_params.top_p,
+                        ),
                     )
                 elif request.num_samples == 1:
-                    results = [
-                        await engine.generate(
+                    logger.info(f"[sample path] request_id={request_id} branch=generate_single")
+                    one_result = await _await_with_external_fail_abort(
+                        engine=engine,
+                        request_id=request_id,
+                        awaitable=engine.generate(
                             sampling_session_id=session_id,
                             prompt_ids=token_ids,
                             request_id=request_id,
@@ -460,21 +590,27 @@ async def _do_sample(
                             top_p=request.sampling_params.top_p,
                             logprobs=True,
                         )
-                    ]
+                    )
+                    results = [one_result]
                 else:
                     if gen_many is None:
                         raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
-                    results = await gen_many(
-                        sampling_session_id=session_id,
-                        prompt_ids=token_ids,
+                    logger.info(f"[sample path] request_id={request_id} branch=generate_many")
+                    results = await _await_with_external_fail_abort(
+                        engine=engine,
                         request_id=request_id,
-                        num_samples=request.num_samples,
-                        max_tokens=request.sampling_params.max_tokens,
-                        stop=request.sampling_params.stop,
-                        temperature=request.sampling_params.temperature,
-                        top_k=request.sampling_params.top_k,
-                        top_p=request.sampling_params.top_p,
-                        logprobs=True,
+                        awaitable=gen_many(
+                            sampling_session_id=session_id,
+                            prompt_ids=token_ids,
+                            request_id=request_id,
+                            num_samples=request.num_samples,
+                            max_tokens=request.sampling_params.max_tokens,
+                            stop=request.sampling_params.stop,
+                            temperature=request.sampling_params.temperature,
+                            top_k=request.sampling_params.top_k,
+                            top_p=request.sampling_params.top_p,
+                            logprobs=True,
+                        ),
                     )
             else:
                 # Legacy mode: per-session engine
@@ -585,7 +721,12 @@ async def _do_sample(
                     request_id=request_id,
                 )
 
+        except asyncio.CancelledError:
+            await _abort_engine_request(engine, request_id)
+            future_store.fail(request_id, "sampling task cancelled")
+            raise
         except Exception as e:
+            await _abort_engine_request(engine, request_id)
             logger.exception(f"Request {request_id} failed: {e}")
             future_store.fail(request_id, str(e))
     finally:

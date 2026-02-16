@@ -58,12 +58,12 @@ http://<RAY_HEAD_IP>:8265
 
 ## 1.1 Resource Queues
 
-| Queue Name | Queue ID | Type | Default Use |
-|------------|----------|------|-------------|
-| `cpu-mindverse` | `q-20251225183621-m2297` | CPU | Ray head nodes (CPU-only) |
-| `a800-mindverse-B` | `q-20260124095758-ngkg7` | GPU | Dev GPU workers (preferred) |
-| `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Prod GPU workers (preferred) |
-| `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Prod GPU workers (fallback) |
+| Queue Name | Queue ID | Type | Use Case |
+|------------|----------|------|----------|
+| `cpu-mindverse` | `q-20251225183621-m2297` | CPU | Ray head node (CPU-only instances) |
+| `a800-mindverse-B` | `q-20260124095758-ngkg7` | GPU | Dev GPU workers (A800 instances, 24 GPUs total) |
+| `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Prod GPU workers (A800 instances, 128 GPUs total) |
+| `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Prod C2 worker pool (K2 multinode vLLM) |
 
 **IMPORTANT:** CPU-only instances (ml.g2a.xlarge) MUST use the CPU queue. GPU instances MUST use a GPU queue.
 
@@ -116,6 +116,20 @@ for q, v in sorted(by_queue.items(), key=lambda kv: (-(kv[1]["Running"]+kv[1]["Q
     print(q, "running_gpus", v["Running"], "queued_gpus", v["Queue"], "other_gpus", v["Other"])
 PY
 ```
+
+### Prod C1/C2 placement policy
+
+When operating on prod (`mint-prod-volcano`), enforce:
+
+- K2 Megatron (`moonshotai/Kimi-K2-Instruct`) to C1 (`q-20251126180002-26lwz`)
+- K2 vLLM to C2 (`q-20260203101340-www2h`)
+- all other actors/workloads to C1
+
+Use the placement verification SOP in `.claude/skills/mint-prod/SKILL.md`:
+
+- actor inventory query (`/api/v1/actors`)
+- queue-to-node-IP query (`list_node_ips_for_resource_queue`)
+- per-run `MegatronRankWorker ip=...` window check against C1/C2 IP sets
 
 ---
 

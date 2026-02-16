@@ -1221,15 +1221,22 @@ async def _do_save_weights_for_sampler(
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
 
         use_per_expert_lora = bool(request.use_per_expert_lora)
-        if (
-            session.backend == "megatron"
-            and not use_per_expert_lora
-            and "use_per_expert_lora" not in getattr(request, "model_fields_set", set())
-        ):
-            # Default behavior for MoE: if the session trains MLP LoRA, export in
-            # per-expert format so vLLM can consume it.
-            if getattr(getattr(session, "lora_config", None), "train_mlp", False):
+        train_mlp = bool(getattr(getattr(session, "lora_config", None), "train_mlp", False))
+        if session.backend == "megatron":
+            # vLLM MoE LoRA expects per-expert MLP weights. If MLP LoRA was trained, we must
+            # export in per-expert format regardless of the caller-provided flag.
+            if train_mlp:
+                if not use_per_expert_lora:
+                    logger.info(
+                        "[save_weights_for_sampler] forcing use_per_expert_lora=True because train_mlp=True"
+                    )
                 use_per_expert_lora = True
+            else:
+                if use_per_expert_lora:
+                    logger.info(
+                        "[save_weights_for_sampler] forcing use_per_expert_lora=False because train_mlp=False"
+                    )
+                use_per_expert_lora = False
 
         print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights

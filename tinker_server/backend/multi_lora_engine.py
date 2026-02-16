@@ -363,6 +363,23 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+            env_vars = {
+                "PYTHONPATH": PFS_PYTHONPATH,
+                "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                "HF_HUB_OFFLINE": "1",
+            }
+            for k in (
+                # vLLM import-time patching (sitecustomize meta_path hook)
+                # Required for MoE LoRA loading in some vLLM versions.
+                "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+                # Allow disabling specific patches without a code deploy.
+                "MINT_VLLM_DISABLE_PACK_MOE_PATCH",
+                "MINT_VLLM_DISABLE_PUNICA_PATCH",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    env_vars[k] = v
+
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
                 name=self.actor_name,
@@ -371,9 +388,7 @@ class MultiLoRAInferenceEngine:
                 max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 runtime_env={
                     "env_vars": {
-                        "PYTHONPATH": PFS_PYTHONPATH,
-                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                        "HF_HUB_OFFLINE": "1",
+                        **env_vars,
                     }
                 },
             ).remote(
@@ -1202,15 +1217,17 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-            if config.vllm_engine == "async":
-                from .multinode_inference import MultiNodeInferenceEngine
+                if config.vllm_engine == "async":
+                    from .multinode_inference import MultiNodeInferenceEngine
 
+                total_gpus = config.total_gpus
+                pipeline_parallel_size = getattr(config, "inference_pp", 1)
                 enable_expert_parallel = config.is_moe and config.inference_dp > 1
                 logger.info(
-                    f"Creating vLLM AsyncLLMEngine for model {model_name}: "
-                    f"actor={actor_name}, TP={config.inference_tp}, DP={config.inference_dp}, "
+                    f"Creating multi-node vLLM engine for model {model_name}: "
+                    f"actor={actor_name}, TP={config.inference_tp}, PP={pipeline_parallel_size}, DP={config.inference_dp}, "
                     f"backend={config.vllm_distributed_executor_backend}, expert_parallel={enable_expert_parallel}, "
-                    f"total_gpus={config.total_gpus}, gpu_util={model_gpu_util}, quant={quantization}, "
+                    f"total_gpus={total_gpus}, gpu_util={model_gpu_util}, quant={quantization}, "
                     f"max_loras={model_max_loras}, max_lora_rank={model_max_lora_rank}, "
                     f"max_model_len={model_max_model_len}, max_num_seqs={model_max_num_seqs}, "
                     f"kv_cache_dtype={model_kv_cache_dtype}"
@@ -1220,6 +1237,7 @@ class MultiModelInferenceManager:
                     model_path=model_path,
                     model_name=model_name,
                     tensor_parallel_size=config.inference_tp,
+                    pipeline_parallel_size=pipeline_parallel_size,
                     data_parallel_size=config.inference_dp,
                     enable_expert_parallel=enable_expert_parallel,
                     gpu_memory_utilization=model_gpu_util,

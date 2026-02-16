@@ -309,7 +309,7 @@ class ResourcePool:
             effective = ray_available - self._pending_gpus
         return max(0, effective)
 
-    def _get_evictable_actors_lru(self) -> list[ActorEntry]:
+    def _get_evictable_actors_lru(self, *, allow_evict_protected: bool) -> list[ActorEntry]:
         """Get evictable actors sorted by last access time (LRU first).
 
         Must be called with lock held.
@@ -324,12 +324,13 @@ class ResourcePool:
         evictable = [
             e for e in self._entries.values()
             if (
-                not e.protected
+                (allow_evict_protected or not e.protected)
                 and e.is_idle(self.SESSION_IDLE_TIMEOUT)
                 and e.idle_time() > self.MIN_ACTOR_AGE
             )
         ]
-        return sorted(evictable, key=lambda e: e.last_accessed)
+        # Prefer evicting unprotected actors first, even if a protected actor is older.
+        return sorted(evictable, key=lambda e: (e.protected, e.last_accessed))
 
     def _kill_actor(self, entry: ActorEntry) -> bool:
         """Kill a Ray actor.
@@ -377,7 +378,7 @@ class ResourcePool:
             logger.warning(f"[ResourcePool] Error killing actor {entry.actor_name}: {e}")
             return False
 
-    def evict_for_gpus(self, needed_gpus: int) -> int:
+    def evict_for_gpus(self, needed_gpus: int, *, allow_evict_protected: bool) -> int:
         """Evict LRU idle actors to free GPUs.
 
         Args:
@@ -389,7 +390,7 @@ class ResourcePool:
         freed_gpus = 0
 
         with self._pool_lock:
-            evictable = self._get_evictable_actors_lru()
+            evictable = self._get_evictable_actors_lru(allow_evict_protected=allow_evict_protected)
 
             for entry in evictable:
                 if freed_gpus >= needed_gpus:
@@ -406,7 +407,13 @@ class ResourcePool:
 
         return freed_gpus
 
-    def ensure_gpus_available(self, needed_gpus: int, timeout: float = 600) -> bool:
+    def ensure_gpus_available(
+        self,
+        needed_gpus: int,
+        timeout: float = 600,
+        *,
+        allow_evict_protected: bool = False,
+    ) -> bool:
         """Ensure at least needed_gpus are available, evicting and waiting if necessary.
 
         Uses get_effective_available_gpus() which accounts for pending reservations
@@ -415,6 +422,8 @@ class ResourcePool:
         Args:
             needed_gpus: Number of GPUs needed.
             timeout: Maximum time to wait for resources (seconds). Default 10 minutes.
+            allow_evict_protected: If True, allow eviction of *idle* protected actors as a last
+                resort. Unprotected actors are always evicted first.
 
         Returns:
             True if enough GPUs are available.
@@ -442,7 +451,7 @@ class ResourcePool:
             need_to_free = needed_gpus - available
 
             # Log actor states for debugging
-            evictable_list = self._get_evictable_actors_lru()
+            evictable_list = self._get_evictable_actors_lru(allow_evict_protected=allow_evict_protected)
             with self._pool_lock:
                 all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating)
                               for e in self._entries.values()]
@@ -450,7 +459,7 @@ class ResourcePool:
             logger.info(
                 f"[ResourcePool] Iteration {iteration}: need {needed_gpus} GPUs, available {available}, "
                 f"pending {pending}, need_to_free {need_to_free}, evictable={len(evictable_list)}, "
-                f"all_actors={all_actors}"
+                f"allow_evict_protected={allow_evict_protected}, all_actors={all_actors}"
             )
 
             if evictable_list:
@@ -459,7 +468,7 @@ class ResourcePool:
                     f"{[(e.actor_name, e.num_gpus) for e in evictable_list]}"
                 )
 
-            freed = self.evict_for_gpus(need_to_free)
+            freed = self.evict_for_gpus(need_to_free, allow_evict_protected=allow_evict_protected)
 
             if freed > 0:
                 # Wait for Ray to reclaim resources
