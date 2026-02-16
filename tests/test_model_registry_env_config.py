@@ -50,3 +50,22 @@ def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
     else:
         raise AssertionError("expected ValueError")
 
+
+def test_is_persistent_model_matches_hf_and_snapshot(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv("MINT_PERSISTENT_MODELS", "Qwen/Qwen3-0.6B")
+    assert mr.is_persistent_model("Qwen/Qwen3-0.6B")
+    assert mr.is_persistent_model(
+        "/vePFS-Mindverse/share/huggingface/models--Qwen--Qwen3-0.6B/snapshots/abc123"
+    )
+
+
+def test_is_persistent_model_accepts_snapshot_entries(monkeypatch):
+    from tinker_server.backend import model_registry as mr
+
+    monkeypatch.setenv(
+        "MINT_PERSISTENT_MODELS",
+        "/vePFS-Mindverse/share/huggingface/models--Qwen--Qwen3-0.6B/snapshots/abc123",
+    )
+    assert mr.is_persistent_model("Qwen/Qwen3-0.6B")
