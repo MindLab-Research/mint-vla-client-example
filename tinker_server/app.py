@@ -350,59 +350,63 @@ async def _prewarm_persistent_models(
                     resource_pool.set_protected(actor_name, True)
                     logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
-                if (
-                    cfg.vllm_engine == "async"
-                    and cfg.vllm_distributed_executor_backend == "mp"
-                    and (cfg.train_gpus + cfg.total_gpus) <= 8
-                ):
-                    try:
-                        pg_name = f"{actor_name}_pg"
-                        node_id = None
-                        deadline = time.monotonic() + 30.0
-                        while time.monotonic() < deadline and not node_id:
-                            pg_table = ray.util.placement_group_table()
-                            for info in pg_table.values():
-                                if info.get("state") != "CREATED":
-                                    continue
-                                if info.get("name") != pg_name:
-                                    continue
-                                node_id = (info.get("bundles_to_node_id") or {}).get(0)
-                                if node_id:
-                                    break
-                            if not node_id:
-                                await asyncio.sleep(0.5)
-                        if node_id:
-                            for n in ray.nodes():
-                                if n.get("NodeID") == node_id:
-                                    ip = n.get("NodeManagerAddress")
-                                    if isinstance(ip, str) and ip.strip():
-                                        pinned_vllm_node_ip[model_name] = ip.strip()
-                                        logger.info(
-                                            f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
-                                        )
-                                    break
-                    except Exception as pin_err:
-                        logger.warning(f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}")
+                    if (
+                        cfg.vllm_engine == "async"
+                        and cfg.vllm_distributed_executor_backend == "mp"
+                        and (cfg.train_gpus + cfg.total_gpus) <= 8
+                    ):
+                        try:
+                            pg_name = f"{actor_name}_pg"
+                            node_id = None
+                            deadline = time.monotonic() + 30.0
+                            while time.monotonic() < deadline and not node_id:
+                                pg_table = ray.util.placement_group_table()
+                                for info in pg_table.values():
+                                    if info.get("state") != "CREATED":
+                                        continue
+                                    if info.get("name") != pg_name:
+                                        continue
+                                    node_id = (info.get("bundles_to_node_id") or {}).get(0)
+                                    if node_id:
+                                        break
+                                if not node_id:
+                                    await asyncio.sleep(0.5)
+                            if node_id:
+                                for n in ray.nodes():
+                                    if n.get("NodeID") == node_id:
+                                        ip = n.get("NodeManagerAddress")
+                                        if isinstance(ip, str) and ip.strip():
+                                            pinned_vllm_node_ip[model_name] = ip.strip()
+                                            logger.info(
+                                                f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
+                                            )
+                                        break
+                        except Exception as pin_err:
+                            logger.warning(
+                                f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
+                            )
 
-                async def _await_ready(
-                    actor=actor,
-                    actor_name=actor_name,
-                    model_name=model_name,
-                ) -> None:
-                    try:
-                        await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
-                        resource_pool.mark_ready(actor_name)
-                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-                    except SystemExit as ready_err:
-                        if getattr(ready_err, "code", None) == 15:
-                            raise
-                        logger.warning(
-                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
-                        )
-                    except Exception as ready_err:
-                        logger.warning(
-                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
-                        )
+                    async def _await_ready(
+                        actor=actor,
+                        actor_name=actor_name,
+                        model_name=model_name,
+                    ) -> None:
+                        try:
+                            await asyncio.to_thread(
+                                ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s
+                            )
+                            resource_pool.mark_ready(actor_name)
+                            logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                        except SystemExit as ready_err:
+                            if getattr(ready_err, "code", None) == 15:
+                                raise
+                            logger.warning(
+                                f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
+                            )
+                        except Exception as ready_err:
+                            logger.warning(
+                                f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
+                            )
 
                     asyncio.create_task(_await_ready())
                 else:

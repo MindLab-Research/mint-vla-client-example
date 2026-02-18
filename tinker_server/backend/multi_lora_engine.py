@@ -368,17 +368,6 @@ class MultiLoRAInferenceEngine:
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
             }
-            for k in (
-                # vLLM import-time patching (sitecustomize meta_path hook)
-                # Required for MoE LoRA loading in some vLLM versions.
-                "MINT_ENABLE_VLLM_IMPORT_PATCHES",
-                # Allow disabling specific patches without a code deploy.
-                "MINT_VLLM_DISABLE_PACK_MOE_PATCH",
-                "MINT_VLLM_DISABLE_PUNICA_PATCH",
-            ):
-                v = os.environ.get(k)
-                if v is not None:
-                    env_vars[k] = v
 
             self.server = ExtendedVLLMHttpServer.options(
                 num_gpus=total_gpus,
@@ -1217,8 +1206,8 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-                if config.vllm_engine == "async":
-                    from .multinode_inference import MultiNodeInferenceEngine
+            if config.vllm_engine == "async":
+                from .multinode_inference import MultiNodeInferenceEngine
 
                 total_gpus = config.total_gpus
                 pipeline_parallel_size = getattr(config, "inference_pp", 1)

@@ -20,6 +20,103 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _apply_megatron_router_expert_bias_no_stack_patch() -> None:
+    """Patch Megatron router expert-bias update to avoid stacking (reduce peak CUDA allocations).
+
+    Megatron's `_update_router_expert_bias` stacks per-layer `local_tokens_per_expert` and
+    `expert_bias` into new tensors, then calls `get_updated_expert_bias(...)` which performs a
+    CUDA all-reduce. For very tight memory regimes (e.g. K2 at 32k context with all-layer LoRA),
+    the extra temporary allocations can trigger OOM.
+
+    This patch updates expert_bias per module in-place:
+      - all-reduce module.local_tokens_per_expert directly (no stack allocations)
+      - apply the same sign(offset) update rule to module.expert_bias
+    """
+    try:
+        import importlib
+
+        # NOTE: `import megatron.core.distributed.finalize_model_grads` can resolve to the
+        # exported *function* `finalize_model_grads` from `megatron.core.distributed.__init__`,
+        # not the module `.../finalize_model_grads.py`. Use importlib to force module import.
+        fmg = importlib.import_module("megatron.core.distributed.finalize_model_grads")
+    except Exception as e:
+        logger.warning(
+            "Could not import megatron.core.distributed.finalize_model_grads; skipping expert_bias no-stack patch: %s",
+            e,
+        )
+        return
+
+    if getattr(fmg, "_tinker_router_expert_bias_no_stack_patched", False):
+        return
+
+    if not hasattr(fmg, "_update_router_expert_bias"):
+        logger.warning(
+            "Megatron finalize_model_grads has no _update_router_expert_bias; skipping expert_bias no-stack patch"
+        )
+        return
+
+    original = fmg._update_router_expert_bias
+
+    def patched(model, config):
+        if not getattr(config, "moe_router_enable_expert_bias", False):
+            return original(model, config)
+
+        # K2 at full-scale (TP=64, EP=64, CP=2) runs in an extremely tight VRAM regime
+        # at 32k context with all-layer LoRA. Even small NCCL collectives inside
+        # `_update_router_expert_bias` have been observed to OOM due to NCCL internal
+        # allocations. Expert-bias updates are an auxiliary load-balancing tweak;
+        # disable them for this specific K2 parallelism profile to avoid hard failure.
+        if (
+            getattr(config, "tensor_model_parallel_size", None) == 64
+            and getattr(config, "expert_model_parallel_size", None) == 64
+            and getattr(config, "context_parallel_size", None) == 2
+            and getattr(config, "expert_tensor_parallel_size", 1) == 1
+        ):
+            if not getattr(patched, "_tinker_k2_expert_bias_disabled_logged", False):
+                print(
+                    "[VERL_PATCH] Disabled Megatron _update_router_expert_bias for K2 (TP=64 EP=64 CP=2) to avoid NCCL OOM"
+                )
+                patched._tinker_k2_expert_bias_disabled_logged = True  # type: ignore[attr-defined]
+
+            import torch
+
+            with torch.no_grad():
+                for model_chunk in model:
+                    for module in fmg.get_attr_wrapped_model(model_chunk, "modules")():
+                        if hasattr(module, "expert_bias") and hasattr(module, "local_tokens_per_expert"):
+                            module.local_tokens_per_expert.zero_()
+            return
+
+        tokens_per_expert = []
+        expert_bias = []
+        for model_chunk in model:
+            for module in fmg.get_attr_wrapped_model(model_chunk, "modules")():
+                if hasattr(module, "expert_bias"):
+                    tokens_per_expert.append(module.local_tokens_per_expert)
+                    expert_bias.append(module.expert_bias)
+
+        if len(expert_bias) == 0:
+            return
+
+        import torch
+        import torch.distributed as dist
+        from megatron.core import parallel_state
+
+        group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        rate = getattr(config, "moe_router_bias_update_rate")
+
+        with torch.no_grad():
+            for t, b in zip(tokens_per_expert, expert_bias):
+                dist.all_reduce(t, group=group)
+                avg = t.sum(dim=-1, keepdim=True) / t.shape[-1]
+                b.add_(torch.sign(avg - t) * rate)
+                t.zero_()
+
+    fmg._update_router_expert_bias = patched  # type: ignore[attr-defined]
+    fmg._tinker_router_expert_bias_no_stack_patched = True  # type: ignore[attr-defined]
+    print("[VERL_PATCH] Patched Megatron _update_router_expert_bias (no stacking, in-place update)")
+
+
 def vocab_parallel_topk(logits: torch.Tensor, k: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute top-K across vocab-parallel sharded logits.
 
@@ -311,6 +408,131 @@ def _apply_rope_thd_cp_len_clamp_patch() -> None:
     print("[VERL_PATCH] Patched rope_utils._get_thd_freqs_on_this_cp_rank (clamp full_seqlen)")
 
 
+def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
+    """Patch verl preprocess_thd_no_padding for CP when input sequences are not explicitly padded.
+
+    Observed failure mode (CP>1):
+        RuntimeError: The expanded size ... must match ... (e.g. 64 vs 50)
+
+    Root cause: verl computes per-sample padded lengths for CP alignment but slices from the
+    original jagged/nested `input_ids[i]` without clamping, assuming it is already padded.
+    """
+    try:
+        from verl.models.mcore import util as verl_mcore_util
+    except Exception as e:
+        logger.warning(f"Could not import verl.models.mcore.util; skipping CP short-seq patch: {type(e).__name__}: {e}")
+        return
+
+    if getattr(verl_mcore_util, "_tinker_preprocess_thd_no_padding_cp_short_seq_patched", False):
+        return
+
+    import torch
+    from megatron.core import parallel_state as mpu
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    def patched_preprocess_thd_no_padding(
+        input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False
+    ) -> tuple[torch.Tensor, PackedSeqParams]:
+        batch_size = input_ids.shape[0]
+
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+        seqlens_in_batch = input_ids.offsets().diff()
+
+        pad_size = (align_size - seqlens_in_batch % align_size) % align_size
+        seqlens_in_batch_padded = seqlens_in_batch + pad_size
+
+        cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device)
+        cu_seqlens_padded[1:] = torch.cumsum(seqlens_in_batch_padded, dim=0)
+
+        seqlens_in_batch_cpu: list[int] = seqlens_in_batch.tolist()
+        seqlens_in_batch_padded_cpu: list[int] = seqlens_in_batch_padded.tolist()
+        cu_seqlens_padded_cpu: list[int] = cu_seqlens_padded.tolist()
+
+        max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu)
+
+        shape = list(input_ids.shape[1:])
+        shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size
+        if pre_process:
+            input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
+            if need_roll:
+                saved_roll_dict: dict[int, torch.Tensor] = {}
+
+            for i in range(batch_size):
+                if cp_size <= 1:
+                    seqlen = seqlens_in_batch_cpu[i]
+                    start_idx = cu_seqlens_padded_cpu[i]
+                    input_ids_rmpad[start_idx : start_idx + seqlen] = input_ids[i]
+                    continue
+
+                seqlen_padded_i = seqlens_in_batch_padded_cpu[i]
+                seqlen = seqlen_padded_i // cp_size
+                half_seqlen = seqlen // 2
+                start_idx = cu_seqlens_padded_cpu[i] // cp_size
+
+                d = input_ids[i]
+                # NOTE: d is often a jagged/nested sequence of the *valid* length, not explicitly padded.
+                # Clamp the first-chunk slice to avoid shape mismatch on assignment.
+                chunk_start = half_seqlen * cp_rank
+                chunk_end = min(half_seqlen * (cp_rank + 1), d.shape[0])
+                chunk_len = max(0, chunk_end - chunk_start)
+                if chunk_len > 0:
+                    input_ids_rmpad[start_idx : start_idx + chunk_len] = d[chunk_start : chunk_start + chunk_len]
+
+                remain_start = seqlen_padded_i - half_seqlen * (cp_rank + 1)
+                remain_end = seqlen_padded_i - half_seqlen * cp_rank
+                remain_end = min(remain_end, d.shape[0])
+                remain_len = max(0, remain_end - remain_start)
+                if remain_len > 0:
+                    input_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
+                        remain_start:remain_end
+                    ]
+
+                if need_roll:
+                    idx = (cp_rank + 1) * half_seqlen
+                    if idx < d.shape[0]:
+                        saved_roll_dict[start_idx + half_seqlen - 1] = d[idx]
+                    if remain_len > 0:
+                        k = start_idx + half_seqlen + remain_len - 1
+                        if remain_end == d.shape[0]:
+                            saved_roll_dict[k] = d[0]
+                        elif remain_end < d.shape[0]:
+                            saved_roll_dict[k] = d[remain_end]
+
+            if need_roll:
+                input_ids_rmpad = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
+                for k, v in saved_roll_dict.items():
+                    input_ids_rmpad[k] = v
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen_in_batch,
+            cu_seqlens_kv=cu_seqlens_padded,
+            max_seqlen_kv=max_seqlen_in_batch,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+        )
+        if pre_process:
+            return input_ids_rmpad.unsqueeze(0), packed_seq_params
+        return input_ids, packed_seq_params
+
+    # Patch the canonical definition.
+    verl_mcore_util.preprocess_thd_no_padding = patched_preprocess_thd_no_padding  # type: ignore[assignment]
+
+    # Patch any modules that imported the symbol by value (common pattern: `from ...util import preprocess_thd_no_padding`).
+    try:
+        from verl.models.mcore import model_forward as verl_mcore_model_forward
+    except Exception:
+        verl_mcore_model_forward = None
+    if verl_mcore_model_forward is not None and hasattr(verl_mcore_model_forward, "preprocess_thd_no_padding"):
+        verl_mcore_model_forward.preprocess_thd_no_padding = patched_preprocess_thd_no_padding  # type: ignore[assignment]
+    verl_mcore_util._tinker_preprocess_thd_no_padding_cp_short_seq_patched = True  # type: ignore[attr-defined]
+    print("[VERL_PATCH] Patched verl preprocess_thd_no_padding (CP short-seq clamp)")
+
+
 def _apply_te_triton_get_int_dtype_patch() -> None:
     """Patch TransformerEngine MoE permutation kernels for Triton compatibility.
 
@@ -484,11 +706,13 @@ def apply_verl_patches():
         logger.warning("verl.workers.engine.megatron.transformer_impl not found, skipping patches")
         return
 
+    _apply_megatron_router_expert_bias_no_stack_patch()
     _apply_te_triton_get_int_dtype_patch()
 
     # Apply external label patch first (fixes last-token logprob issue)
     _apply_external_label_patch()
     _apply_rope_thd_cp_len_clamp_patch()
+    _apply_preprocess_thd_no_padding_cp_short_seq_patch()
 
     # Store original method
     original_build_tf_config = MegatronEngine._build_tf_config

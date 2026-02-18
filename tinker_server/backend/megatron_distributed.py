@@ -313,20 +313,24 @@ class MegatronRankWorker:
         Must be called while in train_mode context (gradients on GPU).
         """
         import torch
+        import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         grads = []
+        want_total_norm = self.rank == 0 and logger.isEnabledFor(logging.DEBUG)
         total_norm_sq = 0.0
         for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
                     for buffer in buffers:
                         if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                            grads.append(buffer.grad_data.cpu().clone())
-                            total_norm_sq += buffer.grad_data.norm().item() ** 2
+                            cpu_grad = buffer.grad_data.detach().cpu()
+                            grads.append(cpu_grad)
+                            if want_total_norm:
+                                total_norm_sq += cpu_grad.float().norm().item() ** 2
 
-        total_norm = total_norm_sq ** 0.5
-        if self.rank == 0:
+        if want_total_norm:
+            total_norm = total_norm_sq ** 0.5
             logger.debug(
                 f"[Rank {self.rank}] _capture_gradients: {len(grads)} buffers, total_norm={total_norm:.6f}"
             )
@@ -341,22 +345,40 @@ class MegatronRankWorker:
             grads: List of CPU tensors from _capture_gradients.
         """
         import torch
+        import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         idx = 0
+        want_total_norm = self.rank == 0 and logger.isEnabledFor(logging.DEBUG)
         total_norm_sq = 0.0
         for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
                     for buffer in buffers:
                         if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                            if idx < len(grads):
-                                buffer.grad_data.copy_(grads[idx].cuda())
-                                total_norm_sq += buffer.grad_data.norm().item() ** 2
-                                idx += 1
+                            if idx >= len(grads):
+                                raise RuntimeError(
+                                    f"[Rank {self.rank}] _restore_gradients: expected >= {idx+1} grads, got {len(grads)}"
+                                )
 
-        total_norm = total_norm_sq ** 0.5
-        if self.rank == 0:
+                            cpu_grad = grads[idx]
+                            if cpu_grad.is_cuda:
+                                raise RuntimeError(
+                                    f"[Rank {self.rank}] _restore_gradients: expected CPU grads, got CUDA tensor at idx={idx}"
+                                )
+
+                            buffer.grad_data.copy_(cpu_grad, non_blocking=True)
+                            if want_total_norm:
+                                total_norm_sq += cpu_grad.float().norm().item() ** 2
+                            idx += 1
+
+        if idx != len(grads):
+            raise RuntimeError(
+                f"[Rank {self.rank}] _restore_gradients: restored {idx} buffers but grads has {len(grads)} tensors"
+            )
+
+        if want_total_norm:
+            total_norm = total_norm_sq ** 0.5
             logger.debug(
                 f"[Rank {self.rank}] _restore_gradients: restored {idx} buffers, total_norm={total_norm:.6f}"
             )

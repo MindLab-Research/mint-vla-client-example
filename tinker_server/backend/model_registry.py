@@ -248,12 +248,14 @@ MODEL_CONFIGS = {
         train_use_fp8=False,
         train_nccl_ib_disable=False,
         # Leave headroom for vLLM MoE LoRA buffers (fused_moe creates weights at engine init).
-        # Observed OOM at 0.96 during LoRA weight creation (alloc 336 MiB with ~58 MiB free).
-        gpu_memory_utilization=0.95,
+        # We have observed OOM during LoRA weight creation (alloc ~336 MiB with ~58 MiB free) when
+        # vLLM preallocates too aggressively.
+        gpu_memory_utilization=0.87,
         max_loras=1,  # LoRA REQUIRED for weight transfer
         max_lora_rank=64,
-        # Reduce from 32K to leave VRAM headroom for MoE LoRA buffers at max_lora_rank=64.
-        max_model_len=32000,
+        # Leave a small generation headroom above a 32k prompt without materially increasing KV cache size.
+        # This avoids hard failures when prompt_target_tokens=32000 (effective_max_tokens would be 0).
+        max_model_len=32256,
         max_num_seqs=8,  # Must be >= default SamplingParams(n=8)
         max_num_batched_tokens=1024,  # Cap logits/prefill peak allocations at long context
         is_mla=True,  # DeepSeek V3 MLA architecture
@@ -262,6 +264,7 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,  # Required to fit model with long context
     ),
     "unsloth/Kimi-K2-Instruct-0905-BF16": ModelConfig(
+        num_parameters=1040.0,
         is_moe=True,
         inference_tp=64,
         inference_pp=1,
@@ -273,10 +276,10 @@ MODEL_CONFIGS = {
         quantization=None,
         train_use_fp8=False,
         train_nccl_ib_disable=False,
-        gpu_memory_utilization=0.95,
+        gpu_memory_utilization=0.87,
         max_loras=1,
         max_lora_rank=64,
-        max_model_len=32000,
+        max_model_len=32256,
         max_num_seqs=8,
         max_num_batched_tokens=1024,
         is_mla=True,

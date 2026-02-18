@@ -47,6 +47,54 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
+    """Patch vLLM fused-MoE LoRA slicing for fully-sharded dummy weights.
+
+    In vLLM, `FusedMoEWithLoRA` allocates W13 LoRA-A stacked tensors with rank
+    divided by TP when `fully_sharded_loras=True`. During adapter activation,
+    vLLM can call `_slice_w13_a()` on tensors already in per-rank shape, which
+    triggers an assertion on `current_lora_rank % tp_size`.
+    """
+
+    import vllm.lora.layers.fused_moe as fused_moe_mod
+
+    def _patch_cls(cls: type) -> None:
+        original = getattr(cls, "_slice_w13_a", None)
+        if original is None:
+            raise RuntimeError(f"vLLM class {cls.__name__} has no _slice_w13_a")
+        if getattr(original, "_tinker_patched_fully_sharded", False):
+            return
+
+        def _slice_w13_a(self, w13_lora_a):  # type: ignore[no-untyped-def]
+            if self.tp_size == 1 or not self.fully_sharded:
+                return w13_lora_a
+
+            expected_rank = int(self.w13_lora_a_stacked[0].shape[2])
+            current_rank = int(w13_lora_a.shape[1])
+            if current_rank == expected_rank:
+                return w13_lora_a
+
+            if current_rank % self.tp_size != 0:
+                raise RuntimeError(
+                    "vLLM fused_moe _slice_w13_a unexpected rank: "
+                    f"current_rank={current_rank} tp_size={self.tp_size} expected_rank={expected_rank}"
+                )
+
+            sliced_rank = current_rank // self.tp_size
+            start_idx = self.tp_rank * sliced_rank
+            end_idx = (self.tp_rank + 1) * sliced_rank
+            return w13_lora_a[:, start_idx:end_idx, :]
+
+        _slice_w13_a._tinker_patched_fully_sharded = True  # type: ignore[attr-defined]
+        cls._slice_w13_a = _slice_w13_a  # type: ignore[method-assign]
+
+    for name in ("FusedMoEWithLoRA", "FusedMoE3DWithLoRA"):
+        cls = getattr(fused_moe_mod, name, None)
+        if cls is None:
+            raise RuntimeError(f"vLLM fused_moe is missing class {name}")
+        _patch_cls(cls)
+
+
 def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str, Any]:
     """Optional single-node pinning for vLLM actors (mp backend).
 
@@ -460,6 +508,7 @@ def _create_multinode_vllm_actor(
                 return
 
             import os
+
             distributed_executor_backend = os.environ.get("MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "ray").strip().lower()
             os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
@@ -492,6 +541,22 @@ def _create_multinode_vllm_actor(
                 and self.tensor_parallel_size >= 32
                 and self.max_lora_rank % self.tensor_parallel_size == 0
             )
+            if fully_sharded_loras:
+                _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
+            lora_dtype_env = os.environ.get("MINT_VLLM_LORA_DTYPE", "auto").strip()
+            lora_dtype_resolved = lora_dtype_env
+            if self.enable_lora and lora_dtype_env.lower() == "auto":
+                # vLLM fused MoE LoRA Triton kernels reinterpret LoRA weight pointers as the
+                # output dtype (see vllm/lora/ops/triton_ops/fused_moe_lora_op.py). If LoRA
+                # weights are loaded in fp16 while model output is bf16, the kernel will
+                # read fp16 memory as bf16 and can produce NaNs. Default to bf16 for BF16
+                # model snapshots unless explicitly overridden.
+                if "BF16" in str(self.model_path).upper():
+                    lora_dtype_resolved = "bfloat16"
+
+            logger.info(
+                "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
+            )
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -519,6 +584,7 @@ def _create_multinode_vllm_actor(
                 max_lora_rank=self.max_lora_rank if self.enable_lora else None,
                 max_cpu_loras=self.max_cpu_loras if self.enable_lora else None,
                 fully_sharded_loras=fully_sharded_loras if self.enable_lora else False,
+                lora_dtype=lora_dtype_resolved,
             )
 
             logger.info(
@@ -1288,9 +1354,19 @@ class MultiNodeInferenceEngine:
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
-                or "300"
+                or "1800"
             )
             logger.info(f"multinode_vllm_init actor={self.actor_name} RAY_CGRAPH_get_timeout={ray_cgraph_get_timeout}")
+
+            # Large models can spend 10-30+ minutes loading shards across many GPUs.
+            if total_required_gpus >= 16:
+                init_timeout = 3600
+            elif total_required_gpus >= 8:
+                init_timeout = 1800
+            elif total_required_gpus >= 4:
+                init_timeout = 1800
+            else:
+                init_timeout = 600
 
             is_persistent = False
             persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
@@ -1304,6 +1380,14 @@ class MultiNodeInferenceEngine:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 try:
                     is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
+                except ray.exceptions.GetTimeoutError:
+                    # During large vLLM initialization the actor event loop can be blocked, so a
+                    # readiness probe may time out. Treat this as "not ready" and fall back to
+                    # waiting on initialize(), rather than killing and recreating the actor.
+                    logger.warning(
+                        f"ray.get(is_ready) timed out for {self.actor_name}; treating as not-ready"
+                    )
+                    is_ready = False
                 except ray.exceptions.RayTaskError as e:
                     logger.warning(
                         f"ray.get(is_ready) failed for {self.actor_name}: {type(e).__name__}: {e}; treating as not-ready"
@@ -1335,13 +1419,49 @@ class MultiNodeInferenceEngine:
                     resource_pool.mark_ready(self.actor_name)
                     return
                 else:
-                    logger.warning(f"Actor {self.actor_name} exists but not ready, will recreate")
+                    # vLLM engine initialization can take a long time. If an actor exists but is not
+                    # ready, assume it is still initializing and wait, rather than killing and
+                    # recreating (which can lead to repeated Volcano placement selection and
+                    # "insufficient free nodes" during initialization).
+                    logger.info(
+                        f"Actor {self.actor_name} exists but not ready; waiting for initialize (timeout={init_timeout}s)"
+                    )
+                    try:
+                        await asyncio.to_thread(ray.get, existing_actor.initialize.remote(), timeout=init_timeout)
+                    except ray.exceptions.GetTimeoutError:
+                        logger.warning(
+                            f"Actor {self.actor_name} initialize timed out after {init_timeout}s; will recreate"
+                        )
+                    except ray.exceptions.RayTaskError as e:
+                        logger.warning(
+                            f"ray.get(initialize) failed for {self.actor_name}: {type(e).__name__}: {e}; will recreate"
+                        )
+                    except SystemExit as e:
+                        if getattr(e, "code", None) == 15:
+                            raise
+                        logger.warning(
+                            f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}; will recreate"
+                        )
+                    else:
+                        logger.info(f"Connected to existing MultiNodeVLLMEngine after init: {self.actor_name}")
+                        self.engine = existing_actor
+                        self._initialized = True
+                        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                        resource_pool = get_resource_pool()
+                        resource_pool.register(
+                            actor_name=self.actor_name,
+                            actor_type=ActorType.VLLM,
+                            num_gpus=total_required_gpus,
+                            actor_handle=self.engine,
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=self.model_path,
+                            protected=is_persistent,
+                        )
+                        resource_pool.mark_ready(self.actor_name)
+                        return
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
-            except ray.exceptions.GetTimeoutError:
-                # Do not assume readiness if we cannot run the readiness RPC.
-                # Reusing a half-initialized actor can surface as 'engine is None' in generate().
-                logger.warning(f"Actor {self.actor_name} is_ready timed out; treating as not-ready and recreating")
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -1397,7 +1517,7 @@ class MultiNodeInferenceEngine:
                     f"rq={volc_rq} nodes={node_ips}"
                 )
                 resources = compute_multinode_engine_resources(
-                    worker_gpus, node_ips=node_ips, gpus_per_node=gpus_per_node
+                    worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
                 )
                 controller_gpus = resources.controller_gpus
                 controller_cpus = resources.controller_cpus
@@ -1480,6 +1600,12 @@ class MultiNodeInferenceEngine:
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                # Some environments import tvm_ffi during vLLM init and try to JIT-build a
+                # torch c-dlpack addon on every Ray worker process, which can spawn dozens
+                # of concurrent compilers and stall engine startup. Disable the optional
+                # build to keep vLLM init deterministic.
+                "TVM_FFI_DISABLE_TORCH_C_DLPACK": "1",
                 # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
                 # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
@@ -1517,20 +1643,13 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENABLE_CHUNKED_PREFILL",
                 "MINT_VLLM_ENABLE_PREFIX_CACHING",
                 "MINT_VLLM_FULLY_SHARDED_LORAS",
+                "MINT_VLLM_LORA_DTYPE",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
                 "VLLM_DISABLE_RAY_COMPILED_DAG",
                 "VLLM_USE_RAY_WRAPPED_PP_COMM",
                 "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
                 "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM",
-                "MINT_FAULTHANDLER_SIGUSR1",
-                "MINT_VLLM_PREFLIGHT_FINITE_GATE",
-                "MINT_VLLM_TRACE_STAGE_STATS",
-                "MINT_VLLM_TRACE_STAGE_STATS_REQ_SUFFIX",
-                "MINT_VLLM_TRACE_NONFINITE",
-                "MINT_VLLM_DISABLE_PACK_MOE_PATCH",
-                "MINT_VLLM_DISABLE_PUNICA_PATCH",
-                "MINT_VLLM_SANITIZE_W13_AFTER_EXPAND",
             ):
                 v = os.environ.get(k)
                 if v is not None:
@@ -1558,17 +1677,13 @@ class MultiNodeInferenceEngine:
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
 
-            # K2 MoE per-expert LoRA is too large to replicate across TP ranks
-            # (e.g., 384 experts * hidden * rank). Enable fully-sharded LoRA by
-            # default for large-TP engines unless explicitly overridden.
-            if "MINT_VLLM_FULLY_SHARDED_LORAS" not in env_vars:
-                if (
-                    self.max_loras > 0
-                    and self.max_lora_rank is not None
-                    and self.tensor_parallel_size >= 32
-                    and self.max_lora_rank % self.tensor_parallel_size == 0
-                ):
-                    env_vars["MINT_VLLM_FULLY_SHARDED_LORAS"] = "1"
+            # Keep fully-sharded LoRAs opt-in.
+            #
+            # We have observed vLLM fused-MoE + LoRA crashes in Volcano deployments when
+            # fully-sharded LoRAs are enabled (assert in vllm/lora/layers/fused_moe.py
+            # during engine init/profile run). Operators can still enable this via:
+            #   export MINT_VLLM_FULLY_SHARDED_LORAS=1
+            # but we should not force-enable it in code.
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
@@ -1600,15 +1715,6 @@ class MultiNodeInferenceEngine:
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
                 f"total_gpus={total_required_gpus}"
             )
-            # Large models can spend 10-30+ minutes loading shards across many GPUs.
-            if total_required_gpus >= 16:
-                init_timeout = 3600
-            elif total_required_gpus >= 8:
-                init_timeout = 1800
-            elif total_required_gpus >= 4:
-                init_timeout = 1800
-            else:
-                init_timeout = 600
 
             loop = asyncio.get_event_loop()
             try:
