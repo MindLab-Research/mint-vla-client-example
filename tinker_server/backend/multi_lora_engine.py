@@ -531,11 +531,12 @@ class MultiLoRAInferenceEngine:
         print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
             print(f"[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
-            await self.server.add_lora_with_id.remote(
+            ref = self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
                 peft_config=peft_config,
             )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             print(f"[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
@@ -544,11 +545,12 @@ class MultiLoRAInferenceEngine:
             self.server = None
             await self.initialize()
             # Retry after restart
-            await self.server.add_lora_with_id.remote(
+            ref = self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
                 peft_config=peft_config,
             )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             print(f"[DEBUG add_lora_for_session] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
             import traceback
@@ -601,11 +603,12 @@ class MultiLoRAInferenceEngine:
         start_time = time.time()
         print(f"[DEBUG add_lora_for_session_from_path] Loading from path: {lora_path}", flush=True)
         try:
-            await self.server.add_lora_from_path.remote(
+            ref = self.server.add_lora_from_path.remote(
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
             )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             print(f"[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
@@ -614,11 +617,12 @@ class MultiLoRAInferenceEngine:
             self.server = None
             await self.initialize()
             # Retry after restart
-            await self.server.add_lora_from_path.remote(
+            ref = self.server.add_lora_from_path.remote(
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
             )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             print(f"[DEBUG add_lora_for_session_from_path] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
             import traceback
@@ -981,7 +985,8 @@ class MultiLoRAInferenceEngine:
 
         # Remove from vLLM engine
         try:
-            await self.server.remove_lora.remote(lora_id)
+            ref = self.server.remove_lora.remote(lora_id)
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
 

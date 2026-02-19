@@ -38,17 +38,21 @@ async def ray_get_with_resource_pool_keepalive(
     pool = get_resource_pool()
     start = time.time()
 
-    while True:
-        pool.touch(actor_name)
+    pool.mark_inflight(actor_name, +1)
+    try:
+        while True:
+            pool.touch(actor_name)
 
-        wait_s = interval_s
-        if timeout_s is not None and timeout_s > 0:
-            remaining = timeout_s - (time.time() - start)
-            if remaining <= 0:
-                raise asyncio.TimeoutError(f"ray_get_timeout_s={timeout_s} actor_name={actor_name}")
-            wait_s = min(wait_s, remaining)
+            wait_s = interval_s
+            if timeout_s is not None and timeout_s > 0:
+                remaining = timeout_s - (time.time() - start)
+                if remaining <= 0:
+                    raise asyncio.TimeoutError(f"ray_get_timeout_s={timeout_s} actor_name={actor_name}")
+                wait_s = min(wait_s, remaining)
 
-        try:
-            return await asyncio.to_thread(ray.get, ref, timeout=wait_s)
-        except ray.exceptions.GetTimeoutError:
-            continue
+            try:
+                return await asyncio.to_thread(ray.get, ref, timeout=wait_s)
+            except ray.exceptions.GetTimeoutError:
+                continue
+    finally:
+        pool.mark_inflight(actor_name, -1)

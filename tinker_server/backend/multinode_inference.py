@@ -1964,11 +1964,12 @@ class MultiNodeInferenceEngine:
         # Add to engine (all workers load from shared path)
         start_time = time.time()
         try:
-            await self.engine.add_lora.remote(
+            ref = self.engine.add_lora.remote(
                 lora_int_id=lora_id,
                 lora_path=adapter_dir,
                 lora_name=sampling_session_id,
             )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
@@ -2006,11 +2007,12 @@ class MultiNodeInferenceEngine:
 
         start_time = time.time()
         try:
-            await self.engine.add_lora.remote(
+            ref = self.engine.add_lora.remote(
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
             )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
@@ -2350,7 +2352,8 @@ class MultiNodeInferenceEngine:
             return False
 
         try:
-            await self.engine.remove_lora.remote(lora_id)
+            ref = self.engine.remove_lora.remote(lora_id)
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
 
