@@ -1239,6 +1239,133 @@ def _create_multinode_vllm_actor(
 
             return out
 
+        async def compute_prompt_topk(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            lora_int_id: int | None,
+            lora_path: str | None,
+            k: int,
+        ) -> list[list[tuple[int, float]] | None]:
+            """Compute top-K prompt logprobs.
+
+            Returns a list of length len(prompt_ids), where:
+            - topk[0] is None (first token has no conditioning context)
+            - topk[i] is a list of (token_id, logprob) pairs for i >= 1
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            if not prompt_ids:
+                return []
+            if len(prompt_ids) == 1:
+                return [None]
+
+            kk = int(k)
+            if kk <= 0:
+                return [None] * len(prompt_ids)
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=kk,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            lora_request = None
+            if lora_int_id is not None and lora_path is not None:
+                lora_request = LoRARequest(
+                    lora_name=str(lora_int_id),
+                    lora_int_id=lora_int_id,
+                    lora_path=lora_path,
+                )
+
+            t0 = time.perf_counter()
+            async with self._maybe_prompt_logprobs_lock():
+                async with self._lock_read():
+                    t1 = time.perf_counter()
+                    try:
+                        collector = await self.engine.add_request(
+                            request_id=request_id,
+                            prompt=prompt,
+                            params=sampling_params,
+                            lora_request=lora_request,
+                        )
+                    except Exception:
+                        _raise_serializable_vllm_error(
+                            request_id=request_id,
+                            where="vllm_prompt_topk_add_request_failed",
+                            extra={
+                                "prompt_len": len(prompt_ids),
+                                "k": kk,
+                                "model_path": self.model_path,
+                                "tp": self.tensor_parallel_size,
+                                "pp": self.pipeline_parallel_size,
+                            },
+                        )
+                    final_res = None
+                    try:
+                        while True:
+                            out = await collector.get()
+                            final_res = out
+                            if out.finished:
+                                break
+                    except Exception:
+                        _raise_serializable_vllm_engine_error(
+                            request_id=request_id,
+                            where="vllm_prompt_topk_collect_failed",
+                            extra={
+                                "prompt_len": len(prompt_ids),
+                                "k": kk,
+                                "model_path": self.model_path,
+                                "tp": self.tensor_parallel_size,
+                                "pp": self.pipeline_parallel_size,
+                            },
+                        )
+                    assert final_res is not None
+            t2 = time.perf_counter()
+            if self._timing:
+                print(
+                    f"[vLLM timing] prompt_topk req={request_id} prompt_len={len(prompt_ids)} "
+                    f"k={kk} lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f}",
+                    flush=True,
+                )
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return [None] * len(prompt_ids)
+
+            out: list[list[tuple[int, float]] | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
+                    continue
+                entry = prompt_logprobs[i]
+                items = getattr(entry, "items", None)
+                if not callable(items):
+                    out.append(None)
+                    continue
+
+                pairs: list[tuple[int, float]] = []
+                for tok, lp_obj in entry.items():
+                    if isinstance(lp_obj, (float, int)):
+                        lp_val = float(lp_obj)
+                    else:
+                        lp_val = getattr(lp_obj, "logprob", None)
+                        if lp_val is None and isinstance(lp_obj, dict):
+                            lp_val = lp_obj.get("logprob")
+                        if lp_val is None:
+                            continue
+                        lp_val = float(lp_val)
+                    pairs.append((int(tok), float(lp_val)))
+
+                pairs.sort(key=lambda kv: kv[1], reverse=True)
+                out.append(pairs[:kk])
+
+            return out
+
     return MultiNodeVLLMEngine
 
 
@@ -2131,6 +2258,79 @@ class MultiNodeInferenceEngine:
                 request_id,
                 sampling_session_id,
                 len(prompt_ids),
+            )
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise
+
+        return list(result)
+
+    async def compute_topk(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        k: int = 10,
+    ) -> list[list[tuple[int, float]] | None]:
+        """Compute top-K prompt logprobs using session-specific LoRA or base model."""
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        if not prompt_ids:
+            return []
+        if len(prompt_ids) == 1:
+            return [None]
+
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
+
+        kk = int(k)
+        if kk <= 0:
+            return [None] * len(prompt_ids)
+
+        ray_get_timeout_s = float(os.environ.get("MINT_VLLM_RAY_GET_TIMEOUT_S", "0"))
+
+        lora_id = None
+        lora_path = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+            if lora_id is not None:
+                lora_path = await self.registry.get_adapter_path(lora_id)
+
+        ref = self.engine.compute_prompt_topk.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            k=kk,
+        )
+        try:
+            timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
+            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
+            ) from e
+        except Exception:
+            logger.exception(
+                "multinode_vllm_ray_get_failed compute_topk actor=%s request_id=%s sampling_session_id=%s prompt_len=%s k=%s",
+                self.actor_name,
+                request_id,
+                sampling_session_id,
+                len(prompt_ids),
+                kk,
             )
             try:
                 ray_kill.kill(
