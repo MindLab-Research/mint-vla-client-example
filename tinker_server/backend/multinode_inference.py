@@ -993,7 +993,6 @@ def _create_multinode_vllm_actor(
                                 non_finite_count += 1
                                 if len(non_finite_samples) < 3:
                                     non_finite_samples.append((i, tid, lp_f))
-                                lp_f = -1e9
                             log_probs.append(lp_f)
                             continue
                         lp_val = getattr(lp_obj, "logprob", None)
@@ -1008,7 +1007,6 @@ def _create_multinode_vllm_actor(
                             non_finite_count += 1
                             if len(non_finite_samples) < 3:
                                 non_finite_samples.append((i, tid, lp_f))
-                            lp_f = -1e9
                         log_probs.append(lp_f)
 
                     if non_finite_count:
@@ -1016,8 +1014,8 @@ def _create_multinode_vllm_actor(
                             "head": token_ids[:8],
                             "tail": token_ids[-8:] if len(token_ids) > 8 else token_ids[:],
                         }
-                        logger.warning(
-                            f"Non-finite sampled-token logprobs clamped: request_id={request_id} "
+                        raise RuntimeError(
+                            f"Non-finite sampled-token logprobs: request_id={request_id} "
                             f"count={non_finite_count} samples(idx,token,lp)={non_finite_samples} "
                             f"token_preview={token_preview}"
                         )
@@ -1088,7 +1086,6 @@ def _create_multinode_vllm_actor(
                                         "head": out_token_ids[:8],
                                         "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
                                     }
-                                lp_f = -1e9
                             out_log_probs.append(lp_f)
                             continue
                         lp_val = getattr(lp_obj, "logprob", None)
@@ -1108,7 +1105,6 @@ def _create_multinode_vllm_actor(
                                     "head": out_token_ids[:8],
                                     "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
                                 }
-                            lp_f = -1e9
                         out_log_probs.append(lp_f)
 
                 out_stop_reason = "length"
@@ -1126,8 +1122,8 @@ def _create_multinode_vllm_actor(
                 )
 
             if non_finite_count:
-                logger.warning(
-                    f"Non-finite sampled-token logprobs clamped: request_id={request_id} "
+                raise RuntimeError(
+                    f"Non-finite sampled-token logprobs: request_id={request_id} "
                     f"count={non_finite_count} samples(seq,idx,token,lp)={non_finite_samples} "
                     f"seq_token_preview={affected_seq_preview}"
                 )
