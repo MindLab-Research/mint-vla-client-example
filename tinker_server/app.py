@@ -213,6 +213,17 @@ async def _cleanup_stale_actors() -> None:
             except ValueError:
                 # Actor name registered but no actor exists
                 logger.debug(f"Actor {name} not found (name registered but no actor)")
+                try:
+                    resource_pool.unregister(name)
+                except Exception:
+                    pass
+                try:
+                    pg_name = f"{name}_pg"
+                    pg = ray.util.get_placement_group(pg_name)
+                    ray.util.remove_placement_group(pg)
+                    logger.warning(f"Removed orphan placement_group={pg_name}")
+                except Exception:
+                    pass
 
         logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
 

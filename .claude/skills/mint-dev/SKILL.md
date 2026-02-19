@@ -27,6 +27,8 @@ description: |
 > | Kill vLLM | `curl -X POST http://localhost:8000/api/v1/kill_vllm` |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
+>
+> Note: `GET /api/v1/healthz` can return `503` when Ray has pending GPU placement-group demand (capacity degraded).
 
 > **CRITICAL: RESTART SERVER AFTER CODE CHANGES**
 >
