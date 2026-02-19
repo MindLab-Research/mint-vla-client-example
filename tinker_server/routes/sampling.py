@@ -493,6 +493,8 @@ async def _do_sample(
     global _inflight_sample_tasks
     session_id: str | None = None
     engine = None
+    resource_pool = None
+    resource_pool_actor_name: str | None = None
     try:
         try:
             if session_manager is None:
@@ -533,6 +535,15 @@ async def _do_sample(
                 engine = await session_manager.get_engine_for_session(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
+                from ..backend.resource_pool import get_resource_pool
+
+                resource_pool = get_resource_pool()
+                resource_pool_actor_name = getattr(engine, "actor_name", None)
+                if not isinstance(resource_pool_actor_name, str) or not resource_pool_actor_name:
+                    raise RuntimeError(
+                        f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
+                    )
+                resource_pool.mark_inflight(resource_pool_actor_name, +1)
 
                 logger.info(
                     f"[sample path] request_id={request_id} session_id={session_id} "
@@ -730,6 +741,8 @@ async def _do_sample(
             logger.exception(f"Request {request_id} failed: {e}")
             future_store.fail(request_id, str(e))
     finally:
+        if resource_pool is not None and resource_pool_actor_name is not None:
+            resource_pool.mark_inflight(resource_pool_actor_name, -1)
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)
         _inflight_sample_tasks -= 1

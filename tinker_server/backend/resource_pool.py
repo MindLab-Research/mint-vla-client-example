@@ -44,6 +44,10 @@ class ActorEntry:
     # LRU tracking
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
+    # Count of in-flight work on this actor. While >0, the actor is considered non-idle and
+    # must not be evicted, even if last_accessed is stale (some long-running Ray calls do not
+    # touch ResourcePool unless explicitly wrapped).
+    inflight_count: int = 0
     # Protection flag: actor being created/initialized is not evictable
     # Set to False after initialization completes
     creating: bool = True
@@ -74,6 +78,8 @@ class ActorEntry:
         """
         # Actors being created are NEVER idle
         if self.creating:
+            return False
+        if self.inflight_count > 0:
             return False
         if self.actor_type == ActorType.VLLM:
             # vLLM uses same idle timeout as other actors to prevent eviction during active use
@@ -252,6 +258,17 @@ class ResourcePool:
                 entry.touch()
                 return True
             return False
+
+    def mark_inflight(self, actor_name: str, delta: int) -> None:
+        if delta == 0:
+            return
+        with self._pool_lock:
+            entry = self._entries.get(actor_name)
+            if entry is None:
+                return
+            entry.inflight_count = max(0, int(entry.inflight_count) + int(delta))
+            if delta > 0:
+                entry.touch()
 
     def mark_ready(self, actor_name: str):
         """Mark an actor as ready (no longer creating).
@@ -453,7 +470,7 @@ class ResourcePool:
             # Log actor states for debugging
             evictable_list = self._get_evictable_actors_lru(allow_evict_protected=allow_evict_protected)
             with self._pool_lock:
-                all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating)
+                all_actors = [(e.actor_name, e.is_idle(self.SESSION_IDLE_TIMEOUT), e.idle_time(), e.creating, e.inflight_count)
                               for e in self._entries.values()]
                 pending = self._pending_gpus
             logger.info(
