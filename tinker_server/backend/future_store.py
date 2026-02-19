@@ -32,6 +32,13 @@ class _InMemoryFutureStore:
         self._errors: dict[str, str] = {}
         self._pending: set[str] = set()
 
+    def stats(self) -> dict[str, Any]:
+        return {
+            "pending": len(self._pending),
+            "results": len(self._results),
+            "errors": len(self._errors),
+        }
+
     def add_pending(self, request_id: str) -> None:
         self._pending.add(request_id)
 
@@ -149,6 +156,18 @@ def _get_or_create_ray_actor():
             self._done_at: dict[str, float] = {}
             self._ttl_s = float(ttl_s)
             self._done_ttl_s = float(done_ttl_s)
+
+        def stats(self) -> dict[str, Any]:
+            self._prune()
+            return {
+                "pending": len(self._pending),
+                "results": len(self._results),
+                "errors": len(self._errors),
+                "refs": len(self._refs),
+                "meta": len(self._meta),
+                "ttl_s": float(self._ttl_s),
+                "done_ttl_s": float(self._done_ttl_s),
+            }
 
         def _prune(self) -> int:
             now = time.time()
@@ -350,6 +369,38 @@ class FutureStore:
         if self._ray_actor is None:
             self._ray_actor = _get_or_create_ray_actor()
         return self._ray_actor
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "ray_namespace": _ray_namespace(),
+            "ray_actor_name": _ray_future_store_actor_name(),
+            "future_ttl_s": _ray_future_ttl_s(),
+            "future_done_ttl_s": _ray_future_done_ttl_s(),
+            "local": self._local.stats(),
+        }
+
+        try:
+            import ray  # type: ignore
+
+            out["ray_initialized"] = bool(ray.is_initialized())
+            if not ray.is_initialized():
+                out["ray_address_inferred"] = _infer_ray_address()
+                return out
+
+            try:
+                actor = ray.get_actor(_ray_future_store_actor_name(), namespace=_ray_namespace())
+            except Exception as e:
+                out["ray_actor_get_error"] = f"{type(e).__name__}: {e}"
+                return out
+
+            try:
+                out["ray_actor_stats"] = ray.get(actor.stats.remote())
+            except Exception as e:
+                out["ray_actor_stats_error"] = f"{type(e).__name__}: {e}"
+            return out
+        except Exception as e:
+            out["ray_import_error"] = f"{type(e).__name__}: {e}"
+            return out
 
     def create(self) -> str:
         request_id = str(uuid.uuid4())

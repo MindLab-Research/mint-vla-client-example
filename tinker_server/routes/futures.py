@@ -60,7 +60,23 @@ async def retrieve_future(
 
         decoded = decode_request_id(body.request_id)
         if decoded is None:
-            raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
+            import uuid as _uuid
+
+            try:
+                _uuid.UUID(body.request_id)
+            except Exception:
+                raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
+
+            detail: object
+            if _is_privileged(http_request):
+                detail = {
+                    "error": f"Unknown request_id (FutureStore lost state): {body.request_id}",
+                    "request_id": body.request_id,
+                    "future_store": future_store.debug_snapshot(),
+                }
+            else:
+                detail = GENERIC_ERROR_MESSAGE
+            raise HTTPException(status_code=503, detail=detail)
 
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
@@ -115,6 +131,14 @@ async def retrieve_future(
         ):
             payload = dict(payload)
             payload["error"] = _public_error(payload.get("error"))
+        if (
+            upstream_resp.status_code != 200
+            and isinstance(payload, dict)
+            and "detail" in payload
+            and not _is_privileged(http_request)
+        ):
+            payload = dict(payload)
+            payload["detail"] = GENERIC_ERROR_MESSAGE
         return payload
 
     if status == FutureStatus.PENDING:
