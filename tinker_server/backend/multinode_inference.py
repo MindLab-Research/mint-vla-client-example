@@ -1840,11 +1840,23 @@ class MultiNodeInferenceEngine:
 
         # Add to engine (all workers load from shared path)
         start_time = time.time()
-        await self.engine.add_lora.remote(
-            lora_int_id=lora_id,
-            lora_path=adapter_dir,
-            lora_name=sampling_session_id,
-        )
+        try:
+            await self.engine.add_lora.remote(
+                lora_int_id=lora_id,
+                lora_path=adapter_dir,
+                lora_name=sampling_session_id,
+            )
+        except Exception as e:
+            # Roll back registry on load failure so retries don't trip
+            # "already has lora_int_id" for the same session.
+            try:
+                await self.registry.remove(lora_id)
+            except Exception as cleanup_e:
+                logger.warning(
+                    f"Failed to roll back lora_int_id={lora_id} after add_lora failure: "
+                    f"{type(cleanup_e).__name__}: {cleanup_e}"
+                )
+            raise
         load_time = time.time() - start_time
 
         logger.info(
@@ -1870,11 +1882,23 @@ class MultiNodeInferenceEngine:
         lora_id = await self.registry.allocate(sampling_session_id, lora_path)
 
         start_time = time.time()
-        await self.engine.add_lora.remote(
-            lora_int_id=lora_id,
-            lora_path=lora_path,
-            lora_name=sampling_session_id,
-        )
+        try:
+            await self.engine.add_lora.remote(
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                lora_name=sampling_session_id,
+            )
+        except Exception as e:
+            # Roll back registry on load failure so retries don't trip
+            # "already has lora_int_id" for the same session.
+            try:
+                await self.registry.remove(lora_id)
+            except Exception as cleanup_e:
+                logger.warning(
+                    f"Failed to roll back lora_int_id={lora_id} after add_lora failure: "
+                    f"{type(cleanup_e).__name__}: {cleanup_e}"
+                )
+            raise
         load_time = time.time() - start_time
 
         logger.info(
