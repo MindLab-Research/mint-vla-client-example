@@ -719,6 +719,10 @@ def _create_multinode_vllm_actor(
                         except Exception as summarize_e:
                             summary["summary_error"] = f"{type(summarize_e).__name__}: {summarize_e}"
 
+                        print(
+                            f"[vLLM add_lora failed] adapter_summary={summary}",
+                            flush=True,
+                        )
                         logger.exception("vLLM add_lora failed; adapter_summary=%s", summary)
                         raise
             t2 = time.perf_counter()
@@ -2089,6 +2093,11 @@ class MultiNodeInferenceEngine:
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception:
+            print(
+                "[vLLM add_lora_for_session_from_path failed] "
+                f"sampling_session_id={sampling_session_id} lora_int_id={lora_id} path={lora_path}",
+                flush=True,
+            )
             logger.exception(
                 "Failed to add LoRA from path for sampling_session_id=%s lora_int_id=%s path=%s",
                 sampling_session_id,
