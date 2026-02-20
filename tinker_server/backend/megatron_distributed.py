@@ -1977,10 +1977,13 @@ class MegatronRankWorker:
             adapter_state = {}
 
             shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+            # Default to exporting the full per-expert LoRA tree so vLLM can pack MoE LoRAs.
+            # Operators can force a "shared expert" export (keep only expert 0) to reduce
+            # artifact size, but this requires downstream broadcasting support.
             shared_export = (
                 bool(model_is_moe)
                 and bool(use_per_expert_lora)
-                and shared_mode not in {"0", "false", "no"}
+                and shared_mode in {"1", "true", "yes"}
             )
             import re
 
@@ -2076,59 +2079,28 @@ class MegatronRankWorker:
                             f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
                         )
 
-                # If expert LoRA weights are globally shared (all experts identical),
-                # exporting per-expert keys is pure duplication (K2 can be tens of GB).
-                # Keep only expert 0 and rely on vLLM to broadcast missing experts
-                # (patched via sitecustomize) to avoid OOM during LoRA hot-load.
+                # Keep "shared-expert" export opt-in. vLLM expects per-expert weights for MoE LoRA.
                 mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
-                if mode not in {"0", "false", "no"}:
-                    do_shared_export = mode in {"1", "true", "yes"}
-                    if not do_shared_export and mode in {"auto", ""}:
-                        try:
-                            import torch
-
-                            checks = 0
-                            shared = True
-                            for k, v in adapter_state.items():
-                                if ".mlp.experts.0." not in k and ".mlp.shared_experts.0." not in k:
-                                    continue
-                                k1 = (
-                                    k.replace(".mlp.experts.0.", ".mlp.experts.1.")
-                                    .replace(".mlp.shared_experts.0.", ".mlp.shared_experts.1.")
-                                )
-                                if k1 not in adapter_state:
-                                    continue
-                                v1 = adapter_state[k1]
-                                if v.shape != v1.shape or v.dtype != v1.dtype or not torch.equal(v, v1):
-                                    shared = False
-                                    break
-                                checks += 1
-                                if checks >= 5:
-                                    break
-                            do_shared_export = shared and checks > 0
-                        except Exception:
-                            do_shared_export = False
-
-                    if do_shared_export:
-                        expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
-                        before = len(adapter_state)
-                        dropped = 0
-                        filtered = {}
-                        for k, v in adapter_state.items():
-                            m = expert_pat.search(k)
-                            if m is None:
-                                filtered[k] = v
-                                continue
-                            idx = int(m.group(1))
-                            if idx == 0:
-                                filtered[k] = v
-                            else:
-                                dropped += 1
-                        adapter_state = filtered
-                        logger.info(
-                            f"[Rank 0] Shared-expert export (export_adapter_weights): kept_expert=0 "
-                            f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
-                        )
+                if mode in {"1", "true", "yes"}:
+                    expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+                    before = len(adapter_state)
+                    dropped = 0
+                    filtered = {}
+                    for k, v in adapter_state.items():
+                        m = expert_pat.search(k)
+                        if m is None:
+                            filtered[k] = v
+                            continue
+                        idx = int(m.group(1))
+                        if idx == 0:
+                            filtered[k] = v
+                        else:
+                            dropped += 1
+                    adapter_state = filtered
+                    logger.info(
+                        f"[Rank 0] Shared-expert export (export_adapter_weights): kept_expert=0 "
+                        f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
+                    )
 
             logger.info(f"[Rank 0] export_adapter_weights returned {len(adapter_state)} params")
             return adapter_state
@@ -2882,54 +2854,26 @@ class MegatronRankWorker:
             import re
 
             mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
-            if mode not in {"0", "false", "no"}:
-                do_shared_export = mode in {"1", "true", "yes"}
-                if not do_shared_export and mode in {"auto", ""}:
-                    try:
-                        import torch
-
-                        checks = 0
-                        shared = True
-                        for k, v in lora_state_dict.items():
-                            if ".mlp.experts.0." not in k and ".mlp.shared_experts.0." not in k:
-                                continue
-                            k1 = (
-                                k.replace(".mlp.experts.0.", ".mlp.experts.1.")
-                                .replace(".mlp.shared_experts.0.", ".mlp.shared_experts.1.")
-                            )
-                            if k1 not in lora_state_dict:
-                                continue
-                            v1 = lora_state_dict[k1]
-                            if v.shape != v1.shape or v.dtype != v1.dtype or not torch.equal(v, v1):
-                                shared = False
-                                break
-                            checks += 1
-                            if checks >= 5:
-                                break
-                        do_shared_export = shared and checks > 0
-                    except Exception:
-                        do_shared_export = False
-
-                if do_shared_export:
-                    expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
-                    before = len(lora_state_dict)
-                    dropped = 0
-                    filtered = {}
-                    for k, v in lora_state_dict.items():
-                        m = expert_pat.search(k)
-                        if m is None:
-                            filtered[k] = v
-                            continue
-                        idx = int(m.group(1))
-                        if idx == 0:
-                            filtered[k] = v
-                        else:
-                            dropped += 1
-                    lora_state_dict = filtered
-                    logger.info(
-                        f"[Rank 0] Shared-expert export (custom extract): kept_expert=0 "
-                        f"dropped_keys={dropped} before={before} after={len(lora_state_dict)}"
-                    )
+            if mode in {"1", "true", "yes"}:
+                expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+                before = len(lora_state_dict)
+                dropped = 0
+                filtered = {}
+                for k, v in lora_state_dict.items():
+                    m = expert_pat.search(k)
+                    if m is None:
+                        filtered[k] = v
+                        continue
+                    idx = int(m.group(1))
+                    if idx == 0:
+                        filtered[k] = v
+                    else:
+                        dropped += 1
+                lora_state_dict = filtered
+                logger.info(
+                    f"[Rank 0] Shared-expert export (custom extract): kept_expert=0 "
+                    f"dropped_keys={dropped} before={before} after={len(lora_state_dict)}"
+                )
 
         return lora_state_dict
 
