@@ -510,7 +510,8 @@ def _create_multinode_vllm_actor(
             import os
 
             distributed_executor_backend = os.environ.get("MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "ray").strip().lower()
-            os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
+            if "VLLM_USE_V1" not in os.environ:
+                os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
             # disable to fall back to torch.distributed collectives.
             os.environ["VLLM_DISABLE_PYNCCL"] = "1"
@@ -546,13 +547,45 @@ def _create_multinode_vllm_actor(
             lora_dtype_env = os.environ.get("MINT_VLLM_LORA_DTYPE", "auto").strip()
             lora_dtype_resolved = lora_dtype_env
             if self.enable_lora and lora_dtype_env.lower() == "auto":
+                def _infer_hf_torch_dtype_str(model_path: str) -> str | None:
+                    from transformers import AutoConfig
+                    import torch
+
+                    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                    torch_dtype = getattr(cfg, "torch_dtype", None)
+                    if torch_dtype is None:
+                        return None
+                    if isinstance(torch_dtype, str):
+                        dtype_str = torch_dtype
+                    elif isinstance(torch_dtype, torch.dtype):
+                        dtype_str = str(torch_dtype)
+                    else:
+                        dtype_str = str(torch_dtype)
+                    dtype_str = dtype_str.replace("torch.", "").strip().lower()
+                    if dtype_str in ("fp16", "float16", "half"):
+                        return "float16"
+                    if dtype_str in ("bf16", "bfloat16"):
+                        return "bfloat16"
+                    if dtype_str in ("fp32", "float32"):
+                        return "float32"
+                    return None
+
                 # vLLM fused MoE LoRA Triton kernels reinterpret LoRA weight pointers as the
                 # output dtype (see vllm/lora/ops/triton_ops/fused_moe_lora_op.py). If LoRA
                 # weights are loaded in fp16 while model output is bf16, the kernel will
                 # read fp16 memory as bf16 and can produce NaNs. Default to bf16 for BF16
                 # model snapshots unless explicitly overridden.
-                if "BF16" in str(self.model_path).upper():
+                inferred = _infer_hf_torch_dtype_str(str(self.model_path))
+                if inferred is not None:
+                    lora_dtype_resolved = inferred
+                elif "BF16" in str(self.model_path).upper():
                     lora_dtype_resolved = "bfloat16"
+                else:
+                    logger.warning(
+                        "Unable to infer HF torch_dtype for model=%r with enable_lora=1; "
+                        "leaving vLLM lora_dtype='auto' (set MINT_VLLM_LORA_DTYPE to override)",
+                        self.model_path,
+                    )
 
             logger.info(
                 "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
@@ -650,7 +683,44 @@ def _create_multinode_vllm_actor(
             async with self._exclusive_engine_op():
                 async with self._lock_write():
                     t1 = time.perf_counter()
-                    await self.engine.add_lora(lora_request)
+                    try:
+                        await self.engine.add_lora(lora_request)
+                    except Exception:
+                        import json
+                        from pathlib import Path
+
+                        adapter_dir = Path(lora_path)
+                        summary: dict[str, object] = {
+                            "lora_int_id": lora_int_id,
+                            "lora_name": lora_name,
+                            "lora_path": lora_path,
+                            "exists": adapter_dir.exists(),
+                            "is_dir": adapter_dir.is_dir(),
+                        }
+                        try:
+                            if adapter_dir.is_dir():
+                                entries = sorted(p.name for p in adapter_dir.iterdir())
+                                summary["entries"] = entries[:20]
+                                for fname in ("adapter_config.json", "adapter_model.safetensors"):
+                                    p = adapter_dir / fname
+                                    summary[f"{fname}_exists"] = p.exists()
+                                    if p.exists():
+                                        summary[f"{fname}_size_bytes"] = p.stat().st_size
+                                cfg_path = adapter_dir / "adapter_config.json"
+                                if cfg_path.exists():
+                                    with cfg_path.open("r", encoding="utf-8") as f:
+                                        cfg = json.load(f)
+                                    summary["adapter_r"] = cfg.get("r")
+                                    summary["target_modules"] = cfg.get("target_modules")
+                                    summary["peft_type"] = cfg.get("peft_type")
+                                    summary["base_model_name_or_path"] = cfg.get(
+                                        "base_model_name_or_path"
+                                    )
+                        except Exception as summarize_e:
+                            summary["summary_error"] = f"{type(summarize_e).__name__}: {summarize_e}"
+
+                        logger.exception("vLLM add_lora failed; adapter_summary=%s", summary)
+                        raise
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -1733,10 +1803,13 @@ class MultiNodeInferenceEngine:
                 # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
-                # mp backend requires local multiprocessing; force v1 there.
-                "VLLM_USE_V1": "1" if distributed_executor_backend == "mp" else "0",
                 "VLLM_DISABLE_PYNCCL": "1",
             }
+            if "VLLM_USE_V1" in os.environ:
+                env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
+            else:
+                # mp backend requires local multiprocessing; default to v1 there unless explicitly overridden.
+                env_vars["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             for k in (
                 # Ray compiled DAG knobs (driver-side env; propagated via runtime_env).
                 "RAY_CGRAPH_submit_timeout",
@@ -1783,6 +1856,8 @@ class MultiNodeInferenceEngine:
 
             # Expose selected vLLM debug/perf knobs via API host env without code deploys.
             for k in (
+                "VLLM_LOGGING_LEVEL",
+                "VLLM_LOG_LEVEL",
                 "VLLM_ATTENTION_BACKEND",
                 "VLLM_USE_FLASHINFER_SAMPLER",
                 "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING",
@@ -2013,7 +2088,13 @@ class MultiNodeInferenceEngine:
                 lora_name=sampling_session_id,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                "Failed to add LoRA from path for sampling_session_id=%s lora_int_id=%s path=%s",
+                sampling_session_id,
+                lora_id,
+                lora_path,
+            )
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
             try:
