@@ -297,6 +297,13 @@ class FutureStore:
     def __init__(self) -> None:
         self._ray_actor = None
 
+    def ensure_ready(self) -> dict[str, Any]:
+        """Fail fast if Ray or the detached FutureStore actor is unavailable."""
+        actor = self._get_ray_actor()
+        import ray
+
+        return ray.get(actor.stats.remote())
+
     def _get_ray_actor(self):
         try:
             import ray
@@ -361,10 +368,9 @@ class FutureStore:
 
         try:
             ray.get(actor.add_pending.remote(request_id))
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            ray.get(actor.add_pending.remote(request_id))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         return request_id
 
     def resolve(self, request_id: str, result: Any) -> None:
@@ -373,10 +379,9 @@ class FutureStore:
 
         try:
             actor.resolve.remote(request_id, result)
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            actor.resolve.remote(request_id, result)
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def fail(self, request_id: str, error: str) -> None:
         actor = self._get_ray_actor()
@@ -384,10 +389,9 @@ class FutureStore:
 
         try:
             actor.fail.remote(request_id, error)
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            actor.fail.remote(request_id, error)
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def get_status(self, request_id: str) -> FutureStatus:
         actor = self._get_ray_actor()
@@ -396,10 +400,9 @@ class FutureStore:
 
         try:
             status = ray.get(actor.get_status.remote(request_id))
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            status = ray.get(actor.get_status.remote(request_id))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         except ray.exceptions.RayTaskError as e:
             msg = str(e)
             cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
@@ -416,10 +419,9 @@ class FutureStore:
 
         try:
             return ray.get(actor.get_result.remote(request_id))
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            return ray.get(actor.get_result.remote(request_id))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         except ray.exceptions.RayTaskError as e:
             msg = str(e)
             cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
@@ -435,10 +437,9 @@ class FutureStore:
 
         try:
             return ray.get(actor.get_error.remote(request_id))
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            return ray.get(actor.get_error.remote(request_id))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         except ray.exceptions.RayTaskError as e:
             msg = str(e)
             cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
@@ -454,10 +455,9 @@ class FutureStore:
 
         try:
             ray.get(actor.attach_ref.remote(request_id, ref, meta))
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            ray.get(actor.attach_ref.remote(request_id, ref, meta))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def submit(
         self,

@@ -537,6 +537,13 @@ async def lifespan(app: FastAPI):
     on startup, shuts down all sessions on application exit.
     """
     # ==========================================================================
+    # Ray: hard requirement (fail fast)
+    # ==========================================================================
+    from .backend.future_store import future_store
+
+    future_store.ensure_ready()
+
+    # ==========================================================================
     # Cleanup: Kill stale actors from previous server runs
     # ==========================================================================
     await _cleanup_stale_actors()
