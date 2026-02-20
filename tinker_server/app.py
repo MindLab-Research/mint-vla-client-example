@@ -635,6 +635,10 @@ async def lifespan(app: FastAPI):
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
 
+    from .gateway import close_http_clients
+
+    await close_http_clients()
+
 
 app = FastAPI(
     lifespan=lifespan,
@@ -643,6 +647,17 @@ app = FastAPI(
     version="0.1.0",
     docs_url=None,  # Disable built-in Swagger UI
 )
+
+from .backend.future_store import FutureStoreUnavailableError
+
+
+@app.exception_handler(FutureStoreUnavailableError)
+async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ray unavailable: FutureStore requires Ray"},
+    )
+
 
 # Paths that don't require authentication
 UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}

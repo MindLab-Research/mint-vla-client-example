@@ -6,7 +6,7 @@ Endpoints:
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from ..backend.future_store import FutureStatus, future_store
+from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
 
@@ -53,29 +53,10 @@ async def retrieve_future(
     a small allowlist of safe, user-actionable errors (e.g. permission/ownership).
     Regular users receive a generic error message for other failures.
     """
-    try:
-        status = future_store.get_status(body.request_id)
-    except KeyError:
-        from ..gateway import decode_request_id, forward_json, upstream_for_alias
+    from ..gateway import decode_request_id, forward_json, upstream_for_alias
 
-        decoded = decode_request_id(body.request_id)
-        if decoded is None:
-            import uuid as _uuid
-
-            try:
-                _uuid.UUID(body.request_id)
-            except Exception:
-                raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
-
-            detail: object = f"Unknown request_id: {body.request_id}"
-            if _is_privileged(http_request):
-                detail = {
-                    "error": detail,
-                    "request_id": body.request_id,
-                    "future_store": future_store.debug_snapshot(),
-                }
-            raise HTTPException(status_code=404, detail=detail)
-
+    decoded = decode_request_id(body.request_id)
+    if decoded is not None:
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
@@ -138,6 +119,20 @@ async def retrieve_future(
             payload = dict(payload)
             payload["detail"] = GENERIC_ERROR_MESSAGE
         return payload
+
+    try:
+        status = future_store.get_status(body.request_id)
+    except FutureStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+    except KeyError:
+        detail: object = f"Unknown request_id: {body.request_id}"
+        if _is_privileged(http_request):
+            detail = {
+                "error": detail,
+                "request_id": body.request_id,
+                "future_store": future_store.debug_snapshot(),
+            }
+        raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
         meta = None

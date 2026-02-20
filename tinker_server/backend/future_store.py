@@ -5,9 +5,8 @@ Maps request_id to results for the async polling pattern:
 2. Server processes in background
 3. Client polls with request_id until result ready
 
-Issue #85: process-local in-memory futures can produce 404 "Unknown request_id"
-if the create and retrieve requests land on different server processes/replicas.
-We default to a detached Ray actor backend when Ray is available.
+Ray is a hard requirement: futures are stored in a detached Ray actor so they
+survive multi-worker deployments without per-process state loss.
 """
 
 from __future__ import annotations
@@ -20,55 +19,15 @@ from typing import Any
 
 from ..config import config as server_config
 
+
+class FutureStoreUnavailableError(RuntimeError):
+    pass
+
+
 class FutureStatus(Enum):
     PENDING = "pending"
     DONE = "done"
     FAILED = "failed"
-
-
-class _InMemoryFutureStore:
-    def __init__(self) -> None:
-        self._results: dict[str, Any] = {}
-        self._errors: dict[str, str] = {}
-        self._pending: set[str] = set()
-
-    def stats(self) -> dict[str, Any]:
-        return {
-            "pending": len(self._pending),
-            "results": len(self._results),
-            "errors": len(self._errors),
-        }
-
-    def add_pending(self, request_id: str) -> None:
-        self._pending.add(request_id)
-
-    def resolve(self, request_id: str, result: Any) -> None:
-        self._pending.discard(request_id)
-        self._results[request_id] = result
-
-    def fail(self, request_id: str, error: str) -> None:
-        self._pending.discard(request_id)
-        self._errors[request_id] = error
-
-    def get_status(self, request_id: str) -> FutureStatus:
-        if request_id in self._results:
-            return FutureStatus.DONE
-        if request_id in self._errors:
-            return FutureStatus.FAILED
-        if request_id in self._pending:
-            return FutureStatus.PENDING
-        raise KeyError(f"Unknown request_id: {request_id}")
-
-    def get_result(self, request_id: str) -> Any:
-        return self._results.get(request_id)
-
-    def get_error(self, request_id: str) -> str | None:
-        return self._errors.get(request_id)
-
-    def cleanup(self, request_id: str) -> None:
-        self._pending.discard(request_id)
-        self._results.pop(request_id, None)
-        self._errors.pop(request_id, None)
 
 
 def _ray_namespace() -> str:
@@ -333,41 +292,34 @@ def _get_or_create_ray_actor():
 
 
 class FutureStore:
-    """FutureStore with a detached Ray actor backend when available."""
+    """FutureStore backed by a detached Ray actor (hard requirement)."""
 
     def __init__(self) -> None:
-        self._local = _InMemoryFutureStore()
         self._ray_actor = None
-
-    def _local_get_status(self, request_id: str) -> FutureStatus | None:
-        try:
-            return self._local.get_status(request_id)
-        except KeyError:
-            return None
 
     def _get_ray_actor(self):
         try:
             import ray
-        except Exception:
-            return None
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray import failed") from e
 
         if not ray.is_initialized():
-            # Sampling routes use the FutureStore even before any Ray-backed code path
-            # runs in a given process. Opportunistically connect to Ray so we use the
-            # detached actor store and avoid per-process in-memory request_id loss.
             try:
                 from ..ray_utils import init_ray
 
                 addr = _infer_ray_address()
                 init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
-            except Exception:
-                return None
+            except Exception as e:
+                raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
 
         if not ray.is_initialized():
-            return None
+            raise FutureStoreUnavailableError("Ray not initialized")
 
         if self._ray_actor is None:
-            self._ray_actor = _get_or_create_ray_actor()
+            try:
+                self._ray_actor = _get_or_create_ray_actor()
+            except Exception as e:
+                raise FutureStoreUnavailableError("Failed to get/create detached Ray FutureStore actor") from e
         return self._ray_actor
 
     def debug_snapshot(self) -> dict[str, Any]:
@@ -376,7 +328,6 @@ class FutureStore:
             "ray_actor_name": _ray_future_store_actor_name(),
             "future_ttl_s": _ray_future_ttl_s(),
             "future_done_ttl_s": _ray_future_done_ttl_s(),
-            "local": self._local.stats(),
         }
 
         try:
@@ -405,9 +356,6 @@ class FutureStore:
     def create(self) -> str:
         request_id = str(uuid.uuid4())
         actor = self._get_ray_actor()
-        if actor is None:
-            self._local.add_pending(request_id)
-            return request_id
 
         import ray
 
@@ -416,53 +364,33 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             ray.get(actor.add_pending.remote(request_id))
         return request_id
 
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()
-        if actor is None:
-            self._local.resolve(request_id, result)
-            return
         import ray
 
         try:
             actor.resolve.remote(request_id, result)
-            # If the request was created before Ray was available, it may live in the
-            # local store. Avoid leaking a stale local pending entry.
-            self._local.cleanup(request_id)
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             actor.resolve.remote(request_id, result)
-            self._local.cleanup(request_id)
 
     def fail(self, request_id: str, error: str) -> None:
         actor = self._get_ray_actor()
-        if actor is None:
-            self._local.fail(request_id, error)
-            return
         import ray
 
         try:
             actor.fail.remote(request_id, error)
-            self._local.cleanup(request_id)
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             actor.fail.remote(request_id, error)
-            self._local.cleanup(request_id)
 
     def get_status(self, request_id: str) -> FutureStatus:
         actor = self._get_ray_actor()
-        if actor is None:
-            return self._local.get_status(request_id)
 
         import ray
 
@@ -471,28 +399,18 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             status = ray.get(actor.get_status.remote(request_id))
         except ray.exceptions.RayTaskError as e:
-            # Ray wraps KeyError from the detached actor. Some requests may have been
-            # created before Ray was available and live in the local store. Prefer
-            # returning local status over reporting a spurious "unknown request_id".
             msg = str(e)
             cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
             is_unknown = "Unknown request_id:" in msg or isinstance(cause, KeyError)
             if is_unknown:
-                local = self._local_get_status(request_id)
-                if local is not None:
-                    return local
                 raise KeyError(f"Unknown request_id: {request_id}") from None
             raise
         return FutureStatus(status)
 
     def get_result(self, request_id: str) -> Any:
         actor = self._get_ray_actor()
-        if actor is None:
-            return self._local.get_result(request_id)
 
         import ray
 
@@ -501,24 +419,17 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             return ray.get(actor.get_result.remote(request_id))
         except ray.exceptions.RayTaskError as e:
             msg = str(e)
             cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
             is_unknown = "Unknown request_id:" in msg or isinstance(cause, KeyError)
             if is_unknown:
-                local = self._local_get_status(request_id)
-                if local is not None:
-                    return self._local.get_result(request_id)
                 raise KeyError(f"Unknown request_id: {request_id}") from None
             raise
 
     def get_error(self, request_id: str) -> str | None:
         actor = self._get_ray_actor()
-        if actor is None:
-            return self._local.get_error(request_id)
 
         import ray
 
@@ -527,24 +438,17 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             return ray.get(actor.get_error.remote(request_id))
         except ray.exceptions.RayTaskError as e:
             msg = str(e)
             cause = getattr(e, "cause", None) or getattr(e, "__cause__", None)
             is_unknown = "Unknown request_id:" in msg or isinstance(cause, KeyError)
             if is_unknown:
-                local = self._local_get_status(request_id)
-                if local is not None:
-                    return self._local.get_error(request_id)
                 raise KeyError(f"Unknown request_id: {request_id}") from None
             raise
 
     def attach_ref(self, request_id: str, ref: Any, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
-        if actor is None:
-            raise RuntimeError("Ray not initialized: FutureStore.attach_ref requires Ray")
 
         import ray
 
@@ -553,8 +457,6 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             ray.get(actor.attach_ref.remote(request_id, ref, meta))
 
     def submit(
@@ -566,8 +468,6 @@ class FutureStore:
         meta: dict[str, Any] | None = None,
     ) -> None:
         actor = self._get_ray_actor()
-        if actor is None:
-            raise RuntimeError("Ray not initialized: FutureStore.submit requires Ray")
 
         import ray
 
@@ -576,14 +476,10 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             ray.get(actor.submit.remote(request_id, target_actor, method_name, args, meta))
 
     def get_meta(self, request_id: str) -> dict[str, Any] | None:
         actor = self._get_ray_actor()
-        if actor is None:
-            return None
 
         import ray
 
@@ -592,15 +488,10 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             return ray.get(actor.get_meta.remote(request_id))
 
     def cleanup(self, request_id: str) -> None:
         actor = self._get_ray_actor()
-        if actor is None:
-            self._local.cleanup(request_id)
-            return
         import ray
 
         try:
@@ -608,8 +499,6 @@ class FutureStore:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            if actor is None:
-                raise
             actor.cleanup.remote(request_id)
 
 
