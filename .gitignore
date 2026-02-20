@@ -192,6 +192,9 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+# Per-task scratchpads (do not commit)
+PROMPT.md
+LOG.md
 
 # PyPI configuration file
 .pypirc
