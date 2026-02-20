@@ -5,8 +5,8 @@ interpreter startup. We use this to patch code paths that run in vLLM
 subprocesses spawned with the `spawn` method, where in-process monkey patches
 from the parent process do not propagate.
 
-This file is intentionally narrow: it only activates for vLLM workers when
-fully-sharded LoRAs are enabled.
+This file activates only when explicitly enabled via environment variables
+propagated into vLLM worker processes.
 """
 
 from __future__ import annotations
@@ -136,8 +136,9 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
     """Patch vLLM MoE LoRA packing to tolerate missing expert adapters.
 
     vLLM's PackedLoRALayerWeights.pack_moe can assume every expert has (w1,w2,w3)
-    LoRA weights present. Our adapter export can be sparse across experts; missing
-    experts are equivalent to zero delta.
+    LoRA weights present. Our adapter export can be shared across experts (export
+    expert 0 only). Missing experts should be treated as sharing the base expert
+    weights, without materializing full per-expert tensors when possible.
     """
 
     from vllm.lora import lora_weights as lw  # type: ignore
@@ -180,26 +181,47 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
         if base_w1 is None or base_w2 is None or base_w3 is None:
             raise RuntimeError(f"MoE LoRA pack_moe missing base weight(s) for module={module_name!r}")
 
-        w1_lora_a = base_w1.lora_a.new_zeros((n_experts,) + tuple(base_w1.lora_a.shape))
-        w2_lora_a = base_w2.lora_a.new_zeros((n_experts,) + tuple(base_w2.lora_a.shape))
-        w3_lora_a = base_w3.lora_a.new_zeros((n_experts,) + tuple(base_w3.lora_a.shape))
-        w1_lora_b = base_w1.lora_b.new_zeros((n_experts,) + tuple(base_w1.lora_b.shape))
-        w2_lora_b = base_w2.lora_b.new_zeros((n_experts,) + tuple(base_w2.lora_b.shape))
-        w3_lora_b = base_w3.lora_b.new_zeros((n_experts,) + tuple(base_w3.lora_b.shape))
+        only_expert0 = True
+        for eid in range(1, n_experts):
+            if (
+                loras[eid * 3] is not None
+                or loras[eid * 3 + 1] is not None
+                or loras[eid * 3 + 2] is not None
+            ):
+                only_expert0 = False
+                break
 
-        for eid in range(n_experts):
-            w1 = loras[eid * 3]
-            w2 = loras[eid * 3 + 1]
-            w3 = loras[eid * 3 + 2]
-            if w1 is not None:
-                w1_lora_a[eid].copy_(w1.lora_a)
-                w1_lora_b[eid].copy_(w1.lora_b)
-            if w2 is not None:
-                w2_lora_a[eid].copy_(w2.lora_a)
-                w2_lora_b[eid].copy_(w2.lora_b)
-            if w3 is not None:
-                w3_lora_a[eid].copy_(w3.lora_a)
-                w3_lora_b[eid].copy_(w3.lora_b)
+        if only_expert0:
+            # Shared-expert export: avoid materializing [num_experts, ...] tensors.
+            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
+            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
+            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
+            w1_lora_b = base_w1.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_b.shape))
+            w2_lora_b = base_w2.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_b.shape))
+            w3_lora_b = base_w3.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_b.shape))
+        else:
+            # General sparse case: default missing experts to base weights, but allow
+            # explicitly-provided experts to override.
+            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape)).clone()
+            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape)).clone()
+            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape)).clone()
+            w1_lora_b = base_w1.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_b.shape)).clone()
+            w2_lora_b = base_w2.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_b.shape)).clone()
+            w3_lora_b = base_w3.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_b.shape)).clone()
+
+            for eid in range(n_experts):
+                w1 = loras[eid * 3]
+                w2 = loras[eid * 3 + 1]
+                w3 = loras[eid * 3 + 2]
+                if w1 is not None:
+                    w1_lora_a[eid].copy_(w1.lora_a)
+                    w1_lora_b[eid].copy_(w1.lora_b)
+                if w2 is not None:
+                    w2_lora_a[eid].copy_(w2.lora_a)
+                    w2_lora_b[eid].copy_(w2.lora_b)
+                if w3 is not None:
+                    w3_lora_a[eid].copy_(w3.lora_a)
+                    w3_lora_b[eid].copy_(w3.lora_b)
 
         return cls(
             module_name,
@@ -287,7 +309,7 @@ def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
 
 
 def _apply_vllm_worker_patches() -> None:
-    if not _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
+    if not _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False):
         return
     if "VLLM_USE_V1" not in os.environ:
         return
@@ -297,11 +319,11 @@ def _apply_vllm_worker_patches() -> None:
     # processes on Ray worker nodes).
     os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
 
-    _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
-    _patch_vllm_skip_dummy_lora_setup_when_inactive()
     _patch_vllm_pack_moe_sparse_ok()
-    _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
+    if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
+        _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
+        _patch_vllm_skip_dummy_lora_setup_when_inactive()
+        _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
 
 
 _apply_vllm_worker_patches()
-

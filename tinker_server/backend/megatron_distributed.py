@@ -1976,7 +1976,9 @@ class MegatronRankWorker:
             logger.info(f"[Rank {self.rank}] Using Megatron-Bridge export_adapter_weights API")
             adapter_state = {}
 
-            shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+            # Default to exporting a shared-expert LoRA artifact (expert 0 only) for MoE models.
+            # vLLM hot-load will broadcast the shared expert weights at load time.
+            shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
             # Default to exporting the full per-expert LoRA tree so vLLM can pack MoE LoRAs.
             # Operators can force a "shared expert" export (keep only expert 0) to reduce
             # artifact size, but this requires downstream broadcasting support.
@@ -2079,8 +2081,9 @@ class MegatronRankWorker:
                             f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
                         )
 
-                # Keep "shared-expert" export opt-in. vLLM expects per-expert weights for MoE LoRA.
-                mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+                # Default to shared-expert export (expert 0 only). vLLM load-time patch will
+                # broadcast the shared expert weights across experts.
+                mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
                 if mode in {"1", "true", "yes"}:
                     expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
                     before = len(adapter_state)
@@ -2853,7 +2856,7 @@ class MegatronRankWorker:
             import os
             import re
 
-            mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+            mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
             if mode in {"1", "true", "yes"}:
                 expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
                 before = len(lora_state_dict)

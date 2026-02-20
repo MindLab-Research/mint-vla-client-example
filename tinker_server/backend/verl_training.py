@@ -2158,27 +2158,6 @@ class VerlTrainingEngine:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
-        except TypeError:
-            meta_ref = worker.save_lora_weights.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
-        except AttributeError:
-            # Backward-compat: existing detached Megatron actors may be running older code
-            # without save_lora_weights(). Fall back to save_checkpoint() so callers can
-            # still export weights without killing the actor.
-            logger.warning(
-                f"[{model_id}] save_lora_weights_for_sampler: actor missing save_lora_weights; "
-                "falling back to save_checkpoint()"
-            )
-            try:
-                meta_ref = worker.save_checkpoint.remote(
-                    abs_path,
-                    use_per_expert_lora=use_per_expert_lora,
-                    session_id=session.model_id,
-                    train_attn=train_attn,
-                    train_mlp=train_mlp,
-                    train_unembed=train_unembed,
-                )
-            except TypeError:
-                meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
         meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
         session.current_step = meta.get("current_step", session.current_step)
 
