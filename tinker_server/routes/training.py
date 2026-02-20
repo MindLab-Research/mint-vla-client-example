@@ -405,23 +405,25 @@ async def create_model_from_state(
                 load_real = os.path.realpath(local_path)
                 checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
                 allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-                if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
-                    allowed_real + os.sep
+                if load_real.startswith(checkpoints_real + os.sep) and not (
+                    load_real == allowed_real or load_real.startswith(allowed_real + os.sep)
                 ):
                     raise HTTPException(status_code=403, detail="Access denied")
             if os.path.isdir(local_path):
+                import asyncio
                 import tempfile
 
+                proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
                 fd, tmp_archive = tempfile.mkstemp(prefix="gateway_ckpt_proxy_", suffix=".tar.gz")
                 os.close(fd)
                 try:
-                    create_checkpoint_archive(local_path, tmp_archive)
+                    await asyncio.to_thread(create_checkpoint_archive, local_path, tmp_archive)
                     upload_resp = await forward_file(
                         upstream=upstream,
                         path="/api/v1/checkpoints/upload",
                         incoming_headers=incoming_headers,
                         file_path=tmp_archive,
-                        timeout_s=600.0,
+                        timeout_s=proxy_timeout_s,
                     )
                 finally:
                     try:
