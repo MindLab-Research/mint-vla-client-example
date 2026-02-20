@@ -67,16 +67,14 @@ async def retrieve_future(
             except Exception:
                 raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
 
-            detail: object
+            detail: object = f"Unknown request_id: {body.request_id}"
             if _is_privileged(http_request):
                 detail = {
-                    "error": f"Unknown request_id (FutureStore lost state): {body.request_id}",
+                    "error": detail,
                     "request_id": body.request_id,
                     "future_store": future_store.debug_snapshot(),
                 }
-            else:
-                detail = GENERIC_ERROR_MESSAGE
-            raise HTTPException(status_code=503, detail=detail)
+            raise HTTPException(status_code=404, detail=detail)
 
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
