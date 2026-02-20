@@ -87,6 +87,22 @@ async def retrieve_future(
                 detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
             )
 
+        if (
+            upstream_resp.status_code == 404
+            and isinstance(payload, dict)
+            and isinstance(payload.get("detail"), str)
+            and "Unknown request_id:" in payload["detail"]
+        ):
+            detail: object = GENERIC_ERROR_MESSAGE
+            if _is_privileged(http_request):
+                detail = {
+                    "error": "Lost future (upstream Unknown request_id)",
+                    "upstream_alias": upstream_alias,
+                    "upstream_request_id": upstream_request_id,
+                    "upstream_detail": payload.get("detail"),
+                }
+            raise HTTPException(status_code=503, detail=detail)
+
         # If this future corresponds to an ephemeral save_weights_for_sampler on an upstream,
         # register the returned sampling_session_id so subsequent /asample routes correctly.
         try:
