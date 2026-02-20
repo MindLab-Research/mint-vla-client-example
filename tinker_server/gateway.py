@@ -141,6 +141,25 @@ async def forward_json(
         return await client.request(method, url, headers=headers, json=json_body)
 
 
+async def forward_file(
+    *,
+    upstream: Upstream,
+    path: str,
+    incoming_headers: dict[str, str],
+    file_path: str,
+    field_name: str = "file",
+    media_type: str = "application/gzip",
+    timeout_s: float = 600.0,
+) -> httpx.Response:
+    url = f"{upstream.base_url}{path}"
+    headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    filename = os.path.basename(file_path)
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        with open(file_path, "rb") as f:
+            files = {field_name: (filename, f, media_type)}
+            return await client.post(url, headers=headers, files=files)
+
+
 _remote_sampling_sessions: dict[str, tuple[str, str]] = {}  # sampling_session_id -> (upstream_alias, base_model)
 _remote_training_models: dict[str, tuple[str, str]] = {}  # model_id -> (upstream_alias, base_model)
 _pending_save_weights_for_sampler: dict[tuple[str, str], tuple[float, str]] = {}  # (up_alias, up_req_id) -> (ts, base_model)

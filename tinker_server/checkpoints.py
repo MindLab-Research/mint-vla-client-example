@@ -100,6 +100,22 @@ def validate_checkpoint_dir(path: str) -> None:
         raise ValueError("Missing optimizer state in extracted checkpoint")
 
 
+def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:
+    """Create a tar.gz containing exactly one top-level checkpoint directory.
+
+    This produces an archive compatible with safe_extract_checkpoint_archive().
+    """
+    if not os.path.isdir(checkpoint_dir):
+        raise ValueError(f"Checkpoint dir is not a directory: {checkpoint_dir}")
+
+    root = os.path.basename(os.path.normpath(checkpoint_dir))
+    if not root:
+        raise ValueError(f"Invalid checkpoint dir: {checkpoint_dir}")
+
+    with tarfile.open(archive_path, "w:gz") as tf:
+        tf.add(checkpoint_dir, arcname=root, recursive=True)
+
+
 def resolve_checkpoint_id(
     checkpoint_id: str, checkpoints_dir: str, *, user_id: str | None = None
 ) -> str | None:

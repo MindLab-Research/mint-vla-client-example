@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse
 from ..backend.future_store import future_store
 from ..checkpoints import (
     CHECKPOINTS_DIR,
+    create_checkpoint_archive,
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
     validate_checkpoint_dir,
@@ -401,6 +402,7 @@ async def load_state(
     """Load model state from checkpoint."""
     from ..gateway import (
         encode_request_id,
+        forward_file,
         forward_json,
         remote_training_model,
         upstream_for_alias,
@@ -417,13 +419,56 @@ async def load_state(
         if not can_access_model(base_model, user_data):
             raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
 
+        user_id = _get_user_id(http_request)
+        incoming_headers = dict(http_request.headers)
+        json_body = request.model_dump()
+        if request.path.startswith(("tinker://", "mint://", "ckpt_")):
+            local_path = resolve_checkpoint_path(request.path, user_id=user_id)
+            if user_id and user_id != "admin":
+                load_real = os.path.realpath(local_path)
+                checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+                allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
+                if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
+                    allowed_real + os.sep
+                ):
+                    raise HTTPException(status_code=403, detail="Access denied")
+            if os.path.isdir(local_path):
+                import tempfile
+
+                fd, tmp_archive = tempfile.mkstemp(prefix="gateway_ckpt_proxy_", suffix=".tar.gz")
+                os.close(fd)
+                try:
+                    create_checkpoint_archive(local_path, tmp_archive)
+                    upload_resp = await forward_file(
+                        upstream=upstream,
+                        path="/api/v1/checkpoints/upload",
+                        incoming_headers=incoming_headers,
+                        file_path=tmp_archive,
+                        timeout_s=600.0,
+                    )
+                finally:
+                    try:
+                        os.unlink(tmp_archive)
+                    except OSError:
+                        pass
+                if upload_resp.status_code >= 400:
+                    raise HTTPException(status_code=upload_resp.status_code, detail=upload_resp.text)
+                payload = upload_resp.json()
+                ckpt_id = payload.get("checkpoint_id")
+                if not isinstance(ckpt_id, str) or not ckpt_id:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Upstream checkpoints/upload returned invalid checkpoint_id",
+                    )
+                json_body["path"] = ckpt_id
+
         try:
             resp = await forward_json(
                 upstream=upstream,
                 method="POST",
                 path=http_request.url.path,
-                incoming_headers=dict(http_request.headers),
-                json_body=request.model_dump(),
+                incoming_headers=incoming_headers,
+                json_body=json_body,
                 timeout_s=30.0,
             )
         except Exception:
