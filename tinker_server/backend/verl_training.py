@@ -2149,15 +2149,14 @@ class VerlTrainingEngine:
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
-        try:
-            meta_ref = worker.save_lora_weights.remote(
-                abs_path,
-                use_per_expert_lora=use_per_expert_lora,
-                session_id=session.model_id,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-            )
+        meta_ref = worker.save_lora_weights.remote(
+            abs_path,
+            use_per_expert_lora=use_per_expert_lora,
+            session_id=session.model_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
         session.current_step = meta.get("current_step", session.current_step)
 
