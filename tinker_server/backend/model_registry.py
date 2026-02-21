@@ -262,6 +262,7 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,  # Required to fit model with long context
     ),
     "unsloth/Kimi-K2-Instruct-0905-BF16": ModelConfig(
+        num_parameters=1040.0,
         is_moe=True,
         inference_tp=64,
         inference_pp=1,

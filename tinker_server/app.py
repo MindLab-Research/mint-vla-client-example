@@ -350,59 +350,65 @@ async def _prewarm_persistent_models(
                     resource_pool.set_protected(actor_name, True)
                     logger.info(f"[prewarm] training __ray_ready__ scheduled model={model_name} actor={actor_name}")
 
-                if (
-                    cfg.vllm_engine == "async"
-                    and cfg.vllm_distributed_executor_backend == "mp"
-                    and (cfg.train_gpus + cfg.total_gpus) <= 8
-                ):
-                    try:
-                        pg_name = f"{actor_name}_pg"
-                        node_id = None
-                        deadline = time.monotonic() + 30.0
-                        while time.monotonic() < deadline and not node_id:
-                            pg_table = ray.util.placement_group_table()
-                            for info in pg_table.values():
-                                if info.get("state") != "CREATED":
-                                    continue
-                                if info.get("name") != pg_name:
-                                    continue
-                                node_id = (info.get("bundles_to_node_id") or {}).get(0)
-                                if node_id:
-                                    break
-                            if not node_id:
-                                await asyncio.sleep(0.5)
-                        if node_id:
-                            for n in ray.nodes():
-                                if n.get("NodeID") == node_id:
-                                    ip = n.get("NodeManagerAddress")
-                                    if isinstance(ip, str) and ip.strip():
-                                        pinned_vllm_node_ip[model_name] = ip.strip()
-                                        logger.info(
-                                            f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
-                                        )
-                                    break
-                    except Exception as pin_err:
-                        logger.warning(f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}")
+                    if (
+                        cfg.vllm_engine == "async"
+                        and cfg.vllm_distributed_executor_backend == "mp"
+                        and (cfg.train_gpus + cfg.total_gpus) <= 8
+                    ):
+                        try:
+                            pg_name = f"{actor_name}_pg"
+                            node_id = None
+                            deadline = time.monotonic() + 30.0
+                            while time.monotonic() < deadline and not node_id:
+                                pg_table = ray.util.placement_group_table()
+                                for info in pg_table.values():
+                                    if info.get("state") != "CREATED":
+                                        continue
+                                    if info.get("name") != pg_name:
+                                        continue
+                                    node_id = (info.get("bundles_to_node_id") or {}).get(0)
+                                    if node_id:
+                                        break
+                                if not node_id:
+                                    await asyncio.sleep(0.5)
+                            if node_id:
+                                for n in ray.nodes():
+                                    if n.get("NodeID") == node_id:
+                                        ip = n.get("NodeManagerAddress")
+                                        if isinstance(ip, str) and ip.strip():
+                                            pinned_vllm_node_ip[model_name] = ip.strip()
+                                            logger.info(
+                                                f"[prewarm] pin_infer model={model_name} pg={pg_name} node_ip={ip.strip()}"
+                                            )
+                                        break
+                        except Exception as pin_err:
+                            logger.warning(
+                                f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
+                            )
 
-                async def _await_ready(
-                    actor=actor,
-                    actor_name=actor_name,
-                    model_name=model_name,
-                ) -> None:
-                    try:
-                        await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s)
-                        resource_pool.mark_ready(actor_name)
-                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-                    except SystemExit as ready_err:
-                        if getattr(ready_err, "code", None) == 15:
-                            raise
-                        logger.warning(
-                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
-                        )
-                    except Exception as ready_err:
-                        logger.warning(
-                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
-                        )
+                    async def _await_ready(
+                        actor=actor,
+                        actor_name=actor_name,
+                        model_name=model_name,
+                    ) -> None:
+                        try:
+                            await asyncio.to_thread(
+                                ray.get,
+                                actor.__ray_ready__.remote(),
+                                timeout=megatron_ready_timeout_s,
+                            )
+                            resource_pool.mark_ready(actor_name)
+                            logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                        except SystemExit as ready_err:
+                            if getattr(ready_err, "code", None) == 15:
+                                raise
+                            logger.warning(
+                                f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
+                            )
+                        except Exception as ready_err:
+                            logger.warning(
+                                f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
+                            )
 
                     asyncio.create_task(_await_ready())
                 else:
@@ -432,10 +438,6 @@ async def _prewarm_persistent_models(
     if multi_model_manager is None:
         return
 
-    if pinned_vllm_node_ip:
-        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
-        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
-
     def _infer_gpus(model_name: str) -> int:
         try:
             cfg = get_model_config(model_name)
@@ -461,6 +463,31 @@ async def _prewarm_persistent_models(
     infer_dense = [m for m in infer_models if not _infer_is_moe(m) and _infer_gpus(m) <= 8]
     infer_moe_single.sort(key=lambda m: (-_infer_gpus(m), m))
     infer_dense.sort(key=lambda m: (-_infer_gpus(m), m))
+
+    # For 2-node clusters (e.g., 16 GPUs as 2x 8-GPU nodes), avoid fragmenting nodes by
+    # pinning dense models to a separate node from single-node MoE models.
+    try:
+        gpu_node_ips = sorted(
+            {
+                str(n.get("NodeManagerAddress") or "").strip()
+                for n in ray.nodes()
+                if n.get("Alive")
+                and float((n.get("Resources") or {}).get("GPU", 0) or 0) > 0
+                and str(n.get("NodeManagerAddress") or "").strip()
+            }
+        )
+        if len(gpu_node_ips) == 2:
+            moe_ip, dense_ip = gpu_node_ips[0], gpu_node_ips[1]
+            for m in infer_moe_single:
+                pinned_vllm_node_ip.setdefault(m, moe_ip)
+            for m in infer_dense:
+                pinned_vllm_node_ip.setdefault(m, dense_ip)
+    except Exception:
+        pass
+
+    if pinned_vllm_node_ip:
+        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
+        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
 
     timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
 

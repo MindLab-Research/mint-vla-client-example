@@ -98,6 +98,7 @@ class MultiLoRAInferenceEngine:
         max_loras: int = DEFAULT_MAX_LORAS,
         max_cpu_loras: int = DEFAULT_MAX_CPU_LORAS,
         max_lora_rank: int = DEFAULT_MAX_LORA_RANK,
+        pinned_node_ip: str | None = None,
         actor_name: str | None = None,
         quantization: str | None = None,  # "fp8" for FP8 models like K2
     ):
@@ -111,6 +112,7 @@ class MultiLoRAInferenceEngine:
         self.max_loras = max_loras
         self.max_cpu_loras = max_cpu_loras
         self.max_lora_rank = max_lora_rank
+        self.pinned_node_ip = pinned_node_ip.strip() if isinstance(pinned_node_ip, str) else None
         # Custom actor name for multi-model support (one actor per base model)
         self.actor_name = actor_name or PERSISTENT_VLLM_ACTOR_NAME
 
@@ -380,17 +382,24 @@ class MultiLoRAInferenceEngine:
                 if v is not None:
                     env_vars[k] = v
 
-            self.server = ExtendedVLLMHttpServer.options(
-                num_gpus=total_gpus,
-                name=self.actor_name,
-                namespace=PERSISTENT_NAMESPACE,
-                lifetime="detached",
-                max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
-                runtime_env={
+            actor_options: dict[str, object] = {
+                "num_gpus": total_gpus,
+                "name": self.actor_name,
+                "namespace": PERSISTENT_NAMESPACE,
+                "lifetime": "detached",
+                "max_concurrency": int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
+                "runtime_env": {
                     "env_vars": {
                         **env_vars,
                     }
                 },
+            }
+            if self.pinned_node_ip:
+                actor_options["resources"] = {f"node:{self.pinned_node_ip}": 0.001}
+                logger.info(f"Pinning vLLM actor to node_ip={self.pinned_node_ip} actor={self.actor_name}")
+
+            self.server = ExtendedVLLMHttpServer.options(
+                **actor_options,
             ).remote(
                 config=rollout_config,
                 model_config=model_config,
@@ -1174,6 +1183,18 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            pinned_node_ip: str | None = None
+            pinned_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
+            if pinned_json:
+                try:
+                    parsed = json.loads(pinned_json)
+                    if isinstance(parsed, dict):
+                        v = parsed.get(model_name) or parsed.get(actor_name)
+                        if isinstance(v, str) and v.strip():
+                            pinned_node_ip = v.strip()
+                except Exception:
+                    pinned_node_ip = None
+
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
 
@@ -1217,12 +1238,16 @@ class MultiModelInferenceManager:
             # Use per-model kv_cache_dtype if specified (FP8 KV cache halves memory)
             model_kv_cache_dtype = config.kv_cache_dtype
 
-                if config.vllm_engine == "async":
-                    from .multinode_inference import MultiNodeInferenceEngine
+            if int(config.total_gpus) > 8:
+                if config.vllm_engine != "async":
+                    raise RuntimeError(
+                        f"Multi-node vLLM requires vllm_engine=async (model={model_name}, vllm_engine={config.vllm_engine})"
+                    )
+                from .multinode_inference import MultiNodeInferenceEngine
 
-                total_gpus = config.total_gpus
-                pipeline_parallel_size = getattr(config, "inference_pp", 1)
-                enable_expert_parallel = config.is_moe and config.inference_dp > 1
+                total_gpus = int(config.total_gpus)
+                pipeline_parallel_size = int(getattr(config, "inference_pp", 1) or 1)
+                enable_expert_parallel = bool(config.is_moe and config.inference_dp > 1)
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
                     f"actor={actor_name}, TP={config.inference_tp}, PP={pipeline_parallel_size}, DP={config.inference_dp}, "
@@ -1270,6 +1295,7 @@ class MultiModelInferenceManager:
                     max_loras=model_max_loras,
                     max_cpu_loras=self.max_cpu_loras if model_max_cpu_loras is None else int(model_max_cpu_loras),
                     max_lora_rank=model_max_lora_rank,
+                    pinned_node_ip=pinned_node_ip,
                     actor_name=actor_name,
                     quantization=quantization,
                 )
