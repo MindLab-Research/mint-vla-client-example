@@ -629,7 +629,9 @@ async def lifespan(app: FastAPI):
         CreateModelFromStateRequest,
         CreateModelRequest,
         ForwardRequest,
+        ForwardBackwardRequest,
         LoadStateRequest,
+        OptimStepRequest,
         SampleRequest,
         SaveStateRequest,
         SaveWeightsForSamplerRequest,
@@ -660,10 +662,18 @@ async def lifespan(app: FastAPI):
         req = ForwardRequest.model_validate_json(item.request_json)
         await training._do_forward(item.request_id, req)
 
+    async def _exec_training_forward_backward(item):
+        req = ForwardBackwardRequest.model_validate_json(item.request_json)
+        await training._do_forward_backward(item.request_id, req, item.user_id)
+
     async def _exec_training_save_weights_for_sampler(item):
         req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
         prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
         await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker)
+
+    async def _exec_training_optim_step(item):
+        req = OptimStepRequest.model_validate_json(item.request_json)
+        await training._do_optim_step(item.request_id, req, item.user_id)
 
     async def _exec_weights_save_weights(item):
         req = SaveStateRequest.model_validate_json(item.request_json)
@@ -697,7 +707,9 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("training.create_model_from_state", _exec_training_create_model_from_state)
     api_work_queue.set_executor("training.train_step", _exec_training_train_step)
     api_work_queue.set_executor("training.forward", _exec_training_forward)
+    api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
     api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
+    api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
     api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
     api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
     api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
@@ -763,6 +775,26 @@ async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailabl
     return JSONResponse(
         status_code=503,
         content={"detail": "Ray unavailable: FutureStore requires Ray"},
+    )
+
+
+from .backend.api_work_queue import ApiWorkQueueUnavailableError
+from .backend.capacity_manager import CapacityManagerUnavailableError
+
+
+@app.exception_handler(ApiWorkQueueUnavailableError)
+async def api_work_queue_unavailable_handler(_: Request, __: ApiWorkQueueUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ray unavailable: ApiWorkQueue requires Ray"},
+    )
+
+
+@app.exception_handler(CapacityManagerUnavailableError)
+async def capacity_manager_unavailable_handler(_: Request, __: CapacityManagerUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ray unavailable: CapacityManager requires Ray"},
     )
 
 
