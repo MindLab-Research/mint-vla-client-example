@@ -267,9 +267,11 @@ async def create_model(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "create_model"})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "create_model"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model",
@@ -279,7 +281,8 @@ async def create_model(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue create_model request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -518,9 +521,11 @@ async def create_model_from_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "create_model_from_state"})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "create_model_from_state"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model_from_state",
@@ -530,7 +535,8 @@ async def create_model_from_state(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue create_model_from_state request: {e}"
         )
@@ -898,9 +904,11 @@ async def train_step(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "train_step", "model_id": request.model_id})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "train_step", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.train_step",
@@ -910,7 +918,8 @@ async def train_step(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue train_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1058,9 +1067,11 @@ async def forward(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "forward", "model_id": request.model_id})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "forward", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.forward",
@@ -1070,7 +1081,8 @@ async def forward(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1369,9 +1381,13 @@ async def save_weights_for_sampler(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "save_weights_for_sampler", "model_id": request.model_id})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(
+            request_id, meta={"op": "save_weights_for_sampler", "model_id": request.model_id}
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.save_weights_for_sampler",
@@ -1382,7 +1398,8 @@ async def save_weights_for_sampler(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue save_weights_for_sampler request: {e}"
         )

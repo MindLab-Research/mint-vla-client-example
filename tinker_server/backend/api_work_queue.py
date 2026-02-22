@@ -129,6 +129,9 @@ class ApiWorkQueueClient:
         webhook_url: str | None,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        import asyncio
+        import ray
+
         actor = self._get_ray_actor()
         item = {
             "request_id": str(request_id),
@@ -139,8 +142,10 @@ class ApiWorkQueueClient:
             "extra": {} if extra is None else dict(extra),
             "created_at": time.time(),
         }
-        # Do not wait: the caller already holds the admission reservation.
-        actor.enqueue.remote(item)
+        # Ensure enqueue succeeds, otherwise the request can remain pending forever
+        # while capacity stays reserved.
+        ref = actor.enqueue.remote(item)
+        await asyncio.to_thread(ray.get, ref)
 
     async def _dequeue(self) -> WorkItem:
         import asyncio

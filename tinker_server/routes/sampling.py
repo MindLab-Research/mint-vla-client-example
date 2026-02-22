@@ -497,9 +497,11 @@ async def asample(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "asample"})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "asample"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="sampling.asample",
@@ -509,7 +511,8 @@ async def asample(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -843,9 +846,11 @@ async def compute_logprobs(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "compute_logprobs"})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "compute_logprobs"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="sampling.compute_logprobs",
@@ -855,7 +860,8 @@ async def compute_logprobs(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)

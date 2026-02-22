@@ -185,9 +185,11 @@ async def save_weights(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "save_weights", "model_id": request.model_id})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "save_weights", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.save_weights",
@@ -198,7 +200,8 @@ async def save_weights(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -291,9 +294,11 @@ async def save_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "save_state", "model_id": request.model_id})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "save_state", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.save_state",
@@ -304,7 +309,8 @@ async def save_state(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -570,9 +576,11 @@ async def load_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    future_store.create_with_id(request_id)
-    future_store.mark_queued(request_id, meta={"op": "load_state", "model_id": request.model_id})
+    created = False
     try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "load_state", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.load_state",
@@ -582,7 +590,8 @@ async def load_state(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        future_store.cleanup(request_id)
+        if created:
+            future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
