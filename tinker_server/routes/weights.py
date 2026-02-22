@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..backend.future_store import future_store
@@ -104,7 +104,6 @@ def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
 @router.post("/save_weights", response_model=UntypedAPIFuture)
 async def save_weights(
     request: SaveStateRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Save LoRA weights for sampling.
@@ -164,15 +163,44 @@ async def save_weights(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
-    background_tasks.add_task(
-        _do_save_state, request_id, session, request, user_id, webhook_url, prefer_tinker
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
     )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    future_store.create_with_id(request_id)
+    future_store.mark_queued(request_id, meta={"op": "save_weights", "model_id": request.model_id})
+    try:
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="weights.save_weights",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=webhook_url,
+            extra={"prefer_tinker": bool(prefer_tinker)},
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -184,7 +212,6 @@ async def save_weights(
 @router.post("/save_state", response_model=UntypedAPIFuture)
 async def save_state(
     request: SaveStateRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Save model state to checkpoint.
@@ -242,21 +269,49 @@ async def save_state(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
     from ..client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
-    background_tasks.add_task(
-        _do_save_state, request_id, session, request, user_id, webhook_url, prefer_tinker
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
     )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    future_store.create_with_id(request_id)
+    future_store.mark_queued(request_id, meta={"op": "save_state", "model_id": request.model_id})
+    try:
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="weights.save_state",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=webhook_url,
+            extra={"prefer_tinker": bool(prefer_tinker)},
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_save_state(
     request_id: str,
-    session,
     request: SaveStateRequest,
     user_id: str | None = None,
     webhook_url: str | None = None,
@@ -270,8 +325,12 @@ async def _do_save_state(
     import json
 
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
 
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
@@ -396,7 +455,6 @@ async def _do_save_state(
 @router.post("/load_weights", response_model=UntypedAPIFuture)  # SDK alias
 async def load_state(
     request: LoadStateRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Load model state from checkpoint."""
@@ -494,19 +552,53 @@ async def load_state(
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
-    background_tasks.add_task(_do_load_state, request_id, session, request, user_id)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    future_store.create_with_id(request_id)
+    future_store.mark_queued(request_id, meta={"op": "load_state", "model_id": request.model_id})
+    try:
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="weights.load_state",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_load_state(
-    request_id: str, session, request: LoadStateRequest, user_id: str | None
+    request_id: str, request: LoadStateRequest, user_id: str | None
 ) -> None:
     """Background task to load state."""
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
 
         # Resolve path
         load_path = _resolve_mint_path(request.path, user_id=user_id)

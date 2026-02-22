@@ -620,6 +620,103 @@ async def lifespan(app: FastAPI):
     logger.info("Training components initialized")
 
     # ==========================================================================
+    # Issue #84: Admission control + API work queue workers + future reaper
+    # ==========================================================================
+    from .backend.api_work_queue import api_work_queue
+    from .backend.capacity_manager import capacity_manager
+    from .models.types import (
+        ComputeLogprobsRequest,
+        CreateModelFromStateRequest,
+        CreateModelRequest,
+        ForwardRequest,
+        LoadStateRequest,
+        SampleRequest,
+        SaveStateRequest,
+        SaveWeightsForSamplerRequest,
+        TrainStepRequest,
+    )
+
+    async def _exec_sampling_asample(item):
+        req = SampleRequest.model_validate_json(item.request_json)
+        await sampling._do_sample(item.request_id, req, item.user_id)
+
+    async def _exec_sampling_compute_logprobs(item):
+        req = ComputeLogprobsRequest.model_validate_json(item.request_json)
+        await sampling._do_compute_logprobs(item.request_id, req, item.user_id)
+
+    async def _exec_training_create_model(item):
+        req = CreateModelRequest.model_validate_json(item.request_json)
+        await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+
+    async def _exec_training_create_model_from_state(item):
+        req = CreateModelFromStateRequest.model_validate_json(item.request_json)
+        await training._do_create_model_from_state(item.request_id, req, item.user_id)
+
+    async def _exec_training_train_step(item):
+        req = TrainStepRequest.model_validate_json(item.request_json)
+        await training._do_train_step(item.request_id, req, item.user_id)
+
+    async def _exec_training_forward(item):
+        req = ForwardRequest.model_validate_json(item.request_json)
+        await training._do_forward(item.request_id, req)
+
+    async def _exec_training_save_weights_for_sampler(item):
+        req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
+        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker)
+
+    async def _exec_weights_save_weights(item):
+        req = SaveStateRequest.model_validate_json(item.request_json)
+        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        await weights._do_save_state(
+            item.request_id,
+            req,
+            user_id=item.user_id,
+            webhook_url=item.webhook_url,
+            prefer_tinker=prefer_tinker,
+        )
+
+    async def _exec_weights_save_state(item):
+        req = SaveStateRequest.model_validate_json(item.request_json)
+        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        await weights._do_save_state(
+            item.request_id,
+            req,
+            user_id=item.user_id,
+            webhook_url=item.webhook_url,
+            prefer_tinker=prefer_tinker,
+        )
+
+    async def _exec_weights_load_state(item):
+        req = LoadStateRequest.model_validate_json(item.request_json)
+        await weights._do_load_state(item.request_id, req, item.user_id)
+
+    api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
+    api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
+    api_work_queue.set_executor("training.create_model", _exec_training_create_model)
+    api_work_queue.set_executor("training.create_model_from_state", _exec_training_create_model_from_state)
+    api_work_queue.set_executor("training.train_step", _exec_training_train_step)
+    api_work_queue.set_executor("training.forward", _exec_training_forward)
+    api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
+    api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
+    api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
+    api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
+
+    await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+
+    async def _future_reaper_loop() -> None:
+        while True:
+            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+            try:
+                reaped = future_store.reap()
+                for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
+                    capacity_manager.release_all(str(rid))
+            except Exception:
+                pass
+
+    future_reaper_task = asyncio.create_task(_future_reaper_loop())
+
+    # ==========================================================================
     # Persistent actors: pre-create and protect at startup
     # ==========================================================================
     asyncio.create_task(_prewarm_persistent_models(train_engine, multi_model_manager))
@@ -629,6 +726,9 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Shutdown
     # ==========================================================================
+    future_reaper_task.cancel()
+    await asyncio.gather(future_reaper_task, return_exceptions=True)
+    await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 
     # Shutdown training sessions

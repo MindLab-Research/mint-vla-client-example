@@ -196,6 +196,14 @@ class ServerConfig:
     future_store_actor_name: str = "tinker_future_store"
     future_store_ttl_s: float = 86400.0
     future_store_done_ttl_s: float = 7200.0
+    future_store_tombstone_ttl_s: float = 300.0
+
+    # Admission control + API work queue (issue #84)
+    capacity_manager_actor_name: str = "tinker_capacity_manager"
+    api_work_queue_actor_name: str = "tinker_api_work_queue"
+    capacity_queue_bytes_budget: int = 512 * 1024 * 1024
+    api_work_queue_num_workers: int = 32
+    api_work_queue_reap_interval_s: float = 5.0
 
     # Training settings (backend/verl_training.py)
     training_force_grad_checkpointing: bool = True
@@ -359,6 +367,37 @@ class ServerConfig:
                 "MINT_FUTURE_DONE_TTL_S",
                 file_future_store.done_ttl_s if file_future_store is not None else None,
                 7200.0,
+            ),
+            future_store_tombstone_ttl_s=_pick_float(
+                "MINT_FUTURE_TOMBSTONE_TTL_S",
+                None,
+                300.0,
+            ),
+            # Admission control + API work queue (issue #84)
+            capacity_manager_actor_name=_pick_str(
+                "TINKER_CAPACITY_MANAGER_ACTOR_NAME",
+                None,
+                "tinker_capacity_manager",
+            ),
+            api_work_queue_actor_name=_pick_str(
+                "TINKER_API_WORK_QUEUE_ACTOR_NAME",
+                None,
+                "tinker_api_work_queue",
+            ),
+            capacity_queue_bytes_budget=_pick_int(
+                "TINKER_CAPACITY_QUEUE_BYTES_BUDGET",
+                None,
+                512 * 1024 * 1024,
+            ),
+            api_work_queue_num_workers=_pick_int(
+                "TINKER_API_WORK_QUEUE_NUM_WORKERS",
+                None,
+                32,
+            ),
+            api_work_queue_reap_interval_s=_pick_float(
+                "TINKER_API_WORK_QUEUE_REAP_INTERVAL_S",
+                None,
+                5.0,
             ),
             # Training settings
             training_force_grad_checkpointing=_pick_bool(

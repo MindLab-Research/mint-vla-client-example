@@ -220,7 +220,8 @@ checkpoints/
 PROMPT.md
 LOG.md
 transcript.txt
-results/
+results/*
+!results/ISSUE84_HANDOFF.md
 
 # Generated files
 ray_head_ip.txt

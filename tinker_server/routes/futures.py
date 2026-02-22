@@ -17,6 +17,8 @@ GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persis
 _SAFE_ERROR_PREFIXES = (
     "Access denied",
     "Checkpoint not found:",
+    "Future expired",
+    "Future already retrieved",
 )
 
 
@@ -175,6 +177,10 @@ async def retrieve_future(
         response.status_code = pending.status_code
         response.headers.update(pending.headers)
         return pending.body
+    elif status == FutureStatus.EXPIRED:
+        return {"error": "Future expired", "category": "system"}
+    elif status == FutureStatus.RETRIEVED:
+        return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
         error = future_store.get_error(body.request_id)
         # Only expose full error details to privileged users
@@ -182,8 +188,28 @@ async def retrieve_future(
             payload = {"error": error, "category": "system"}
         else:
             payload = {"error": _public_error(error), "category": "system"}
+        try:
+            from ..backend.capacity_manager import capacity_manager
+
+            capacity_manager.release_all(body.request_id)
+        except Exception:
+            pass
+        try:
+            future_store.cleanup(body.request_id)
+        except Exception:
+            pass
         return payload
     else:
         # DONE - return the result
         result = future_store.get_result(body.request_id)
+        try:
+            from ..backend.capacity_manager import capacity_manager
+
+            capacity_manager.release_all(body.request_id)
+        except Exception:
+            pass
+        try:
+            future_store.cleanup(body.request_id)
+        except Exception:
+            pass
         return result
