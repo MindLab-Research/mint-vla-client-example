@@ -189,7 +189,7 @@ class ApiWorkQueueClient:
 
     async def _worker_loop(self, worker_idx: int) -> None:
         from .capacity_manager import capacity_manager
-        from .future_store import future_store
+        from .future_store import FutureStatus, future_store
 
         while self._running:
             item = await self._dequeue()
@@ -198,6 +198,27 @@ class ApiWorkQueueClient:
             except Exception:
                 # Do not fail open: the reservation leak will force 429 and surface via stats.
                 pass
+
+            # If the future has already transitioned to a terminal state (for example due to
+            # queue-timeout), do not run the executor. This prevents a timed-out future from
+            # later being overwritten by a "successful" resolve.
+            try:
+                status = future_store.get_status(item.request_id)
+            except KeyError:
+                try:
+                    capacity_manager.release_all(item.request_id)
+                except Exception:
+                    pass
+                continue
+            except Exception:
+                status = None
+
+            if status is not None and status != FutureStatus.PENDING:
+                try:
+                    capacity_manager.release_all(item.request_id)
+                except Exception:
+                    pass
+                continue
 
             try:
                 future_store.mark_running(item.request_id, meta={"worker_idx": int(worker_idx), "op": item.op})
