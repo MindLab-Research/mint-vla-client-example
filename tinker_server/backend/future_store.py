@@ -53,6 +53,11 @@ def _ray_future_ttl_s() -> float:
     return float(server_config.future_store_ttl_s)
 
 
+def _ray_future_queue_ttl_s() -> float:
+    # Maximum time (seconds) a request may remain QUEUED (not RUNNING) before being FAILED.
+    return float(server_config.future_store_queue_ttl_s)
+
+
 def _ray_future_done_ttl_s() -> float:
     # Retain DONE/FAILED results for this long, then transition to EXPIRED tombstone.
     return float(server_config.future_store_done_ttl_s)
@@ -103,6 +108,7 @@ def _get_or_create_ray_actor():
     actor_name = _ray_future_store_actor_name()
     namespace = _ray_namespace()
     ttl_s = _ray_future_ttl_s()
+    queue_ttl_s = _ray_future_queue_ttl_s()
     done_ttl_s = _ray_future_done_ttl_s()
     tombstone_ttl_s = _ray_future_tombstone_ttl_s()
 
@@ -113,7 +119,9 @@ def _get_or_create_ray_actor():
 
     @ray.remote
     class _RayFutureStoreActor:
-        def __init__(self, ttl_s: float, done_ttl_s: float, tombstone_ttl_s: float) -> None:
+        def __init__(
+            self, ttl_s: float, queue_ttl_s: float, done_ttl_s: float, tombstone_ttl_s: float
+        ) -> None:
             self._pending: set[str] = set()
             self._result_refs: dict[str, Any] = {}
             self._errors: dict[str, str] = {}
@@ -128,6 +136,7 @@ def _get_or_create_ray_actor():
             self._retrieved_at: dict[str, float] = {}
 
             self._execution_timeout_s = float(ttl_s)
+            self._queue_timeout_s = float(queue_ttl_s)
             self._result_ttl_s = float(done_ttl_s)
             self._tombstone_ttl_s = float(tombstone_ttl_s)
 
@@ -142,6 +151,7 @@ def _get_or_create_ray_actor():
                 "expired": len(self._expired_at),
                 "retrieved": len(self._retrieved_at),
                 "execution_timeout_s": float(self._execution_timeout_s),
+                "queue_timeout_s": float(self._queue_timeout_s),
                 "result_ttl_s": float(self._result_ttl_s),
                 "tombstone_ttl_s": float(self._tombstone_ttl_s),
             }
@@ -150,6 +160,23 @@ def _get_or_create_ray_actor():
             now = time.time()
             expired: list[str] = []
             timed_out: list[str] = []
+
+            # Queue timeout applies only after QUEUED, before RUNNING.
+            if self._queue_timeout_s > 0:
+                for rid, ts in list(self._queued_at.items()):
+                    if (
+                        rid in self._pending
+                        and rid not in self._running_at
+                        and (now - ts) > self._queue_timeout_s
+                    ):
+                        self._pending.discard(rid)
+                        self._refs.pop(rid, None)
+                        self._result_refs.pop(rid, None)
+                        self._errors[rid] = "queue timeout"
+                        self._done_at[rid] = now
+                        self._queued_at.pop(rid, None)
+                        self._running_at.pop(rid, None)
+                        timed_out.append(rid)
 
             # Execution timeout applies only once RUNNING begins.
             if self._execution_timeout_s > 0:
@@ -362,7 +389,7 @@ def _get_or_create_ray_actor():
             name=actor_name,
             namespace=namespace,
             lifetime="detached",
-        ).remote(ttl_s, done_ttl_s, tombstone_ttl_s)
+        ).remote(ttl_s, queue_ttl_s, done_ttl_s, tombstone_ttl_s)
     except Exception:
         # Race: another process may have created the actor between get_actor and create.
         return ray.get_actor(actor_name, namespace=namespace)

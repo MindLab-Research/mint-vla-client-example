@@ -31,6 +31,11 @@ Key components:
 Bug fixed during dev validation:
 - `tinker_server/backend/future_store.py`: `FutureStore.get_result` no longer does a second `ray.get` (the extra `ray.get` caused HTTP 500 on `/api/v1/retrieve_future` on this Ray cluster).
 
+Follow-up hardening (post-review):
+- `tinker_server/backend/future_store.py`: adds a QUEUED-only timeout (`future_store_queue_ttl_s`) so futures cannot remain `PENDING` forever if work queue workers stop making progress. Timed out request_ids transition to `FAILED` with error `"queue timeout"` and are reaped by the server reaper loop, releasing reservations.
+- `tinker_server/backend/result_size_estimator.py` + `tinker_server/routes/training.py`: `forward` and `forward_backward` now reserve object store bytes based on total target tokens (logprobs payload size), rather than the fixed `estimate_small_result_bytes()` (256 KiB).
+- `tinker_server/config_file.py`: config file schema now supports `future_store.queue_ttl_s` and `future_store.tombstone_ttl_s` (previously env-only).
+
 ## Memory budgets (dev cluster, observed values)
 
 Results (object store) budget signal on `mint-dev`:
@@ -77,6 +82,18 @@ Observed behavior (2026-02-22):
   - `retry_ok=128 retry_429=0`
 - Draining a sample of futures succeeded:
   - `drain_terminal_status_counts={'200': 32}`
+
+Observed behavior (2026-02-22, second run with smaller queue budget to force 429 quickly):
+- Server budgets (via `GET /internal/admission_stats`):
+  - `queue_bytes_budget=262144`
+  - `object_store_free_bytes=203306287074` (bytes)
+- Under sustained load, HTTP 429 was observed with explicit reason:
+  - `reason=queue_bytes_budget_exceeded`
+  - `queue_bytes_reserved` stabilized near `262063` bytes
+- After queue relief, retries succeeded:
+  - `retry_ok=256 retry_429=0` (in cycles 1, 2, 3)
+- Draining futures remained healthy:
+  - `drain_terminal_status_counts={'200': 32}` (in cycles 1, 2, 3)
 
 Additional load evidence (2026-02-22):
 - Sustained overload for 5 cycles (60 s per cycle) continued to return 429s while staying responsive:

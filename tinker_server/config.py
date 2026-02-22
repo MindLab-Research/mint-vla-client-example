@@ -195,6 +195,9 @@ class ServerConfig:
     # Future store settings (backend/future_store.py)
     future_store_actor_name: str = "tinker_future_store"
     future_store_ttl_s: float = 86400.0
+    # Maximum time a request may stay QUEUED (not RUNNING) before being marked FAILED.
+    # This is a safety net for worker/queue failures; it is not the execution timeout.
+    future_store_queue_ttl_s: float = 7 * 86400.0
     future_store_done_ttl_s: float = 7200.0
     future_store_tombstone_ttl_s: float = 300.0
 
@@ -363,6 +366,11 @@ class ServerConfig:
                 file_future_store.ttl_s if file_future_store is not None else None,
                 86400.0,
             ),
+            future_store_queue_ttl_s=_pick_float(
+                "MINT_FUTURE_QUEUE_TTL_S",
+                file_future_store.queue_ttl_s if file_future_store is not None else None,
+                7 * 86400.0,
+            ),
             future_store_done_ttl_s=_pick_float(
                 "MINT_FUTURE_DONE_TTL_S",
                 file_future_store.done_ttl_s if file_future_store is not None else None,
@@ -370,7 +378,7 @@ class ServerConfig:
             ),
             future_store_tombstone_ttl_s=_pick_float(
                 "MINT_FUTURE_TOMBSTONE_TTL_S",
-                None,
+                file_future_store.tombstone_ttl_s if file_future_store is not None else None,
                 300.0,
             ),
             # Admission control + API work queue (issue #84)

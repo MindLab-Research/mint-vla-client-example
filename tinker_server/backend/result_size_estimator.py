@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from ..models.types import ComputeLogprobsRequest, SampleRequest
+from ..models.types import ComputeLogprobsRequest, ForwardBackwardRequest, ForwardRequest, SampleRequest
 
 
 def _clamp_nonneg(x: int) -> int:
@@ -53,7 +53,41 @@ def estimate_compute_logprobs_result_bytes(req: ComputeLogprobsRequest) -> int:
     return int(math.ceil(raw * 2.0))
 
 
+def _estimate_training_logprobs_result_bytes(data) -> int:
+    num_items = len(data)
+    total_targets = 0
+    for datum in data:
+        n = 0
+        try:
+            target = datum.loss_fn_inputs.get("target_tokens")
+            if isinstance(target, dict):
+                target_data = target.get("data")
+                if isinstance(target_data, list):
+                    n = len(target_data)
+        except Exception:
+            n = 0
+        if n <= 0:
+            n = len(datum.model_input.to_token_ids())
+        total_targets += int(n)
+
+    # Result payloads for training forward/forward_backward are Python dicts of Python lists
+    # (see TrainingWorker.forward / forward_backward). Serialized overhead per float is
+    # materially larger than 8 bytes; reserve conservatively to avoid object-store OOM.
+    bytes_per_logprob = 64
+    per_item_overhead = 4096
+    overhead = 8192
+    raw = overhead + total_targets * bytes_per_logprob + num_items * per_item_overhead
+    return int(raw)
+
+
+def estimate_forward_result_bytes(req: ForwardRequest) -> int:
+    return _estimate_training_logprobs_result_bytes(req.forward_input.data)
+
+
+def estimate_forward_backward_result_bytes(req: ForwardBackwardRequest) -> int:
+    return _estimate_training_logprobs_result_bytes(req.forward_backward_input.data)
+
+
 def estimate_small_result_bytes() -> int:
     # Training and checkpoint endpoints typically return small dicts and metadata.
     return 256 * 1024
-
