@@ -245,12 +245,12 @@ class CapacityManager:
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
 
-    def snapshot(self) -> CapacitySnapshot:
+    def snapshot(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
         actor = self._get_ray_actor()
         import ray
 
         try:
-            d = ray.get(actor.snapshot.remote())
+            d = ray.get(actor.snapshot.remote(), timeout=float(timeout_s))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
@@ -267,4 +267,3 @@ class CapacityManager:
 
 
 capacity_manager = CapacityManager()
-

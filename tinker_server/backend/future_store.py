@@ -401,12 +401,12 @@ class FutureStore:
     def __init__(self) -> None:
         self._ray_actor = None
 
-    def ensure_ready(self) -> dict[str, Any]:
+    def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         """Fail fast if Ray or the detached FutureStore actor is unavailable."""
         actor = self._get_ray_actor()
         import ray
 
-        return ray.get(actor.stats.remote())
+        return ray.get(actor.stats.remote(), timeout=float(timeout_s))
 
     def _get_ray_actor(self):
         try:

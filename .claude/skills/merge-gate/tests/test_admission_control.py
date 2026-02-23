@@ -99,13 +99,21 @@ class TestAdmissionControl:
         - After flood, a normal request must still succeed.
         """
 
-        cap_before = get_admission_stats().get("capacity") or {}
+        stats_before = get_admission_stats()
+        cap_before = stats_before.get("capacity") or {}
         if not isinstance(cap_before, dict) or "error" in cap_before:
             raise AssertionError(f"capacity snapshot unavailable: {cap_before!r}")
         queue_before = int(cap_before.get("queue_bytes_reserved", -1))
         obj_before = int(cap_before.get("object_store_bytes_reserved", -1))
         if queue_before < 0 or obj_before < 0:
             raise AssertionError(f"invalid capacity snapshot: {cap_before!r}")
+
+        proc_before = stats_before.get("process") or {}
+        if not isinstance(proc_before, dict):
+            raise AssertionError(f"invalid process stats: {proc_before!r}")
+        rss_before = int(proc_before.get("rss_bytes", -1))
+        if rss_before < 0:
+            raise AssertionError(f"missing process rss_bytes: {proc_before!r}")
 
         actors_before = list_actors().get("actors", [])
         actor_names_before = {
@@ -137,13 +145,22 @@ class TestAdmissionControl:
                 counts[s] = counts.get(s, 0) + 1
             raise AssertionError(f"expected all 429; got status counts: {counts}")
 
-        cap_after = get_admission_stats().get("capacity") or {}
+        stats_after = get_admission_stats()
+        cap_after = stats_after.get("capacity") or {}
         if not isinstance(cap_after, dict) or "error" in cap_after:
             raise AssertionError(f"capacity snapshot unavailable after flood: {cap_after!r}")
         queue_after = int(cap_after.get("queue_bytes_reserved", -1))
         obj_after = int(cap_after.get("object_store_bytes_reserved", -1))
         assert queue_after == queue_before, f"queue_bytes_reserved leaked: {queue_before} -> {queue_after}"
         assert obj_after == obj_before, f"object_store_bytes_reserved leaked: {obj_before} -> {obj_after}"
+
+        proc_after = stats_after.get("process") or {}
+        if not isinstance(proc_after, dict):
+            raise AssertionError(f"invalid process stats after flood: {proc_after!r}")
+        rss_after = int(proc_after.get("rss_bytes", -1))
+        if rss_after < 0:
+            raise AssertionError(f"missing process rss_bytes after flood: {proc_after!r}")
+        assert (rss_after - rss_before) < 512 * 1024 * 1024, f"API RSS grew too much: {rss_before} -> {rss_after}"
 
         actors_after = list_actors().get("actors", [])
         actor_names_after = {
