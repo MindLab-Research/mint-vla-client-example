@@ -720,14 +720,14 @@ async def forward_backward(
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_forward_result_bytes
+    from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
-        object_store_bytes=estimate_forward_result_bytes(request),
+        object_store_bytes=estimate_forward_backward_result_bytes(request),
     )
     if not bool(reserve.get("ok")):
         raise HTTPException(
