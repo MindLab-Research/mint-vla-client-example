@@ -169,7 +169,7 @@ MODEL_CONFIGS = {
         max_cpu_loras=16,
         gradient_checkpointing=True,
         vllm_engine="async",
-        vllm_distributed_executor_backend="ray",
+        vllm_distributed_executor_backend="mp",
     ),
     "Qwen/Qwen3-30B-A3B": ModelConfig(
         num_parameters=30.0,
