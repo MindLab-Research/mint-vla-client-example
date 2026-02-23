@@ -143,45 +143,34 @@ async def health_check():
 
 @router.get("/admission_stats")
 async def admission_stats() -> dict:
-    import asyncio
     from dataclasses import asdict
-    from typing import Any
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
 
-    async def _bounded(label: str, awaitable, *, timeout_s: float) -> dict | Any:
-        try:
-            return await asyncio.wait_for(awaitable, timeout=float(timeout_s))
-        except asyncio.TimeoutError:
-            return {"error": f"{label} timeout after {timeout_s}s"}
-        except Exception as e:
-            return {"error": str(e)}
-
     cap = None
-    cap_raw = await _bounded(
-        "capacity_manager.snapshot",
-        asyncio.to_thread(capacity_manager.snapshot),
-        timeout_s=5.0,
-    )
-    if isinstance(cap_raw, dict) and "error" in cap_raw:
-        cap = cap_raw
-    else:
-        try:
-            cap = asdict(cap_raw)
-        except Exception as e:
-            cap = {"error": str(e)}
+    try:
+        cap = asdict(capacity_manager.snapshot())
+    except Exception as e:
+        cap = {"error": str(e)}
 
     q = None
-    q = await _bounded("api_work_queue.stats", api_work_queue.stats(), timeout_s=5.0)
+    try:
+        import ray
+
+        actor = api_work_queue._get_ray_actor()
+        q = ray.get(actor.stats.remote(), timeout=5.0)
+        if not isinstance(q, dict):
+            q = {"error": f"api_work_queue.stats returned non-dict: {type(q)}"}
+    except Exception as e:
+        q = {"error": str(e)}
 
     fs = None
-    fs = await _bounded(
-        "future_store.ensure_ready",
-        asyncio.to_thread(future_store.ensure_ready),
-        timeout_s=5.0,
-    )
+    try:
+        fs = future_store.ensure_ready()
+    except Exception as e:
+        fs = {"error": str(e)}
 
     return {"capacity": cap, "work_queue": q, "future_store": fs}
 
