@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import time
 from dataclasses import dataclass
@@ -89,6 +90,7 @@ class ApiWorkQueueClient:
         self._executors: dict[str, Executor] = {}
         self._worker_tasks: list[Any] = []
         self._running = False
+        self._dequeue_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def _get_ray_actor(self):
         try:
@@ -150,9 +152,13 @@ class ApiWorkQueueClient:
         import asyncio
         import ray
 
+        if self._dequeue_executor is None:
+            raise RuntimeError("ApiWorkQueueClient not started (dequeue executor missing)")
+
         actor = self._get_ray_actor()
         ref = actor.dequeue.remote()
-        item = await asyncio.to_thread(ray.get, ref)
+        loop = asyncio.get_running_loop()
+        item = await loop.run_in_executor(self._dequeue_executor, ray.get, ref)
         if not isinstance(item, dict):
             raise TypeError(f"ApiWorkQueue.dequeue returned non-dict: {type(item)}")
         return WorkItem(
@@ -174,6 +180,10 @@ class ApiWorkQueueClient:
         n = int(num_workers)
         if n < 1:
             n = 1
+        self._dequeue_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=n,
+            thread_name_prefix="api_work_queue_dequeue",
+        )
         self._worker_tasks = [asyncio.create_task(self._worker_loop(i)) for i in range(n)]
 
     async def shutdown(self) -> None:
@@ -185,6 +195,9 @@ class ApiWorkQueueClient:
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks = []
+        if self._dequeue_executor is not None:
+            self._dequeue_executor.shutdown(wait=False, cancel_futures=True)
+            self._dequeue_executor = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
         from .capacity_manager import capacity_manager
