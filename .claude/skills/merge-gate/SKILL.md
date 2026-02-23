@@ -164,6 +164,8 @@ curl -s http://localhost:8000/api/v1/healthz
 | **stress** | 5 concurrent clients with different configs | All complete without deadlock | 5 min |
 | **interleaved_sessions** | A → B → A session switching | Loss continuity preserved | 3 min |
 | **rapid_session_creation** | 5 sessions in quick succession | All create successfully | 1 min |
+| **admission_control_backpressure** | Flood oversized requests (no Ray work) | Rejected with 429; capacity/actors unchanged; next request succeeds | 1 min |
+| **trainer_request_queueing** | Competing requests against same trainer | Dense+MoE requests complete; trainer actor not restarted | 3 min |
 | **mixed_model_lru_eviction** | Dense → MoE → Dense | Graceful actor replacement | 5 min |
 | **moe_long_context_inference** | MoE inference at 38K tokens (near 40K limit) | Generates output without OOM | 5 min |
 | **moe_long_context_training** | MoE training at 38K tokens (near 40K limit) | Loss computed without OOM | 8 min |

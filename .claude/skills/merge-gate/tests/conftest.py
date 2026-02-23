@@ -171,6 +171,17 @@ def list_actors(actor_type: str | None = None, model_name: str | None = None) ->
     return resp.json()
 
 
+def get_admission_stats() -> dict:
+    """Fetch admission control stats (capacity manager, work queue, future store)."""
+    url = f"{BASE_URL}/internal/admission_stats"
+    resp = requests.get(url, headers=get_headers(), timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise TypeError(f"admission_stats returned non-dict: {type(payload)}")
+    return payload
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
