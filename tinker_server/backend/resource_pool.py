@@ -539,10 +539,24 @@ class ResourcePool:
                     logger.info(f"[ResourcePool] Removing stale actor: {name}")
                     del self._entries[name]
 
+            def _backend(e: ActorEntry) -> str:
+                if e.actor_type == ActorType.DENSE:
+                    return "peft"
+                if e.actor_type == ActorType.MEGATRON:
+                    return "megatron"
+                return "vllm"
+
+            def _role(e: ActorEntry) -> str:
+                if e.actor_type == ActorType.VLLM:
+                    return "inference"
+                return "trainer"
+
             return [
                 {
                     "actor_name": e.actor_name,
                     "actor_type": e.actor_type.value,
+                    "backend": _backend(e),
+                    "role": _role(e),
                     "num_gpus": e.num_gpus,
                     "base_model": e.base_model,
                     "current_session": e.current_session,

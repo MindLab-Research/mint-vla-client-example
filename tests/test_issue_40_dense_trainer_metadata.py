@@ -24,6 +24,8 @@ def test_resource_pool_list_actors_includes_metadata() -> None:
 
     listed = [a for a in pool.list_actors() if a.get("actor_name") == actor_name]
     assert len(listed) == 1
+    assert listed[0]["backend"] == "peft"
+    assert listed[0]["role"] == "trainer"
     assert listed[0]["metadata"]["max_lora_rank"] == 64
     assert listed[0]["metadata"]["actual_rank"] == 8
 

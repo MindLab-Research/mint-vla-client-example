@@ -1,4 +1,4 @@
-"""Dense trainer actor helpers (ResourcePool is the source of truth).
+"""PEFT (dense) trainer actor helpers (ResourcePool is the source of truth).
 
 This module replaces the previous DenseTrainerPool tracking dictionary with:
 - deterministic actor naming
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import logging
 from dataclasses import dataclass
 
 import ray
@@ -18,9 +19,12 @@ from . import ray_kill
 from .resource_pool import ActorType, get_resource_pool
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
+logger = logging.getLogger(__name__)
+
 
 PERSISTENT_DENSE_NAMESPACE = RAY_NAMESPACE
-PERSISTENT_DENSE_ACTOR_PREFIX = "dense_trainer_pool_"
+# Naming clarifies actor role/back-end.
+PERSISTENT_DENSE_ACTOR_PREFIX = "peft_trainer_"
 PFS_PYTHONPATH_DENSE = PFS_PYTHONPATH
 
 DEFAULT_MAX_LORA_RANK = 64
@@ -39,8 +43,25 @@ class DenseTrainerHandle:
     max_lora_rank: int
 
 
-def _make_actor_name(base_model: str, max_rank: int) -> str:
-    model_name = base_model.split("/")[-1].replace("-", "_").lower()
+def _normalize_model_key_for_actor_name(model_key: str) -> str:
+    k = (model_key or "").strip()
+    if k.startswith("/"):
+        k = k.split("/")[-1]
+    else:
+        # Keep org in "org/model" for uniqueness, but make it Ray-name safe.
+        k = k.replace("/", "__")
+    k = (
+        k.replace("-", "_")
+        .replace(".", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+        .lower()
+    )
+    return k or "unknown"
+
+
+def _make_actor_name(*, model_key: str, max_rank: int) -> str:
+    model_name = _normalize_model_key_for_actor_name(model_key)
     return f"{PERSISTENT_DENSE_ACTOR_PREFIX}{model_name}_maxr{int(max_rank)}"
 
 
@@ -85,6 +106,7 @@ def get_or_create_dense_trainer(
     *,
     training_worker_cls,
     base_model: str,
+    model_key: str | None = None,
     lora_rank: int,
     learning_rate: float,
     session_id: str | None = None,
@@ -121,7 +143,8 @@ def get_or_create_dense_trainer(
 
         try:
             effective_max_rank = max(int(lora_rank), int(max_lora_rank or 0), int(DEFAULT_MAX_LORA_RANK))
-            actor_name = _make_actor_name(base_model, effective_max_rank)
+            name_key = model_key or base_model
+            actor_name = _make_actor_name(model_key=name_key, max_rank=effective_max_rank)
 
             pool = get_resource_pool()
             from .model_registry import is_persistent_model
@@ -213,7 +236,11 @@ def get_or_create_dense_trainer(
                 base_model=base_model,
                 session_id=session_id,
                 protected=is_persistent,
-                metadata={"max_lora_rank": effective_max_rank, "actual_rank": int(lora_rank)},
+                metadata={
+                    "max_lora_rank": effective_max_rank,
+                    "actual_rank": int(lora_rank),
+                    "model_key": name_key,
+                },
             )
             pool.mark_ready(actor_name)
             entry.current_session = session_id

@@ -1420,44 +1420,6 @@ class VerlTrainingEngine:
             )
         logger.info("VerlTrainingEngine ready (Ray actors)")
 
-    def _kill_session_actor(self, session: "TrainingSession") -> None:
-        model_id = session.model_id
-
-        worker = self._workers.get(model_id)
-        if worker is not None:
-            actor_name = self._resource_pool_actor_names.get(model_id)
-            try:
-                ray_kill.kill(
-                    worker,
-                    reason="session_timeout",
-                    actor_name=actor_name,
-                    namespace=RAY_NAMESPACE,
-                    no_restart=True,
-                    model_id=model_id,
-                )
-            except Exception:
-                pass
-            return
-
-        actor_name = self._resource_pool_actor_names.get(model_id)
-        if not actor_name:
-            return
-        try:
-            actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
-        except Exception:
-            return
-        try:
-            ray_kill.kill(
-                actor,
-                reason="session_timeout",
-                actor_name=actor_name,
-                namespace=RAY_NAMESPACE,
-                no_restart=True,
-                model_id=model_id,
-            )
-        except Exception:
-            pass
-
     def _touch_actor(self, session: "TrainingSession") -> None:
         """Update last_accessed timestamp and session for the session's actor.
 
@@ -1495,8 +1457,7 @@ class VerlTrainingEngine:
             if timeout_s is not None and timeout_s > 0:
                 remaining = timeout_s - (time.time() - start)
                 if remaining <= 0:
-                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s; killing actor")
-                    self._kill_session_actor(session)
+                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
                     raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
                 wait_s = min(wait_s, remaining)
 
@@ -1662,7 +1623,9 @@ class VerlTrainingEngine:
             # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
             # with session_id for proper session state management (Issue #44)
         else:
-            logger.info(f"[{model_id}] Using dense trainer actors for dense model (base={base_model}, lora_rank={lora_rank})")
+            logger.info(
+                f"[{model_id}] Using pooled PEFT trainer actors for dense model (base={base_model}, lora_rank={lora_rank})"
+            )
 
             import asyncio
             from .dense_trainer import get_or_create_dense_trainer
@@ -1676,6 +1639,7 @@ class VerlTrainingEngine:
                     get_or_create_dense_trainer,
                     training_worker_cls=TrainingWorker,
                     base_model=base_model,
+                    model_key=requested_model,
                     lora_rank=lora_rank,
                     learning_rate=session.learning_rate,
                     session_id=session.model_id,
@@ -1695,16 +1659,28 @@ class VerlTrainingEngine:
             # instead of inheriting trained weights from previous session
             logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
             reinit_timeout_s = float(server_config.training_reinit_lora_timeout_s)
+            effective_reinit_timeout_s = reinit_timeout_s if reinit_timeout_s > 0 else None
             print(
-                f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={reinit_timeout_s}",
+                f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={effective_reinit_timeout_s}",
                 flush=True,
             )
-            result = await self._await_with_keepalive(
-                worker.reinit_lora_weights.remote(session.learning_rate),
-                session,
-                interval_s=30.0,
-                timeout_s=reinit_timeout_s,
-            )
+            try:
+                result = await self._await_with_keepalive(
+                    worker.reinit_lora_weights.remote(session.learning_rate),
+                    session,
+                    interval_s=30.0,
+                    timeout_s=effective_reinit_timeout_s,
+                )
+            except Exception:
+                self._resource_pool_actor_names.pop(model_id, None)
+                self._workers.pop(model_id, None)
+                try:
+                    from .resource_pool import get_resource_pool
+
+                    get_resource_pool().clear_session(model_id)
+                except Exception:
+                    pass
+                raise
             print(
                 f"[DEBUG {model_id}] dense reinit_lora_weights done",
                 flush=True,
@@ -1744,12 +1720,23 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] __ray_ready__ start: timeout_s={ready_timeout_s}",
             flush=True,
         )
-        await self._await_with_keepalive(
-            worker.__ray_ready__.remote(),
-            session,
-            interval_s=30.0,
-            timeout_s=ready_timeout_s,
-        )
+        try:
+            await self._await_with_keepalive(
+                worker.__ray_ready__.remote(),
+                session,
+                interval_s=30.0,
+                timeout_s=ready_timeout_s,
+            )
+        except Exception:
+            self._resource_pool_actor_names.pop(model_id, None)
+            self._workers.pop(model_id, None)
+            try:
+                from .resource_pool import get_resource_pool
+
+                get_resource_pool().clear_session(model_id)
+            except Exception:
+                pass
+            raise
         print(
             f"[DEBUG {model_id}] __ray_ready__ done",
             flush=True,

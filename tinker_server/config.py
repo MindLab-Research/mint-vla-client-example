@@ -213,7 +213,7 @@ class ServerConfig:
     training_enable_sdp: bool = True
     training_megatron_create_timeout_s: float = 1800.0
     training_dense_get_or_create_timeout_s: float = 1800.0
-    training_reinit_lora_timeout_s: float = 120.0
+    training_reinit_lora_timeout_s: float = 0.0
     training_actor_ready_timeout_s: float | None = None
 
     # Persistent-prewarm settings (app.py)
@@ -431,7 +431,7 @@ class ServerConfig:
             training_reinit_lora_timeout_s=_pick_float(
                 "MINT_REINIT_LORA_TIMEOUT_S",
                 file_training.reinit_lora_timeout_s if file_training is not None else None,
-                120.0,
+                0.0,
             ),
             training_actor_ready_timeout_s=actor_ready_timeout_s,
             # Persistent prewarm settings

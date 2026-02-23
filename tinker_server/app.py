@@ -88,6 +88,26 @@ async def _cleanup_stale_actors() -> None:
             try:
                 actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
 
+                # Hard break: legacy dense trainer actor names are no longer supported.
+                # Kill them proactively to avoid consuming GPUs indefinitely.
+                if name.startswith("dense_trainer_pool_"):
+                    try:
+                        ray_kill.kill(
+                            actor,
+                            reason="legacy_dense_trainer_prefix",
+                            actor_name=name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
+                        cleaned += 1
+                    except Exception as kill_err:
+                        logger.warning(f"Failed to kill legacy dense trainer actor {name}: {kill_err}")
+                    try:
+                        resource_pool.unregister(name)
+                    except Exception:
+                        pass
+                    continue
+
                 # Check if actor is alive.
                 # WARNING: __ray_ready__ is a normal actor task and can time out if the actor is busy.
                 # Do not treat GetTimeoutError as death; killing busy detached actors breaks in-flight work.
@@ -108,7 +128,7 @@ async def _cleanup_stale_actors() -> None:
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
-                    elif name.startswith("dense_trainer_pool_"):
+                    elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
                         base_model = ""
@@ -178,7 +198,7 @@ async def _cleanup_stale_actors() -> None:
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
-                        elif name.startswith("dense_trainer_pool_"):
+                        elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
                             base_model = ""
@@ -243,7 +263,7 @@ async def _prewarm_persistent_models(
       - MINT_PERSISTENT_TRAIN_LR (default: 5e-5)
 
     When enabled, creates:
-      - Training actors (dense trainer pools and MegatronWorkerGroup)
+      - Training actors (pooled PEFT trainers and MegatronWorkerGroup)
       - vLLM inference actors (MultiModelInferenceManager)
 
     and marks them as ResourcePool protected to prevent LRU eviction.
@@ -513,11 +533,12 @@ async def _prewarm_persistent_models(
 
         for model_name, base_model in deferred_dense_training:
             try:
-                logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
+                logger.info(f"[prewarm] training create start model={model_name} backend=peft_trainer")
                 dense = await asyncio.to_thread(
                     get_or_create_dense_trainer,
                     training_worker_cls=TrainingWorker,
                     base_model=base_model,
+                    model_key=model_name,
                     lora_rank=lora_rank,
                     learning_rate=learning_rate,
                     session_id=None,
@@ -526,7 +547,7 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
-                logger.exception(f"[prewarm] training failed model={model_name} backend=dense_pool: {e}")
+                logger.exception(f"[prewarm] training failed model={model_name} backend=peft_trainer: {e}")
 
 
 @asynccontextmanager
