@@ -260,6 +260,15 @@ class MegatronRankWorker:
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
 
+    def get_rss_bytes(self) -> int:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return rss_pages * page_size
+
     def log_memory_breakdown(self, phase: str) -> dict:
         """Log detailed GPU memory breakdown for profiling.
 
@@ -4051,6 +4060,15 @@ class MegatronWorkerGroup:
         self._master_port: int | None = None
 
         self._initialize()
+
+    def get_rss_bytes(self) -> int:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return rss_pages * page_size
 
     def get_master_addr(self) -> str | None:
         return self._master_addr

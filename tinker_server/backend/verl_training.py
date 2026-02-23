@@ -497,6 +497,15 @@ class TrainingWorker:
             "time_until_timeout": max(0, self._idle_timeout - (time.time() - self._last_activity)),
         }
 
+    def get_rss_bytes(self) -> int:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return rss_pages * page_size
+
     def forward_backward(
         self,
         data_items: list[dict],

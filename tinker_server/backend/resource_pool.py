@@ -571,6 +571,41 @@ class ResourcePool:
                 for e in self._entries.values()
             ]
 
+    def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
+        """Best-effort RSS snapshot for all tracked actors.
+
+        Requires each actor to implement a `get_rss_bytes()` method.
+        """
+        import ray
+
+        with self._pool_lock:
+            entries = list(self._entries.values())
+
+        out: list[dict] = []
+        for e in entries:
+            rec = {
+                "actor_name": e.actor_name,
+                "actor_type": e.actor_type.value,
+                "num_gpus": e.num_gpus,
+                "base_model": e.base_model,
+                "current_session": e.current_session,
+                "node_id": e.node_id,
+                "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
+                "idle_time": e.idle_time(),
+                "age": e.age(),
+            }
+            try:
+                h = e.actor_handle
+                if h is None:
+                    raise RuntimeError("missing actor_handle")
+                rss = ray.get(h.get_rss_bytes.remote(), timeout=float(timeout_s))
+                rec["rss_bytes"] = int(rss)
+            except Exception as ex:
+                rec["error"] = f"{type(ex).__name__}: {ex}"
+            out.append(rec)
+
+        return out
+
     def iter_entries(self) -> list[ActorEntry]:
         """Return list of ActorEntry objects (for internal use).
 

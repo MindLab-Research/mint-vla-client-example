@@ -80,6 +80,15 @@ def _get_or_create_ray_actor():
             self._object_store_released: set[str] = set()
             self._created_at: dict[str, float] = {}
 
+        def get_rss_bytes(self) -> int:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) < 2:
+                raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+            rss_pages = int(parts[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return rss_pages * page_size
+
         def snapshot(self) -> dict[str, Any]:
             free = None
             try:
@@ -264,6 +273,17 @@ class CapacityManager:
             rejects_total=_require_int("rejects_total", d.get("rejects_total")),
             reserves_total=_require_int("reserves_total", d.get("reserves_total")),
         )
+
+    def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            v = ray.get(actor.get_rss_bytes.remote(), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
+        return int(v)
 
 
 capacity_manager = CapacityManager()

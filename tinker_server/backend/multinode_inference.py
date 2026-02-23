@@ -420,6 +420,15 @@ def _create_multinode_vllm_actor(
         def get_node_ip(self) -> str:
             return ray.util.get_node_ip_address()
 
+        def get_rss_bytes(self) -> int:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) < 2:
+                raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+            rss_pages = int(parts[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return rss_pages * page_size
+
         @asynccontextmanager
         async def _reserve_seq_slots(self, n_req: int):
             if (not self._admission_control) or (self.max_num_seqs is None):

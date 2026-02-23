@@ -174,6 +174,15 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
             self._mint_pack_moe_patched = False
 
+        def get_rss_bytes(self) -> int:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) < 2:
+                raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+            rss_pages = int(parts[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return rss_pages * page_size
+
         async def is_engine_ready(self) -> bool:
             """Check if vLLM engine is properly initialized.
 

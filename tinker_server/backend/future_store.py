@@ -140,6 +140,15 @@ def _get_or_create_ray_actor():
             self._result_ttl_s = float(done_ttl_s)
             self._tombstone_ttl_s = float(tombstone_ttl_s)
 
+        def get_rss_bytes(self) -> int:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) < 2:
+                raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+            rss_pages = int(parts[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return rss_pages * page_size
+
         def stats(self) -> dict[str, Any]:
             self._prune()
             return {
@@ -407,6 +416,17 @@ class FutureStore:
         import ray
 
         return ray.get(actor.stats.remote(), timeout=float(timeout_s))
+
+    def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            v = ray.get(actor.get_rss_bytes.remote(), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        return int(v)
 
     def _get_ray_actor(self):
         try:

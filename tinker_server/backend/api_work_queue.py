@@ -60,6 +60,15 @@ def _get_or_create_ray_actor():
             self._enqueued = 0
             self._dequeued = 0
 
+        def get_rss_bytes(self) -> int:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) < 2:
+                raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+            rss_pages = int(parts[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return rss_pages * page_size
+
         async def enqueue(self, item: dict[str, Any]) -> None:
             async with self._cv:
                 self._items.append(dict(item))
@@ -268,6 +277,14 @@ class ApiWorkQueueClient:
         actor = self._get_ray_actor()
         ref = actor.stats.remote()
         return ray.get(ref, timeout=float(timeout_s))
+
+    async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+        import ray
+
+        actor = self._get_ray_actor()
+        ref = actor.get_rss_bytes.remote()
+        v = ray.get(ref, timeout=float(timeout_s))
+        return int(v)
 
 
 api_work_queue = ApiWorkQueueClient()
