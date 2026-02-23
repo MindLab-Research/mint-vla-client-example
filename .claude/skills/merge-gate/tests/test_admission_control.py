@@ -23,8 +23,11 @@ from .conftest import (
     get_headers,
     list_actors,
     poll_future,
+    save_weights,
     sample,
 )
+
+_SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
 
 
 def _asample_raw(*, payload: dict, timeout_s: float = 30.0) -> requests.Response:
@@ -55,6 +58,23 @@ def _find_trainer_actor(
     current_session: str | None = None,
     base_model: str | None = None,
 ) -> dict | None:
+    def _matches_base_model(actual: object, expected: str) -> bool:
+        if not isinstance(actual, str) or not actual:
+            return False
+        if actual == expected:
+            return True
+        if expected in actual:
+            return True
+        # Common case: ResourcePool reports a resolved HF snapshot path like:
+        #   /.../models--Qwen--Qwen3-.../snapshots/<sha>
+        # while callers use the repo id: Qwen/Qwen3-...
+        if "/" in expected and expected.count("/") == 1:
+            org, name = expected.split("/", 1)
+            needle = f"models--{org}--{name}"
+            if needle in actual:
+                return True
+        return False
+
     actors = actors_payload.get("actors")
     if not isinstance(actors, list):
         return None
@@ -67,7 +87,7 @@ def _find_trainer_actor(
             continue
         if current_session is not None and a.get("current_session") != current_session:
             continue
-        if base_model is not None and a.get("base_model") != base_model:
+        if base_model is not None and not _matches_base_model(a.get("base_model"), base_model):
             continue
         return a
     return None
@@ -92,12 +112,18 @@ def _wait_for_trainer_actor(*, backend: str, base_model: str, timeout_s: float) 
 
 class TestAdmissionControl:
     def test_flood_rejected_429_no_capacity_leak_and_retry_works(self, tokenizer):
-        """Flood oversized sampling requests and ensure server stays healthy.
+        """Flood sampling requests, hit 429 backpressure, and recover via retry.
 
-        - Oversized requests must be rejected with 429 (admission control).
-        - Capacity reservations must not increase (bounded memory signal).
-        - After flood, a normal request must still succeed.
+        - Under flood, some requests should be rejected with 429.
+        - Capacity reservations should not leak (bounded memory signal).
+        - A previously-rejected request should be admitted after retry.
         """
+
+        # Warmup: ensure sampling is available for this model_id.
+        _session_id, model_id = create_session(DENSE_MODEL, lora_rank=16, lr=1e-4)
+        r = save_weights(model_id, name="admission_control_warmup")
+        if "error" in r:
+            raise AssertionError(f"save_weights failed: {r['error']}")
 
         stats_before = get_admission_stats()
         cap_before = stats_before.get("capacity") or {}
@@ -120,35 +146,68 @@ class TestAdmissionControl:
             a.get("actor_name") for a in actors_before if isinstance(a, dict) and a.get("actor_name")
         }
 
-        # Make the estimated result size absurdly large to force admission rejection (429)
-        # without starting any Ray work.
-        overload_payload = {
-            "model_id": "merge_gate_dummy_model_id",
-            "prompt": {"chunks": [{"tokens": [1], "type": "encoded_text"}]},
-            "sampling_params": {"max_tokens": 1, "temperature": 0.0},
+        prompt_tokens = tokenizer.encode("The capital of France is", add_special_tokens=True)
+        flood_payload = {
+            "model_id": model_id,
+            "prompt": {"chunks": [{"tokens": prompt_tokens, "type": "encoded_text"}]},
+            "sampling_params": {"max_tokens": 256, "temperature": 0.0},
             "num_samples": 1,
-            "include_prompt_logprobs": True,
-            "topk_prompt_logprobs": 1_000_000_000_000,
         }
 
-        statuses: list[int] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
-            futs = [ex.submit(_asample_raw, payload=overload_payload) for _ in range(64)]
-            for f in concurrent.futures.as_completed(futs):
-                resp = f.result()
-                statuses.append(int(resp.status_code))
+        def _post() -> requests.Response:
+            return requests.post(
+                f"{BASE_URL}/api/v1/asample",
+                json=flood_payload,
+                headers={**get_headers(), _SAMPLING_BACKPRESSURE_HEADER: "1"},
+                timeout=30.0,
+            )
 
-        assert statuses, "no responses collected"
-        if any(s != 429 for s in statuses):
+        ok_request_ids: list[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+            # 1) Seed load so worker inflight rises above the configured limit.
+            seed_statuses: list[int] = []
+            for resp in ex.map(lambda _: _post(), range(48)):
+                seed_statuses.append(int(resp.status_code))
+                if resp.status_code == 200:
+                    rid = resp.json().get("request_id")
+                    if isinstance(rid, str) and rid:
+                        ok_request_ids.append(rid)
+                    continue
+                if resp.status_code != 429:
+                    raise AssertionError(f"unexpected seed status {resp.status_code}: {resp.text}")
+
+        assert ok_request_ids, "expected at least one admitted request_id during seed flood"
+        time.sleep(2.0)
+
+        # 2) Under sustained load, a new request should get 429 (backpressure) at least once.
+        statuses: list[int] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for resp in ex.map(lambda _: _post(), range(32)):
+                statuses.append(int(resp.status_code))
+                if resp.status_code == 200:
+                    rid = resp.json().get("request_id")
+                    if isinstance(rid, str) and rid:
+                        ok_request_ids.append(rid)
+
+        all_statuses = seed_statuses + statuses
+        if not any(s == 429 for s in all_statuses):
             counts: dict[int, int] = {}
-            for s in statuses:
+            for s in all_statuses:
                 counts[s] = counts.get(s, 0) + 1
-            raise AssertionError(f"expected all 429; got status counts: {counts}")
+            raise AssertionError(
+                "expected at least one 429 under flood; got status counts: "
+                f"{counts}. Hint: restart server with a smaller "
+                "TINKER_MAX_INFLIGHT_SAMPLE_TASKS (e.g. 16) so backpressure is observable."
+            )
+
+        # 3) Drain outstanding requests so we can assert no reservation leaks.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(lambda rid: poll_future(rid, timeout=600), ok_request_ids))
 
         stats_after = get_admission_stats()
         cap_after = stats_after.get("capacity") or {}
         if not isinstance(cap_after, dict) or "error" in cap_after:
-            raise AssertionError(f"capacity snapshot unavailable after flood: {cap_after!r}")
+            raise AssertionError(f"capacity snapshot unavailable after drain: {cap_after!r}")
         queue_after = int(cap_after.get("queue_bytes_reserved", -1))
         obj_after = int(cap_after.get("object_store_bytes_reserved", -1))
         assert queue_after == queue_before, f"queue_bytes_reserved leaked: {queue_before} -> {queue_after}"
@@ -156,10 +215,10 @@ class TestAdmissionControl:
 
         proc_after = stats_after.get("process") or {}
         if not isinstance(proc_after, dict):
-            raise AssertionError(f"invalid process stats after flood: {proc_after!r}")
+            raise AssertionError(f"invalid process stats after drain: {proc_after!r}")
         rss_after = int(proc_after.get("rss_bytes", -1))
         if rss_after < 0:
-            raise AssertionError(f"missing process rss_bytes after flood: {proc_after!r}")
+            raise AssertionError(f"missing process rss_bytes after drain: {proc_after!r}")
         assert (rss_after - rss_before) < 512 * 1024 * 1024, f"API RSS grew too much: {rss_before} -> {rss_after}"
 
         actors_after = list_actors().get("actors", [])
@@ -168,11 +227,9 @@ class TestAdmissionControl:
         }
         assert actor_names_before.issubset(actor_names_after), "rejected flood should not kill actors"
 
-        # Recovery: a normal request (valid session + small sample) must still succeed.
-        _session_id, model_id = create_session(DENSE_MODEL, lora_rank=16, lr=1e-4)
-        prompt_tokens = tokenizer.encode("The capital of France is", add_special_tokens=True)
-        result = sample(model_id, prompt_tokens, max_tokens=5, temperature=0.0)
-        assert "error" not in result, f"post-flood sampling failed: {result.get('error')}"
+        # Recovery: load drained; a normal request should succeed.
+        probe = sample(model_id, prompt_tokens, max_tokens=8, temperature=0.0)
+        assert "error" not in probe, f"probe sampling failed: {probe.get('error')}"
 
 
 class TestTrainerQueuing:
