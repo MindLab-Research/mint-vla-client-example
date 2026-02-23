@@ -141,6 +141,35 @@ async def health_check():
     )
 
 
+@router.get("/admission_stats")
+async def admission_stats() -> dict:
+    from dataclasses import asdict
+
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.future_store import future_store
+
+    cap = None
+    try:
+        cap = asdict(capacity_manager.snapshot())
+    except Exception as e:
+        cap = {"error": str(e)}
+
+    q = None
+    try:
+        q = await api_work_queue.stats()
+    except Exception as e:
+        q = {"error": str(e)}
+
+    fs = None
+    try:
+        fs = future_store.ensure_ready()
+    except Exception as e:
+        fs = {"error": str(e)}
+
+    return {"capacity": cap, "work_queue": q, "future_store": fs}
+
+
 # =============================================================================
 # Checkpoint API (per spec: .claude/skills/architecture-design/references/checkpoint-download-api.md)
 # =============================================================================

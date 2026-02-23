@@ -220,7 +220,7 @@ checkpoints/
 PROMPT.md
 LOG.md
 transcript.txt
-results/
+results/*
 
 # Generated files
 ray_head_ip.txt

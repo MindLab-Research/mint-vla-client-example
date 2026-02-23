@@ -84,7 +84,9 @@ class _FutureStoreSection(BaseModel):
 
     actor_name: str | None = None
     ttl_s: float | None = None
+    queue_ttl_s: float | None = None
     done_ttl_s: float | None = None
+    tombstone_ttl_s: float | None = None
 
 
 class _TrainingSection(BaseModel):
