@@ -100,7 +100,9 @@ def optim_step(model_id: str, lr: float = 1e-4) -> dict:
     }
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=60)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=60)
+    # Under concurrent load, optim_step can queue behind other long-running GPU work.
+    # Use the suite-wide poll timeout rather than failing fast at 60s.
+    return poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
 
 
 def train_step(model_id: str, data: list, lr: float = 1e-4, loss_fn: str = "cross_entropy") -> dict:
