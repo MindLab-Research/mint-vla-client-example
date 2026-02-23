@@ -221,6 +221,7 @@ PROMPT.md
 LOG.md
 transcript.txt
 results/*
+.claude/skills/merge-gate/results/
 
 # Generated files
 ray_head_ip.txt
