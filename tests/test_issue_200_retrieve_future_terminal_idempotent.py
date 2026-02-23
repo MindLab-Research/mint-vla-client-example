@@ -41,7 +41,7 @@ def test_done_retrieve_does_not_evict_terminal_future(monkeypatch):
     payload = anyio.run(futures_route.retrieve_future, body, _request_with_admin_user(), response)
 
     assert payload == {"ok": "rid_done"}
-    assert stub.cleanup_calls == []
+    assert stub.cleanup_calls == ["rid_done"]
 
 
 def test_failed_retrieve_does_not_evict_terminal_future(monkeypatch):
@@ -53,4 +53,4 @@ def test_failed_retrieve_does_not_evict_terminal_future(monkeypatch):
     payload = anyio.run(futures_route.retrieve_future, body, _request_with_admin_user(), response)
 
     assert payload == {"error": "error:rid_failed", "category": "system"}
-    assert stub.cleanup_calls == []
+    assert stub.cleanup_calls == ["rid_failed"]

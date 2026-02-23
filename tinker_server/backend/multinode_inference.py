@@ -47,6 +47,54 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
+    """Patch vLLM fused-MoE LoRA slicing for fully-sharded dummy weights.
+
+    In vLLM, `FusedMoEWithLoRA` allocates W13 LoRA-A stacked tensors with rank
+    divided by TP when `fully_sharded_loras=True`. During adapter activation,
+    vLLM can call `_slice_w13_a()` on tensors already in per-rank shape, which
+    triggers an assertion on `current_lora_rank % tp_size`.
+    """
+
+    import vllm.lora.layers.fused_moe as fused_moe_mod
+
+    def _patch_cls(cls: type) -> None:
+        original = getattr(cls, "_slice_w13_a", None)
+        if original is None:
+            raise RuntimeError(f"vLLM class {cls.__name__} has no _slice_w13_a")
+        if getattr(original, "_tinker_patched_fully_sharded", False):
+            return
+
+        def _slice_w13_a(self, w13_lora_a):  # type: ignore[no-untyped-def]
+            if self.tp_size == 1 or not self.fully_sharded:
+                return w13_lora_a
+
+            expected_rank = int(self.w13_lora_a_stacked[0].shape[2])
+            current_rank = int(w13_lora_a.shape[1])
+            if current_rank == expected_rank:
+                return w13_lora_a
+
+            if current_rank % self.tp_size != 0:
+                raise RuntimeError(
+                    "vLLM fused_moe _slice_w13_a unexpected rank: "
+                    f"current_rank={current_rank} tp_size={self.tp_size} expected_rank={expected_rank}"
+                )
+
+            sliced_rank = current_rank // self.tp_size
+            start_idx = self.tp_rank * sliced_rank
+            end_idx = (self.tp_rank + 1) * sliced_rank
+            return w13_lora_a[:, start_idx:end_idx, :]
+
+        _slice_w13_a._tinker_patched_fully_sharded = True  # type: ignore[attr-defined]
+        cls._slice_w13_a = _slice_w13_a  # type: ignore[method-assign]
+
+    for name in ("FusedMoEWithLoRA", "FusedMoE3DWithLoRA"):
+        cls = getattr(fused_moe_mod, name, None)
+        if cls is None:
+            raise RuntimeError(f"vLLM fused_moe is missing class {name}")
+        _patch_cls(cls)
+
+
 def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str, Any]:
     """Optional single-node pinning for vLLM actors (mp backend).
 
@@ -372,6 +420,15 @@ def _create_multinode_vllm_actor(
         def get_node_ip(self) -> str:
             return ray.util.get_node_ip_address()
 
+        def get_rss_bytes(self) -> int:
+            with open("/proc/self/statm", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) < 2:
+                raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+            rss_pages = int(parts[1])
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            return rss_pages * page_size
+
         @asynccontextmanager
         async def _reserve_seq_slots(self, n_req: int):
             if (not self._admission_control) or (self.max_num_seqs is None):
@@ -460,8 +517,10 @@ def _create_multinode_vllm_actor(
                 return
 
             import os
+
             distributed_executor_backend = os.environ.get("MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "ray").strip().lower()
-            os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
+            if "VLLM_USE_V1" not in os.environ:
+                os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
             # disable to fall back to torch.distributed collectives.
             os.environ["VLLM_DISABLE_PYNCCL"] = "1"
@@ -492,6 +551,54 @@ def _create_multinode_vllm_actor(
                 and self.tensor_parallel_size >= 32
                 and self.max_lora_rank % self.tensor_parallel_size == 0
             )
+            if fully_sharded_loras:
+                _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
+            lora_dtype_env = os.environ.get("MINT_VLLM_LORA_DTYPE", "auto").strip()
+            lora_dtype_resolved = lora_dtype_env
+            if self.enable_lora and lora_dtype_env.lower() == "auto":
+                def _infer_hf_torch_dtype_str(model_path: str) -> str | None:
+                    from transformers import AutoConfig
+                    import torch
+
+                    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                    torch_dtype = getattr(cfg, "torch_dtype", None)
+                    if torch_dtype is None:
+                        return None
+                    if isinstance(torch_dtype, str):
+                        dtype_str = torch_dtype
+                    elif isinstance(torch_dtype, torch.dtype):
+                        dtype_str = str(torch_dtype)
+                    else:
+                        dtype_str = str(torch_dtype)
+                    dtype_str = dtype_str.replace("torch.", "").strip().lower()
+                    if dtype_str in ("fp16", "float16", "half"):
+                        return "float16"
+                    if dtype_str in ("bf16", "bfloat16"):
+                        return "bfloat16"
+                    if dtype_str in ("fp32", "float32"):
+                        return "float32"
+                    return None
+
+                # vLLM fused MoE LoRA Triton kernels reinterpret LoRA weight pointers as the
+                # output dtype (see vllm/lora/ops/triton_ops/fused_moe_lora_op.py). If LoRA
+                # weights are loaded in fp16 while model output is bf16, the kernel will
+                # read fp16 memory as bf16 and can produce NaNs. Default to bf16 for BF16
+                # model snapshots unless explicitly overridden.
+                inferred = _infer_hf_torch_dtype_str(str(self.model_path))
+                if inferred is not None:
+                    lora_dtype_resolved = inferred
+                elif "BF16" in str(self.model_path).upper():
+                    lora_dtype_resolved = "bfloat16"
+                else:
+                    logger.warning(
+                        "Unable to infer HF torch_dtype for model=%r with enable_lora=1; "
+                        "leaving vLLM lora_dtype='auto' (set MINT_VLLM_LORA_DTYPE to override)",
+                        self.model_path,
+                    )
+
+            logger.info(
+                "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
+            )
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -519,6 +626,7 @@ def _create_multinode_vllm_actor(
                 max_lora_rank=self.max_lora_rank if self.enable_lora else None,
                 max_cpu_loras=self.max_cpu_loras if self.enable_lora else None,
                 fully_sharded_loras=fully_sharded_loras if self.enable_lora else False,
+                lora_dtype=lora_dtype_resolved,
             )
 
             logger.info(
@@ -584,7 +692,48 @@ def _create_multinode_vllm_actor(
             async with self._exclusive_engine_op():
                 async with self._lock_write():
                     t1 = time.perf_counter()
-                    await self.engine.add_lora(lora_request)
+                    try:
+                        await self.engine.add_lora(lora_request)
+                    except Exception:
+                        import json
+                        from pathlib import Path
+
+                        adapter_dir = Path(lora_path)
+                        summary: dict[str, object] = {
+                            "lora_int_id": lora_int_id,
+                            "lora_name": lora_name,
+                            "lora_path": lora_path,
+                            "exists": adapter_dir.exists(),
+                            "is_dir": adapter_dir.is_dir(),
+                        }
+                        try:
+                            if adapter_dir.is_dir():
+                                entries = sorted(p.name for p in adapter_dir.iterdir())
+                                summary["entries"] = entries[:20]
+                                for fname in ("adapter_config.json", "adapter_model.safetensors"):
+                                    p = adapter_dir / fname
+                                    summary[f"{fname}_exists"] = p.exists()
+                                    if p.exists():
+                                        summary[f"{fname}_size_bytes"] = p.stat().st_size
+                                cfg_path = adapter_dir / "adapter_config.json"
+                                if cfg_path.exists():
+                                    with cfg_path.open("r", encoding="utf-8") as f:
+                                        cfg = json.load(f)
+                                    summary["adapter_r"] = cfg.get("r")
+                                    summary["target_modules"] = cfg.get("target_modules")
+                                    summary["peft_type"] = cfg.get("peft_type")
+                                    summary["base_model_name_or_path"] = cfg.get(
+                                        "base_model_name_or_path"
+                                    )
+                        except Exception as summarize_e:
+                            summary["summary_error"] = f"{type(summarize_e).__name__}: {summarize_e}"
+
+                        print(
+                            f"[vLLM add_lora failed] adapter_summary={summary}",
+                            flush=True,
+                        )
+                        logger.exception("vLLM add_lora failed; adapter_summary=%s", summary)
+                        raise
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -927,7 +1076,6 @@ def _create_multinode_vllm_actor(
                                 non_finite_count += 1
                                 if len(non_finite_samples) < 3:
                                     non_finite_samples.append((i, tid, lp_f))
-                                lp_f = -1e9
                             log_probs.append(lp_f)
                             continue
                         lp_val = getattr(lp_obj, "logprob", None)
@@ -942,7 +1090,6 @@ def _create_multinode_vllm_actor(
                             non_finite_count += 1
                             if len(non_finite_samples) < 3:
                                 non_finite_samples.append((i, tid, lp_f))
-                            lp_f = -1e9
                         log_probs.append(lp_f)
 
                     if non_finite_count:
@@ -950,8 +1097,8 @@ def _create_multinode_vllm_actor(
                             "head": token_ids[:8],
                             "tail": token_ids[-8:] if len(token_ids) > 8 else token_ids[:],
                         }
-                        logger.warning(
-                            f"Non-finite sampled-token logprobs clamped: request_id={request_id} "
+                        raise RuntimeError(
+                            f"Non-finite sampled-token logprobs: request_id={request_id} "
                             f"count={non_finite_count} samples(idx,token,lp)={non_finite_samples} "
                             f"token_preview={token_preview}"
                         )
@@ -1022,7 +1169,6 @@ def _create_multinode_vllm_actor(
                                         "head": out_token_ids[:8],
                                         "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
                                     }
-                                lp_f = -1e9
                             out_log_probs.append(lp_f)
                             continue
                         lp_val = getattr(lp_obj, "logprob", None)
@@ -1042,7 +1188,6 @@ def _create_multinode_vllm_actor(
                                     "head": out_token_ids[:8],
                                     "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
                                 }
-                            lp_f = -1e9
                         out_log_probs.append(lp_f)
 
                 out_stop_reason = "length"
@@ -1060,8 +1205,8 @@ def _create_multinode_vllm_actor(
                 )
 
             if non_finite_count:
-                logger.warning(
-                    f"Non-finite sampled-token logprobs clamped: request_id={request_id} "
+                raise RuntimeError(
+                    f"Non-finite sampled-token logprobs: request_id={request_id} "
                     f"count={non_finite_count} samples(seq,idx,token,lp)={non_finite_samples} "
                     f"seq_token_preview={affected_seq_preview}"
                 )
@@ -1170,6 +1315,133 @@ def _create_multinode_vllm_actor(
                 token_id = prompt_ids[i]
                 token_lp = prompt_logprobs[i].get(token_id)
                 out.append(token_lp.logprob if token_lp is not None else None)
+
+            return out
+
+        async def compute_prompt_topk(
+            self,
+            prompt_ids: list[int],
+            request_id: str,
+            lora_int_id: int | None,
+            lora_path: str | None,
+            k: int,
+        ) -> list[list[tuple[int, float]] | None]:
+            """Compute top-K prompt logprobs.
+
+            Returns a list of length len(prompt_ids), where:
+            - topk[0] is None (first token has no conditioning context)
+            - topk[i] is a list of (token_id, logprob) pairs for i >= 1
+            """
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from vllm.lora.request import LoRARequest
+
+            if not prompt_ids:
+                return []
+            if len(prompt_ids) == 1:
+                return [None]
+
+            kk = int(k)
+            if kk <= 0:
+                return [None] * len(prompt_ids)
+
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                prompt_logprobs=kk,
+                temperature=1.0,
+            )
+
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+            lora_request = None
+            if lora_int_id is not None and lora_path is not None:
+                lora_request = LoRARequest(
+                    lora_name=str(lora_int_id),
+                    lora_int_id=lora_int_id,
+                    lora_path=lora_path,
+                )
+
+            t0 = time.perf_counter()
+            async with self._maybe_prompt_logprobs_lock():
+                async with self._lock_read():
+                    t1 = time.perf_counter()
+                    try:
+                        collector = await self.engine.add_request(
+                            request_id=request_id,
+                            prompt=prompt,
+                            params=sampling_params,
+                            lora_request=lora_request,
+                        )
+                    except Exception:
+                        _raise_serializable_vllm_error(
+                            request_id=request_id,
+                            where="vllm_prompt_topk_add_request_failed",
+                            extra={
+                                "prompt_len": len(prompt_ids),
+                                "k": kk,
+                                "model_path": self.model_path,
+                                "tp": self.tensor_parallel_size,
+                                "pp": self.pipeline_parallel_size,
+                            },
+                        )
+                    final_res = None
+                    try:
+                        while True:
+                            out = await collector.get()
+                            final_res = out
+                            if out.finished:
+                                break
+                    except Exception:
+                        _raise_serializable_vllm_engine_error(
+                            request_id=request_id,
+                            where="vllm_prompt_topk_collect_failed",
+                            extra={
+                                "prompt_len": len(prompt_ids),
+                                "k": kk,
+                                "model_path": self.model_path,
+                                "tp": self.tensor_parallel_size,
+                                "pp": self.pipeline_parallel_size,
+                            },
+                        )
+                    assert final_res is not None
+            t2 = time.perf_counter()
+            if self._timing:
+                print(
+                    f"[vLLM timing] prompt_topk req={request_id} prompt_len={len(prompt_ids)} "
+                    f"k={kk} lora_id={lora_int_id} lock_wait_s={t1 - t0:.3f} total_s={t2 - t0:.3f}",
+                    flush=True,
+                )
+
+            prompt_logprobs = final_res.prompt_logprobs
+            if prompt_logprobs is None:
+                return [None] * len(prompt_ids)
+
+            out: list[list[tuple[int, float]] | None] = [None]
+            for i in range(1, len(prompt_ids)):
+                if i >= len(prompt_logprobs) or prompt_logprobs[i] is None:
+                    out.append(None)
+                    continue
+                entry = prompt_logprobs[i]
+                items = getattr(entry, "items", None)
+                if not callable(items):
+                    out.append(None)
+                    continue
+
+                pairs: list[tuple[int, float]] = []
+                for tok, lp_obj in entry.items():
+                    if isinstance(lp_obj, (float, int)):
+                        lp_val = float(lp_obj)
+                    else:
+                        lp_val = getattr(lp_obj, "logprob", None)
+                        if lp_val is None and isinstance(lp_obj, dict):
+                            lp_val = lp_obj.get("logprob")
+                        if lp_val is None:
+                            continue
+                        lp_val = float(lp_val)
+                    pairs.append((int(tok), float(lp_val)))
+
+                pairs.sort(key=lambda kv: kv[1], reverse=True)
+                out.append(pairs[:kk])
 
             return out
 
@@ -1288,9 +1560,19 @@ class MultiNodeInferenceEngine:
             ray_cgraph_get_timeout = (
                 os.environ.get("RAY_CGRAPH_get_timeout")
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
-                or "300"
+                or "1800"
             )
             logger.info(f"multinode_vllm_init actor={self.actor_name} RAY_CGRAPH_get_timeout={ray_cgraph_get_timeout}")
+
+            # Large models can spend 10-30+ minutes loading shards across many GPUs.
+            if total_required_gpus >= 16:
+                init_timeout = 3600
+            elif total_required_gpus >= 8:
+                init_timeout = 1800
+            elif total_required_gpus >= 4:
+                init_timeout = 1800
+            else:
+                init_timeout = 600
 
             is_persistent = False
             persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()
@@ -1304,6 +1586,14 @@ class MultiNodeInferenceEngine:
                 existing_actor = ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                 try:
                     is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
+                except ray.exceptions.GetTimeoutError:
+                    # During large vLLM initialization the actor event loop can be blocked, so a
+                    # readiness probe may time out. Treat this as "not ready" and fall back to
+                    # waiting on initialize(), rather than killing and recreating the actor.
+                    logger.warning(
+                        f"ray.get(is_ready) timed out for {self.actor_name}; treating as not-ready"
+                    )
+                    is_ready = False
                 except ray.exceptions.RayTaskError as e:
                     logger.warning(
                         f"ray.get(is_ready) failed for {self.actor_name}: {type(e).__name__}: {e}; treating as not-ready"
@@ -1335,13 +1625,49 @@ class MultiNodeInferenceEngine:
                     resource_pool.mark_ready(self.actor_name)
                     return
                 else:
-                    logger.warning(f"Actor {self.actor_name} exists but not ready, will recreate")
+                    # vLLM engine initialization can take a long time. If an actor exists but is not
+                    # ready, assume it is still initializing and wait, rather than killing and
+                    # recreating (which can lead to repeated Volcano placement selection and
+                    # "insufficient free nodes" during initialization).
+                    logger.info(
+                        f"Actor {self.actor_name} exists but not ready; waiting for initialize (timeout={init_timeout}s)"
+                    )
+                    try:
+                        await asyncio.to_thread(ray.get, existing_actor.initialize.remote(), timeout=init_timeout)
+                    except ray.exceptions.GetTimeoutError:
+                        logger.warning(
+                            f"Actor {self.actor_name} initialize timed out after {init_timeout}s; will recreate"
+                        )
+                    except ray.exceptions.RayTaskError as e:
+                        logger.warning(
+                            f"ray.get(initialize) failed for {self.actor_name}: {type(e).__name__}: {e}; will recreate"
+                        )
+                    except SystemExit as e:
+                        if getattr(e, "code", None) == 15:
+                            raise
+                        logger.warning(
+                            f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}; will recreate"
+                        )
+                    else:
+                        logger.info(f"Connected to existing MultiNodeVLLMEngine after init: {self.actor_name}")
+                        self.engine = existing_actor
+                        self._initialized = True
+                        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                        resource_pool = get_resource_pool()
+                        resource_pool.register(
+                            actor_name=self.actor_name,
+                            actor_type=ActorType.VLLM,
+                            num_gpus=total_required_gpus,
+                            actor_handle=self.engine,
+                            namespace=PERSISTENT_NAMESPACE,
+                            base_model=self.model_path,
+                            protected=is_persistent,
+                        )
+                        resource_pool.mark_ready(self.actor_name)
+                        return
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
-            except ray.exceptions.GetTimeoutError:
-                # Do not assume readiness if we cannot run the readiness RPC.
-                # Reusing a half-initialized actor can surface as 'engine is None' in generate().
-                logger.warning(f"Actor {self.actor_name} is_ready timed out; treating as not-ready and recreating")
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -1397,7 +1723,7 @@ class MultiNodeInferenceEngine:
                     f"rq={volc_rq} nodes={node_ips}"
                 )
                 resources = compute_multinode_engine_resources(
-                    worker_gpus, node_ips=node_ips, gpus_per_node=gpus_per_node
+                    worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
                 )
                 controller_gpus = resources.controller_gpus
                 controller_cpus = resources.controller_cpus
@@ -1480,14 +1806,24 @@ class MultiNodeInferenceEngine:
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                # Some environments import tvm_ffi during vLLM init and try to JIT-build a
+                # torch c-dlpack addon on every Ray worker process, which can spawn dozens
+                # of concurrent compilers and stall engine startup. Disable the optional
+                # build to keep vLLM init deterministic.
+                "TVM_FFI_DISABLE_TORCH_C_DLPACK": "1",
                 # vLLM Ray executor uses Ray compiled DAG (cgraph); vLLM defaults to 300s.
                 # If a model execution takes longer, EngineCore can die and the actor becomes unusable.
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
-                # mp backend requires local multiprocessing; force v1 there.
-                "VLLM_USE_V1": "1" if distributed_executor_backend == "mp" else "0",
                 "VLLM_DISABLE_PYNCCL": "1",
             }
+            env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+            if "VLLM_USE_V1" in os.environ:
+                env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
+            else:
+                # mp backend requires local multiprocessing; default to v1 there unless explicitly overridden.
+                env_vars["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             for k in (
                 # Ray compiled DAG knobs (driver-side env; propagated via runtime_env).
                 "RAY_CGRAPH_submit_timeout",
@@ -1517,20 +1853,13 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENABLE_CHUNKED_PREFILL",
                 "MINT_VLLM_ENABLE_PREFIX_CACHING",
                 "MINT_VLLM_FULLY_SHARDED_LORAS",
+                "MINT_VLLM_LORA_DTYPE",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
                 "VLLM_DISABLE_RAY_COMPILED_DAG",
                 "VLLM_USE_RAY_WRAPPED_PP_COMM",
                 "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
                 "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM",
-                "MINT_FAULTHANDLER_SIGUSR1",
-                "MINT_VLLM_PREFLIGHT_FINITE_GATE",
-                "MINT_VLLM_TRACE_STAGE_STATS",
-                "MINT_VLLM_TRACE_STAGE_STATS_REQ_SUFFIX",
-                "MINT_VLLM_TRACE_NONFINITE",
-                "MINT_VLLM_DISABLE_PACK_MOE_PATCH",
-                "MINT_VLLM_DISABLE_PUNICA_PATCH",
-                "MINT_VLLM_SANITIZE_W13_AFTER_EXPAND",
             ):
                 v = os.environ.get(k)
                 if v is not None:
@@ -1541,6 +1870,8 @@ class MultiNodeInferenceEngine:
 
             # Expose selected vLLM debug/perf knobs via API host env without code deploys.
             for k in (
+                "VLLM_LOGGING_LEVEL",
+                "VLLM_LOG_LEVEL",
                 "VLLM_ATTENTION_BACKEND",
                 "VLLM_USE_FLASHINFER_SAMPLER",
                 "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING",
@@ -1558,17 +1889,13 @@ class MultiNodeInferenceEngine:
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
 
-            # K2 MoE per-expert LoRA is too large to replicate across TP ranks
-            # (e.g., 384 experts * hidden * rank). Enable fully-sharded LoRA by
-            # default for large-TP engines unless explicitly overridden.
-            if "MINT_VLLM_FULLY_SHARDED_LORAS" not in env_vars:
-                if (
-                    self.max_loras > 0
-                    and self.max_lora_rank is not None
-                    and self.tensor_parallel_size >= 32
-                    and self.max_lora_rank % self.tensor_parallel_size == 0
-                ):
-                    env_vars["MINT_VLLM_FULLY_SHARDED_LORAS"] = "1"
+            # Keep fully-sharded LoRAs opt-in.
+            #
+            # We have observed vLLM fused-MoE + LoRA crashes in Volcano deployments when
+            # fully-sharded LoRAs are enabled (assert in vllm/lora/layers/fused_moe.py
+            # during engine init/profile run). Operators can still enable this via:
+            #   export MINT_VLLM_FULLY_SHARDED_LORAS=1
+            # but we should not force-enable it in code.
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
@@ -1600,15 +1927,6 @@ class MultiNodeInferenceEngine:
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
                 f"total_gpus={total_required_gpus}"
             )
-            # Large models can spend 10-30+ minutes loading shards across many GPUs.
-            if total_required_gpus >= 16:
-                init_timeout = 3600
-            elif total_required_gpus >= 8:
-                init_timeout = 1800
-            elif total_required_gpus >= 4:
-                init_timeout = 1800
-            else:
-                init_timeout = 600
 
             loop = asyncio.get_event_loop()
             try:
@@ -1734,11 +2052,24 @@ class MultiNodeInferenceEngine:
 
         # Add to engine (all workers load from shared path)
         start_time = time.time()
-        await self.engine.add_lora.remote(
-            lora_int_id=lora_id,
-            lora_path=adapter_dir,
-            lora_name=sampling_session_id,
-        )
+        try:
+            ref = self.engine.add_lora.remote(
+                lora_int_id=lora_id,
+                lora_path=adapter_dir,
+                lora_name=sampling_session_id,
+            )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        except Exception as e:
+            # Roll back registry on load failure so retries don't trip
+            # "already has lora_int_id" for the same session.
+            try:
+                await self.registry.remove(lora_id)
+            except Exception as cleanup_e:
+                logger.warning(
+                    f"Failed to roll back lora_int_id={lora_id} after add_lora failure: "
+                    f"{type(cleanup_e).__name__}: {cleanup_e}"
+                )
+            raise
         load_time = time.time() - start_time
 
         logger.info(
@@ -1764,11 +2095,35 @@ class MultiNodeInferenceEngine:
         lora_id = await self.registry.allocate(sampling_session_id, lora_path)
 
         start_time = time.time()
-        await self.engine.add_lora.remote(
-            lora_int_id=lora_id,
-            lora_path=lora_path,
-            lora_name=sampling_session_id,
-        )
+        try:
+            ref = self.engine.add_lora.remote(
+                lora_int_id=lora_id,
+                lora_path=lora_path,
+                lora_name=sampling_session_id,
+            )
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        except Exception:
+            print(
+                "[vLLM add_lora_for_session_from_path failed] "
+                f"sampling_session_id={sampling_session_id} lora_int_id={lora_id} path={lora_path}",
+                flush=True,
+            )
+            logger.exception(
+                "Failed to add LoRA from path for sampling_session_id=%s lora_int_id=%s path=%s",
+                sampling_session_id,
+                lora_id,
+                lora_path,
+            )
+            # Roll back registry on load failure so retries don't trip
+            # "already has lora_int_id" for the same session.
+            try:
+                await self.registry.remove(lora_id)
+            except Exception as cleanup_e:
+                logger.warning(
+                    f"Failed to roll back lora_int_id={lora_id} after add_lora failure: "
+                    f"{type(cleanup_e).__name__}: {cleanup_e}"
+                )
+            raise
         load_time = time.time() - start_time
 
         logger.info(
@@ -2017,6 +2372,79 @@ class MultiNodeInferenceEngine:
 
         return list(result)
 
+    async def compute_topk(
+        self,
+        sampling_session_id: str | None,
+        prompt_ids: list[int],
+        request_id: str,
+        k: int = 10,
+    ) -> list[list[tuple[int, float]] | None]:
+        """Compute top-K prompt logprobs using session-specific LoRA or base model."""
+        if not self._initialized:
+            raise RuntimeError("Engine not initialized")
+
+        if not prompt_ids:
+            return []
+        if len(prompt_ids) == 1:
+            return [None]
+
+        if self.max_model_len is not None and len(prompt_ids) > self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_ids)} tokens, exceeds max_model_len={self.max_model_len}. "
+                "Reduce prompt or use a model with larger context."
+            )
+
+        kk = int(k)
+        if kk <= 0:
+            return [None] * len(prompt_ids)
+
+        ray_get_timeout_s = float(os.environ.get("MINT_VLLM_RAY_GET_TIMEOUT_S", "0"))
+
+        lora_id = None
+        lora_path = None
+        if sampling_session_id is not None:
+            lora_id = await self.registry.get_lora_id(sampling_session_id)
+            if lora_id is not None:
+                lora_path = await self.registry.get_adapter_path(lora_id)
+
+        ref = self.engine.compute_prompt_topk.remote(
+            prompt_ids=prompt_ids,
+            request_id=request_id,
+            lora_int_id=lora_id,
+            lora_path=lora_path,
+            k=kk,
+        )
+        try:
+            timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
+            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
+            ) from e
+        except Exception:
+            logger.exception(
+                "multinode_vllm_ray_get_failed compute_topk actor=%s request_id=%s sampling_session_id=%s prompt_len=%s k=%s",
+                self.actor_name,
+                request_id,
+                sampling_session_id,
+                len(prompt_ids),
+                kk,
+            )
+            try:
+                ray_kill.kill(
+                    self.engine,
+                    reason="multinode_vllm_ray_get_failed",
+                    actor_name=self.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    timeout_s=10,
+                )
+            except Exception:
+                pass
+            raise
+
+        return list(result)
+
     async def remove_session(self, sampling_session_id: str) -> bool:
         """Remove a sampling session and its LoRA."""
         lora_id = await self.registry.get_lora_id(sampling_session_id)
@@ -2024,7 +2452,8 @@ class MultiNodeInferenceEngine:
             return False
 
         try:
-            await self.engine.remove_lora.remote(lora_id)
+            ref = self.engine.remove_lora.remote(lora_id)
+            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
 

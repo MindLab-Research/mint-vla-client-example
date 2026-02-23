@@ -119,9 +119,6 @@ ipython_config.py
 
 # pixi
 
-# Codex task scratch files
-PROMPT.md
-LOG.md
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 #pixi.lock
 #   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
@@ -195,6 +192,9 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+# Per-task scratchpads (do not commit)
+PROMPT.md
+LOG.md
 
 # PyPI configuration file
 .pypirc
@@ -219,9 +219,9 @@ checkpoints/
 # Codex task files (do not commit)
 PROMPT.md
 LOG.md
-.PROMPT.md
 transcript.txt
-results/
+results/*
+.claude/skills/merge-gate/results/
 
 # Generated files
 ray_head_ip.txt

@@ -23,10 +23,10 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from ..backend.future_store import future_store
-from ..checkpoints import CHECKPOINTS_DIR, resolve_checkpoint_path
+from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
 from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -174,7 +174,6 @@ def _get_max_model_len(base_model: str | None) -> int | None:
 @router.post("/create_model", response_model=UntypedAPIFuture)
 async def create_model(
     request: CreateModelRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
@@ -234,7 +233,6 @@ async def create_model(
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
 
@@ -252,7 +250,41 @@ async def create_model(
             config={"lora_rank": request.lora_config.rank if request.lora_config else None},
         )
 
-    background_tasks.add_task(_do_create_model, request_id, request, user_id, webhook_url)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "create_model"})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.create_model",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=webhook_url,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue create_model request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -366,7 +398,6 @@ def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a training model and load existing checkpoint.
@@ -389,6 +420,7 @@ async def create_model_from_state(
 
     from ..gateway import (
         encode_request_id,
+        forward_file,
         forward_json,
         register_remote_training_model,
         upstream_for_model,
@@ -396,12 +428,55 @@ async def create_model_from_state(
 
     upstream = upstream_for_model(request.base_model)
     if upstream is not None:
+        user_id = _get_user_id(http_request)
+        incoming_headers = dict(http_request.headers)
+        if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
+            local_path = resolve_checkpoint_path(request.state_path, user_id=user_id)
+            if user_id and user_id != "admin":
+                load_real = os.path.realpath(local_path)
+                checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+                allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
+                if load_real.startswith(checkpoints_real + os.sep) and not (
+                    load_real == allowed_real or load_real.startswith(allowed_real + os.sep)
+                ):
+                    raise HTTPException(status_code=403, detail="Access denied")
+            if os.path.isdir(local_path):
+                import asyncio
+                import tempfile
+
+                proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
+                fd, tmp_archive = tempfile.mkstemp(prefix="gateway_ckpt_proxy_", suffix=".tar.gz")
+                os.close(fd)
+                try:
+                    await asyncio.to_thread(create_checkpoint_archive, local_path, tmp_archive)
+                    upload_resp = await forward_file(
+                        upstream=upstream,
+                        path="/api/v1/checkpoints/upload",
+                        incoming_headers=incoming_headers,
+                        file_path=tmp_archive,
+                        timeout_s=proxy_timeout_s,
+                    )
+                finally:
+                    try:
+                        os.unlink(tmp_archive)
+                    except OSError:
+                        pass
+                if upload_resp.status_code >= 400:
+                    raise HTTPException(status_code=upload_resp.status_code, detail=upload_resp.text)
+                payload = upload_resp.json()
+                ckpt_id = payload.get("checkpoint_id")
+                if not isinstance(ckpt_id, str) or not ckpt_id:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Upstream checkpoints/upload returned invalid checkpoint_id",
+                    )
+                request = request.model_copy(update={"state_path": ckpt_id})
         try:
             resp = await forward_json(
                 upstream=upstream,
                 method="POST",
                 path="/api/v1/create_model_from_state",
-                incoming_headers=dict(http_request.headers),
+                incoming_headers=incoming_headers,
                 json_body=request.model_dump(),
                 timeout_s=30.0,
             )
@@ -428,9 +503,44 @@ async def create_model_from_state(
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
-    background_tasks.add_task(_do_create_model_from_state, request_id, request, user_id)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_forward_backward_result_bytes(request),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "create_model_from_state"})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.create_model_from_state",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue create_model_from_state request: {e}"
+        )
+
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -544,7 +654,6 @@ async def _do_create_model_from_state(
 @router.post("/forward_backward", response_model=UntypedAPIFuture)
 async def forward_backward(
     request: ForwardBackwardRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform forward + backward pass on training data."""
@@ -608,68 +717,65 @@ async def forward_backward(
                 ),
             )
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
 
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_forward_backward_result_bytes(request),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
     try:
-        if training_engine is None:
-            raise RuntimeError("Training engine not initialized")
-
-        worker = getattr(training_engine, "_workers", {}).get(session.model_id)
-        if worker is None:
-            raise RuntimeError(f"Training worker not found for model_id={session.model_id}")
-
-        batch = request.forward_backward_input.data
-        token_count, max_seq_len = _compute_token_stats(batch)
-        msg = (
-            f"[{session.model_id}] forward_backward submit request_id={request_id} "
-            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
-            f"loss_fn={request.forward_backward_input.loss_fn}"
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "forward_backward", "model_id": request.model_id})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.forward_backward",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
         )
-        print(msg, flush=True)
-        logger.info(msg)
-
-        data_items = [item.model_dump() for item in request.forward_backward_input.data]
-        loss_fn = request.forward_backward_input.loss_fn
-        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
-
-        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(session.model_id)
-        future_store.submit(
-            request_id,
-            worker,
-            "forward_backward",
-            {
-                "data_items": data_items,
-                "loss_fn": loss_fn,
-                "loss_fn_config": loss_fn_config,
-                "session_id": session.model_id,
-            },
-            meta={"actor_name": actor_name, "model_id": session.model_id, "op": "forward_backward"},
-        )
-
-        if user_id:
-            get_usage_logger().log(
-                user_id=user_id,
-                operation_type="forward_backward",
-                model_name=session.base_model,
-                token_count=token_count,
-                session_id=session.model_id,
-                request_id=request_id,
-            )
     except Exception as e:
-        logger.exception(f"[forward_backward] submit failed: {e}")
-        future_store.fail(request_id, str(e))
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue forward_backward request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_forward_backward(
-    request_id: str, session, request: ForwardBackwardRequest, user_id: str | None
-) -> None:
+async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest, user_id: str | None) -> None:
     """Background task for forward_backward."""
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
+
+        max_model_len = _get_max_model_len(session.base_model)
+        if max_model_len is not None:
+            _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
+            if max_seq_len > max_model_len:
+                raise RuntimeError(
+                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                    f"for model {session.base_model}"
+                )
 
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
@@ -712,7 +818,6 @@ async def _do_forward_backward(
 @router.post("/train_step", response_model=UntypedAPIFuture)
 async def train_step(
     request: TrainStepRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform a combined forward_backward + optim_step."""
@@ -778,19 +883,58 @@ async def train_step(
                 ),
             )
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
-    background_tasks.add_task(_do_train_step, request_id, session, request, user_id)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "train_step", "model_id": request.model_id})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.train_step",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue train_step request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_train_step(
-    request_id: str, session, request: TrainStepRequest, user_id: str | None
+    request_id: str, request: TrainStepRequest, user_id: str | None
 ) -> None:
     """Background task for train_step."""
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
 
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
@@ -832,7 +976,6 @@ async def _do_train_step(
 @router.post("/forward", response_model=UntypedAPIFuture)
 async def forward(
     request: ForwardRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform forward pass only (no backward). Returns logprobs.
@@ -904,18 +1047,57 @@ async def forward(
                 ),
             )
 
-    request_id = future_store.create()
-    background_tasks.add_task(_do_forward, request_id, session, request)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "forward", "model_id": request.model_id})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.forward",
+            request_json=request_json,
+            user_id=None,
+            webhook_url=None,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue forward request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_forward(
-    request_id: str, session, request: ForwardRequest
+    request_id: str, request: ForwardRequest
 ) -> None:
     """Background task for forward."""
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
 
         result = await training_engine.forward(session, request)
         future_store.resolve(request_id, result)
@@ -933,7 +1115,6 @@ async def _do_forward(
 @router.post("/optim_step", response_model=UntypedAPIFuture)
 async def optim_step(
     request: OptimStepRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform optimizer step to update weights."""
@@ -988,41 +1169,56 @@ async def optim_step(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    request_id = future_store.create()
+    user_id = _get_user_id(http_request)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
 
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
     try:
-        if training_engine is None:
-            raise RuntimeError("Training engine not initialized")
-
-        worker = getattr(training_engine, "_workers", {}).get(session.model_id)
-        if worker is None:
-            raise RuntimeError(f"Training worker not found for model_id={session.model_id}")
-
-        lr = request.adam_params.learning_rate if request.adam_params else None
-        msg = f"[{session.model_id}] optim_step submit request_id={request_id} lr={lr}"
-        print(msg, flush=True)
-        logger.info(msg)
-
-        actor_name = getattr(training_engine, "_resource_pool_actor_names", {}).get(session.model_id)
-        future_store.submit(
-            request_id,
-            worker,
-            "optim_step",
-            {"learning_rate": lr, "session_id": session.model_id},
-            meta={"actor_name": actor_name, "model_id": session.model_id, "op": "optim_step"},
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "optim_step", "model_id": request.model_id})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.optim_step",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
         )
     except Exception as e:
-        logger.exception(f"[optim_step] submit failed: {e}")
-        future_store.fail(request_id, str(e))
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue optim_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_optim_step(request_id: str, session, request: OptimStepRequest) -> None:
+async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: str | None) -> None:
     """Background task for optim_step."""
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
 
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
@@ -1118,7 +1314,6 @@ async def reset_expert_bias(
 @router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)
 async def save_weights_for_sampler(
     request: SaveWeightsForSamplerRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Save model weights for inference use."""
@@ -1177,20 +1372,55 @@ async def save_weights_for_sampler(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
     from ..client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
-    background_tasks.add_task(
-        _do_save_weights_for_sampler, request_id, session, request, user_id, prefer_tinker
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
     )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(
+            request_id, meta={"op": "save_weights_for_sampler", "model_id": request.model_id}
+        )
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="training.save_weights_for_sampler",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+            extra={"prefer_tinker": bool(prefer_tinker)},
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue save_weights_for_sampler request: {e}"
+        )
+
     return UntypedAPIFuture(request_id=request_id)
 
 
 async def _do_save_weights_for_sampler(
     request_id: str,
-    session,
     request: SaveWeightsForSamplerRequest,
     user_id: str | None,
     prefer_tinker: bool,
@@ -1203,8 +1433,14 @@ async def _do_save_weights_for_sampler(
     """
     print(f"[DEBUG _do_save_weights_for_sampler] ENTRY request_id={request_id}", flush=True)
     try:
-        if training_engine is None:
+        if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
 
         from ..checkpoints import get_checkpoints_dir
 

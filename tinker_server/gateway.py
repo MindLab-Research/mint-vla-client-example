@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,6 +13,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _GATEWAY_REQUEST_ID_PREFIX = "gw:"
+
+_http_clients_lock = asyncio.Lock()
+_http_clients: dict[str, httpx.AsyncClient] = {}
 
 
 @dataclass(frozen=True)
@@ -135,10 +139,41 @@ async def forward_json(
     json_body: dict[str, Any] | None,
     timeout_s: float = 30.0,
 ) -> httpx.Response:
+    headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    key = upstream.base_url
+    async with _http_clients_lock:
+        client = _http_clients.get(key)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(base_url=upstream.base_url)
+            _http_clients[key] = client
+    return await client.request(method, path, headers=headers, json=json_body, timeout=timeout_s)
+
+
+async def close_http_clients() -> None:
+    async with _http_clients_lock:
+        clients = list(_http_clients.values())
+        _http_clients.clear()
+    for c in clients:
+        await c.aclose()
+
+
+async def forward_file(
+    *,
+    upstream: Upstream,
+    path: str,
+    incoming_headers: dict[str, str],
+    file_path: str,
+    field_name: str = "file",
+    media_type: str = "application/gzip",
+    timeout_s: float = 600.0,
+) -> httpx.Response:
     url = f"{upstream.base_url}{path}"
     headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    filename = os.path.basename(file_path)
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        return await client.request(method, url, headers=headers, json=json_body)
+        with open(file_path, "rb") as f:
+            files = {field_name: (filename, f, media_type)}
+            return await client.post(url, headers=headers, files=files)
 
 
 _remote_sampling_sessions: dict[str, tuple[str, str]] = {}  # sampling_session_id -> (upstream_alias, base_model)

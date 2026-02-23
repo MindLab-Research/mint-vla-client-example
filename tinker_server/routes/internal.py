@@ -141,6 +141,77 @@ async def health_check():
     )
 
 
+@router.get("/admission_stats")
+async def admission_stats() -> dict:
+    from dataclasses import asdict
+
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.future_store import future_store
+    from ..backend.resource_pool import get_resource_pool
+
+    def _self_rss_bytes() -> int:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return rss_pages * page_size
+
+    timeout_s = 10.0
+
+    cap = None
+    try:
+        cap = asdict(capacity_manager.snapshot(timeout_s=timeout_s))
+    except Exception as e:
+        cap = {"error": f"{type(e).__name__}: {e}"}
+
+    q = None
+    try:
+        q = await api_work_queue.stats(timeout_s=timeout_s)
+        if not isinstance(q, dict):
+            q = {"error": f"api_work_queue.stats returned non-dict: {type(q)}"}
+    except Exception as e:
+        q = {"error": f"{type(e).__name__}: {e}"}
+
+    fs = None
+    try:
+        fs = future_store.ensure_ready(timeout_s=timeout_s)
+    except Exception as e:
+        fs = {"error": f"{type(e).__name__}: {e}"}
+
+    actors: dict = {}
+    try:
+        actors["capacity_manager"] = {"rss_bytes": int(capacity_manager.rss_bytes(timeout_s=timeout_s))}
+    except Exception as e:
+        actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        actors["api_work_queue"] = {"rss_bytes": int(await api_work_queue.rss_bytes(timeout_s=timeout_s))}
+    except Exception as e:
+        actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        actors["future_store"] = {"rss_bytes": int(future_store.rss_bytes(timeout_s=timeout_s))}
+    except Exception as e:
+        actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        pool = get_resource_pool()
+        actors["resource_pool"] = pool.rss_snapshot(timeout_s=timeout_s)
+    except Exception as e:
+        actors["resource_pool"] = {"error": f"{type(e).__name__}: {e}"}
+
+    proc = {"pid": int(os.getpid())}
+    try:
+        proc["rss_bytes"] = int(_self_rss_bytes())
+    except Exception as e:
+        proc["rss_error"] = f"{type(e).__name__}: {e}"
+
+    return {"capacity": cap, "work_queue": q, "future_store": fs, "actors": actors, "process": proc}
+
+
 # =============================================================================
 # Checkpoint API (per spec: .claude/skills/architecture-design/references/checkpoint-download-api.md)
 # =============================================================================

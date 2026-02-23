@@ -88,6 +88,26 @@ async def _cleanup_stale_actors() -> None:
             try:
                 actor = ray.get_actor(name, namespace=PERSISTENT_NAMESPACE)
 
+                # Hard break: legacy dense trainer actor names are no longer supported.
+                # Kill them proactively to avoid consuming GPUs indefinitely.
+                if name.startswith("dense_trainer_pool_"):
+                    try:
+                        ray_kill.kill(
+                            actor,
+                            reason="legacy_dense_trainer_prefix",
+                            actor_name=name,
+                            namespace=PERSISTENT_NAMESPACE,
+                            no_restart=True,
+                        )
+                        cleaned += 1
+                    except Exception as kill_err:
+                        logger.warning(f"Failed to kill legacy dense trainer actor {name}: {kill_err}")
+                    try:
+                        resource_pool.unregister(name)
+                    except Exception:
+                        pass
+                    continue
+
                 # Check if actor is alive.
                 # WARNING: __ray_ready__ is a normal actor task and can time out if the actor is busy.
                 # Do not treat GetTimeoutError as death; killing busy detached actors breaks in-flight work.
@@ -108,7 +128,7 @@ async def _cleanup_stale_actors() -> None:
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
-                    elif name.startswith("dense_trainer_pool_"):
+                    elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
                         base_model = ""
@@ -178,7 +198,7 @@ async def _cleanup_stale_actors() -> None:
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
-                        elif name.startswith("dense_trainer_pool_"):
+                        elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
                             base_model = ""
@@ -213,6 +233,17 @@ async def _cleanup_stale_actors() -> None:
             except ValueError:
                 # Actor name registered but no actor exists
                 logger.debug(f"Actor {name} not found (name registered but no actor)")
+                try:
+                    resource_pool.unregister(name)
+                except Exception:
+                    pass
+                try:
+                    pg_name = f"{name}_pg"
+                    pg = ray.util.get_placement_group(pg_name)
+                    ray.util.remove_placement_group(pg)
+                    logger.warning(f"Removed orphan placement_group={pg_name}")
+                except Exception:
+                    pass
 
         logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
 
@@ -232,7 +263,7 @@ async def _prewarm_persistent_models(
       - MINT_PERSISTENT_TRAIN_LR (default: 5e-5)
 
     When enabled, creates:
-      - Training actors (dense trainer pools and MegatronWorkerGroup)
+      - Training actors (pooled PEFT trainers and MegatronWorkerGroup)
       - vLLM inference actors (MultiModelInferenceManager)
 
     and marks them as ResourcePool protected to prevent LRU eviction.
@@ -525,11 +556,12 @@ async def _prewarm_persistent_models(
 
         for model_name, base_model in deferred_dense_training:
             try:
-                logger.info(f"[prewarm] training create start model={model_name} backend=dense_pool")
+                logger.info(f"[prewarm] training create start model={model_name} backend=peft_trainer")
                 dense = await asyncio.to_thread(
                     get_or_create_dense_trainer,
                     training_worker_cls=TrainingWorker,
                     base_model=base_model,
+                    model_key=model_name,
                     lora_rank=lora_rank,
                     learning_rate=learning_rate,
                     session_id=None,
@@ -538,7 +570,7 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
-                logger.exception(f"[prewarm] training failed model={model_name} backend=dense_pool: {e}")
+                logger.exception(f"[prewarm] training failed model={model_name} backend=peft_trainer: {e}")
 
 
 @asynccontextmanager
@@ -548,6 +580,13 @@ async def lifespan(app: FastAPI):
     Initializes both inference SessionManager and training components
     on startup, shuts down all sessions on application exit.
     """
+    # ==========================================================================
+    # Ray: hard requirement (fail fast)
+    # ==========================================================================
+    from .backend.future_store import future_store
+
+    future_store.ensure_ready()
+
     # ==========================================================================
     # Cleanup: Kill stale actors from previous server runs
     # ==========================================================================
@@ -625,6 +664,115 @@ async def lifespan(app: FastAPI):
     logger.info("Training components initialized")
 
     # ==========================================================================
+    # Issue #84: Admission control + API work queue workers + future reaper
+    # ==========================================================================
+    from .backend.api_work_queue import api_work_queue
+    from .backend.capacity_manager import capacity_manager
+    from .models.types import (
+        ComputeLogprobsRequest,
+        CreateModelFromStateRequest,
+        CreateModelRequest,
+        ForwardRequest,
+        ForwardBackwardRequest,
+        LoadStateRequest,
+        OptimStepRequest,
+        SampleRequest,
+        SaveStateRequest,
+        SaveWeightsForSamplerRequest,
+        TrainStepRequest,
+    )
+
+    async def _exec_sampling_asample(item):
+        req = SampleRequest.model_validate_json(item.request_json)
+        await sampling._do_sample(item.request_id, req, item.user_id)
+
+    async def _exec_sampling_compute_logprobs(item):
+        req = ComputeLogprobsRequest.model_validate_json(item.request_json)
+        await sampling._do_compute_logprobs(item.request_id, req, item.user_id)
+
+    async def _exec_training_create_model(item):
+        req = CreateModelRequest.model_validate_json(item.request_json)
+        await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+
+    async def _exec_training_create_model_from_state(item):
+        req = CreateModelFromStateRequest.model_validate_json(item.request_json)
+        await training._do_create_model_from_state(item.request_id, req, item.user_id)
+
+    async def _exec_training_train_step(item):
+        req = TrainStepRequest.model_validate_json(item.request_json)
+        await training._do_train_step(item.request_id, req, item.user_id)
+
+    async def _exec_training_forward(item):
+        req = ForwardRequest.model_validate_json(item.request_json)
+        await training._do_forward(item.request_id, req)
+
+    async def _exec_training_forward_backward(item):
+        req = ForwardBackwardRequest.model_validate_json(item.request_json)
+        await training._do_forward_backward(item.request_id, req, item.user_id)
+
+    async def _exec_training_save_weights_for_sampler(item):
+        req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
+        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker)
+
+    async def _exec_training_optim_step(item):
+        req = OptimStepRequest.model_validate_json(item.request_json)
+        await training._do_optim_step(item.request_id, req, item.user_id)
+
+    async def _exec_weights_save_weights(item):
+        req = SaveStateRequest.model_validate_json(item.request_json)
+        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        await weights._do_save_state(
+            item.request_id,
+            req,
+            user_id=item.user_id,
+            webhook_url=item.webhook_url,
+            prefer_tinker=prefer_tinker,
+        )
+
+    async def _exec_weights_save_state(item):
+        req = SaveStateRequest.model_validate_json(item.request_json)
+        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        await weights._do_save_state(
+            item.request_id,
+            req,
+            user_id=item.user_id,
+            webhook_url=item.webhook_url,
+            prefer_tinker=prefer_tinker,
+        )
+
+    async def _exec_weights_load_state(item):
+        req = LoadStateRequest.model_validate_json(item.request_json)
+        await weights._do_load_state(item.request_id, req, item.user_id)
+
+    api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
+    api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
+    api_work_queue.set_executor("training.create_model", _exec_training_create_model)
+    api_work_queue.set_executor("training.create_model_from_state", _exec_training_create_model_from_state)
+    api_work_queue.set_executor("training.train_step", _exec_training_train_step)
+    api_work_queue.set_executor("training.forward", _exec_training_forward)
+    api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
+    api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
+    api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
+    api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
+    api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
+    api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
+
+    await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+
+    async def _future_reaper_loop() -> None:
+        while True:
+            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+            try:
+                reaped = future_store.reap()
+                for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
+                    capacity_manager.release_all(str(rid))
+            except Exception:
+                pass
+
+    future_reaper_task = asyncio.create_task(_future_reaper_loop())
+
+    # ==========================================================================
     # Persistent actors: pre-create and protect at startup
     # ==========================================================================
     asyncio.create_task(_prewarm_persistent_models(train_engine, multi_model_manager))
@@ -634,6 +782,9 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Shutdown
     # ==========================================================================
+    future_reaper_task.cancel()
+    await asyncio.gather(future_reaper_task, return_exceptions=True)
+    await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 
     # Shutdown training sessions
@@ -647,6 +798,10 @@ async def lifespan(app: FastAPI):
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
 
+    from .gateway import close_http_clients
+
+    await close_http_clients()
+
 
 app = FastAPI(
     lifespan=lifespan,
@@ -655,6 +810,37 @@ app = FastAPI(
     version="0.1.0",
     docs_url=None,  # Disable built-in Swagger UI
 )
+
+from .backend.future_store import FutureStoreUnavailableError
+
+
+@app.exception_handler(FutureStoreUnavailableError)
+async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ray unavailable: FutureStore requires Ray"},
+    )
+
+
+from .backend.api_work_queue import ApiWorkQueueUnavailableError
+from .backend.capacity_manager import CapacityManagerUnavailableError
+
+
+@app.exception_handler(ApiWorkQueueUnavailableError)
+async def api_work_queue_unavailable_handler(_: Request, __: ApiWorkQueueUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ray unavailable: ApiWorkQueue requires Ray"},
+    )
+
+
+@app.exception_handler(CapacityManagerUnavailableError)
+async def capacity_manager_unavailable_handler(_: Request, __: CapacityManagerUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ray unavailable: CapacityManager requires Ray"},
+    )
+
 
 # Paths that don't require authentication
 UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}

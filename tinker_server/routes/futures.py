@@ -6,7 +6,7 @@ Endpoints:
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from ..backend.future_store import FutureStatus, future_store
+from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
 
@@ -17,6 +17,8 @@ GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persis
 _SAFE_ERROR_PREFIXES = (
     "Access denied",
     "Checkpoint not found:",
+    "Future expired",
+    "Future already retrieved",
 )
 
 
@@ -53,15 +55,10 @@ async def retrieve_future(
     a small allowlist of safe, user-actionable errors (e.g. permission/ownership).
     Regular users receive a generic error message for other failures.
     """
-    try:
-        status = future_store.get_status(body.request_id)
-    except KeyError:
-        from ..gateway import decode_request_id, forward_json, upstream_for_alias
+    from ..gateway import decode_request_id, forward_json, upstream_for_alias
 
-        decoded = decode_request_id(body.request_id)
-        if decoded is None:
-            raise HTTPException(status_code=404, detail=f"Unknown request_id: {body.request_id}")
-
+    decoded = decode_request_id(body.request_id)
+    if decoded is not None:
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
@@ -92,6 +89,22 @@ async def retrieve_future(
                 detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
             )
 
+        if (
+            upstream_resp.status_code == 404
+            and isinstance(payload, dict)
+            and isinstance(payload.get("detail"), str)
+            and "Unknown request_id:" in payload["detail"]
+        ):
+            detail: object = GENERIC_ERROR_MESSAGE
+            if _is_privileged(http_request):
+                detail = {
+                    "error": "Lost future (upstream Unknown request_id)",
+                    "upstream_alias": upstream_alias,
+                    "upstream_request_id": upstream_request_id,
+                    "upstream_detail": payload.get("detail"),
+                }
+            raise HTTPException(status_code=503, detail=detail)
+
         # If this future corresponds to an ephemeral save_weights_for_sampler on an upstream,
         # register the returned sampling_session_id so subsequent /asample routes correctly.
         try:
@@ -115,7 +128,29 @@ async def retrieve_future(
         ):
             payload = dict(payload)
             payload["error"] = _public_error(payload.get("error"))
+        if (
+            upstream_resp.status_code != 200
+            and isinstance(payload, dict)
+            and "detail" in payload
+            and not _is_privileged(http_request)
+        ):
+            payload = dict(payload)
+            payload["detail"] = GENERIC_ERROR_MESSAGE
         return payload
+
+    try:
+        status = future_store.get_status(body.request_id)
+    except FutureStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+    except KeyError:
+        detail: object = f"Unknown request_id: {body.request_id}"
+        if _is_privileged(http_request):
+            detail = {
+                "error": detail,
+                "request_id": body.request_id,
+                "future_store": future_store.debug_snapshot(),
+            }
+        raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
         meta = None
@@ -142,6 +177,10 @@ async def retrieve_future(
         response.status_code = pending.status_code
         response.headers.update(pending.headers)
         return pending.body
+    elif status == FutureStatus.EXPIRED:
+        return {"error": "Future expired", "category": "system"}
+    elif status == FutureStatus.RETRIEVED:
+        return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
         error = future_store.get_error(body.request_id)
         # Only expose full error details to privileged users
@@ -149,8 +188,28 @@ async def retrieve_future(
             payload = {"error": error, "category": "system"}
         else:
             payload = {"error": _public_error(error), "category": "system"}
+        try:
+            from ..backend.capacity_manager import capacity_manager
+
+            capacity_manager.release_all(body.request_id)
+        except Exception:
+            pass
+        try:
+            future_store.cleanup(body.request_id)
+        except Exception:
+            pass
         return payload
     else:
         # DONE - return the result
         result = future_store.get_result(body.request_id)
+        try:
+            from ..backend.capacity_manager import capacity_manager
+
+            capacity_manager.release_all(body.request_id)
+        except Exception:
+            pass
+        try:
+            future_store.cleanup(body.request_id)
+        except Exception:
+            pass
         return result

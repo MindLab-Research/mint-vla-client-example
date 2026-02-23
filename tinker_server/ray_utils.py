@@ -10,7 +10,8 @@ def ray_log_to_driver_enabled() -> bool:
 
 
 def ray_log_to_driver_kwargs() -> dict[str, Any]:
-    return {"log_to_driver": True} if ray_log_to_driver_enabled() else {}
+    # Ray defaults log_to_driver=True in some contexts; explicitly set False unless enabled.
+    return {"log_to_driver": ray_log_to_driver_enabled()}
 
 
 def init_ray(**kwargs: Any) -> Any:

@@ -17,7 +17,12 @@ client -> HTTP -> tinker-server (FastAPI) -> Ray -> GPU actors
 
 ## Ray persistent (detached) actors
 
-Some GPU actors are created as detached Ray actors in a fixed namespace so they can be reused across API server restarts.
+Some control-plane and GPU actors are created as detached Ray actors in a fixed namespace so they can be reused across API server restarts.
+
+Control-plane detached actors:
+- `tinker_future_store`: async future state and result refs (results stored in Ray object store).
+- `tinker_capacity_manager`: admission control for async backlog (queue bytes and object store bytes).
+- `tinker_api_work_queue`: stores request JSON for async operations; API workers dequeue and execute.
 
 Implications:
 - A server restart loses in-process mappings (sessions, registries), but detached actors may still exist and hold GPU memory.

@@ -13,9 +13,10 @@ import hashlib
 import logging
 import os
 import time
+import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, future_store
@@ -429,7 +430,6 @@ def _get_user_id(request: Request) -> str | None:
 @router.post("/asample")
 async def asample(
     request: SampleRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Submit an async sampling request.
@@ -479,10 +479,42 @@ async def asample(
     global _inflight_sample_tasks
     if _should_backpressure(http_request):
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
-    _inflight_sample_tasks += 1
-    background_tasks.add_task(_do_sample, request_id, request, user_id)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_sampling_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_sampling_result_bytes(request),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "asample"})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="sampling.asample",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -491,8 +523,11 @@ async def _do_sample(
 ) -> None:
     """Background task to perform sampling."""
     global _inflight_sample_tasks
+    _inflight_sample_tasks += 1
     session_id: str | None = None
     engine = None
+    resource_pool = None
+    resource_pool_actor_name: str | None = None
     try:
         try:
             if session_manager is None:
@@ -533,6 +568,15 @@ async def _do_sample(
                 engine = await session_manager.get_engine_for_session(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
+                from ..backend.resource_pool import get_resource_pool
+
+                resource_pool = get_resource_pool()
+                resource_pool_actor_name = getattr(engine, "actor_name", None)
+                if not isinstance(resource_pool_actor_name, str) or not resource_pool_actor_name:
+                    raise RuntimeError(
+                        f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
+                    )
+                resource_pool.mark_inflight(resource_pool_actor_name, +1)
 
                 logger.info(
                     f"[sample path] request_id={request_id} session_id={session_id} "
@@ -730,6 +774,8 @@ async def _do_sample(
             logger.exception(f"Request {request_id} failed: {e}")
             future_store.fail(request_id, str(e))
     finally:
+        if resource_pool is not None and resource_pool_actor_name is not None:
+            resource_pool.mark_inflight(resource_pool_actor_name, -1)
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)
         _inflight_sample_tasks -= 1
@@ -738,7 +784,6 @@ async def _do_sample(
 @router.post("/compute_logprobs")
 async def compute_logprobs(
     request: ComputeLogprobsRequest,
-    background_tasks: BackgroundTasks,
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Compute logprobs for a sequence.
@@ -783,9 +828,42 @@ async def compute_logprobs(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
 
-    request_id = future_store.create()
     user_id = _get_user_id(http_request)
-    background_tasks.add_task(_do_compute_logprobs, request_id, request, user_id)
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_compute_logprobs_result_bytes
+
+    request_json = request.model_dump_json().encode("utf-8")
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_compute_logprobs_result_bytes(request),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "compute_logprobs"})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="sampling.compute_logprobs",
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
+
     return UntypedAPIFuture(request_id=request_id)
 
 

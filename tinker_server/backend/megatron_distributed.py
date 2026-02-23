@@ -260,6 +260,15 @@ class MegatronRankWorker:
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
 
+    def get_rss_bytes(self) -> int:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return rss_pages * page_size
+
     def log_memory_breakdown(self, phase: str) -> dict:
         """Log detailed GPU memory breakdown for profiling.
 
@@ -313,20 +322,24 @@ class MegatronRankWorker:
         Must be called while in train_mode context (gradients on GPU).
         """
         import torch
+        import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         grads = []
+        want_total_norm = self.rank == 0 and logger.isEnabledFor(logging.DEBUG)
         total_norm_sq = 0.0
         for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
                     for buffer in buffers:
                         if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                            grads.append(buffer.grad_data.cpu().clone())
-                            total_norm_sq += buffer.grad_data.norm().item() ** 2
+                            cpu_grad = buffer.grad_data.detach().cpu()
+                            grads.append(cpu_grad)
+                            if want_total_norm:
+                                total_norm_sq += cpu_grad.float().norm().item() ** 2
 
-        total_norm = total_norm_sq ** 0.5
-        if self.rank == 0:
+        if want_total_norm:
+            total_norm = total_norm_sq ** 0.5
             logger.debug(
                 f"[Rank {self.rank}] _capture_gradients: {len(grads)} buffers, total_norm={total_norm:.6f}"
             )
@@ -341,22 +354,40 @@ class MegatronRankWorker:
             grads: List of CPU tensors from _capture_gradients.
         """
         import torch
+        import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         idx = 0
+        want_total_norm = self.rank == 0 and logger.isEnabledFor(logging.DEBUG)
         total_norm_sq = 0.0
         for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
                     for buffer in buffers:
                         if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                            if idx < len(grads):
-                                buffer.grad_data.copy_(grads[idx].cuda())
-                                total_norm_sq += buffer.grad_data.norm().item() ** 2
-                                idx += 1
+                            if idx >= len(grads):
+                                raise RuntimeError(
+                                    f"[Rank {self.rank}] _restore_gradients: expected >= {idx+1} grads, got {len(grads)}"
+                                )
 
-        total_norm = total_norm_sq ** 0.5
-        if self.rank == 0:
+                            cpu_grad = grads[idx]
+                            if cpu_grad.is_cuda:
+                                raise RuntimeError(
+                                    f"[Rank {self.rank}] _restore_gradients: expected CPU grads, got CUDA tensor at idx={idx}"
+                                )
+
+                            buffer.grad_data.copy_(cpu_grad, non_blocking=True)
+                            if want_total_norm:
+                                total_norm_sq += cpu_grad.float().norm().item() ** 2
+                            idx += 1
+
+        if idx != len(grads):
+            raise RuntimeError(
+                f"[Rank {self.rank}] _restore_gradients: restored {idx} buffers but grads has {len(grads)} tensors"
+            )
+
+        if want_total_norm:
+            total_norm = total_norm_sq ** 0.5
             logger.debug(
                 f"[Rank {self.rank}] _restore_gradients: restored {idx} buffers, total_norm={total_norm:.6f}"
             )
@@ -1954,11 +1985,16 @@ class MegatronRankWorker:
             logger.info(f"[Rank {self.rank}] Using Megatron-Bridge export_adapter_weights API")
             adapter_state = {}
 
-            shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
+            # Default to exporting a shared-expert LoRA artifact (expert 0 only) for MoE models.
+            # vLLM hot-load will broadcast the shared expert weights at load time.
+            shared_mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
+            # Default to exporting the full per-expert LoRA tree so vLLM can pack MoE LoRAs.
+            # Operators can force a "shared expert" export (keep only expert 0) to reduce
+            # artifact size, but this requires downstream broadcasting support.
             shared_export = (
                 bool(model_is_moe)
                 and bool(use_per_expert_lora)
-                and shared_mode not in {"0", "false", "no"}
+                and shared_mode in {"1", "true", "yes"}
             )
             import re
 
@@ -2054,59 +2090,29 @@ class MegatronRankWorker:
                             f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
                         )
 
-                # If expert LoRA weights are globally shared (all experts identical),
-                # exporting per-expert keys is pure duplication (K2 can be tens of GB).
-                # Keep only expert 0 and rely on vLLM to broadcast missing experts
-                # (patched via sitecustomize) to avoid OOM during LoRA hot-load.
-                mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
-                if mode not in {"0", "false", "no"}:
-                    do_shared_export = mode in {"1", "true", "yes"}
-                    if not do_shared_export and mode in {"auto", ""}:
-                        try:
-                            import torch
-
-                            checks = 0
-                            shared = True
-                            for k, v in adapter_state.items():
-                                if ".mlp.experts.0." not in k and ".mlp.shared_experts.0." not in k:
-                                    continue
-                                k1 = (
-                                    k.replace(".mlp.experts.0.", ".mlp.experts.1.")
-                                    .replace(".mlp.shared_experts.0.", ".mlp.shared_experts.1.")
-                                )
-                                if k1 not in adapter_state:
-                                    continue
-                                v1 = adapter_state[k1]
-                                if v.shape != v1.shape or v.dtype != v1.dtype or not torch.equal(v, v1):
-                                    shared = False
-                                    break
-                                checks += 1
-                                if checks >= 5:
-                                    break
-                            do_shared_export = shared and checks > 0
-                        except Exception:
-                            do_shared_export = False
-
-                    if do_shared_export:
-                        expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
-                        before = len(adapter_state)
-                        dropped = 0
-                        filtered = {}
-                        for k, v in adapter_state.items():
-                            m = expert_pat.search(k)
-                            if m is None:
-                                filtered[k] = v
-                                continue
-                            idx = int(m.group(1))
-                            if idx == 0:
-                                filtered[k] = v
-                            else:
-                                dropped += 1
-                        adapter_state = filtered
-                        logger.info(
-                            f"[Rank 0] Shared-expert export (export_adapter_weights): kept_expert=0 "
-                            f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
-                        )
+                # Default to shared-expert export (expert 0 only). vLLM load-time patch will
+                # broadcast the shared expert weights across experts.
+                mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
+                if mode in {"1", "true", "yes"}:
+                    expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+                    before = len(adapter_state)
+                    dropped = 0
+                    filtered = {}
+                    for k, v in adapter_state.items():
+                        m = expert_pat.search(k)
+                        if m is None:
+                            filtered[k] = v
+                            continue
+                        idx = int(m.group(1))
+                        if idx == 0:
+                            filtered[k] = v
+                        else:
+                            dropped += 1
+                    adapter_state = filtered
+                    logger.info(
+                        f"[Rank 0] Shared-expert export (export_adapter_weights): kept_expert=0 "
+                        f"dropped_keys={dropped} before={before} after={len(adapter_state)}"
+                    )
 
             logger.info(f"[Rank 0] export_adapter_weights returned {len(adapter_state)} params")
             return adapter_state
@@ -2859,55 +2865,27 @@ class MegatronRankWorker:
             import os
             import re
 
-            mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "auto").strip().lower()
-            if mode not in {"0", "false", "no"}:
-                do_shared_export = mode in {"1", "true", "yes"}
-                if not do_shared_export and mode in {"auto", ""}:
-                    try:
-                        import torch
-
-                        checks = 0
-                        shared = True
-                        for k, v in lora_state_dict.items():
-                            if ".mlp.experts.0." not in k and ".mlp.shared_experts.0." not in k:
-                                continue
-                            k1 = (
-                                k.replace(".mlp.experts.0.", ".mlp.experts.1.")
-                                .replace(".mlp.shared_experts.0.", ".mlp.shared_experts.1.")
-                            )
-                            if k1 not in lora_state_dict:
-                                continue
-                            v1 = lora_state_dict[k1]
-                            if v.shape != v1.shape or v.dtype != v1.dtype or not torch.equal(v, v1):
-                                shared = False
-                                break
-                            checks += 1
-                            if checks >= 5:
-                                break
-                        do_shared_export = shared and checks > 0
-                    except Exception:
-                        do_shared_export = False
-
-                if do_shared_export:
-                    expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
-                    before = len(lora_state_dict)
-                    dropped = 0
-                    filtered = {}
-                    for k, v in lora_state_dict.items():
-                        m = expert_pat.search(k)
-                        if m is None:
-                            filtered[k] = v
-                            continue
-                        idx = int(m.group(1))
-                        if idx == 0:
-                            filtered[k] = v
-                        else:
-                            dropped += 1
-                    lora_state_dict = filtered
-                    logger.info(
-                        f"[Rank 0] Shared-expert export (custom extract): kept_expert=0 "
-                        f"dropped_keys={dropped} before={before} after={len(lora_state_dict)}"
-                    )
+            mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
+            if mode in {"1", "true", "yes"}:
+                expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
+                before = len(lora_state_dict)
+                dropped = 0
+                filtered = {}
+                for k, v in lora_state_dict.items():
+                    m = expert_pat.search(k)
+                    if m is None:
+                        filtered[k] = v
+                        continue
+                    idx = int(m.group(1))
+                    if idx == 0:
+                        filtered[k] = v
+                    else:
+                        dropped += 1
+                lora_state_dict = filtered
+                logger.info(
+                    f"[Rank 0] Shared-expert export (custom extract): kept_expert=0 "
+                    f"dropped_keys={dropped} before={before} after={len(lora_state_dict)}"
+                )
 
         return lora_state_dict
 
@@ -4082,6 +4060,15 @@ class MegatronWorkerGroup:
         self._master_port: int | None = None
 
         self._initialize()
+
+    def get_rss_bytes(self) -> int:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"unexpected /proc/self/statm format: {parts!r}")
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return rss_pages * page_size
 
     def get_master_addr(self) -> str | None:
         return self._master_addr

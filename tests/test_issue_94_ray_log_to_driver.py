@@ -23,7 +23,7 @@ def test_issue_94_init_ray_injects_log_to_driver(monkeypatch) -> None:
 
     monkeypatch.delenv("MINT_RAY_LOG_TO_DRIVER", raising=False)
     init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
-    assert "log_to_driver" not in calls[-1]
+    assert calls[-1]["log_to_driver"] is False
 
     monkeypatch.setenv("MINT_RAY_LOG_TO_DRIVER", "1")
     init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
@@ -39,4 +39,3 @@ def test_issue_94_init_ray_does_not_override_explicit_kwarg(monkeypatch) -> None
     monkeypatch.setenv("MINT_RAY_LOG_TO_DRIVER", "1")
     init_ray(address="auto", namespace="ns", ignore_reinit_error=True, log_to_driver=False)
     assert calls[-1]["log_to_driver"] is False
-

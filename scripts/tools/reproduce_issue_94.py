@@ -37,8 +37,8 @@ def main() -> int:
 
     os.environ.pop("MINT_RAY_LOG_TO_DRIVER", None)
     init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
-    if calls[-1].get("log_to_driver") is not None:
-        return _fail(f"log_to_driver unexpectedly set when disabled: {calls[-1]!r}")
+    if calls[-1].get("log_to_driver") is not False:
+        return _fail(f"log_to_driver expected False when disabled: {calls[-1]!r}")
 
     os.environ["MINT_RAY_LOG_TO_DRIVER"] = "1"
     init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
@@ -55,4 +55,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

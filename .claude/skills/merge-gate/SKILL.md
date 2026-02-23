@@ -35,7 +35,7 @@ The merge gate validates that code on `develop` is ready to merge to `main`. It 
 
 ### Full Merge Gate Procedure
 
-The merge gate runs in **two phases** with different cluster configurations:
+The merge gate runs in **three phases** with different cluster configurations:
 
 **Phase 1: Functional Tests (8 GPUs - one 8-GPU worker)**
 1. Start cluster with 8 GPUs
@@ -46,6 +46,16 @@ The merge gate runs in **two phases** with different cluster configurations:
 1. Run LRU eviction test with MINT_MIN_ACTOR_AGE=0 and a small MINT_SESSION_IDLE_TIMEOUT (to make eviction observable during the test run)
 2. Tests Dense → MoE → Dense switches with eviction
 3. Requires an observed eviction event (actor inventory changes), not just request completion
+
+**Phase 3: Multitenancy + Admission Control (8 GPUs - one 8-GPU worker)**
+1. Run backpressure/admission tests: `.claude/skills/merge-gate/tests/test_admission_control.py`
+2. Verifies 429 under flood and that retries can be admitted after load drops
+3. Verifies PEFT + Megatron trainer requests queue instead of killing/restarting actors
+
+Phase 3 requires enabling sampling backpressure by starting the server with
+`TINKER_MAX_INFLIGHT_SAMPLE_TASKS` set smaller than the API work queue worker
+count (for example `TINKER_MAX_INFLIGHT_SAMPLE_TASKS=16` with
+`TINKER_API_WORK_QUEUE_NUM_WORKERS=32`).
 
 Use the **volcano-cluster** skill to manage workers.
 
@@ -164,6 +174,8 @@ curl -s http://localhost:8000/api/v1/healthz
 | **stress** | 5 concurrent clients with different configs | All complete without deadlock | 5 min |
 | **interleaved_sessions** | A → B → A session switching | Loss continuity preserved | 3 min |
 | **rapid_session_creation** | 5 sessions in quick succession | All create successfully | 1 min |
+| **admission_control_backpressure** | Flood oversized requests (no Ray work) | Rejected with 429; capacity/actors unchanged; next request succeeds | 1 min |
+| **trainer_request_queueing** | Competing requests against same trainer | Dense+MoE requests complete; trainer actor not restarted | 3 min |
 | **mixed_model_lru_eviction** | Dense → MoE → Dense | Graceful actor replacement | 5 min |
 | **moe_long_context_inference** | MoE inference at 38K tokens (near 40K limit) | Generates output without OOM | 5 min |
 | **moe_long_context_training** | MoE training at 38K tokens (near 40K limit) | Loss computed without OOM | 8 min |
