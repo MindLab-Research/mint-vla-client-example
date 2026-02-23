@@ -145,6 +145,7 @@ async def health_check():
 async def admission_stats() -> dict:
     import asyncio
     from dataclasses import asdict
+    from typing import Any
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
