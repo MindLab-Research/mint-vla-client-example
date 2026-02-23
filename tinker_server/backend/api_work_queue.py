@@ -251,12 +251,11 @@ class ApiWorkQueueClient:
                     pass
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        import asyncio
         import ray
 
         actor = self._get_ray_actor()
         ref = actor.stats.remote()
-        return await asyncio.to_thread(ray.get, ref, timeout=float(timeout_s))
+        return ray.get(ref, timeout=float(timeout_s))
 
 
 api_work_queue = ApiWorkQueueClient()
