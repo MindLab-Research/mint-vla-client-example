@@ -424,7 +424,9 @@ async def _prewarm_persistent_models(
                     ) -> None:
                         try:
                             await asyncio.to_thread(
-                                ray.get, actor.__ray_ready__.remote(), timeout=megatron_ready_timeout_s
+                                ray.get,
+                                actor.__ray_ready__.remote(),
+                                timeout=megatron_ready_timeout_s,
                             )
                             resource_pool.mark_ready(actor_name)
                             logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
@@ -467,10 +469,6 @@ async def _prewarm_persistent_models(
     if multi_model_manager is None:
         return
 
-    if pinned_vllm_node_ip:
-        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
-        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
-
     def _infer_gpus(model_name: str) -> int:
         try:
             cfg = get_model_config(model_name)
@@ -496,6 +494,31 @@ async def _prewarm_persistent_models(
     infer_dense = [m for m in infer_models if not _infer_is_moe(m) and _infer_gpus(m) <= 8]
     infer_moe_single.sort(key=lambda m: (-_infer_gpus(m), m))
     infer_dense.sort(key=lambda m: (-_infer_gpus(m), m))
+
+    # For 2-node clusters (e.g., 16 GPUs as 2x 8-GPU nodes), avoid fragmenting nodes by
+    # pinning dense models to a separate node from single-node MoE models.
+    try:
+        gpu_node_ips = sorted(
+            {
+                str(n.get("NodeManagerAddress") or "").strip()
+                for n in ray.nodes()
+                if n.get("Alive")
+                and float((n.get("Resources") or {}).get("GPU", 0) or 0) > 0
+                and str(n.get("NodeManagerAddress") or "").strip()
+            }
+        )
+        if len(gpu_node_ips) == 2:
+            moe_ip, dense_ip = gpu_node_ips[0], gpu_node_ips[1]
+            for m in infer_moe_single:
+                pinned_vllm_node_ip.setdefault(m, moe_ip)
+            for m in infer_dense:
+                pinned_vllm_node_ip.setdefault(m, dense_ip)
+    except Exception:
+        pass
+
+    if pinned_vllm_node_ip:
+        os.environ["MINT_VLLM_PINNED_NODE_IP_JSON"] = json.dumps(pinned_vllm_node_ip)
+        logger.info(f"[prewarm] MINT_VLLM_PINNED_NODE_IP_JSON={os.environ['MINT_VLLM_PINNED_NODE_IP_JSON']}")
 
     timeout_s = float(os.environ.get("MINT_PERSISTENT_INFER_TIMEOUT_S", "1800"))
 
