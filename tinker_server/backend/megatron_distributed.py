@@ -1300,37 +1300,11 @@ class MegatronRankWorker:
 
         # Session state swap moved inside train_mode() - see below
 
-        # Get sequence lengths from raw data (before tensor creation) and filter valid items.
-        valid_items: list[dict] = []
-        valid_indices: list[int] = []
-        seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
-            if tokens:
-                valid_items.append(item)
-                valid_indices.append(item_index)
-                seq_lengths.append(len(tokens))
-            else:
-                logger.warning(f"[Rank {self.rank}] Missing tokens in item {item_index}, skipping")
-
-        if not valid_items:
-            if output_rank:
-                empty_outputs = [
-                    {"loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
-                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                    for _ in data_items
-                ]
-                return {
-                    "loss_value": 0.0,
-                    "num_tokens": 0,
-                    "clip_frac_sum": 0.0,
-                    "ratio_mean_sum": 0.0,
-                    "n_ppo_results": 0,
-                    "valid_count": 0,
-                    "loss_fn_outputs": empty_outputs,
-                }
-            return {}
+            if not tokens:
+                raise ValueError(f"Item {item_index}: model_input has no tokens")
 
         # Test CUDA context before creating TensorDict
         device = torch.cuda.current_device()
@@ -1346,7 +1320,7 @@ class MegatronRankWorker:
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         # verl's forward_step calls batch.to(device) which fails for nested tensors on CPU
         max_token_len = get_model_config(self.base_model).max_model_len
-        data = tinker_to_tensordict(valid_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Log memory before forward-backward
         self.log_memory_breakdown("before_forward_backward")
@@ -1662,40 +1636,16 @@ class MegatronRankWorker:
         if reset_bias:
             self.reset_expert_bias()
 
-        # Get sequence lengths from raw data (before tensor creation) and filter valid items.
-        valid_items: list[dict] = []
-        valid_indices: list[int] = []
-        seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
-            if tokens:
-                valid_items.append(item)
-                valid_indices.append(item_index)
-                seq_lengths.append(len(tokens))
-            else:
-                logger.warning(f"[Rank {self.rank}] Missing tokens in item {item_index}, skipping")
-
-        if not valid_items:
-            if output_rank:
-                empty_outputs = [
-                    {"loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
-                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                    for _ in data_items
-                ]
-                return {
-                    "loss_value": 0.0,
-                    "num_tokens": 0,
-                    "valid_count": 0,
-                    "loss_fn_outputs": empty_outputs,
-                    "log_probs": None,
-                }
-            return {}
+            if not tokens:
+                raise ValueError(f"Item {item_index}: model_input has no tokens")
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
         max_token_len = get_model_config(self.base_model).max_model_len
-        data = tinker_to_tensordict(valid_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        data = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
         from tinker_server.backend.megatron_training import create_logprob_extractor_fn
@@ -4503,10 +4453,8 @@ class MegatronWorkerGroup:
         if valid_count is None:
             valid_count = len(data_items)
 
-        # NaN guard: check for NaN/Inf in loss_value
         if math.isnan(loss_value) or math.isinf(loss_value):
-            logger.warning(f"[MegatronWorkerGroup] NaN/Inf in loss_value={loss_value}, replacing with 0.0")
-            loss_value = 0.0
+            raise ValueError(f"non-finite loss_value={loss_value!r}")
 
         metrics = {
             "loss:mean": float(loss_value),
@@ -4538,36 +4486,23 @@ class MegatronWorkerGroup:
 
         logger.info(f"[MegatronWorkerGroup] forward_backward ({loss_fn}): loss={loss_value:.4f}")
 
-        loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
-
-        # NaN guard for individual loss_fn_outputs entries
-        # orjson converts NaN/Inf to null, causing pydantic validation failures
-        avg_loss_fallback = loss_value / max(valid_count, 1) if valid_count > 0 else 0.0
-        if math.isnan(avg_loss_fallback) or math.isinf(avg_loss_fallback):
-            avg_loss_fallback = 0.0
-
-        nan_count = 0
-        for output in loss_fn_outputs:
-            if isinstance(output, dict) and "loss" in output:
-                loss_data = output["loss"].get("data", [])
-                if loss_data:
-                    val = loss_data[0]
-                    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
-                        output["loss"]["data"] = [avg_loss_fallback]
-                        nan_count += 1
-        if nan_count > 0:
-            logger.warning(f"[MegatronWorkerGroup] Replaced {nan_count} NaN/Inf/None loss values with {avg_loss_fallback}")
-
-        if len(loss_fn_outputs) < len(data_items):
-            # Use avg_loss_fallback (already NaN-guarded) for padding entries
-            loss_fn_outputs = list(loss_fn_outputs)
-            loss_fn_outputs.extend(
-                {
-                    "loss": {"data": [avg_loss_fallback], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
-                }
-                for _ in range(len(data_items) - len(loss_fn_outputs))
-            )
+        loss_fn_outputs = rank0_result.get("loss_fn_outputs")
+        if not isinstance(loss_fn_outputs, list):
+            raise ValueError(f"loss_fn_outputs missing/invalid: {type(loss_fn_outputs)}")
+        if len(loss_fn_outputs) != len(data_items):
+            raise ValueError(f"loss_fn_outputs length {len(loss_fn_outputs)} != request length {len(data_items)}")
+        for i, output in enumerate(loss_fn_outputs):
+            if not isinstance(output, dict):
+                raise ValueError(f"loss_fn_outputs[{i}] invalid type {type(output)}")
+            loss = output.get("loss")
+            if not isinstance(loss, dict):
+                raise ValueError(f"loss_fn_outputs[{i}].loss missing/invalid: {type(loss)}")
+            loss_data = loss.get("data")
+            if not (isinstance(loss_data, list) and len(loss_data) == 1):
+                raise ValueError(f"loss_fn_outputs[{i}].loss.data invalid: {loss_data!r}")
+            v = loss_data[0]
+            if not isinstance(v, (int, float)) or math.isnan(v) or math.isinf(v):
+                raise ValueError(f"loss_fn_outputs[{i}].loss.data[0] non-finite: {v!r}")
 
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
@@ -4677,39 +4612,26 @@ class MegatronWorkerGroup:
         if valid_count is None:
             valid_count = len(data_items)
 
-        # NaN guard for loss_value
         if math.isnan(loss_value) or math.isinf(loss_value):
-            logger.warning(f"[MegatronWorkerGroup.forward] NaN/Inf in loss_value={loss_value}, replacing with 0.0")
-            loss_value = 0.0
+            raise ValueError(f"non-finite loss_value={loss_value!r}")
 
-        loss_fn_outputs = rank0_result.get("loss_fn_outputs", [])
-
-        # NaN guard for individual loss_fn_outputs entries
-        avg_loss_fallback = loss_value / max(valid_count, 1) if valid_count > 0 else 0.0
-        if math.isnan(avg_loss_fallback) or math.isinf(avg_loss_fallback):
-            avg_loss_fallback = 0.0
-
-        nan_count = 0
-        for output in loss_fn_outputs:
-            if isinstance(output, dict) and "loss" in output:
-                loss_data = output["loss"].get("data", [])
-                if loss_data:
-                    val = loss_data[0]
-                    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
-                        output["loss"]["data"] = [avg_loss_fallback]
-                        nan_count += 1
-        if nan_count > 0:
-            logger.warning(f"[MegatronWorkerGroup.forward] Replaced {nan_count} NaN/Inf/None loss values with {avg_loss_fallback}")
-
-        if len(loss_fn_outputs) < len(data_items):
-            loss_fn_outputs = list(loss_fn_outputs)
-            loss_fn_outputs.extend(
-                {
-                    "loss": {"data": [avg_loss_fallback], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
-                }
-                for _ in range(len(data_items) - len(loss_fn_outputs))
-            )
+        loss_fn_outputs = rank0_result.get("loss_fn_outputs")
+        if not isinstance(loss_fn_outputs, list):
+            raise ValueError(f"loss_fn_outputs missing/invalid: {type(loss_fn_outputs)}")
+        if len(loss_fn_outputs) != len(data_items):
+            raise ValueError(f"loss_fn_outputs length {len(loss_fn_outputs)} != request length {len(data_items)}")
+        for i, output in enumerate(loss_fn_outputs):
+            if not isinstance(output, dict):
+                raise ValueError(f"loss_fn_outputs[{i}] invalid type {type(output)}")
+            loss = output.get("loss")
+            if not isinstance(loss, dict):
+                raise ValueError(f"loss_fn_outputs[{i}].loss missing/invalid: {type(loss)}")
+            loss_data = loss.get("data")
+            if not (isinstance(loss_data, list) and len(loss_data) == 1):
+                raise ValueError(f"loss_fn_outputs[{i}].loss.data invalid: {loss_data!r}")
+            v = loss_data[0]
+            if not isinstance(v, (int, float)) or math.isnan(v) or math.isinf(v):
+                raise ValueError(f"loss_fn_outputs[{i}].loss.data[0] non-finite: {v!r}")
         log_probs = rank0_result.get("log_probs")  # Per-token log_probs tensor
 
         metrics = {
