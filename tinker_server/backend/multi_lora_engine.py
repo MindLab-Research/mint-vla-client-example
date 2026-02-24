@@ -1333,7 +1333,11 @@ class MultiModelInferenceManager:
 
 
 def _list_named_vllm_actor_names(*, namespace: str) -> list[str]:
-    """List vLLM actor names by Ray named actor registry (fallback when ResourcePool is stale)."""
+    """List vLLM actor names by Ray named actor registry.
+
+    This is useful for detecting inventory mismatches (ResourcePool staleness).
+    Callers must not silently treat this registry as authoritative.
+    """
     names: list[str] = []
     for a in ray.util.list_named_actors(all_namespaces=True):
         if a.get("namespace") != namespace:
@@ -1426,31 +1430,15 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 except Exception as e:
                     logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
         if not killed_any:
-            # ResourcePool can be stale if startup reconciliation failed or code changed in-flight.
-            # Fall back to Ray named actor registry.
-            for actor_name in _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE):
-                try:
-                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-                    ray_kill.kill(
-                        actor,
-                        reason="vllm_kill_by_name_fallback",
-                        actor_name=actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                    )
-                    logger.info(f"Killed vLLM actor (fallback): {actor_name}")
-                    resource_pool.unregister(actor_name)
-                    try:
-                        pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                        ray.util.remove_placement_group(pg)
-                    except Exception:
-                        pass
-                    killed_any = True
-                except ValueError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error killing vLLM actor {actor_name} (fallback): {e}")
-            if not killed_any:
-                logger.info("No vLLM actors found (resource pool and Ray named actors)")
+            from tinker_server.backend.resource_pool import ResourcePoolStaleError
+
+            named = _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE)
+            if named:
+                raise ResourcePoolStaleError(
+                    "ResourcePool lists 0 vLLM actors but Ray named-actor registry has "
+                    f"{len(named)} vLLM actor(s) in namespace={PERSISTENT_NAMESPACE!r}: {named!r}"
+                )
+            logger.info("No vLLM actors found in ResourcePool")
         return killed_any
 
 
@@ -1492,7 +1480,7 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
         try:
             res = ray.get(ref, timeout=5)
         except ray.exceptions.GetTimeoutError:
-            return True
+            return False
 
         if isinstance(res, bool):
             return res
@@ -1517,13 +1505,6 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         return True
                 except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
                     continue
-        for actor_name in _list_named_vllm_actor_names(namespace=PERSISTENT_NAMESPACE):
-            try:
-                actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-                if _is_actor_ready(actor):
-                    return True
-            except (ValueError, ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
-                continue
         return False
 
 

@@ -661,13 +661,12 @@ def _create_multinode_vllm_actor(
                     async with self._active_generates_cond:
                         if self._active_generates > 0:
                             return True
-                    # Best-effort: if idle, treat actor as ready without probing EngineCore.
-                    # Failures will surface naturally on real RPCs (generate / logprobs).
+                    # When idle, probe EngineCore via a cheap RPC.
+                    await self.engine.list_loras()
                     return True
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
-            return True
 
         async def add_lora(self, lora_int_id: int, lora_path: str, lora_name: str) -> None:
             """Add LoRA adapter from shared filesystem path.

@@ -20,6 +20,15 @@ from . import ray_kill
 logger = logging.getLogger(__name__)
 
 
+class ResourcePoolStaleError(RuntimeError):
+    """ResourcePool inventory/state disagrees with Ray named-actor registry.
+
+    This indicates startup reconciliation (or an in-flight code change) failed to
+    register/unregister actors deterministically. Callers should surface this
+    rather than silently falling back to alternate registries.
+    """
+
+
 class ActorType(Enum):
     MEGATRON = "megatron"  # MoE training (8 GPUs)
     DENSE = "dense"        # Dense training (1 GPU)

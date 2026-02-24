@@ -183,8 +183,11 @@ async def _cleanup_stale_actors() -> None:
                     except Exception as kill_err:
                         logger.warning(f"Failed to kill actor {name}: {kill_err}")
                 except ray.exceptions.GetTimeoutError:
-                    # Actor might be busy; register it and move on.
-                    logger.warning(f"Actor {name} __ray_ready__ timed out; assuming busy and registering without kill")
+                    # Actor might be busy; do not treat a timeout as readiness.
+                    # Register it as "creating" so operators can see reconciliation uncertainty.
+                    logger.warning(
+                        f"Actor {name} __ray_ready__ timed out; registering without marking ready"
+                    )
                     try:
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
@@ -223,10 +226,12 @@ async def _cleanup_stale_actors() -> None:
                             actor_handle=actor,
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=base_model,
+                            metadata={"startup_reconcile": "__ray_ready__timeout"},
                         )
-                        resource_pool.mark_ready(name)
                         registered += 1
-                        logger.info(f"Registered busy actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
+                        logger.info(
+                            f"Registered busy actor (not ready): {name} ({actor_type.value}, {num_gpus} GPUs)"
+                        )
                     except Exception as reg_err:
                         logger.warning(f"Failed to register busy actor {name}: {reg_err}")
 

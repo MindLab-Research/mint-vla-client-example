@@ -654,11 +654,15 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
 
     if t in ("vllm", "all"):
         from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+        from ..backend.resource_pool import ResourcePoolStaleError
 
-        if t == "vllm":
-            killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(model_name) else 0
-        else:
-            killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(None) else 0
+        try:
+            if t == "vllm":
+                killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(model_name) else 0
+            else:
+                killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(None) else 0
+        except ResourcePoolStaleError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
 
     if t in ("megatron", "all"):
         from ..backend.megatron_distributed import kill_megatron_actor
