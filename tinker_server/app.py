@@ -17,6 +17,7 @@ from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
+from .health_state import clear_startup_degraded_state, set_startup_degraded_state
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
@@ -253,8 +254,12 @@ async def _cleanup_stale_actors() -> None:
         logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
 
     except Exception as e:
-        # Don't fail startup if cleanup fails
-        logger.warning(f"Actor cleanup failed (continuing anyway): {e}")
+        # Surface reconciliation failures via degraded health rather than silently continuing.
+        set_startup_degraded_state(
+            reason="startup_actor_cleanup_failed",
+            error=f"{type(e).__name__}: {e}",
+        )
+        logger.error(f"Actor cleanup failed; healthz will be degraded: {type(e).__name__}: {e}")
 
 async def _prewarm_persistent_models(
     train_engine: VerlTrainingEngine,
@@ -588,6 +593,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Ray: hard requirement (fail fast)
     # ==========================================================================
+    clear_startup_degraded_state()
     from .backend.future_store import future_store
 
     future_store.ensure_ready()

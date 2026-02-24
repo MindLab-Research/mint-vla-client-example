@@ -1467,7 +1467,7 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
         Notes:
         - For verl's ExtendedVLLMHttpServer: prefer is_engine_ready()
         - For MultiNodeVLLMEngine: prefer is_ready() (touches EngineCore)
-        - If the readiness call times out, treat as "alive but busy".
+        - If the readiness call times out, treat readiness as unknown and fail closed.
         """
         try:
             try:

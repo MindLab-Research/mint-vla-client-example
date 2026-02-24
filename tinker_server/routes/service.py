@@ -69,6 +69,19 @@ async def healthz() -> dict:
     placement-group demand in the configured namespace. This indicates the API
     surface may be healthy while Ray-backed workloads are capacity-degraded.
     """
+    from ..health_state import get_startup_degraded_state
+
+    degraded = get_startup_degraded_state()
+    if degraded is not None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "reason": degraded.get("reason", "startup_degraded"),
+                "error": degraded.get("error", ""),
+                "details": degraded.get("details", {}),
+            },
+        )
     try:
         import ray
 

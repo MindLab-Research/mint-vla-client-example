@@ -5649,7 +5649,7 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)
                     return True
                 except ray.exceptions.GetTimeoutError:
-                    return False
+                    continue
                 except Exception:
                     pass
         return False

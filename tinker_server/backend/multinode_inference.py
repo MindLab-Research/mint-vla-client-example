@@ -656,11 +656,11 @@ def _create_multinode_vllm_actor(
                 # Also: avoid cancelling vLLM engine coroutines during liveness checks. Cancellation
                 # can leave engine state inconsistent and later generations can hang.
                 if self._gate_lock.locked():
-                    return True
+                    return False
                 async with self._gate_lock:
                     async with self._active_generates_cond:
                         if self._active_generates > 0:
-                            return True
+                            return False
                     # When idle, probe EngineCore via a cheap RPC.
                     await self.engine.list_loras()
                     return True
