@@ -17,6 +17,7 @@ from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .backend.training_session_manager import TrainingSessionManager
 from .backend.verl_training import VerlTrainingEngine
 from .config import config
+from .health_state import clear_startup_degraded_state, set_startup_degraded_state
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
@@ -183,8 +184,11 @@ async def _cleanup_stale_actors() -> None:
                     except Exception as kill_err:
                         logger.warning(f"Failed to kill actor {name}: {kill_err}")
                 except ray.exceptions.GetTimeoutError:
-                    # Actor might be busy; register it and move on.
-                    logger.warning(f"Actor {name} __ray_ready__ timed out; assuming busy and registering without kill")
+                    # Actor might be busy; do not treat a timeout as readiness.
+                    # Register it as "creating" so operators can see reconciliation uncertainty.
+                    logger.warning(
+                        f"Actor {name} __ray_ready__ timed out; registering without marking ready"
+                    )
                     try:
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
@@ -223,10 +227,12 @@ async def _cleanup_stale_actors() -> None:
                             actor_handle=actor,
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=base_model,
+                            metadata={"startup_reconcile": "__ray_ready__timeout"},
                         )
-                        resource_pool.mark_ready(name)
                         registered += 1
-                        logger.info(f"Registered busy actor: {name} ({actor_type.value}, {num_gpus} GPUs)")
+                        logger.info(
+                            f"Registered busy actor (not ready): {name} ({actor_type.value}, {num_gpus} GPUs)"
+                        )
                     except Exception as reg_err:
                         logger.warning(f"Failed to register busy actor {name}: {reg_err}")
 
@@ -248,8 +254,12 @@ async def _cleanup_stale_actors() -> None:
         logger.info(f"Actor cleanup complete: {cleaned} cleaned, {registered} registered")
 
     except Exception as e:
-        # Don't fail startup if cleanup fails
-        logger.warning(f"Actor cleanup failed (continuing anyway): {e}")
+        # Surface reconciliation failures via degraded health rather than silently continuing.
+        set_startup_degraded_state(
+            reason="startup_actor_cleanup_failed",
+            error=f"{type(e).__name__}: {e}",
+        )
+        logger.error(f"Actor cleanup failed; healthz will be degraded: {type(e).__name__}: {e}")
 
 async def _prewarm_persistent_models(
     train_engine: VerlTrainingEngine,
@@ -583,6 +593,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     # Ray: hard requirement (fail fast)
     # ==========================================================================
+    clear_startup_degraded_state()
     from .backend.future_store import future_store
 
     future_store.ensure_ready()

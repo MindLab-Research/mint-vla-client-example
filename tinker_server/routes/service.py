@@ -61,14 +61,30 @@ def _get_user_id(request: Request) -> str | None:
     return None
 
 
-@router.get("/healthz")
+@router.get("/healthz", response_model=None)
 async def healthz() -> dict:
     """Health check endpoint.
 
     Returns HTTP 503 when the server can connect to Ray but Ray has pending GPU
     placement-group demand in the configured namespace. This indicates the API
     surface may be healthy while Ray-backed workloads are capacity-degraded.
+
+    Also returns HTTP 503 when startup reconciliation recorded a degraded state
+    (e.g., actor cleanup/reconciliation failed).
     """
+    from ..health_state import get_startup_degraded_state
+
+    degraded = get_startup_degraded_state()
+    if degraded is not None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "reason": degraded.get("reason", "startup_degraded"),
+                "error": degraded.get("error", ""),
+                "details": degraded.get("details", {}),
+            },
+        )
     try:
         import ray
 
@@ -654,11 +670,15 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
 
     if t in ("vllm", "all"):
         from ..backend.multi_lora_engine import kill_persistent_vllm_actor
+        from ..backend.resource_pool import ResourcePoolStaleError
 
-        if t == "vllm":
-            killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(model_name) else 0
-        else:
-            killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(None) else 0
+        try:
+            if t == "vllm":
+                killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(model_name) else 0
+            else:
+                killed_by_type["vllm"] = 1 if kill_persistent_vllm_actor(None) else 0
+        except ResourcePoolStaleError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
 
     if t in ("megatron", "all"):
         from ..backend.megatron_distributed import kill_megatron_actor

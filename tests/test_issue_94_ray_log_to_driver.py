@@ -3,7 +3,7 @@ import sys
 import types
 
 
-def _install_ray_stub(calls: list[dict]) -> None:
+def _install_ray_stub(calls: list[dict], monkeypatch) -> None:
     ray = types.ModuleType("ray")
     ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
 
@@ -12,12 +12,12 @@ def _install_ray_stub(calls: list[dict]) -> None:
         return {"ok": True}
 
     ray.init = init  # type: ignore[attr-defined]
-    sys.modules["ray"] = ray
+    monkeypatch.setitem(sys.modules, "ray", ray)
 
 
 def test_issue_94_init_ray_injects_log_to_driver(monkeypatch) -> None:
     calls: list[dict] = []
-    _install_ray_stub(calls)
+    _install_ray_stub(calls, monkeypatch)
 
     from tinker_server.ray_utils import init_ray
 
@@ -32,7 +32,7 @@ def test_issue_94_init_ray_injects_log_to_driver(monkeypatch) -> None:
 
 def test_issue_94_init_ray_does_not_override_explicit_kwarg(monkeypatch) -> None:
     calls: list[dict] = []
-    _install_ray_stub(calls)
+    _install_ray_stub(calls, monkeypatch)
 
     from tinker_server.ray_utils import init_ray
 

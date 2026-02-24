@@ -5636,8 +5636,7 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
             ray.get(actor.get_diagnostics.remote(), timeout=5)
             return True
         except ray.exceptions.GetTimeoutError:
-            # Actor is alive but busy; treat as running.
-            return True
+            return False
         except (ValueError, ray.exceptions.RayActorError, Exception):
             return False
     else:
@@ -5650,7 +5649,7 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)
                     return True
                 except ray.exceptions.GetTimeoutError:
-                    return True
+                    continue
                 except Exception:
                     pass
         return False
