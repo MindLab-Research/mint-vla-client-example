@@ -26,6 +26,7 @@ from .conftest import (
     save_weights,
     sample,
 )
+from .framework import create_test_report, print_report_summary
 
 _SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
 
@@ -110,6 +111,44 @@ def _wait_for_trainer_actor(*, backend: str, base_model: str, timeout_s: float) 
     raise AssertionError(f"trainer actor not found (backend={backend} base_model={base_model}): {last_payload!r}")
 
 
+def _require_rss_payload(stats: dict) -> dict:
+    actors = stats.get("actors")
+    if not isinstance(actors, dict):
+        raise AssertionError(
+            f"admission_stats missing actors dict: {actors!r}. Hint: restart server to load new code."
+        )
+
+    rp = actors.get("resource_pool")
+    if not isinstance(rp, list):
+        raise AssertionError(f"admission_stats actors.resource_pool missing list: {rp!r}")
+
+    missing = [a for a in rp if not (isinstance(a, dict) and isinstance(a.get('rss_bytes'), int))]
+    if missing:
+        raise AssertionError(f"resource_pool rss_bytes missing for some actors: {missing[:3]!r}")
+
+    for k in ("capacity_manager", "api_work_queue", "future_store"):
+        v = actors.get(k)
+        if not isinstance(v, dict):
+            raise AssertionError(f"admission_stats actors.{k} missing dict: {v!r}")
+        if "rss_bytes" not in v:
+            raise AssertionError(f"admission_stats actors.{k} missing rss_bytes: {v!r}")
+
+    return actors
+
+
+def _rss_snapshot(actors_payload: dict) -> dict[str, int]:
+    rp = actors_payload["resource_pool"]
+    out: dict[str, int] = {}
+    for a in rp:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("actor_name")
+        rss = a.get("rss_bytes")
+        if isinstance(name, str) and name and isinstance(rss, int):
+            out[name] = rss
+    return out
+
+
 class TestAdmissionControl:
     def test_flood_rejected_429_no_capacity_leak_and_retry_works(self, tokenizer):
         """Flood sampling requests, hit 429 backpressure, and recover via retry.
@@ -118,6 +157,8 @@ class TestAdmissionControl:
         - Capacity reservations should not leak (bounded memory signal).
         - A previously-rejected request should be admitted after retry.
         """
+        start_time = time.time()
+        report_data: dict = {}
 
         # Warmup: ensure sampling is available for this model_id.
         _session_id, model_id = create_session(DENSE_MODEL, lora_rank=16, lr=1e-4)
@@ -126,6 +167,10 @@ class TestAdmissionControl:
             raise AssertionError(f"save_weights failed: {r['error']}")
 
         stats_before = get_admission_stats()
+        report_data["stats_before"] = stats_before
+        rss_actors_before = _require_rss_payload(stats_before)
+        rss_pool_before = _rss_snapshot(rss_actors_before)
+        report_data["rss_pool_before"] = rss_pool_before
         cap_before = stats_before.get("capacity") or {}
         if not isinstance(cap_before, dict) or "error" in cap_before:
             raise AssertionError(f"capacity snapshot unavailable: {cap_before!r}")
@@ -140,11 +185,13 @@ class TestAdmissionControl:
         rss_before = int(proc_before.get("rss_bytes", -1))
         if rss_before < 0:
             raise AssertionError(f"missing process rss_bytes: {proc_before!r}")
+        report_data["api_rss_before"] = rss_before
 
         actors_before = list_actors().get("actors", [])
         actor_names_before = {
             a.get("actor_name") for a in actors_before if isinstance(a, dict) and a.get("actor_name")
         }
+        report_data["actor_names_before"] = sorted(x for x in actor_names_before if isinstance(x, str))
 
         prompt_tokens = tokenizer.encode("The capital of France is", add_special_tokens=True)
         flood_payload = {
@@ -176,6 +223,7 @@ class TestAdmissionControl:
                 if resp.status_code != 429:
                     raise AssertionError(f"unexpected seed status {resp.status_code}: {resp.text}")
 
+        report_data["seed_statuses"] = list(seed_statuses)
         assert ok_request_ids, "expected at least one admitted request_id during seed flood"
         time.sleep(2.0)
 
@@ -189,6 +237,8 @@ class TestAdmissionControl:
                     if isinstance(rid, str) and rid:
                         ok_request_ids.append(rid)
 
+        report_data["statuses"] = list(statuses)
+        report_data["ok_request_ids"] = list(ok_request_ids)
         all_statuses = seed_statuses + statuses
         if not any(s == 429 for s in all_statuses):
             counts: dict[int, int] = {}
@@ -205,6 +255,19 @@ class TestAdmissionControl:
             list(ex.map(lambda rid: poll_future(rid, timeout=600), ok_request_ids))
 
         stats_after = get_admission_stats()
+        report_data["stats_after"] = stats_after
+        rss_actors_after = _require_rss_payload(stats_after)
+        rss_pool_after = _rss_snapshot(rss_actors_after)
+        report_data["rss_pool_after"] = rss_pool_after
+
+        max_delta = 0
+        for name, before in rss_pool_before.items():
+            after = int(rss_pool_after.get(name, -1))
+            if after < 0:
+                raise AssertionError(f"actor disappeared from rss snapshot: {name}")
+            max_delta = max(max_delta, after - int(before))
+        assert max_delta < 512 * 1024 * 1024, f"Ray actor RSS grew too much under flood: max_delta={max_delta}"
+
         cap_after = stats_after.get("capacity") or {}
         if not isinstance(cap_after, dict) or "error" in cap_after:
             raise AssertionError(f"capacity snapshot unavailable after drain: {cap_after!r}")
@@ -220,16 +283,31 @@ class TestAdmissionControl:
         if rss_after < 0:
             raise AssertionError(f"missing process rss_bytes after drain: {proc_after!r}")
         assert (rss_after - rss_before) < 512 * 1024 * 1024, f"API RSS grew too much: {rss_before} -> {rss_after}"
+        report_data["api_rss_after"] = rss_after
 
         actors_after = list_actors().get("actors", [])
         actor_names_after = {
             a.get("actor_name") for a in actors_after if isinstance(a, dict) and a.get("actor_name")
         }
+        report_data["actor_names_after"] = sorted(x for x in actor_names_after if isinstance(x, str))
         assert actor_names_before.issubset(actor_names_after), "rejected flood should not kill actors"
 
         # Recovery: load drained; a normal request should succeed.
         probe = sample(model_id, prompt_tokens, max_tokens=8, temperature=0.0)
+        report_data["probe"] = probe
         assert "error" not in probe, f"probe sampling failed: {probe.get('error')}"
+
+        report = create_test_report(
+            test_name="admission_control_backpressure",
+            test_type="api",
+            data=report_data,
+            start_time=start_time,
+            plots=[],
+            metadata={"dense_model": DENSE_MODEL},
+        )
+        report_path = report.save()
+        print_report_summary(report)
+        print(f"report_json={report_path}")
 
 
 class TestTrainerQueuing:
