@@ -61,13 +61,16 @@ def _get_user_id(request: Request) -> str | None:
     return None
 
 
-@router.get("/healthz")
+@router.get("/healthz", response_model=None)
 async def healthz() -> dict:
     """Health check endpoint.
 
     Returns HTTP 503 when the server can connect to Ray but Ray has pending GPU
     placement-group demand in the configured namespace. This indicates the API
     surface may be healthy while Ray-backed workloads are capacity-degraded.
+
+    Also returns HTTP 503 when startup reconciliation recorded a degraded state
+    (e.g., actor cleanup/reconciliation failed).
     """
     from ..health_state import get_startup_degraded_state
 

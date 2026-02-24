@@ -1359,6 +1359,11 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     Returns:
         True if any actor was killed, False if none found.
+
+    Raises:
+        ResourcePoolStaleError: When ResourcePool reports no vLLM actors but Ray named
+            actors exist in the namespace. This is an accounting invariant violation
+            and must be surfaced rather than falling back silently.
     """
     from tinker_server.backend.resource_pool import ActorType, get_resource_pool
 

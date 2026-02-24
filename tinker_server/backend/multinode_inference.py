@@ -646,7 +646,13 @@ def _create_multinode_vllm_actor(
             logger.info("MultiNodeVLLMEngine initialized")
 
         async def is_ready(self) -> bool:
-            """Check if engine is initialized and the EngineCore is responsive."""
+            """Check if engine is initialized and the EngineCore is responsive.
+
+            Semantics:
+            - Returns False when the engine is busy (cannot safely probe EngineCore).
+              Callers must treat False as "not ready / unknown", not as "dead".
+            - When idle, performs a cheap EngineCore probe to avoid false positives.
+            """
             if not self._initialized or self.engine is None:
                 return False
             try:
