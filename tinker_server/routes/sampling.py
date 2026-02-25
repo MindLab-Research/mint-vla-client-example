@@ -486,6 +486,7 @@ async def asample(
         if not base_model:
             raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
         token_ids = request.prompt.to_token_ids()
+        max_tokens = int(request.sampling_params.max_tokens)
         from ..backend.model_registry import get_model_config
 
         try:
@@ -498,10 +499,14 @@ async def asample(
                     f"{type(e).__name__}: {e}"
                 ),
             )
-        if len(token_ids) > max_model_len:
+        total_len = len(token_ids) + max_tokens
+        if total_len > max_model_len:
             raise HTTPException(
                 status_code=400,
-                detail=f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} for model {base_model}",
+                detail=(
+                    f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                    f"for model {base_model}"
+                ),
             )
 
     global _inflight_sample_tasks
@@ -577,9 +582,10 @@ async def _do_sample(
                 from ..backend.model_registry import get_model_config
 
                 max_model_len = int(get_model_config(base_model).max_model_len)
-                if len(token_ids) > max_model_len:
+                total_len = len(token_ids) + int(request.sampling_params.max_tokens)
+                if total_len > max_model_len:
                     raise ValueError(
-                        f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
                         f"for model {base_model}"
                     )
 
