@@ -8,6 +8,8 @@ Checkpoint endpoints follow /internal/v1/checkpoints spec:
 import json
 import os
 import subprocess
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -210,6 +212,55 @@ async def admission_stats() -> dict:
         proc["rss_error"] = f"{type(e).__name__}: {e}"
 
     return {"capacity": cap, "work_queue": q, "future_store": fs, "actors": actors, "process": proc}
+
+
+@router.post("/work_queue/noop")
+async def work_queue_noop() -> dict:
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.future_store import future_store
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_id = uuid.uuid4().hex
+    request_json = b"{}"
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": "internal.noop"})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op="internal.noop",
+            request_json=request_json,
+            user_id=None,
+            webhook_url=None,
+            extra={"ts": float(time.time())},
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue internal.noop: {e}")
+
+    return {"request_id": request_id}
+
+
+@router.get("/work_queue/debug_state")
+async def work_queue_debug_state() -> dict:
+    from ..backend.api_work_queue import api_work_queue
+
+    return await api_work_queue.debug_state(timeout_s=10.0)
 
 
 # =============================================================================

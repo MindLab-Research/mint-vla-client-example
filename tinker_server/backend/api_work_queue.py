@@ -74,6 +74,10 @@ def _get_or_create_ray_actor():
             self._dequeued = 0
             self._recent_dequeues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
             self._recent_enqueues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
+            self._active_job_id: str | None = None
+
+        def set_active_job_id(self, job_id: str) -> None:
+            self._active_job_id = None if not job_id else str(job_id)
 
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
@@ -84,7 +88,7 @@ def _get_or_create_ray_actor():
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
 
-        async def enqueue(self, item: dict[str, Any]) -> None:
+        async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> None:
             async with self._cv:
                 self._items.append(dict(item))
                 self._enqueued += 1
@@ -95,7 +99,7 @@ def _get_or_create_ray_actor():
                     self._recent_enqueues.append(
                         {
                             "ts": time.time(),
-                            "job_id": str(ctx.get_job_id()),
+                            "job_id": None if producer_job_id is None else str(producer_job_id),
                             "task_id": str(ctx.get_task_id()),
                             "request_id": str(item.get("request_id")),
                             "op": str(item.get("op")),
@@ -105,10 +109,16 @@ def _get_or_create_ray_actor():
                     pass
                 self._cv.notify(1)
 
-        async def dequeue(self) -> dict[str, Any]:
+        async def dequeue(self, consumer_job_id: str) -> dict[str, Any]:
             async with self._cv:
                 while not self._items:
                     await self._cv.wait()
+                if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
+                    self._cv.notify(1)
+                    raise RuntimeError(
+                        f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
+                    )
+
                 self._dequeued += 1
                 item = self._items.popleft()
                 try:
@@ -118,7 +128,7 @@ def _get_or_create_ray_actor():
                     self._recent_dequeues.append(
                         {
                             "ts": time.time(),
-                            "job_id": str(ctx.get_job_id()),
+                            "job_id": str(consumer_job_id),
                             "task_id": str(ctx.get_task_id()),
                             "request_id": str(item.get("request_id")),
                             "op": str(item.get("op")),
@@ -136,6 +146,7 @@ def _get_or_create_ray_actor():
                 "stats": self.stats(),
                 "recent_enqueues": list(self._recent_enqueues),
                 "recent_dequeues": list(self._recent_dequeues),
+                "active_job_id": self._active_job_id,
             }
 
     # Keep the detached queue actor on the head node when possible. Losing this
@@ -174,6 +185,7 @@ class ApiWorkQueueClient:
         self._worker_tasks: list[Any] = []
         self._running = False
         self._dequeue_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._consumer_job_id: str | None = None
 
     def _get_ray_actor(self):
         try:
@@ -224,6 +236,11 @@ class ApiWorkQueueClient:
         import ray
 
         actor = self._get_ray_actor()
+        producer_job_id = None
+        try:
+            producer_job_id = str(ray.get_runtime_context().get_job_id())
+        except Exception:
+            producer_job_id = None
         item = {
             "request_id": str(request_id),
             "op": str(op),
@@ -235,7 +252,7 @@ class ApiWorkQueueClient:
         }
         # Ensure enqueue succeeds, otherwise the request can remain pending forever
         # while capacity stays reserved.
-        ref = actor.enqueue.remote(item)
+        ref = actor.enqueue.remote(item, producer_job_id)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
 
@@ -245,9 +262,11 @@ class ApiWorkQueueClient:
 
         if self._dequeue_executor is None:
             raise RuntimeError("ApiWorkQueueClient not started (dequeue executor missing)")
+        if self._consumer_job_id is None:
+            raise RuntimeError("ApiWorkQueueClient not started (consumer job id missing)")
 
         actor = self._get_ray_actor()
-        ref = actor.dequeue.remote()
+        ref = actor.dequeue.remote(self._consumer_job_id)
         loop = asyncio.get_running_loop()
         item = await loop.run_in_executor(self._dequeue_executor, ray.get, ref)
         if not isinstance(item, dict):
@@ -268,6 +287,21 @@ class ApiWorkQueueClient:
         if self._running:
             return
         self._running = True
+
+        actor = self._get_ray_actor()
+        try:
+            import ray
+
+            job_id = str(ray.get_runtime_context().get_job_id())
+            self._consumer_job_id = job_id
+            ref = actor.set_active_job_id.remote(job_id)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
+        except Exception as e:
+            self._running = False
+            self._consumer_job_id = None
+            raise RuntimeError(f"Failed to set ApiWorkQueue active job id: {type(e).__name__}: {e}") from e
+
         n = int(num_workers)
         if n < 1:
             n = 1
@@ -289,6 +323,7 @@ class ApiWorkQueueClient:
         if self._dequeue_executor is not None:
             self._dequeue_executor.shutdown(wait=False, cancel_futures=True)
             self._dequeue_executor = None
+        self._consumer_job_id = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
         import asyncio
@@ -553,6 +588,16 @@ class ApiWorkQueueClient:
         ref = actor.get_rss_bytes.remote()
         v = ray.get(ref, timeout=float(timeout_s))
         return int(v)
+
+    async def debug_state(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        import ray
+
+        actor = self._get_ray_actor()
+        ref = actor.debug_state.remote()
+        v = ray.get(ref, timeout=float(timeout_s))
+        if not isinstance(v, dict):
+            raise TypeError(f"ApiWorkQueue.debug_state returned non-dict: {type(v)}")
+        return v
 
 
 api_work_queue = ApiWorkQueueClient()

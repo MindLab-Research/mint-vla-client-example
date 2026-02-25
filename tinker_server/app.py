@@ -756,6 +756,14 @@ async def lifespan(app: FastAPI):
         req = LoadStateRequest.model_validate_json(item.request_json)
         await weights._do_load_state(item.request_id, req, item.user_id)
 
+    async def _exec_internal_noop(item):
+        from .backend.future_store import future_store
+
+        future_store.resolve(
+            str(item.request_id),
+            {"ok": True, "op": "internal.noop", "ts": time.time()},
+        )
+
     api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
     api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
     api_work_queue.set_executor("training.create_model", _exec_training_create_model)
@@ -768,6 +776,7 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
     api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
     api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
+    api_work_queue.set_executor("internal.noop", _exec_internal_noop)
 
     await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
 
