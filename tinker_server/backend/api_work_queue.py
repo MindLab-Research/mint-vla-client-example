@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config
+
+logger = logging.getLogger(__name__)
 
 
 class ApiWorkQueueUnavailableError(RuntimeError):
@@ -45,11 +48,21 @@ def _get_or_create_ray_actor():
 
     actor_name = _ray_api_work_queue_actor_name()
     try:
-        return ray.get_actor(actor_name, namespace=_ray_namespace())
+        actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+        try:
+            # Ensure the handle is actually usable. A dead named actor can still
+            # be discoverable via `ray.get_actor`, but any call will raise
+            # ActorDiedError and enqueue will fail with 503.
+            ray.get(actor.stats.remote(), timeout=1.0)
+            return actor
+        except Exception:
+            pass
     except ValueError:
         pass
 
-    @ray.remote
+    max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "128"))
+
+    @ray.remote(max_concurrency=max_concurrency)
     class _RayApiWorkQueueActor:
         def __init__(self) -> None:
             import asyncio
@@ -59,6 +72,8 @@ def _get_or_create_ray_actor():
             self._cv = asyncio.Condition()
             self._enqueued = 0
             self._dequeued = 0
+            self._recent_dequeues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
+            self._recent_enqueues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
 
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
@@ -73,6 +88,21 @@ def _get_or_create_ray_actor():
             async with self._cv:
                 self._items.append(dict(item))
                 self._enqueued += 1
+                try:
+                    import ray
+
+                    ctx = ray.get_runtime_context()
+                    self._recent_enqueues.append(
+                        {
+                            "ts": time.time(),
+                            "job_id": str(ctx.get_job_id()),
+                            "task_id": str(ctx.get_task_id()),
+                            "request_id": str(item.get("request_id")),
+                            "op": str(item.get("op")),
+                        }
+                    )
+                except Exception:
+                    pass
                 self._cv.notify(1)
 
         async def dequeue(self) -> dict[str, Any]:
@@ -80,13 +110,57 @@ def _get_or_create_ray_actor():
                 while not self._items:
                     await self._cv.wait()
                 self._dequeued += 1
-                return self._items.popleft()
+                item = self._items.popleft()
+                try:
+                    import ray
+
+                    ctx = ray.get_runtime_context()
+                    self._recent_dequeues.append(
+                        {
+                            "ts": time.time(),
+                            "job_id": str(ctx.get_job_id()),
+                            "task_id": str(ctx.get_task_id()),
+                            "request_id": str(item.get("request_id")),
+                            "op": str(item.get("op")),
+                        }
+                    )
+                except Exception:
+                    pass
+                return item
 
         def stats(self) -> dict[str, Any]:
             return {"depth": len(self._items), "enqueued": int(self._enqueued), "dequeued": int(self._dequeued)}
 
+        def debug_state(self) -> dict[str, Any]:
+            return {
+                "stats": self.stats(),
+                "recent_enqueues": list(self._recent_enqueues),
+                "recent_dequeues": list(self._recent_dequeues),
+            }
+
+    # Keep the detached queue actor on the head node when possible. Losing this
+    # actor drops all queued items (in-memory queue), which can leave futures
+    # pending forever.
+    resources = None
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            resources = {"node:__internal_head__": 0.001}
+    except Exception:
+        resources = None
+
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": _ray_namespace(),
+        "lifetime": "detached",
+        "get_if_exists": True,
+        "max_restarts": -1,
+        "max_task_retries": -1,
+    }
+    if resources is not None:
+        options["resources"] = resources
+
     return _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
-        name=actor_name, namespace=_ray_namespace(), lifetime="detached", get_if_exists=True
+        **options
     ).remote()
 
 
@@ -120,6 +194,12 @@ class ApiWorkQueueClient:
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
+        if self._ray_actor is not None:
+            try:
+                ray.get(self._ray_actor.stats.remote(), timeout=1.0)
+            except Exception:
+                self._ray_actor = None
+
         if self._ray_actor is None:
             try:
                 self._ray_actor = _get_or_create_ray_actor()
@@ -140,6 +220,7 @@ class ApiWorkQueueClient:
         webhook_url: str | None,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        import asyncio
         import ray
 
         actor = self._get_ray_actor()
@@ -155,7 +236,8 @@ class ApiWorkQueueClient:
         # Ensure enqueue succeeds, otherwise the request can remain pending forever
         # while capacity stays reserved.
         ref = actor.enqueue.remote(item)
-        ray.get(ref, timeout=10.0)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
 
     async def _dequeue(self) -> WorkItem:
         import asyncio
@@ -209,11 +291,46 @@ class ApiWorkQueueClient:
             self._dequeue_executor = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
+        import asyncio
+
         from .capacity_manager import capacity_manager
         from .future_store import FutureStatus, future_store
 
         while self._running:
-            item = await self._dequeue()
+            try:
+                item = await self._dequeue()
+            except Exception as e:
+                # Never let a dequeue failure permanently kill the background workers.
+                # If the detached Ray queue actor dies (or Ray connectivity blips),
+                # keep the server alive and retry.
+                try:
+                    import ray
+
+                    if isinstance(e, (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError)):
+                        self._ray_actor = None
+                except Exception:
+                    pass
+
+                logger.error(
+                    "[api_work_queue] dequeue failed (worker_idx=%s): %s: %s",
+                    int(worker_idx),
+                    type(e).__name__,
+                    e,
+                )
+                await asyncio.sleep(1.0)
+                continue
+            if str(item.op) == "training.create_model":
+                try:
+                    age_s = max(0.0, time.time() - float(item.created_at))
+                except Exception:
+                    age_s = -1.0
+                logger.info(
+                    "[api_work_queue] dequeued request_id=%s op=%s worker_idx=%s age_s=%.3f",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                    float(age_s),
+                )
             try:
                 capacity_manager.release_queue(item.request_id)
             except Exception:
@@ -228,13 +345,58 @@ class ApiWorkQueueClient:
             except KeyError:
                 try:
                     capacity_manager.release_all(item.request_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(
+                        "[api_work_queue] release_all failed after unknown future (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e).__name__,
+                        e,
+                    )
                 continue
-            except Exception:
-                status = None
+            except Exception as e:
+                logger.error(
+                    "[api_work_queue] get_status failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                    int(worker_idx),
+                    str(item.request_id),
+                    str(item.op),
+                    type(e).__name__,
+                    e,
+                )
+                try:
+                    future_store.fail(item.request_id, f"internal error: future_store.get_status failed: {type(e).__name__}: {e}")
+                except Exception as e2:
+                    logger.error(
+                        "[api_work_queue] future_store.fail failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e2).__name__,
+                        e2,
+                    )
+                try:
+                    capacity_manager.release_all(item.request_id)
+                except Exception as e2:
+                    logger.error(
+                        "[api_work_queue] release_all failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e2).__name__,
+                        e2,
+                    )
+                continue
 
             if status is not None and status != FutureStatus.PENDING:
+                if str(item.op) == "training.create_model":
+                    logger.info(
+                        "[api_work_queue] skip_non_pending request_id=%s op=%s worker_idx=%s status=%s",
+                        str(item.request_id),
+                        str(item.op),
+                        int(worker_idx),
+                        str(status),
+                    )
                 try:
                     capacity_manager.release_all(item.request_id)
                 except Exception:
@@ -243,33 +405,119 @@ class ApiWorkQueueClient:
 
             try:
                 future_store.mark_running(item.request_id, meta={"worker_idx": int(worker_idx), "op": item.op})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(
+                    "[api_work_queue] mark_running failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                    int(worker_idx),
+                    str(item.request_id),
+                    str(item.op),
+                    type(e).__name__,
+                    e,
+                )
+                try:
+                    future_store.fail(item.request_id, f"internal error: future_store.mark_running failed: {type(e).__name__}: {e}")
+                except Exception as e2:
+                    logger.error(
+                        "[api_work_queue] future_store.fail failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e2).__name__,
+                        e2,
+                    )
+                try:
+                    capacity_manager.release_all(item.request_id)
+                except Exception as e2:
+                    logger.error(
+                        "[api_work_queue] release_all failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e2).__name__,
+                        e2,
+                    )
+                continue
+            if str(item.op) == "training.create_model":
+                logger.info(
+                    "[api_work_queue] running request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
 
             ex = self._executors.get(item.op)
             if ex is None:
+                logger.error(
+                    "[api_work_queue] unknown op request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
                 try:
                     future_store.fail(item.request_id, f"unknown op: {item.op!r}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(
+                        "[api_work_queue] future_store.fail failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e).__name__,
+                        e,
+                    )
                 try:
                     capacity_manager.release_object_store(item.request_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(
+                        "[api_work_queue] release_object_store failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e).__name__,
+                        e,
+                    )
                 continue
 
             try:
                 await ex(item)
+                if str(item.op) == "training.create_model":
+                    logger.info(
+                        "[api_work_queue] done request_id=%s op=%s worker_idx=%s",
+                        str(item.request_id),
+                        str(item.op),
+                        int(worker_idx),
+                    )
             except Exception as e:
+                logger.error(
+                    "[api_work_queue] executor failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                    int(worker_idx),
+                    str(item.request_id),
+                    str(item.op),
+                    type(e).__name__,
+                    e,
+                )
                 # Ensure the future does not remain pending forever.
                 try:
                     future_store.fail(item.request_id, f"executor failed: {e}")
-                except Exception:
-                    pass
+                except Exception as e2:
+                    logger.error(
+                        "[api_work_queue] future_store.fail failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e2).__name__,
+                        e2,
+                    )
                 try:
                     capacity_manager.release_object_store(item.request_id)
-                except Exception:
-                    pass
+                except Exception as e2:
+                    logger.error(
+                        "[api_work_queue] release_object_store failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e2).__name__,
+                        e2,
+                    )
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         import ray

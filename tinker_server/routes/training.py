@@ -288,6 +288,14 @@ async def create_model(
             user_id=user_id,
             webhook_url=webhook_url,
         )
+        logger.info(
+            "[create_model] enqueued request_id=%s op=%s model_id=%s base_model=%s bytes=%s",
+            str(request_id),
+            "training.create_model",
+            str(model_id),
+            str(request.base_model),
+            int(len(request_json)),
+        )
     except Exception as e:
         capacity_manager.release_all(request_id)
         if created:
