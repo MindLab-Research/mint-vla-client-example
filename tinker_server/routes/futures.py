@@ -107,16 +107,13 @@ async def retrieve_future(
 
         # If this future corresponds to an ephemeral save_weights_for_sampler on an upstream,
         # register the returned sampling_session_id so subsequent /asample routes correctly.
-        try:
-            from ..gateway import maybe_register_sampling_session_from_retrieve_future
+        from ..gateway import maybe_register_sampling_session_from_retrieve_future
 
-            maybe_register_sampling_session_from_retrieve_future(
-                upstream_alias=upstream_alias,
-                upstream_request_id=upstream_request_id,
-                payload=payload,
-            )
-        except Exception:
-            pass
+        maybe_register_sampling_session_from_retrieve_future(
+            upstream_alias=upstream_alias,
+            upstream_request_id=upstream_request_id,
+            payload=payload,
+        )
 
         # If the gateway uses an upstream credential (static_api_key), the upstream may treat
         # the request as privileged. Preserve local error-masking semantics based on the caller.

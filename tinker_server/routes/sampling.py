@@ -447,7 +447,10 @@ async def asample(
     )
 
     session_id = request.get_session_id()
-    remote = remote_sampling_session(session_id)
+    is_local = False
+    if session_manager is not None:
+        is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
+    remote = None if is_local else remote_sampling_session(session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -475,6 +478,39 @@ async def asample(
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
+
+    # Preflight prompt length gate for multi-LoRA sessions. Do this before enqueuing
+    # work so misconfiguration is surfaced as an HTTP error rather than a latent
+    # async failure.
+    if session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+    if session_manager.is_multi_lora_session(session_id):
+        base_model = session_manager.get_session_base_model(session_id)
+        if not base_model:
+            raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
+        token_ids = request.prompt.to_token_ids()
+        max_tokens = int(request.sampling_params.max_tokens)
+        from ..backend.model_registry import get_model_config
+
+        try:
+            max_model_len = int(get_model_config(base_model).max_model_len)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Cannot determine max_model_len for base_model {base_model!r}: "
+                    f"{type(e).__name__}: {e}"
+                ),
+            )
+        total_len = len(token_ids) + max_tokens
+        if total_len > max_model_len:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                    f"for model {base_model}"
+                ),
+            )
 
     global _inflight_sample_tasks
     if _should_backpressure(http_request):
@@ -544,19 +580,17 @@ async def _do_sample(
             is_multi_lora = session_manager.is_multi_lora_session(session_id)
             if is_multi_lora:
                 base_model = session_manager.get_session_base_model(session_id)
-                if base_model:
-                    try:
-                        from ..backend.model_registry import get_model_config, normalize_model_name
+                if not base_model:
+                    raise RuntimeError(f"Session {session_id!r} missing base_model")
+                from ..backend.model_registry import get_model_config
 
-                        cfg = get_model_config(normalize_model_name(base_model))
-                        max_model_len = int(cfg.max_model_len)
-                    except Exception:
-                        max_model_len = None
-                    if max_model_len is not None and len(token_ids) > max_model_len:
-                        raise ValueError(
-                            f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
-                            f"for model {base_model}"
-                        )
+                max_model_len = int(get_model_config(base_model).max_model_len)
+                total_len = len(token_ids) + int(request.sampling_params.max_tokens)
+                if total_len > max_model_len:
+                    raise ValueError(
+                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    )
 
             # Generate for each sample
             if request.num_samples < 1:
@@ -799,7 +833,12 @@ async def compute_logprobs(
         upstream_for_alias,
     )
 
-    remote = remote_sampling_session(request.sampling_session_id)
+    is_local = False
+    if session_manager is not None:
+        is_local = session_manager.is_multi_lora_session(request.sampling_session_id) or (
+            session_manager.get_engine(request.sampling_session_id) is not None
+        )
+    remote = None if is_local else remote_sampling_session(request.sampling_session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -827,6 +866,32 @@ async def compute_logprobs(
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
+
+    # Preflight length gate for multi-LoRA sessions to fail fast on registry issues.
+    if session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+    if session_manager.is_multi_lora_session(request.sampling_session_id):
+        base_model = session_manager.get_session_base_model(request.sampling_session_id)
+        if not base_model:
+            raise HTTPException(status_code=500, detail=f"Session {request.sampling_session_id!r} missing base_model")
+        token_ids = request.sequence.to_token_ids()
+        from ..backend.model_registry import get_model_config
+
+        try:
+            max_model_len = int(get_model_config(base_model).max_model_len)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Cannot determine max_model_len for base_model {base_model!r}: "
+                    f"{type(e).__name__}: {e}"
+                ),
+            )
+        if len(token_ids) > max_model_len:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} for model {base_model}",
+            )
 
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
@@ -884,19 +949,16 @@ async def _do_compute_logprobs(
         is_multi_lora = session_manager.is_multi_lora_session(session_id)
         if is_multi_lora:
             base_model = session_manager.get_session_base_model(session_id)
-            if base_model:
-                try:
-                    from ..backend.model_registry import get_model_config, normalize_model_name
+            if not base_model:
+                raise RuntimeError(f"Session {session_id!r} missing base_model")
+            from ..backend.model_registry import get_model_config
 
-                    cfg = get_model_config(normalize_model_name(base_model))
-                    max_model_len = int(cfg.max_model_len)
-                except Exception:
-                    max_model_len = None
-                if max_model_len is not None and len(token_ids) > max_model_len:
-                    raise ValueError(
-                        f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
-                        f"for model {base_model}"
-                    )
+            max_model_len = int(get_model_config(base_model).max_model_len)
+            if len(token_ids) > max_model_len:
+                raise ValueError(
+                    f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                    f"for model {base_model}"
+                )
 
         if is_multi_lora:
             # Multi-LoRA mode: handles both LoRA and base model sessions

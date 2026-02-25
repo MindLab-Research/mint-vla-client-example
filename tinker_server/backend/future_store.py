@@ -494,7 +494,7 @@ class FutureStore:
         import ray
 
         try:
-            ray.get(actor.add_pending.remote(str(request_id)))
+            ray.get(actor.add_pending.remote(request_id=str(request_id)))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -506,22 +506,22 @@ class FutureStore:
 
         payload = None if meta is None else dict(meta)
         try:
-            actor.mark_queued.remote(request_id, meta=payload)
+            actor.mark_queued.remote(request_id=request_id, meta=payload)
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            actor.mark_queued.remote(request_id, meta=payload)
+            actor.mark_queued.remote(request_id=request_id, meta=payload)
 
     def mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
         import ray
 
         try:
-            actor.mark_running.remote(request_id, meta=None if meta is None else dict(meta))
+            actor.mark_running.remote(request_id=request_id, meta=None if meta is None else dict(meta))
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            actor.mark_running.remote(request_id, meta=None if meta is None else dict(meta))
+            actor.mark_running.remote(request_id=request_id, meta=None if meta is None else dict(meta))
 
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()
@@ -529,7 +529,7 @@ class FutureStore:
 
         try:
             ref = ray.put(result)
-            actor.resolve_ref.remote(request_id, ref)
+            actor.resolve_ref.remote(request_id=request_id, ref=ref)
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -539,7 +539,7 @@ class FutureStore:
         import ray
 
         try:
-            actor.fail.remote(request_id, error)
+            actor.fail.remote(request_id=request_id, error=str(error))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -556,7 +556,7 @@ class FutureStore:
         import ray
 
         try:
-            status = ray.get(actor.get_status.remote(request_id))
+            status = ray.get(actor.get_status.remote(request_id=request_id))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -577,7 +577,7 @@ class FutureStore:
         try:
             # Ray auto-dereferences ObjectRef return values, so actor.get_result
             # yields the actual payload (or None), not an ObjectRef.
-            return ray.get(actor.get_result.remote(request_id))
+            return ray.get(actor.get_result.remote(request_id=request_id))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -612,7 +612,7 @@ class FutureStore:
         import ray
 
         try:
-            return ray.get(actor.get_error.remote(request_id))
+            return ray.get(actor.get_error.remote(request_id=request_id))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -630,7 +630,7 @@ class FutureStore:
         import ray
 
         try:
-            ray.get(actor.attach_ref.remote(request_id, ref, meta))
+            ray.get(actor.attach_ref.remote(request_id=request_id, ref=ref, meta=meta))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
@@ -648,11 +648,27 @@ class FutureStore:
         import ray
 
         try:
-            ray.get(actor.submit.remote(request_id, target_actor, method_name, args, meta))
+            ray.get(
+                actor.submit.remote(
+                    request_id=request_id,
+                    target_actor=target_actor,
+                    method_name=method_name,
+                    args=args,
+                    meta=meta,
+                )
+            )
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            ray.get(actor.submit.remote(request_id, target_actor, method_name, args, meta))
+            ray.get(
+                actor.submit.remote(
+                    request_id=request_id,
+                    target_actor=target_actor,
+                    method_name=method_name,
+                    args=args,
+                    meta=meta,
+                )
+            )
 
     def get_meta(self, request_id: str) -> dict[str, Any] | None:
         actor = self._get_ray_actor()
@@ -660,22 +676,22 @@ class FutureStore:
         import ray
 
         try:
-            return ray.get(actor.get_meta.remote(request_id))
+            return ray.get(actor.get_meta.remote(request_id=request_id))
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            return ray.get(actor.get_meta.remote(request_id))
+            return ray.get(actor.get_meta.remote(request_id=request_id))
 
     def cleanup(self, request_id: str) -> None:
         actor = self._get_ray_actor()
         import ray
 
         try:
-            actor.cleanup.remote(request_id)
+            actor.cleanup.remote(request_id=request_id)
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
             actor = self._get_ray_actor()
-            actor.cleanup.remote(request_id)
+            actor.cleanup.remote(request_id=request_id)
 
 
 future_store = FutureStore()

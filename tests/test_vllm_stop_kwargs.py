@@ -13,6 +13,15 @@ def test_vllm_stop_kwargs_strings() -> None:
     assert vllm_stop_kwargs("x", default_stop_token_ids=[1]) == {"stop": "x"}
     assert vllm_stop_kwargs(["x", ""], default_stop_token_ids=[1]) == {"stop": ["x"]}
 
+    # Issue #222: newline-only delimiters expand to also match literal backslash-n sequences.
+    assert vllm_stop_kwargs("\n\n", default_stop_token_ids=[1]) == {"stop": ["\n\n", "\\n\\n"]}
+    assert vllm_stop_kwargs(["\n\n"], default_stop_token_ids=[1]) == {"stop": ["\n\n", "\\n\\n"]}
+
+    # Do not expand single-newline or non-newline stop strings.
+    assert vllm_stop_kwargs("\n", default_stop_token_ids=[1]) == {"stop": "\n"}
+    assert vllm_stop_kwargs("\n\nEND", default_stop_token_ids=[1]) == {"stop": "\n\nEND"}
+    assert vllm_stop_kwargs("}\n\n", default_stop_token_ids=[1]) == {"stop": "}\n\n"}
+
 
 def test_vllm_stop_kwargs_token_ids() -> None:
     assert vllm_stop_kwargs([], default_stop_token_ids=[1]) == {}
@@ -27,4 +36,3 @@ def test_vllm_stop_kwargs_rejects_mixed_lists() -> None:
 def test_vllm_stop_kwargs_rejects_other_types() -> None:
     with pytest.raises(TypeError):
         vllm_stop_kwargs(123, default_stop_token_ids=[1])  # type: ignore[arg-type]
-

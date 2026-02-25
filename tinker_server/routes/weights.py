@@ -122,44 +122,48 @@ async def save_weights(
         upstream_for_alias,
     )
 
-    remote = remote_training_model(request.model_id)
-    if remote is not None:
-        upstream_alias, base_model = remote
-        upstream = upstream_for_alias(upstream_alias)
-        if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+    session = training_manager.get_session(request.model_id) if training_manager is not None else None
 
-        user_data = _get_user_data(http_request)
-        if not can_access_model(base_model, user_data):
-            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    if session is None:
+        remote = remote_training_model(request.model_id)
+        if remote is not None:
+            upstream_alias, base_model = remote
+            upstream = upstream_for_alias(upstream_alias)
+            if upstream is None:
+                raise HTTPException(
+                    status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}"
+                )
 
-        try:
-            resp = await forward_json(
-                upstream=upstream,
-                method="POST",
-                path=http_request.url.path,
-                incoming_headers=dict(http_request.headers),
-                json_body=request.model_dump(),
-                timeout_s=30.0,
+            user_data = _get_user_data(http_request)
+            if not can_access_model(base_model, user_data):
+                raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+            try:
+                resp = await forward_json(
+                    upstream=upstream,
+                    method="POST",
+                    path=http_request.url.path,
+                    incoming_headers=dict(http_request.headers),
+                    json_body=request.model_dump(),
+                    timeout_s=30.0,
+                )
+            except Exception:
+                logger.exception("Upstream save_weights failed: %s", upstream_alias)
+                raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} save_weights failed")
+
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            payload = resp.json()
+            upstream_request_id = payload.get("request_id")
+            if not isinstance(upstream_request_id, str) or not upstream_request_id:
+                raise HTTPException(status_code=502, detail="Upstream save_weights returned invalid request_id")
+            return UntypedAPIFuture(
+                request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
-        except Exception:
-            logger.exception("Upstream save_weights failed: %s", upstream_alias)
-            raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} save_weights failed")
-
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        payload = resp.json()
-        upstream_request_id = payload.get("request_id")
-        if not isinstance(upstream_request_id, str) or not upstream_request_id:
-            raise HTTPException(status_code=502, detail="Upstream save_weights returned invalid request_id")
-        return UntypedAPIFuture(
-            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
-        )
 
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
-    session = training_manager.get_session(request.model_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
@@ -231,44 +235,47 @@ async def save_state(
         upstream_for_alias,
     )
 
-    remote = remote_training_model(request.model_id)
-    if remote is not None:
-        upstream_alias, base_model = remote
-        upstream = upstream_for_alias(upstream_alias)
-        if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+    session = training_manager.get_session(request.model_id) if training_manager is not None else None
+    if session is None:
+        remote = remote_training_model(request.model_id)
+        if remote is not None:
+            upstream_alias, base_model = remote
+            upstream = upstream_for_alias(upstream_alias)
+            if upstream is None:
+                raise HTTPException(
+                    status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}"
+                )
 
-        user_data = _get_user_data(http_request)
-        if not can_access_model(base_model, user_data):
-            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+            user_data = _get_user_data(http_request)
+            if not can_access_model(base_model, user_data):
+                raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
 
-        try:
-            resp = await forward_json(
-                upstream=upstream,
-                method="POST",
-                path="/api/v1/save_state",
-                incoming_headers=dict(http_request.headers),
-                json_body=request.model_dump(),
-                timeout_s=30.0,
+            try:
+                resp = await forward_json(
+                    upstream=upstream,
+                    method="POST",
+                    path="/api/v1/save_state",
+                    incoming_headers=dict(http_request.headers),
+                    json_body=request.model_dump(),
+                    timeout_s=30.0,
+                )
+            except Exception:
+                logger.exception("Upstream save_state failed: %s", upstream_alias)
+                raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} save_state failed")
+
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            payload = resp.json()
+            upstream_request_id = payload.get("request_id")
+            if not isinstance(upstream_request_id, str) or not upstream_request_id:
+                raise HTTPException(status_code=502, detail="Upstream save_state returned invalid request_id")
+            return UntypedAPIFuture(
+                request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
             )
-        except Exception:
-            logger.exception("Upstream save_state failed: %s", upstream_alias)
-            raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} save_state failed")
-
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        payload = resp.json()
-        upstream_request_id = payload.get("request_id")
-        if not isinstance(upstream_request_id, str) or not upstream_request_id:
-            raise HTTPException(status_code=502, detail="Upstream save_state returned invalid request_id")
-        return UntypedAPIFuture(
-            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
-        )
 
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
-    session = training_manager.get_session(request.model_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
@@ -472,7 +479,8 @@ async def load_state(
         upstream_for_alias,
     )
 
-    remote = remote_training_model(request.model_id)
+    session = training_manager.get_session(request.model_id) if training_manager is not None else None
+    remote = None if session is not None else remote_training_model(request.model_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)

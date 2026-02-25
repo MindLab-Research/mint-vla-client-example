@@ -147,7 +147,7 @@ def tinker_to_tensordict(
         # Extract input tokens
         tokens = flatten_encoded_text_chunks(model_input)
         if not tokens:
-            continue
+            raise ValueError(f"Item {item_index}: model_input has no tokens")
 
         tokens_len = len(tokens)
         max_len = max(max_len, tokens_len)
@@ -162,9 +162,7 @@ def tinker_to_tensordict(
         if advantages is not None:
             _ensure_len("advantages", advantages, tokens_len, item_index)
 
-        # Extract weights (loss mask)
-        # Prefer "loss_mask"/"mask"; fallback to "weights".
-        # If missing and advantages provided, derive mask from advantages (non-zero = 1).
+        # Extract weights (loss mask). Require explicit weights to avoid silent semantics changes.
         weights_data = None
         weights_key = None
         for key in ("loss_mask", "mask", "weights"):
@@ -173,14 +171,10 @@ def tinker_to_tensordict(
                 weights_data = candidate
                 weights_key = key
                 break
-        if weights_data is not None:
-            _ensure_len(weights_key, weights_data, tokens_len, item_index)
-            weights = weights_data
-        elif advantages is not None:
-            weights = [1.0 if a != 0 else 0.0 for a in advantages]
-        else:
-            # Default: all tokens contribute to loss
-            weights = [1.0] * tokens_len
+        if weights_data is None:
+            raise ValueError(f"Item {item_index}: missing loss_mask/mask/weights")
+        _ensure_len(weights_key, weights_data, tokens_len, item_index)
+        weights = weights_data
         loss_mask_list.append(weights)
 
         # Derive prompt/response split from loss_mask (response assumed to be suffix).
@@ -415,8 +409,7 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         log_probs = model_output.get("log_probs")
 
         if log_probs is None:
-            loss = torch.tensor(0.0)
-            return loss, {"error": "no_log_probs", "num_tokens": 0}
+            raise ValueError("model_output missing required log_probs")
 
         # Handle NestedTensor format from verl (NO_PADDING mode)
         if hasattr(log_probs, 'values'):
@@ -431,8 +424,7 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         elif loss_mask is not None:
             loss_mask_flat = loss_mask
         else:
-            # Default: all tokens contribute
-            loss_mask_flat = torch.ones_like(log_probs_flat, dtype=torch.bool)
+            raise ValueError("data missing required loss_mask")
 
         use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
         if not use_external_label:

@@ -646,7 +646,13 @@ def _create_multinode_vllm_actor(
             logger.info("MultiNodeVLLMEngine initialized")
 
         async def is_ready(self) -> bool:
-            """Check if engine is initialized and the EngineCore is responsive."""
+            """Check if engine is initialized and the EngineCore is responsive.
+
+            Semantics:
+            - Returns False when the engine is busy (cannot safely probe EngineCore).
+              Callers must treat False as "not ready / unknown", not as "dead".
+            - When idle, performs a cheap EngineCore probe to avoid false positives.
+            """
             if not self._initialized or self.engine is None:
                 return False
             try:
@@ -656,18 +662,17 @@ def _create_multinode_vllm_actor(
                 # Also: avoid cancelling vLLM engine coroutines during liveness checks. Cancellation
                 # can leave engine state inconsistent and later generations can hang.
                 if self._gate_lock.locked():
-                    return True
+                    return False
                 async with self._gate_lock:
                     async with self._active_generates_cond:
                         if self._active_generates > 0:
-                            return True
-                    # Best-effort: if idle, treat actor as ready without probing EngineCore.
-                    # Failures will surface naturally on real RPCs (generate / logprobs).
+                            return False
+                    # When idle, probe EngineCore via a cheap RPC.
+                    await self.engine.list_loras()
                     return True
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
-            return True
 
         async def add_lora(self, lora_int_id: int, lora_path: str, lora_name: str) -> None:
             """Add LoRA adapter from shared filesystem path.
