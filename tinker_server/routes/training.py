@@ -153,17 +153,26 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
 
-def _get_max_model_len(base_model: str | None) -> int | None:
-    """Return the configured max_model_len for a supported model name, else None."""
-    if not base_model:
-        return None
-    try:
-        from ..backend.model_registry import get_model_config, normalize_model_name
+def _get_max_model_len(base_model: str | None) -> int:
+    """Return the configured max_model_len for a supported model name.
 
-        model_name = normalize_model_name(base_model)
-        return int(get_model_config(model_name).max_model_len)
-    except Exception:
-        return None
+    If the server cannot determine the model's max_model_len, fail fast rather
+    than silently skipping the length gate.
+    """
+    if not base_model:
+        raise HTTPException(status_code=500, detail="Training session missing base_model")
+    from ..backend.model_registry import get_model_config
+
+    try:
+        return int(get_model_config(base_model).max_model_len)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Cannot determine max_model_len for base_model {base_model!r}: "
+                f"{type(e).__name__}: {e}"
+            ),
+        )
 
 
 # =============================================================================
@@ -706,16 +715,15 @@ async def forward_backward(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     max_model_len = _get_max_model_len(session.base_model)
-    if max_model_len is not None:
-        _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
-        if max_seq_len > max_model_len:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                    f"for model {session.base_model}"
-                ),
-            )
+    _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
+    if max_seq_len > max_model_len:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                f"for model {session.base_model}"
+            ),
+        )
 
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
@@ -769,13 +777,12 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
         max_model_len = _get_max_model_len(session.base_model)
-        if max_model_len is not None:
-            _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
-            if max_seq_len > max_model_len:
-                raise RuntimeError(
-                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                    f"for model {session.base_model}"
-                )
+        _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
+        if max_seq_len > max_model_len:
+            raise RuntimeError(
+                f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                f"for model {session.base_model}"
+            )
 
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
@@ -872,16 +879,15 @@ async def train_step(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     max_model_len = _get_max_model_len(session.base_model)
-    if max_model_len is not None:
-        _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
-        if max_seq_len > max_model_len:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                    f"for model {session.base_model}"
-                ),
-            )
+    _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
+    if max_seq_len > max_model_len:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                f"for model {session.base_model}"
+            ),
+        )
 
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
@@ -1036,16 +1042,15 @@ async def forward(
         )
 
     max_model_len = _get_max_model_len(session.base_model)
-    if max_model_len is not None:
-        _, max_seq_len = _compute_token_stats(request.forward_input.data)
-        if max_seq_len > max_model_len:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
-                    f"for model {session.base_model}"
-                ),
-            )
+    _, max_seq_len = _compute_token_stats(request.forward_input.data)
+    if max_seq_len > max_model_len:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Input sequence length {max_seq_len} exceeds max_model_len {max_model_len} "
+                f"for model {session.base_model}"
+            ),
+        )
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager

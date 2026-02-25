@@ -12,7 +12,7 @@ def _normalize_local_model_name(base_model: str) -> str | None:
         return base_model
     try:
         return normalize_model_name(base_model)
-    except Exception:
+    except ValueError:
         return None
 
 
