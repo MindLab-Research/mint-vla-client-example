@@ -69,8 +69,11 @@ def _get_or_create_actor():
             namespace=namespace,
             lifetime="detached",
         ).remote()
-    except Exception:
-        return ray.get_actor(name, namespace=namespace)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to create detached gateway session store actor name={name!r} namespace={namespace!r}: "
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 
 def _ensure_ray_initialized() -> None:
@@ -104,16 +107,16 @@ def _ensure_ray_initialized() -> None:
                     break
 
         init_ray(address=addr or "auto")
-    except Exception:
-        return
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Ray for gateway session store: {type(e).__name__}: {e}") from e
+    if not ray.is_initialized():
+        raise RuntimeError("Ray is not initialized after init_ray() for gateway session store")
 
 
 def upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
     import ray
 
     _ensure_ray_initialized()
-    if not ray.is_initialized():
-        return
     actor = _get_or_create_actor()
     ray.get(
         actor.upsert_sampling_session.remote(
@@ -127,8 +130,6 @@ def get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
     import ray
 
     _ensure_ray_initialized()
-    if not ray.is_initialized():
-        return None
     actor = _get_or_create_actor()
     info = ray.get(actor.get_sampling_session.remote(sampling_session_id))
     if not isinstance(info, dict):
@@ -146,8 +147,6 @@ def delete_sampling_session(sampling_session_id: str) -> None:
     import ray
 
     _ensure_ray_initialized()
-    if not ray.is_initialized():
-        return
     actor = _get_or_create_actor()
     ray.get(actor.delete_sampling_session.remote(sampling_session_id))
 
@@ -156,8 +155,6 @@ def upsert_training_model(*, model_id: str, upstream_alias: str, base_model: str
     import ray
 
     _ensure_ray_initialized()
-    if not ray.is_initialized():
-        return
     actor = _get_or_create_actor()
     ray.get(
         actor.upsert_training_model.remote(
@@ -171,8 +168,6 @@ def get_training_model(model_id: str) -> tuple[str, str] | None:
     import ray
 
     _ensure_ray_initialized()
-    if not ray.is_initialized():
-        return None
     actor = _get_or_create_actor()
     info = ray.get(actor.get_training_model.remote(model_id))
     if not isinstance(info, dict):
@@ -190,7 +185,5 @@ def delete_training_model(model_id: str) -> None:
     import ray
 
     _ensure_ray_initialized()
-    if not ray.is_initialized():
-        return
     actor = _get_or_create_actor()
     ray.get(actor.delete_training_model.remote(model_id))

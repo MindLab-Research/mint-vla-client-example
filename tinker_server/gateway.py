@@ -218,7 +218,12 @@ def maybe_register_sampling_session_from_retrieve_future(
 
 def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
     _remote_sampling_sessions[sampling_session_id] = (upstream_alias, base_model)
+    cfg = get_gateway_config()
+    if cfg is None or not cfg.model_to_upstream:
+        return
     try:
+        from fastapi import HTTPException
+
         from .backend import gateway_session_store
 
         gateway_session_store.upsert_sampling_session(
@@ -226,38 +231,64 @@ def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias
             upstream_alias=upstream_alias,
             base_model=base_model,
         )
-    except Exception:
+    except Exception as e:
+        _remote_sampling_sessions.pop(sampling_session_id, None)
         logger.exception("gateway_session_store.upsert_sampling_session failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+        )
 
 
 def remote_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
     cached = _remote_sampling_sessions.get(sampling_session_id)
     if cached is not None:
         return cached
+    cfg = get_gateway_config()
+    if cfg is None or not cfg.model_to_upstream:
+        return None
     try:
+        from fastapi import HTTPException
+
         from .backend import gateway_session_store
 
         info = gateway_session_store.get_sampling_session(sampling_session_id)
         if info is not None:
             _remote_sampling_sessions[sampling_session_id] = info
         return info
-    except Exception:
-        return None
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+        )
 
 
 def unregister_remote_sampling_session(sampling_session_id: str) -> None:
     _remote_sampling_sessions.pop(sampling_session_id, None)
+    cfg = get_gateway_config()
+    if cfg is None or not cfg.model_to_upstream:
+        return
     try:
+        from fastapi import HTTPException
+
         from .backend import gateway_session_store
 
         gateway_session_store.delete_sampling_session(sampling_session_id)
-    except Exception:
-        pass
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+        )
 
 
 def register_remote_training_model(*, model_id: str, upstream_alias: str, base_model: str) -> None:
     _remote_training_models[model_id] = (upstream_alias, base_model)
+    cfg = get_gateway_config()
+    if cfg is None or not cfg.model_to_upstream:
+        return
     try:
+        from fastapi import HTTPException
+
         from .backend import gateway_session_store
 
         gateway_session_store.upsert_training_model(
@@ -265,33 +296,54 @@ def register_remote_training_model(*, model_id: str, upstream_alias: str, base_m
             upstream_alias=upstream_alias,
             base_model=base_model,
         )
-    except Exception:
+    except Exception as e:
+        _remote_training_models.pop(model_id, None)
         logger.exception("gateway_session_store.upsert_training_model failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+        )
 
 
 def remote_training_model(model_id: str) -> tuple[str, str] | None:
     cached = _remote_training_models.get(model_id)
     if cached is not None:
         return cached
+    cfg = get_gateway_config()
+    if cfg is None or not cfg.model_to_upstream:
+        return None
     try:
+        from fastapi import HTTPException
+
         from .backend import gateway_session_store
 
         info = gateway_session_store.get_training_model(model_id)
         if info is not None:
             _remote_training_models[model_id] = info
         return info
-    except Exception:
-        return None
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+        )
 
 
 def unregister_remote_training_model(model_id: str) -> None:
     _remote_training_models.pop(model_id, None)
+    cfg = get_gateway_config()
+    if cfg is None or not cfg.model_to_upstream:
+        return
     try:
+        from fastapi import HTTPException
+
         from .backend import gateway_session_store
 
         gateway_session_store.delete_training_model(model_id)
-    except Exception:
-        pass
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+        )
 
 
 _cap_cache: dict[str, tuple[float, dict[str, int]]] = {}  # upstream_alias -> (ts, model_name->max_len)
