@@ -309,7 +309,12 @@ class ApiWorkQueueClient:
                     if isinstance(e, (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError)):
                         self._ray_actor = None
                 except Exception:
-                    pass
+                    logger.error(
+                        "[api_work_queue] failed to classify dequeue exception as Ray error (worker_idx=%s): %s: %s",
+                        int(worker_idx),
+                        type(e).__name__,
+                        e,
+                    )
 
                 logger.error(
                     "[api_work_queue] dequeue failed (worker_idx=%s): %s: %s",
@@ -333,9 +338,16 @@ class ApiWorkQueueClient:
                 )
             try:
                 capacity_manager.release_queue(item.request_id)
-            except Exception:
+            except Exception as e:
                 # Do not fail open: the reservation leak will force 429 and surface via stats.
-                pass
+                logger.error(
+                    "[api_work_queue] release_queue failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                    int(worker_idx),
+                    str(item.request_id),
+                    str(item.op),
+                    type(e).__name__,
+                    e,
+                )
 
             # If the future has already transitioned to a terminal state (for example due to
             # queue-timeout), do not run the executor. This prevents a timed-out future from
@@ -399,8 +411,16 @@ class ApiWorkQueueClient:
                     )
                 try:
                     capacity_manager.release_all(item.request_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(
+                        "[api_work_queue] release_all failed after skip_non_pending (worker_idx=%s, request_id=%s, op=%s, status=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        str(status),
+                        type(e).__name__,
+                        e,
+                    )
                 continue
 
             try:
