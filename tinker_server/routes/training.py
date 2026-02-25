@@ -135,6 +135,21 @@ def _restore_training_session(model_id: str):
         return None
 
 
+def _raise_if_local_model_id_exists(model_id: str) -> None:
+    if training_engine is None or training_manager is None:
+        return
+    if training_manager.get_session(model_id) is not None:
+        raise HTTPException(status_code=409, detail=f"Model_id conflict: local model already exists: {model_id!r}")
+    try:
+        from ..backend.training_session_store import get_training_session_info
+
+        info = get_training_session_info(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+    if isinstance(info, dict):
+        raise HTTPException(status_code=409, detail=f"Model_id conflict: local model already exists: {model_id!r}")
+
+
 def _generate_model_id(session_id: str, model_seq_id: int) -> str:
     """Generate unique model_id from session_id and model_seq_id."""
     return f"{session_id}_{model_seq_id}"
@@ -199,17 +214,22 @@ async def create_model(
             detail=get_access_denied_error(request.base_model)
         )
 
+    model_id = _generate_model_id(request.session_id, request.model_seq_id)
+
     # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
     # return a gateway-encoded request_id so /retrieve_future can route it.
     from ..gateway import (
         encode_request_id,
         forward_json,
+        get_gateway_config,
         register_remote_training_model,
+        remote_training_model,
         upstream_for_model,
     )
 
     upstream = upstream_for_model(request.base_model)
     if upstream is not None:
+        _raise_if_local_model_id_exists(model_id)
         try:
             resp = await forward_json(
                 upstream=upstream,
@@ -229,7 +249,6 @@ async def create_model(
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
             raise HTTPException(status_code=502, detail="Upstream create_model returned invalid request_id")
 
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
         register_remote_training_model(
             model_id=model_id,
             upstream_alias=upstream.alias,
@@ -242,11 +261,20 @@ async def create_model(
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
 
+    cfg = get_gateway_config()
+    if cfg is not None and cfg.model_to_upstream:
+        remote = remote_training_model(model_id)
+        if remote is not None:
+            upstream_alias, _ = remote
+            raise HTTPException(
+                status_code=409,
+                detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
+            )
+
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
 
     # 1. 发送 pending 状态 - 任务已创建，等待执行
-    model_id = _generate_model_id(request.session_id, request.model_seq_id)
     if webhook_url and user_id:
         send_task_event(
             webhook_url=webhook_url,
@@ -427,16 +455,21 @@ async def create_model_from_state(
             detail=get_access_denied_error(request.base_model)
         )
 
+    model_id = _generate_model_id(request.session_id, request.model_seq_id)
+
     from ..gateway import (
         encode_request_id,
         forward_file,
         forward_json,
+        get_gateway_config,
         register_remote_training_model,
+        remote_training_model,
         upstream_for_model,
     )
 
     upstream = upstream_for_model(request.base_model)
     if upstream is not None:
+        _raise_if_local_model_id_exists(model_id)
         user_id = _get_user_id(http_request)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
@@ -499,7 +532,6 @@ async def create_model_from_state(
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
             raise HTTPException(status_code=502, detail="Upstream create_model_from_state returned invalid request_id")
 
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
         register_remote_training_model(
             model_id=model_id,
             upstream_alias=upstream.alias,
@@ -511,6 +543,16 @@ async def create_model_from_state(
 
     if training_engine is None or training_manager is None:
         raise HTTPException(status_code=503, detail="Training engine not initialized")
+
+    cfg = get_gateway_config()
+    if cfg is not None and cfg.model_to_upstream:
+        remote = remote_training_model(model_id)
+        if remote is not None:
+            upstream_alias, _ = remote
+            raise HTTPException(
+                status_code=409,
+                detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
+            )
 
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
