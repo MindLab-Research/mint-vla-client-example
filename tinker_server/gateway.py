@@ -205,7 +205,7 @@ def maybe_register_sampling_session_from_retrieve_future(
     if not isinstance(sampling_session_id, str) or not sampling_session_id:
         return
     key = (upstream_alias, upstream_request_id)
-    entry = _pending_save_weights_for_sampler.pop(key, None)
+    entry = _pending_save_weights_for_sampler.get(key)
     if entry is None:
         return
     _, base_model = entry
@@ -214,6 +214,7 @@ def maybe_register_sampling_session_from_retrieve_future(
         upstream_alias=upstream_alias,
         base_model=base_model,
     )
+    _pending_save_weights_for_sampler.pop(key, None)
 
 
 def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
@@ -236,7 +237,7 @@ def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias
         logger.exception("gateway_session_store.upsert_sampling_session failed")
         raise HTTPException(
             status_code=503,
-            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+            detail="Gateway session store unavailable",
         )
 
 
@@ -259,7 +260,7 @@ def remote_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+            detail="Gateway session store unavailable",
         )
 
 
@@ -277,7 +278,7 @@ def unregister_remote_sampling_session(sampling_session_id: str) -> None:
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+            detail="Gateway session store unavailable",
         )
 
 
@@ -301,7 +302,7 @@ def register_remote_training_model(*, model_id: str, upstream_alias: str, base_m
         logger.exception("gateway_session_store.upsert_training_model failed")
         raise HTTPException(
             status_code=503,
-            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+            detail="Gateway session store unavailable",
         )
 
 
@@ -324,7 +325,7 @@ def remote_training_model(model_id: str) -> tuple[str, str] | None:
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+            detail="Gateway session store unavailable",
         )
 
 
@@ -342,7 +343,7 @@ def unregister_remote_training_model(model_id: str) -> None:
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Gateway session store unavailable: {type(e).__name__}: {e}",
+            detail="Gateway session store unavailable",
         )
 
 

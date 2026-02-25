@@ -70,10 +70,15 @@ def _get_or_create_actor():
             lifetime="detached",
         ).remote()
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to create detached gateway session store actor name={name!r} namespace={namespace!r}: "
-            f"{type(e).__name__}: {e}"
-        ) from e
+        # Concurrency: another process may have created the detached actor after our initial
+        # ray.get_actor(name) check but before this .remote() call.
+        try:
+            return ray.get_actor(name, namespace=namespace)
+        except Exception:
+            raise RuntimeError(
+                f"Failed to create detached gateway session store actor name={name!r} namespace={namespace!r}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
 
 def _ensure_ray_initialized() -> None:
