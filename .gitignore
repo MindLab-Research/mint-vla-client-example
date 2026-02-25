@@ -219,6 +219,7 @@ checkpoints/
 # Codex task files (do not commit)
 PROMPT.md
 LOG.md
+PROMPT.md
 transcript.txt
 results/*
 .claude/skills/merge-gate/results/

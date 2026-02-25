@@ -363,13 +363,6 @@ def normalize_model_name(model_name_or_path: str) -> str:
         if candidate in MODEL_CONFIGS:
             return candidate
 
-    # Try substring matching as fallback
-    for model_name in MODEL_CONFIGS:
-        # Normalize for comparison: Qwen/Qwen3-0.6B -> qwen--qwen3-0.6b
-        path_pattern = model_name.replace("/", "--").lower()
-        if path_pattern in model_name_or_path.lower():
-            return model_name
-
     raise ValueError(
         f"Cannot identify model from: {model_name_or_path}. "
         f"Supported models: {list(MODEL_CONFIGS.keys())}"
@@ -393,11 +386,6 @@ def maybe_normalize_model_name(model_name_or_path: str) -> str | None:
         candidate = f"{org}/{model}"
         if candidate in MODEL_CONFIGS:
             return candidate
-
-    lower = model_name_or_path.lower()
-    for model_name in MODEL_CONFIGS:
-        if model_name.replace("/", "--").lower() in lower:
-            return model_name
 
     return None
 

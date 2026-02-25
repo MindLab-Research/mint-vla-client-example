@@ -188,7 +188,6 @@ async def get_server_capabilities(http_request: Request) -> dict:
 
     # Fetch capabilities once per upstream alias that has at least one routed model.
     alias_to_caps: dict[str, dict[str, int]] = {}
-    unavailable_aliases: set[str] = set()
     for alias in set(cfg.model_to_upstream.values()):
         upstream = cfg.upstreams.get(alias)
         if upstream is None:
@@ -197,9 +196,12 @@ async def get_server_capabilities(http_request: Request) -> dict:
             alias_to_caps[alias] = await get_upstream_capabilities(
                 upstream=upstream, incoming_headers=incoming_headers
             )
-        except Exception:
+        except Exception as e:
             logger.exception("Upstream capabilities unavailable: %s", alias)
-            unavailable_aliases.add(alias)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Upstream {alias!r} capabilities unavailable: {type(e).__name__}: {e}",
+            )
 
     merged: list[dict] = []
     seen: set[str] = set()
@@ -211,9 +213,7 @@ async def get_server_capabilities(http_request: Request) -> dict:
         if m in cfg.model_to_upstream:
             upstream = upstream_for_model(m)
             if upstream is None:
-                continue
-            if upstream.alias in unavailable_aliases:
-                continue
+                raise HTTPException(status_code=500, detail=f"Gateway misconfig: no upstream resolved for model {m!r}")
             caps = alias_to_caps.get(upstream.alias, {})
             config = None
             try:
@@ -223,11 +223,6 @@ async def get_server_capabilities(http_request: Request) -> dict:
 
             if m in caps:
                 max_len = int(caps[m])
-            elif config is not None:
-                # Some upstream deployments run with ALLOW_UNSUPPORTED_MODELS=1 and therefore may not
-                # advertise every routable model. Keep routing functional by falling back to the
-                # local registry's max_model_len for that model.
-                max_len = int(config.max_model_len)
             else:
                 raise HTTPException(
                     status_code=500,
