@@ -447,7 +447,10 @@ async def asample(
     )
 
     session_id = request.get_session_id()
-    remote = remote_sampling_session(session_id)
+    is_local = False
+    if session_manager is not None:
+        is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
+    remote = None if is_local else remote_sampling_session(session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -830,7 +833,12 @@ async def compute_logprobs(
         upstream_for_alias,
     )
 
-    remote = remote_sampling_session(request.sampling_session_id)
+    is_local = False
+    if session_manager is not None:
+        is_local = session_manager.is_multi_lora_session(request.sampling_session_id) or (
+            session_manager.get_engine(request.sampling_session_id) is not None
+        )
+    remote = None if is_local else remote_sampling_session(request.sampling_session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
