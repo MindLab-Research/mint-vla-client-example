@@ -37,7 +37,9 @@ description: |
 
 - **NEVER** `ssh mint-dev` - that's development
 - **NEVER** use port `8000` - that's development
-- **NEVER** use unison for production sync - use rsync (unidirectional)
+- **NEVER** run `rsync` with `--delete` on production paths
+- **NEVER** sync virtualenvs or temp dirs (exclude `.venv*/`, `.venv_cpu/`, `.unison*/`, `cpu-pydeps/`)
+- **NEVER** interrupt a running `rsync` (partial trees cause hard-to-debug corruption)
 - **NEVER** use `mint-dev-*.yaml` Ray configs - that's development
 - **NEVER** use `tinker-server` directory (without `-auth`) - that's development
 - **NEVER** use `pkill -f "run_server"` - may kill dev server; use `fuser -k 18000/tcp`
@@ -182,36 +184,34 @@ curl -X POST -H "X-API-Key: $TINKER_API_KEY" http://localhost:18000/api/v1/kill_
 
 ## 1. Code Synchronization
 
-> **CRITICAL: USE RSYNC FOR PRODUCTION DEPLOYMENT**
+> **CRITICAL: DEPLOY VIA RSYNC (NO `--delete`)**
 >
-> Production uses **unidirectional rsync** from local to server. This ensures:
-> - Local code is the source of truth
-> - No accidental overwrites from server
-> - Explicit deployment step (not background sync)
+> Production code sync is **unidirectional rsync** from local to server.
+>
+> Hard rule: **do not use `--delete`**. Also exclude any environment or temp trees so rsync cannot clobber them.
+
+### Deploy latest `origin/main`
 
 ```bash
-# From the tinker-server-prod directory:
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+```
 
-# Sync local code to production server (dry-run first)
-rsync -avz --dry-run --delete \
+### Sync code to production (dry-run first)
+
+```bash
+rsync -avz --dry-run \
   --exclude='.git' \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
   --exclude='.env' \
   --exclude='.secrets.env' \
-  --exclude='LOG.md' \
-  --exclude='PROMPT.md' \
-  --exclude='ray_head_ip.txt' \
-  --exclude='.claude' \
-  ./ mint-prod-volcano:/vePFS-Mindverse/share/code/tinker-server-auth/
-
-# Execute sync (remove --dry-run)
-rsync -avz --delete \
-  --exclude='.git' \
-  --exclude='__pycache__' \
-  --exclude='*.pyc' \
-  --exclude='.env' \
-  --exclude='.secrets.env' \
+  --exclude='.venv' \
+  --exclude='.venv*/' \
+  --exclude='.venv_cpu/' \
+  --exclude='cpu-pydeps/' \
+  --exclude='.unison*' \
   --exclude='LOG.md' \
   --exclude='PROMPT.md' \
   --exclude='ray_head_ip.txt' \
@@ -219,13 +219,31 @@ rsync -avz --delete \
   ./ mint-prod-volcano:/vePFS-Mindverse/share/code/tinker-server-auth/
 ```
 
-**Verify sync succeeded:**
-```bash
-# Compare specific file
-ssh mint-prod-volcano "head -5 /vePFS-Mindverse/share/code/tinker-server-auth/tinker_server/backend/model_registry.py"
+### Execute sync
 
-# Check git commit on server
-ssh mint-prod-volcano "cd /vePFS-Mindverse/share/code/tinker-server-auth && git log -1 --oneline"
+```bash
+rsync -avz \
+  --exclude='.git' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.env' \
+  --exclude='.secrets.env' \
+  --exclude='.venv' \
+  --exclude='.venv*/' \
+  --exclude='.venv_cpu/' \
+  --exclude='cpu-pydeps/' \
+  --exclude='.unison*' \
+  --exclude='LOG.md' \
+  --exclude='PROMPT.md' \
+  --exclude='ray_head_ip.txt' \
+  --exclude='.claude' \
+  ./ mint-prod-volcano:/vePFS-Mindverse/share/code/tinker-server-auth/
+```
+
+### Restart to load new code
+
+```bash
+ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
 ```
 
 **SSH server symlink setup** (one-time):
@@ -244,7 +262,7 @@ ssh mint-prod-volcano "rm -rf /root/tinker_project/tinker-server-auth && \
 
 **Update secrets on prod (required when rotating credentials):**
 ```bash
-# From repo root: copy local `.secrets.env` to prod and restart
+# From repo root: copy local `.secrets.env` to prod and restart (single file only)
 rsync -av .secrets.env mint-prod-volcano:/root/tinker_project/tinker-server-auth/.secrets.env
 ssh mint-prod-volcano 'chmod 600 /root/tinker_project/tinker-server-auth/.secrets.env'
 ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'
@@ -624,7 +642,7 @@ ssh mint-prod-volcano "grep 'loss_fn_inputs\|Missing' /tmp/tinker_server_auth.lo
 
 | Symptom | Fix |
 |---------|-----|
-| Code out of sync | Run rsync from local to server (see Code Synchronization) |
+| Code out of sync | Re-run rsync deploy (NO `--delete`) and restart server (see Code Synchronization) |
 | Symlink broken | Re-run symlink setup command |
 | Server won't start | Check logs: `tail -100 /tmp/tinker_server_auth.log` |
 | Auth bypass | Verify `PYTHONPATH` prioritizes `tinker-server-auth` |
