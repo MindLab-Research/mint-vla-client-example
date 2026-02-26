@@ -614,6 +614,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
                     str(model_id),
                     str(checkpoint_name),
                     prefer_tinker=prefer_tinker_uri(http_request),
+                    checkpoint_type="sampler",
                 )
             else:
                 model_path = info.get("model_path_raw")

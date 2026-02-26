@@ -1666,8 +1666,43 @@ async def _do_save_weights_for_sampler(
         )
         print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
-        tinker_uri = f"tinker://{session.model_id}/{checkpoint_name}"
-        mint_uri = f"mint://{session.model_id}/{checkpoint_name}"
+        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
+
+        if checkpoint_has_optimizer_state(save_path):
+            raise RuntimeError(
+                f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
+            )
+
+        write_checkpoint_metadata(
+            save_path,
+            {
+                "checkpoint_id": checkpoint_name,
+                "owner_id": user_id,
+                "model_id": session.model_id,
+                "model_name": session.base_model,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "step": session.current_step,
+                "checkpoint_type": "sampler",
+                "optimizer_present": False,
+                "backend": session.backend,
+                "type": "sampler",
+            },
+        )
+
+        from ..client_compat import checkpoint_uri
+
+        tinker_uri = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=True,
+            checkpoint_type="sampler",
+        )
+        mint_uri = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="sampler",
+        )
         path_uri = tinker_uri if prefer_tinker else mint_uri
 
         if request.path is not None:
@@ -1940,9 +1975,12 @@ async def get_model_info(model_id: str):
         "base_model": session.base_model,
         "lora_config": session.lora_config.model_dump() if session.lora_config else None,
         "user_metadata": session.user_metadata,
+        "learning_rate": session.learning_rate,
         "created_at": session.created_at,
         "current_step": session.current_step,
         "is_active": session.is_active,
+        "backend": session.backend,
+        "user_id": session.user_id,
     }
 
 

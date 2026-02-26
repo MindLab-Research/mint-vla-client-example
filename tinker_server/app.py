@@ -733,6 +733,8 @@ async def lifespan(app: FastAPI):
     async def _exec_weights_save_weights(item):
         req = SaveStateRequest.model_validate_json(item.request_json)
         prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
+        # This must produce a training checkpoint (weights + optimizer state).
         await weights._do_save_state(
             item.request_id,
             req,

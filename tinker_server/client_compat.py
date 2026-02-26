@@ -32,6 +32,23 @@ def prefer_tinker_uri(request: Any) -> bool:
     return is_tinker_sdk_user_agent(_get_user_agent_from_request(request))
 
 
-def checkpoint_uri(model_id: str, checkpoint_name: str, *, prefer_tinker: bool) -> str:
+def checkpoint_uri(
+    model_id: str,
+    checkpoint_name: str,
+    *,
+    prefer_tinker: bool,
+    checkpoint_type: str | None = None,
+) -> str:
     scheme = "tinker" if prefer_tinker else "mint"
+
+    # Canonical Tinker checkpoint paths:
+    # - tinker://{training_run_id}/weights/{checkpoint_id}
+    # - tinker://{training_run_id}/sampler_weights/{checkpoint_id}
+    #
+    # Older MinT paths omitted the type segment (tinker://{run_id}/{checkpoint_id}).
+    # Keep emitting legacy shape only when checkpoint_type is unknown.
+    if checkpoint_type == "training":
+        return f"{scheme}://{model_id}/weights/{checkpoint_name}"
+    if checkpoint_type == "sampler":
+        return f"{scheme}://{model_id}/sampler_weights/{checkpoint_name}"
     return f"{scheme}://{model_id}/{checkpoint_name}"

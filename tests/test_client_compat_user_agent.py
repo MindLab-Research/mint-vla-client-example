@@ -13,5 +13,23 @@ def test_is_tinker_sdk_user_agent():
 
 
 def test_checkpoint_uri_scheme():
+    assert (
+        checkpoint_uri("run-1", "0000", prefer_tinker=True, checkpoint_type="training")
+        == "tinker://run-1/weights/0000"
+    )
+    assert (
+        checkpoint_uri("run-1", "0000", prefer_tinker=True, checkpoint_type="sampler")
+        == "tinker://run-1/sampler_weights/0000"
+    )
+    assert (
+        checkpoint_uri("run-1", "0000", prefer_tinker=False, checkpoint_type="training")
+        == "mint://run-1/weights/0000"
+    )
+    assert (
+        checkpoint_uri("run-1", "0000", prefer_tinker=False, checkpoint_type="sampler")
+        == "mint://run-1/sampler_weights/0000"
+    )
+
+    # Legacy fallback when checkpoint type is unknown.
     assert checkpoint_uri("run-1", "0000", prefer_tinker=True) == "tinker://run-1/0000"
     assert checkpoint_uri("run-1", "0000", prefer_tinker=False) == "mint://run-1/0000"

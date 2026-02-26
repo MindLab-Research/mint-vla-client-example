@@ -3687,7 +3687,9 @@ class MegatronRankWorker:
         rank_path = _get_rank_checkpoint_path(checkpoint_path)
         optimizer_file = rank_path + "_optimizer.pt"
         if not os.path.isfile(optimizer_file):
-            return {}
+            raise FileNotFoundError(
+                f"Optimizer restore requested, but optimizer shard not found: {optimizer_file}"
+            )
 
         state_dict = torch.load(optimizer_file, map_location="cpu")
         with self.engine.train_mode():
@@ -4983,10 +4985,17 @@ class MegatronWorkerGroup:
                 result["load_method"] = "load_adapter_state"
 
                 if load_optimizer:
-                    opt_results = ray.get([w.load_optimizer_state.remote(load_path) for w in self.workers])
-                    result["optimizer_restored"] = any(
+                    opt_results = ray.get(
+                        [w.load_optimizer_state.remote(load_path) for w in self.workers]
+                    )
+                    optimizer_restored = any(
                         isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
                     )
+                    if not optimizer_restored:
+                        raise RuntimeError(
+                            "Optimizer restore requested, but no rank reported optimizer restored"
+                        )
+                    result["optimizer_restored"] = True
                 else:
                     result["optimizer_restored"] = False
 
@@ -5000,11 +5009,13 @@ class MegatronWorkerGroup:
 
                 return result
             else:
-                logger.warning(f"[MegatronWorkerGroup] load_checkpoint: no adapter files found in {load_path}")
+                raise FileNotFoundError(
+                    f"Missing distributed adapter shards (mp_rank_*_adapter.pt) in: {load_path}"
+                )
         else:
-            logger.error(f"[MegatronWorkerGroup] load_checkpoint: path does not exist or is not a directory: {load_path}")
-
-        return {"status": "no_adapter_files", "path": load_path}
+            raise FileNotFoundError(
+                f"Checkpoint path does not exist or is not a directory: {load_path}"
+            )
 
 
     def save_checkpoint(

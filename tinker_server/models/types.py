@@ -3,6 +3,7 @@
 These types match the tinker client API for compatibility.
 """
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -476,10 +477,18 @@ class LoadStateResponse(BaseModel):
 class CheckpointInfo(BaseModel):
     """Information about a checkpoint."""
 
-    checkpoint_id: str  # directory name, e.g. "checkpoint-100"
-    path: str  # tinker://{model_id}/{checkpoint_id} or mint://{model_id}/{checkpoint_id}
+    checkpoint_id: str
+    checkpoint_type: Literal["training", "sampler"]
+    time: datetime
+    tinker_path: str
+
+    # Compatibility fields (ignored by Tinker clients; used by Mint tooling).
+    path: str | None = None
     step: int | None = None  # parsed from checkpoint name if available
-    created_at: str  # ISO timestamp
+    created_at: str | None = None  # ISO timestamp
+    size_bytes: int | None = None
+    public: bool = False
+    expires_at: datetime | None = None
 
 
 class CheckpointsListResponse(BaseModel):

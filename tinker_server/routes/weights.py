@@ -2,7 +2,7 @@
 
 Endpoints:
 - POST /save_weights: Save model weights (currently LoRA-only; legacy)
-- POST /save_state: Save checkpoint for training resume (currently LoRA-only; optimizer saving not implemented)
+- POST /save_state: Save checkpoint for training resume (LoRA-only, includes optimizer state)
 - POST /load_state: Load checkpoint to resume training
 - GET /training_runs/{model_id}/checkpoints: List checkpoints for model
 - DELETE /training_runs/{model_id}/checkpoints/{checkpoint_id}: Delete checkpoint
@@ -15,11 +15,11 @@ import logging
 import os
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 from ..backend.future_store import future_store
 from ..checkpoints import (
@@ -106,14 +106,10 @@ async def save_weights(
     request: SaveStateRequest,
     http_request: Request,
 ) -> UntypedAPIFuture:
-    """Save LoRA weights for sampling.
+    """Save training checkpoint (Tinker TrainingClient.save_state).
 
-    Saves LoRA weights and registers them for multi-LoRA sampling.
-
-    CURRENT BEHAVIOR: Saves LoRA weights only.
-
-    INTENDED BEHAVIOR: Should save weights + optimizer state for true training resume
-    with preserved momentum. See GitHub issue #67.
+    Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
+    This must produce a training checkpoint (weights + optimizer state).
     """
     from ..gateway import (
         encode_request_id,
@@ -212,7 +208,7 @@ async def save_weights(
 
 
 # =============================================================================
-# POST /save_state - async (full checkpoint - optimizer saving NOT IMPLEMENTED)
+# POST /save_state - async (training checkpoint: includes optimizer state)
 # =============================================================================
 
 
@@ -223,10 +219,7 @@ async def save_state(
 ) -> UntypedAPIFuture:
     """Save model state to checkpoint.
 
-    CURRENT BEHAVIOR: Saves LoRA weights only (same as /save_weights).
-
-    INTENDED BEHAVIOR (not implemented): Should save weights + optimizer state
-    for true training resume with preserved momentum. See GitHub issue #67.
+    This endpoint produces a training checkpoint intended for resume, including optimizer state.
     """
     from ..gateway import (
         encode_request_id,
@@ -357,7 +350,7 @@ async def _do_save_state(
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
-        # Save checkpoint on worker, returns path
+        # Save training checkpoint on worker, returns path
         abs_path = await training_engine.save_weights(session, save_path)
 
         # Save ownership metadata (for user-scoped checkpoint API)
@@ -365,18 +358,27 @@ async def _do_save_state(
         # sync may not be complete yet. Create directory on API server to ensure it exists.
         os.makedirs(save_path, exist_ok=True)
 
+        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
+
+        optimizer_present = bool(checkpoint_has_optimizer_state(save_path))
+        if not optimizer_present:
+            raise RuntimeError(
+                f"save_state must produce optimizer artifacts, but none found under: {save_path}"
+            )
+
         metadata = {
             "checkpoint_id": checkpoint_name,
             "owner_id": user_id,
             "model_id": session.model_id,
             "model_name": session.base_model,
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "step": session.current_step,
-            "type": "training",  # vs "inference" for sampler-only weights
+            "checkpoint_type": "training",
+            "optimizer_present": optimizer_present,
+            "backend": session.backend,
+            "type": "training",
         }
-        metadata_path = os.path.join(save_path, "metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_checkpoint_metadata(save_path, metadata)
 
         # Register for sampling via path-based loading (avoids tensor transfer OOM)
         sampling_registered = False
@@ -409,9 +411,17 @@ async def _do_save_state(
         from ..client_compat import checkpoint_uri
 
         mint_path = _to_mint_path(session.model_id, checkpoint_name)
-        tinker_path = checkpoint_uri(session.model_id, checkpoint_name, prefer_tinker=True)
+        tinker_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=True,
+            checkpoint_type="training",
+        )
         selected_path = checkpoint_uri(
-            session.model_id, checkpoint_name, prefer_tinker=prefer_tinker
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=prefer_tinker,
+            checkpoint_type="training",
         )
 
         # Include state_dict metadata in response for verification (e.g., checking MLP modules)
@@ -426,6 +436,7 @@ async def _do_save_state(
             "filesystem_path": save_path,
             "type": "save_weights",
             "sampling_registered": sampling_registered,
+            "checkpoint_type": "training",
         })
 
         # 发送 completed 状态 - 训练完成（权重已保存）
@@ -455,6 +466,153 @@ async def _do_save_state(
                 task_name=f"Training {session.base_model}",
                 task_type="training",
                 model_name=session.base_model,
+                error=str(e),
+            )
+
+
+async def _do_save_weights(
+    request_id: str,
+    request: SaveStateRequest,
+    user_id: str | None = None,
+    webhook_url: str | None = None,
+    prefer_tinker: bool = False,
+) -> None:
+    """Background task to save sampler-only LoRA weights (legacy /save_weights).
+
+    Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
+    Also registers the model for sampling via multi-LoRA engine.
+    """
+    try:
+        if training_engine is None or training_manager is None:
+            raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
+
+        checkpoint_name = request.path.strip() if request.path is not None else ""
+        if checkpoint_name:
+            if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\\\" in checkpoint_name:
+                raise ValueError(f"Invalid checkpoint name: {request.path!r}")
+        else:
+            checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
+
+        owner_dir = user_id or "anonymous"
+        checkpoint_base_dir = os.path.join(CHECKPOINTS_DIR, owner_dir)
+        save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+
+        logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
+
+        abs_path = await training_engine.save_weights_for_sampler(
+            session=session,
+            checkpoint_name=checkpoint_name,
+            checkpoint_base_dir=checkpoint_base_dir,
+            use_per_expert_lora=False,
+        )
+
+        os.makedirs(save_path, exist_ok=True)
+
+        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
+
+        if checkpoint_has_optimizer_state(save_path):
+            raise RuntimeError(
+                f"save_weights must not produce optimizer artifacts, but found some under: {save_path}"
+            )
+
+        metadata = {
+            "checkpoint_id": checkpoint_name,
+            "owner_id": user_id,
+            "model_id": session.model_id,
+            "model_name": session.base_model,
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "step": session.current_step,
+            "checkpoint_type": "sampler",
+            "optimizer_present": False,
+            "backend": session.backend,
+            "type": "sampler",
+        }
+        write_checkpoint_metadata(save_path, metadata)
+
+        sampling_registered = False
+        base_model = session.base_model
+        if inference_manager is not None and base_model is not None:
+            try:
+                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
+
+                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
+                if existing_lora_id is not None:
+                    await multi_lora_engine.remove_session(session.model_id)
+
+                await multi_lora_engine.add_lora_for_session_from_path(
+                    sampling_session_id=session.model_id,
+                    lora_path=abs_path,
+                )
+                try:
+                    inference_manager.register_multi_lora_session(
+                        session.model_id, base_model=base_model
+                    )
+                except ValueError:
+                    pass
+                sampling_registered = True
+                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
+            except Exception as reg_err:
+                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
+
+        from ..client_compat import checkpoint_uri
+
+        mint_path = _to_mint_path(session.model_id, checkpoint_name)
+        tinker_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=True,
+            checkpoint_type="sampler",
+        )
+        selected_path = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=prefer_tinker,
+            checkpoint_type="sampler",
+        )
+
+        future_store.resolve(
+            request_id,
+            {
+                "checkpoint_id": checkpoint_name,
+                "path": selected_path,
+                "mint_path": mint_path,
+                "tinker_path": tinker_path,
+                "filesystem_path": save_path,
+                "type": "save_weights",
+                "sampling_registered": sampling_registered,
+                "checkpoint_type": "sampler",
+            },
+        )
+
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_COMPLETED,
+                user_id=user_id,
+                session_id=session.model_id,
+                task_name=f"Training {session.base_model}",
+                task_type="training",
+                model_name=session.base_model,
+                result={"checkpoint_id": checkpoint_name, "step": session.current_step},
+            )
+
+    except Exception as e:
+        logger.error(f"[save_weights] Failed: {e}", exc_info=True)
+        future_store.fail(request_id, str(e))
+
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_FAILED,
+                user_id=user_id,
+                session_id=request.model_id,
+                task_name="Save weights",
+                task_type="training",
+                model_name=None,
                 error=str(e),
             )
 
@@ -567,6 +725,22 @@ async def load_state(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     user_id = _get_user_id(http_request)
+    if request.optimizer:
+        try:
+            from ..checkpoints import validate_checkpoint_load_contract
+
+            load_path = _resolve_mint_path(request.path, user_id=user_id)
+            validate_checkpoint_load_contract(load_path, load_optimizer=True)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_checkpoint_for_optimizer_restore",
+                    "error": str(e),
+                    "path": request.path,
+                },
+            ) from e
+
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_small_result_bytes
@@ -629,6 +803,11 @@ async def _do_load_state(
                 raise PermissionError("Access denied")
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
+
+        if request.optimizer:
+            from ..checkpoints import validate_checkpoint_load_contract
+
+            validate_checkpoint_load_contract(load_path, load_optimizer=True)
 
         # Call training engine to load checkpoint
         await training_engine.load_weights(session, load_path, load_optimizer=request.optimizer)
@@ -693,7 +872,41 @@ async def upload_checkpoint_archive(
                 out.write(chunk)
 
         safe_extract_checkpoint_archive(tmp_archive, tmp_dir)
-        validate_checkpoint_dir(tmp_dir)
+
+        # Determine checkpoint class (training vs sampler).
+        # Rules:
+        # - If metadata.json declares a checkpoint_type, it must match the artifacts.
+        # - Otherwise, infer from presence of optimizer artifacts.
+        from ..checkpoints import checkpoint_has_optimizer_state
+
+        inferred_type = "training" if checkpoint_has_optimizer_state(tmp_dir) else "sampler"
+
+        existing_meta: dict | None = None
+        existing_meta_path = os.path.join(tmp_dir, "metadata.json")
+        if os.path.exists(existing_meta_path):
+            try:
+                with open(existing_meta_path) as f:
+                    existing_meta = json.load(f)
+            except Exception:
+                existing_meta = None
+
+        declared_type = None
+        if isinstance(existing_meta, dict):
+            declared_type = existing_meta.get("checkpoint_type") or existing_meta.get("type")
+        if declared_type is not None and declared_type not in ("training", "sampler"):
+            raise HTTPException(status_code=400, detail=f"Invalid checkpoint_type in metadata.json: {declared_type!r}")
+
+        checkpoint_type = declared_type or inferred_type
+        if declared_type is not None and declared_type != inferred_type:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Checkpoint metadata declares checkpoint_type={declared_type!r}, "
+                    f"but artifacts look like {inferred_type!r}"
+                ),
+            )
+
+        validate_checkpoint_dir(tmp_dir, checkpoint_type=checkpoint_type)
 
         # Optional metadata extraction from checkpoint files
         model_id = None
@@ -715,25 +928,22 @@ async def upload_checkpoint_archive(
                 model_name = cfg.get("base_model_name_or_path") or cfg.get("base_model") or model_name
         except Exception:
             pass
-        try:
-            existing_meta_path = os.path.join(tmp_dir, "metadata.json")
-            if os.path.exists(existing_meta_path):
-                with open(existing_meta_path) as f:
-                    existing = json.load(f)
-                model_id = existing.get("model_id") or model_id
-                model_name = existing.get("model_name") or model_name
-                step = existing.get("step") if step is None else step
-        except Exception:
-            pass
+        if isinstance(existing_meta, dict):
+            model_id = existing_meta.get("model_id") or model_id
+            model_name = existing_meta.get("model_name") or model_name
+            step = existing_meta.get("step") if step is None else step
 
         metadata = {
             "checkpoint_id": checkpoint_id,
             "owner_id": user_id,
             "model_id": model_id,
             "model_name": model_name,
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "step": step,
-            "type": "training",
+            "checkpoint_type": checkpoint_type,
+            "optimizer_present": checkpoint_type == "training",
+            "backend": None,
+            "type": checkpoint_type,
         }
         with open(os.path.join(tmp_dir, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
@@ -828,11 +1038,39 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                     pass
 
             created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
+            checkpoint_type = metadata.get("checkpoint_type")
+            if checkpoint_type not in ("training", "sampler"):
+                continue
+
+            created_at = metadata.get("created_at") or created_at
+            try:
+                created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except Exception:
+                created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
+
+            checkpoint_id = (
+                f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
+            )
+            tinker_path = checkpoint_uri(
+                model_id,
+                name,
+                prefer_tinker=True,
+                checkpoint_type=checkpoint_type,
+            )
+            path_uri = checkpoint_uri(
+                model_id,
+                name,
+                prefer_tinker=prefer_tinker,
+                checkpoint_type=checkpoint_type,
+            )
 
             checkpoints.append(
                 CheckpointInfo(
-                    checkpoint_id=name,
-                    path=checkpoint_uri(model_id, name, prefer_tinker=prefer_tinker),
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_type=checkpoint_type,
+                    time=created_time,
+                    tinker_path=tinker_path,
+                    path=path_uri,
                     step=step,
                     created_at=created_at,
                 )
@@ -876,10 +1114,38 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             if user_id != "admin" and metadata.get("owner_id") != user_id:
                 continue
             created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
+            checkpoint_type = metadata.get("checkpoint_type")
+            if checkpoint_type not in ("training", "sampler"):
+                continue
+
+            created_at = metadata.get("created_at") or created_at
+            try:
+                created_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except Exception:
+                created_time = datetime.fromtimestamp(os.path.getctime(ckpt_path))
+
+            checkpoint_id = (
+                f"weights/{name}" if checkpoint_type == "training" else f"sampler_weights/{name}"
+            )
+            tinker_path = checkpoint_uri(
+                model_id,
+                name,
+                prefer_tinker=True,
+                checkpoint_type=checkpoint_type,
+            )
+            path_uri = checkpoint_uri(
+                model_id,
+                name,
+                prefer_tinker=prefer_tinker,
+                checkpoint_type=checkpoint_type,
+            )
             checkpoints.append(
                 CheckpointInfo(
-                    checkpoint_id=name,
-                    path=checkpoint_uri(model_id, name, prefer_tinker=prefer_tinker),
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_type=checkpoint_type,
+                    time=created_time,
+                    tinker_path=tinker_path,
+                    path=path_uri,
                     step=None,
                     created_at=created_at,
                 )
@@ -899,7 +1165,17 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 # =============================================================================
 
 
-@router.delete("/training_runs/{model_id}/checkpoints/{checkpoint_id}")
+def _split_tinker_checkpoint_id(checkpoint_id: str) -> tuple[str, str | None]:
+    # Tinker canonical checkpoint IDs include an explicit kind prefix:
+    # - weights/<name> -> training
+    # - sampler_weights/<name> -> sampler
+    parts = checkpoint_id.split("/")
+    if len(parts) == 2 and parts[0] in ("weights", "sampler_weights") and parts[1]:
+        return parts[1], ("training" if parts[0] == "weights" else "sampler")
+    return checkpoint_id, None
+
+
+@router.delete("/training_runs/{model_id}/checkpoints/{checkpoint_id:path}")
 async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request):
     """Delete a specific checkpoint.
 
@@ -907,17 +1183,20 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     """
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
+    checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
     candidates = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_id),
-        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id),  # legacy
-        os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id),  # uploaded /checkpoints/{owner}/{ckpt_id}
+        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_name),
+        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_name),  # legacy
+        os.path.join(
+            CHECKPOINTS_DIR, owner_dir, checkpoint_name
+        ),  # uploaded /checkpoints/{owner}/{ckpt_id}
     ]
     if user_id == "admin":
-        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_id))
+        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_name))
         try:
             for owner in os.listdir(CHECKPOINTS_DIR):
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_id))
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_id))
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_name))
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_name))
         except OSError:
             pass
 
@@ -940,6 +1219,8 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
     if user_id != "admin" and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
     shutil.rmtree(ckpt_path)
 
@@ -953,8 +1234,13 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
 # =============================================================================
 
 
-@router.get("/training_runs/{model_id}/checkpoints/{checkpoint_id}/archive")
-async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request: Request):
+@router.get("/training_runs/{model_id}/checkpoints/{checkpoint_id:path}/archive")
+async def download_checkpoint_archive(
+    model_id: str,
+    checkpoint_id: str,
+    request: Request,
+    direct: bool = False,
+):
     """Download checkpoint as tar.gz archive.
 
     Uses subprocess tar+gzip for true streaming without loading into memory.
@@ -965,17 +1251,20 @@ async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request
 
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
+    checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
     candidates = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_id),
-        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_id),  # legacy
-        os.path.join(CHECKPOINTS_DIR, owner_dir, checkpoint_id),  # uploaded /checkpoints/{owner}/{ckpt_id}
+        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_name),
+        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_name),  # legacy
+        os.path.join(
+            CHECKPOINTS_DIR, owner_dir, checkpoint_name
+        ),  # uploaded /checkpoints/{owner}/{ckpt_id}
     ]
     if user_id == "admin":
-        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_id))
+        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_name))
         try:
             for owner in os.listdir(CHECKPOINTS_DIR):
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_id))
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_id))
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_name))
+                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_name))
         except OSError:
             pass
 
@@ -998,13 +1287,30 @@ async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
     if user_id != "admin" and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+
+    # Tinker SDK expects this endpoint to respond with 302 + Location.
+    # It does not follow redirects automatically; it treats Location as a signed URL.
+    if not direct:
+        from ..client_compat import is_tinker_sdk_user_agent
+
+        if is_tinker_sdk_user_agent(request.headers.get("user-agent")):
+            direct_url = str(request.url.include_query_params(direct="1"))
+            expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+            expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
+            return RedirectResponse(
+                url=direct_url,
+                status_code=302,
+                headers={"Expires": expires_header},
+            )
 
     def stream_tar_gz():
         """Stream tar.gz via subprocess to avoid memory explosion."""
         # Run tar in parent directory, archive the checkpoint_id folder
         parent_dir = os.path.dirname(ckpt_path)
         proc = subprocess.Popen(
-            ["tar", "czf", "-", checkpoint_id],
+            ["tar", "czf", "-", checkpoint_name],
             cwd=parent_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1016,7 +1322,8 @@ async def download_checkpoint_archive(model_id: str, checkpoint_id: str, request
             proc.stdout.close()
             proc.wait()
 
-    filename = f"{model_id}_{checkpoint_id}.tar.gz"
+    safe_checkpoint_id = checkpoint_id.replace("/", "_")
+    filename = f"{model_id}_{safe_checkpoint_id}.tar.gz"
     logger.info(f"[{model_id}] Streaming checkpoint archive: {checkpoint_id}")
 
     return StreamingResponse(
