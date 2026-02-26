@@ -8,6 +8,7 @@ def test_is_tinker_sdk_user_agent():
     assert is_tinker_sdk_user_agent("mint/0.1") is False
     assert is_tinker_sdk_user_agent("tinker/0.1") is False
     assert is_tinker_sdk_user_agent("Tinker SDK/0.1") is False
+    assert is_tinker_sdk_user_agent("Mint/Python 0.1.0") is True
     assert is_tinker_sdk_user_agent("AsyncTinker/Python 0.0.0") is True
     assert is_tinker_sdk_user_agent("Tinker/Python 0.0.0") is True
 

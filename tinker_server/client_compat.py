@@ -13,10 +13,12 @@ def is_tinker_sdk_user_agent(user_agent: str | None) -> bool:
     low = ua.lower()
     # Tinker SDK sets: "User-Agent: {ClientClassName}/Python {__version__}"
     # e.g. "AsyncTinker/Python 0.2.3".
+    #
+    # MinT's `mint` wrapper reuses the same SDK but sets "Mint/Python {ver}".
     if "/python " not in low:
         return False
     client_name = low.split("/", 1)[0]
-    return client_name.endswith("tinker")
+    return client_name.endswith("tinker") or client_name == "mint"
 
 
 def _get_user_agent_from_request(request: Any) -> str | None:
