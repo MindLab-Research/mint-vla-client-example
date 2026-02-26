@@ -43,10 +43,6 @@ AccessType: "Private"
 
 Storages:
     - Type: "Vepfs"
-      MountPath: "/vePFS-Mindverse"
-      SubPath: ""
-      ReadOnly: true
-    - Type: "Vepfs"
       MountPath: "/vePFS-Mindverse/share"
       SubPath: "share"
       ReadOnly: false

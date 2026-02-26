@@ -61,7 +61,7 @@ http://<RAY_HEAD_IP>:8265
 | Queue Name | Queue ID | Type | Use Case |
 |------------|----------|------|----------|
 | `cpu-mindverse` | `q-20251225183621-m2297` | CPU | Ray head node (CPU-only instances) |
-| `a800-mindverse-B` | `q-20260124095758-ngkg7` | GPU | Dev GPU workers (A800 instances, 24 GPUs total) |
+| `a800-mindverse-B` | `q-20260124095758-ngkg7` | GPU | Deprecated or unavailable. Confirm in Volcano console before use. |
 | `a800-mindverse-C1` | `q-20251126180002-26lwz` | GPU | Prod GPU workers (A800 instances, 128 GPUs total) |
 | `a800-mindverse-C2` | `q-20260203101340-www2h` | GPU | Prod C2 worker pool (K2 multinode vLLM) |
 
@@ -231,8 +231,9 @@ PY
    ```bash
    cp .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml /tmp/mint-dev-worker.yaml
    sed -i "s/<RAY_HEAD_IP>/<actual_ip>/g" /tmp/mint-dev-worker.yaml
-   sed -i "s/<GPU_QUEUE_ID>/q-20260124095758-ngkg7/g" /tmp/mint-dev-worker.yaml  # prefer a800-mindverse-B for dev
+   sed -i "s/<GPU_QUEUE_ID>/<queue_id>/g" /tmp/mint-dev-worker.yaml
    ```
+   Choose a GPU queue that is currently available in the Volcano console. If only prod GPU queues are available, get user approval before submitting dev workers.
 
 4. **Submit worker from temp file:**
    ```bash
