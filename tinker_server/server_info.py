@@ -87,5 +87,6 @@ def get_server_info() -> dict:
             "sampling_max_inflight_sample_tasks": server_config.sampling_max_inflight_sample_tasks,
             "sampling_max_concurrent_samples_per_request": server_config.sampling_max_concurrent_samples_per_request,
             "auth_enabled": server_config.auth_enabled,
+            "router_replay_mode": server_config.router_replay_mode,
         },
     }

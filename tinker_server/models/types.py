@@ -50,6 +50,7 @@ class SampledSequence(BaseModel):
 
     tokens: list[int]
     logprobs: list[float] | None
+    routed_experts: list | None = None
     stop_reason: Literal["length", "stop", "eos"]
 
 

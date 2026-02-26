@@ -62,9 +62,9 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
             scaling=1.0,
         )
 
-    def pack_moe_sparse_ok(cls, loras, module_name: str):  # type: ignore[no-untyped-def]
+    def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
         if not loras or (len(loras) % 3) != 0:
-            return orig_fn(cls, loras, module_name)
+            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
         n_experts = len(loras) // 3
         base_w1 = next(
@@ -100,6 +100,7 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 
 # Import model registry
@@ -171,6 +172,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "yes",
                 "y",
                 "on",
+            )
+            self._enable_rollout_routing_replay = bool(
+                getattr(self.config, "enable_rollout_routing_replay", False)
             )
             self._mint_pack_moe_patched = False
 
@@ -528,6 +532,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         logprobs[token_ids[i]].logprob
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
+                routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(final_res.outputs[0], "routed_experts", None)
+                    if raw is not None:
+                        routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 # Determine stop reason
                 stop_reason = "length"
@@ -539,6 +548,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
+                    "routed_experts": routed_experts,
                     "stop_reason": stop_reason,
                     "_timing_total_s": float(total_s),
                     "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -575,6 +585,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         lp[out_token_ids[i]].logprob
                         for i, lp in enumerate(out.logprobs)
                     ]
+                out_routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(out, "routed_experts", None)
+                    if raw is not None:
+                        out_routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
@@ -586,6 +601,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     {
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
+                        "routed_experts": out_routed_experts,
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -685,6 +701,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         logprobs[token_ids[i]].logprob
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
+                routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(final_res.outputs[0], "routed_experts", None)
+                    if raw is not None:
+                        routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 # Determine stop reason
                 stop_reason = "length"
@@ -696,6 +717,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
+                    "routed_experts": routed_experts,
                     "stop_reason": stop_reason,
                     "_timing_total_s": float(total_s),
                     "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -732,6 +754,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         lp[out_token_ids[i]].logprob
                         for i, lp in enumerate(out.logprobs)
                     ]
+                out_routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(out, "routed_experts", None)
+                    if raw is not None:
+                        out_routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
@@ -743,6 +770,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     {
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
+                        "routed_experts": out_routed_experts,
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -832,7 +860,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     logprobs[token_ids[i]].logprob
                     for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                 ]
-            return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+            routed_experts = None
+            if self._enable_rollout_routing_replay:
+                raw = getattr(final_res.outputs[0], "routed_experts", None)
+                if raw is not None:
+                    routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
+            return TokenOutput(
+                token_ids=token_ids,
+                log_probs=log_probs,
+                routed_experts=routed_experts,
+            )
 
         async def compute_prompt_logprobs(
             self,
@@ -1455,6 +1492,7 @@ class GenerateResult:
 
     token_ids: list[int]
     log_probs: list[float] | None
+    routed_experts: list | None = None
 
 
 class VerlInferenceEngine:
@@ -1554,6 +1592,7 @@ class VerlInferenceEngine:
         # Create rollout config using dataclass
         # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
         # Expert parallelism is enabled via engine_kwargs instead
+        enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
         rollout_config = RolloutConfig(
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
@@ -1575,6 +1614,7 @@ class VerlInferenceEngine:
             data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
             expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
             engine_kwargs=engine_kwargs,
+            enable_rollout_routing_replay=enable_rollout_routing_replay,
         )
 
         # Create model config using dataclass
@@ -1671,6 +1711,11 @@ class VerlInferenceEngine:
         return GenerateResult(
             token_ids=list(result.token_ids),
             log_probs=list(result.log_probs) if result.log_probs else None,
+            routed_experts=(
+                result.routed_experts.tolist()
+                if getattr(result, "routed_experts", None) is not None and hasattr(result.routed_experts, "tolist")
+                else getattr(result, "routed_experts", None)
+            ),
         )
 
     async def compute_logprobs(

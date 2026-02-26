@@ -155,12 +155,12 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
     if getattr(orig_fn, "__mint_sparse_ok__", False):
         return
 
-    def pack_moe_sparse_ok(cls, loras, module_name: str):  # type: ignore[no-untyped-def]
+    def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
         try:
             if loras and all(l is not None for l in loras):
-                return orig_fn(cls, loras, module_name)
+                return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
         except Exception:
-            return orig_fn(cls, loras, module_name)
+            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
         if not loras or (len(loras) % 3) != 0:
             raise RuntimeError(

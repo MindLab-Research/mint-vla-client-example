@@ -134,6 +134,8 @@ def tinker_to_tensordict(
     response_advantages_list = []
     response_lens = []
     target_tokens_list = []  # External labels (correctly shifted, with true last token)
+    routed_experts_list = []
+    has_routed_experts = False
 
     max_len = 0
     has_external_labels = False
@@ -224,6 +226,35 @@ def tinker_to_tensordict(
         else:
             has_full_external_labels = False
             target_tokens_list.append(None)
+
+        # Router replay (R3): per-token routed expert indices
+        re_field = loss_fn_inputs.get("routed_experts")
+        if re_field is not None:
+            # re_field may be either:
+            #   - nested list [seq_len][layer_num][topk] (from SampledSequence.routed_experts directly)
+            #   - Tinker wire format dict {"data": flat_list, "shape": [S, L, K], "dtype": "int64"}
+            # vLLM only returns routed_experts for decode tokens (not prefill/prompt).
+            # Prepend zeros for the prompt tokens so shape[0] == tokens_len.
+            if isinstance(re_field, dict):
+                flat = re_field["data"]
+                shape = re_field["shape"]
+                if len(shape) != 3:
+                    raise ValueError(f"Item {item_index}: routed_experts shape must be [S, L, K], got {shape}")
+                re_tensor = torch.tensor(flat, dtype=torch.int64, device=device).reshape(shape)
+            else:
+                re_tensor = torch.tensor(re_field, dtype=torch.int64, device=device)
+            if re_tensor.ndim != 3:
+                raise ValueError(f"Item {item_index}: routed_experts must be shape [seq_len, layer_num, topk], got {list(re_tensor.shape)}")
+            if re_tensor.shape[0] < tokens_len:
+                pad_len = tokens_len - re_tensor.shape[0]
+                padding = torch.zeros((pad_len, re_tensor.shape[1], re_tensor.shape[2]), dtype=torch.int64, device=device)
+                re_tensor = torch.cat([padding, re_tensor], dim=0)
+            if re_tensor.shape[0] != tokens_len:
+                raise ValueError(f"Item {item_index}: routed_experts seq_len {re_tensor.shape[0]} != tokens length {tokens_len}")
+            routed_experts_list.append(re_tensor)
+            has_routed_experts = True
+        else:
+            routed_experts_list.append(None)
 
     if not input_ids_list:
         raise ValueError("No valid data items found")
@@ -321,6 +352,16 @@ def tinker_to_tensordict(
             logger.warning(
                 "[tinker_to_tensordict] Mixed target_tokens presence in batch; "
                 "skipping external labels to avoid TensorDict shape mismatch."
+            )
+
+    if has_routed_experts:
+        if all(re is not None for re in routed_experts_list):
+            re_nested = torch.nested.as_nested_tensor(routed_experts_list, layout=torch.jagged)
+            td["routed_experts"] = re_nested
+            td.set_non_tensor("enable_routing_replay", True)
+        else:
+            logger.warning(
+                "[tinker_to_tensordict] Mixed routed_experts presence in batch; skipping R3"
             )
 
     # Add non-tensor metadata for verl's prepare_micro_batches

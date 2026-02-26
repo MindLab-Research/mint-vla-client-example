@@ -1578,6 +1578,7 @@ class VerlTrainingEngine:
                 context_parallel_size=train_cp,
                 expert_tensor_parallel_size=train_etp,
                 use_fp8=use_fp8,
+                router_replay_mode=server_config.router_replay_mode,
             )
             logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
 

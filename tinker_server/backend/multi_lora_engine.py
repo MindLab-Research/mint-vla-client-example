@@ -35,6 +35,7 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
@@ -72,6 +73,7 @@ class GenerateResult:
     token_ids: list[int]
     logprobs: list[float] | None = None
     stop_reason: str | None = None
+    routed_experts: list | None = None
 
 
 class MultiLoRAInferenceEngine:
@@ -320,6 +322,7 @@ class MultiLoRAInferenceEngine:
             # Configure rollout with multi-LoRA support
             # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
             # Expert parallelism is enabled via engine_kwargs instead
+            enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
             rollout_config = RolloutConfig(
                 name="vllm",
                 tensor_model_parallel_size=self.tensor_parallel_size,
@@ -342,6 +345,7 @@ class MultiLoRAInferenceEngine:
                 expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
                 engine_kwargs=engine_kwargs,
                 quantization=self.quantization,  # "fp8" for FP8 models like K2
+                enable_rollout_routing_replay=enable_rollout_routing_replay,
             )
             if self.quantization:
                 logger.info(f"vLLM quantization enabled: {self.quantization}")
@@ -734,6 +738,7 @@ class MultiLoRAInferenceEngine:
             token_ids=result["token_ids"],
             logprobs=result.get("logprobs"),
             stop_reason=result.get("stop_reason"),
+            routed_experts=result.get("routed_experts"),
         )
 
     async def generate_many(
@@ -821,6 +826,7 @@ class MultiLoRAInferenceEngine:
                 token_ids=r["token_ids"],
                 logprobs=r.get("logprobs"),
                 stop_reason=r.get("stop_reason"),
+                routed_experts=r.get("routed_experts"),
             )
             for r in raw_list
         ]

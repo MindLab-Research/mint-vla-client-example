@@ -160,6 +160,7 @@ class DistributedConfig:
     expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
+    router_replay_mode: str = "disabled"
 
     @property
     def world_size(self) -> int:
@@ -817,7 +818,12 @@ class MegatronRankWorker:
             logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
-        from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+        from verl.workers.config import (
+            HFModelConfig,
+            McoreEngineConfig,
+            McoreOptimizerConfig,
+        )
+        from verl.workers.config.engine import EngineRouterReplayConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
@@ -1027,6 +1033,7 @@ class MegatronRankWorker:
             expert_model_parallel_size=self.config.expert_parallel_size,
             expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
             context_parallel_size=self.config.context_parallel_size,
+            router_replay=EngineRouterReplayConfig(mode=self.config.router_replay_mode),
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
