@@ -39,6 +39,11 @@ Review checklist:
 2) Does the reproduction script actually exercise the running system (integrated HTTP to the issue-scoped dev server, with real deps), not source
    inspection and not direct handler calls with stubs?
    - Only accept a local-only repro if the issue is truly local-only (no server/runtime surface) and the PR explicitly justifies why an integrated repro cannot exercise it. Mock-only/stub-only is still blocking.
+2a) Is the reproduction script discriminative (a valid test)?
+   - Reject as iterate if the repro can PASS for unrelated reasons (example: returning PASS on any exception).
+   - Read `scripts/tools/reproduce_issue_<N>.py` line-by-line and audit the logic:
+     - For every PASS branch, state what property it implies and why that matches the acceptance criteria from the issue thread.
+     - Try to construct a false positive (a way to get PASS without fixing the issue). If you can, recommendation must be iterate.
 3) Does the reproduction script FAIL on old code and PASS on new code?
    - Preferred: verify by running the repro on the PR base commit and on the PR head commit.
    - If you cannot run the base commit in your environment, require concrete pre-fix FAIL output in the PR (or issue) that came from executing the same reproduction script. If missing: iterate.

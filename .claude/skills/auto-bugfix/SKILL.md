@@ -48,6 +48,14 @@ Hard rules:
   - For server/runtime bugs: the reproduction must hit the issue-scoped dev server over HTTP and exercise the real dependency stack (FastAPI + Ray).
 - "Runtime" means the real runtime. If the production code path uses Ray, a "runtime test" that does not connect to real Ray is not a runtime test.
   - "Runtime without Ray" is a non-test for the server: do not accept it for Ray-backed endpoints, actor lifecycle, scheduling, vLLM, or Megatron paths.
+- Reproduction scripts must be discriminative:
+  - A repro that can PASS for unrelated reasons is invalid (example: returning PASS on any exception).
+  - Encode acceptance criteria as assertions about the expected behavior, not a generic gate like "200 vs error" or "did not crash".
+    - Assert response structure and at least one semantic invariant (required keys, list lengths, monotonic counters, content checks, etc).
+    - Treat unexpected errors as FAIL and surface the error text in the repro output.
+  - Reviewer must do an adversarial read of `reproduce_issue_<N>.py`:
+    - For every PASS branch in the script, state what property it implies and why it matches the acceptance criteria.
+    - Try to construct a false positive. If you can, recommendation must be iterate.
 - Assume an integrated repro IS feasible by default. Use the issue-scoped server on `mint-dev` + SSH tunnel; do not accept "not run (server not available)" as closure evidence.
 - For any change that touches scheduling / placement groups / GPU allocation / engine initialization:
   - A "repro" that only asserts on computed resource numbers / GPU counts is partial evidence.
