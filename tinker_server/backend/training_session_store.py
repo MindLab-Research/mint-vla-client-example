@@ -98,3 +98,12 @@ def get_training_session_info(model_id: str) -> dict[str, Any] | None:
         return None
     actor = _get_or_create_actor()
     return ray.get(actor.get.remote(model_id))
+
+
+def list_training_sessions() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        return []
+    actor = _get_or_create_actor()
+    return ray.get(actor.list.remote())
