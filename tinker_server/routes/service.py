@@ -4,6 +4,9 @@ Endpoints:
 - GET /healthz: Health check
 - POST /create_session: Create a new session
 - POST /create_sampling_session: Create a sampling session with dedicated engine
+- GET /sessions: List sessions
+- GET /sessions/{session_id}: Get session details
+- GET /samplers/{sampler_id}: Get sampler details
 - POST /session_heartbeat: Keep session alive
 - POST /telemetry: Accept telemetry data (discarded)
 """
@@ -15,6 +18,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -28,6 +32,9 @@ from ..models.types import (
     CreateSamplingSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
+    GetSamplerResponse,
+    GetSessionResponse,
+    ListSessionsResponse,
     SessionHeartbeatRequest,
     SessionHeartbeatResponse,
     TelemetryRequest,
@@ -59,6 +66,28 @@ def _get_user_id(request: Request) -> str | None:
     if user_data:
         return user_data.get("user_id")
     return None
+
+
+def _user_visible(request_user_id: str | None, owner: str | None) -> bool:
+    if request_user_id is None:
+        return True
+    if request_user_id == "admin":
+        return True
+    return bool(owner) and owner == request_user_id
+
+
+def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
+    if model_path.startswith("tinker://"):
+        path_part = model_path[len("tinker://") :]
+    elif model_path.startswith("mint://"):
+        path_part = model_path[len("mint://") :]
+    else:
+        return None
+
+    parts = [p for p in path_part.split("/") if p]
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
 
 
 @router.get("/healthz", response_model=None)
@@ -274,16 +303,33 @@ async def server_info() -> dict:
 
 
 @router.post("/create_session")
-async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
+async def create_session(request: CreateSessionRequest, http_request: Request) -> CreateSessionResponse:
     """Create a new session.
 
     Sessions are used to group related operations together.
     """
     session_id = str(uuid.uuid4())
+    user_id = _get_user_id(http_request)
     sessions[session_id] = {
         "tags": request.tags,
         "metadata": request.user_metadata,
+        "user_id": user_id,
+        "created_at": datetime.now().isoformat(),
     }
+    try:
+        from ..backend.session_index_store import upsert_session_index
+
+        upsert_session_index(
+            {
+                "session_id": session_id,
+                "training_run_ids": [],
+                "sampler_ids": [],
+                "user_id": user_id,
+                "created_at": sessions[session_id]["created_at"],
+            }
+        )
+    except Exception:
+        pass
     return CreateSessionResponse(session_id=session_id)
 
 
@@ -306,6 +352,7 @@ async def create_sampling_session(
 
     sampling_session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
+    created_at = datetime.now().isoformat()
 
     # Determine base_model from request or infer from model_path
     base_model = request.base_model
@@ -426,7 +473,176 @@ async def create_sampling_session(
     # Store metadata
     sampling_sessions[sampling_session_id] = base_model
 
+    try:
+        from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+
+        add_sampler_to_session(
+            session_id=request.session_id,
+            sampler_id=sampling_session_id,
+            user_id=user_id,
+            created_at=created_at,
+        )
+
+        sampler_info: dict = {
+            "sampler_id": sampling_session_id,
+            "session_id": request.session_id,
+            "base_model": base_model,
+            "user_id": user_id,
+            "created_at": created_at,
+        }
+
+        if request.model_path:
+            parsed = _parse_checkpoint_path(request.model_path)
+            if parsed:
+                model_id, checkpoint_name = parsed
+                sampler_info.update(
+                    {
+                        "source_type": "checkpoint",
+                        "model_id": model_id,
+                        "checkpoint_name": checkpoint_name,
+                        "model_path_raw": request.model_path,
+                    }
+                )
+            else:
+                sampler_info.update(
+                    {
+                        "source_type": "raw_model_path",
+                        "model_path_raw": request.model_path,
+                    }
+                )
+        else:
+            sampler_info.update({"source_type": "base_model"})
+
+        upsert_sampler_index(sampler_info)
+    except Exception:
+        pass
+
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+
+
+@router.get("/sessions/{session_id}", response_model=GetSessionResponse)
+async def get_session(session_id: str, http_request: Request) -> GetSessionResponse:
+    request_user_id = _get_user_id(http_request)
+    info = None
+    try:
+        from ..backend.session_index_store import get_session_index
+
+        info = get_session_index(session_id)
+    except Exception:
+        info = None
+
+    if isinstance(info, dict):
+        if not _user_visible(request_user_id, info.get("user_id")):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        return GetSessionResponse(
+            training_run_ids=list(info.get("training_run_ids") or []),
+            sampler_ids=list(info.get("sampler_ids") or []),
+        )
+
+    entry = sessions.get(session_id)
+    if entry and _user_visible(request_user_id, entry.get("user_id")):
+        return GetSessionResponse(training_run_ids=[], sampler_ids=[])
+
+    raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+
+@router.get("/sessions", response_model=ListSessionsResponse)
+async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request = None) -> ListSessionsResponse:
+    request_user_id = _get_user_id(http_request) if http_request else None
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    try:
+        from ..backend.session_index_store import list_session_index
+
+        for info in list_session_index():
+            sid = info.get("session_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            if not _user_visible(request_user_id, info.get("user_id")):
+                continue
+            entries.append({"session_id": sid, "created_at": info.get("created_at")})
+            seen.add(sid)
+    except Exception:
+        pass
+
+    for sid, entry in sessions.items():
+        if sid in seen:
+            continue
+        if not _user_visible(request_user_id, entry.get("user_id")):
+            continue
+        entries.append({"session_id": sid, "created_at": entry.get("created_at")})
+
+    entries.sort(key=lambda x: str(x.get("session_id") or ""))
+    entries.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+    page = entries[offset : offset + limit]
+    return ListSessionsResponse(sessions=[e["session_id"] for e in page])
+
+
+@router.get("/samplers/{sampler_id}", response_model=GetSamplerResponse)
+async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerResponse:
+    request_user_id = _get_user_id(http_request)
+    info = None
+    try:
+        from ..backend.session_index_store import get_sampler_index
+
+        info = get_sampler_index(sampler_id)
+    except Exception:
+        info = None
+
+    if isinstance(info, dict):
+        if not _user_visible(request_user_id, info.get("user_id")):
+            raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
+        base_model = info.get("base_model")
+        if not base_model and session_manager is not None:
+            base_model = session_manager.get_session_base_model(sampler_id)
+
+        from ..client_compat import checkpoint_uri, prefer_tinker_uri
+
+        model_path = None
+        source_type = info.get("source_type")
+        if source_type == "checkpoint":
+            model_id = info.get("model_id")
+            checkpoint_name = info.get("checkpoint_name")
+            if model_id and checkpoint_name:
+                model_path = checkpoint_uri(
+                    str(model_id),
+                    str(checkpoint_name),
+                    prefer_tinker=prefer_tinker_uri(http_request),
+                )
+            else:
+                model_path = info.get("model_path_raw")
+        elif source_type == "raw_model_path":
+            model_path = info.get("model_path_raw")
+        elif source_type == "base_model":
+            model_path = None
+        else:
+            model_path = info.get("model_path_raw")
+
+        if not base_model:
+            raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
+
+        return GetSamplerResponse(
+            sampler_id=sampler_id,
+            base_model=str(base_model),
+            model_path=model_path,
+        )
+
+    if session_manager is not None:
+        base_model = session_manager.get_session_base_model(sampler_id)
+        if base_model:
+            return GetSamplerResponse(
+                sampler_id=sampler_id,
+                base_model=base_model,
+                model_path=None,
+            )
+
+    raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
 
 
 def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:

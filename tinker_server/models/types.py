@@ -197,6 +197,57 @@ class CreateModelResponse(BaseModel):
     backend: str | None = None  # "megatron" for MoE, "peft" for dense
 
 
+class Cursor(BaseModel):
+    """Pagination cursor information."""
+
+    offset: int
+    limit: int
+    total_count: int
+
+
+class TrainingRun(BaseModel):
+    """Training run metadata."""
+
+    training_run_id: str
+    base_model: str
+    model_owner: str | None = None
+    is_lora: bool
+    corrupted: bool
+    lora_rank: int | None = None
+    last_request_time: str | None = None
+    last_checkpoint: Any | None = None
+    last_sampler_checkpoint: Any | None = None
+    user_metadata: dict[str, Any] | None = None
+
+
+class TrainingRunsResponse(BaseModel):
+    """List of training runs with pagination info."""
+
+    training_runs: list[TrainingRun]
+    cursor: Cursor | None = None
+
+
+class GetSessionResponse(BaseModel):
+    """Session metadata response."""
+
+    training_run_ids: list[str]
+    sampler_ids: list[str]
+
+
+class ListSessionsResponse(BaseModel):
+    """List of session IDs."""
+
+    sessions: list[str]
+
+
+class GetSamplerResponse(BaseModel):
+    """Sampler metadata response."""
+
+    sampler_id: str
+    base_model: str
+    model_path: str | None = None
+
+
 class Datum(BaseModel):
     """A single data item for training."""
 

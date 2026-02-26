@@ -1,0 +1,195 @@
+"""Detached Ray store for session and sampler indices.
+
+Persists minimal metadata for RestClient session and sampler endpoints.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+
+def _ray_namespace() -> str:
+    return (
+        os.environ.get("TINKER_RAY_NAMESPACE")
+        or os.environ.get("MINT_RAY_NAMESPACE")
+        or "tinker"
+    )
+
+
+def _actor_name() -> str:
+    return os.environ.get("MINT_SESSION_INDEX_ACTOR_NAME", "tinker_session_index_store")
+
+
+def _get_or_create_actor():
+    import ray
+
+    name = _actor_name()
+    namespace = _ray_namespace()
+    try:
+        return ray.get_actor(name, namespace=namespace)
+    except ValueError:
+        pass
+
+    @ray.remote
+    class _SessionIndexStore:
+        def __init__(self) -> None:
+            self._sessions: dict[str, dict[str, Any]] = {}
+            self._samplers: dict[str, dict[str, Any]] = {}
+
+        def upsert_session(self, session_id: str, info: dict[str, Any]) -> None:
+            current = self._sessions.get(session_id, {})
+            merged = dict(current)
+            merged.update(info)
+            merged.setdefault("session_id", session_id)
+            merged.setdefault("training_run_ids", list(current.get("training_run_ids", [])))
+            merged.setdefault("sampler_ids", list(current.get("sampler_ids", [])))
+            self._sessions[session_id] = merged
+
+        def add_training_run(self, session_id: str, training_run_id: str, user_id: str | None, created_at: str | None) -> None:
+            current = self._sessions.get(session_id, {})
+            runs = list(current.get("training_run_ids", []))
+            if training_run_id not in runs:
+                runs.append(training_run_id)
+            current["session_id"] = session_id
+            current["training_run_ids"] = runs
+            if user_id is not None:
+                current.setdefault("user_id", user_id)
+            if created_at is not None:
+                current.setdefault("created_at", created_at)
+            self._sessions[session_id] = current
+
+        def add_sampler(self, session_id: str, sampler_id: str, user_id: str | None, created_at: str | None) -> None:
+            current = self._sessions.get(session_id, {})
+            samplers = list(current.get("sampler_ids", []))
+            if sampler_id not in samplers:
+                samplers.append(sampler_id)
+            current["session_id"] = session_id
+            current["sampler_ids"] = samplers
+            if user_id is not None:
+                current.setdefault("user_id", user_id)
+            if created_at is not None:
+                current.setdefault("created_at", created_at)
+            self._sessions[session_id] = current
+
+        def get_session(self, session_id: str) -> dict[str, Any] | None:
+            return self._sessions.get(session_id)
+
+        def list_sessions(self) -> list[dict[str, Any]]:
+            return list(self._sessions.values())
+
+        def upsert_sampler(self, sampler_id: str, info: dict[str, Any]) -> None:
+            current = self._samplers.get(sampler_id, {})
+            merged = dict(current)
+            merged.update(info)
+            merged.setdefault("sampler_id", sampler_id)
+            self._samplers[sampler_id] = merged
+
+        def get_sampler(self, sampler_id: str) -> dict[str, Any] | None:
+            return self._samplers.get(sampler_id)
+
+        def list_samplers(self) -> list[dict[str, Any]]:
+            return list(self._samplers.values())
+
+    try:
+        return _SessionIndexStore.options(
+            name=name,
+            namespace=namespace,
+            lifetime="detached",
+        ).remote()
+    except Exception:
+        return ray.get_actor(name, namespace=namespace)
+
+
+def upsert_session_index(info: dict[str, Any]) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    actor = _get_or_create_actor()
+    session_id = str(info.get("session_id") or "")
+    if not session_id:
+        return
+    ray.get(actor.upsert_session.remote(session_id, dict(info)))
+
+
+def add_training_run_to_session(
+    session_id: str,
+    training_run_id: str,
+    *,
+    user_id: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    if not session_id or not training_run_id:
+        return
+    actor = _get_or_create_actor()
+    ray.get(actor.add_training_run.remote(session_id, training_run_id, user_id, created_at))
+
+
+def add_sampler_to_session(
+    session_id: str,
+    sampler_id: str,
+    *,
+    user_id: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    if not session_id or not sampler_id:
+        return
+    actor = _get_or_create_actor()
+    ray.get(actor.add_sampler.remote(session_id, sampler_id, user_id, created_at))
+
+
+def get_session_index(session_id: str) -> dict[str, Any] | None:
+    import ray
+
+    if not ray.is_initialized():
+        return None
+    actor = _get_or_create_actor()
+    return ray.get(actor.get_session.remote(session_id))
+
+
+def list_session_index() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        return []
+    actor = _get_or_create_actor()
+    return ray.get(actor.list_sessions.remote())
+
+
+def upsert_sampler_index(info: dict[str, Any]) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    sampler_id = str(info.get("sampler_id") or "")
+    if not sampler_id:
+        return
+    actor = _get_or_create_actor()
+    ray.get(actor.upsert_sampler.remote(sampler_id, dict(info)))
+
+
+def get_sampler_index(sampler_id: str) -> dict[str, Any] | None:
+    import ray
+
+    if not ray.is_initialized():
+        return None
+    actor = _get_or_create_actor()
+    return ray.get(actor.get_sampler.remote(sampler_id))
+
+
+def list_sampler_index() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        return []
+    actor = _get_or_create_actor()
+    return ray.get(actor.list_samplers.remote())
