@@ -1300,11 +1300,13 @@ class MegatronRankWorker:
 
         # Session state swap moved inside train_mode() - see below
 
+        seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
             if not tokens:
                 raise ValueError(f"Item {item_index}: model_input has no tokens")
+            seq_lengths.append(len(tokens))
 
         # Test CUDA context before creating TensorDict
         device = torch.cuda.current_device()
@@ -1535,17 +1537,6 @@ class MegatronRankWorker:
                         "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
                     })
 
-            if valid_indices:
-                avg_loss_per_sample = loss_value / max(valid_count, 1)
-                full_outputs = [
-                    {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                    for _ in data_items
-                ]
-                for output, item_index in zip(loss_fn_outputs, valid_indices):
-                    full_outputs[item_index] = output
-                loss_fn_outputs = full_outputs
-
             # Calculate precision difference metrics if log_probs present
             debug_metrics = {}
             if result and isinstance(result, dict):
@@ -1636,11 +1627,13 @@ class MegatronRankWorker:
         if reset_bias:
             self.reset_expert_bias()
 
+        seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
             if not tokens:
                 raise ValueError(f"Item {item_index}: model_input has no tokens")
+            seq_lengths.append(len(tokens))
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
@@ -1664,6 +1657,7 @@ class MegatronRankWorker:
 
         # Only one output rank returns metrics
         if output_rank:
+            valid_count = len(seq_lengths)
             loss_value = 0.0
             num_tokens = 0
             all_log_probs = []
@@ -1755,18 +1749,6 @@ class MegatronRankWorker:
                             "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
                             "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                         })
-
-                valid_count = len(seq_lengths)
-                if valid_indices:
-                    avg_loss_per_sample = loss_value / max(valid_count, 1)
-                    full_outputs = [
-                        {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                         "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                        for _ in data_items
-                    ]
-                    for output, item_index in zip(loss_fn_outputs, valid_indices):
-                        full_outputs[item_index] = output
-                    loss_fn_outputs = full_outputs
 
             return {
                 "loss_value": float(loss_value),
