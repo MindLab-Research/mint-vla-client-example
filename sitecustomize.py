@@ -193,12 +193,25 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
 
         if only_expert0:
             # Shared-expert export: avoid materializing [num_experts, ...] tensors.
+            #
+            # vLLM later calls `optimize()` (in-place scaling merge) on packed LoRA
+            # weights. `expand(...)` returns a view with overlapping storage, so
+            # in-place ops (e.g., `lora_b *= scaling`) crash with:
+            #   "unsupported operation: more than one element ... refers to a single
+            #    memory location"
+            #
+            # Keep the non-materialized representation, but pre-apply scaling
+            # out-of-place and mark scaling=1 so vLLM's in-place optimize is a no-op.
             w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
             w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
             w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
-            w1_lora_b = base_w1.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_b.shape))
-            w2_lora_b = base_w2.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_b.shape))
-            w3_lora_b = base_w3.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_b.shape))
+            w1_lora_b_base = base_w1.lora_b * float(getattr(base_w1, "scaling", lora_alpha / rank))
+            w2_lora_b_base = base_w2.lora_b * float(getattr(base_w2, "scaling", lora_alpha / rank))
+            w3_lora_b_base = base_w3.lora_b * float(getattr(base_w3, "scaling", lora_alpha / rank))
+            w1_lora_b = w1_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w1_lora_b_base.shape))
+            w2_lora_b = w2_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w2_lora_b_base.shape))
+            w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
+            packed_scaling = [1.0, 1.0, 1.0]
         else:
             # General sparse case: default missing experts to base weights, but allow
             # explicitly-provided experts to override.
@@ -222,6 +235,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                 if w3 is not None:
                     w3_lora_a[eid].copy_(w3.lora_a)
                     w3_lora_b[eid].copy_(w3.lora_b)
+            packed_scaling = None
 
         return cls(
             module_name,
@@ -229,10 +243,127 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
             [lora_alpha, lora_alpha, lora_alpha],
             [w1_lora_a, w2_lora_a, w3_lora_a],
             [w1_lora_b, w2_lora_b, w3_lora_b],
+            scaling=packed_scaling,
         )
 
     pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
+
+
+def _patch_vllm_lora_optimize_overlap_safe() -> None:
+    """Avoid in-place LoRA optimize on overlapping tensors.
+
+    vLLM merges scaling into `lora_b` via in-place ops (`*= scaling`) inside
+    LoRA `optimize()`. This fails for tensors with internal overlap (commonly
+    produced by `expand(...)`), raising:
+      "unsupported operation: more than one element ... refers to a single
+       memory location"
+
+    When overlap is detected, use out-of-place multiplication and replace the
+    tensor reference to preserve semantics without invalid writes.
+    """
+
+    try:
+        import torch
+        from vllm.lora import lora_weights as lw  # type: ignore
+    except Exception:
+        return
+
+    LoRA = getattr(lw, "LoRALayerWeights", None)
+    Packed = getattr(lw, "PackedLoRALayerWeights", None)
+    if LoRA is None or Packed is None:
+        return
+
+    def _has_internal_overlap(t: "torch.Tensor") -> bool:  # type: ignore[name-defined]
+        try:
+            return bool(torch._C._debug_has_internal_overlap(t))  # type: ignore[attr-defined]
+        except Exception:
+            return False
+
+    orig_opt = getattr(LoRA, "optimize", None)
+    if callable(orig_opt) and not getattr(orig_opt, "_tinker_overlap_safe", False):
+
+        def optimize(self):  # type: ignore[no-untyped-def]
+            if getattr(self, "scaling", 1) == 1:
+                return self
+            lb = getattr(self, "lora_b", None)
+            if lb is None:
+                return self
+            if _has_internal_overlap(lb):
+                self.lora_b = lb * float(self.scaling)
+            else:
+                self.lora_b *= float(self.scaling)
+            self.scaling = 1
+            return self
+
+        optimize._tinker_overlap_safe = True  # type: ignore[attr-defined]
+        LoRA.optimize = optimize  # type: ignore[method-assign]
+
+    orig_popt = getattr(Packed, "optimize", None)
+    if callable(orig_popt) and not getattr(orig_popt, "_tinker_overlap_safe", False):
+
+        def optimize(self):  # type: ignore[no-untyped-def]
+            for i in range(len(self.lora_b)):
+                if self.scaling[i] == 1 or self.lora_b[i] is None:  # type: ignore
+                    continue
+                lb = self.lora_b[i]  # type: ignore
+                if _has_internal_overlap(lb):
+                    self.lora_b[i] = lb * float(self.scaling[i])  # type: ignore
+                else:
+                    self.lora_b[i] *= float(self.scaling[i])  # type: ignore
+                self.scaling[i] = 1  # type: ignore
+            return self
+
+        optimize._tinker_overlap_safe = True  # type: ignore[attr-defined]
+        Packed.optimize = optimize  # type: ignore[method-assign]
+
+
+def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
+    """Ensure vLLM Ray workers start with our PYTHONPATH.
+
+    vLLM's Ray backend uses `vllm.ray.ray_env.get_env_vars_to_copy()` to decide
+    which env vars are propagated via Ray runtime_env at actor startup.
+
+    By default it only carries vLLM-defined env vars; it does not include
+    `PYTHONPATH`, so worker processes (EngineCore, TP workers, etc.) may not
+    import `sitecustomize.py`, and thus miss our vLLM monkey patches.
+    """
+
+    try:
+        import vllm.ray.ray_env as ray_env  # type: ignore
+    except Exception:
+        return
+
+    orig = getattr(ray_env, "get_env_vars_to_copy", None)
+    if not callable(orig) or getattr(orig, "_tinker_pythonpath_carryover", False):
+        return
+
+    def get_env_vars_to_copy(  # type: ignore[no-untyped-def]
+        exclude_vars=None,
+        additional_vars=None,
+        destination=None,
+    ):
+        extra = {
+            "PYTHONPATH",
+            "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+            "VLLM_USE_V1",
+            "MINT_VLLM_DISABLE_MOE_LORA_PACKING",
+            "MINT_VLLM_FULLY_SHARDED_LORAS",
+            "MINT_VLLM_DISABLE_TORCH_DIST_TP",
+            "TVM_FFI_DISABLE_TORCH_C_DLPACK",
+        }
+        if additional_vars is None:
+            additional_vars2 = set(extra)
+        else:
+            additional_vars2 = set(additional_vars) | set(extra)
+        return orig(
+            exclude_vars=exclude_vars,
+            additional_vars=additional_vars2,
+            destination=destination,
+        )
+
+    get_env_vars_to_copy._tinker_pythonpath_carryover = True  # type: ignore[attr-defined]
+    ray_env.get_env_vars_to_copy = get_env_vars_to_copy  # type: ignore[method-assign]
 
 
 def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
@@ -319,7 +450,10 @@ def _apply_vllm_worker_patches() -> None:
     # processes on Ray worker nodes).
     os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
 
-    _patch_vllm_pack_moe_sparse_ok()
+    _patch_vllm_ray_env_carry_over_pythonpath()
+    if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
+        _patch_vllm_pack_moe_sparse_ok()
+    _patch_vllm_lora_optimize_overlap_safe()
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
         _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
         _patch_vllm_skip_dummy_lora_setup_when_inactive()
