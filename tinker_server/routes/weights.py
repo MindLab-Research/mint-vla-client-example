@@ -1296,11 +1296,26 @@ async def download_checkpoint_archive(
         from ..client_compat import is_tinker_sdk_user_agent
 
         if is_tinker_sdk_user_agent(request.headers.get("user-agent")):
-            direct_url = str(request.url.include_query_params(direct="1"))
-            expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+            from ..config import config
+            from ..download_tokens import make_archive_download_token
+
+            secret = (config.token_secret_key or config.api_key or "").strip()
+            direct_url_obj = request.url.include_query_params(direct="1")
+            if secret:
+                token, exp = make_archive_download_token(
+                    secret=secret,
+                    user_id=user_id,
+                    model_id=model_id,
+                    checkpoint_id=checkpoint_id,
+                    ttl_s=15 * 60,
+                )
+                direct_url_obj = direct_url_obj.include_query_params(download_token=token)
+                expires = datetime.fromtimestamp(exp, tz=timezone.utc)
+            else:
+                expires = datetime.now(timezone.utc) + timedelta(minutes=15)
             expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
             return RedirectResponse(
-                url=direct_url,
+                url=str(direct_url_obj),
                 status_code=302,
                 headers={"Expires": expires_header},
             )
@@ -1313,14 +1328,16 @@ async def download_checkpoint_archive(
             ["tar", "czf", "-", checkpoint_name],
             cwd=parent_dir,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
         try:
             while chunk := proc.stdout.read(65536):
                 yield chunk
         finally:
             proc.stdout.close()
-            proc.wait()
+            returncode = proc.wait()
+            if returncode != 0:
+                raise RuntimeError(f"tar exited with code {returncode}")
 
     safe_checkpoint_id = checkpoint_id.replace("/", "_")
     filename = f"{model_id}_{safe_checkpoint_id}.tar.gz"

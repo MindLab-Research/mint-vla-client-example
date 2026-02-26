@@ -899,6 +899,34 @@ async def api_key_auth_middleware(request: Request, call_next):
     if path in UNAUTHENTICATED_PATHS:
         return await call_next(request)
 
+    # Special-case: allow unauthenticated checkpoint archive downloads when a valid,
+    # short-lived signed token is provided in the URL (Tinker SDK expects a signed URL).
+    if path.startswith("/api/v1/training_runs/") and path.endswith("/archive"):
+        direct = request.query_params.get("direct")
+        download_token = request.query_params.get("download_token")
+        if direct and download_token:
+            try:
+                from .download_tokens import verify_download_token
+
+                # Prefer token_secret_key (if configured), otherwise api_key.
+                secret = config.token_secret_key or config.api_key or ""
+                payload = verify_download_token(str(download_token), secret=secret)
+                if payload is None:
+                    raise ValueError("invalid token")
+
+                prefix = "/api/v1/training_runs/"
+                mid_and_rest = path[len(prefix) :]
+                model_id, rest = mid_and_rest.split("/checkpoints/", 1)
+                checkpoint_id = rest[: -len("/archive")]
+
+                if payload.get("model_id") != model_id or payload.get("checkpoint_id") != checkpoint_id:
+                    raise ValueError("token does not match request path")
+
+                request.state.user_data = {"user_id": payload.get("user_id")}
+                return await call_next(request)
+            except Exception:
+                return JSONResponse(status_code=401, content={"error": "Invalid download token"})
+
     # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")
     if not api_key:

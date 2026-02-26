@@ -85,9 +85,11 @@ def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
         return None
 
     parts = [p for p in path_part.split("/") if p]
-    if len(parts) != 2:
-        return None
-    return parts[0], parts[1]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) == 3 and parts[1] in ("weights", "sampler_weights"):
+        return parts[0], parts[2]
+    return None
 
 
 @router.get("/healthz", response_model=None)

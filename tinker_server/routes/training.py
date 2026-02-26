@@ -538,6 +538,18 @@ async def create_model_from_state(
         )
 
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    user_id = _get_user_id(http_request)
+
+    # Fail fast: sampler checkpoints are not eligible for optimizer restore.
+    if bool(request.load_optimizer):
+        try:
+            from ..checkpoints import validate_checkpoint_load_contract
+
+            local_path = _resolve_state_path(request.state_path, user_id=user_id)
+            if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
+                validate_checkpoint_load_contract(local_path, load_optimizer=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     from ..gateway import (
         encode_request_id,
@@ -552,10 +564,20 @@ async def create_model_from_state(
     upstream = upstream_for_model(request.base_model)
     if upstream is not None:
         _raise_if_local_model_id_exists(model_id)
-        user_id = _get_user_id(http_request)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
             local_path = resolve_checkpoint_path(request.state_path, user_id=user_id)
+            if (
+                bool(request.load_optimizer)
+                and os.path.isdir(local_path)
+                and os.path.exists(os.path.join(local_path, "metadata.json"))
+            ):
+                try:
+                    from ..checkpoints import validate_checkpoint_load_contract
+
+                    validate_checkpoint_load_contract(local_path, load_optimizer=True)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
             if user_id and user_id != "admin":
                 load_real = os.path.realpath(local_path)
                 checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
@@ -636,7 +658,6 @@ async def create_model_from_state(
                 detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
             )
 
-    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
@@ -1613,7 +1634,6 @@ async def _do_save_weights_for_sampler(
     - Named (path is not None): Save to persistent location, return path
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
-    print(f"[DEBUG _do_save_weights_for_sampler] ENTRY request_id={request_id}", flush=True)
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
@@ -1656,7 +1676,6 @@ async def _do_save_weights_for_sampler(
                     )
                 use_per_expert_lora = False
 
-        print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
@@ -1664,7 +1683,6 @@ async def _do_save_weights_for_sampler(
             checkpoint_base_dir=checkpoint_dir,
             use_per_expert_lora=use_per_expert_lora,
         )
-        print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
         from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
 
@@ -1707,7 +1725,6 @@ async def _do_save_weights_for_sampler(
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately
-            print(f"[DEBUG _do_save_weights_for_sampler] Named flow", flush=True)
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
@@ -1716,7 +1733,6 @@ async def _do_save_weights_for_sampler(
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
             # Each sampling session gets unique lora_int_id with frozen weights.
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
-            print(f"[DEBUG _do_save_weights_for_sampler] Ephemeral flow", flush=True)
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
 
@@ -1725,12 +1741,9 @@ async def _do_save_weights_for_sampler(
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
             base_model = session.base_model
-            print(f"[DEBUG _do_save_weights_for_sampler] base_model={base_model}", flush=True)
 
             # Get or create engine for this model (dynamically creates vLLM actor if needed)
-            print(f"[DEBUG _do_save_weights_for_sampler] getting engine for model", flush=True)
             multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-            print(f"[DEBUG _do_save_weights_for_sampler] got engine: {multi_lora_engine is not None}", flush=True)
 
             if multi_lora_engine is not None:
                 # Multi-LoRA mode: Each sampling session gets frozen weights
@@ -1740,12 +1753,10 @@ async def _do_save_weights_for_sampler(
 
                 # Add LoRA from path - vLLM worker loads directly from PFS
                 # This avoids serializing 37k+ tensors through Ray object store
-                print(f"[DEBUG _do_save_weights_for_sampler] calling add_lora_for_session_from_path with {save_path}", flush=True)
                 lora_id = await multi_lora_engine.add_lora_for_session_from_path(
                     sampling_session_id=sampling_session_id,
                     lora_path=save_path,
                 )
-                print(f"[DEBUG _do_save_weights_for_sampler] add_lora_for_session_from_path returned lora_id={lora_id}", flush=True)
 
                 # Register in session manager with base_model for multi-model routing
                 inference_manager.register_multi_lora_session(
@@ -1754,7 +1765,6 @@ async def _do_save_weights_for_sampler(
                     lora_rank=lora_rank,
                     adapter_path=save_path,
                 )
-                print(f"[DEBUG _do_save_weights_for_sampler] registered session", flush=True)
 
                 load_time = time.time() - start_time
                 logger.info(
