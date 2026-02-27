@@ -549,5 +549,6 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
         "moonshotai/Kimi-K2-Instruct",
+        "moonshotai/Moonlight-16B-A3B-Instruct",
     ]
     return [m for m in allowed if m in MODEL_CONFIGS]

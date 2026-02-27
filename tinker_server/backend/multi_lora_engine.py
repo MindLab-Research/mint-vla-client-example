@@ -402,6 +402,7 @@ class MultiLoRAInferenceEngine:
                 node_rank=0,
                 gpus_per_node=total_gpus,
                 nnodes=1,
+                cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
             )
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
