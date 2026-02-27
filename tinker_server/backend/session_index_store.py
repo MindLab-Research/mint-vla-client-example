@@ -5,8 +5,12 @@ Persists minimal metadata for RestClient session and sampler endpoints.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def _ray_namespace() -> str:
@@ -105,12 +109,16 @@ def upsert_session_index(info: dict[str, Any]) -> None:
     import ray
 
     if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
         return
-    actor = _get_or_create_actor()
     session_id = str(info.get("session_id") or "")
     if not session_id:
         return
-    ray.get(actor.upsert_session.remote(session_id, dict(info)))
+    try:
+        actor = _get_or_create_actor()
+        actor.upsert_session.remote(session_id, dict(info))
+    except Exception as e:
+        logger.warning("Session index store write failed: upsert_session: %s", e)
 
 
 def add_training_run_to_session(
@@ -123,11 +131,15 @@ def add_training_run_to_session(
     import ray
 
     if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
         return
     if not session_id or not training_run_id:
         return
-    actor = _get_or_create_actor()
-    ray.get(actor.add_training_run.remote(session_id, training_run_id, user_id, created_at))
+    try:
+        actor = _get_or_create_actor()
+        actor.add_training_run.remote(session_id, training_run_id, user_id, created_at)
+    except Exception as e:
+        logger.warning("Session index store write failed: add_training_run: %s", e)
 
 
 def add_sampler_to_session(
@@ -140,18 +152,22 @@ def add_sampler_to_session(
     import ray
 
     if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
         return
     if not session_id or not sampler_id:
         return
-    actor = _get_or_create_actor()
-    ray.get(actor.add_sampler.remote(session_id, sampler_id, user_id, created_at))
+    try:
+        actor = _get_or_create_actor()
+        actor.add_sampler.remote(session_id, sampler_id, user_id, created_at)
+    except Exception as e:
+        logger.warning("Session index store write failed: add_sampler: %s", e)
 
 
 def get_session_index(session_id: str) -> dict[str, Any] | None:
     import ray
 
     if not ray.is_initialized():
-        return None
+        raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.get_session.remote(session_id))
 
@@ -160,7 +176,7 @@ def list_session_index() -> list[dict[str, Any]]:
     import ray
 
     if not ray.is_initialized():
-        return []
+        raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.list_sessions.remote())
 
@@ -169,19 +185,23 @@ def upsert_sampler_index(info: dict[str, Any]) -> None:
     import ray
 
     if not ray.is_initialized():
+        logger.warning("Session index store write skipped: Ray not initialized")
         return
     sampler_id = str(info.get("sampler_id") or "")
     if not sampler_id:
         return
-    actor = _get_or_create_actor()
-    ray.get(actor.upsert_sampler.remote(sampler_id, dict(info)))
+    try:
+        actor = _get_or_create_actor()
+        actor.upsert_sampler.remote(sampler_id, dict(info))
+    except Exception as e:
+        logger.warning("Session index store write failed: upsert_sampler: %s", e)
 
 
 def get_sampler_index(sampler_id: str) -> dict[str, Any] | None:
     import ray
 
     if not ray.is_initialized():
-        return None
+        raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.get_sampler.remote(sampler_id))
 
@@ -190,6 +210,6 @@ def list_sampler_index() -> list[dict[str, Any]]:
     import ray
 
     if not ray.is_initialized():
-        return []
+        raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.list_samplers.remote())

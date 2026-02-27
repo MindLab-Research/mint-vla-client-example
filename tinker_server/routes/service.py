@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -328,8 +329,8 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
                 "created_at": sessions[session_id]["created_at"],
             }
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[create_session] session index write failed: %s", e)
     return CreateSessionResponse(session_id=session_id)
 
 
@@ -514,8 +515,8 @@ async def create_sampling_session(
             sampler_info.update({"source_type": "base_model"})
 
         upsert_sampler_index(sampler_info)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[create_sampling_session] sampler index write failed: %s", e)
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
@@ -527,9 +528,9 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
     try:
         from ..backend.session_index_store import get_session_index
 
-        info = get_session_index(session_id)
-    except Exception:
-        info = None
+        info = await run_in_threadpool(get_session_index, session_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
     if isinstance(info, dict):
         if not _user_visible(request_user_id, info.get("user_id")):
@@ -555,16 +556,18 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
     try:
         from ..backend.session_index_store import list_session_index
 
-        for info in list_session_index():
-            sid = info.get("session_id")
-            if not isinstance(sid, str) or not sid:
-                continue
-            if not _user_visible(request_user_id, info.get("user_id")):
-                continue
-            entries.append({"session_id": sid, "created_at": info.get("created_at")})
-            seen.add(sid)
-    except Exception:
-        pass
+        infos = await run_in_threadpool(list_session_index)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
+
+    for info in infos or []:
+        sid = info.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        if not _user_visible(request_user_id, info.get("user_id")):
+            continue
+        entries.append({"session_id": sid, "created_at": info.get("created_at")})
+        seen.add(sid)
 
     for sid, entry in sessions.items():
         if sid in seen:
@@ -591,9 +594,9 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
     try:
         from ..backend.session_index_store import get_sampler_index
 
-        info = get_sampler_index(sampler_id)
-    except Exception:
-        info = None
+        info = await run_in_threadpool(get_sampler_index, sampler_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
     if isinstance(info, dict):
         if not _user_visible(request_user_id, info.get("user_id")):
@@ -656,15 +659,21 @@ def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     """
     from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 
+    if user_id != "admin" and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     checkpoint_dir = get_checkpoints_dir()
     resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
-    if user_id and user_id != "admin":
+    if user_id != "admin":
+        if model_path.startswith("ckpt_") and resolved == model_path:
+            return resolved
         resolved_real = os.path.realpath(resolved)
         checkpoints_real = os.path.realpath(checkpoint_dir)
-        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, user_id))
-        if resolved_real.startswith(checkpoints_real + os.sep) and not resolved_real.startswith(
-            allowed_real + os.sep
-        ):
+        if not resolved_real.startswith(checkpoints_real + os.sep):
+            raise HTTPException(status_code=403, detail="Access denied")
+        owner_dir = user_id or "anonymous"
+        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, owner_dir))
+        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
             raise HTTPException(status_code=403, detail="Access denied")
     return resolved
 

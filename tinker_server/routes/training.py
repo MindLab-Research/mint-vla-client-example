@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
@@ -196,21 +197,21 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         except Exception:
             pass
 
+    model_owner = info.get("user_id") or "anonymous"
+    user_metadata = info.get("user_metadata") or {}
+    last_request_time = info.get("last_request_time") or info.get("created_at")
+
     return TrainingRun(
         training_run_id=str(info.get("model_id", "")),
         base_model=str(info.get("base_model", "")),
-        model_owner=str(info.get("user_id") or ""),
+        model_owner=model_owner,
         is_lora=bool(is_lora),
         corrupted=False,
         lora_rank=lora_rank,
-        last_request_time=(
-            info.get("last_request_time")
-            or info.get("created_at")
-            or datetime.now().isoformat()
-        ),
+        last_request_time=last_request_time,
         last_checkpoint=None,
         last_sampler_checkpoint=None,
-        user_metadata=info.get("user_metadata") or {},
+        user_metadata=user_metadata,
     )
 
 def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
@@ -444,8 +445,8 @@ async def _do_create_model(
                 "user_id": user_id,
                 "created_at": session.created_at,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[create_model] training session store write failed: %s", e)
 
         try:
             from ..backend.session_index_store import add_training_run_to_session
@@ -456,8 +457,8 @@ async def _do_create_model(
                 user_id=user_id,
                 created_at=session.created_at,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[create_model] session index write failed: %s", e)
 
         response = CreateModelResponse(
             request_id=request_id,
@@ -513,7 +514,22 @@ async def _do_create_model(
 # =============================================================================
 
 def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
-    return resolve_checkpoint_path(state_uri, user_id=user_id)
+    if user_id != "admin" and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    resolved = resolve_checkpoint_path(state_uri, user_id=user_id)
+    if user_id != "admin":
+        if state_uri.startswith("ckpt_") and resolved == state_uri:
+            return resolved
+        resolved_real = os.path.realpath(resolved)
+        checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+        if not resolved_real.startswith(checkpoints_real + os.sep):
+            raise HTTPException(status_code=403, detail="Access denied")
+        owner_dir = user_id or "anonymous"
+        allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, owner_dir))
+        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
+            raise HTTPException(status_code=403, detail="Access denied")
+    return resolved
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
@@ -552,18 +568,9 @@ async def create_model_from_state(
     upstream = upstream_for_model(request.base_model)
     if upstream is not None:
         _raise_if_local_model_id_exists(model_id)
-        user_id = _get_user_id(http_request)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.state_path, user_id=user_id)
-            if user_id and user_id != "admin":
-                load_real = os.path.realpath(local_path)
-                checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-                allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-                if load_real.startswith(checkpoints_real + os.sep) and not (
-                    load_real == allowed_real or load_real.startswith(allowed_real + os.sep)
-                ):
-                    raise HTTPException(status_code=403, detail="Access denied")
+            local_path = _resolve_state_path(request.state_path, user_id=user_id)
             if os.path.isdir(local_path):
                 import asyncio
                 import tempfile
@@ -746,8 +753,8 @@ async def _do_create_model_from_state(
                 "user_id": user_id,
                 "created_at": session.created_at,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[create_model_from_state] training session store write failed: %s", e)
 
         try:
             from ..backend.session_index_store import add_training_run_to_session
@@ -758,8 +765,8 @@ async def _do_create_model_from_state(
                 user_id=user_id,
                 created_at=session.created_at,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[create_model_from_state] session index write failed: %s", e)
 
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
@@ -1805,8 +1812,8 @@ async def _do_save_weights_for_sampler(
                         "model_path_raw": tinker_uri,
                     }
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[save_weights_for_sampler] session index write failed: %s", e)
 
             response = SaveWeightsForSamplerResponse(
                 path=None,  # Ephemeral - no path returned
@@ -1848,10 +1855,9 @@ async def get_training_run(training_run_id: str, http_request: Request) -> Train
     if info is None:
         try:
             from ..backend.training_session_store import get_training_session_info
-
-            info = get_training_session_info(training_run_id)
-        except Exception:
-            info = None
+            info = await run_in_threadpool(get_training_session_info, training_run_id)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Training session store unavailable") from e
 
     if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Training run '{training_run_id}' not found")
@@ -1878,7 +1884,7 @@ async def list_training_runs(limit: int = 20, offset: int = 0, http_request: Req
     try:
         from ..backend.training_session_store import list_training_sessions
 
-        for info in list_training_sessions():
+        for info in await run_in_threadpool(list_training_sessions):
             model_id = info.get("model_id")
             if not isinstance(model_id, str) or not model_id:
                 continue
@@ -1892,8 +1898,8 @@ async def list_training_runs(limit: int = 20, offset: int = 0, http_request: Req
                     existing["user_metadata"] = info.get("user_metadata")
                 continue
             infos_by_id[model_id] = info
-    except Exception:
-        pass
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
 
     infos = [
         info for info in infos_by_id.values() if _owner_visible(request_user_id, info.get("user_id"))
