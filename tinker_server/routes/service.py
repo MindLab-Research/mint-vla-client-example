@@ -162,7 +162,21 @@ async def healthz() -> dict:
                 pending.append(name)
             return pending
 
-        pending_pg_names = await asyncio.to_thread(_pending_gpu_pg_names_in_namespace)
+        healthz_ray_timeout_s = float(os.environ.get("MINT_HEALTHZ_RAY_TIMEOUT_S", "10.0"))
+        try:
+            pending_pg_names = await asyncio.wait_for(
+                asyncio.to_thread(_pending_gpu_pg_names_in_namespace),
+                timeout=healthz_ray_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "reason": "ray_healthz_timeout",
+                    "timeout_s": healthz_ray_timeout_s,
+                },
+            )
         if pending_pg_names:
             ar = ray.available_resources()
             cr = ray.cluster_resources()

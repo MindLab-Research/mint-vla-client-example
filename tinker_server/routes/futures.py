@@ -4,6 +4,14 @@ Endpoints:
 - POST /retrieve_future: Get result of an async operation
 """
 
+from __future__ import annotations
+
+import logging
+import os
+import time
+from collections import OrderedDict
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
@@ -11,6 +19,48 @@ from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _retrieve_grace_s() -> float:
+    v = (
+        os.environ.get("MINT_RETRIEVE_FUTURE_GRACE_S")
+        or os.environ.get("TINKER_RETRIEVE_FUTURE_GRACE_S")
+        or "120"
+    ).strip()
+    try:
+        return max(0.0, float(v))
+    except Exception:
+        return 120.0
+
+
+_RECENT_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_RECENT_MAX", "2048"))
+_RECENT: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+
+
+def _recent_put(request_id: str, payload: Any) -> None:
+    now = time.time()
+    _RECENT[request_id] = (now, payload)
+    _RECENT.move_to_end(request_id)
+    # Evict oldest first.
+    while len(_RECENT) > _RECENT_MAX:
+        _RECENT.popitem(last=False)
+
+
+def _recent_get(request_id: str) -> Any | None:
+    grace_s = _retrieve_grace_s()
+    if grace_s <= 0:
+        return None
+    now = time.time()
+    v = _RECENT.get(request_id)
+    if v is None:
+        return None
+    ts, payload = v
+    if (now - ts) > grace_s:
+        _RECENT.pop(request_id, None)
+        return None
+    _RECENT.move_to_end(request_id)
+    return payload
 
 GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persists."
 
@@ -140,6 +190,7 @@ async def retrieve_future(
     except FutureStoreUnavailableError:
         raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
     except KeyError:
+        logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
         detail: object = f"Unknown request_id: {body.request_id}"
         if _is_privileged(http_request):
             detail = {
@@ -175,8 +226,14 @@ async def retrieve_future(
         response.headers.update(pending.headers)
         return pending.body
     elif status == FutureStatus.EXPIRED:
+        logger.info("[retrieve_future] request_id=%s status=expired", body.request_id)
         return {"error": "Future expired", "category": "system"}
     elif status == FutureStatus.RETRIEVED:
+        cached = _recent_get(body.request_id)
+        if cached is not None:
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
+            return cached
+        logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
         error = future_store.get_error(body.request_id)
@@ -185,6 +242,8 @@ async def retrieve_future(
             payload = {"error": error, "category": "system"}
         else:
             payload = {"error": _public_error(error), "category": "system"}
+        _recent_put(body.request_id, payload)
+        logger.info("[retrieve_future] request_id=%s status=failed", body.request_id)
         try:
             from ..backend.capacity_manager import capacity_manager
 
@@ -202,6 +261,8 @@ async def retrieve_future(
     else:
         # DONE - return the result
         result = future_store.get_result(body.request_id)
+        _recent_put(body.request_id, result)
+        logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
         try:
             from ..backend.capacity_manager import capacity_manager
 

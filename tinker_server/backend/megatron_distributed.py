@@ -1300,11 +1300,13 @@ class MegatronRankWorker:
 
         # Session state swap moved inside train_mode() - see below
 
+        seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
             if not tokens:
                 raise ValueError(f"Item {item_index}: model_input has no tokens")
+            seq_lengths.append(len(tokens))
 
         # Test CUDA context before creating TensorDict
         device = torch.cuda.current_device()
@@ -1535,17 +1537,6 @@ class MegatronRankWorker:
                         "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
                     })
 
-            if valid_indices:
-                avg_loss_per_sample = loss_value / max(valid_count, 1)
-                full_outputs = [
-                    {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                     "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                    for _ in data_items
-                ]
-                for output, item_index in zip(loss_fn_outputs, valid_indices):
-                    full_outputs[item_index] = output
-                loss_fn_outputs = full_outputs
-
             # Calculate precision difference metrics if log_probs present
             debug_metrics = {}
             if result and isinstance(result, dict):
@@ -1636,11 +1627,13 @@ class MegatronRankWorker:
         if reset_bias:
             self.reset_expert_bias()
 
+        seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
             if not tokens:
                 raise ValueError(f"Item {item_index}: model_input has no tokens")
+            seq_lengths.append(len(tokens))
 
         # Create TensorDict directly on GPU to avoid .to() issues with nested tensors
         device = torch.cuda.current_device()
@@ -1664,6 +1657,7 @@ class MegatronRankWorker:
 
         # Only one output rank returns metrics
         if output_rank:
+            valid_count = len(seq_lengths)
             loss_value = 0.0
             num_tokens = 0
             all_log_probs = []
@@ -1755,18 +1749,6 @@ class MegatronRankWorker:
                             "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
                             "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
                         })
-
-                valid_count = len(seq_lengths)
-                if valid_indices:
-                    avg_loss_per_sample = loss_value / max(valid_count, 1)
-                    full_outputs = [
-                        {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                         "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                        for _ in data_items
-                    ]
-                    for output, item_index in zip(loss_fn_outputs, valid_indices):
-                        full_outputs[item_index] = output
-                    loss_fn_outputs = full_outputs
 
             return {
                 "loss_value": float(loss_value),
@@ -4118,6 +4100,15 @@ class MegatronWorkerGroup:
                 "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
             },
         }
+
+        # Forward MoE LoRA export knobs into rank workers.
+        for k in (
+            "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
+            "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
         if disable_nccl_ib or os.environ.get("MINT_NCCL_IB_DISABLE", "0") == "1":
             runtime_env["env_vars"]["NCCL_IB_DISABLE"] = "1"
             # Volcano images can set an external NCCL net plugin (e.g. RDMA/SHARP) via env.
@@ -5438,6 +5429,26 @@ def get_or_create_megatron_worker_group(
             # Actor doesn't exist, create new one
             logger.info(f"Creating new detached Megatron actor: {actor_name} for {base_model}")
 
+        # Heal a common invariant violation: a detached Megatron placement group can outlive the
+        # named actor (e.g., crash during initialization). The orphan PG reserves GPUs, which can
+        # make ensure_gpus_available() block forever even though nothing is actually running.
+        pg_name = f"{actor_name}_pg"
+        try:
+            orphan_pg = ray.util.get_placement_group(pg_name)
+        except ValueError:
+            orphan_pg = None
+        except Exception as e:
+            raise RuntimeError(f"Failed to probe placement group {pg_name!r}: {e}") from e
+
+        if orphan_pg is not None:
+            logger.warning(
+                f"Found orphan Megatron placement group without actor; removing to unblock recreate: {pg_name}"
+            )
+            try:
+                ray.util.remove_placement_group(orphan_pg)
+            except Exception as e:
+                raise RuntimeError(f"Failed to remove orphan placement group {pg_name!r}: {e}") from e
+
         # Check available GPUs and evict LRU actors if necessary.
         # For large, full-cluster Megatron jobs, allow preempting idle protected actors
         # (e.g., inference "always-on" actors) to avoid deadlocking on a fixed-size cluster.
@@ -5460,6 +5471,16 @@ def get_or_create_megatron_worker_group(
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                 }
             }
+
+            # Forward MoE LoRA export knobs into the detached Megatron actor so the
+            # on-GPU export path can be switched without code deploys.
+            for k in (
+                "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
+                "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    runtime_env["env_vars"][k] = v
             volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
             if volc_rq:
                 from .volc_placement import list_node_ips_for_resource_queue
@@ -5574,6 +5595,21 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     resource_pool = get_resource_pool()
     killed_any = False
 
+    def _remove_detached_pg(actor_name: str) -> None:
+        pg_name = f"{actor_name}_pg"
+        try:
+            pg = ray.util.get_placement_group(pg_name)
+        except ValueError:
+            return
+        except Exception as e:
+            logger.warning(f"Failed to get placement group {pg_name!r}: {e}")
+            return
+        try:
+            ray.util.remove_placement_group(pg)
+            logger.info(f"Removed Megatron placement group: {pg_name}")
+        except Exception as e:
+            logger.warning(f"Failed to remove placement group {pg_name!r}: {e}")
+
     if base_model:
         # Kill specific model's actor
         actor_name = _make_megatron_actor_name(base_model)
@@ -5593,32 +5629,40 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
             )
             logger.info(f"Killed Megatron actor: {actor_name}")
             resource_pool.unregister(actor_name)
+            _remove_detached_pg(actor_name)
             killed_any = True
         except ValueError:
             logger.info(f"No Megatron actor to kill for {base_model}")
+            resource_pool.unregister(actor_name)
+            _remove_detached_pg(actor_name)
     else:
         # Kill ALL Megatron actors from resource pool
         for entry in resource_pool.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
                     actor = ray.get_actor(entry.actor_name, namespace=PERSISTENT_NAMESPACE)
-                    try:
-                        ray.get(actor.shutdown.remote(), timeout=10)
-                    except Exception:
-                        pass
-                    ray_kill.kill(
-                        actor,
-                        reason="kill_megatron_actor",
-                        actor_name=entry.actor_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        no_restart=True,
-                        base_model=entry.base_model,
-                    )
-                    logger.info(f"Killed Megatron actor: {entry.actor_name}")
-                    resource_pool.unregister(entry.actor_name)
-                    killed_any = True
                 except ValueError:
+                    resource_pool.unregister(entry.actor_name)
+                    _remove_detached_pg(entry.actor_name)
+                    continue
+
+                try:
+                    ray.get(actor.shutdown.remote(), timeout=10)
+                except Exception:
                     pass
+
+                ray_kill.kill(
+                    actor,
+                    reason="kill_megatron_actor",
+                    actor_name=entry.actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    base_model=entry.base_model,
+                )
+                logger.info(f"Killed Megatron actor: {entry.actor_name}")
+                resource_pool.unregister(entry.actor_name)
+                _remove_detached_pg(entry.actor_name)
+                killed_any = True
 
     return killed_any
 

@@ -16,6 +16,10 @@ Non-negotiable rules:
   integrated repro is feasible.
 - "Runtime without Ray" is not runtime for Ray-backed production paths. If the production code path uses Ray, your repro must run against a server connected
   to real Ray (no stubs, no bypassing Ray).
+- Reproduction scripts must be discriminative:
+  - A repro that can PASS for unrelated reasons is invalid (example: returning PASS on any exception).
+  - Encode acceptance criteria as assertions about the expected behavior, not a generic gate like "200 vs error" or "did not crash".
+  - Before sending to reviewer, do a soundness check: read the repro line-by-line and try to make it return PASS for the wrong reason. If you can, fix the script first.
 - For actor lifecycle / resource scheduling / placement-group bugs: a repro that only asserts on computed resource numbers / GPU counts is partial. The repro
   must create the affected session/engine in Ray and complete at least one request that uses it (e.g. create_sampling_session + asample + retrieve_future).
 - If the issue is scale-dependent (example: fails only at 16 GPUs / TP=16), your integrated repro must run at that target scale. Smaller-scale "it works at

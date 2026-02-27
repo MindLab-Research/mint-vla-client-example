@@ -296,7 +296,7 @@ async def create_model(
                 path="/api/v1/create_model",
                 incoming_headers=dict(http_request.headers),
                 json_body=request.model_dump(),
-                timeout_s=30.0,
+                timeout_s=120.0,
             )
         except Exception:
             logger.exception("Upstream create_model failed: %s", upstream.alias)
@@ -624,7 +624,7 @@ async def create_model_from_state(
                 path="/api/v1/create_model_from_state",
                 incoming_headers=incoming_headers,
                 json_body=request.model_dump(),
-                timeout_s=30.0,
+                timeout_s=120.0,
             )
         except Exception:
             logger.exception("Upstream create_model_from_state failed: %s", upstream.alias)
@@ -1472,7 +1472,7 @@ async def reset_expert_bias(
                     path="/api/v1/reset_expert_bias",
                     incoming_headers=dict(http_request.headers),
                     json_body=request.model_dump(),
-                    timeout_s=30.0,
+                    timeout_s=120.0,
                 )
             except Exception:
                 logger.exception("Upstream reset_expert_bias failed: %s", upstream_alias)
@@ -1546,7 +1546,7 @@ async def save_weights_for_sampler(
                     path="/api/v1/save_weights_for_sampler",
                     incoming_headers=dict(http_request.headers),
                     json_body=request.model_dump(),
-                    timeout_s=30.0,
+                    timeout_s=300.0,
                 )
             except Exception:
                 logger.exception("Upstream save_weights_for_sampler failed: %s", upstream_alias)
@@ -2028,7 +2028,7 @@ async def get_info(request: GetInfoRequest, http_request: Request) -> GetInfoRes
                     path="/api/v1/get_info",
                     incoming_headers=dict(http_request.headers),
                     json_body=request.model_dump(),
-                    timeout_s=30.0,
+                    timeout_s=120.0,
                 )
             except Exception:
                 logger.exception("Upstream get_info failed: %s", upstream_alias)

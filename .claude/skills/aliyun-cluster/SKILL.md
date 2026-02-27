@@ -23,6 +23,33 @@ This skill mirrors `volcano-cluster`, but uses Aliyun PAI DLC CLI (`dlc`) instea
   - Mount target: `cpfs-03001407yug37qgafv7j5-vpc-q9ctsd.cn-beijing.cpfs.aliyuncs.com`
   - File system path: `/`
 
+## Code and environment invariants (Aliyun)
+
+- Deploy code via **unidirectional rsync** from local to server.
+- Never run any sync with `--delete` against a production path.
+- Treat `.venv_cpu/` as environment state, not code. Always exclude it from code deployments.
+- Exclude `.unison*` and other temp trees from deployments. Do not copy `.unison*.unison.tmp` artifacts into any live directory.
+
+### Safe rsync pattern (Aliyun code root)
+
+```bash
+rsync -avz --dry-run \
+  --exclude='.git' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.env' \
+  --exclude='.secrets.env' \
+  --exclude='.venv' \
+  --exclude='.venv*/' \
+  --exclude='.venv_cpu/' \
+  --exclude='cpu-pydeps/' \
+  --exclude='.unison*' \
+  --exclude='LOG.md' \
+  --exclude='PROMPT.md' \
+  --exclude='.claude' \
+  ./ mint-prod-aliyun:/vePFS-Mindverse/share/code/tinker-server-aliyun/
+```
+
 ## Quick Reference
 
 ```bash
