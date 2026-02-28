@@ -659,14 +659,15 @@ def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     """
     from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 
-    if user_id != "admin" and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
+    is_admin = user_id is None or user_id == "admin"
+    if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     checkpoint_dir = get_checkpoints_dir()
     resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
-    if user_id != "admin":
-        if model_path.startswith("ckpt_") and resolved == model_path:
-            return resolved
+    if model_path.startswith("ckpt_") and resolved == model_path:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    if not is_admin:
         resolved_real = os.path.realpath(resolved)
         checkpoints_real = os.path.realpath(checkpoint_dir)
         if not resolved_real.startswith(checkpoints_real + os.sep):

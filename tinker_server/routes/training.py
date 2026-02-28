@@ -274,7 +274,9 @@ async def create_model(
             detail=get_access_denied_error(request.base_model)
         )
 
+    user_id = _get_user_id(http_request)
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    user_id = _get_user_id(http_request)
 
     # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
     # return a gateway-encoded request_id so /retrieve_future can route it.
@@ -514,13 +516,14 @@ async def _do_create_model(
 # =============================================================================
 
 def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
-    if user_id != "admin" and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
+    is_admin = user_id is None or user_id == "admin"
+    if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     resolved = resolve_checkpoint_path(state_uri, user_id=user_id)
-    if user_id != "admin":
-        if state_uri.startswith("ckpt_") and resolved == state_uri:
-            return resolved
+    if state_uri.startswith("ckpt_") and resolved == state_uri:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    if not is_admin:
         resolved_real = os.path.realpath(resolved)
         checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
         if not resolved_real.startswith(checkpoints_real + os.sep):
@@ -553,6 +556,7 @@ async def create_model_from_state(
             detail=get_access_denied_error(request.base_model)
         )
 
+    user_id = _get_user_id(http_request)
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
     from ..gateway import (
@@ -643,7 +647,6 @@ async def create_model_from_state(
                 detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
             )
 
-    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
@@ -877,7 +880,6 @@ async def forward_backward(
             ),
         )
 
-    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
