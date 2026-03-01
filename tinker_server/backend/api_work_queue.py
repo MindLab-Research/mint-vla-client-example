@@ -75,6 +75,303 @@ def _get_or_create_ray_actor():
             self._recent_dequeues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
             self._recent_enqueues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
             self._active_job_id: str | None = None
+            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
+            self._scheduler_max_consecutive = max(
+                1,
+                int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
+            )
+            self._scheduler_starvation_s = max(
+                0.0,
+                float(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")),
+            )
+            self._scheduler_coalesce_ms = max(
+                0.0,
+                float(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")),
+            )
+            self._sched_domains: dict[str, dict[str, Any]] = {}
+            self._sched_stats: dict[str, Any] = {
+                "picks_total": 0,
+                "switches_total": 0,
+                "starvation_picks_total": 0,
+                "wait_s_sum": 0.0,
+                "switch_reasons": {},
+            }
+
+        def _to_bool(self, v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            if v is None:
+                return False
+            s = str(v).strip().lower()
+            return s in ("1", "true", "yes", "y", "on")
+
+        def _item_created_at(self, item: dict[str, Any], now: float | None = None) -> float:
+            fallback = time.time() if now is None else float(now)
+            try:
+                return float(item.get("created_at", fallback))
+            except Exception:
+                return fallback
+
+        def _scheduler_item_info(self, item: dict[str, Any]) -> tuple[bool, str, str]:
+            if not bool(self._scheduler_enabled):
+                return False, "", ""
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                return False, "", ""
+            if not self._to_bool(extra.get("scheduler_enabled")):
+                return False, "", ""
+            domain = str(extra.get("scheduler_domain") or "").strip()
+            session_id = str(extra.get("session_id") or "").strip()
+            if not domain or not session_id:
+                return False, "", ""
+            return True, domain, session_id
+
+        def _get_domain_state(self, domain: str) -> dict[str, Any]:
+            from collections import deque
+
+            state = self._sched_domains.get(domain)
+            if state is not None:
+                return state
+            state = {
+                "queues_by_session": {},
+                "ready_rr": deque(),
+                "ready_set": set(),
+                "current_session": None,
+                "consecutive_count": 0,
+                "stats": {
+                    "picks": 0,
+                    "switches": 0,
+                    "starvation_picks": 0,
+                    "wait_s_sum": 0.0,
+                },
+            }
+            self._sched_domains[domain] = state
+            return state
+
+        def _compact_domain_ready(self, state: dict[str, Any]) -> None:
+            from collections import deque
+
+            queues_by_session = state["queues_by_session"]
+            new_rr = deque()
+            new_set = set()
+            for sid in list(state["ready_rr"]):
+                q = queues_by_session.get(sid)
+                if q:
+                    if sid not in new_set:
+                        new_rr.append(sid)
+                        new_set.add(sid)
+                else:
+                    queues_by_session.pop(sid, None)
+            state["ready_rr"] = new_rr
+            state["ready_set"] = new_set
+            current = state.get("current_session")
+            if current is not None and not queues_by_session.get(current):
+                state["current_session"] = None
+                state["consecutive_count"] = 0
+
+        def _remove_session_from_ready(self, state: dict[str, Any], session_id: str) -> None:
+            from collections import deque
+
+            state["ready_set"].discard(session_id)
+            state["ready_rr"] = deque([sid for sid in state["ready_rr"] if sid != session_id])
+
+        def _scheduled_depth(self) -> int:
+            depth = 0
+            for state in self._sched_domains.values():
+                for q in state.get("queues_by_session", {}).values():
+                    depth += len(q)
+            return int(depth)
+
+        def _oldest_scheduled_created_at(self) -> float | None:
+            oldest: float | None = None
+            for state in self._sched_domains.values():
+                for q in state.get("queues_by_session", {}).values():
+                    if not q:
+                        continue
+                    ts = self._item_created_at(q[0])
+                    if oldest is None or ts < oldest:
+                        oldest = ts
+            return oldest
+
+        def _enqueue_scheduled(self, item: dict[str, Any], *, domain: str, session_id: str) -> None:
+            from collections import deque
+
+            state = self._get_domain_state(domain)
+            queues_by_session = state["queues_by_session"]
+            q = queues_by_session.get(session_id)
+            if q is None:
+                q = deque()
+                queues_by_session[session_id] = q
+            was_empty = len(q) == 0
+            q.append(item)
+            if was_empty and session_id not in state["ready_set"]:
+                state["ready_rr"].append(session_id)
+                state["ready_set"].add(session_id)
+
+        def _pick_round_robin_session(self, state: dict[str, Any], *, avoid: str | None = None) -> str | None:
+            self._compact_domain_ready(state)
+            rr = state["ready_rr"]
+            queues_by_session = state["queues_by_session"]
+            if not rr:
+                return None
+
+            fallback: str | None = None
+            n = len(rr)
+            for _ in range(n):
+                sid = rr.popleft()
+                q = queues_by_session.get(sid)
+                if not q:
+                    state["ready_set"].discard(sid)
+                    queues_by_session.pop(sid, None)
+                    continue
+                rr.append(sid)
+                if fallback is None:
+                    fallback = sid
+                if avoid is not None and sid == avoid:
+                    continue
+                return sid
+            return fallback
+
+        def _choose_session_for_domain(self, domain: str, state: dict[str, Any], *, now: float) -> tuple[str, str] | None:
+            self._compact_domain_ready(state)
+            queues_by_session = state["queues_by_session"]
+            rr_order = [sid for sid in state["ready_rr"] if queues_by_session.get(sid)]
+            if not rr_order:
+                return None
+
+            if self._scheduler_starvation_s > 0:
+                chosen_starved_sid: str | None = None
+                max_wait = self._scheduler_starvation_s
+                for sid in rr_order:
+                    q = queues_by_session.get(sid)
+                    if not q:
+                        continue
+                    wait_s = max(0.0, now - self._item_created_at(q[0], now=now))
+                    if wait_s >= self._scheduler_starvation_s and wait_s >= max_wait:
+                        chosen_starved_sid = sid
+                        max_wait = wait_s
+                if chosen_starved_sid is not None:
+                    return chosen_starved_sid, "starvation"
+
+            current = state.get("current_session")
+            if (
+                isinstance(current, str)
+                and current
+                and queues_by_session.get(current)
+                and int(state.get("consecutive_count", 0)) < int(self._scheduler_max_consecutive)
+            ):
+                return current, "sticky"
+
+            avoid = current if isinstance(current, str) and current and len(rr_order) > 1 else None
+            sid = self._pick_round_robin_session(state, avoid=avoid)
+            if sid is None:
+                return None
+            return sid, "fairness"
+
+        def _pick_scheduled_candidate(self, *, now: float) -> tuple[str, str, str] | None:
+            best: tuple[float, str, str, str] | None = None
+            for domain, state in self._sched_domains.items():
+                chosen = self._choose_session_for_domain(domain, state, now=now)
+                if chosen is None:
+                    continue
+                sid, reason = chosen
+                q = state["queues_by_session"].get(sid)
+                if not q:
+                    continue
+                created_at = self._item_created_at(q[0], now=now)
+                if best is None or created_at < best[0]:
+                    best = (created_at, domain, sid, reason)
+            if best is None:
+                return None
+            return best[1], best[2], best[3]
+
+        def _record_switch_reason(self, reason: str) -> None:
+            reasons = self._sched_stats.get("switch_reasons")
+            if not isinstance(reasons, dict):
+                reasons = {}
+                self._sched_stats["switch_reasons"] = reasons
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+        def _pop_scheduled(self, *, domain: str, session_id: str, reason: str, now: float) -> dict[str, Any]:
+            state = self._sched_domains.get(domain)
+            if state is None:
+                raise KeyError(f"scheduler domain missing during pop: {domain!r}")
+            queues_by_session = state["queues_by_session"]
+            q = queues_by_session.get(session_id)
+            if not q:
+                raise KeyError(f"scheduler session queue empty during pop: domain={domain!r} session={session_id!r}")
+
+            item = q.popleft()
+            if not q:
+                queues_by_session.pop(session_id, None)
+                self._remove_session_from_ready(state, session_id)
+
+            current = state.get("current_session")
+            if current == session_id:
+                state["consecutive_count"] = int(state.get("consecutive_count", 0)) + 1
+            else:
+                if current is not None:
+                    state["stats"]["switches"] = int(state["stats"].get("switches", 0)) + 1
+                    self._sched_stats["switches_total"] = int(self._sched_stats.get("switches_total", 0)) + 1
+                    self._record_switch_reason(reason)
+                state["current_session"] = session_id
+                state["consecutive_count"] = 1
+
+            wait_s = max(0.0, now - self._item_created_at(item, now=now))
+            state["stats"]["wait_s_sum"] = float(state["stats"].get("wait_s_sum", 0.0)) + float(wait_s)
+            state["stats"]["picks"] = int(state["stats"].get("picks", 0)) + 1
+            self._sched_stats["wait_s_sum"] = float(self._sched_stats.get("wait_s_sum", 0.0)) + float(wait_s)
+            self._sched_stats["picks_total"] = int(self._sched_stats.get("picks_total", 0)) + 1
+            if reason == "starvation":
+                state["stats"]["starvation_picks"] = int(state["stats"].get("starvation_picks", 0)) + 1
+                self._sched_stats["starvation_picks_total"] = int(self._sched_stats.get("starvation_picks_total", 0)) + 1
+
+            if not queues_by_session:
+                state["current_session"] = None
+                state["consecutive_count"] = 0
+
+            return item
+
+        def _scheduler_debug(self) -> dict[str, Any]:
+            domains: dict[str, Any] = {}
+            for domain, state in self._sched_domains.items():
+                queues_by_session = state.get("queues_by_session", {})
+                queue_depths = {
+                    str(sid): int(len(q))
+                    for sid, q in queues_by_session.items()
+                    if len(q) > 0
+                }
+                domain_stats = state.get("stats", {})
+                if not queue_depths and int(domain_stats.get("picks", 0)) == 0:
+                    continue
+                domains[str(domain)] = {
+                    "current_session": state.get("current_session"),
+                    "consecutive_count": int(state.get("consecutive_count", 0)),
+                    "queue_depths": queue_depths,
+                    "ready_rr": [str(x) for x in list(state.get("ready_rr", []))],
+                    "stats": {
+                        "picks": int(domain_stats.get("picks", 0)),
+                        "switches": int(domain_stats.get("switches", 0)),
+                        "starvation_picks": int(domain_stats.get("starvation_picks", 0)),
+                        "wait_s_sum": float(domain_stats.get("wait_s_sum", 0.0)),
+                    },
+                }
+            return {
+                "enabled": bool(self._scheduler_enabled),
+                "max_consecutive": int(self._scheduler_max_consecutive),
+                "starvation_s": float(self._scheduler_starvation_s),
+                "coalesce_ms": float(self._scheduler_coalesce_ms),
+                "domains": domains,
+                "stats": {
+                    "picks_total": int(self._sched_stats.get("picks_total", 0)),
+                    "switches_total": int(self._sched_stats.get("switches_total", 0)),
+                    "starvation_picks_total": int(self._sched_stats.get("starvation_picks_total", 0)),
+                    "wait_s_sum": float(self._sched_stats.get("wait_s_sum", 0.0)),
+                    "switch_reasons": dict(self._sched_stats.get("switch_reasons", {})),
+                },
+            }
 
         def set_active_job_id(self, job_id: str) -> None:
             self._active_job_id = None if not job_id else str(job_id)
@@ -90,19 +387,32 @@ def _get_or_create_ray_actor():
 
         async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> None:
             async with self._cv:
-                self._items.append(dict(item))
+                packed = dict(item)
+                is_sched, domain, session_id = self._scheduler_item_info(packed)
+                if is_sched:
+                    self._enqueue_scheduled(packed, domain=domain, session_id=session_id)
+                else:
+                    self._items.append(packed)
                 self._enqueued += 1
                 try:
                     import ray
 
                     ctx = ray.get_runtime_context()
+                    extra = packed.get("extra")
+                    scheduler_domain = None
+                    scheduler_session_id = None
+                    if isinstance(extra, dict):
+                        scheduler_domain = extra.get("scheduler_domain")
+                        scheduler_session_id = extra.get("session_id")
                     self._recent_enqueues.append(
                         {
                             "ts": time.time(),
                             "job_id": None if producer_job_id is None else str(producer_job_id),
                             "task_id": str(ctx.get_task_id()),
-                            "request_id": str(item.get("request_id")),
-                            "op": str(item.get("op")),
+                            "request_id": str(packed.get("request_id")),
+                            "op": str(packed.get("op")),
+                            "scheduler_domain": None if scheduler_domain is None else str(scheduler_domain),
+                            "scheduler_session_id": None if scheduler_session_id is None else str(scheduler_session_id),
                         }
                     )
                 except Exception:
@@ -111,16 +421,72 @@ def _get_or_create_ray_actor():
 
         async def dequeue(self, consumer_job_id: str) -> dict[str, Any]:
             async with self._cv:
-                while not self._items:
-                    await self._cv.wait()
-                if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
-                    self._cv.notify(1)
-                    raise RuntimeError(
-                        f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
-                    )
+                while True:
+                    has_legacy = bool(self._items)
+                    now = time.time()
+                    sched_choice = self._pick_scheduled_candidate(now=now) if bool(self._scheduler_enabled) else None
+
+                    if not has_legacy and sched_choice is None:
+                        await self._cv.wait()
+                        continue
+
+                    if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
+                        self._cv.notify(1)
+                        raise RuntimeError(
+                            f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
+                        )
+
+                    item: dict[str, Any]
+                    dequeue_reason = "fifo"
+                    scheduler_domain = None
+                    scheduler_session_id = None
+
+                    if has_legacy and sched_choice is not None:
+                        legacy_head = self._items[0]
+                        legacy_ts = self._item_created_at(legacy_head, now=now)
+                        sched_domain, sched_session_id, sched_reason = sched_choice
+                        sched_state = self._sched_domains.get(sched_domain)
+                        sched_queue = (
+                            None
+                            if sched_state is None
+                            else (sched_state.get("queues_by_session", {}) or {}).get(sched_session_id)
+                        )
+                        sched_head_ts = (
+                            legacy_ts
+                            if not sched_queue
+                            else self._item_created_at(sched_queue[0], now=now)
+                        )
+                        if legacy_ts <= sched_head_ts:
+                            item = self._items.popleft()
+                        else:
+                            item = self._pop_scheduled(
+                                domain=sched_domain,
+                                session_id=sched_session_id,
+                                reason=sched_reason,
+                                now=now,
+                            )
+                            dequeue_reason = str(sched_reason)
+                            scheduler_domain = str(sched_domain)
+                            scheduler_session_id = str(sched_session_id)
+                    elif has_legacy:
+                        item = self._items.popleft()
+                    else:
+                        if sched_choice is None:
+                            await self._cv.wait()
+                            continue
+                        sched_domain, sched_session_id, sched_reason = sched_choice
+                        item = self._pop_scheduled(
+                            domain=sched_domain,
+                            session_id=sched_session_id,
+                            reason=sched_reason,
+                            now=now,
+                        )
+                        dequeue_reason = str(sched_reason)
+                        scheduler_domain = str(sched_domain)
+                        scheduler_session_id = str(sched_session_id)
+                    break
 
                 self._dequeued += 1
-                item = self._items.popleft()
                 try:
                     import ray
 
@@ -132,6 +498,9 @@ def _get_or_create_ray_actor():
                             "task_id": str(ctx.get_task_id()),
                             "request_id": str(item.get("request_id")),
                             "op": str(item.get("op")),
+                            "dequeue_reason": str(dequeue_reason),
+                            "scheduler_domain": None if scheduler_domain is None else str(scheduler_domain),
+                            "scheduler_session_id": None if scheduler_session_id is None else str(scheduler_session_id),
                         }
                     )
                 except Exception:
@@ -139,7 +508,21 @@ def _get_or_create_ray_actor():
                 return item
 
         def stats(self) -> dict[str, Any]:
-            return {"depth": len(self._items), "enqueued": int(self._enqueued), "dequeued": int(self._dequeued)}
+            depth_legacy = int(len(self._items))
+            depth_scheduled = int(self._scheduled_depth())
+            return {
+                "depth": int(depth_legacy + depth_scheduled),
+                "depth_legacy": int(depth_legacy),
+                "depth_scheduled": int(depth_scheduled),
+                "enqueued": int(self._enqueued),
+                "dequeued": int(self._dequeued),
+                "scheduler_enabled": bool(self._scheduler_enabled),
+                "scheduler_picks_total": int(self._sched_stats.get("picks_total", 0)),
+                "scheduler_switches_total": int(self._sched_stats.get("switches_total", 0)),
+                "scheduler_starvation_picks_total": int(self._sched_stats.get("starvation_picks_total", 0)),
+                "scheduler_wait_s_sum": float(self._sched_stats.get("wait_s_sum", 0.0)),
+                "scheduler_domains_total": int(len(self._sched_domains)),
+            }
 
         def debug_state(self) -> dict[str, Any]:
             return {
@@ -147,6 +530,7 @@ def _get_or_create_ray_actor():
                 "recent_enqueues": list(self._recent_enqueues),
                 "recent_dequeues": list(self._recent_dequeues),
                 "active_job_id": self._active_job_id,
+                "scheduler": self._scheduler_debug(),
             }
 
     # Keep the detached queue actor on the head node when possible. Losing this
