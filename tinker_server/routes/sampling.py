@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException, Request
 
 from ..config import config as server_config
-from ..backend.future_store import FutureStatus, future_store
+from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
@@ -189,6 +189,16 @@ def _prompt_fingerprint(token_ids: list[int]) -> bytes:
     # 32k token prompts are common; collisions must be negligible but hashing cost is amortized by prefill.
     a = array.array("I", token_ids)
     return hashlib.blake2b(a.tobytes(), digest_size=16).digest()
+
+
+def _payload_hash(payload: bytes) -> str:
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _deterministic_request_id(session_id: str, seq_id: int) -> str:
+    seed = f"{session_id}:{int(seq_id)}".encode("utf-8")
+    digest = hashlib.blake2b(seed, digest_size=16).hexdigest()
+    return f"sample_{digest}"
 
 
 def _stop_key(stop: object | None) -> object:
@@ -447,6 +457,11 @@ async def asample(
     )
 
     session_id = request.get_session_id()
+    if server_config.sampling_require_seq_id and request.seq_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="seq_id is required when sampling_session_id or model_id is provided",
+        )
     is_local = False
     if session_manager is not None:
         is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
@@ -521,13 +536,46 @@ async def asample(
     from ..backend.result_size_estimator import estimate_sampling_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
+    payload_hash = _payload_hash(request_json)
     request_id = uuid.uuid4().hex
+    created_pending = False
+
+    if request.seq_id is not None:
+        request_id = _deterministic_request_id(session_id, request.seq_id)
+        try:
+            ensure = future_store.ensure_pending(
+                request_id=request_id,
+                meta={"payload_hash": payload_hash},
+            )
+        except FutureStoreUnavailableError:
+            raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+        if not bool(ensure.get("created")):
+            meta = ensure.get("meta")
+            existing_hash = meta.get("payload_hash") if isinstance(meta, dict) else None
+            if not isinstance(existing_hash, str) or not existing_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Duplicate seq_id with existing request lacking payload hash",
+                )
+            if existing_hash != payload_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Duplicate seq_id with different request payload",
+                )
+            return UntypedAPIFuture(request_id=request_id)
+        created_pending = True
+
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_sampling_result_bytes(request),
     )
     if not bool(reserve.get("ok")):
+        if created_pending:
+            try:
+                future_store.forget(request_id)
+            except FutureStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -535,8 +583,9 @@ async def asample(
 
     created = False
     try:
-        future_store.create_with_id(request_id)
-        created = True
+        if not created_pending:
+            future_store.create_with_id(request_id)
+            created = True
         future_store.mark_queued(request_id, meta={"op": "asample"})
         await api_work_queue.enqueue(
             request_id=request_id,
@@ -547,7 +596,12 @@ async def asample(
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
-        if created:
+        if created_pending:
+            try:
+                future_store.forget(request_id)
+            except FutureStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+        elif created:
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 

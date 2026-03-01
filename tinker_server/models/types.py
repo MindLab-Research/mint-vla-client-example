@@ -61,7 +61,7 @@ class SampleRequest(BaseModel):
 
     sampling_session_id: str | None = None
     model_id: str | None = None  # Alias for sampling_session_id (Tinker SDK compat)
-    seq_id: int = 0  # Default to 0 if not provided
+    seq_id: int | None = None
     num_samples: int
     prompt: ModelInput
     sampling_params: SamplingParams
