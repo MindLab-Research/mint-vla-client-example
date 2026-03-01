@@ -276,7 +276,6 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
-    user_id = _get_user_id(http_request)
 
     # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
     # return a gateway-encoded request_id so /retrieve_future can route it.
@@ -516,7 +515,7 @@ async def _do_create_model(
 # =============================================================================
 
 def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
-    is_admin = user_id is None or user_id == "admin"
+    is_admin = user_id == "admin"
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
