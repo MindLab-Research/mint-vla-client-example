@@ -24,7 +24,7 @@ import os
 import time
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -246,6 +246,39 @@ def _get_max_model_len(base_model: str | None) -> int:
                 f"{type(e).__name__}: {e}"
             ),
         )
+
+
+def _build_training_scheduler_extra(
+    *,
+    session: Any,
+    model_id: str,
+    training_op: str,
+    seq_id: int | None = None,
+) -> dict[str, Any]:
+    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    backend = str(getattr(session, "backend", "") or "unknown")
+    base_model = str(getattr(session, "base_model", "") or "")
+    domain_key = base_model if base_model else str(model_id)
+    extra: dict[str, Any] = {
+        "scheduler_enabled": bool(enabled),
+        "scheduler_domain": f"{backend}:{domain_key}",
+        # Scheduler session key is model_id (server-side training session identity),
+        # not the user-provided create_model session_id string.
+        "scheduler_session_key": str(model_id),
+        "training_op": str(training_op),
+    }
+    if seq_id is not None:
+        try:
+            extra["seq_id"] = int(seq_id)
+        except Exception:
+            extra["seq_id"] = None
+    return extra
 
 
 # =============================================================================
@@ -909,6 +942,12 @@ async def forward_backward(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="forward_backward",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "forward_backward", "model_id": request.model_id})
@@ -918,6 +957,7 @@ async def forward_backward(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1079,6 +1119,12 @@ async def train_step(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="train_step",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "train_step", "model_id": request.model_id})
@@ -1088,6 +1134,7 @@ async def train_step(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1376,6 +1423,12 @@ async def optim_step(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="optim_step",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "optim_step", "model_id": request.model_id})
@@ -1385,6 +1438,7 @@ async def optim_step(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
