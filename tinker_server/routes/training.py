@@ -197,21 +197,19 @@ def _training_run_from_info(info: dict) -> TrainingRun:
         except Exception:
             pass
 
-    model_owner = info.get("user_id") or "anonymous"
-    user_metadata = info.get("user_metadata") or {}
-    last_request_time = info.get("last_request_time") or info.get("created_at")
-
     return TrainingRun(
         training_run_id=str(info.get("model_id", "")),
         base_model=str(info.get("base_model", "")),
-        model_owner=model_owner,
+        model_owner=str(info.get("user_id") or "anonymous"),
         is_lora=bool(is_lora),
         corrupted=False,
         lora_rank=lora_rank,
-        last_request_time=last_request_time,
+        last_request_time=str(
+            info.get("last_request_time") or info.get("created_at") or datetime.now().isoformat()
+        ),
         last_checkpoint=None,
         last_sampler_checkpoint=None,
-        user_metadata=user_metadata,
+        user_metadata=info.get("user_metadata") or {},
     )
 
 def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
@@ -298,7 +296,7 @@ async def create_model(
                 path="/api/v1/create_model",
                 incoming_headers=dict(http_request.headers),
                 json_body=request.model_dump(),
-                timeout_s=30.0,
+                timeout_s=120.0,
             )
         except Exception:
             logger.exception("Upstream create_model failed: %s", upstream.alias)
@@ -461,6 +459,18 @@ async def _do_create_model(
         except Exception as e:
             logger.warning("[create_model] session index write failed: %s", e)
 
+        try:
+            from ..backend.session_index_store import add_training_run_to_session
+
+            add_training_run_to_session(
+                session_id=request.session_id,
+                training_run_id=model_id,
+                user_id=user_id,
+                created_at=session.created_at,
+            )
+        except Exception:
+            pass
+
         response = CreateModelResponse(
             request_id=request_id,
             model_id=model_id,
@@ -532,6 +542,8 @@ def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
         if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
             raise HTTPException(status_code=403, detail="Access denied")
     return resolved
+
+
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
@@ -555,8 +567,19 @@ async def create_model_from_state(
             detail=get_access_denied_error(request.base_model)
         )
 
-    user_id = _get_user_id(http_request)
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    user_id = _get_user_id(http_request)
+
+    # Fail fast: sampler checkpoints are not eligible for optimizer restore.
+    if bool(request.load_optimizer):
+        try:
+            from ..checkpoints import validate_checkpoint_load_contract
+
+            local_path = _resolve_state_path(request.state_path, user_id=user_id)
+            if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
+                validate_checkpoint_load_contract(local_path, load_optimizer=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     from ..gateway import (
         encode_request_id,
@@ -612,7 +635,7 @@ async def create_model_from_state(
                 path="/api/v1/create_model_from_state",
                 incoming_headers=incoming_headers,
                 json_body=request.model_dump(),
-                timeout_s=30.0,
+                timeout_s=120.0,
             )
         except Exception:
             logger.exception("Upstream create_model_from_state failed: %s", upstream.alias)
@@ -769,6 +792,18 @@ async def _do_create_model_from_state(
             )
         except Exception as e:
             logger.warning("[create_model_from_state] session index write failed: %s", e)
+
+        try:
+            from ..backend.session_index_store import add_training_run_to_session
+
+            add_training_run_to_session(
+                session_id=request.session_id,
+                training_run_id=model_id,
+                user_id=user_id,
+                created_at=session.created_at,
+            )
+        except Exception:
+            pass
 
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
@@ -1459,7 +1494,7 @@ async def reset_expert_bias(
                     path="/api/v1/reset_expert_bias",
                     incoming_headers=dict(http_request.headers),
                     json_body=request.model_dump(),
-                    timeout_s=30.0,
+                    timeout_s=120.0,
                 )
             except Exception:
                 logger.exception("Upstream reset_expert_bias failed: %s", upstream_alias)
@@ -1533,7 +1568,7 @@ async def save_weights_for_sampler(
                     path="/api/v1/save_weights_for_sampler",
                     incoming_headers=dict(http_request.headers),
                     json_body=request.model_dump(),
-                    timeout_s=30.0,
+                    timeout_s=300.0,
                 )
             except Exception:
                 logger.exception("Upstream save_weights_for_sampler failed: %s", upstream_alias)
@@ -1621,7 +1656,6 @@ async def _do_save_weights_for_sampler(
     - Named (path is not None): Save to persistent location, return path
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
-    print(f"[DEBUG _do_save_weights_for_sampler] ENTRY request_id={request_id}", flush=True)
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
@@ -1664,7 +1698,6 @@ async def _do_save_weights_for_sampler(
                     )
                 use_per_expert_lora = False
 
-        print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
@@ -1672,15 +1705,48 @@ async def _do_save_weights_for_sampler(
             checkpoint_base_dir=checkpoint_dir,
             use_per_expert_lora=use_per_expert_lora,
         )
-        print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
-        tinker_uri = f"tinker://{session.model_id}/{checkpoint_name}"
-        mint_uri = f"mint://{session.model_id}/{checkpoint_name}"
+        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
+
+        if checkpoint_has_optimizer_state(save_path):
+            raise RuntimeError(
+                f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
+            )
+
+        write_checkpoint_metadata(
+            save_path,
+            {
+                "checkpoint_id": checkpoint_name,
+                "owner_id": user_id,
+                "model_id": session.model_id,
+                "model_name": session.base_model,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "step": session.current_step,
+                "checkpoint_type": "sampler",
+                "optimizer_present": False,
+                "backend": session.backend,
+                "type": "sampler",
+            },
+        )
+
+        from ..client_compat import checkpoint_uri
+
+        tinker_uri = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=True,
+            checkpoint_type="sampler",
+        )
+        mint_uri = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="sampler",
+        )
         path_uri = tinker_uri if prefer_tinker else mint_uri
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately
-            print(f"[DEBUG _do_save_weights_for_sampler] Named flow", flush=True)
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
@@ -1689,7 +1755,6 @@ async def _do_save_weights_for_sampler(
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
             # Each sampling session gets unique lora_int_id with frozen weights.
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
-            print(f"[DEBUG _do_save_weights_for_sampler] Ephemeral flow", flush=True)
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
 
@@ -1698,12 +1763,9 @@ async def _do_save_weights_for_sampler(
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
             base_model = session.base_model
-            print(f"[DEBUG _do_save_weights_for_sampler] base_model={base_model}", flush=True)
 
             # Get or create engine for this model (dynamically creates vLLM actor if needed)
-            print(f"[DEBUG _do_save_weights_for_sampler] getting engine for model", flush=True)
             multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-            print(f"[DEBUG _do_save_weights_for_sampler] got engine: {multi_lora_engine is not None}", flush=True)
 
             if multi_lora_engine is not None:
                 # Multi-LoRA mode: Each sampling session gets frozen weights
@@ -1713,12 +1775,10 @@ async def _do_save_weights_for_sampler(
 
                 # Add LoRA from path - vLLM worker loads directly from PFS
                 # This avoids serializing 37k+ tensors through Ray object store
-                print(f"[DEBUG _do_save_weights_for_sampler] calling add_lora_for_session_from_path with {save_path}", flush=True)
                 lora_id = await multi_lora_engine.add_lora_for_session_from_path(
                     sampling_session_id=sampling_session_id,
                     lora_path=save_path,
                 )
-                print(f"[DEBUG _do_save_weights_for_sampler] add_lora_for_session_from_path returned lora_id={lora_id}", flush=True)
 
                 # Register in session manager with base_model for multi-model routing
                 inference_manager.register_multi_lora_session(
@@ -1727,7 +1787,6 @@ async def _do_save_weights_for_sampler(
                     lora_rank=lora_rank,
                     adapter_path=save_path,
                 )
-                print(f"[DEBUG _do_save_weights_for_sampler] registered session", flush=True)
 
                 load_time = time.time() - start_time
                 logger.info(
@@ -1947,9 +2006,12 @@ async def get_model_info(model_id: str):
         "base_model": session.base_model,
         "lora_config": session.lora_config.model_dump() if session.lora_config else None,
         "user_metadata": session.user_metadata,
+        "learning_rate": session.learning_rate,
         "created_at": session.created_at,
         "current_step": session.current_step,
         "is_active": session.is_active,
+        "backend": session.backend,
+        "user_id": session.user_id,
     }
 
 
@@ -1987,7 +2049,7 @@ async def get_info(request: GetInfoRequest, http_request: Request) -> GetInfoRes
                     path="/api/v1/get_info",
                     incoming_headers=dict(http_request.headers),
                     json_body=request.model_dump(),
-                    timeout_s=30.0,
+                    timeout_s=120.0,
                 )
             except Exception:
                 logger.exception("Upstream get_info failed: %s", upstream_alias)

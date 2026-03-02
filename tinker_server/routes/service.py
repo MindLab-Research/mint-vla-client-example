@@ -86,9 +86,11 @@ def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
         return None
 
     parts = [p for p in path_part.split("/") if p]
-    if len(parts) != 2:
-        return None
-    return parts[0], parts[1]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) == 3 and parts[1] in ("weights", "sampler_weights"):
+        return parts[0], parts[2]
+    return None
 
 
 @router.get("/healthz", response_model=None)
@@ -161,7 +163,21 @@ async def healthz() -> dict:
                 pending.append(name)
             return pending
 
-        pending_pg_names = await asyncio.to_thread(_pending_gpu_pg_names_in_namespace)
+        healthz_ray_timeout_s = float(os.environ.get("MINT_HEALTHZ_RAY_TIMEOUT_S", "10.0"))
+        try:
+            pending_pg_names = await asyncio.wait_for(
+                asyncio.to_thread(_pending_gpu_pg_names_in_namespace),
+                timeout=healthz_ray_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "reason": "ray_healthz_timeout",
+                    "timeout_s": healthz_ray_timeout_s,
+                },
+            )
         if pending_pg_names:
             ar = ray.available_resources()
             cr = ray.cluster_resources()
@@ -617,6 +633,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
                     str(model_id),
                     str(checkpoint_name),
                     prefer_tinker=prefer_tinker_uri(http_request),
+                    checkpoint_type="sampler",
                 )
             else:
                 model_path = info.get("model_path_raw")

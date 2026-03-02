@@ -139,12 +139,14 @@ celerybeat.pid
 .env
 .envrc
 .secrets.env
+.secrets.env*
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.unison*
 
 # Spyder project settings
 .spyderproject

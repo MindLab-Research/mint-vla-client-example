@@ -13,10 +13,12 @@ def is_tinker_sdk_user_agent(user_agent: str | None) -> bool:
     low = ua.lower()
     # Tinker SDK sets: "User-Agent: {ClientClassName}/Python {__version__}"
     # e.g. "AsyncTinker/Python 0.2.3".
+    #
+    # MinT's `mint` wrapper reuses the same SDK but sets "Mint/Python {ver}".
     if "/python " not in low:
         return False
     client_name = low.split("/", 1)[0]
-    return client_name.endswith("tinker")
+    return client_name.endswith("tinker") or client_name == "mint"
 
 
 def _get_user_agent_from_request(request: Any) -> str | None:
@@ -32,6 +34,23 @@ def prefer_tinker_uri(request: Any) -> bool:
     return is_tinker_sdk_user_agent(_get_user_agent_from_request(request))
 
 
-def checkpoint_uri(model_id: str, checkpoint_name: str, *, prefer_tinker: bool) -> str:
+def checkpoint_uri(
+    model_id: str,
+    checkpoint_name: str,
+    *,
+    prefer_tinker: bool,
+    checkpoint_type: str | None = None,
+) -> str:
     scheme = "tinker" if prefer_tinker else "mint"
+
+    # Canonical Tinker checkpoint paths:
+    # - tinker://{training_run_id}/weights/{checkpoint_id}
+    # - tinker://{training_run_id}/sampler_weights/{checkpoint_id}
+    #
+    # Older MinT paths omitted the type segment (tinker://{run_id}/{checkpoint_id}).
+    # Keep emitting legacy shape only when checkpoint_type is unknown.
+    if checkpoint_type == "training":
+        return f"{scheme}://{model_id}/weights/{checkpoint_name}"
+    if checkpoint_type == "sampler":
+        return f"{scheme}://{model_id}/sampler_weights/{checkpoint_name}"
     return f"{scheme}://{model_id}/{checkpoint_name}"

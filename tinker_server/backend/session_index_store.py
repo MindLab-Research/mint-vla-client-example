@@ -1,6 +1,7 @@
 """Detached Ray store for session and sampler indices.
 
-Persists minimal metadata for RestClient session and sampler endpoints.
+Persists minimal metadata for REST endpoints that need to enumerate or fetch
+sessions and samplers across API server restarts.
 """
 
 from __future__ import annotations
@@ -9,16 +10,11 @@ import logging
 import os
 from typing import Any
 
-
 logger = logging.getLogger(__name__)
 
 
 def _ray_namespace() -> str:
-    return (
-        os.environ.get("TINKER_RAY_NAMESPACE")
-        or os.environ.get("MINT_RAY_NAMESPACE")
-        or "tinker"
-    )
+    return os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker"
 
 
 def _actor_name() -> str:
@@ -42,17 +38,22 @@ def _get_or_create_actor():
             self._samplers: dict[str, dict[str, Any]] = {}
 
         def upsert_session(self, session_id: str, info: dict[str, Any]) -> None:
-            current = self._sessions.get(session_id, {})
-            merged = dict(current)
-            merged.update(info)
-            merged.setdefault("session_id", session_id)
-            merged.setdefault("training_run_ids", list(current.get("training_run_ids", [])))
-            merged.setdefault("sampler_ids", list(current.get("sampler_ids", [])))
-            self._sessions[session_id] = merged
+            current = dict(self._sessions.get(session_id, {}))
+            current.update(info)
+            current.setdefault("session_id", session_id)
+            current.setdefault("training_run_ids", list(current.get("training_run_ids") or []))
+            current.setdefault("sampler_ids", list(current.get("sampler_ids") or []))
+            self._sessions[session_id] = current
 
-        def add_training_run(self, session_id: str, training_run_id: str, user_id: str | None, created_at: str | None) -> None:
-            current = self._sessions.get(session_id, {})
-            runs = list(current.get("training_run_ids", []))
+        def add_training_run(
+            self,
+            session_id: str,
+            training_run_id: str,
+            user_id: str | None,
+            created_at: str | None,
+        ) -> None:
+            current = dict(self._sessions.get(session_id, {}))
+            runs = list(current.get("training_run_ids") or [])
             if training_run_id not in runs:
                 runs.append(training_run_id)
             current["session_id"] = session_id
@@ -63,9 +64,15 @@ def _get_or_create_actor():
                 current.setdefault("created_at", created_at)
             self._sessions[session_id] = current
 
-        def add_sampler(self, session_id: str, sampler_id: str, user_id: str | None, created_at: str | None) -> None:
-            current = self._sessions.get(session_id, {})
-            samplers = list(current.get("sampler_ids", []))
+        def add_sampler(
+            self,
+            session_id: str,
+            sampler_id: str,
+            user_id: str | None,
+            created_at: str | None,
+        ) -> None:
+            current = dict(self._sessions.get(session_id, {}))
+            samplers = list(current.get("sampler_ids") or [])
             if sampler_id not in samplers:
                 samplers.append(sampler_id)
             current["session_id"] = session_id
@@ -83,11 +90,10 @@ def _get_or_create_actor():
             return list(self._sessions.values())
 
         def upsert_sampler(self, sampler_id: str, info: dict[str, Any]) -> None:
-            current = self._samplers.get(sampler_id, {})
-            merged = dict(current)
-            merged.update(info)
-            merged.setdefault("sampler_id", sampler_id)
-            self._samplers[sampler_id] = merged
+            current = dict(self._samplers.get(sampler_id, {}))
+            current.update(info)
+            current.setdefault("sampler_id", sampler_id)
+            self._samplers[sampler_id] = current
 
         def get_sampler(self, sampler_id: str) -> dict[str, Any] | None:
             return self._samplers.get(sampler_id)
