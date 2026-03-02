@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -13,12 +14,24 @@ from pathlib import Path
 COOKBOOK_RAW_REPO_DEFAULT = "https://raw.githubusercontent.com/thinking-machines-lab/tinker-cookbook/refs/heads/main"
 
 
-def _fetch_text(url: str, timeout_s: float) -> str:
+def _fetch_text(url: str, timeout_s: float, retries: int, backoff_s: float) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "mint-tinker-official-reference-updater/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = resp.read()
-    # Keep UTF-8; upstream may include non-ASCII.
-    return data.decode("utf-8")
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                data = resp.read()
+            # Keep UTF-8; upstream may include non-ASCII.
+            return data.decode("utf-8")
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            last_err = e
+            if attempt + 1 >= retries:
+                break
+            sleep_s = backoff_s * (2**attempt)
+            print(f"warning: fetch failed for {url}; retrying in {sleep_s:.1f}s: {e}", file=sys.stderr)
+            time.sleep(sleep_s)
+    assert last_err is not None
+    raise last_err
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -40,6 +53,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Network timeout in seconds (default: 30)",
+    )
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=4,
+        help="Fetch attempts per file (default: 4)",
+    )
+    p.add_argument(
+        "--retry-backoff-s",
+        type=float,
+        default=1.0,
+        help="Base backoff in seconds between retries (default: 1.0)",
     )
     p.add_argument(
         "--out-dir",
@@ -104,7 +129,7 @@ def main(argv: list[str]) -> int:
     for rel in docs_paths:
         url = f"{cookbook_raw_repo_url}/{rel}"
         try:
-            fetched[rel] = _fetch_text(url, args.timeout_s)
+            fetched[rel] = _fetch_text(url, args.timeout_s, args.retries, args.retry_backoff_s)
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
             print(f"error: failed to fetch {rel}: {e}", file=sys.stderr)
             return 2

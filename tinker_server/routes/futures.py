@@ -247,7 +247,10 @@ async def retrieve_future(
         try:
             from ..backend.capacity_manager import capacity_manager
 
-            capacity_manager.release_all(body.request_id)
+            import ray
+
+            if ray.is_initialized():
+                capacity_manager.release_all(body.request_id)
         except Exception:
             pass
         try:
@@ -263,7 +266,10 @@ async def retrieve_future(
         try:
             from ..backend.capacity_manager import capacity_manager
 
-            capacity_manager.release_all(body.request_id)
+            import ray
+
+            if ray.is_initialized():
+                capacity_manager.release_all(body.request_id)
         except Exception:
             pass
         try:

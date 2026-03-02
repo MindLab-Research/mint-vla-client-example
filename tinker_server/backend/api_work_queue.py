@@ -138,8 +138,45 @@ def _get_or_create_ray_actor():
                     pass
                 return item
 
+        def _item_executor(self, item: dict[str, Any]) -> str:
+            executor = item.get("executor")
+            if isinstance(executor, str) and executor.strip():
+                return executor.strip()
+            op = item.get("op")
+            if isinstance(op, str) and op.strip():
+                return op.strip()
+            return "unknown"
+
+        def _queued_age_stats(self) -> dict[str, float]:
+            now = time.time()
+            ages: list[float] = []
+            for item in self._items:
+                try:
+                    ts = float(item.get("created_at", 0.0))
+                except Exception:
+                    continue
+                if ts <= 0:
+                    continue
+                ages.append(max(0.0, now - ts))
+
+            return {
+                "oldest_queued_s": max(ages) if ages else 0.0,
+                "avg_queued_s": (sum(ages) / len(ages)) if ages else 0.0,
+            }
+
         def stats(self) -> dict[str, Any]:
-            return {"depth": len(self._items), "enqueued": int(self._enqueued), "dequeued": int(self._dequeued)}
+            by_executor: dict[str, int] = {}
+            for item in self._items:
+                executor = self._item_executor(item)
+                by_executor[executor] = int(by_executor.get(executor, 0)) + 1
+
+            return {
+                "depth": len(self._items),
+                "enqueued": int(self._enqueued),
+                "dequeued": int(self._dequeued),
+                "by_executor": by_executor,
+                "age_stats": self._queued_age_stats(),
+            }
 
         def debug_state(self) -> dict[str, Any]:
             return {

@@ -9,6 +9,8 @@ Endpoints:
 - POST /optim_step: Optimizer update
 - POST /save_weights_for_sampler: Save weights for inference
 - POST /get_info: Get model info (tinker client compatible)
+- GET /training_runs: List training runs (RestClient)
+- GET /training_runs/{training_run_id}: Get training run (RestClient)
 - GET /models: List training models
 - GET /models/{model_id}: Get model info
 - GET /models/{model_id}/tokenizer: Get tokenizer config
@@ -21,9 +23,11 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
@@ -34,6 +38,7 @@ from ..models.types import (
     CreateModelFromStateResponse,
     CreateModelRequest,
     CreateModelResponse,
+    Cursor,
     Datum,
     ForwardBackwardRequest,
     ForwardRequest,
@@ -46,6 +51,8 @@ from ..models.types import (
     ResetExpertBiasResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
+    TrainingRun,
+    TrainingRunsResponse,
     TrainStepRequest,
     UntypedAPIFuture,
 )
@@ -112,10 +119,14 @@ def _restore_training_session(model_id: str):
                 base_model=str(info.get("base_model", "")),
                 lora_config=lora_cfg,
                 user_metadata=info.get("user_metadata") or {},
+                user_id=info.get("user_id"),
                 learning_rate=float(info.get("learning_rate", 1e-4)),
             )
 
         session.backend = str(info.get("backend", session.backend))
+        created_at = info.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            session.created_at = created_at
         try:
             session.current_step = int(info.get("current_step", session.current_step))
         except Exception:
@@ -153,6 +164,53 @@ def _raise_if_local_model_id_exists(model_id: str) -> None:
 def _generate_model_id(session_id: str, model_seq_id: int) -> str:
     """Generate unique model_id from session_id and model_seq_id."""
     return f"{session_id}_{model_seq_id}"
+
+
+def _session_info_from_live(session) -> dict:
+    return {
+        "model_id": session.model_id,
+        "session_id": session.session_id,
+        "model_seq_id": session.model_seq_id,
+        "base_model": session.base_model,
+        "lora_config": session.lora_config.model_dump() if session.lora_config else None,
+        "user_metadata": session.user_metadata,
+        "learning_rate": session.learning_rate,
+        "current_step": session.current_step,
+        "is_active": session.is_active,
+        "created_at": session.created_at,
+        "backend": session.backend,
+        "user_id": session.user_id,
+    }
+
+
+def _training_run_from_info(info: dict) -> TrainingRun:
+    lora_cfg = info.get("lora_config")
+    lora_rank = None
+    is_lora = False
+    if isinstance(lora_cfg, dict):
+        lora_rank = lora_cfg.get("rank")
+        is_lora = lora_rank is not None
+    elif lora_cfg is not None:
+        try:
+            lora_rank = int(getattr(lora_cfg, "rank", None))
+            is_lora = lora_rank is not None
+        except Exception:
+            pass
+
+    return TrainingRun(
+        training_run_id=str(info.get("model_id", "")),
+        base_model=str(info.get("base_model", "")),
+        model_owner=str(info.get("user_id") or "anonymous"),
+        is_lora=bool(is_lora),
+        corrupted=False,
+        lora_rank=lora_rank,
+        last_request_time=str(
+            info.get("last_request_time") or info.get("created_at") or datetime.now().isoformat()
+        ),
+        last_checkpoint=None,
+        last_sampler_checkpoint=None,
+        user_metadata=info.get("user_metadata") or {},
+    )
 
 def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
     """Compute (total_tokens, max_seq_len) without materializing token-id lists."""
@@ -214,6 +272,7 @@ async def create_model(
             detail=get_access_denied_error(request.base_model)
         )
 
+    user_id = _get_user_id(http_request)
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
     # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
@@ -361,6 +420,7 @@ async def _do_create_model(
             base_model=request.base_model,
             lora_config=request.lora_config,
             user_metadata=request.user_metadata,
+            user_id=user_id,
         )
 
         # Create Ray actor - if this fails, session will be cleaned up in except block
@@ -381,9 +441,23 @@ async def _do_create_model(
                 "backend": session.backend,
                 "actor_name": actor_name,
                 "namespace": RAY_NAMESPACE,
+                "user_id": user_id,
+                "created_at": session.created_at,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[create_model] training session store write failed: %s", e)
+
+        try:
+            from ..backend.session_index_store import add_training_run_to_session
+
+            add_training_run_to_session(
+                session_id=request.session_id,
+                training_run_id=model_id,
+                user_id=user_id,
+                created_at=session.created_at,
+            )
+        except Exception as e:
+            logger.warning("[create_model] session index write failed: %s", e)
 
         response = CreateModelResponse(
             request_id=request_id,
@@ -439,7 +513,25 @@ async def _do_create_model(
 # =============================================================================
 
 def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
-    return resolve_checkpoint_path(state_uri, user_id=user_id)
+    is_admin = user_id == "admin"
+    if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    resolved = resolve_checkpoint_path(state_uri, user_id=user_id)
+    if state_uri.startswith("ckpt_") and resolved == state_uri:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    if not is_admin:
+        resolved_real = os.path.realpath(resolved)
+        checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
+        if not resolved_real.startswith(checkpoints_real + os.sep):
+            raise HTTPException(status_code=403, detail="Access denied")
+        owner_dir = user_id or "anonymous"
+        allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, owner_dir))
+        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
+            raise HTTPException(status_code=403, detail="Access denied")
+    return resolved
+
+
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
 async def create_model_from_state(
     request: CreateModelFromStateRequest,
@@ -464,6 +556,18 @@ async def create_model_from_state(
         )
 
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    user_id = _get_user_id(http_request)
+
+    # Fail fast: sampler checkpoints are not eligible for optimizer restore.
+    if bool(request.load_optimizer):
+        try:
+            from ..checkpoints import validate_checkpoint_load_contract
+
+            local_path = _resolve_state_path(request.state_path, user_id=user_id)
+            if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
+                validate_checkpoint_load_contract(local_path, load_optimizer=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     from ..gateway import (
         encode_request_id,
@@ -478,18 +582,9 @@ async def create_model_from_state(
     upstream = upstream_for_model(request.base_model)
     if upstream is not None:
         _raise_if_local_model_id_exists(model_id)
-        user_id = _get_user_id(http_request)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.state_path, user_id=user_id)
-            if user_id and user_id != "admin":
-                load_real = os.path.realpath(local_path)
-                checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-                allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-                if load_real.startswith(checkpoints_real + os.sep) and not (
-                    load_real == allowed_real or load_real.startswith(allowed_real + os.sep)
-                ):
-                    raise HTTPException(status_code=403, detail="Access denied")
+            local_path = _resolve_state_path(request.state_path, user_id=user_id)
             if os.path.isdir(local_path):
                 import asyncio
                 import tempfile
@@ -562,7 +657,6 @@ async def create_model_from_state(
                 detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
             )
 
-    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
@@ -641,6 +735,7 @@ async def _do_create_model_from_state(
             base_model=request.base_model,
             lora_config=request.lora_config,
             user_metadata=request.user_metadata,
+            user_id=user_id,
         )
 
         # Create Ray actor
@@ -668,9 +763,23 @@ async def _do_create_model_from_state(
                 "backend": session.backend,
                 "actor_name": actor_name,
                 "namespace": RAY_NAMESPACE,
+                "user_id": user_id,
+                "created_at": session.created_at,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[create_model_from_state] training session store write failed: %s", e)
+
+        try:
+            from ..backend.session_index_store import add_training_run_to_session
+
+            add_training_run_to_session(
+                session_id=request.session_id,
+                training_run_id=model_id,
+                user_id=user_id,
+                created_at=session.created_at,
+            )
+        except Exception as e:
+            logger.warning("[create_model_from_state] session index write failed: %s", e)
 
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
@@ -781,7 +890,6 @@ async def forward_backward(
             ),
         )
 
-    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
@@ -1524,7 +1632,6 @@ async def _do_save_weights_for_sampler(
     - Named (path is not None): Save to persistent location, return path
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
-    print(f"[DEBUG _do_save_weights_for_sampler] ENTRY request_id={request_id}", flush=True)
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
@@ -1567,7 +1674,6 @@ async def _do_save_weights_for_sampler(
                     )
                 use_per_expert_lora = False
 
-        print(f"[DEBUG _do_save_weights_for_sampler] calling save_weights_for_sampler", flush=True)
         # Save weights
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
@@ -1575,15 +1681,48 @@ async def _do_save_weights_for_sampler(
             checkpoint_base_dir=checkpoint_dir,
             use_per_expert_lora=use_per_expert_lora,
         )
-        print(f"[DEBUG _do_save_weights_for_sampler] save_path={save_path}", flush=True)
 
-        tinker_uri = f"tinker://{session.model_id}/{checkpoint_name}"
-        mint_uri = f"mint://{session.model_id}/{checkpoint_name}"
+        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
+
+        if checkpoint_has_optimizer_state(save_path):
+            raise RuntimeError(
+                f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
+            )
+
+        write_checkpoint_metadata(
+            save_path,
+            {
+                "checkpoint_id": checkpoint_name,
+                "owner_id": user_id,
+                "model_id": session.model_id,
+                "model_name": session.base_model,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "step": session.current_step,
+                "checkpoint_type": "sampler",
+                "optimizer_present": False,
+                "backend": session.backend,
+                "type": "sampler",
+            },
+        )
+
+        from ..client_compat import checkpoint_uri
+
+        tinker_uri = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=True,
+            checkpoint_type="sampler",
+        )
+        mint_uri = checkpoint_uri(
+            session.model_id,
+            checkpoint_name,
+            prefer_tinker=False,
+            checkpoint_type="sampler",
+        )
         path_uri = tinker_uri if prefer_tinker else mint_uri
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately
-            print(f"[DEBUG _do_save_weights_for_sampler] Named flow", flush=True)
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
@@ -1592,7 +1731,6 @@ async def _do_save_weights_for_sampler(
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
             # Each sampling session gets unique lora_int_id with frozen weights.
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
-            print(f"[DEBUG _do_save_weights_for_sampler] Ephemeral flow", flush=True)
             if inference_manager is None:
                 raise RuntimeError("Inference manager not initialized")
 
@@ -1601,12 +1739,9 @@ async def _do_save_weights_for_sampler(
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
             base_model = session.base_model
-            print(f"[DEBUG _do_save_weights_for_sampler] base_model={base_model}", flush=True)
 
             # Get or create engine for this model (dynamically creates vLLM actor if needed)
-            print(f"[DEBUG _do_save_weights_for_sampler] getting engine for model", flush=True)
             multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-            print(f"[DEBUG _do_save_weights_for_sampler] got engine: {multi_lora_engine is not None}", flush=True)
 
             if multi_lora_engine is not None:
                 # Multi-LoRA mode: Each sampling session gets frozen weights
@@ -1616,12 +1751,10 @@ async def _do_save_weights_for_sampler(
 
                 # Add LoRA from path - vLLM worker loads directly from PFS
                 # This avoids serializing 37k+ tensors through Ray object store
-                print(f"[DEBUG _do_save_weights_for_sampler] calling add_lora_for_session_from_path with {save_path}", flush=True)
                 lora_id = await multi_lora_engine.add_lora_for_session_from_path(
                     sampling_session_id=sampling_session_id,
                     lora_path=save_path,
                 )
-                print(f"[DEBUG _do_save_weights_for_sampler] add_lora_for_session_from_path returned lora_id={lora_id}", flush=True)
 
                 # Register in session manager with base_model for multi-model routing
                 inference_manager.register_multi_lora_session(
@@ -1630,7 +1763,6 @@ async def _do_save_weights_for_sampler(
                     lora_rank=lora_rank,
                     adapter_path=save_path,
                 )
-                print(f"[DEBUG _do_save_weights_for_sampler] registered session", flush=True)
 
                 load_time = time.time() - start_time
                 logger.info(
@@ -1692,6 +1824,33 @@ async def _do_save_weights_for_sampler(
                     f"{sampling_session_id} using per-session engine for {session.model_id}"
                 )
 
+            try:
+                from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+
+                created_at = datetime.now().isoformat()
+                add_sampler_to_session(
+                    session_id=session.session_id,
+                    sampler_id=sampling_session_id,
+                    user_id=user_id,
+                    created_at=created_at,
+                )
+
+                upsert_sampler_index(
+                    {
+                        "sampler_id": sampling_session_id,
+                        "session_id": session.session_id,
+                        "base_model": base_model,
+                        "user_id": user_id,
+                        "created_at": created_at,
+                        "source_type": "checkpoint",
+                        "model_id": session.model_id,
+                        "checkpoint_name": checkpoint_name,
+                        "model_path_raw": tinker_uri,
+                    }
+                )
+            except Exception as e:
+                logger.warning("[save_weights_for_sampler] session index write failed: %s", e)
+
             response = SaveWeightsForSamplerResponse(
                 path=None,  # Ephemeral - no path returned
                 sampling_session_id=sampling_session_id,
@@ -1707,6 +1866,101 @@ async def _do_save_weights_for_sampler(
 # =============================================================================
 # Model info endpoints
 # =============================================================================
+
+
+def _owner_visible(request_user_id: str | None, owner: str | None) -> bool:
+    if request_user_id is None:
+        return True
+    if request_user_id == "admin":
+        return True
+    return bool(owner) and owner == request_user_id
+
+
+@router.get("/training_runs/{training_run_id}", response_model=TrainingRun)
+async def get_training_run(training_run_id: str, http_request: Request) -> TrainingRun:
+    request_user_id = _get_user_id(http_request)
+    info = None
+
+    if training_manager is not None:
+        session = training_manager.get_session(training_run_id)
+        if session is None:
+            session = _restore_training_session(training_run_id)
+        if session is not None:
+            info = _session_info_from_live(session)
+
+    if info is None:
+        try:
+            from ..backend.training_session_store import get_training_session_info
+            info = await run_in_threadpool(get_training_session_info, training_run_id)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+
+    if not isinstance(info, dict):
+        raise HTTPException(status_code=404, detail=f"Training run '{training_run_id}' not found")
+
+    if not _owner_visible(request_user_id, info.get("user_id")):
+        raise HTTPException(status_code=404, detail=f"Training run '{training_run_id}' not found")
+
+    if "model_id" not in info:
+        info = dict(info)
+        info["model_id"] = training_run_id
+
+    return _training_run_from_info(info)
+
+
+@router.get("/training_runs", response_model=TrainingRunsResponse)
+async def list_training_runs(limit: int = 20, offset: int = 0, http_request: Request = None) -> TrainingRunsResponse:
+    request_user_id = _get_user_id(http_request) if http_request else None
+    infos_by_id: dict[str, dict] = {}
+
+    if training_manager is not None:
+        for session in training_manager.list_sessions():
+            infos_by_id[session.model_id] = _session_info_from_live(session)
+
+    try:
+        from ..backend.training_session_store import list_training_sessions
+
+        for info in await run_in_threadpool(list_training_sessions):
+            model_id = info.get("model_id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            if model_id in infos_by_id:
+                existing = infos_by_id[model_id]
+                if not existing.get("user_id") and info.get("user_id"):
+                    existing["user_id"] = info.get("user_id")
+                if not existing.get("created_at") and info.get("created_at"):
+                    existing["created_at"] = info.get("created_at")
+                if not existing.get("user_metadata") and info.get("user_metadata"):
+                    existing["user_metadata"] = info.get("user_metadata")
+                continue
+            infos_by_id[model_id] = info
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+
+    infos = [
+        info for info in infos_by_id.values() if _owner_visible(request_user_id, info.get("user_id"))
+    ]
+
+    infos.sort(key=lambda x: str(x.get("model_id") or ""))
+    infos.sort(
+        key=lambda x: (
+            str(x.get("created_at") or ""),
+            int(x.get("model_seq_id") or 0),
+        ),
+        reverse=True,
+    )
+
+    total_count = len(infos)
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+    page = infos[offset : offset + limit]
+
+    return TrainingRunsResponse(
+        training_runs=[_training_run_from_info(info) for info in page],
+        cursor=Cursor(offset=offset, limit=limit, total_count=total_count),
+    )
 
 
 @router.get("/models/{model_id}")
@@ -1728,9 +1982,12 @@ async def get_model_info(model_id: str):
         "base_model": session.base_model,
         "lora_config": session.lora_config.model_dump() if session.lora_config else None,
         "user_metadata": session.user_metadata,
+        "learning_rate": session.learning_rate,
         "created_at": session.created_at,
         "current_step": session.current_step,
         "is_active": session.is_active,
+        "backend": session.backend,
+        "user_id": session.user_id,
     }
 
 

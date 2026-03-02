@@ -3,6 +3,7 @@
 These types match the tinker client API for compatibility.
 """
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -195,6 +196,57 @@ class CreateModelResponse(BaseModel):
     model_id: str
     type: Literal["create_model"] = "create_model"
     backend: str | None = None  # "megatron" for MoE, "peft" for dense
+
+
+class Cursor(BaseModel):
+    """Pagination cursor information."""
+
+    offset: int
+    limit: int
+    total_count: int
+
+
+class TrainingRun(BaseModel):
+    """Training run metadata."""
+
+    training_run_id: str
+    base_model: str
+    model_owner: str | None = None
+    is_lora: bool
+    corrupted: bool
+    lora_rank: int | None = None
+    last_request_time: str | None = None
+    last_checkpoint: Any | None = None
+    last_sampler_checkpoint: Any | None = None
+    user_metadata: dict[str, Any] | None = None
+
+
+class TrainingRunsResponse(BaseModel):
+    """List of training runs with pagination info."""
+
+    training_runs: list[TrainingRun]
+    cursor: Cursor | None = None
+
+
+class GetSessionResponse(BaseModel):
+    """Session metadata response."""
+
+    training_run_ids: list[str]
+    sampler_ids: list[str]
+
+
+class ListSessionsResponse(BaseModel):
+    """List of session IDs."""
+
+    sessions: list[str]
+
+
+class GetSamplerResponse(BaseModel):
+    """Sampler metadata response."""
+
+    sampler_id: str
+    base_model: str
+    model_path: str | None = None
 
 
 class Datum(BaseModel):
@@ -425,10 +477,18 @@ class LoadStateResponse(BaseModel):
 class CheckpointInfo(BaseModel):
     """Information about a checkpoint."""
 
-    checkpoint_id: str  # directory name, e.g. "checkpoint-100"
-    path: str  # tinker://{model_id}/{checkpoint_id} or mint://{model_id}/{checkpoint_id}
+    checkpoint_id: str
+    checkpoint_type: Literal["training", "sampler"]
+    time: datetime
+    tinker_path: str
+
+    # Compatibility fields (ignored by Tinker clients; used by Mint tooling).
+    path: str | None = None
     step: int | None = None  # parsed from checkpoint name if available
-    created_at: str  # ISO timestamp
+    created_at: str | None = None  # ISO timestamp
+    size_bytes: int | None = None
+    public: bool = False
+    expires_at: datetime | None = None
 
 
 class CheckpointsListResponse(BaseModel):
