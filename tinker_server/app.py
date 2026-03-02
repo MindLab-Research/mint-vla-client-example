@@ -1,5 +1,7 @@
 """FastAPI application for tinker-server."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -7,20 +9,23 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .backend.multi_lora_engine import MultiModelInferenceManager
 from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
-from .backend.training_session_manager import TrainingSessionManager
-from .backend.verl_training import VerlTrainingEngine
 from .config import config
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
+
+if TYPE_CHECKING:
+    from .backend.multi_lora_engine import MultiModelInferenceManager
+    from .backend.training_session_manager import TrainingSessionManager
+    from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -633,6 +638,8 @@ async def lifespan(app: FastAPI):
     multi_model_manager: MultiModelInferenceManager | None = None
 
     if config.enable_multi_lora:
+        from .backend.multi_lora_engine import MultiModelInferenceManager
+
         logger.info(
             f"Initializing Multi-Model Inference Manager: max_loras={config.max_loras}, "
             f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
@@ -657,6 +664,9 @@ async def lifespan(app: FastAPI):
     # Training: Initialize TrainingSessionManager and VerlTrainingEngine
     # ==========================================================================
     logger.info("Initializing training components")
+
+    from .backend.training_session_manager import TrainingSessionManager
+    from .backend.verl_training import VerlTrainingEngine
 
     train_manager = TrainingSessionManager()
     train_engine = VerlTrainingEngine()

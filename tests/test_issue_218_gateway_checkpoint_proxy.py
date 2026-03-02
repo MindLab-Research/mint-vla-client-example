@@ -90,7 +90,10 @@ def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(
     out = asyncio.run(
         tr.create_model_from_state(
             request=req,
-            http_request=_DummyRequest(url_path="/api/v1/create_model_from_state"),
+            http_request=_DummyRequest(
+                url_path="/api/v1/create_model_from_state",
+                user_data={"user_id": "admin"},
+            ),
         )
     )
 
@@ -144,7 +147,10 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
     out = asyncio.run(
         wt.load_state(
             request=req,
-            http_request=_DummyRequest(url_path="/api/v1/load_state"),
+            http_request=_DummyRequest(
+                url_path="/api/v1/load_state",
+                user_data={"user_id": "admin"},
+            ),
         )
     )
 
