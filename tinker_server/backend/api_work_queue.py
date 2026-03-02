@@ -600,15 +600,56 @@ def _get_or_create_ray_actor():
                     pass
                 return item
 
+        def _item_executor(self, item: dict[str, Any]) -> str:
+            executor = item.get("executor")
+            if isinstance(executor, str) and executor.strip():
+                return executor.strip()
+            op = item.get("op")
+            if isinstance(op, str) and op.strip():
+                return op.strip()
+            return "unknown"
+
+        def _iter_all_queued_items(self):
+            for item in self._items:
+                yield item
+            for state in self._sched_domains.values():
+                queues_by_session = state.get("queues_by_session", {})
+                for q in queues_by_session.values():
+                    for item in q:
+                        yield item
+
+        def _queued_age_stats(self) -> dict[str, float]:
+            now = time.time()
+            ages: list[float] = []
+            for item in self._iter_all_queued_items():
+                try:
+                    ts = float(item.get("created_at", 0.0))
+                except Exception:
+                    continue
+                if ts <= 0:
+                    continue
+                ages.append(max(0.0, now - ts))
+
+            return {
+                "oldest_queued_s": max(ages) if ages else 0.0,
+                "avg_queued_s": (sum(ages) / len(ages)) if ages else 0.0,
+            }
+
         def stats(self) -> dict[str, Any]:
             depth_legacy = int(len(self._items))
             depth_scheduled = int(self._scheduled_depth())
+            by_executor: dict[str, int] = {}
+            for item in self._iter_all_queued_items():
+                executor = self._item_executor(item)
+                by_executor[executor] = int(by_executor.get(executor, 0)) + 1
             return {
                 "depth": int(depth_legacy + depth_scheduled),
                 "depth_legacy": int(depth_legacy),
                 "depth_scheduled": int(depth_scheduled),
                 "enqueued": int(self._enqueued),
                 "dequeued": int(self._dequeued),
+                "by_executor": by_executor,
+                "age_stats": self._queued_age_stats(),
                 "scheduler_enabled": bool(self._scheduler_enabled),
                 "scheduler_picks_total": int(self._sched_stats.get("picks_total", 0)),
                 "scheduler_switches_total": int(self._sched_stats.get("switches_total", 0)),
