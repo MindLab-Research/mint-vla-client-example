@@ -20,6 +20,7 @@ Hard rules:
 - Never swallow an incident: always leave artifacts under `results/` and, when appropriate, file a GitHub issue.
 - No START notifications. Send exactly one final Feishu report at the end, even if all results are OK.
 - Use the official production base URL `https://mint.macaron.im` (do not use SSH tunnels / `localhost`).
+- Do not use an ad-hoc "hung after 240s" cutoff. Under load, 235B sampling can queue for many minutes. Treat only the configured per-request timeout (`--timeout-s` / `MINT_TEST_TIMEOUT_S`) or explicit server-side errors as failure signals.
 
 ## Inputs
 
@@ -84,6 +85,10 @@ Do not add `--inference-only`.
   - `ssh mint-prod-volcano "tail -400 /tmp/tinker_server_auth.log"`
 - Aliyun (235B):
   - `ssh mint-prod-aliyun "tail -400 /tmp/tinker_server_auth.log"`
+
+2) If 235B is "slow but pending" (no exception, just long `retrieve_future` / pending sampling):
+- Do not interrupt or kill vLLM solely due to elapsed time.
+- Capture request_id(s) from local debug output, and rely on the configured per-request timeout for termination.
 
 3) Determine failure class:
 - Client-side (bad base URL/auth) -> fix env and rerun; still report as incident.
@@ -155,7 +160,7 @@ Required report style (message + evidence):
 Send via:
 ```bash
 python .claude/skills/sanity-check/feishu_notify.py \
-  --title "tinker-server sanity-check: incident report" \
+  --title "MinT sanity-check report" \
   --markdown "<agent-written report markdown>"
 ```
 

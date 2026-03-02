@@ -132,7 +132,7 @@ def _parse_args() -> argparse.Namespace:
         dest="timeout_s",
         type=float,
         default=float(os.environ.get("MINT_TEST_TIMEOUT_S", str(DEFAULT_TIMEOUT_S))),
-        help="Per-request timeout seconds (default: env MINT_TEST_TIMEOUT_S or 300; use <=0 to disable).",
+        help="Per-request timeout seconds (default: env MINT_TEST_TIMEOUT_S or 10800; use <=0 to disable).",
     )
     parser.add_argument(
         "--model",
