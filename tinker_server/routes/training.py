@@ -832,6 +832,8 @@ async def forward_backward(
         upstream_for_alias,
     )
 
+    user_id = _get_user_id(http_request)
+
     session = None
     if training_manager is not None:
         session = training_manager.get_session(request.model_id)
