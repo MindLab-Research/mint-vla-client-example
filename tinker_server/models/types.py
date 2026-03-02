@@ -174,6 +174,21 @@ class LoRAConfig(BaseModel):
     train_attn: bool = True
 
 
+class RolloutCorrectionConfig(BaseModel):
+    """Session-level rollout correction policy for RL losses.
+
+    This mirrors verl's canonical `policy_loss.rollout_correction` schema.
+    """
+
+    rollout_is: Literal["token", "sequence"] | None = None
+    rollout_is_threshold: float | None = None
+    rollout_is_batch_normalize: bool | None = None
+    rollout_rs: str | None = None
+    rollout_rs_threshold: str | float | None = None
+    bypass_mode: bool | None = None
+    loss_type: Literal["ppo_clip", "reinforce"] | None = None
+
+
 class CreateModelRequest(BaseModel):
     """Request to create a new training model."""
 
@@ -184,6 +199,7 @@ class CreateModelRequest(BaseModel):
     base_model: str
     user_metadata: dict[str, Any] | None = None
     lora_config: LoRAConfig | None = None
+    rollout_correction_config: RolloutCorrectionConfig | None = None
     type: Literal["create_model"] = "create_model"
 
 
@@ -228,7 +244,7 @@ class ForwardBackwardInput(BaseModel):
 
     data: list[Datum]
     loss_fn: str
-    loss_fn_config: dict[str, float] | None = None
+    loss_fn_config: dict[str, Any] | None = None
 
 
 class ForwardBackwardOutput(BaseModel):
@@ -459,6 +475,7 @@ class CreateModelFromStateRequest(BaseModel):
     base_model: str
     state_path: str  # mint:// or file:// path to checkpoint
     lora_config: LoRAConfig | None = None
+    rollout_correction_config: RolloutCorrectionConfig | None = None
     load_optimizer: bool = True  # whether to restore optimizer state
     user_metadata: dict[str, Any] | None = None
     type: Literal["create_model_from_state"] = "create_model_from_state"

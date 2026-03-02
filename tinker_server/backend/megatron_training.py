@@ -519,16 +519,20 @@ def create_loss_fn() -> Callable:
     return create_sft_loss_fn(return_logprobs=False)
 
 
-def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
+def create_ppo_loss_fn(
+    epsilon: float = 0.2,
+    rollout_correction_config: dict[str, Any] | None = None,
+) -> Callable:
     """Create PPO loss function by reusing verl's ppo_loss/agg_loss path."""
     import math
     import torch.nn.functional as F
-    from verl.workers.config import ActorConfig
+    from verl.trainer.config import RolloutCorrectionConfig
+    from verl.workers.config import ActorConfig, PolicyLossConfig
     from verl.workers.utils.losses import ppo_loss as verl_ppo_loss, _slice_response_from_unpad_output
 
     clip_ratio = float(epsilon)
     clip_ratio_c = 1e6 if math.isinf(clip_ratio) else 3.0
-    actor_config = ActorConfig(
+    actor_config_kwargs: dict[str, Any] = dict(
         strategy="tinker",
         rollout_n=1,
         use_dynamic_bsz=True,
@@ -537,6 +541,17 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         clip_ratio_high=clip_ratio,
         clip_ratio_c=clip_ratio_c,
     )
+
+    if isinstance(rollout_correction_config, dict):
+        # Keep only explicitly configured values so verl defaults can apply.
+        rollout_corr_clean = {k: v for k, v in rollout_correction_config.items() if v is not None}
+        bypass_mode = bool(rollout_corr_clean.get("bypass_mode", False))
+        actor_config_kwargs["policy_loss"] = PolicyLossConfig(
+            loss_mode="bypass_mode" if bypass_mode else "vanilla",
+            rollout_correction=RolloutCorrectionConfig(**rollout_corr_clean),
+        )
+
+    actor_config = ActorConfig(**actor_config_kwargs)
 
     def ppo_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """PPO clipped objective loss via verl's implementation.
@@ -888,6 +903,7 @@ class MegatronTrainingWorker:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict[str, Any] | None = None,
     ) -> dict:
         """Forward + backward pass via MegatronEngine.
 
@@ -895,6 +911,7 @@ class MegatronTrainingWorker:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
             loss_fn_config: Optional config (e.g., {"epsilon": 0.2} for PPO).
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
 
         Returns:
             Dict with loss_fn_outputs and metrics.
@@ -941,10 +958,16 @@ class MegatronTrainingWorker:
             loss_function = create_sft_loss_fn()
         elif loss_fn == "ppo":
             epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(epsilon)
+            loss_function = create_ppo_loss_fn(
+                epsilon,
+                rollout_correction_config=rollout_correction_config,
+            )
         elif loss_fn == "importance_sampling":
             # Importance sampling is PPO without clipping
-            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
+            loss_function = create_ppo_loss_fn(
+                epsilon=float("inf"),
+                rollout_correction_config=rollout_correction_config,
+            )
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 

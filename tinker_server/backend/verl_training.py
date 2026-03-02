@@ -1784,7 +1784,22 @@ class VerlTrainingEngine:
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
-        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+        loss_fn_config = dict(request.forward_backward_input.loss_fn_config or {})
+        session_rollout_corr = getattr(session, "rollout_correction_config", None)
+        rollout_correction_config = None
+        if loss_fn in ("ppo", "importance_sampling") and isinstance(session_rollout_corr, dict):
+            if session.backend != "megatron":
+                raise ValueError(
+                    "session-level rollout_correction_config is only supported on Megatron backend "
+                    f"(got backend={session.backend!r})"
+                )
+            rollout_correction_config = dict(session_rollout_corr)
+            logger.info(
+                "[%s] Applied session rollout_correction_config: loss_fn=%r config=%s",
+                session.model_id,
+                loss_fn,
+                rollout_correction_config,
+            )
 
         lora_cfg = getattr(session, "lora_config", None)
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
@@ -1797,6 +1812,7 @@ class VerlTrainingEngine:
                 data_items,
                 loss_fn,
                 loss_fn_config,
+                rollout_correction_config,
                 session.model_id,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
@@ -1956,7 +1972,22 @@ class VerlTrainingEngine:
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
         loss_fn = request.forward_backward_input.loss_fn
-        loss_fn_config = request.forward_backward_input.loss_fn_config or {}
+        loss_fn_config = dict(request.forward_backward_input.loss_fn_config or {})
+        session_rollout_corr = getattr(session, "rollout_correction_config", None)
+        rollout_correction_config = None
+        if loss_fn in ("ppo", "importance_sampling") and isinstance(session_rollout_corr, dict):
+            if session.backend != "megatron":
+                raise ValueError(
+                    "session-level rollout_correction_config is only supported on Megatron backend "
+                    f"(got backend={session.backend!r})"
+                )
+            rollout_correction_config = dict(session_rollout_corr)
+            logger.info(
+                "[%s] Applied session rollout_correction_config: loss_fn=%r config=%s",
+                session.model_id,
+                loss_fn,
+                rollout_correction_config,
+            )
         lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
 
         lora_cfg = getattr(session, "lora_config", None)
@@ -1979,6 +2010,7 @@ class VerlTrainingEngine:
                 data_items,
                 loss_fn,
                 loss_fn_config,
+                rollout_correction_config,
                 lr,
                 session.model_id,
                 train_attn=train_attn,
@@ -1994,6 +2026,7 @@ class VerlTrainingEngine:
                     data_items,
                     loss_fn,
                     loss_fn_config,
+                    rollout_correction_config,
                     session.model_id,
                     train_attn=train_attn,
                     train_mlp=train_mlp,

@@ -111,6 +111,7 @@ def _restore_training_session(model_id: str):
                 model_seq_id=int(info.get("model_seq_id", 0)),
                 base_model=str(info.get("base_model", "")),
                 lora_config=lora_cfg,
+                rollout_correction_config=info.get("rollout_correction_config"),
                 user_metadata=info.get("user_metadata") or {},
                 learning_rate=float(info.get("learning_rate", 1e-4)),
             )
@@ -360,6 +361,9 @@ async def _do_create_model(
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
+            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
             user_metadata=request.user_metadata,
         )
 
@@ -376,6 +380,9 @@ async def _do_create_model(
                 "model_seq_id": request.model_seq_id,
                 "base_model": request.base_model,
                 "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
@@ -640,6 +647,9 @@ async def _do_create_model_from_state(
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
+            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
             user_metadata=request.user_metadata,
         )
 
@@ -663,6 +673,9 @@ async def _do_create_model_from_state(
                 "model_seq_id": request.model_seq_id,
                 "base_model": request.base_model,
                 "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
