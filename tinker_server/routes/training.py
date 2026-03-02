@@ -459,18 +459,6 @@ async def _do_create_model(
         except Exception as e:
             logger.warning("[create_model] session index write failed: %s", e)
 
-        try:
-            from ..backend.session_index_store import add_training_run_to_session
-
-            add_training_run_to_session(
-                session_id=request.session_id,
-                training_run_id=model_id,
-                user_id=user_id,
-                created_at=session.created_at,
-            )
-        except Exception:
-            pass
-
         response = CreateModelResponse(
             request_id=request_id,
             model_id=model_id,
@@ -792,18 +780,6 @@ async def _do_create_model_from_state(
             )
         except Exception as e:
             logger.warning("[create_model_from_state] session index write failed: %s", e)
-
-        try:
-            from ..backend.session_index_store import add_training_run_to_session
-
-            add_training_run_to_session(
-                session_id=request.session_id,
-                training_run_id=model_id,
-                user_id=user_id,
-                created_at=session.created_at,
-            )
-        except Exception:
-            pass
 
         logger.info(
             f"[{model_id}] Created model from state: {request.state_path} "
