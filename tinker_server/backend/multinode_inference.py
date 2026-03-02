@@ -916,7 +916,7 @@ def _create_multinode_vllm_actor(
                 # Use a positive value so per-token logprobs are populated.
                 logprobs=1 if logprobs else None,
                 n=n_req,
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -1119,7 +1119,7 @@ def _create_multinode_vllm_actor(
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":  # type: ignore[union-attr]
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 return {
@@ -1210,7 +1210,7 @@ def _create_multinode_vllm_actor(
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 multi_results.append(

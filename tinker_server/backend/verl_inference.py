@@ -520,7 +520,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
                 n=effective_n,
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -581,7 +581,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 return {
@@ -633,7 +633,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 outs.append(
@@ -702,7 +702,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
                 n=effective_n,
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -752,7 +752,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 return {
@@ -804,7 +804,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 outs.append(
@@ -1742,7 +1742,7 @@ class VerlInferenceEngine:
             "top_p": top_p,
             "logprobs": logprobs,
         }
-        sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]))
+        sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]))
 
         # Call the Ray actor's generate method
         result = await self.server.generate.remote(

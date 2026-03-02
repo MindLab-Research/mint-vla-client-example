@@ -4,7 +4,10 @@ from typing import Any, Literal, Sequence
 
 StopReason = Literal["length", "stop", "eos"]
 
-DEFAULT_EOS_TOKENS: frozenset[int] = frozenset({151645, 151643})
+# Default stop/EOS tokens:
+# - Qwen-style: 151645, 151643
+# - Moonlight: <|im_end|>=163586, [EOS]=163585
+DEFAULT_EOS_TOKENS: frozenset[int] = frozenset({151645, 151643, 163586, 163585})
 
 from .models.types import SampledSequence
 

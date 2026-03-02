@@ -1,31 +1,11 @@
 #!/usr/bin/env python3
 """R3 router replay validation tool (v3).
 
-Uses DAPO-Math-17k as prompt source, but trains with Tinker `loss_fn="ppo"` only.
-
 Key metrics tracked:
 - logprobs_diff_mean/max/std: Training-inference mismatch (TIM)
 - actor_rollout_pearson: Correlation between training and rollout probs
 - ppo_kl_divergence: Policy divergence
 - gradient_norm: Training stability indicator
-
-Quick Start:
------------
-# 1. Run baseline (R3 disabled)
-ssh mint-dev 'pkill -f run_server; sleep 2'
-ssh mint-dev 'cd /vePFS-Mindverse/share/code/tinker-server && \
-  MINT_ROUTER_REPLAY_MODE=disabled nohup python scripts/run_server.py &'
-sleep 10
-TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
-  python scripts/wip/r3_router_replay_smoke_v3.py --steps 100
-
-# 2. Run with R3 enabled
-ssh mint-dev 'pkill -f run_server; sleep 2'
-ssh mint-dev 'cd /vePFS-Mindverse/share/code/tinker-server && \
-  MINT_ROUTER_REPLAY_MODE=R3 nohup python scripts/run_server.py &'
-sleep 10
-TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=dummy \
-  python scripts/wip/r3_router_replay_smoke_v3.py --steps 100
 """
 
 from __future__ import annotations
@@ -53,12 +33,29 @@ except ImportError:
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_MODEL = "moonshotai/Moonlight-16B-A3B-Instruct"
-DEFAULT_MAX_REQUEST_TRAINING_LOAD = 256
-DEFAULT_PROBLEMS_PER_BATCH = 256
+DEFAULT_MAX_REQUEST_TRAINING_LOAD = 24
+DEFAULT_PROBLEMS_PER_BATCH = 24
 DEFAULT_NUM_SAMPLES = 8
 DEFAULT_MAX_PROMPT_LENGTH = 1024 * 2
-DEFAULT_MAX_RESPONSE_LENGTH = 128
+DEFAULT_MAX_RESPONSE_LENGTH = 1024 * 6
 DEFAULT_STEPS = 50
+DEFAULT_FORMAT_REWARD_COEF = 0.1
+
+
+def _default_stop_token_ids_for_model(model: str) -> list[int] | None:
+    """Return explicit stop token ids.
+
+    Always return a concrete list so sampling requests always pass `stop`
+    explicitly (instead of relying on server-side defaults).
+    """
+    ref = (model or "").lower()
+    if "moonlight-16b-a3b-instruct" in ref:
+        # Moonlight tokenizer special tokens:
+        # - <|im_end|> = 163586
+        # - [EOS]      = 163585
+        return [163586, 163585]
+    # Keep compatibility with existing server defaults for Qwen-style chat.
+    return [151645, 151643]
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -79,18 +76,6 @@ def _base_url(args: argparse.Namespace) -> str:
         DEFAULT_BASE_URL,
     ) or DEFAULT_BASE_URL
     return str(base).rstrip("/")
-
-
-def _parse_tokens(token_str: str) -> list[int]:
-    if not token_str.strip():
-        return []
-    out: list[int] = []
-    for part in token_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        out.append(int(part))
-    return out
 
 
 def _headers(args: argparse.Namespace) -> dict[str, str]:
@@ -195,39 +180,14 @@ def _parallel_map_bounded(
     return out
 
 
-def _parallel_map_bounded_return_exceptions(
-    *,
-    items: list[Any],
-    worker_fn: Any,
-    max_workers: int,
-) -> list[Any | Exception]:
-    if not items:
-        return []
-
-    workers = max(int(max_workers), 1)
-    workers = min(workers, len(items))
-    out: list[Any | Exception] = [None] * len(items)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_to_idx = {ex.submit(worker_fn, item): idx for idx, item in enumerate(items)}
-        for fut in as_completed(future_to_idx):
-            idx = future_to_idx[fut]
-            try:
-                out[idx] = fut.result()
-            except Exception as e:
-                out[idx] = e
-    return out
-
-
 def _tokenize_many_bounded(
     *,
-    base_url: str,
-    headers: dict[str, str],
     texts: list[str],
     model: str,
     max_prompt_length: int,
 ) -> list[list[int]]:
     def _one(text: str) -> list[int]:
-        tokens = _tokenize_text(base_url, headers, text, model)
+        tokens = _tokenize_text(text, model)
         return _truncate_prompt_tokens(tokens, max_prompt_length)
 
     return [_one(text) for text in texts]
@@ -284,7 +244,7 @@ def _detokenize_many_bounded(
             out.append(_one(tokens))
         except Exception as e:
             out.append(e)
-    return [str(item) if isinstance(item, str) else item for item in out]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +304,63 @@ def load_dapo_math_dataset(split: str = "train", num_samples: int | None = None)
 # Answer extraction and grading
 # ---------------------------------------------------------------------------
 
+# Adapted core normalization rules from DAPO-style verifiers
+# (e.g., verl/utils/reward_score/math_dapo.py and downstream ports).
+_DAPO_SUBSTITUTIONS: list[tuple[str, str]] = [
+    ("an ", ""),
+    ("a ", ""),
+    (".$", "$"),
+    ("\\$", ""),
+    (r"\ ", ""),
+    (" ", ""),
+    ("mbox", "text"),
+    (",\\text{and}", ","),
+    ("\\text{and}", ","),
+    ("\\text{m}", "\\text{}"),
+]
+
+_DAPO_REMOVED_EXPRESSIONS: list[str] = [
+    "square",
+    "ways",
+    "integers",
+    "dollars",
+    "mph",
+    "inches",
+    "hours",
+    "km",
+    "units",
+    "\\ldots",
+    "points",
+    "feet",
+    "minutes",
+    "digits",
+    "cents",
+    "degrees",
+    "cm",
+    "gm",
+    "pounds",
+    "meters",
+    "meals",
+    "edges",
+    "students",
+    "\\text{s}",
+    "\\text{.}",
+    "\\text{}^2",
+    "\\text{}^3",
+    "\\text{}",
+    r"\mathrm{th}",
+    r"^\circ",
+    r"^{\circ}",
+    r"\;",
+    r",\!",
+    "{,}",
+    '"',
+    "\\dots",
+]
+
+_MATH_VERIFY_AVAILABLE: bool | None = None
+
+
 def extract_answer(text: str) -> str | None:
     """Extract answer from generated text.
 
@@ -354,20 +371,54 @@ def extract_answer(text: str) -> str | None:
     """
     import re
 
-    # Try \\boxed{} format (MATH dataset)
-    boxed_match = re.search(r'\\boxed\{([^}]+)\}', text)
-    if boxed_match:
-        return boxed_match.group(1).strip()
+    text = _strip_special_tokens(text)
 
-    # Try "Answer:" format
-    answer_match = re.search(r'Answer:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if answer_match:
-        return answer_match.group(1).strip()
+    # Highest-priority explicit final-answer markers.
+    explicit_final = _extract_explicit_final_answer(text)
+    if explicit_final:
+        cleaned = _sanitize_extracted_answer(explicit_final)
+        if cleaned:
+            return cleaned
 
-    # Try "####" format (GSM8K)
-    gsm_match = re.search(r'####\s*(.+?)(?:\n|$)', text)
-    if gsm_match:
-        return gsm_match.group(1).strip()
+    # Prefer the last boxed answer (common in math outputs).
+    boxed_values = _extract_boxed_contents(text)
+    for raw in reversed(boxed_values):
+        cleaned = _sanitize_extracted_answer(raw)
+        if cleaned:
+            return cleaned
+
+    # Then try line-anchored answer formats, taking the last one.
+    patterns = [
+        r'(?im)^\s*\\text\{\s*(?:final\s+)?answer\s*:?\s*\}\s*(.+?)\s*$',
+        r'(?im)^\s*\*+\s*(?:final\s+)?answer\s*\*+\s*[:：]\s*(.+?)\s*$',
+        r'(?im)^\s*\*+\s*(?:final\s+)?answer\s*[:：]\s*(.+?)\*+\s*$',
+        r'(?im)^\s*(?:final\s+)?answer\s*[:：]\s*(.+?)\s*$',
+        r'(?im)^\s*最终答案\s*[:：]\s*(.+?)\s*$',
+        r'(?im)^\s*(?:最终\s*)?m\s*\+\s*n\s*=\s*(.+?)\s*$',
+        r'(?im)^\s*####\s*(.+?)\s*$',
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for raw in reversed(matches):
+            cleaned = _sanitize_extracted_answer(raw)
+            if cleaned:
+                return cleaned
+
+    # Fallback for prose-only styles.
+    prose_matches = re.findall(
+        r'(?im)^\s*(?:therefore[, ]*)?(?:the\s+)?(?:final\s+)?answer\s+is\s*[:：]?\s*(.+?)\s*$',
+        text,
+    )
+    for raw in reversed(prose_matches):
+        cleaned = _sanitize_extracted_answer(raw)
+        if cleaned:
+            return cleaned
+
+    inline_answer_matches = re.findall(r'(?im)\banswer\s*[:：]\s*(.+?)\s*$', text)
+    for raw in reversed(inline_answer_matches):
+        cleaned = _sanitize_extracted_answer(raw)
+        if cleaned:
+            return cleaned
 
     return None
 
@@ -375,15 +426,263 @@ def extract_answer(text: str) -> str | None:
 def normalize_answer(answer: str) -> str:
     """Normalize answer for comparison."""
     import re
-    # Remove whitespace
-    answer = answer.strip()
-    # Remove commas from numbers
-    answer = answer.replace(',', '')
-    # Remove dollar signs
-    answer = answer.replace('$', '')
-    # Remove trailing periods
-    answer = answer.rstrip('.')
-    return answer.lower()
+
+    normalized = _sanitize_extracted_answer(answer)
+    if normalized is None:
+        return ""
+
+    # DAPO/Minerva-style: keep RHS for forms like "x = 3".
+    normalized = normalized.split("=")[-1].strip()
+
+    for before, after in _DAPO_SUBSTITUTIONS:
+        normalized = normalized.replace(before, after)
+    for expr in _DAPO_REMOVED_EXPRESSIONS:
+        normalized = normalized.replace(expr, "")
+
+    normalized = normalized.lower()
+    normalized = normalized.replace("\\left", "").replace("\\right", "")
+    normalized = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", normalized)
+    normalized = re.sub(r"(\\text\{)(.*?)(\})", "\\2", normalized)
+    normalized = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", normalized)
+    normalized = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", normalized)
+    normalized = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", normalized)
+    normalized = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", normalized)
+    normalized = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", normalized)
+
+    # Normalize simple LaTeX fractions to a/b.
+    frac_match = re.fullmatch(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', normalized)
+    if frac_match:
+        normalized = f"{frac_match.group(1)}/{frac_match.group(2)}"
+
+    normalized = normalized.replace(',', '')
+    normalized = normalized.replace('$', '')
+    normalized = normalized.replace(' ', '')
+    normalized = normalized.rstrip('.')
+    return normalized
+
+
+def _strip_special_tokens(text: str) -> str:
+    import re
+
+    out = text.replace("[EOS]", "")
+    out = re.sub(r"<\|[^|>]+\|>", "", out)
+    return out
+
+
+def _extract_boxed_contents(text: str) -> list[str]:
+    """Extract all \\boxed{...} contents using brace matching."""
+    out: list[str] = []
+    needle = "\\boxed{"
+    i = 0
+    n = len(text)
+    while i < n:
+        start = text.find(needle, i)
+        if start < 0:
+            break
+        j = start + len(needle)
+        depth = 1
+        content_start = j
+        while j < n and depth > 0:
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            j += 1
+        if depth == 0:
+            out.append(text[content_start : j - 1].strip())
+            i = j
+            continue
+        break
+    return out
+
+
+def _sanitize_extracted_answer(answer: str) -> str | None:
+    import re
+
+    out = _strip_special_tokens(answer).strip()
+    if not out:
+        return None
+
+    explicit_final = _extract_explicit_final_answer(out)
+    if explicit_final:
+        out = explicit_final.strip()
+
+    # If candidate still contains boxed markup, keep its last boxed payload.
+    boxed_values = _extract_boxed_contents(out)
+    if boxed_values:
+        out = boxed_values[-1].strip()
+
+    out = out.strip("`").strip()
+    out = re.sub(r'\(?\s*without\s+quotes?[^)\n]*\)?', '', out, flags=re.IGNORECASE)
+    out = re.sub(r'^(?:final\s+)?answer\s*[:：]\s*', '', out, flags=re.IGNORECASE)
+    out = re.sub(r'^\\text\{\s*(?:final\s+)?answer\s*:?\s*\}\s*', '', out, flags=re.IGNORECASE)
+    out = re.sub(r'^\*+\s*(?:final\s+)?answer\s*\*+\s*[:：]\s*', '', out, flags=re.IGNORECASE)
+    out = re.sub(r'^最终答案\s*[:：]\s*', '', out, flags=re.IGNORECASE)
+    out = re.sub(r'^(?:最终\s*)?m\s*\+\s*n\s*=\s*', '', out, flags=re.IGNORECASE)
+    out = re.sub(r'^(?:the\s+)?(?:final\s+)?answer\s+is\s*[:：]?\s*', '', out, flags=re.IGNORECASE)
+    out = out.replace("\\left", "").replace("\\right", "")
+    out = out.strip("*").strip()
+    out = re.sub(r'\\[\)\]]\s*$', '', out)
+
+    # Strip outer wrappers.
+    changed = True
+    while changed and out:
+        changed = False
+        wrappers = [
+            ("\\(", "\\)"),
+            ("\\[", "\\]"),
+            ("$", "$"),
+            ("{", "}"),
+            ("(", ")"),
+        ]
+        for left, right in wrappers:
+            if out.startswith(left) and out.endswith(right) and len(out) > len(left) + len(right):
+                out = out[len(left) : len(out) - len(right)].strip()
+                changed = True
+
+    out = out.strip().rstrip(".,;:。；：")
+    out = " ".join(out.split())
+    if not out:
+        return None
+    if re.fullmatch(r'[\[\]\(\)\{\}\\]+', out):
+        return None
+    return out
+
+
+def _extract_explicit_final_answer(text: str) -> str | None:
+    import re
+
+    candidates: list[str] = []
+    patterns = [
+        r'(?is)(?:final\s+answer|最终答案)\s*[:：]\s*([^)\]\n\r]+)',
+        r'(?is)\*+\s*(?:final\s+)?answer\s*[:：]\s*([^*\n\r]+)\*+',
+        r'(?is)\*+\s*(?:final\s+)?answer\s*\*+\s*[:：]\s*([^\n\r]+)',
+        r'(?is)(?:最终\s*)?m\s*\+\s*n\s*=\s*([^\n\r]+)',
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, text):
+            v = m.group(1).strip()
+            if v:
+                candidates.append(v)
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
+def _to_fraction(value: str) -> Any | None:
+    import re
+    from decimal import Decimal
+    from fractions import Fraction
+
+    s = value.strip()
+    if not s:
+        return None
+    if re.fullmatch(r'[-+]?\d+', s):
+        return Fraction(int(s), 1)
+    if re.fullmatch(r'[-+]?\d+\s*/\s*[-+]?\d+', s):
+        left, right = re.split(r'\s*/\s*', s)
+        denom = int(right)
+        if denom == 0:
+            return None
+        return Fraction(int(left), denom)
+    if re.fullmatch(r'[-+]?(?:\d+\.\d*|\.\d+)', s):
+        return Fraction(Decimal(s))
+    return None
+
+
+def _remove_reasoning_blocks(text: str) -> str:
+    import re
+
+    out = text
+    # Keep removing nested/duplicated reasoning spans.
+    pattern = re.compile(r'<think>[\s\S]*?</think>', flags=re.IGNORECASE)
+    while True:
+        new_out = re.sub(pattern, "", out)
+        if new_out == out:
+            break
+        out = new_out
+    return out
+
+
+def _grade_with_math_verify(generated: str, ground_truth: str) -> bool | None:
+    """Use math-verify when available; return None if unavailable/error."""
+    global _MATH_VERIFY_AVAILABLE
+
+    try:
+        from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
+    except Exception:
+        _MATH_VERIFY_AVAILABLE = False
+        return None
+
+    _MATH_VERIFY_AVAILABLE = True
+    try:
+        gold = parse(
+            f"${ground_truth}$",
+            extraction_config=[
+                LatexExtractionConfig(
+                    boxed_match_priority=0,
+                    try_extract_without_anchor=True,
+                ),
+                ExprExtractionConfig(),
+            ],
+            extraction_mode="any_match",
+        )
+
+        candidate_preds: list[Any] = []
+        cleaned_generated = _remove_reasoning_blocks(_strip_special_tokens(generated))
+        candidate_preds.append(
+            parse(
+                cleaned_generated,
+                extraction_config=[
+                    LatexExtractionConfig(
+                        boxed_match_priority=0,
+                        try_extract_without_anchor=False,
+                    ),
+                    ExprExtractionConfig(),
+                ],
+                extraction_mode="any_match",
+            )
+        )
+
+        extracted = extract_answer(cleaned_generated)
+        if extracted:
+            candidate_preds.append(
+                parse(
+                    extracted,
+                    extraction_config=[
+                        LatexExtractionConfig(
+                            boxed_match_priority=0,
+                            try_extract_without_anchor=True,
+                        ),
+                        ExprExtractionConfig(),
+                    ],
+                    extraction_mode="any_match",
+                )
+            )
+
+        explicit_final = _extract_explicit_final_answer(cleaned_generated)
+        if explicit_final:
+            candidate_preds.append(
+                parse(
+                    explicit_final,
+                    extraction_config=[
+                        LatexExtractionConfig(
+                            boxed_match_priority=0,
+                            try_extract_without_anchor=True,
+                        ),
+                        ExprExtractionConfig(),
+                    ],
+                    extraction_mode="any_match",
+                )
+            )
+
+        for pred in candidate_preds:
+            if verify(gold, pred):
+                return True
+        return False
+    except Exception:
+        return None
 
 
 def grade_answer(generated: str, ground_truth: str) -> bool:
@@ -391,6 +690,10 @@ def grade_answer(generated: str, ground_truth: str) -> bool:
 
     Returns True if correct, False otherwise.
     """
+    mv_result = _grade_with_math_verify(generated, ground_truth)
+    if mv_result is True:
+        return mv_result
+
     extracted = extract_answer(generated)
     if extracted is None:
         return False
@@ -399,27 +702,53 @@ def grade_answer(generated: str, ground_truth: str) -> bool:
     extracted_norm = normalize_answer(extracted)
     gt_norm = normalize_answer(ground_truth)
 
-    # Simple string match
-    return extracted_norm == gt_norm
+    if extracted_norm == gt_norm:
+        return True
+
+    # Numeric equivalence fallback for simple numeric strings.
+    extracted_frac = _to_fraction(extracted_norm)
+    gt_frac = _to_fraction(gt_norm)
+    if extracted_frac is not None and gt_frac is not None:
+        return extracted_frac == gt_frac
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Tokenization helpers
 # ---------------------------------------------------------------------------
 
-def _tokenize_text(base_url: str, headers: dict[str, str], text: str, model: str) -> list[int]:
-    """Tokenize text using local tokenizer (no server route)."""
+def _tokenize_text(text: str, model: str) -> list[int]:
+    """Tokenize text using local tokenizer (no server route).
+
+    Require chat template so prompts are always in user->assistant format
+    with a generation prompt.
+    """
     tokenizer = _get_local_tokenizer(model)
-    tokens = tokenizer.encode(
-        text,
-        add_special_tokens=False,
-    )
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise RuntimeError(
+            f"Tokenizer for model {model!r} does not support apply_chat_template; "
+            "chat-style tokenization is required."
+        )
+    try:
+        tokens: Any = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"apply_chat_template failed for model {model!r}: {e}"
+        ) from e
     if not isinstance(tokens, list):
         raise RuntimeError(f"local tokenize returned invalid tokens: {type(tokens)}")
+    if model not in _TOKENIZE_MODE_PRINTED:
+        print(f"[tokenize] model={model} mode=chat_template", flush=True)
+        _TOKENIZE_MODE_PRINTED.add(model)
     return [int(t) for t in tokens]
 
 
 _LOCAL_TOKENIZER_CACHE: dict[str, Any] = {}
+_TOKENIZE_MODE_PRINTED: set[str] = set()
 
 
 def _get_local_tokenizer(model: str) -> Any:
@@ -608,6 +937,35 @@ def _write_meta(path: Path, meta: dict[str, Any]) -> None:
         json.dump(meta, f, indent=2)
 
 
+def _write_step_markdown(path: Path, step: int, rows: list[dict[str, Any]]) -> None:
+    lines: list[str] = [f"# Step {step} First Responses", ""]
+    for row in rows:
+        problem_idx = int(row.get("problem_idx", -1))
+        ts = str(row.get("ts", ""))
+        prompt = str(row.get("prompt", ""))
+        resp = str(row.get("resp", ""))
+        ground_truth = str(row.get("ground_truth", ""))
+
+        lines.append(f"## Problem {problem_idx}")
+        lines.append(f"- ts: `{ts}`")
+        if ground_truth.strip():
+            lines.append(f"- ground_truth: `{ground_truth}`")
+        lines.append("")
+        lines.append("### Prompt")
+        lines.append("```text")
+        lines.append(prompt)
+        lines.append("```")
+        lines.append("")
+        lines.append("### First Response")
+        lines.append("```text")
+        lines.append(resp)
+        lines.append("```")
+        lines.append("")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 def _utc_ts() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -734,6 +1092,8 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
         raise ValueError("--top-p must be in (0, 1]")
     if int(args.max_request_training_load) <= 0:
         raise ValueError("--max-request-training-load must be > 0")
+    if float(args.format_reward_coef) < 0.0:
+        raise ValueError("--format-reward-coef must be >= 0")
 
     # Get server info
     info = _get(f"{base_url}/api/v1/server_info", headers, timeout_s=120.0)
@@ -743,33 +1103,20 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
 
     _ = _get(f"{base_url}/api/v1/get_server_capabilities", headers, timeout_s=120.0)
     base_model = args.base_model or DEFAULT_MODEL
-    fixed_prompt_tokens = _parse_tokens(args.prompt_tokens)
-    if args.prompt_source == "fixed" and not fixed_prompt_tokens:
-        raise ValueError("--prompt-tokens is empty but --prompt-source=fixed")
-    if args.prompt_source == "dataset":
-        try:
-            _get_local_tokenizer(base_model)
-        except Exception as e:
-            raise RuntimeError(
-                f"prompt_source=dataset requires local tokenizer for {base_model!r}, but load failed: {e}"
-            ) from e
+    try:
+        _get_local_tokenizer(base_model)
+    except Exception as e:
+        raise RuntimeError(
+            f"DAPO dataset prompt source requires local tokenizer for {base_model!r}, but load failed: {e}"
+        ) from e
     grade_with_detokenize = bool(args.grade_with_detokenize)
-    if grade_with_detokenize and args.prompt_source != "dataset":
-        grade_with_detokenize = False
-        print(
-            "[Warning] prompt_source=fixed has no ground-truth answers; disable grading automatically "
-            "and use unit advantages.",
-            flush=True,
+    if not grade_with_detokenize:
+        raise ValueError(
+            "--no-grade-with-detokenize is not supported: this script now always uses grading reward "
+            "to build PPO advantages."
         )
-    if grade_with_detokenize:
-        try:
-            _get_local_tokenizer(base_model)
-        except Exception as e:
-            grade_with_detokenize = False
-            print(
-                f"[Warning] Local detokenizer unavailable, disable grading automatically: {e}",
-                flush=True,
-            )
+    format_reward_coef = float(args.format_reward_coef)
+    explicit_stop_token_ids = _default_stop_token_ids_for_model(base_model)
 
     print(f"=== R3 Router Replay Experiment (v3) ===", flush=True)
     print(f"Server: {base_url}", flush=True)
@@ -790,30 +1137,25 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
     )
     print(f"Max request training load: {args.max_request_training_load}", flush=True)
     print(f"LoRA rank: {args.lora_rank}", flush=True)
-    print(f"Prompt source: {args.prompt_source}", flush=True)
-    if args.prompt_source == "fixed":
-        print(f"Prompt tokens: {len(fixed_prompt_tokens)} tokens (v2-style fixed prompt)", flush=True)
+    print("Prompt source: dataset (DAPO-Math-17k)", flush=True)
     print(f"Grade with detokenize: {grade_with_detokenize}", flush=True)
+    print(f"Format reward coef: {format_reward_coef}", flush=True)
+    print(f"Explicit sampling stop_token_ids: {explicit_stop_token_ids}", flush=True)
     print(
         "Note: train_prompt_mini_bsz/ppo_micro_batch_size_per_gpu are server-side in tinker-server.",
         flush=True,
     )
     print(flush=True)
 
-    # Prompt source:
-    # - fixed (default): v2-style token prompts.
-    # - dataset: DAPO-Math text prompts, requires local tokenizer.
-    problems: list[dict[str, Any]] = []
-    if args.prompt_source == "dataset":
-        problems = load_dapo_math_dataset(split="train", num_samples=args.dataset_size)
-        if not problems:
-            raise ValueError(
-                "prompt_source=dataset but no valid prompts were loaded from DAPO-Math-17k "
-                f"(dataset_size={args.dataset_size})"
-            )
+    problems = load_dapo_math_dataset(split="train", num_samples=args.dataset_size)
+    if not problems:
+        raise ValueError(
+            "No valid prompts were loaded from DAPO-Math-17k "
+            f"(dataset_size={args.dataset_size})"
+        )
 
     # Create sessions
-    session_id = _create_session(base_url, headers, script_tag="scripts/wip/r3_router_replay_smoke_v3.py", timeout_s=120.0)
+    session_id = _create_session(base_url, headers, script_tag="scripts/tools/r3_router_replay_smoke_v3.py", timeout_s=120.0)
     sampling_session_id = _create_sampling_session(base_url, headers, session_id=session_id, base_model=base_model, timeout_s=120.0)
     model_id = _create_model(
         base_url, headers, session_id=session_id, base_model=base_model,
@@ -832,6 +1174,8 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
     mode_suffix = "r3" if router_replay_mode == "R3" else "no_r3"
     out_csv = Path(args.out) if args.out else run_dir / f"{mode_suffix}_ppo_curve.csv"
     meta_path = out_csv.with_suffix(".meta.json")
+    first_resp_md_dir = run_dir / f"{mode_suffix}_first_responses_md"
+    first_resp_md_dir.mkdir(parents=True, exist_ok=True)
 
     meta = {
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -856,12 +1200,15 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
         "clip_low_bound": float(1.0 - float(args.clip_ratio_low)),
         "clip_high_bound": float(1.0 + float(args.clip_ratio_high)),
         "max_request_training_load": int(args.max_request_training_load),
-        "dataset": "DAPO-Math-17k (prompt source)" if args.prompt_source == "dataset" else "fixed_prompt_tokens",
-        "prompt_source": str(args.prompt_source),
-        "prompt_tokens_len": int(len(fixed_prompt_tokens)),
+        "dataset": "DAPO-Math-17k",
+        "prompt_source": "dataset",
         "grade_with_detokenize": bool(grade_with_detokenize),
+        "format_reward_coef": float(format_reward_coef),
+        "explicit_sampling_stop_token_ids": list(explicit_stop_token_ids),
         "training_loss_fn": "ppo",
-        "dataset_size": len(problems) if args.prompt_source == "dataset" else 0,
+        "dataset_size": len(problems),
+        "first_response_markdown_dir": str(first_resp_md_dir),
+        "first_response_markdown_pattern": "step_XXXX.md",
     }
     _write_meta(meta_path, meta)
 
@@ -878,11 +1225,11 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
 
     print(f"Output CSV: {out_csv}", flush=True)
     print(f"Metadata: {meta_path}", flush=True)
+    print(f"First responses Markdown dir: {first_resp_md_dir}", flush=True)
     print(flush=True)
 
-    # Shuffle dataset prompts for variety (dataset mode only)
-    if args.prompt_source == "dataset":
-        random.shuffle(problems)
+    # Shuffle dataset prompts for variety.
+    random.shuffle(problems)
     problem_iter = 0
 
     # PPO training loop
@@ -891,16 +1238,12 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
 
         # Build one training batch with N prompts, each with M responses.
         batch_problems: list[dict[str, Any]] = []
-        if args.prompt_source == "dataset":
-            for _ in range(int(args.problems_per_batch)):
-                if problem_iter >= len(problems):
-                    random.shuffle(problems)
-                    problem_iter = 0
-                batch_problems.append(problems[problem_iter])
-                problem_iter += 1
-        else:
-            # v2-style fixed prompt tokens.
-            batch_problems = [{} for _ in range(int(args.problems_per_batch))]
+        for _ in range(int(args.problems_per_batch)):
+            if problem_iter >= len(problems):
+                random.shuffle(problems)
+                problem_iter = 0
+            batch_problems.append(problems[problem_iter])
+            problem_iter += 1
 
         print(
             f"[Step {step}] Batch config: problems={len(batch_problems)} "
@@ -909,33 +1252,30 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-        if args.prompt_source == "dataset":
-            prompt_tokens_list = _tokenize_many_bounded(
-                base_url=base_url,
-                headers=headers,
-                texts=[str(problem.get("prompt", "")) for problem in batch_problems],
-                model=base_model,
-                max_prompt_length=int(args.max_prompt_length),
-            )
-        else:
-            prompt_tokens_list = [list(fixed_prompt_tokens) for _ in range(int(args.problems_per_batch))]
+        prompt_tokens_list = _tokenize_many_bounded(
+            texts=[str(problem.get("prompt", "")) for problem in batch_problems],
+            model=base_model,
+            max_prompt_length=int(args.max_prompt_length),
+        )
 
         # Submit all sampling requests with bounded concurrency.
         sample_jobs: list[dict[str, Any]] = []
         sample_reqs: list[dict[str, Any]] = []
         for problem_idx, (problem, prompt_tokens) in enumerate(zip(batch_problems, prompt_tokens_list, strict=True)):
+            sampling_params = {
+                "max_tokens": int(args.max_response_length),
+                "temperature": float(args.temperature),
+                "top_k": int(args.top_k),
+                "top_p": float(args.top_p),
+            }
+            sampling_params["stop"] = list(explicit_stop_token_ids)
 
             sample_reqs.append({
                 "sampling_session_id": sampling_session_id,
                 "seq_id": int(step) * int(args.problems_per_batch) + int(problem_idx),
                 "num_samples": int(args.num_samples),
                 "prompt": {"chunks": [{"type": "encoded_text", "tokens": prompt_tokens}]},
-                "sampling_params": {
-                    "max_tokens": int(args.max_response_length),
-                    "temperature": float(args.temperature),
-                    "top_k": int(args.top_k),
-                    "top_p": float(args.top_p),
-                },
+                "sampling_params": sampling_params,
                 "prompt_logprobs": True,
             })
 
@@ -962,6 +1302,7 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
             future_timeout_s=float(args.timeout_s),
             concurrency=int(args.max_request_training_load),
         )
+        first_resp_rows: list[dict[str, Any]] = []
 
         for problem_idx, (sample_job, sample_out) in enumerate(zip(sample_jobs, sample_outs, strict=True)):
             problem = sample_job["problem"]
@@ -984,6 +1325,31 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
                     f"step={step} problem_idx={problem_idx} expected {args.num_samples} responses, "
                     f"got {len(sequences)}"
                 )
+
+            first_seq = sequences[0]
+            first_resp_tokens = first_seq.get("tokens")
+            if not isinstance(first_resp_tokens, list) or not first_resp_tokens:
+                raise RuntimeError(
+                    f"step={step} problem_idx={problem_idx} first response tokens invalid"
+                )
+            try:
+                prompt_text = _detokenize_tokens([int(t) for t in prompt_tokens], base_model)
+                resp_text = _detokenize_tokens([int(t) for t in first_resp_tokens], base_model)
+            except Exception as e:
+                raise RuntimeError(
+                    f"step={step} problem_idx={problem_idx} failed to decode first response: {e}"
+                ) from e
+            first_resp_rows.append(
+                {
+                    "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                    "step": int(step),
+                    "problem_idx": int(problem_idx),
+                    "seq_idx": 0,
+                    "prompt": prompt_text,
+                    "resp": resp_text,
+                    "ground_truth": str(problem.get("answer", "")),
+                }
+            )
 
             for seq_idx, seq in enumerate(sequences):
                 gen_tokens = seq.get("tokens")
@@ -1026,16 +1392,13 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
                     }
                 )
 
-        detok_results: list[str | Exception | None]
-        if grade_with_detokenize:
-            detok_results = _detokenize_many_bounded(
-                token_batches=[item["gen_tokens"] for item in pending_sequences],
-                model=base_model,
-            )
-        else:
-            # PPO-only compatibility path (matches v2 behavior): use unit advantages on response tokens.
-            detok_results = [None] * len(pending_sequences)
+        detok_results: list[str | Exception] = _detokenize_many_bounded(
+            token_batches=[item["gen_tokens"] for item in pending_sequences],
+            model=base_model,
+        )
 
+        num_formatted = 0
+        num_nonzero_reward = 0
         for item, detok_result in zip(pending_sequences, detok_results, strict=True):
             problem_idx = int(item["problem_idx"])
             seq_idx = int(item["seq_idx"])
@@ -1045,27 +1408,34 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
             weights = item["weights"]
             routed_experts = item["routed_experts"]
 
-            if detok_result is None:
-                advantages = [1.0 if w != 0.0 else 0.0 for w in weights]
-            elif isinstance(detok_result, Exception):
+            if isinstance(detok_result, Exception):
                 print(
                     f"[Step {step}] Warning: answer grading skipped/failed for problem {problem_idx} seq {seq_idx}: {detok_result}",
                     flush=True,
                 )
-                advantages = [1.0 if w != 0.0 else 0.0 for w in weights]
+                is_formatted = False
+                is_correct = False
             else:
                 generated_text = detok_result
                 ground_truth = problem.get("answer")
                 if isinstance(ground_truth, str) and ground_truth.strip():
+                    is_formatted = extract_answer(generated_text) is not None
+                    if is_formatted:
+                        num_formatted += 1
                     is_correct = grade_answer(generated_text, ground_truth)
                     if is_correct:
                         num_correct += 1
-                    reward = 1.0 if is_correct else 0.0
-                    advantages = [reward if w != 0.0 else 0.0 for w in weights]
                 else:
-                    # If a sample has no ground truth, fall back to unit advantages
-                    # to avoid zero-gradient training steps.
-                    advantages = [1.0 if w != 0.0 else 0.0 for w in weights]
+                    is_formatted = False
+                    is_correct = False
+
+            # OpenR1-style reward shaping:
+            # reward = 1[correct] + c * (1[formatted] - 1)
+            reward = (1.0 if is_correct else 0.0) + format_reward_coef * ((1.0 if is_formatted else 0.0) - 1.0)
+            if reward != 0.0:
+                num_nonzero_reward += 1
+
+            advantages = [reward if w != 0.0 else 0.0 for w in weights]
 
             loss_fn_inputs: dict[str, Any] = {
                 "weights": {"data": weights, "shape": [len(weights)], "dtype": "float32"},
@@ -1084,9 +1454,19 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
                 }
             )
 
+        step_md_path = first_resp_md_dir / f"step_{int(step):04d}.md"
+        _write_step_markdown(step_md_path, int(step), first_resp_rows)
+
         expected_step_samples = int(args.problems_per_batch) * int(args.num_samples)
         if num_sequences != expected_step_samples:
             raise RuntimeError(f"step={step} expected {expected_step_samples} samples, got {num_sequences}")
+
+        print(
+            f"[Step {step}] reward_stats: correct={num_correct}/{num_sequences} "
+            f"formatted={num_formatted}/{num_sequences} "
+            f"nonzero={num_nonzero_reward}/{num_sequences}",
+            flush=True,
+        )
 
         avg_response_len = total_response_len / max(num_sequences, 1)
         avg_prompt_len = total_prompt_len / max(num_sequences, 1)
@@ -1251,17 +1631,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--base-url", default=None, help="Server base URL")
     p.add_argument("--api-key", default=None, help="API key")
     p.add_argument("--base-model", default=None, help=f"Base model (default: {DEFAULT_MODEL})")
-    p.add_argument(
-        "--prompt-source",
-        choices=("fixed", "dataset"),
-        default="fixed",
-        help="Prompt source: fixed token ids (v2-style) or DAPO dataset text (requires local tokenizer)",
-    )
-    p.add_argument(
-        "--prompt-tokens",
-        default="1,2,3,4,5,6,7,8",
-        help="Comma-separated token ids used when --prompt-source=fixed",
-    )
     p.set_defaults(grade_with_detokenize=True)
     p.add_argument(
         "--grade-with-detokenize",
@@ -1303,6 +1672,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     p.add_argument("--learning-rate", type=float, default=1e-6, help="Learning rate")
     p.add_argument("--epsilon", type=float, default=0.2, help="PPO epsilon")
+    p.add_argument(
+        "--format-reward-coef",
+        type=float,
+        default=DEFAULT_FORMAT_REWARD_COEF,
+        help="Reward shaping coefficient c in 1[correct] + c*(1[formatted]-1)",
+    )
     p.add_argument("--clip-ratio-low", type=float, default=0.2, help="PPO low clip ratio delta (e.g. 0.2 => lower bound 0.8)")
     p.add_argument("--clip-ratio-high", type=float, default=0.28, help="PPO high clip ratio delta (e.g. 0.28 => upper bound 1.28)")
     p.add_argument(
