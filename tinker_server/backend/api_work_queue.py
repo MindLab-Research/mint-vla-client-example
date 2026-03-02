@@ -128,7 +128,9 @@ def _get_or_create_ray_actor():
             if not enabled:
                 return False, "", ""
             domain = str(extra.get("scheduler_domain") or "").strip()
-            session_id = str(extra.get("session_id") or "").strip()
+            # Preferred key is scheduler_session_key; keep legacy session_id fallback
+            # so in-flight enqueued items (or older clients) remain schedulable.
+            session_id = str(extra.get("scheduler_session_key") or extra.get("session_id") or "").strip()
             if not domain or not session_id:
                 return False, "", ""
             return True, domain, session_id
@@ -144,6 +146,7 @@ def _get_or_create_ray_actor():
                 "ready_rr": deque(),
                 "ready_set": set(),
                 "current_session": None,
+                "last_session": None,
                 "consecutive_count": 0,
                 "stats": {
                     "picks": 0,
@@ -173,8 +176,10 @@ def _get_or_create_ray_actor():
             state["ready_set"] = new_set
             current = state.get("current_session")
             if current is not None and not queues_by_session.get(current):
-                state["current_session"] = None
-                state["consecutive_count"] = 0
+                raise RuntimeError(
+                    "scheduler invariant violated: "
+                    f"current_session={current!r} has no queue during compaction"
+                )
 
         def _remove_session_from_ready(self, state: dict[str, Any], session_id: str) -> None:
             from collections import deque
@@ -339,21 +344,21 @@ def _get_or_create_ray_actor():
             if not q:
                 raise KeyError(f"scheduler session queue empty during pop: domain={domain!r} session={session_id!r}")
 
+            previous_current = state.get("current_session")
             item = q.popleft()
             if not q:
                 queues_by_session.pop(session_id, None)
                 self._remove_session_from_ready(state, session_id)
 
-            current = state.get("current_session")
-            if current == session_id:
-                state["consecutive_count"] = int(state.get("consecutive_count", 0)) + 1
+            next_consecutive = 1
+            if previous_current == session_id:
+                next_consecutive = int(state.get("consecutive_count", 0)) + 1
             else:
-                if current is not None:
+                if previous_current is not None:
                     state["stats"]["switches"] = int(state["stats"].get("switches", 0)) + 1
                     self._sched_stats["switches_total"] = int(self._sched_stats.get("switches_total", 0)) + 1
                     self._record_switch_reason(reason)
-                state["current_session"] = session_id
-                state["consecutive_count"] = 1
+                next_consecutive = 1
 
             wait_s = max(0.0, now - self._item_created_at(item, now=now))
             state["stats"]["wait_s_sum"] = float(state["stats"].get("wait_s_sum", 0.0)) + float(wait_s)
@@ -364,9 +369,14 @@ def _get_or_create_ray_actor():
                 state["stats"]["starvation_picks"] = int(state["stats"].get("starvation_picks", 0)) + 1
                 self._sched_stats["starvation_picks_total"] = int(self._sched_stats.get("starvation_picks_total", 0)) + 1
 
-            if not queues_by_session:
+            # Invariant: current_session must always reference a non-empty queue.
+            if queues_by_session.get(session_id):
+                state["current_session"] = session_id
+                state["consecutive_count"] = int(next_consecutive)
+            else:
                 state["current_session"] = None
                 state["consecutive_count"] = 0
+            state["last_session"] = session_id
             state["last_pick_ts"] = float(now)
 
             return item
@@ -442,7 +452,9 @@ def _get_or_create_ray_actor():
                     scheduler_enabled = None
                     if isinstance(extra, dict):
                         scheduler_domain = extra.get("scheduler_domain")
-                        scheduler_session_id = extra.get("session_id")
+                        scheduler_session_id = extra.get("scheduler_session_key")
+                        if scheduler_session_id is None:
+                            scheduler_session_id = extra.get("session_id")
                         scheduler_enabled = self._to_bool(extra.get("scheduler_enabled"))
                     self._recent_enqueues.append(
                         {
@@ -494,15 +506,19 @@ def _get_or_create_ray_actor():
                             if isinstance(state, dict):
                                 queues = state.get("queues_by_session", {}) or {}
                                 current = state.get("current_session")
+                                if isinstance(current, str) and current and not queues.get(current):
+                                    # current_session should always point to a non-empty queue.
+                                    raise RuntimeError(
+                                        "scheduler invariant violated: "
+                                        f"current_session={current!r} has no queue in domain={sched_domain!r}"
+                                    )
+                                last_session = state.get("last_session")
                                 if (
-                                    isinstance(current, str)
-                                    and current
-                                    and current != sched_session_id
-                                    and not queues.get(current)
+                                    isinstance(last_session, str)
+                                    and last_session
+                                    and last_session != sched_session_id
+                                    and not queues.get(last_session)
                                 ):
-                                    active_sessions = sum(1 for q in queues.values() if q)
-                                    if int(active_sessions) < 3:
-                                        continue
                                     last_pick_ts = float(state.get("last_pick_ts", 0.0) or 0.0)
                                     coalesce_window_s = float(self._scheduler_coalesce_ms) / 1000.0
                                     remaining_s = coalesce_window_s - max(0.0, now - last_pick_ts)

@@ -268,7 +268,9 @@ def _build_training_scheduler_extra(
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
         "scheduler_domain": f"{backend}:{domain_key}",
-        "session_id": str(model_id),
+        # Scheduler session key is model_id (server-side training session identity),
+        # not the user-provided create_model session_id string.
+        "scheduler_session_key": str(model_id),
         "training_op": str(training_op),
     }
     if seq_id is not None:
