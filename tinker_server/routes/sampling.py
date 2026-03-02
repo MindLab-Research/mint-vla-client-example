@@ -542,14 +542,17 @@ async def asample(
 
     if request.seq_id is not None:
         request_id = _deterministic_request_id(session_id, request.seq_id)
-        try:
-            ensure = future_store.ensure_pending(
-                request_id=request_id,
-                meta={"payload_hash": payload_hash},
-            )
-        except FutureStoreUnavailableError:
-            raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
-        if not bool(ensure.get("created")):
+        for attempt in range(2):
+            try:
+                ensure = future_store.ensure_pending(
+                    request_id=request_id,
+                    meta={"payload_hash": payload_hash},
+                )
+            except FutureStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+            if bool(ensure.get("created")):
+                created_pending = True
+                break
             meta = ensure.get("meta")
             existing_hash = meta.get("payload_hash") if isinstance(meta, dict) else None
             if not isinstance(existing_hash, str) or not existing_hash:
@@ -562,8 +565,18 @@ async def asample(
                     status_code=409,
                     detail="Duplicate seq_id with different request payload",
                 )
+            try:
+                future_store.get_status(request_id)
+            except FutureStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+            except KeyError:
+                if attempt == 0:
+                    continue
+                raise HTTPException(
+                    status_code=503,
+                    detail="Duplicate seq_id lost while confirming pending request",
+                )
             return UntypedAPIFuture(request_id=request_id)
-        created_pending = True
 
     reserve = capacity_manager.try_reserve(
         request_id,

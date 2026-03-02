@@ -76,6 +76,11 @@ class _StubFutureStore:
             cur.update(dict(meta))
         self.pending[request_id] = cur
 
+    def get_status(self, request_id: str) -> str:
+        if request_id in self.pending:
+            return "PENDING"
+        raise KeyError(f"Unknown request_id: {request_id}")
+
     def cleanup(self, _request_id: str) -> None:
         return None
 
