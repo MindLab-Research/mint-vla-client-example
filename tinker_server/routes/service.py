@@ -367,9 +367,9 @@ async def create_sampling_session(
     if session_manager is None:
         raise HTTPException(status_code=503, detail="Session manager not initialized")
 
-    sampling_session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
+    adapter_path: str | None = None
 
     # Determine base_model from request or infer from model_path
     base_model = request.base_model
@@ -432,20 +432,10 @@ async def create_sampling_session(
         )
         return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id_remote)
 
-    # Get or create engine for this model (dynamically creates vLLM actor if needed)
-    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
-    # Warm vLLM in the background; /asample work will await readiness.
-    async def _warm_engine() -> None:
-        try:
-            await session_manager.get_engine_for_model(base_model)
-        except Exception as e:
-            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
-
-    asyncio.create_task(_warm_engine())
-
     if request.model_path:
         # Resolve adapter directory (file://, mint://, absolute path).
-        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
+        if adapter_path is None:
+            adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
 
         # Fast validation: ensure weights exist; loading happens on first /asample.
         weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
@@ -474,7 +464,85 @@ async def create_sampling_session(
                 f"[create_sampling_session] failed to infer lora_rank from {config_path}: "
                 f"{type(e).__name__}: {e}"
             )
+    else:
+        lora_rank = 0
 
+    def _write_sampler_index(sampler_id: str) -> None:
+        try:
+            from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+
+            add_sampler_to_session(
+                session_id=request.session_id,
+                sampler_id=sampler_id,
+                user_id=user_id,
+                created_at=created_at,
+            )
+
+            sampler_info: dict = {
+                "sampler_id": sampler_id,
+                "session_id": request.session_id,
+                "base_model": base_model,
+                "user_id": user_id,
+                "created_at": created_at,
+            }
+
+            if request.model_path:
+                parsed = _parse_checkpoint_path(request.model_path)
+                if parsed:
+                    model_id, checkpoint_name = parsed
+                    sampler_info.update(
+                        {
+                            "source_type": "checkpoint",
+                            "model_id": model_id,
+                            "checkpoint_name": checkpoint_name,
+                            "model_path_raw": request.model_path,
+                        }
+                    )
+                else:
+                    sampler_info.update(
+                        {
+                            "source_type": "raw_model_path",
+                            "model_path_raw": request.model_path,
+                        }
+                    )
+            else:
+                sampler_info.update({"source_type": "base_model"})
+
+            upsert_sampler_index(sampler_info)
+        except Exception as e:
+            logger.warning("[create_sampling_session] sampler index write failed: %s", e)
+
+    if request.sampling_session_seq_id is not None:
+        sampling_session_id = f"{request.session_id}:sample:{request.sampling_session_seq_id}"
+        existing_base = session_manager.get_session_base_model(sampling_session_id)
+        if existing_base is not None:
+            existing_adapter = session_manager.get_session_adapter_path(sampling_session_id)
+            existing_rank = session_manager.get_session_lora_rank(sampling_session_id) or 0
+            expected_adapter = adapter_path if request.model_path else None
+            expected_rank = int(lora_rank)
+            if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank) != expected_rank:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Sampling session already exists with different configuration",
+                )
+            sampling_sessions[sampling_session_id] = base_model
+            _write_sampler_index(sampling_session_id)
+            return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+    else:
+        sampling_session_id = str(uuid.uuid4())
+
+    # Get or create engine for this model (dynamically creates vLLM actor if needed)
+    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
+    # Warm vLLM in the background; /asample work will await readiness.
+    async def _warm_engine() -> None:
+        try:
+            await session_manager.get_engine_for_model(base_model)
+        except Exception as e:
+            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
+
+    asyncio.create_task(_warm_engine())
+
+    if request.model_path:
         # Register session now; LoRA will be loaded lazily on first /asample.
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,
@@ -490,49 +558,7 @@ async def create_sampling_session(
     # Store metadata
     sampling_sessions[sampling_session_id] = base_model
 
-    try:
-        from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
-
-        add_sampler_to_session(
-            session_id=request.session_id,
-            sampler_id=sampling_session_id,
-            user_id=user_id,
-            created_at=created_at,
-        )
-
-        sampler_info: dict = {
-            "sampler_id": sampling_session_id,
-            "session_id": request.session_id,
-            "base_model": base_model,
-            "user_id": user_id,
-            "created_at": created_at,
-        }
-
-        if request.model_path:
-            parsed = _parse_checkpoint_path(request.model_path)
-            if parsed:
-                model_id, checkpoint_name = parsed
-                sampler_info.update(
-                    {
-                        "source_type": "checkpoint",
-                        "model_id": model_id,
-                        "checkpoint_name": checkpoint_name,
-                        "model_path_raw": request.model_path,
-                    }
-                )
-            else:
-                sampler_info.update(
-                    {
-                        "source_type": "raw_model_path",
-                        "model_path_raw": request.model_path,
-                    }
-                )
-        else:
-            sampler_info.update({"source_type": "base_model"})
-
-        upsert_sampler_index(sampler_info)
-    except Exception as e:
-        logger.warning("[create_sampling_session] sampler index write failed: %s", e)
+    _write_sampler_index(sampling_session_id)
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
