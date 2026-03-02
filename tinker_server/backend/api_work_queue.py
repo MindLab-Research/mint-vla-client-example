@@ -80,6 +80,10 @@ def _get_or_create_ray_actor():
                 1,
                 int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
             )
+            fairness = str(os.environ.get("MINT_SCHEDULER_FAIRNESS", "oldest")).strip().lower()
+            if fairness not in ("oldest", "rr"):
+                fairness = "oldest"
+            self._scheduler_fairness = fairness
             self._scheduler_starvation_s = max(
                 0.0,
                 float(os.environ.get("MINT_SCHEDULER_STARVATION_S", "30")),
@@ -115,12 +119,13 @@ def _get_or_create_ray_actor():
                 return fallback
 
         def _scheduler_item_info(self, item: dict[str, Any]) -> tuple[bool, str, str]:
-            if not bool(self._scheduler_enabled):
-                return False, "", ""
             extra = item.get("extra")
             if not isinstance(extra, dict):
                 return False, "", ""
-            if not self._to_bool(extra.get("scheduler_enabled")):
+            enabled = bool(self._scheduler_enabled)
+            if "scheduler_enabled" in extra:
+                enabled = self._to_bool(extra.get("scheduler_enabled"))
+            if not enabled:
                 return False, "", ""
             domain = str(extra.get("scheduler_domain") or "").strip()
             session_id = str(extra.get("session_id") or "").strip()
@@ -234,6 +239,32 @@ def _get_or_create_ray_actor():
                 return sid
             return fallback
 
+        def _pick_oldest_session(self, state: dict[str, Any], *, now: float, avoid: str | None = None) -> str | None:
+            self._compact_domain_ready(state)
+            queues_by_session = state["queues_by_session"]
+            rr = [sid for sid in state["ready_rr"] if queues_by_session.get(sid)]
+            if not rr:
+                return None
+
+            def _select(candidates: list[str]) -> str | None:
+                best_sid: str | None = None
+                best_created_at: float | None = None
+                for sid in candidates:
+                    q = queues_by_session.get(sid)
+                    if not q:
+                        continue
+                    created_at = self._item_created_at(q[0], now=now)
+                    if best_created_at is None or created_at < best_created_at:
+                        best_created_at = created_at
+                        best_sid = sid
+                return best_sid
+
+            if avoid is not None and len(rr) > 1:
+                sid = _select([sid for sid in rr if sid != avoid])
+                if sid is not None:
+                    return sid
+            return _select(rr)
+
         def _choose_session_for_domain(self, domain: str, state: dict[str, Any], *, now: float) -> tuple[str, str] | None:
             self._compact_domain_ready(state)
             queues_by_session = state["queues_by_session"]
@@ -265,10 +296,15 @@ def _get_or_create_ray_actor():
                 return current, "sticky"
 
             avoid = current if isinstance(current, str) and current and len(rr_order) > 1 else None
-            sid = self._pick_round_robin_session(state, avoid=avoid)
+            if self._scheduler_fairness == "oldest":
+                sid = self._pick_oldest_session(state, now=now, avoid=avoid)
+                reason = "fairness_oldest"
+            else:
+                sid = self._pick_round_robin_session(state, avoid=avoid)
+                reason = "fairness_rr"
             if sid is None:
                 return None
-            return sid, "fairness"
+            return sid, reason
 
         def _pick_scheduled_candidate(self, *, now: float) -> tuple[str, str, str] | None:
             best: tuple[float, str, str, str] | None = None
@@ -331,6 +367,7 @@ def _get_or_create_ray_actor():
             if not queues_by_session:
                 state["current_session"] = None
                 state["consecutive_count"] = 0
+            state["last_pick_ts"] = float(now)
 
             return item
 
@@ -361,6 +398,7 @@ def _get_or_create_ray_actor():
             return {
                 "enabled": bool(self._scheduler_enabled),
                 "max_consecutive": int(self._scheduler_max_consecutive),
+                "fairness": str(self._scheduler_fairness),
                 "starvation_s": float(self._scheduler_starvation_s),
                 "coalesce_ms": float(self._scheduler_coalesce_ms),
                 "domains": domains,
@@ -401,9 +439,11 @@ def _get_or_create_ray_actor():
                     extra = packed.get("extra")
                     scheduler_domain = None
                     scheduler_session_id = None
+                    scheduler_enabled = None
                     if isinstance(extra, dict):
                         scheduler_domain = extra.get("scheduler_domain")
                         scheduler_session_id = extra.get("session_id")
+                        scheduler_enabled = self._to_bool(extra.get("scheduler_enabled"))
                     self._recent_enqueues.append(
                         {
                             "ts": time.time(),
@@ -413,6 +453,8 @@ def _get_or_create_ray_actor():
                             "op": str(packed.get("op")),
                             "scheduler_domain": None if scheduler_domain is None else str(scheduler_domain),
                             "scheduler_session_id": None if scheduler_session_id is None else str(scheduler_session_id),
+                            "scheduler_enabled": scheduler_enabled,
+                            "scheduler_accepted": bool(is_sched),
                         }
                     )
                 except Exception:
@@ -420,11 +462,13 @@ def _get_or_create_ray_actor():
                 self._cv.notify(1)
 
         async def dequeue(self, consumer_job_id: str) -> dict[str, Any]:
+            import asyncio
+
             async with self._cv:
                 while True:
                     has_legacy = bool(self._items)
                     now = time.time()
-                    sched_choice = self._pick_scheduled_candidate(now=now) if bool(self._scheduler_enabled) else None
+                    sched_choice = self._pick_scheduled_candidate(now=now)
 
                     if not has_legacy and sched_choice is None:
                         await self._cv.wait()
@@ -435,6 +479,39 @@ def _get_or_create_ray_actor():
                         raise RuntimeError(
                             f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
                         )
+
+                    # Short coalescing wait: if we are about to switch sessions in a
+                    # scheduled domain right after the previous pick, give the current
+                    # session a tiny window to enqueue the next chunk.
+                    if (
+                        not has_legacy
+                        and sched_choice is not None
+                        and self._scheduler_coalesce_ms > 0.0
+                    ):
+                        sched_domain, sched_session_id, sched_reason = sched_choice
+                        if str(sched_reason).startswith("fairness"):
+                            state = self._sched_domains.get(sched_domain)
+                            if isinstance(state, dict):
+                                queues = state.get("queues_by_session", {}) or {}
+                                current = state.get("current_session")
+                                if (
+                                    isinstance(current, str)
+                                    and current
+                                    and current != sched_session_id
+                                    and not queues.get(current)
+                                ):
+                                    active_sessions = sum(1 for q in queues.values() if q)
+                                    if int(active_sessions) < 3:
+                                        continue
+                                    last_pick_ts = float(state.get("last_pick_ts", 0.0) or 0.0)
+                                    coalesce_window_s = float(self._scheduler_coalesce_ms) / 1000.0
+                                    remaining_s = coalesce_window_s - max(0.0, now - last_pick_ts)
+                                    if remaining_s > 0.0:
+                                        try:
+                                            await asyncio.wait_for(self._cv.wait(), timeout=remaining_s)
+                                        except asyncio.TimeoutError:
+                                            pass
+                                        continue
 
                     item: dict[str, Any]
                     dequeue_reason = "fifo"
