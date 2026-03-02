@@ -923,6 +923,7 @@ async def forward_backward(
             ),
         )
 
+    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
