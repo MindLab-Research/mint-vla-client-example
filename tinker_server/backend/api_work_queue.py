@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config
-from ..logging_context import set_request_id
+from ..logging_context import ensure_trace_id, get_trace_id, set_request_id, set_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -811,14 +811,20 @@ class ApiWorkQueueClient:
         except Exception:
             producer_job_id = None
         item = {
+            # Keep external request_id semantics intact; this is the future key/API identifier.
             "request_id": str(request_id),
             "op": str(op),
             "request_json": bytes(request_json),
             "user_id": None if user_id is None else str(user_id),
             "webhook_url": None if webhook_url is None else str(webhook_url),
-            "extra": {} if extra is None else dict(extra),
+            "extra": {},
             "created_at": time.time(),
         }
+        item_extra = {} if extra is None else dict(extra)
+        if not isinstance(item_extra.get("_trace_id"), str) or not item_extra.get("_trace_id"):
+            trace_id = get_trace_id() or ensure_trace_id()
+            item_extra["_trace_id"] = trace_id
+        item["extra"] = item_extra
         # Ensure enqueue succeeds, otherwise the request can remain pending forever
         # while capacity stays reserved.
         ref = actor.enqueue.remote(item, producer_job_id)
@@ -962,7 +968,9 @@ class ApiWorkQueueClient:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Restore request_id context for logging in worker
+            # Restore trace_id/request_id context for logging in worker.
+            item_trace_id = item.extra.get("_trace_id")
+            set_trace_id(item_trace_id if isinstance(item_trace_id, str) else None)
             set_request_id(item.request_id)
 
             if str(item.op) == "training.create_model":

@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .config import config
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .logging_context import ensure_trace_id, extract_trace_id_from_traceparent
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
@@ -900,14 +901,27 @@ async def api_key_auth_middleware(request: Request, call_next):
     If neither is configured, auth is disabled (dev mode).
     """
     path = request.url.path
+    incoming_trace_id = (
+        extract_trace_id_from_traceparent(request.headers.get("traceparent"))
+        or request.headers.get("X-Trace-Id")
+    )
+    trace_id = ensure_trace_id(incoming_trace_id)
+    request.state.trace_id = trace_id
+
+    def _with_trace(response):
+        response.headers.setdefault("X-Trace-Id", trace_id)
+        return response
+
+    async def _next_with_trace():
+        return _with_trace(await call_next(request))
 
     # Skip auth if no authentication configured (dev mode)
     if not config.auth_enabled:
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Skip auth for specific paths
     if path in UNAUTHENTICATED_PATHS:
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Special-case: allow unauthenticated checkpoint archive downloads when a valid,
     # short-lived signed token is provided in the URL (Tinker SDK expects a signed URL).
@@ -933,9 +947,9 @@ async def api_key_auth_middleware(request: Request, call_next):
                     raise ValueError("token does not match request path")
 
                 request.state.user_data = {"user_id": payload.get("user_id")}
-                return await call_next(request)
+                return await _next_with_trace()
             except Exception:
-                return JSONResponse(status_code=401, content={"error": "Invalid download token"})
+                return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid download token"}))
 
     # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")
@@ -948,16 +962,16 @@ async def api_key_auth_middleware(request: Request, call_next):
             api_key = auth_header
 
     if not api_key:
-        return JSONResponse(
+        return _with_trace(JSONResponse(
             status_code=401,
             content={"error": "Missing API key"},
-        )
+        ))
 
     # Method 1: Check hardcoded API key (admin)
     if config.validate_api_key(api_key):
         # Admin key - assign special "admin" user_id for checkpoint ownership
         request.state.user_data = {"user_id": "admin"}
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Method 2: Try sk- token decryption
     if api_key.startswith("sk-") and config.token_secret_key:
@@ -966,13 +980,13 @@ async def api_key_auth_middleware(request: Request, call_next):
             user_data = encryptor.decrypt_token(api_key)
             if user_data is not None:
                 request.state.user_data = user_data
-                return await call_next(request)
+                return await _next_with_trace()
 
     # Neither method succeeded
-    return JSONResponse(
+    return _with_trace(JSONResponse(
         status_code=401,
         content={"error": "Invalid API key or token"},
-    )
+    ))
 
 
 # Register routes with API prefix

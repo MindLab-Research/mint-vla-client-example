@@ -16,12 +16,17 @@ import logging
 import logging.handlers
 import os
 import sys
+import uuid
 from typing import Any
 
 import structlog
 
 # Context variable to store current request_id
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
+# Context variable to store current trace_id
+trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("trace_id", default=None)
+
+_HEX_CHARS = frozenset("0123456789abcdef")
 
 
 def set_request_id(request_id: str | None) -> None:
@@ -34,10 +39,88 @@ def get_request_id() -> str | None:
     return request_id_var.get()
 
 
+def _normalize_trace_id(trace_id: str | None) -> str | None:
+    if not trace_id:
+        return None
+    normalized = str(trace_id).strip().lower().replace("-", "")
+    if len(normalized) != 32:
+        return None
+    if any(ch not in _HEX_CHARS for ch in normalized):
+        return None
+    if normalized == "0" * 32:
+        return None
+    return normalized
+
+
+def set_trace_id(trace_id: str | None) -> None:
+    """Set the trace_id for the current context."""
+    trace_id_var.set(_normalize_trace_id(trace_id))
+
+
+def get_trace_id() -> str | None:
+    """Get the trace_id from the current context."""
+    return _normalize_trace_id(trace_id_var.get())
+
+
+def generate_trace_id() -> str:
+    """Generate an OpenTelemetry-compatible trace_id (32 lowercase hex chars)."""
+    return uuid.uuid4().hex
+
+
+def _get_current_otel_trace_id() -> str | None:
+    """Return current OTel trace_id if a valid span context is active."""
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        if span is None:
+            return None
+        span_context = span.get_span_context()
+        trace_id_int = getattr(span_context, "trace_id", 0)
+        if not isinstance(trace_id_int, int) or trace_id_int == 0:
+            return None
+        return _normalize_trace_id(f"{trace_id_int:032x}")
+    except Exception:
+        return None
+
+
+def extract_trace_id_from_traceparent(traceparent: str | None) -> str | None:
+    """Extract trace_id from W3C traceparent header."""
+    if not traceparent:
+        return None
+    parts = str(traceparent).strip().split("-")
+    if len(parts) != 4:
+        return None
+    return _normalize_trace_id(parts[1])
+
+
+def ensure_trace_id(preferred_trace_id: str | None = None) -> str:
+    """Ensure trace_id is available in context.
+
+    Priority: preferred -> existing context -> current OTel span -> generated.
+    """
+    trace_id = _normalize_trace_id(preferred_trace_id)
+    if trace_id is None:
+        trace_id = get_trace_id()
+    if trace_id is None:
+        trace_id = _get_current_otel_trace_id()
+    if trace_id is None:
+        trace_id = generate_trace_id()
+    set_trace_id(trace_id)
+    return trace_id
+
+
 def add_request_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Structlog processor to add request_id to all log events."""
     request_id = get_request_id()
     event_dict["request_id"] = request_id if request_id else "-"
+    return event_dict
+
+
+def add_trace_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Structlog processor to add trace_id to all log events."""
+    trace_id = get_trace_id() or _get_current_otel_trace_id()
+    event_dict["trace_id"] = trace_id if trace_id else "-"
     return event_dict
 
 
@@ -61,6 +144,7 @@ def configure_logging() -> None:
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         add_request_id,
+        add_trace_id,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),
@@ -172,6 +256,12 @@ def configure_logging() -> None:
                             }
                             if hasattr(record, "request_id"):
                                 attributes["request_id"] = record.request_id
+                            if hasattr(record, "trace_id"):
+                                attributes["trace_id"] = record.trace_id
+                            else:
+                                trace_id = get_trace_id() or _get_current_otel_trace_id()
+                                if trace_id:
+                                    attributes["trace_id"] = trace_id
                             current_span.add_event(record.getMessage(), attributes=attributes)
                     except Exception:
                         self.handleError(record)
