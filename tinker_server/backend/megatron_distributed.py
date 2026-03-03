@@ -1589,6 +1589,8 @@ class MegatronRankWorker:
             logger.debug(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}")
 
             # Return CPU-safe scalars and loss_fn_outputs
+            routing_replay_enabled = int("routed_experts" in data.keys())
+            routing_replay_items = int(valid_count) if routing_replay_enabled else 0
             result_dict = {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
@@ -1597,6 +1599,8 @@ class MegatronRankWorker:
                 "n_ppo_results": int(n_ppo_results),
                 "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
+                "routing_replay_enabled": routing_replay_enabled,
+                "routing_replay_items": routing_replay_items,
             }
             # Add debug metrics if present
             if debug_metrics:
@@ -4462,6 +4466,12 @@ class MegatronWorkerGroup:
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
+        metrics["routing_replay_enabled:mean"] = float(
+            rank0_result.get("routing_replay_enabled", 0.0)
+        )
+        metrics["routing_replay_items:sum"] = float(
+            rank0_result.get("routing_replay_items", 0.0)
+        )
 
         # Add PPO metrics if present (now pre-extracted as scalars)
         # importance_sampling uses PPO loss with epsilon=inf, so include it here

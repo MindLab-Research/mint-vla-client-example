@@ -574,6 +574,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(final_res.outputs[0], "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
                     if raw is not None:
                         routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
@@ -627,6 +631,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 out_routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(out, "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
                     if raw is not None:
                         out_routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
@@ -745,6 +753,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(final_res.outputs[0], "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
                     if raw is not None:
                         routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
@@ -798,6 +810,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 out_routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(out, "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
                     if raw is not None:
                         out_routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
@@ -904,6 +920,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             routed_experts = None
             if self._enable_rollout_routing_replay:
                 raw = getattr(final_res.outputs[0], "routed_experts", None)
+                if raw is None:
+                    raise RuntimeError(
+                        "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                    )
                 if raw is not None:
                     routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
             return TokenOutput(

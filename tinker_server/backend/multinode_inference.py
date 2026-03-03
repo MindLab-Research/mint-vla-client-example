@@ -601,6 +601,21 @@ def _create_multinode_vllm_actor(
                 "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
             )
             enable_return_routed_experts = (server_config.router_replay_mode == "R3")
+            if enable_return_routed_experts:
+                import inspect
+
+                sig = inspect.signature(AsyncEngineArgs.__init__)
+                has_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if "enable_return_routed_experts" not in sig.parameters and not has_kwargs:
+                    import vllm  # type: ignore
+
+                    raise RuntimeError(
+                        "router_replay_mode=R3 requires vLLM AsyncEngineArgs(enable_return_routed_experts=...). "
+                        f"Installed vllm={getattr(vllm, '__version__', 'unknown')!r} does not support it "
+                        f"(AsyncEngineArgs.__init__ signature={sig})."
+                    )
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -1112,6 +1127,10 @@ def _create_multinode_vllm_actor(
                         )
                 routed_experts = None
                 raw_re = getattr(final_res.outputs[0], "routed_experts", None)  # type: ignore[union-attr]
+                if server_config.router_replay_mode == "R3" and raw_re is None:
+                    raise RuntimeError(
+                        "router_replay_mode=R3 but vLLM returned no routed_experts for single-output generate"
+                    )
                 if raw_re is not None:
                     routed_experts = raw_re.tolist() if hasattr(raw_re, "tolist") else raw_re
 
@@ -1204,6 +1223,10 @@ def _create_multinode_vllm_actor(
                         out_log_probs.append(lp_f)
                 out_routed_experts = None
                 raw_re = getattr(out, "routed_experts", None)
+                if server_config.router_replay_mode == "R3" and raw_re is None:
+                    raise RuntimeError(
+                        "router_replay_mode=R3 but vLLM returned no routed_experts for multi-output generate"
+                    )
                 if raw_re is not None:
                     out_routed_experts = raw_re.tolist() if hasattr(raw_re, "tolist") else raw_re
 

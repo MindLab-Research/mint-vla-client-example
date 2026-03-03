@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     pass
 
 from tinker_server.backend.model_registry import get_model_config
+from tinker_server.config import server_config
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
 logger = logging.getLogger(__name__)
@@ -354,12 +355,21 @@ def tinker_to_tensordict(
                 "skipping external labels to avoid TensorDict shape mismatch."
             )
 
-    if has_routed_experts:
+    require_r3 = (server_config.router_replay_mode == "R3")
+    if require_r3:
+        missing = [i for i, re in enumerate(routed_experts_list) if re is None]
+        if missing:
+            raise ValueError(
+                "router_replay_mode=R3 requires routed_experts for every datum "
+                f"(missing item indexes: {missing})"
+            )
+
+    if has_routed_experts or require_r3:
         if all(re is not None for re in routed_experts_list):
             re_nested = torch.nested.as_nested_tensor(routed_experts_list, layout=torch.jagged)
             td["routed_experts"] = re_nested
             td.set_non_tensor("enable_routing_replay", True)
-        else:
+        elif has_routed_experts:
             logger.warning(
                 "[tinker_to_tensordict] Mixed routed_experts presence in batch; skipping R3"
             )

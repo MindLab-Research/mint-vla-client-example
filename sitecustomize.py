@@ -232,11 +232,29 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
     if getattr(orig_fn, "__mint_sparse_ok__", False):
         return
 
+    import inspect
+
+    try:
+        sig = inspect.signature(orig_fn)
+    except Exception as e:
+        raise RuntimeError(
+            f"Unable to inspect vLLM PackedLoRALayerWeights.pack_moe signature: {type(e).__name__}: {e}"
+        ) from e
+
+    has_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if "is_non_gated_moe" not in sig.parameters and not has_kwargs:
+        import vllm  # type: ignore
+
+        raise RuntimeError(
+            "vLLM PackedLoRALayerWeights.pack_moe signature mismatch for sparse-ok patch: "
+            f"expected 'is_non_gated_moe' kwarg (or **kwargs), got signature={sig}. "
+            f"installed_vllm_version={getattr(vllm, '__version__', 'unknown')!r}"
+        )
+
     def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
-        try:
-            if loras and all(l is not None for l in loras):
-                return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
-        except Exception:
+        if loras and all(l is not None for l in loras):
             return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
         if not loras or (len(loras) % 3) != 0:
