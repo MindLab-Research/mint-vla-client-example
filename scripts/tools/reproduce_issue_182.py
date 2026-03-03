@@ -115,6 +115,22 @@ def _check_pending_payload(body: dict, headers: dict[str, str]) -> None:
         if not isinstance(tg, int) or not isinstance(mx, int) or tg < 0 or mx < 1 or tg > mx:
             raise RuntimeError(f"progress={prog!r} invalid")
 
+def _format_pending_line(body: dict, headers: dict[str, str]) -> str:
+    return (
+        "pending_fields "
+        f"status={body.get('status')!r} "
+        f"queue_state={body.get('queue_state')!r} "
+        f"queue_state_reason={body.get('queue_state_reason')!r} "
+        f"queue_depth={body.get('queue_depth')!r} "
+        f"queue_position={body.get('queue_position')!r} "
+        f"queue_eta_s={body.get('queue_eta_s')!r} "
+        f"queue_progress={body.get('queue_progress')!r} "
+        f"retry_after_s={body.get('retry_after_s')!r} "
+        f"x_queue_depth={headers.get('X-Queue-Depth')!r} "
+        f"x_queue_status={headers.get('X-Queue-Status')!r} "
+        f"retry_after={headers.get('Retry-After')!r}"
+    )
+
 
 def main() -> int:
     session_id = f"issue182_{int(time.time())}"
@@ -147,6 +163,7 @@ def main() -> int:
                 if rid not in pending_checked:
                     body = r.json()
                     _check_pending_payload(body, r.headers)
+                    _ok(_format_pending_line(body, r.headers))
                     pending_checked.add(rid)
                 continue
             if r.status_code != 200:
