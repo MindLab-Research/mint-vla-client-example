@@ -60,6 +60,16 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
+    except Exception:
+        return default
+
+
 def _model_key_from_base_model(base_model: str) -> str:
     import re
 
@@ -259,8 +269,128 @@ class MegatronRankWorker:
         self._current_session_id = None
         self._session_gradients: dict[str, list[torch.Tensor]] = {}  # Per-session gradient storage (CPU)
         self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
+        self._sticky_train_mode_enabled = _env_flag("MINT_MEGATRON_STICKY_TRAIN_MODE", default=False)
+        self._sticky_train_mode_idle_timeout_s = _env_float("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S", default=15.0)
+        self._sticky_train_mode_close_on_optim = _env_flag("MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM", default=True)
+        self._sticky_train_mode_diag = _env_flag("MINT_MEGATRON_STICKY_TIMING_DIAG", default=False)
+        self._sticky_train_mode_ctx = None
+        self._sticky_train_mode_session_id: str | None = None
+        self._sticky_train_mode_last_used_s: float = 0.0
+        self._sticky_train_mode_enter_total: int = 0
+        self._sticky_train_mode_reuse_total: int = 0
+        self._sticky_train_mode_exit_total: int = 0
 
         logger.info(f"[MegatronRankWorker] Worker {rank}/{world_size} created (not yet initialized)")
+
+    def _sticky_enabled_for(self, session_id: str | None) -> bool:
+        return bool(self._sticky_train_mode_enabled and session_id)
+
+    def _release_sticky_train_mode(self, *, reason: str, snapshot_gradients: bool) -> dict:
+        released = False
+        exit_s = 0.0
+        snap_count = 0
+        active_session = self._sticky_train_mode_session_id
+        if self._sticky_train_mode_ctx is not None:
+            if snapshot_gradients and active_session is not None:
+                try:
+                    captured = self._capture_gradients()
+                    self._session_gradients[active_session] = captured
+                    snap_count = len(captured)
+                except Exception as e:
+                    logger.warning(
+                        f"[Rank {self.rank}] sticky_train_mode snapshot failed "
+                        f"(session={active_session}, reason={reason}): {e}"
+                    )
+
+            t0 = time.perf_counter()
+            self._sticky_train_mode_ctx.__exit__(None, None, None)
+            exit_s = time.perf_counter() - t0
+            self._sticky_train_mode_ctx = None
+            self._sticky_train_mode_session_id = None
+            self._sticky_train_mode_last_used_s = 0.0
+            self._sticky_train_mode_exit_total += 1
+            released = True
+
+            if self._sticky_train_mode_diag:
+                logger.info(
+                    f"[Rank {self.rank}] sticky_train_mode release: reason={reason} "
+                    f"exit_ms={exit_s * 1000.0:.2f} snapshot_count={snap_count}"
+                )
+
+        return {
+            "released": released,
+            "exit_s": exit_s,
+            "snapshot_count": snap_count,
+            "exit_total": self._sticky_train_mode_exit_total,
+            "session_id": active_session,
+        }
+
+    def _ensure_sticky_train_mode(self, *, session_id: str, reason: str) -> dict:
+        if not self._sticky_enabled_for(session_id):
+            return {
+                "reused": False,
+                "enter_s": 0.0,
+                "released_before_enter": False,
+                "enter_total": self._sticky_train_mode_enter_total,
+                "reuse_total": self._sticky_train_mode_reuse_total,
+            }
+
+        released_before_enter = False
+        now = time.perf_counter()
+        if self._sticky_train_mode_ctx is not None:
+            idle_s = (
+                now - self._sticky_train_mode_last_used_s
+                if self._sticky_train_mode_last_used_s > 0
+                else 0.0
+            )
+            session_changed = self._sticky_train_mode_session_id != session_id
+            idle_expired = (
+                self._sticky_train_mode_idle_timeout_s > 0
+                and idle_s > self._sticky_train_mode_idle_timeout_s
+            )
+            if session_changed or idle_expired:
+                self._release_sticky_train_mode(
+                    reason="session_change" if session_changed else "idle_timeout",
+                    snapshot_gradients=True,
+                )
+                released_before_enter = True
+
+        if self._sticky_train_mode_ctx is not None:
+            self._sticky_train_mode_reuse_total += 1
+            self._sticky_train_mode_last_used_s = time.perf_counter()
+            if self._sticky_train_mode_diag:
+                logger.info(
+                    f"[Rank {self.rank}] sticky_train_mode reuse: "
+                    f"session={session_id} reason={reason} reuse_total={self._sticky_train_mode_reuse_total}"
+                )
+            return {
+                "reused": True,
+                "enter_s": 0.0,
+                "released_before_enter": released_before_enter,
+                "enter_total": self._sticky_train_mode_enter_total,
+                "reuse_total": self._sticky_train_mode_reuse_total,
+            }
+
+        t0 = time.perf_counter()
+        ctx = self.engine.train_mode()
+        ctx.__enter__()
+        enter_s = time.perf_counter() - t0
+        self._sticky_train_mode_ctx = ctx
+        self._sticky_train_mode_session_id = session_id
+        self._sticky_train_mode_last_used_s = time.perf_counter()
+        self._sticky_train_mode_enter_total += 1
+        if self._sticky_train_mode_diag:
+            logger.info(
+                f"[Rank {self.rank}] sticky_train_mode enter: "
+                f"session={session_id} reason={reason} enter_ms={enter_s * 1000.0:.2f}"
+            )
+        return {
+            "reused": False,
+            "enter_s": enter_s,
+            "released_before_enter": released_before_enter,
+            "enter_total": self._sticky_train_mode_enter_total,
+            "reuse_total": self._sticky_train_mode_reuse_total,
+        }
 
     def get_rss_bytes(self) -> int:
         with open("/proc/self/statm", encoding="utf-8") as f:
@@ -628,6 +758,10 @@ class MegatronRankWorker:
         """
         if self._current_session_id == new_session_id:
             return
+
+        if self._sticky_train_mode_ctx is not None:
+            # Avoid nested train_mode contexts during session switch routines.
+            self._release_sticky_train_mode(reason="swap_session_state", snapshot_gradients=True)
 
         # Must use train_mode to access GPU gradient buffers (required for param_offload)
         with self.engine.train_mode():
@@ -1382,31 +1516,23 @@ class MegatronRankWorker:
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-        # Use train_mode context to load model from CPU to GPU (required for param_offload)
-        # The context manager handles: load to GPU on __enter__, offload to CPU on __exit__
-        # IMPORTANT: train_mode() entry zeros gradients via load_megatron_model_to_gpu().
-        # For gradient isolation: restore cached grads after entry, capture before exit.
-        with self.engine.train_mode():
-            # 1. Restore this session's cached gradients (if any and not consumed)
-            # None means gradients were consumed by optim_step - start fresh with zeros
-            # NOTE: train_mode() entry already zeros gradients, so no explicit zeroing needed.
-            # DO NOT call optimizer_zero_grad() here - it corrupts internal state needed
-            # for forward pass (zero_grad_buffer() breaks something in Megatron DDP).
-            cached_grads = self._session_gradients.get(session_id) if session_id else None
-            if cached_grads is not None:
-                self._restore_gradients(cached_grads)
-                logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
-            else:
-                logger.debug(f"[Rank {self.rank}] No cached gradients for session {session_id}, using zeroed grads from train_mode entry")
+        result = None
+        train_mode_enter_ms = 0.0
+        train_mode_exit_ms = 0.0
+        train_mode_reused = False
+        grad_restore_skipped = False
+        forward_backward_batch_ms = 0.0
 
-            # 2. Run forward-backward (accumulates gradients on top of restored/zero grads)
+        def _run_forward_backward_compute():
+            nonlocal result, forward_backward_batch_ms
+            t_fb0 = time.perf_counter()
             result = self.engine.forward_backward_batch(
                 data=data,
                 loss_function=loss_function,
                 forward_only=False,
             )
+            forward_backward_batch_ms = (time.perf_counter() - t_fb0) * 1000.0
 
-            # DEBUG: Log result structure
             if result:
                 logger.debug(
                     f"[Rank {self.rank} DEBUG] forward_backward_batch result keys: "
@@ -1425,13 +1551,53 @@ class MegatronRankWorker:
             else:
                 logger.debug(f"[Rank {self.rank} DEBUG] forward_backward_batch returned empty/None result")
 
-            # Log memory after forward-backward (peak usage during training)
             self.log_memory_breakdown("after_forward_backward")
 
-            # 3. Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
-            if session_id is not None:
-                self._session_gradients[session_id] = self._capture_gradients()
-                logger.debug(f"[Rank {self.rank}] Captured gradients for session {session_id}")
+        # Use train_mode context to load model from CPU to GPU (required for param_offload)
+        # The context manager handles: load to GPU on __enter__, offload to CPU on __exit__
+        # IMPORTANT: train_mode() entry zeros gradients via load_megatron_model_to_gpu().
+        # For gradient isolation: restore cached grads after entry, capture before exit.
+        if self._sticky_enabled_for(session_id):
+            sticky = self._ensure_sticky_train_mode(session_id=session_id, reason="forward_backward")
+            train_mode_reused = bool(sticky.get("reused", False))
+            train_mode_enter_ms = float(sticky.get("enter_s", 0.0)) * 1000.0
+
+            cached_grads = self._session_gradients.get(session_id)
+            if cached_grads is not None and not train_mode_reused:
+                self._restore_gradients(cached_grads)
+                logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
+            elif train_mode_reused:
+                grad_restore_skipped = True
+                logger.debug(f"[Rank {self.rank}] Reused sticky train_mode for session {session_id}, skip gradient restore")
+            else:
+                logger.debug(
+                    f"[Rank {self.rank}] No cached gradients for session {session_id}, "
+                    "using zeroed grads from train_mode entry"
+                )
+
+            _run_forward_backward_compute()
+        else:
+            tm_enter_t0 = time.perf_counter()
+            with self.engine.train_mode():
+                train_mode_enter_ms = (time.perf_counter() - tm_enter_t0) * 1000.0
+                cached_grads = self._session_gradients.get(session_id) if session_id else None
+                if cached_grads is not None:
+                    self._restore_gradients(cached_grads)
+                    logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
+                else:
+                    logger.debug(
+                        f"[Rank {self.rank}] No cached gradients for session {session_id}, "
+                        "using zeroed grads from train_mode entry"
+                    )
+
+                _run_forward_backward_compute()
+
+                # Capture gradients BEFORE exiting train_mode (exit destroys GPU grads)
+                if session_id is not None:
+                    self._session_gradients[session_id] = self._capture_gradients()
+                    logger.debug(f"[Rank {self.rank}] Captured gradients for session {session_id}")
+                tm_exit_t0 = time.perf_counter()
+            train_mode_exit_ms = (time.perf_counter() - tm_exit_t0) * 1000.0
 
         # Only one output rank returns metrics
         if output_rank:
@@ -1630,6 +1796,14 @@ class MegatronRankWorker:
                 "loss_fn_outputs": loss_fn_outputs,
                 "routing_replay_enabled": routing_replay_enabled,
                 "routing_replay_items": routing_replay_items,
+                "train_mode_enter_ms": float(train_mode_enter_ms),
+                "train_mode_exit_ms": float(train_mode_exit_ms),
+                "train_mode_reused": float(1.0 if train_mode_reused else 0.0),
+                "grad_restore_skipped": float(1.0 if grad_restore_skipped else 0.0),
+                "forward_backward_batch_ms": float(forward_backward_batch_ms),
+                "train_mode_enter_total": float(self._sticky_train_mode_enter_total),
+                "train_mode_reuse_total": float(self._sticky_train_mode_reuse_total),
+                "train_mode_exit_total": float(self._sticky_train_mode_exit_total),
             }
             # Add debug metrics if present
             if debug_metrics:
@@ -1828,45 +2002,49 @@ class MegatronRankWorker:
         train_attn = True if train_attn is None else bool(train_attn)
         train_mlp = True if train_mlp is None else bool(train_mlp)
         train_unembed = True if train_unembed is None else bool(train_unembed)
+        train_mode_enter_ms = 0.0
+        train_mode_exit_ms = 0.0
+        train_mode_reused = False
+        grad_restore_skipped = False
+        optim_step_batch_ms = 0.0
 
-        # Use train_mode context to ensure model/gradients are on GPU (required for param_offload)
-        # IMPORTANT: verl zeros gradients on train_mode entry.
-        # We must restore cached gradients before optimizer_step.
-        with self.engine.train_mode():
+        def _run_optim_core():
+            nonlocal grad_norm, current_lr, optim_step_batch_ms
+            t_opt0 = time.perf_counter()
+
             # DEBUG: Check optimizer state size BEFORE step
             if self.rank == 0:
                 from megatron.core.optimizer import ChainedOptimizer
+
                 optimizer = self.engine.optimizer
                 if optimizer is not None:
                     def iter_optimizers(opt):
                         if isinstance(opt, ChainedOptimizer):
                             return opt.chained_optimizers
                         return [opt]
+
                     for i, _opt in enumerate(iter_optimizers(optimizer)):
-                        if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
+                        if hasattr(_opt, "optimizer") and _opt.optimizer is not None:
                             inner_opt = _opt.optimizer
                             state = inner_opt.state
-                            state_size = len(state) if hasattr(state, '__len__') else 'unknown'
-                            # Check first param's state if any
+                            state_size = len(state) if hasattr(state, "__len__") else "unknown"
                             first_state = None
                             if state:
                                 first_param = next(iter(state), None)
                                 if first_param is not None:
-                                    first_state = {k: v.shape if hasattr(v, 'shape') else v for k, v in state[first_param].items()}
-                            print(f"[Rank {self.rank}] optim_step BEFORE: opt[{i}] state size = {state_size}, first_state_keys = {first_state}", flush=True)
+                                    first_state = {
+                                        k: v.shape if hasattr(v, "shape") else v
+                                        for k, v in state[first_param].items()
+                                    }
+                            print(
+                                f"[Rank {self.rank}] optim_step BEFORE: opt[{i}] state size = {state_size}, "
+                                f"first_state_keys = {first_state}",
+                                flush=True,
+                            )
 
-            # 1. Restore this session's cached gradients (if not None/consumed)
-            cached_grads = self._session_gradients.get(session_id) if session_id else None
-            if cached_grads is not None:
-                self._restore_gradients(cached_grads)
-                logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
-
-            # 2. Apply gradients
             grad_norm = self.engine.optimizer_step()
             current_lr = self.engine.lr_scheduler_step()
 
-            # Enforce disabled LoRA targets as exact zero. This keeps train/inference behavior
-            # consistent even though the optimizer state includes all LoRA params.
             try:
                 from verl.utils.megatron_utils import unwrap_model
 
@@ -1879,16 +2057,50 @@ class MegatronRankWorker:
             except Exception:
                 pass
 
-            # Log memory after optimizer step
             self.log_memory_breakdown("after_optim_step")
+            optim_step_batch_ms = (time.perf_counter() - t_opt0) * 1000.0
 
-            # 3. Mark gradients as consumed (don't delete!)
-            # CRITICAL FIX: Setting to None instead of deleting prevents swap_session_state
-            # from capturing stale GPU gradients when switching away from this session.
-            # None acts as a sentinel meaning "gradients were consumed by optim_step".
             if session_id is not None:
                 self._session_gradients[session_id] = None
                 logger.debug(f"[Rank {self.rank}] Marked gradients as consumed for session {session_id}")
+
+        grad_norm = None
+        current_lr = None
+        if self._sticky_enabled_for(session_id):
+            sticky = self._ensure_sticky_train_mode(session_id=session_id, reason="optim_step")
+            train_mode_reused = bool(sticky.get("reused", False))
+            train_mode_enter_ms = float(sticky.get("enter_s", 0.0)) * 1000.0
+
+            cached_grads = self._session_gradients.get(session_id)
+            if cached_grads is not None and not train_mode_reused:
+                self._restore_gradients(cached_grads)
+                logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
+            elif train_mode_reused:
+                grad_restore_skipped = True
+                logger.debug(
+                    f"[Rank {self.rank}] Reused sticky train_mode for optim_step, "
+                    f"session {session_id}, skip gradient restore"
+                )
+
+            _run_optim_core()
+
+            if self._sticky_train_mode_close_on_optim:
+                released = self._release_sticky_train_mode(
+                    reason="optim_step_complete",
+                    snapshot_gradients=False,
+                )
+                train_mode_exit_ms = float(released.get("exit_s", 0.0)) * 1000.0
+        else:
+            tm_enter_t0 = time.perf_counter()
+            with self.engine.train_mode():
+                train_mode_enter_ms = (time.perf_counter() - tm_enter_t0) * 1000.0
+                cached_grads = self._session_gradients.get(session_id) if session_id else None
+                if cached_grads is not None:
+                    self._restore_gradients(cached_grads)
+                    logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
+                _run_optim_core()
+                tm_exit_t0 = time.perf_counter()
+            train_mode_exit_ms = (time.perf_counter() - tm_exit_t0) * 1000.0
 
         if self.rank == 0:
             # Handle current_lr being either a float or a list
@@ -1902,6 +2114,14 @@ class MegatronRankWorker:
                 "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
                 "lr": float(lr_value),
                 "step": "completed",
+                "train_mode_enter_ms": float(train_mode_enter_ms),
+                "train_mode_exit_ms": float(train_mode_exit_ms),
+                "train_mode_reused": float(1.0 if train_mode_reused else 0.0),
+                "grad_restore_skipped": float(1.0 if grad_restore_skipped else 0.0),
+                "optim_step_batch_ms": float(optim_step_batch_ms),
+                "train_mode_enter_total": float(self._sticky_train_mode_enter_total),
+                "train_mode_reuse_total": float(self._sticky_train_mode_reuse_total),
+                "train_mode_exit_total": float(self._sticky_train_mode_exit_total),
             }
         return {}
 
@@ -4017,6 +4237,8 @@ class MegatronRankWorker:
     def shutdown(self):
         """Clean shutdown of distributed process."""
         import torch
+        if self._sticky_train_mode_ctx is not None:
+            self._release_sticky_train_mode(reason="shutdown", snapshot_gradients=False)
         # Clear session state
         self._session_gradients.clear()
         self._session_optimizer_states.clear()
@@ -4615,6 +4837,14 @@ class MegatronWorkerGroup:
         metrics["routing_replay_items:sum"] = float(
             rank0_result.get("routing_replay_items", 0.0)
         )
+        metrics["train_mode_enter_ms:mean"] = float(rank0_result.get("train_mode_enter_ms", 0.0))
+        metrics["train_mode_exit_ms:mean"] = float(rank0_result.get("train_mode_exit_ms", 0.0))
+        metrics["train_mode_reused:mean"] = float(rank0_result.get("train_mode_reused", 0.0))
+        metrics["grad_restore_skipped:mean"] = float(rank0_result.get("grad_restore_skipped", 0.0))
+        metrics["forward_backward_batch_ms:mean"] = float(rank0_result.get("forward_backward_batch_ms", 0.0))
+        metrics["train_mode_enter_total:sum"] = float(rank0_result.get("train_mode_enter_total", 0.0))
+        metrics["train_mode_reuse_total:sum"] = float(rank0_result.get("train_mode_reuse_total", 0.0))
+        metrics["train_mode_exit_total:sum"] = float(rank0_result.get("train_mode_exit_total", 0.0))
 
         # Add PPO metrics if present (now pre-extracted as scalars)
         # importance_sampling uses PPO loss with epsilon=inf, so include it here
@@ -4889,6 +5119,14 @@ class MegatronWorkerGroup:
                 "step": self._step_count,
                 "grad_norm": grad_norm,
                 "lr": lr,
+                "train_mode_enter_ms:mean": float(rank0_result.get("train_mode_enter_ms", 0.0)),
+                "train_mode_exit_ms:mean": float(rank0_result.get("train_mode_exit_ms", 0.0)),
+                "train_mode_reused:mean": float(rank0_result.get("train_mode_reused", 0.0)),
+                "grad_restore_skipped:mean": float(rank0_result.get("grad_restore_skipped", 0.0)),
+                "optim_step_batch_ms:mean": float(rank0_result.get("optim_step_batch_ms", 0.0)),
+                "train_mode_enter_total:sum": float(rank0_result.get("train_mode_enter_total", 0.0)),
+                "train_mode_reuse_total:sum": float(rank0_result.get("train_mode_reuse_total", 0.0)),
+                "train_mode_exit_total:sum": float(rank0_result.get("train_mode_exit_total", 0.0)),
             }
         }
 
