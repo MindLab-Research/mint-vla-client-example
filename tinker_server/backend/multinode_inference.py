@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
@@ -599,6 +600,22 @@ def _create_multinode_vllm_actor(
             logger.info(
                 "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
             )
+            enable_return_routed_experts = (server_config.router_replay_mode == "R3")
+            if enable_return_routed_experts:
+                import inspect
+
+                sig = inspect.signature(AsyncEngineArgs.__init__)
+                has_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if "enable_return_routed_experts" not in sig.parameters and not has_kwargs:
+                    import vllm  # type: ignore
+
+                    raise RuntimeError(
+                        "router_replay_mode=R3 requires vLLM AsyncEngineArgs(enable_return_routed_experts=...). "
+                        f"Installed vllm={getattr(vllm, '__version__', 'unknown')!r} does not support it "
+                        f"(AsyncEngineArgs.__init__ signature={sig})."
+                    )
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -627,6 +644,7 @@ def _create_multinode_vllm_actor(
                 max_cpu_loras=self.max_cpu_loras if self.enable_lora else None,
                 fully_sharded_loras=fully_sharded_loras if self.enable_lora else False,
                 lora_dtype=lora_dtype_resolved,
+                enable_return_routed_experts=enable_return_routed_experts,
             )
 
             logger.info(
@@ -943,7 +961,7 @@ def _create_multinode_vllm_actor(
                 # Use a positive value so per-token logprobs are populated.
                 logprobs=1 if logprobs else None,
                 n=n_req,
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -1137,18 +1155,27 @@ def _create_multinode_vllm_actor(
                             f"count={non_finite_count} samples(idx,token,lp)={non_finite_samples} "
                             f"token_preview={token_preview}"
                         )
+                routed_experts = None
+                raw_re = getattr(final_res.outputs[0], "routed_experts", None)  # type: ignore[union-attr]
+                if server_config.router_replay_mode == "R3" and raw_re is None:
+                    raise RuntimeError(
+                        "router_replay_mode=R3 but vLLM returned no routed_experts for single-output generate"
+                    )
+                if raw_re is not None:
+                    routed_experts = raw_re.tolist() if hasattr(raw_re, "tolist") else raw_re
 
                 # Determine stop reason
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":  # type: ignore[union-attr]
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
+                    "routed_experts": routed_experts,
                 }
 
             outs = list(final_res.outputs)  # type: ignore[union-attr]
@@ -1224,11 +1251,19 @@ def _create_multinode_vllm_actor(
                                     "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
                                 }
                         out_log_probs.append(lp_f)
+                out_routed_experts = None
+                raw_re = getattr(out, "routed_experts", None)
+                if server_config.router_replay_mode == "R3" and raw_re is None:
+                    raise RuntimeError(
+                        "router_replay_mode=R3 but vLLM returned no routed_experts for multi-output generate"
+                    )
+                if raw_re is not None:
+                    out_routed_experts = raw_re.tolist() if hasattr(raw_re, "tolist") else raw_re
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 multi_results.append(
@@ -1236,6 +1271,7 @@ def _create_multinode_vllm_actor(
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
+                        "routed_experts": out_routed_experts,
                     }
                 )
 
@@ -1490,6 +1526,7 @@ class GenerateResult:
     token_ids: list[int]
     logprobs: list[float] | None = None
     stop_reason: str | None = None
+    routed_experts: list | None = None
 
 
 class MultiNodeInferenceEngine:
@@ -2257,6 +2294,7 @@ class MultiNodeInferenceEngine:
             token_ids=result["token_ids"],
             logprobs=result.get("logprobs"),
             stop_reason=result.get("stop_reason"),
+            routed_experts=result.get("routed_experts"),
         )
 
     async def generate_many(
@@ -2347,6 +2385,7 @@ class MultiNodeInferenceEngine:
                 token_ids=r["token_ids"],
                 logprobs=r.get("logprobs"),
                 stop_reason=r.get("stop_reason"),
+                routed_experts=r.get("routed_experts"),
             )
             for r in raw_list
         ]

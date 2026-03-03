@@ -118,6 +118,7 @@ def _restore_training_session(model_id: str):
                 model_seq_id=int(info.get("model_seq_id", 0)),
                 base_model=str(info.get("base_model", "")),
                 lora_config=lora_cfg,
+                rollout_correction_config=info.get("rollout_correction_config"),
                 user_metadata=info.get("user_metadata") or {},
                 user_id=info.get("user_id"),
                 learning_rate=float(info.get("learning_rate", 1e-4)),
@@ -247,6 +248,52 @@ def _get_max_model_len(base_model: str | None) -> int:
             ),
         )
 
+def _validate_rollout_correction_config_or_400(
+    *,
+    base_model: str,
+    rollout_correction_config: Any,
+) -> None:
+    if rollout_correction_config is None:
+        return
+
+    from ..backend.model_registry import get_model_config
+
+    if not bool(get_model_config(base_model).is_moe):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "rollout_correction_config is only supported on Megatron backend (MoE models); "
+                f"base_model={base_model!r} is not configured as MoE"
+            ),
+        )
+
+    try:
+        cfg = rollout_correction_config.model_dump(exclude_none=True)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="rollout_correction_config must be a pydantic model compatible with .model_dump()",
+        )
+
+    try:
+        from verl.trainer.config import RolloutCorrectionConfig as VerlRolloutCorrectionConfig
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "rollout_correction_config requires verl to be installed on the API server "
+                f"(import failed: {type(e).__name__}: {e})"
+            ),
+        )
+
+    try:
+        VerlRolloutCorrectionConfig(**cfg)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid rollout_correction_config for verl: {type(e).__name__}: {e}",
+        )
+
 
 def _build_training_scheduler_extra(
     *,
@@ -296,6 +343,11 @@ async def create_model(
 
     base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
     request = request.model_copy(update={"base_model": base_model})
+
+    _validate_rollout_correction_config_or_400(
+        base_model=request.base_model,
+        rollout_correction_config=request.rollout_correction_config,
+    )
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -452,6 +504,9 @@ async def _do_create_model(
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
+            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
@@ -469,6 +524,9 @@ async def _do_create_model(
                 "model_seq_id": request.model_seq_id,
                 "base_model": request.base_model,
                 "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
@@ -579,6 +637,11 @@ async def create_model_from_state(
 
     base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
     request = request.model_copy(update={"base_model": base_model})
+
+    _validate_rollout_correction_config_or_400(
+        base_model=request.base_model,
+        rollout_correction_config=request.rollout_correction_config,
+    )
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -767,6 +830,9 @@ async def _do_create_model_from_state(
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
+            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
@@ -791,6 +857,9 @@ async def _do_create_model_from_state(
                 "model_seq_id": request.model_seq_id,
                 "base_model": request.base_model,
                 "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,

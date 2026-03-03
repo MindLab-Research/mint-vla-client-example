@@ -11,7 +11,11 @@ propagated into vLLM worker processes.
 
 from __future__ import annotations
 
+import importlib.util
+import multiprocessing.spawn as _mp_spawn
 import os
+import sys
+import sysconfig
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -19,6 +23,79 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _is_cv2_package_dir(path: object) -> bool:
+    if not isinstance(path, str) or not path:
+        return False
+    norm = os.path.normpath(path)
+    return norm.endswith("/site-packages/cv2")
+
+
+def _is_cv2_typing_file(path: object) -> bool:
+    if not isinstance(path, str) or not path:
+        return False
+    norm = os.path.normpath(path)
+    return norm.endswith("/site-packages/cv2/typing/__init__.py")
+
+
+def _sanitize_paths(paths: list[str]) -> list[str]:
+    out: list[str] = []
+    for p in paths:
+        if not p:
+            continue
+        if _is_cv2_package_dir(p):
+            continue
+        if p in out:
+            continue
+        out.append(p)
+    return out
+
+
+def _patch_cv2_typing_shadow() -> None:
+    """Prevent accidental import of `cv2/typing` as top-level `typing`.
+
+    Some worker subprocesses inherit polluted sys.path containing
+    `.../site-packages/cv2`, which can shadow stdlib `typing.py` and crash with
+    `ImportError: libxcb.so.1`.
+    """
+    if _env_flag("MINT_DISABLE_CV2_TYPING_PATCH", default=False):
+        return
+
+    # 1) Clean current process paths.
+    sys.path[:] = _sanitize_paths(list(sys.path))
+
+    raw_py = os.environ.get("PYTHONPATH", "")
+    if raw_py:
+        parts = [p.strip() for p in raw_py.split(":")]
+        os.environ["PYTHONPATH"] = ":".join(_sanitize_paths(parts))
+
+    # 2) Ensure multiprocessing spawn does not reintroduce bad paths.
+    orig = _mp_spawn.get_preparation_data
+    if not getattr(orig, "__mint_cv2_typing_patched__", False):
+        def _mint_get_preparation_data(*args, **kwargs):
+            data = orig(*args, **kwargs)
+            raw = data.get("sys_path")
+            if isinstance(raw, list):
+                data["sys_path"] = _sanitize_paths(raw)
+            return data
+
+        _mint_get_preparation_data.__mint_cv2_typing_patched__ = True  # type: ignore[attr-defined]
+        _mp_spawn.get_preparation_data = _mint_get_preparation_data  # type: ignore[assignment]
+
+    # 3) Pin top-level typing module to stdlib implementation.
+    try:
+        import typing as _typing  # noqa: F401
+    except Exception:
+        _typing = None  # type: ignore[assignment]
+
+    if _typing is None or _is_cv2_typing_file(getattr(_typing, "__file__", None)):
+        stdlib_typing = os.path.join(sysconfig.get_path("stdlib"), "typing.py")
+        spec = importlib.util.spec_from_file_location("typing", stdlib_typing)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules["typing"] = mod
 
 
 def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
@@ -155,12 +232,30 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
     if getattr(orig_fn, "__mint_sparse_ok__", False):
         return
 
-    def pack_moe_sparse_ok(cls, loras, module_name: str):  # type: ignore[no-untyped-def]
-        try:
-            if loras and all(l is not None for l in loras):
-                return orig_fn(cls, loras, module_name)
-        except Exception:
-            return orig_fn(cls, loras, module_name)
+    import inspect
+
+    try:
+        sig = inspect.signature(orig_fn)
+    except Exception as e:
+        raise RuntimeError(
+            f"Unable to inspect vLLM PackedLoRALayerWeights.pack_moe signature: {type(e).__name__}: {e}"
+        ) from e
+
+    has_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if "is_non_gated_moe" not in sig.parameters and not has_kwargs:
+        import vllm  # type: ignore
+
+        raise RuntimeError(
+            "vLLM PackedLoRALayerWeights.pack_moe signature mismatch for sparse-ok patch: "
+            f"expected 'is_non_gated_moe' kwarg (or **kwargs), got signature={sig}. "
+            f"installed_vllm_version={getattr(vllm, '__version__', 'unknown')!r}"
+        )
+
+    def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
+        if loras and all(l is not None for l in loras):
+            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
         if not loras or (len(loras) % 3) != 0:
             raise RuntimeError(
@@ -460,4 +555,5 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
 
 
+_patch_cv2_typing_shadow()
 _apply_vllm_worker_patches()

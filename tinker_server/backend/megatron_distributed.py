@@ -160,6 +160,7 @@ class DistributedConfig:
     expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
+    router_replay_mode: str = "disabled"
 
     @property
     def world_size(self) -> int:
@@ -817,7 +818,12 @@ class MegatronRankWorker:
             logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
-        from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+        from verl.workers.config import (
+            HFModelConfig,
+            McoreEngineConfig,
+            McoreOptimizerConfig,
+        )
+        from verl.workers.config.engine import EngineRouterReplayConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
@@ -1027,6 +1033,7 @@ class MegatronRankWorker:
             expert_model_parallel_size=self.config.expert_parallel_size,
             expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
             context_parallel_size=self.config.context_parallel_size,
+            router_replay=EngineRouterReplayConfig(mode=self.config.router_replay_mode),
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
@@ -1264,6 +1271,7 @@ class MegatronRankWorker:
         data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
+        rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
     ) -> dict:
@@ -1276,6 +1284,7 @@ class MegatronRankWorker:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
             loss_fn_config: Config for loss function (e.g., {"epsilon": 0.2} for PPO).
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             session_id: Optional session ID for gradient isolation.
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
@@ -1332,9 +1341,15 @@ class MegatronRankWorker:
             loss_function = create_sft_loss_fn(return_logprobs=True)
         elif loss_fn == "ppo":
             epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(epsilon)
+            loss_function = create_ppo_loss_fn(
+                epsilon,
+                rollout_correction_config=rollout_correction_config,
+            )
         elif loss_fn == "importance_sampling":
-            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
+            loss_function = create_ppo_loss_fn(
+                epsilon=float("inf"),
+                rollout_correction_config=rollout_correction_config,
+            )
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
@@ -1574,6 +1589,8 @@ class MegatronRankWorker:
             logger.debug(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}")
 
             # Return CPU-safe scalars and loss_fn_outputs
+            routing_replay_enabled = int("routed_experts" in data.keys())
+            routing_replay_items = int(valid_count) if routing_replay_enabled else 0
             result_dict = {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
@@ -1582,6 +1599,8 @@ class MegatronRankWorker:
                 "n_ppo_results": int(n_ppo_results),
                 "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
+                "routing_replay_enabled": routing_replay_enabled,
+                "routing_replay_items": routing_replay_items,
             }
             # Add debug metrics if present
             if debug_metrics:
@@ -4384,6 +4403,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
         *,
@@ -4397,6 +4417,7 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             session_id: Session ID for multi-tenant gradient isolation.
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
@@ -4425,7 +4446,9 @@ class MegatronWorkerGroup:
         # to avoid Ray serialization issues with nested tensors)
         t2 = time.perf_counter() if timing else 0.0
         futures = [
-            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id, reset_bias)
+            w.forward_backward.remote(
+                data_items, loss_fn, loss_fn_config, rollout_correction_config, effective_session_id, reset_bias
+            )
             for w in self.workers
         ]
         results = ray.get(futures)
@@ -4454,6 +4477,12 @@ class MegatronWorkerGroup:
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
+        metrics["routing_replay_enabled:mean"] = float(
+            rank0_result.get("routing_replay_enabled", 0.0)
+        )
+        metrics["routing_replay_items:sum"] = float(
+            rank0_result.get("routing_replay_items", 0.0)
+        )
 
         # Add PPO metrics if present (now pre-extracted as scalars)
         # importance_sampling uses PPO loss with epsilon=inf, so include it here
@@ -4508,6 +4537,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict | None = None,
         learning_rate: float | None = None,
         session_id: str | None = None,
         *,
@@ -4524,6 +4554,7 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             learning_rate: Optional LR override (defaults to current group's LR).
             session_id: Session ID for multi-tenant gradient isolation.
 
@@ -4538,6 +4569,7 @@ class MegatronWorkerGroup:
             data_items=data_items,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
+            rollout_correction_config=rollout_correction_config,
             session_id=effective_session_id,
             train_attn=train_attn,
             train_mlp=train_mlp,
