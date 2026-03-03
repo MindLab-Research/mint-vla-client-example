@@ -25,7 +25,6 @@ from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
-    SampledSequence,
     SampleRequest,
     SampleResponse,
     UntypedAPIFuture,
@@ -718,7 +717,7 @@ async def _do_sample(
                     f"has_generate_many={gen_many is not None} num_samples={request.num_samples}"
                 )
                 if can_coalesce:
-                    logger.info(f"[sample path] branch=coalesced_generate")
+                    logger.info("[sample path] branch=coalesced_generate")
                     results = await _await_with_external_fail_abort(
                         engine=engine,
                         request_id=request_id,
@@ -736,7 +735,7 @@ async def _do_sample(
                         ),
                     )
                 elif request.num_samples == 1:
-                    logger.info(f"[sample path] branch=generate_single")
+                    logger.info("[sample path] branch=generate_single")
                     one_result = await _await_with_external_fail_abort(
                         engine=engine,
                         request_id=request_id,
@@ -756,7 +755,7 @@ async def _do_sample(
                 else:
                     if gen_many is None:
                         raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
-                    logger.info(f"[sample path] branch=generate_many")
+                    logger.info("[sample path] branch=generate_many")
                     results = await _await_with_external_fail_abort(
                         engine=engine,
                         request_id=request_id,
@@ -885,7 +884,7 @@ async def _do_sample(
         except asyncio.CancelledError:
             await _abort_engine_request(engine, request_id)
             future_store.fail(request_id, "sampling task cancelled")
-            logger.warning(f"Sampling task cancelled")
+            logger.warning("Sampling task cancelled")
             raise
         except Exception as e:
             await _abort_engine_request(engine, request_id)

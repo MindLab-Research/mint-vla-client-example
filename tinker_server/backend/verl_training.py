@@ -6,12 +6,10 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -30,7 +28,7 @@ from ..logging_context import get_request_id
 DEFAULT_IDLE_TIMEOUT = 0  # Disabled - LRU eviction manages actor lifecycle
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import RAY_NAMESPACE
 from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 

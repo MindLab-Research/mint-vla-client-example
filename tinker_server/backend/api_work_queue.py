@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config
-from ..logging_context import set_request_id, get_request_id
+from ..logging_context import set_request_id
 
 logger = logging.getLogger(__name__)
 
