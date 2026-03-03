@@ -173,6 +173,47 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "on",
             )
             self._mint_pack_moe_patched = False
+            self._progress_last: dict[str, float] = {}
+
+        def _progress_meta(self, tokens_generated: int, max_tokens: int) -> dict[str, Any]:
+            return {
+                "tokens_generated": int(tokens_generated),
+                "max_tokens": int(max_tokens),
+                "last_progress_at": time.time(),
+            }
+
+        async def _update_progress(
+            self,
+            *,
+            request_id: str,
+            tokens_generated: int,
+            max_tokens: int,
+            stage: str = "decode",
+            min_interval_s: float = 5.0,
+        ) -> None:
+            now = time.time()
+            last = self._progress_last.get(request_id)
+            if last is not None and (now - last) < min_interval_s:
+                return
+            self._progress_last[request_id] = now
+            try:
+                from tinker_server.backend.future_store import future_store
+
+                future_store.update_meta(
+                    request_id,
+                    meta={
+                        "stage": stage,
+                        "progress": self._progress_meta(tokens_generated, max_tokens),
+                        "last_progress_at": time.time(),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "verl_vllm_progress_update_failed request_id=%s err=%s: %s",
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
 
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
@@ -500,6 +541,24 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 request_id=request_id,
                 lora_request=lora_request,
             )
+            try:
+                from tinker_server.backend.future_store import future_store
+
+                future_store.update_meta(
+                    request_id,
+                    meta={
+                        "stage": "prefill",
+                        "progress": None,
+                        "max_tokens": int(effective_max_tokens),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "verl_vllm_prefill_meta_update_failed request_id=%s err=%s: %s",
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
 
             # Get final response
             if sampling_params.n == 1:
@@ -509,6 +568,21 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 async for output in generator:
                     if first_tok_s is None:
                         first_tok_s = time.perf_counter() - t0
+                    try:
+                        tokens_generated = len(output.outputs[0].token_ids)
+                        await self._update_progress(
+                            request_id=request_id,
+                            tokens_generated=tokens_generated,
+                            max_tokens=effective_max_tokens,
+                            stage="decode",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                            request_id,
+                            type(e).__name__,
+                            e,
+                        )
                     final_res = output
                 assert final_res is not None
                 total_s = time.perf_counter() - t0
@@ -528,6 +602,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         logprobs[token_ids[i]].logprob
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
+                self._progress_last.pop(request_id, None)
 
                 # Determine stop reason
                 stop_reason = "length"
@@ -550,6 +625,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             async for output in generator:
                 if first_tok_s is None:
                     first_tok_s = time.perf_counter() - t0
+                try:
+                    lengths = [len(oo.token_ids) for oo in output.outputs]
+                    tokens_generated = min(lengths) if lengths else 0
+                    await self._update_progress(
+                        request_id=request_id,
+                        tokens_generated=tokens_generated,
+                        max_tokens=effective_max_tokens,
+                        stage="decode",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                        request_id,
+                        type(e).__name__,
+                        e,
+                    )
                 for out in output.outputs:
                     by_index[int(out.index)] = out
             total_s = time.perf_counter() - t0
@@ -591,6 +682,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                     }
                 )
+            self._progress_last.pop(request_id, None)
             return outs
 
         async def generate_base(
@@ -657,6 +749,24 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 request_id=request_id,
                 lora_request=None,  # No LoRA = base model
             )
+            try:
+                from tinker_server.backend.future_store import future_store
+
+                future_store.update_meta(
+                    request_id,
+                    meta={
+                        "stage": "prefill",
+                        "progress": None,
+                        "max_tokens": int(effective_max_tokens),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "verl_vllm_prefill_meta_update_failed request_id=%s err=%s: %s",
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
 
             # Get final response
             if sampling_params.n == 1:
@@ -666,6 +776,21 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 async for output in generator:
                     if first_tok_s is None:
                         first_tok_s = time.perf_counter() - t0
+                    try:
+                        tokens_generated = len(output.outputs[0].token_ids)
+                        await self._update_progress(
+                            request_id=request_id,
+                            tokens_generated=tokens_generated,
+                            max_tokens=effective_max_tokens,
+                            stage="decode",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                            request_id,
+                            type(e).__name__,
+                            e,
+                        )
                     final_res = output
                 assert final_res is not None
                 total_s = time.perf_counter() - t0
@@ -685,6 +810,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         logprobs[token_ids[i]].logprob
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
+                self._progress_last.pop(request_id, None)
 
                 # Determine stop reason
                 stop_reason = "length"
@@ -707,6 +833,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             async for output in generator:
                 if first_tok_s is None:
                     first_tok_s = time.perf_counter() - t0
+                try:
+                    lengths = [len(oo.token_ids) for oo in output.outputs]
+                    tokens_generated = min(lengths) if lengths else 0
+                    await self._update_progress(
+                        request_id=request_id,
+                        tokens_generated=tokens_generated,
+                        max_tokens=effective_max_tokens,
+                        stage="decode",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                        request_id,
+                        type(e).__name__,
+                        e,
+                    )
                 for out in output.outputs:
                     by_index[int(out.index)] = out
             total_s = time.perf_counter() - t0
@@ -748,6 +890,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                     }
                 )
+            self._progress_last.pop(request_id, None)
             return outs
 
         async def generate(

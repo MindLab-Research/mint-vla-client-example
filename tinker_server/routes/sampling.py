@@ -599,7 +599,15 @@ async def asample(
         if not created_pending:
             future_store.create_with_id(request_id)
             created = True
-        future_store.mark_queued(request_id, meta={"op": "asample"})
+        future_store.mark_queued(
+            request_id,
+            meta={
+                "op": "asample",
+                "queue_state": "queued",
+                "queued_at": time.time(),
+                "stage": "queued",
+            },
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op="sampling.asample",
