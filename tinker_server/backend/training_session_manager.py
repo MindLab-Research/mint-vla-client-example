@@ -25,6 +25,7 @@ class TrainingSession:
     session_id: str
     model_seq_id: int
     base_model: str
+    user_id: str | None = None
     lora_config: LoRAConfig | None = None
     rollout_correction_config: dict[str, Any] | None = None
     user_metadata: dict = field(default_factory=dict)
@@ -49,6 +50,7 @@ class TrainingSession:
             "session_id": self.session_id,
             "model_seq_id": self.model_seq_id,
             "base_model": self.base_model,
+            "user_id": self.user_id,
             "lora_config": self.lora_config.model_dump() if self.lora_config else None,
             "rollout_correction_config": self.rollout_correction_config,
             "user_metadata": self.user_metadata,
@@ -80,6 +82,7 @@ class TrainingSessionManager:
         lora_config: LoRAConfig | None = None,
         rollout_correction_config: dict[str, Any] | None = None,
         user_metadata: dict | None = None,
+        user_id: str | None = None,
         learning_rate: float = 1e-4,
     ) -> TrainingSession:
         """Create a new training session.
@@ -108,6 +111,7 @@ class TrainingSessionManager:
             session_id=session_id,
             model_seq_id=model_seq_id,
             base_model=base_model,
+            user_id=user_id,
             lora_config=lora_config,
             rollout_correction_config=rollout_correction_config,
             user_metadata=user_metadata or {},

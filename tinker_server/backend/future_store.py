@@ -127,6 +127,7 @@ def _get_or_create_ray_actor():
             self._errors: dict[str, str] = {}
             self._refs: dict[str, Any] = {}
             self._meta: dict[str, dict[str, Any]] = {}
+            self._op_by_request: dict[str, str] = {}
 
             self._created_at: dict[str, float] = {}
             self._queued_at: dict[str, float] = {}
@@ -139,6 +140,77 @@ def _get_or_create_ray_actor():
             self._queue_timeout_s = float(queue_ttl_s)
             self._result_ttl_s = float(done_ttl_s)
             self._tombstone_ttl_s = float(tombstone_ttl_s)
+
+        def _op_from_meta(self, meta: dict[str, Any] | None) -> str | None:
+            if not isinstance(meta, dict):
+                return None
+            op = meta.get("op")
+            if not isinstance(op, str):
+                return None
+            op = op.strip()
+            return op or None
+
+        def _update_op_from_meta(self, request_id: str, meta: dict[str, Any] | None) -> None:
+            op = self._op_from_meta(meta)
+            if op is not None:
+                self._op_by_request[request_id] = op
+
+        def _request_op(self, request_id: str) -> str:
+            op = self._op_by_request.get(request_id)
+            if isinstance(op, str) and op:
+                return op
+            op_from_meta = self._op_from_meta(self._meta.get(request_id))
+            if op_from_meta is not None:
+                self._op_by_request[request_id] = op_from_meta
+                return op_from_meta
+            return "unknown"
+
+        def _stats_by_op(self) -> dict[str, dict[str, int]]:
+            by_op: dict[str, dict[str, int]] = {}
+
+            def _bump(op: str, key: str) -> None:
+                bucket = by_op.setdefault(op, {"pending": 0, "results": 0, "errors": 0})
+                bucket[key] = int(bucket.get(key, 0)) + 1
+
+            for rid in self._pending:
+                _bump(self._request_op(rid), "pending")
+            for rid in self._result_refs:
+                _bump(self._request_op(rid), "results")
+            for rid in self._errors:
+                _bump(self._request_op(rid), "errors")
+
+            return by_op
+
+        def _age_stats(self) -> dict[str, float]:
+            now = time.time()
+            pending_ages: list[float] = []
+            for rid in self._pending:
+                ts = self._created_at.get(rid)
+                if ts is not None:
+                    pending_ages.append(max(0.0, now - float(ts)))
+
+            done_ids = set(self._result_refs.keys()) | set(self._errors.keys())
+            done_ages: list[float] = []
+            for rid in done_ids:
+                ts = self._done_at.get(rid)
+                if ts is None:
+                    ts = self._created_at.get(rid)
+                if ts is not None:
+                    done_ages.append(max(0.0, now - float(ts)))
+
+            return {
+                "oldest_pending_s": max(pending_ages) if pending_ages else 0.0,
+                "oldest_done_s": max(done_ages) if done_ages else 0.0,
+                "avg_pending_s": (sum(pending_ages) / len(pending_ages)) if pending_ages else 0.0,
+                "avg_done_s": (sum(done_ages) / len(done_ages)) if done_ages else 0.0,
+            }
+
+        def _payload_stats(self) -> dict[str, int]:
+            return {
+                "result_refs_count": len(self._result_refs),
+                "errors_count": len(self._errors),
+                "refs_count": len(self._refs),
+            }
 
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
@@ -163,6 +235,9 @@ def _get_or_create_ray_actor():
                 "queue_timeout_s": float(self._queue_timeout_s),
                 "result_ttl_s": float(self._result_ttl_s),
                 "tombstone_ttl_s": float(self._tombstone_ttl_s),
+                "by_op": self._stats_by_op(),
+                "age_stats": self._age_stats(),
+                "payload_stats": self._payload_stats(),
             }
 
         def _prune(self) -> dict[str, list[str]]:
@@ -227,6 +302,7 @@ def _get_or_create_ray_actor():
             self._errors.pop(request_id, None)
             self._refs.pop(request_id, None)
             self._meta.pop(request_id, None)
+            self._op_by_request.pop(request_id, None)
             self._created_at.pop(request_id, None)
             self._queued_at.pop(request_id, None)
             self._running_at.pop(request_id, None)
@@ -239,6 +315,25 @@ def _get_or_create_ray_actor():
             self._pending.add(request_id)
             self._created_at[request_id] = time.time()
 
+        def ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+            self._prune()
+            exists = (
+                request_id in self._pending
+                or request_id in self._refs
+                or request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            )
+            existing_meta = self._meta.get(request_id)
+            if exists:
+                return {"created": False, "meta": existing_meta}
+            self._pending.add(request_id)
+            self._created_at[request_id] = time.time()
+            if meta is not None:
+                self._meta[request_id] = dict(meta)
+            return {"created": True, "meta": existing_meta}
+
         def mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
             if request_id in self._pending:
@@ -247,6 +342,7 @@ def _get_or_create_ray_actor():
                 m = self._meta.get(request_id) or {}
                 m.update(dict(meta))
                 self._meta[request_id] = m
+                self._update_op_from_meta(request_id, m)
 
         def mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
@@ -256,6 +352,7 @@ def _get_or_create_ray_actor():
                 m = self._meta.get(request_id) or {}
                 m.update(dict(meta))
                 self._meta[request_id] = m
+                self._update_op_from_meta(request_id, m)
 
         def attach_ref(self, request_id: str, ref: Any, meta: dict[str, Any] | None = None) -> None:
             self._prune()
@@ -264,6 +361,7 @@ def _get_or_create_ray_actor():
             self._refs[request_id] = ref
             if meta is not None:
                 self._meta[request_id] = dict(meta)
+                self._update_op_from_meta(request_id, self._meta[request_id])
 
         def submit(
             self,
@@ -278,6 +376,7 @@ def _get_or_create_ray_actor():
             self._created_at[request_id] = time.time()
             if meta is not None:
                 self._meta[request_id] = dict(meta)
+                self._update_op_from_meta(request_id, self._meta[request_id])
             method = getattr(target_actor, method_name)
             if isinstance(args, dict):
                 self._refs[request_id] = method.remote(**args)
@@ -288,6 +387,7 @@ def _get_or_create_ray_actor():
             self._prune()
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
+            self._update_op_from_meta(request_id, self._meta.get(request_id))
             self._meta.pop(request_id, None)
             import ray
 
@@ -305,6 +405,7 @@ def _get_or_create_ray_actor():
             self._prune()
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
+            self._update_op_from_meta(request_id, self._meta.get(request_id))
             self._meta.pop(request_id, None)
             self._errors[request_id] = error
             self._done_at[request_id] = time.time()
@@ -327,6 +428,7 @@ def _get_or_create_ray_actor():
                 if ready:
                     meta = self._meta.get(request_id)
                     self._pending.discard(request_id)
+                    self._update_op_from_meta(request_id, meta)
                     try:
                         result = ray.get(ref)
                         if isinstance(meta, dict) and meta.get("op") == "optim_step":
@@ -387,6 +489,9 @@ def _get_or_create_ray_actor():
             self._done_at.pop(request_id, None)
             self._expired_at.pop(request_id, None)
             self._retrieved_at[request_id] = time.time()
+
+        def forget(self, request_id: str) -> None:
+            self._forget(request_id)
 
         def reap(self) -> dict[str, list[str]]:
             # Return request_ids that transitioned to terminal tombstones and must
@@ -500,6 +605,17 @@ class FutureStore:
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         return str(request_id)
 
+    def ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        import ray
+
+        payload = None if meta is None else dict(meta)
+        try:
+            return ray.get(actor.ensure_pending.remote(request_id=str(request_id), meta=payload))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+
     def mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
         import ray
@@ -522,6 +638,16 @@ class FutureStore:
             self._ray_actor = None
             actor = self._get_ray_actor()
             actor.mark_running.remote(request_id=request_id, meta=None if meta is None else dict(meta))
+
+    def forget(self, request_id: str) -> None:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            actor.forget.remote(request_id=request_id)
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()

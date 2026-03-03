@@ -4,6 +4,9 @@ Endpoints:
 - GET /healthz: Health check
 - POST /create_session: Create a new session
 - POST /create_sampling_session: Create a sampling session with dedicated engine
+- GET /sessions: List sessions
+- GET /sessions/{session_id}: Get session details
+- GET /samplers/{sampler_id}: Get sampler details
 - POST /session_heartbeat: Keep session alive
 - POST /telemetry: Accept telemetry data (discarded)
 """
@@ -15,9 +18,11 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -28,6 +33,9 @@ from ..models.types import (
     CreateSamplingSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
+    GetSamplerResponse,
+    GetSessionResponse,
+    ListSessionsResponse,
     SessionHeartbeatRequest,
     SessionHeartbeatResponse,
     TelemetryRequest,
@@ -58,6 +66,30 @@ def _get_user_id(request: Request) -> str | None:
     user_data = _get_user_data(request)
     if user_data:
         return user_data.get("user_id")
+    return None
+
+
+def _user_visible(request_user_id: str | None, owner: str | None) -> bool:
+    if request_user_id is None:
+        return True
+    if request_user_id == "admin":
+        return True
+    return bool(owner) and owner == request_user_id
+
+
+def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
+    if model_path.startswith("tinker://"):
+        path_part = model_path[len("tinker://") :]
+    elif model_path.startswith("mint://"):
+        path_part = model_path[len("mint://") :]
+    else:
+        return None
+
+    parts = [p for p in path_part.split("/") if p]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) == 3 and parts[1] in ("weights", "sampler_weights"):
+        return parts[0], parts[2]
     return None
 
 
@@ -288,16 +320,33 @@ async def server_info() -> dict:
 
 
 @router.post("/create_session")
-async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
+async def create_session(request: CreateSessionRequest, http_request: Request) -> CreateSessionResponse:
     """Create a new session.
 
     Sessions are used to group related operations together.
     """
     session_id = str(uuid.uuid4())
+    user_id = _get_user_id(http_request)
     sessions[session_id] = {
         "tags": request.tags,
         "metadata": request.user_metadata,
+        "user_id": user_id,
+        "created_at": datetime.now().isoformat(),
     }
+    try:
+        from ..backend.session_index_store import upsert_session_index
+
+        upsert_session_index(
+            {
+                "session_id": session_id,
+                "training_run_ids": [],
+                "sampler_ids": [],
+                "user_id": user_id,
+                "created_at": sessions[session_id]["created_at"],
+            }
+        )
+    except Exception as e:
+        logger.warning("[create_session] session index write failed: %s", e)
     return CreateSessionResponse(session_id=session_id)
 
 
@@ -318,8 +367,9 @@ async def create_sampling_session(
     if session_manager is None:
         raise HTTPException(status_code=503, detail="Session manager not initialized")
 
-    sampling_session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
+    created_at = datetime.now().isoformat()
+    adapter_path: str | None = None
 
     # Determine base_model from request or infer from model_path
     base_model = request.base_model
@@ -382,20 +432,10 @@ async def create_sampling_session(
         )
         return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id_remote)
 
-    # Get or create engine for this model (dynamically creates vLLM actor if needed)
-    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
-    # Warm vLLM in the background; /asample work will await readiness.
-    async def _warm_engine() -> None:
-        try:
-            await session_manager.get_engine_for_model(base_model)
-        except Exception as e:
-            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
-
-    asyncio.create_task(_warm_engine())
-
     if request.model_path:
         # Resolve adapter directory (file://, mint://, absolute path).
-        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
+        if adapter_path is None:
+            adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
 
         # Fast validation: ensure weights exist; loading happens on first /asample.
         weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
@@ -424,7 +464,85 @@ async def create_sampling_session(
                 f"[create_sampling_session] failed to infer lora_rank from {config_path}: "
                 f"{type(e).__name__}: {e}"
             )
+    else:
+        lora_rank = 0
 
+    def _write_sampler_index(sampler_id: str) -> None:
+        try:
+            from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+
+            add_sampler_to_session(
+                session_id=request.session_id,
+                sampler_id=sampler_id,
+                user_id=user_id,
+                created_at=created_at,
+            )
+
+            sampler_info: dict = {
+                "sampler_id": sampler_id,
+                "session_id": request.session_id,
+                "base_model": base_model,
+                "user_id": user_id,
+                "created_at": created_at,
+            }
+
+            if request.model_path:
+                parsed = _parse_checkpoint_path(request.model_path)
+                if parsed:
+                    model_id, checkpoint_name = parsed
+                    sampler_info.update(
+                        {
+                            "source_type": "checkpoint",
+                            "model_id": model_id,
+                            "checkpoint_name": checkpoint_name,
+                            "model_path_raw": request.model_path,
+                        }
+                    )
+                else:
+                    sampler_info.update(
+                        {
+                            "source_type": "raw_model_path",
+                            "model_path_raw": request.model_path,
+                        }
+                    )
+            else:
+                sampler_info.update({"source_type": "base_model"})
+
+            upsert_sampler_index(sampler_info)
+        except Exception as e:
+            logger.warning("[create_sampling_session] sampler index write failed: %s", e)
+
+    if request.sampling_session_seq_id is not None:
+        sampling_session_id = f"{request.session_id}:sample:{request.sampling_session_seq_id}"
+        existing_base = session_manager.get_session_base_model(sampling_session_id)
+        if existing_base is not None:
+            existing_adapter = session_manager.get_session_adapter_path(sampling_session_id)
+            existing_rank = session_manager.get_session_lora_rank(sampling_session_id) or 0
+            expected_adapter = adapter_path if request.model_path else None
+            expected_rank = int(lora_rank)
+            if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank) != expected_rank:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Sampling session already exists with different configuration",
+                )
+            sampling_sessions[sampling_session_id] = base_model
+            _write_sampler_index(sampling_session_id)
+            return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+    else:
+        sampling_session_id = str(uuid.uuid4())
+
+    # Get or create engine for this model (dynamically creates vLLM actor if needed)
+    # Do not block on vLLM cold-start here (can exceed reverse-proxy timeouts).
+    # Warm vLLM in the background; /asample work will await readiness.
+    async def _warm_engine() -> None:
+        try:
+            await session_manager.get_engine_for_model(base_model)
+        except Exception as e:
+            logger.warning(f"[create_sampling_session] warm engine failed: model={base_model} err={e}")
+
+    asyncio.create_task(_warm_engine())
+
+    if request.model_path:
         # Register session now; LoRA will be loaded lazily on first /asample.
         session_manager.register_multi_lora_session(
             session_id=sampling_session_id,
@@ -440,7 +558,137 @@ async def create_sampling_session(
     # Store metadata
     sampling_sessions[sampling_session_id] = base_model
 
+    _write_sampler_index(sampling_session_id)
+
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+
+
+@router.get("/sessions/{session_id}", response_model=GetSessionResponse)
+async def get_session(session_id: str, http_request: Request) -> GetSessionResponse:
+    request_user_id = _get_user_id(http_request)
+    info = None
+    try:
+        from ..backend.session_index_store import get_session_index
+
+        info = await run_in_threadpool(get_session_index, session_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
+
+    if isinstance(info, dict):
+        if not _user_visible(request_user_id, info.get("user_id")):
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        return GetSessionResponse(
+            training_run_ids=list(info.get("training_run_ids") or []),
+            sampler_ids=list(info.get("sampler_ids") or []),
+        )
+
+    entry = sessions.get(session_id)
+    if entry and _user_visible(request_user_id, entry.get("user_id")):
+        return GetSessionResponse(training_run_ids=[], sampler_ids=[])
+
+    raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+
+@router.get("/sessions", response_model=ListSessionsResponse)
+async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request = None) -> ListSessionsResponse:
+    request_user_id = _get_user_id(http_request) if http_request else None
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    try:
+        from ..backend.session_index_store import list_session_index
+
+        infos = await run_in_threadpool(list_session_index)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
+
+    for info in infos or []:
+        sid = info.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            continue
+        if not _user_visible(request_user_id, info.get("user_id")):
+            continue
+        entries.append({"session_id": sid, "created_at": info.get("created_at")})
+        seen.add(sid)
+
+    for sid, entry in sessions.items():
+        if sid in seen:
+            continue
+        if not _user_visible(request_user_id, entry.get("user_id")):
+            continue
+        entries.append({"session_id": sid, "created_at": entry.get("created_at")})
+
+    entries.sort(key=lambda x: str(x.get("session_id") or ""))
+    entries.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+    page = entries[offset : offset + limit]
+    return ListSessionsResponse(sessions=[e["session_id"] for e in page])
+
+
+@router.get("/samplers/{sampler_id}", response_model=GetSamplerResponse)
+async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerResponse:
+    request_user_id = _get_user_id(http_request)
+    info = None
+    try:
+        from ..backend.session_index_store import get_sampler_index
+
+        info = await run_in_threadpool(get_sampler_index, sampler_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Session index store unavailable") from e
+
+    if isinstance(info, dict):
+        if not _user_visible(request_user_id, info.get("user_id")):
+            raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
+        base_model = info.get("base_model")
+        if not base_model and session_manager is not None:
+            base_model = session_manager.get_session_base_model(sampler_id)
+
+        from ..client_compat import checkpoint_uri, prefer_tinker_uri
+
+        model_path = None
+        source_type = info.get("source_type")
+        if source_type == "checkpoint":
+            model_id = info.get("model_id")
+            checkpoint_name = info.get("checkpoint_name")
+            if model_id and checkpoint_name:
+                model_path = checkpoint_uri(
+                    str(model_id),
+                    str(checkpoint_name),
+                    prefer_tinker=prefer_tinker_uri(http_request),
+                    checkpoint_type="sampler",
+                )
+            else:
+                model_path = info.get("model_path_raw")
+        elif source_type == "raw_model_path":
+            model_path = info.get("model_path_raw")
+        elif source_type == "base_model":
+            model_path = None
+        else:
+            model_path = info.get("model_path_raw")
+
+        if not base_model:
+            raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
+
+        return GetSamplerResponse(
+            sampler_id=sampler_id,
+            base_model=str(base_model),
+            model_path=model_path,
+        )
+
+    if session_manager is not None:
+        base_model = session_manager.get_session_base_model(sampler_id)
+        if base_model:
+            return GetSamplerResponse(
+                sampler_id=sampler_id,
+                base_model=base_model,
+                model_path=None,
+            )
+
+    raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
 
 
 def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
@@ -454,15 +702,22 @@ def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     """
     from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 
+    is_admin = user_id == "admin"
+    if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     checkpoint_dir = get_checkpoints_dir()
     resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
-    if user_id and user_id != "admin":
+    if model_path.startswith("ckpt_") and resolved == model_path:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    if not is_admin:
         resolved_real = os.path.realpath(resolved)
         checkpoints_real = os.path.realpath(checkpoint_dir)
-        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, user_id))
-        if resolved_real.startswith(checkpoints_real + os.sep) and not resolved_real.startswith(
-            allowed_real + os.sep
-        ):
+        if not resolved_real.startswith(checkpoints_real + os.sep):
+            raise HTTPException(status_code=403, detail="Access denied")
+        owner_dir = user_id or "anonymous"
+        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, owner_dir))
+        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
             raise HTTPException(status_code=403, detail="Access denied")
     return resolved
 

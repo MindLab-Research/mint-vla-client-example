@@ -8,8 +8,12 @@ This supports recovery after API server restarts:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def _ray_namespace() -> str:
@@ -75,26 +79,43 @@ def upsert_training_session(info: dict[str, Any]) -> None:
     import ray
 
     if not ray.is_initialized():
+        logger.warning("Training session store write skipped: Ray not initialized")
         return
-    actor = _get_or_create_actor()
     payload = dict(info)
     payload.setdefault("current_step", 0)
-    ray.get(actor.upsert.remote(str(payload.get("model_id", "")), payload))
+    try:
+        actor = _get_or_create_actor()
+        actor.upsert.remote(str(payload.get("model_id", "")), payload)
+    except Exception as e:
+        logger.warning("Training session store write failed: upsert: %s", e)
 
 
 def delete_training_session(model_id: str) -> None:
     import ray
 
     if not ray.is_initialized():
+        logger.warning("Training session store write skipped: Ray not initialized")
         return
-    actor = _get_or_create_actor()
-    ray.get(actor.delete.remote(model_id))
+    try:
+        actor = _get_or_create_actor()
+        actor.delete.remote(model_id)
+    except Exception as e:
+        logger.warning("Training session store write failed: delete: %s", e)
 
 
 def get_training_session_info(model_id: str) -> dict[str, Any] | None:
     import ray
 
     if not ray.is_initialized():
-        return None
+        raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.get.remote(model_id))
+
+
+def list_training_sessions() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return ray.get(actor.list.remote())

@@ -794,10 +794,40 @@ def _create_multinode_vllm_actor(
             import sys
             import vllm
 
+            try:
+                from vllm.lora import lora_weights as lw  # type: ignore
+
+                Packed = getattr(lw, "PackedLoRALayerWeights", None)
+                LoRA = getattr(lw, "LoRALayerWeights", None)
+                pack_moe_cm = Packed.__dict__.get("pack_moe") if Packed is not None else None
+                pack_moe_orig = getattr(pack_moe_cm, "__func__", None)
+                pack_moe_sparse_ok = bool(getattr(pack_moe_orig, "__mint_sparse_ok__", False))
+                lora_opt_safe = bool(
+                    getattr(getattr(LoRA, "optimize", None), "_tinker_overlap_safe", False)
+                )
+                packed_opt_safe = bool(
+                    getattr(getattr(Packed, "optimize", None), "_tinker_overlap_safe", False)
+                )
+            except Exception as e:
+                pack_moe_sparse_ok = False
+                lora_opt_safe = False
+                packed_opt_safe = False
+                lora_patch_err = f"{type(e).__name__}: {e}"
+            else:
+                lora_patch_err = None
+
             return {
                 "pythonpath": os.environ.get("PYTHONPATH", ""),
                 "pfs_vllm_path": os.environ.get("PFS_VLLM_PATH", ""),
+                "mint_enable_vllm_import_patches": os.environ.get(
+                    "MINT_ENABLE_VLLM_IMPORT_PATCHES"
+                ),
+                "vllm_use_v1": os.environ.get("VLLM_USE_V1"),
                 "vllm_file": vllm.__file__,
+                "vllm_lora_patch_error": lora_patch_err,
+                "vllm_lora_pack_moe_sparse_ok": pack_moe_sparse_ok,
+                "vllm_lora_opt_overlap_safe": lora_opt_safe,
+                "vllm_lora_packed_opt_overlap_safe": packed_opt_safe,
                 "sys_path_first_8": sys.path[:8],
             }
 

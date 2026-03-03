@@ -12,9 +12,64 @@ import os
 import shutil
 import tarfile
 from pathlib import Path
+from typing import Literal
 
 DEFAULT_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/tinker_checkpoints"
 CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_CHECKPOINTS_DIR)
+
+CheckpointType = Literal["training", "sampler"]
+
+
+def checkpoint_has_lora_weights(path: str) -> bool:
+    return os.path.exists(os.path.join(path, "adapter_model.safetensors")) or bool(
+        glob.glob(os.path.join(path, "mp_rank_*_adapter.pt"))
+    )
+
+
+def checkpoint_has_optimizer_state(path: str) -> bool:
+    return os.path.exists(os.path.join(path, "optimizer.pt")) or bool(
+        glob.glob(os.path.join(path, "*_optimizer.pt"))
+    )
+
+
+def read_checkpoint_metadata(path: str) -> dict:
+    meta_path = os.path.join(path, "metadata.json")
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def write_checkpoint_metadata(path: str, metadata: dict) -> None:
+    os.makedirs(path, exist_ok=True)
+    meta_path = os.path.join(path, "metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def validate_checkpoint_load_contract(
+    path: str, *, load_optimizer: bool
+) -> tuple[CheckpointType, bool]:
+    metadata = read_checkpoint_metadata(path)
+
+    checkpoint_type = metadata.get("checkpoint_type") or metadata.get("type")
+    if checkpoint_type not in ("training", "sampler"):
+        raise ValueError(f"Invalid checkpoint_type in metadata.json: {checkpoint_type!r}")
+
+    optimizer_present = metadata.get("optimizer_present")
+    if not isinstance(optimizer_present, bool):
+        optimizer_present = bool(checkpoint_has_optimizer_state(path))
+
+    if load_optimizer:
+        if checkpoint_type != "training":
+            raise ValueError(
+                "Optimizer restore requested, but checkpoint_type is not 'training'"
+            )
+        if not optimizer_present:
+            raise ValueError(
+                "Optimizer restore requested, but optimizer artifacts are missing"
+            )
+
+    return checkpoint_type, optimizer_present
+
 
 
 def get_checkpoints_dir() -> str:
@@ -86,18 +141,22 @@ def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
-def validate_checkpoint_dir(path: str) -> None:
-    has_lora = os.path.exists(os.path.join(path, "adapter_model.safetensors")) or bool(
-        glob.glob(os.path.join(path, "mp_rank_*_adapter.pt"))
-    )
-    has_optimizer = os.path.exists(os.path.join(path, "optimizer.pt")) or bool(
-        glob.glob(os.path.join(path, "*_optimizer.pt"))
-    )
+def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None = None) -> None:
+    has_lora = checkpoint_has_lora_weights(path)
+    has_optimizer = checkpoint_has_optimizer_state(path)
 
     if not has_lora:
         raise ValueError("Missing LoRA weights in extracted checkpoint")
-    if not has_optimizer:
-        raise ValueError("Missing optimizer state in extracted checkpoint")
+    if checkpoint_type == "training":
+        if not has_optimizer:
+            raise ValueError("Missing optimizer state in extracted checkpoint")
+    elif checkpoint_type == "sampler":
+        if has_optimizer:
+            raise ValueError("Sampler checkpoint must not include optimizer state")
+    else:
+        # Backward-compatible default: uploads are full-state unless explicitly labeled.
+        if not has_optimizer:
+            raise ValueError("Missing optimizer state in extracted checkpoint")
 
 
 def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:
@@ -164,8 +223,22 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
             resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=None)
         return resolved or uri
 
+    def _strip_tinker_checkpoint_kind(path_part: str) -> str:
+        # Canonical Tinker checkpoint paths include an explicit kind segment:
+        #   {run_id}/weights/{checkpoint_name}
+        #   {run_id}/sampler_weights/{checkpoint_name}
+        #
+        # MinT's on-disk layout is:
+        #   {owner}/{run_id}/{checkpoint_name}
+        #
+        # So for canonical paths, we strip the kind segment when resolving to disk.
+        parts = path_part.split("/")
+        if len(parts) >= 3 and parts[1] in ("weights", "sampler_weights"):
+            return "/".join([parts[0], *parts[2:]])
+        return path_part
+
     if uri.startswith("tinker://"):
-        path_part = uri[len("tinker://") :]
+        path_part = _strip_tinker_checkpoint_kind(uri[len("tinker://") :])
         if user_id == "admin":
             legacy = os.path.join(checkpoints_dir, path_part)
             if os.path.exists(legacy):
@@ -178,7 +251,7 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
         owner_dir = user_id or "anonymous"
         return os.path.join(checkpoints_dir, owner_dir, path_part)
     if uri.startswith("mint://"):
-        path_part = uri[len("mint://") :]
+        path_part = _strip_tinker_checkpoint_kind(uri[len("mint://") :])
         if user_id == "admin":
             legacy = os.path.join(checkpoints_dir, path_part)
             if os.path.exists(legacy):

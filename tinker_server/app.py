@@ -1,5 +1,7 @@
 """FastAPI application for tinker-server."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -7,20 +9,23 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .backend.multi_lora_engine import MultiModelInferenceManager
 from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
-from .backend.training_session_manager import TrainingSessionManager
-from .backend.verl_training import VerlTrainingEngine
 from .config import config
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
+
+if TYPE_CHECKING:
+    from .backend.multi_lora_engine import MultiModelInferenceManager
+    from .backend.training_session_manager import TrainingSessionManager
+    from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -633,6 +638,8 @@ async def lifespan(app: FastAPI):
     multi_model_manager: MultiModelInferenceManager | None = None
 
     if config.enable_multi_lora:
+        from .backend.multi_lora_engine import MultiModelInferenceManager
+
         logger.info(
             f"Initializing Multi-Model Inference Manager: max_loras={config.max_loras}, "
             f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
@@ -657,6 +664,9 @@ async def lifespan(app: FastAPI):
     # Training: Initialize TrainingSessionManager and VerlTrainingEngine
     # ==========================================================================
     logger.info("Initializing training components")
+
+    from .backend.training_session_manager import TrainingSessionManager
+    from .backend.verl_training import VerlTrainingEngine
 
     train_manager = TrainingSessionManager()
     train_engine = VerlTrainingEngine()
@@ -733,6 +743,8 @@ async def lifespan(app: FastAPI):
     async def _exec_weights_save_weights(item):
         req = SaveStateRequest.model_validate_json(item.request_json)
         prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+        # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
+        # This must produce a training checkpoint (weights + optimizer state).
         await weights._do_save_state(
             item.request_id,
             req,
@@ -896,6 +908,34 @@ async def api_key_auth_middleware(request: Request, call_next):
     # Skip auth for specific paths
     if path in UNAUTHENTICATED_PATHS:
         return await call_next(request)
+
+    # Special-case: allow unauthenticated checkpoint archive downloads when a valid,
+    # short-lived signed token is provided in the URL (Tinker SDK expects a signed URL).
+    if path.startswith("/api/v1/training_runs/") and path.endswith("/archive"):
+        direct = request.query_params.get("direct")
+        download_token = request.query_params.get("download_token")
+        if direct and download_token:
+            try:
+                from .download_tokens import verify_download_token
+
+                # Prefer token_secret_key (if configured), otherwise api_key.
+                secret = config.token_secret_key or config.api_key or ""
+                payload = verify_download_token(str(download_token), secret=secret)
+                if payload is None:
+                    raise ValueError("invalid token")
+
+                prefix = "/api/v1/training_runs/"
+                mid_and_rest = path[len(prefix) :]
+                model_id, rest = mid_and_rest.split("/checkpoints/", 1)
+                checkpoint_id = rest[: -len("/archive")]
+
+                if payload.get("model_id") != model_id or payload.get("checkpoint_id") != checkpoint_id:
+                    raise ValueError("token does not match request path")
+
+                request.state.user_data = {"user_id": payload.get("user_id")}
+                return await call_next(request)
+            except Exception:
+                return JSONResponse(status_code=401, content={"error": "Invalid download token"})
 
     # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")

@@ -43,6 +43,7 @@ class _SamplingSection(BaseModel):
     sample_coalesce_window_ms: float | None = None
     sample_coalesce_max_batch: int | None = None
     sample_coalesce_max_samples: int | None = None
+    require_seq_id: bool | None = None
 
 
 class _RaySection(BaseModel):

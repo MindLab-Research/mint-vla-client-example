@@ -1100,11 +1100,12 @@ class TrainingWorker:
         # 2. Optionally load optimizer state
         if load_optimizer:
             optimizer_path = os.path.join(load_path, "optimizer.pt")
-            if os.path.exists(optimizer_path):
-                self.optimizer.load_state_dict(
-                    torch.load(optimizer_path, map_location=self.device)
+            if not os.path.exists(optimizer_path):
+                raise FileNotFoundError(
+                    f"Optimizer restore requested, but optimizer state not found: {optimizer_path}"
                 )
-                logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
+            self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+            logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
 
         # 3. Load and return metadata
         meta = {}
@@ -1914,6 +1915,8 @@ class VerlTrainingEngine:
 
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
+        if lr is not None:
+            session.learning_rate = lr
 
         lora_cfg = getattr(session, "lora_config", None)
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
@@ -1989,6 +1992,7 @@ class VerlTrainingEngine:
                 rollout_correction_config,
             )
         lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
+        session.learning_rate = lr
 
         lora_cfg = getattr(session, "lora_config", None)
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
@@ -2139,7 +2143,49 @@ class VerlTrainingEngine:
             return await self.save_lora_weights_for_sampler(
                 session, save_path, use_per_expert_lora=use_per_expert_lora
             )
-        return await self.save_weights(session, save_path, use_per_expert_lora=use_per_expert_lora)
+        return await self.save_dense_lora_weights_for_sampler(session, save_path)
+
+    async def save_dense_lora_weights_for_sampler(
+        self,
+        session: TrainingSession,
+        save_path: str,
+    ) -> str:
+        """Save minimal PEFT LoRA artifacts for sampling on the dense backend.
+
+        This intentionally excludes optimizer/resume artifacts.
+        """
+        import asyncio
+        import os
+
+        import ray
+
+        model_id = session.model_id
+        worker = self._workers[model_id]
+        abs_path = os.path.abspath(save_path)
+
+        try:
+            from .model_registry import get_model_config
+
+            train_gpus = get_model_config(session.base_model).train_gpus
+        except Exception:
+            train_gpus = 1
+
+        if train_gpus >= 32:
+            default_timeout_s = 3600
+        elif train_gpus >= 16:
+            default_timeout_s = 1800
+        elif train_gpus >= 4:
+            default_timeout_s = 600
+        else:
+            default_timeout_s = 300
+        timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
+
+        loop = asyncio.get_running_loop()
+        ref = worker.save_lora_weights.remote(abs_path)
+        _ = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=timeout_s))
+
+        logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
+        return abs_path
 
     async def save_lora_weights_for_sampler(
         self,
@@ -2282,6 +2328,10 @@ class VerlTrainingEngine:
 
         # Update session state from loaded metadata
         session.current_step = meta.get("current_step", 0)
+        try:
+            session.learning_rate = float(meta.get("learning_rate", session.learning_rate))
+        except Exception:
+            pass
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 

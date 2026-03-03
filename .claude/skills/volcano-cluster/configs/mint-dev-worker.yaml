@@ -3,7 +3,7 @@
 # Before submitting:
 #   1. Get Ray head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
 #   2. Replace <RAY_HEAD_IP> below with the actual IP address
-#   3. Replace <GPU_QUEUE_ID> below with the desired GPU queue id (dev prefers a800-mindverse-B: q-20260124095758-ngkg7)
+#   3. Replace <GPU_QUEUE_ID> below with the desired GPU queue id (confirm in Volcano console)
 #   4. Adjust RoleReplicas as needed: N replicas = 8*N GPUs
 #
 # Submit with: volc ml_task submit -c mint-dev-worker.yaml --output json
@@ -44,7 +44,7 @@ Entrypoint: |
   PY
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:12"
-ResourceQueueID: "<GPU_QUEUE_ID>"  # Dev prefers a800-mindverse-B (q-20260124095758-ngkg7). Set explicitly before submit.
+ResourceQueueID: "<GPU_QUEUE_ID>"  # Set explicitly before submit. If only prod GPU queues are available, get user approval.
 Framework: "Custom"
 
 TaskRoleSpecs:
@@ -58,10 +58,6 @@ DelayExitTimeSeconds: 0
 AccessType: "Private"
 
 Storages:
-    - Type: "Vepfs"
-      MountPath: "/vePFS-Mindverse"
-      SubPath: ""
-      ReadOnly: true
     - Type: "Vepfs"
       MountPath: "/vePFS-Mindverse/share"
       SubPath: "share"

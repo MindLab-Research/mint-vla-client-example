@@ -188,6 +188,7 @@ class ServerConfig:
     sampling_sample_coalesce_window_ms: float = 2.0
     sampling_sample_coalesce_max_batch: int = 32
     sampling_sample_coalesce_max_samples: int = 16
+    sampling_require_seq_id: bool = False
 
     # ResourcePool settings (backend/resource_pool.py)
     resource_pool_min_actor_age_s: int = 300
@@ -344,6 +345,11 @@ class ServerConfig:
                 "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
                 file_sampling.sample_coalesce_max_samples if file_sampling is not None else None,
                 16,
+            ),
+            sampling_require_seq_id=_pick_bool(
+                "TINKER_SAMPLE_REQUIRE_SEQ_ID",
+                file_sampling.require_seq_id if file_sampling is not None else None,
+                False,
             ),
             # ResourcePool settings
             resource_pool_min_actor_age_s=_pick_int(
