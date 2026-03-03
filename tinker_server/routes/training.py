@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
+from ..logging_context import set_request_id
+
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
 from ..config import RAY_NAMESPACE
@@ -1009,6 +1011,11 @@ async def forward_backward(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+
+    # Set request_id in context for logging
+    set_request_id(request_id)
+    logger.info(f"forward_backward request received: model_id={request.model_id}")
+
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1053,6 +1060,9 @@ async def forward_backward(
 
 async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest, user_id: str | None) -> None:
     """Background task for forward_backward."""
+    # Restore request_id context for logging
+    set_request_id(request_id)
+
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
@@ -1074,18 +1084,16 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
-        msg = (
-            f"[{session.model_id}] forward_backward start request_id={request_id} "
+        logger.info(
+            f"[{session.model_id}] forward_backward start: "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
             f"loss_fn={request.forward_backward_input.loss_fn}"
         )
-        print(msg, flush=True)
-        logger.info(msg)
         result = await training_engine.forward_backward(session, request)
         elapsed_s = time.time() - t0
-        msg = f"[{session.model_id}] forward_backward done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        print(msg, flush=True)
-        logger.info(msg)
+        logger.info(
+            f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
+        )
         future_store.resolve(request_id, result)
 
         # Log usage
@@ -1100,7 +1108,7 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
             )
 
     except Exception as e:
-        logger.exception(f"[forward_backward] Failed: {e}")
+        logger.exception(f"[forward_backward] Failed for request_id={request_id}: {e}")
         future_store.fail(request_id, str(e))
 
 

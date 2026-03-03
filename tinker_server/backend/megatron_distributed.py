@@ -27,6 +27,7 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
+from ..logging_context import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -721,7 +722,8 @@ class MegatronRankWorker:
 
         logger.info(
             f"[Rank {self.rank}] initialize() starting: CUDA_VISIBLE_DEVICES={cuda_device!r}, "
-            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}"
+            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}, "
+            f"request_id={get_request_id() or '-'}"
         )
 
         if device_count != 1:

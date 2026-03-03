@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 from . import ray_kill
+from ..logging_context import get_request_id
 
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
@@ -756,7 +757,8 @@ class TrainingWorker:
                 metrics["clipfrac:mean"] = total_clipfrac / num_rl_samples
 
         logger.info(
-            f"[TrainingWorker] forward_backward ({loss_fn}): loss={avg_loss:.4f}, tokens={total_tokens:.0f}"
+            f"[TrainingWorker] forward_backward ({loss_fn}): loss={avg_loss:.4f}, tokens={total_tokens:.0f}, "
+            f"request_id={get_request_id() or '-'}"
         )
 
         return {

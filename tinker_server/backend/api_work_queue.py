@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config
+from ..logging_context import set_request_id, get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +438,14 @@ def _get_or_create_ray_actor():
         async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> None:
             async with self._cv:
                 packed = dict(item)
+                request_id = packed.get("request_id")
+
+                # Log enqueue with request_id context
+                logger.info(
+                    f"[Queue] enqueue: request_id={request_id}, op={packed.get('op')}, "
+                    f"user_id={packed.get('user_id')}"
+                )
+
                 is_sched, domain, session_id = self._scheduler_item_info(packed)
                 if is_sched:
                     self._enqueue_scheduled(packed, domain=domain, session_id=session_id)
@@ -581,6 +590,15 @@ def _get_or_create_ray_actor():
                     break
 
                 self._dequeued += 1
+
+                # Log dequeue with request_id context
+                request_id = item.get("request_id")
+                logger.info(
+                    f"[Queue] dequeue: request_id={request_id}, op={item.get('op')}, "
+                    f"reason={dequeue_reason}, scheduler_domain={scheduler_domain}, "
+                    f"scheduler_session_id={scheduler_session_id}"
+                )
+
                 try:
                     import ray
 
@@ -943,6 +961,10 @@ class ApiWorkQueueClient:
                 )
                 await asyncio.sleep(1.0)
                 continue
+
+            # Restore request_id context for logging in worker
+            set_request_id(item.request_id)
+
             if str(item.op) == "training.create_model":
                 try:
                     age_s = max(0.0, time.time() - float(item.created_at))
@@ -1053,6 +1075,12 @@ class ApiWorkQueueClient:
                         "running_at": time.time(),
                     },
                 )
+                logger.debug(
+                    "[api_work_queue] mark_running request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
             except Exception as e:
                 logger.error(
                     "[api_work_queue] mark_running failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1127,7 +1155,19 @@ class ApiWorkQueueClient:
 
             try:
                 exec_start = time.perf_counter()
+                logger.debug(
+                    "[api_work_queue] executing request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
                 await ex(item)
+                logger.debug(
+                    "[api_work_queue] executor completed request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
                 exec_elapsed = time.perf_counter() - exec_start
                 try:
                     actor = self._get_ray_actor()

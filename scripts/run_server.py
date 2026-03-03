@@ -73,8 +73,9 @@ if __name__ == "__main__":
     if args.config_path:
         os.environ["TINKER_CONFIG_PATH"] = str(args.config_path)
 
-    # Configure logging early
-    logging.basicConfig(level=logging.INFO)
+    # Configure logging early with request_id support
+    from tinker_server.logging_context import configure_logging
+    configure_logging(level=logging.INFO)
 
     # Suppress noisy 408 polling logs
     logging.getLogger("uvicorn.access").addFilter(PollingLogFilter())
