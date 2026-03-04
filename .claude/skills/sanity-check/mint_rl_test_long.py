@@ -140,14 +140,19 @@ def _patch_trust_remote_code_for_tokenizers() -> None:
     if getattr(sampling_client, "_mint_trust_remote_code_patched", False):
         return
 
-    real_from_pretrained = sampling_client.AutoTokenizer.from_pretrained
+    AutoTokenizer = getattr(sampling_client, "AutoTokenizer", None)
+    if AutoTokenizer is None:
+        _dbg("sampling_client.AutoTokenizer not present; skipping trust_remote_code patch")
+        return
+
+    real_from_pretrained = AutoTokenizer.from_pretrained
 
     def wrapped_from_pretrained(tokenizer_id: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         if tokenizer_id == "moonshotai/Moonlight-16B-A3B-Instruct":
             kwargs.setdefault("trust_remote_code", True)
         return real_from_pretrained(tokenizer_id, *args, **kwargs)
 
-    sampling_client.AutoTokenizer.from_pretrained = wrapped_from_pretrained  # type: ignore[method-assign]
+    AutoTokenizer.from_pretrained = wrapped_from_pretrained  # type: ignore[method-assign]
     sampling_client._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
     _dbg("patched AutoTokenizer.from_pretrained trust_remote_code for Moonlight tokenizer")
 

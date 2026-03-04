@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 #
 # We patch pack_moe inside vLLM TP worker processes via EngineCore.collective_rpc.
 def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
-    import torch
+    import inspect
     from vllm.lora import lora_weights as lw  # type: ignore
 
     Packed = getattr(lw, "PackedLoRALayerWeights", None)
@@ -43,33 +43,53 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
     if Packed is None or LoRALayerWeights is None:
         raise RuntimeError("vLLM lora_weights types missing; cannot patch pack_moe")
 
-    current = getattr(Packed, "pack_moe", None)
-    if getattr(current, "__mint_sparse_ok__", False):
-        return "ok:already"
-
-    orig_cm = Packed.__dict__.get("pack_moe")
-    orig_fn = getattr(orig_cm, "__func__", None)
+    cm = Packed.__dict__.get("pack_moe")
+    orig_fn = getattr(cm, "__func__", None)
     if orig_fn is None:
         raise RuntimeError("vLLM pack_moe not found; cannot patch")
+    if getattr(orig_fn, "__mint_sparse_ok__", False):
+        return "ok:already"
 
-    def _zero_like(base: Any, module_name: str) -> Any:
-        return LoRALayerWeights(
-            module_name=str(getattr(base, "module_name", module_name)),
-            rank=int(getattr(base, "rank", 0)),
-            lora_alpha=int(getattr(base, "lora_alpha", 1)),
-            lora_a=torch.zeros_like(getattr(base, "lora_a")),
-            lora_b=torch.zeros_like(getattr(base, "lora_b")),
-            scaling=1.0,
+    try:
+        sig = inspect.signature(orig_fn)
+    except Exception as e:
+        raise RuntimeError(
+            f"Unable to inspect vLLM PackedLoRALayerWeights.pack_moe signature: {type(e).__name__}: {e}"
+        ) from e
+
+    has_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if "is_non_gated_moe" not in sig.parameters and not has_kwargs:
+        import vllm  # type: ignore
+
+        raise RuntimeError(
+            "vLLM PackedLoRALayerWeights.pack_moe signature mismatch for sparse-ok patch: "
+            f"expected 'is_non_gated_moe' kwarg (or **kwargs), got signature={sig}. "
+            f"installed_vllm_version={getattr(vllm, '__version__', 'unknown')!r}"
         )
 
     def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
-        if not loras or (len(loras) % 3) != 0:
+        if loras and all(l is not None for l in loras):
             return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
+        if not loras or (len(loras) % 3) != 0:
+            raise RuntimeError(
+                f"Unexpected MoE LoRA pack_moe inputs for module={module_name!r}: len(loras)={len(loras)}"
+            )
+
         n_experts = len(loras) // 3
+
+        base_any = next((l for l in loras if l is not None), None)
+        if base_any is None:
+            raise RuntimeError(
+                f"MoE LoRA pack_moe got all-None loras for module={module_name!r}"
+            )
+        rank = int(getattr(base_any, "rank"))
+        lora_alpha = int(getattr(base_any, "lora_alpha"))
+
         base_w1 = next(
-            (loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None),
-            None,
+            (loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None), None
         )
         base_w2 = next(
             (loras[i * 3 + 1] for i in range(n_experts) if loras[i * 3 + 1] is not None),
@@ -80,18 +100,96 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
             None,
         )
         if base_w1 is None or base_w2 is None or base_w3 is None:
-            raise RuntimeError("MoE LoRA pack_moe missing base weights; cannot fill zeros")
+            raise RuntimeError(
+                f"MoE LoRA pack_moe missing base weight(s) for module={module_name!r}"
+            )
 
-        filled = list(loras)
-        for eid in range(n_experts):
-            i = eid * 3
-            if filled[i] is None:
-                filled[i] = _zero_like(base_w1, module_name)
-            if filled[i + 1] is None:
-                filled[i + 1] = _zero_like(base_w2, module_name)
-            if filled[i + 2] is None:
-                filled[i + 2] = _zero_like(base_w3, module_name)
-        return orig_fn(cls, filled, module_name)
+        only_expert0 = True
+        for eid in range(1, n_experts):
+            if (
+                loras[eid * 3] is not None
+                or loras[eid * 3 + 1] is not None
+                or loras[eid * 3 + 2] is not None
+            ):
+                only_expert0 = False
+                break
+
+        if only_expert0:
+            # Shared-expert export (expert 0 only): expand across experts without
+            # materializing full per-expert tensors.
+            #
+            # vLLM later calls optimize() (in-place scaling merge) on packed weights.
+            # expand(...) returns a view with internal overlap; avoid in-place ops by
+            # pre-applying scaling out-of-place and setting scaling=1.
+            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
+            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
+            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
+
+            w1_lora_b_base = base_w1.lora_b * float(getattr(base_w1, "scaling", lora_alpha / rank))
+            w2_lora_b_base = base_w2.lora_b * float(getattr(base_w2, "scaling", lora_alpha / rank))
+            w3_lora_b_base = base_w3.lora_b * float(getattr(base_w3, "scaling", lora_alpha / rank))
+            w1_lora_b = w1_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w1_lora_b_base.shape))
+            w2_lora_b = w2_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w2_lora_b_base.shape))
+            w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
+
+            packed_scaling = [1.0, 1.0, 1.0]
+        else:
+            # General sparse case: missing experts default to base weights (zero delta),
+            # explicitly provided experts override.
+            w1_lora_a = (
+                base_w1.lora_a.unsqueeze(0)
+                .expand((n_experts,) + tuple(base_w1.lora_a.shape))
+                .clone()
+            )
+            w2_lora_a = (
+                base_w2.lora_a.unsqueeze(0)
+                .expand((n_experts,) + tuple(base_w2.lora_a.shape))
+                .clone()
+            )
+            w3_lora_a = (
+                base_w3.lora_a.unsqueeze(0)
+                .expand((n_experts,) + tuple(base_w3.lora_a.shape))
+                .clone()
+            )
+            w1_lora_b = (
+                base_w1.lora_b.unsqueeze(0)
+                .expand((n_experts,) + tuple(base_w1.lora_b.shape))
+                .clone()
+            )
+            w2_lora_b = (
+                base_w2.lora_b.unsqueeze(0)
+                .expand((n_experts,) + tuple(base_w2.lora_b.shape))
+                .clone()
+            )
+            w3_lora_b = (
+                base_w3.lora_b.unsqueeze(0)
+                .expand((n_experts,) + tuple(base_w3.lora_b.shape))
+                .clone()
+            )
+
+            for eid in range(n_experts):
+                w1 = loras[eid * 3]
+                w2 = loras[eid * 3 + 1]
+                w3 = loras[eid * 3 + 2]
+                if w1 is not None:
+                    w1_lora_a[eid].copy_(w1.lora_a)
+                    w1_lora_b[eid].copy_(w1.lora_b)
+                if w2 is not None:
+                    w2_lora_a[eid].copy_(w2.lora_a)
+                    w2_lora_b[eid].copy_(w2.lora_b)
+                if w3 is not None:
+                    w3_lora_a[eid].copy_(w3.lora_a)
+                    w3_lora_b[eid].copy_(w3.lora_b)
+            packed_scaling = None
+
+        return cls(
+            module_name,
+            rank,
+            [lora_alpha, lora_alpha, lora_alpha],
+            [w1_lora_a, w2_lora_a, w3_lora_a],
+            [w1_lora_b, w2_lora_b, w3_lora_b],
+            scaling=packed_scaling,
+        )
 
     pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
