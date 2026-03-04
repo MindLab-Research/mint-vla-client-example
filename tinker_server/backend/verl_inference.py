@@ -26,6 +26,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _mint_present_expert_ids_from_keys(keys: list[str]) -> set[int]:
+    import re
+
+    expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
+    out: set[int] = set()
+    for k in keys:
+        m = expert_pat.search(k)
+        if m is not None:
+            out.add(int(m.group(1)))
+    return out
+
+
+def _mint_present_expert_ids_from_adapter_dir(adapter_dir: str) -> set[int]:
+    from safetensors import safe_open
+
+    path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    with safe_open(path, framework="pt", device="cpu") as f:
+        return _mint_present_expert_ids_from_keys(list(f.keys()))
+
+
 # vLLM MoE LoRA support: tolerate shared-expert sparse adapters.
 #
 # vLLM's PackedLoRALayerWeights.pack_moe currently asserts that every expert has
@@ -332,6 +353,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 raise RuntimeError(f"vLLM worker pack_moe patch failed: {results}")
             self._mint_pack_moe_patched = True
 
+        async def _maybe_ensure_pack_moe_patched_for_adapter_dir(self, adapter_dir: object) -> None:
+            if not isinstance(adapter_dir, str) or not adapter_dir:
+                raise RuntimeError(f"vLLM LoRARequest missing lora_path: {adapter_dir!r}")
+            present = _mint_present_expert_ids_from_adapter_dir(adapter_dir)
+            if present == {0}:
+                await self._ensure_pack_moe_patched()
+
+        async def _maybe_ensure_pack_moe_patched_for_state_dict(self, state_dict: dict) -> None:
+            present = _mint_present_expert_ids_from_keys([str(k) for k in state_dict.keys()])
+            if present == {0}:
+                await self._ensure_pack_moe_patched()
+
         def _patch_lora_args(self, args):
             """Patch args Namespace with multi-LoRA config.
 
@@ -374,7 +407,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 pass  # May not have any LoRA loaded
 
             # Add new LoRA
-            await self._ensure_pack_moe_patched()
+            await self._maybe_ensure_pack_moe_patched_for_adapter_dir(getattr(lora_request, "lora_path", None))
             await self.engine.add_lora(lora_request)
 
         async def add_lora_from_tensors(
@@ -431,7 +464,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
-            await self._ensure_pack_moe_patched()
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -519,7 +552,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Add to engine (no need to remove - this is a new unique ID)
-            await self._ensure_pack_moe_patched()
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -554,7 +587,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 lora_path=lora_path,
             )
 
-            await self._ensure_pack_moe_patched()
+            await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
             await self.engine.add_lora(lora_request)
 
             # Track path for generate_with_lora (needed for GPU/CPU swap)

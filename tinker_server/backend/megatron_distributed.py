@@ -2023,6 +2023,14 @@ class MegatronRankWorker:
                 import re
 
                 if os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0":
+                    mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
+                    if mode not in {"1", "true", "yes"}:
+                        raise RuntimeError(
+                            "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT requires shared-expert semantics. "
+                            "If you want a full per-expert export, set MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0. "
+                            "Otherwise enable shared export via MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1."
+                        )
+
                     # Determine EP size.
                     try:
                         from megatron.core import parallel_state as mpu
@@ -2056,9 +2064,7 @@ class MegatronRankWorker:
                             for r in range(ep_size)
                             if (base + (1 if r < rem else 0)) > 0
                         }
-
-                        mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
-                        if mode not in {"1", "true", "yes"} and reps != {0}:
+                        if reps != {0}:
                             raise RuntimeError(
                                 "Unsupported MoE LoRA sparse export: one representative expert per EP shard "
                                 "is not loadable by the current vLLM hot-load patch. "

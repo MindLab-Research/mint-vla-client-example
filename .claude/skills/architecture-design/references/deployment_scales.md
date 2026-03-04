@@ -18,10 +18,10 @@ Rule:
 
 Note (vLLM internal worker patching):
 - Some vLLM features in this repo patch TP worker internals via EngineCore collective RPC. This requires
-  `VLLM_ALLOW_INSECURE_SERIALIZATION=1` inside the vLLM actor process. By default the code enables it
-  for backwards compatibility, but you can explicitly disable auto-enable via
-  `MINT_VLLM_ALLOW_INSECURE_SERIALIZATION=0` (only safe if you do not need collective RPC patching, e.g.
-  when using full per-expert MoE LoRA exports).
+  `VLLM_ALLOW_INSECURE_SERIALIZATION=1` inside the vLLM actor process.
+- The code uses collective RPC patching only when loading a sparse "shared-expert" MoE LoRA (expert-0-only).
+- You can explicitly disable auto-enable via `MINT_VLLM_ALLOW_INSECURE_SERIALIZATION=0`. This is safe only
+  if you do not load sparse shared-expert adapters (for example if you export full per-expert adapters).
 
 ## 2) API server / Ray driver venv (host Python)
 
