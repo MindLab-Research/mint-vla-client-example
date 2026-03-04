@@ -19,7 +19,10 @@ Hard rules:
 - Minimize downtime: prefer killing a single actor over restarting the whole server.
 - Never swallow an incident: always leave artifacts under `results/` and, when appropriate, file a GitHub issue.
 - No START notifications. Send exactly one final Feishu report at the end, even if all results are OK.
-- Use the official production base URL `https://mint.macaron.im` (do not use SSH tunnels / `localhost`).
+- Production base URLs:
+  - `https://mint.macaron.im` (international access)
+  - `https://mint.macaron.xin` (China access)
+- In this skill, use `https://mint.macaron.xin` as the base URL (do not use SSH tunnels / `localhost`).
 - Do not use an ad-hoc "hung after 240s" cutoff. Under load, 235B sampling can queue for many minutes. Treat only the configured per-request timeout (`--timeout-s` / `MINT_TEST_TIMEOUT_S`) or explicit server-side errors as failure signals.
 
 ## Inputs
@@ -52,8 +55,8 @@ set -a && source .secrets.env && set +a
 ```
 
 2) Confirm production targeting:
-- Set `TINKER_BASE_URL=https://mint.macaron.im`.
-- Refuse to run if `TINKER_BASE_URL` is anything else (including `localhost:*`).
+- Set `TINKER_BASE_URL=https://mint.macaron.xin`.
+- Refuse to run if `TINKER_BASE_URL` is anything else (including `localhost:*` and `https://mint.macaron.im`).
 
 3) (Optional) Quick read-only probes (not sufficient alone):
 ```bash

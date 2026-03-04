@@ -56,7 +56,7 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 |----------|-------|
 | SSH Host | `mint-prod-volcano` |
 | Port | 18000 |
-| External URL | `https://mint.macaron.im` |
+| External URL | `https://mint.macaron.im` (international), `https://mint.macaron.xin` (China) |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
 | Ray Configs | `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`, `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` |
@@ -153,7 +153,7 @@ curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/js
 
 Then recreate actors as needed and re-run placement checks above.
 
-**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint.macaron.im`. No additional setup required.
+**Reverse Proxy:** Port 18000 is reverse-proxied by Azure Gateway at `https://mint.macaron.im` (international) and `https://mint.macaron.xin` (China). No additional setup required.
 
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
 
