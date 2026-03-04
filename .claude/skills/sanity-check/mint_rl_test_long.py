@@ -131,30 +131,51 @@ def _patch_trust_remote_code_for_tokenizers() -> None:
 
     This only affects the local client process that runs this script.
     """
+    # Patch transformers AutoTokenizer directly (this is what tinker uses internally).
+    try:
+        from transformers import AutoTokenizer as _HF_AutoTokenizer  # type: ignore
+    except Exception as e:
+        _dbg(f"cannot import transformers.AutoTokenizer: {type(e).__name__}: {e}")
+        _HF_AutoTokenizer = None
+
+    if _HF_AutoTokenizer is not None and not getattr(
+        _HF_AutoTokenizer, "_mint_trust_remote_code_patched", False
+    ):
+        real_from_pretrained = _HF_AutoTokenizer.from_pretrained
+
+        def wrapped_from_pretrained(tokenizer_id: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+            if tokenizer_id == "moonshotai/Moonlight-16B-A3B-Instruct":
+                kwargs.setdefault("trust_remote_code", True)
+            return real_from_pretrained(tokenizer_id, *args, **kwargs)
+
+        _HF_AutoTokenizer.from_pretrained = wrapped_from_pretrained  # type: ignore[method-assign]
+        _HF_AutoTokenizer._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+        _dbg("patched transformers.AutoTokenizer.from_pretrained trust_remote_code for Moonlight tokenizer")
+
+    # Best-effort: patch any re-exported AutoTokenizer under tinker too (older SDK variants).
     try:
         import tinker.lib.public_interfaces.sampling_client as sampling_client  # type: ignore
-    except Exception as e:
-        _dbg(f"cannot import tinker.lib.public_interfaces.sampling_client: {type(e).__name__}: {e}")
+    except Exception:
         return
 
     if getattr(sampling_client, "_mint_trust_remote_code_patched", False):
         return
-
-    AutoTokenizer = getattr(sampling_client, "AutoTokenizer", None)
-    if AutoTokenizer is None:
-        _dbg("sampling_client.AutoTokenizer not present; skipping trust_remote_code patch")
+    AutoTokenizer2 = getattr(sampling_client, "AutoTokenizer", None)
+    if AutoTokenizer2 is None:
         return
+    if getattr(AutoTokenizer2, "_mint_trust_remote_code_patched", False):
+        sampling_client._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+        return
+    real2 = AutoTokenizer2.from_pretrained
 
-    real_from_pretrained = AutoTokenizer.from_pretrained
-
-    def wrapped_from_pretrained(tokenizer_id: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+    def wrapped2(tokenizer_id: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         if tokenizer_id == "moonshotai/Moonlight-16B-A3B-Instruct":
             kwargs.setdefault("trust_remote_code", True)
-        return real_from_pretrained(tokenizer_id, *args, **kwargs)
+        return real2(tokenizer_id, *args, **kwargs)
 
-    AutoTokenizer.from_pretrained = wrapped_from_pretrained  # type: ignore[method-assign]
+    AutoTokenizer2.from_pretrained = wrapped2  # type: ignore[method-assign]
+    AutoTokenizer2._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
     sampling_client._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
-    _dbg("patched AutoTokenizer.from_pretrained trust_remote_code for Moonlight tokenizer")
 
 
 def _parse_args() -> argparse.Namespace:
