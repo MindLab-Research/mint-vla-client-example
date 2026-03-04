@@ -336,13 +336,20 @@ def _get_or_create_ray_actor():
 
         def mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
+            now = time.time()
             if request_id in self._pending:
-                self._queued_at[request_id] = time.time()
+                self._queued_at[request_id] = now
+            m = self._meta.get(request_id) or {}
             if meta is not None:
-                m = self._meta.get(request_id) or {}
                 m.update(dict(meta))
-                self._meta[request_id] = m
-                self._update_op_from_meta(request_id, m)
+            if "queue_state" not in m:
+                m["queue_state"] = "queued"
+            if "stage" not in m:
+                m["stage"] = "queued"
+            if not isinstance(m.get("queued_at"), (int, float)):
+                m["queued_at"] = now
+            self._meta[request_id] = m
+            self._update_op_from_meta(request_id, m)
 
         def mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()

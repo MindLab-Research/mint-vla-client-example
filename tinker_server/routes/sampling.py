@@ -602,7 +602,7 @@ async def asample(
         future_store.mark_queued(
             request_id,
             meta={
-                "op": "asample",
+                "op": "sampling.asample",
                 "queue_state": "queued",
                 "queued_at": time.time(),
                 "stage": "queued",
@@ -990,7 +990,7 @@ async def compute_logprobs(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "compute_logprobs"})
+        future_store.mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="sampling.compute_logprobs",

@@ -189,7 +189,7 @@ async def save_weights(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "save_weights", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.save_weights",
@@ -298,7 +298,7 @@ async def save_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "save_state", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.save_state",
@@ -762,7 +762,7 @@ async def load_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "load_state", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.load_state",

@@ -49,7 +49,7 @@ def _response_stub():
 
 
 def test_issue_182_pending_payload_queue_backlog_reason(monkeypatch):
-    meta = {"queue_state": "queued", "stage": "queued", "op": "asample"}
+    meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
     import tinker_server.backend.api_work_queue as wq
 
@@ -70,7 +70,7 @@ def test_issue_182_pending_payload_queue_backlog_reason(monkeypatch):
 
 
 def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
-    meta = {"queue_state": "running", "stage": "prefill", "op": "asample"}
+    meta = {"queue_state": "running", "stage": "prefill", "op": "sampling.asample"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
     import tinker_server.backend.api_work_queue as wq
 
@@ -89,7 +89,7 @@ def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
 
 
 def test_issue_182_pending_payload_queue_lookup_unavailable_maps_503(monkeypatch):
-    meta = {"queue_state": "queued", "stage": "queued", "op": "asample"}
+    meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
     import tinker_server.backend.api_work_queue as wq
 

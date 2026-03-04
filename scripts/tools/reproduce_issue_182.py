@@ -101,12 +101,16 @@ def _check_pending_payload(body: dict, headers: dict[str, str]) -> None:
 
     if status == "queued":
         qp = body.get("queue_position")
-        if not isinstance(qp, int) or qp < 0:
-            raise RuntimeError(f"queue_position={qp!r} expected int>=0")
-        if qd < 1:
-            raise RuntimeError(f"queue_depth={qd!r} expected >=1 when queued")
-        if body.get("queue_state_reason") != "queue_backlog":
-            raise RuntimeError(f"queue_state_reason={body.get('queue_state_reason')!r} expected 'queue_backlog'")
+        if qp is not None:
+            if not isinstance(qp, int) or qp < 0:
+                raise RuntimeError(f"queue_position={qp!r} expected int>=0 or null")
+            if qd < 1:
+                raise RuntimeError(f"queue_depth={qd!r} expected >=1 when queue_position is set")
+        if isinstance(qd, int) and qd > 0:
+            if body.get("queue_state_reason") != "queue_backlog":
+                raise RuntimeError(
+                    f"queue_state_reason={body.get('queue_state_reason')!r} expected 'queue_backlog' when queue_depth>0"
+                )
 
     prog = body.get("progress")
     if isinstance(prog, dict):
@@ -123,8 +127,8 @@ def _format_pending_line(body: dict, headers: dict[str, str]) -> str:
         f"queue_state_reason={body.get('queue_state_reason')!r} "
         f"queue_depth={body.get('queue_depth')!r} "
         f"queue_position={body.get('queue_position')!r} "
-        f"queue_eta_s={body.get('queue_eta_s')!r} "
-        f"queue_progress={body.get('queue_progress')!r} "
+        f"estimated_wait_s={body.get('estimated_wait_s')!r} "
+        f"progress={body.get('progress')!r} "
         f"retry_after_s={body.get('retry_after_s')!r} "
         f"x_queue_depth={headers.get('X-Queue-Depth')!r} "
         f"x_queue_status={headers.get('X-Queue-Status')!r} "
