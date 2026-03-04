@@ -19,6 +19,7 @@ import contextvars
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import uuid
 from typing import Any
@@ -36,7 +37,9 @@ _OTEL_INITIALIZED = False
 _OTEL_LOG_HANDLER_ATTACHED = False
 _HTTP_REQUEST_COUNTER: Any | None = None
 _HTTP_DURATION_HISTOGRAM: Any | None = None
+_HTTP_ERROR_COUNTER: Any | None = None
 _TRACER: Any | None = None
+_OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 
 
 def set_request_id(request_id: str | None) -> None:
@@ -134,6 +137,49 @@ def add_trace_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> d
     return event_dict
 
 
+def add_component(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Structlog processor to add component field for easier incident filtering."""
+    if isinstance(event_dict.get("component"), str) and event_dict["component"]:
+        return event_dict
+    name = str(event_dict.get("logger") or getattr(logger, "name", "") or "")
+    if name.startswith("tinker_server."):
+        name = name[len("tinker_server.") :]
+    event_dict["component"] = name if name else "unknown"
+    return event_dict
+
+
+def add_operation(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Infer `op` from common `[op] ...` log prefixes when caller didn't provide one."""
+    if isinstance(event_dict.get("op"), str) and event_dict["op"]:
+        return event_dict
+    event = event_dict.get("event")
+    if isinstance(event, str):
+        match = _OP_PREFIX_RE.match(event.strip())
+        if match:
+            event_dict["op"] = match.group(1)
+    return event_dict
+
+
+def classify_failure_reason(error: Exception) -> str:
+    """Best-effort failure categorization for incident-first logs."""
+    typ = type(error).__name__.lower()
+    msg = str(error).lower()
+    text = f"{typ} {msg}"
+    if "timeout" in text:
+        return "timeout"
+    if "cancel" in text:
+        return "canceled"
+    if "oom" in text or "out of memory" in text or "resource_exhausted" in text:
+        return "resource_exhausted"
+    if "permission" in text or "forbidden" in text or "access denied" in text:
+        return "permission_denied"
+    if "not found" in text:
+        return "not_found"
+    if "validation" in text or "invalid" in text:
+        return "validation"
+    return "internal_error"
+
+
 def _parse_bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -160,7 +206,7 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
 def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
-    global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _TRACER
+    global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER, _TRACER
 
     if _OTEL_INITIALIZED:
         return
@@ -200,7 +246,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         tracer_provider = TracerProvider(resource=resource)
         tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
         trace.set_tracer_provider(tracer_provider)
-        _TRACER = trace.get_tracer("tinker_server.http")
+        _TRACER = trace.get_tracer("mint.http")
 
         # 2) Metrics
         export_interval_ms = int(os.getenv("OTEL_METRIC_EXPORT_INTERVAL_MS", "60000"))
@@ -211,11 +257,16 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         )
         meter_provider = MeterProvider(metric_readers=[metric_reader], resource=resource)
         metrics.set_meter_provider(meter_provider)
-        meter = metrics.get_meter("tinker_server.http")
+        meter = metrics.get_meter("mint.http")
         _HTTP_REQUEST_COUNTER = meter.create_counter(
             "mint_http_server_requests_total",
             unit="{request}",
-            description="Total HTTP requests handled by tinker-server",
+            description="Total HTTP requests handled by mint",
+        )
+        _HTTP_ERROR_COUNTER = meter.create_counter(
+            "mint_http_server_errors_total",
+            unit="{error}",
+            description="Total HTTP 5xx responses handled by mint",
         )
         _HTTP_DURATION_HISTOGRAM = meter.create_histogram(
             "mint_http_server_request_duration_ms",
@@ -267,6 +318,8 @@ def record_http_server_metrics(*, method: str, route: str, status_code: int, dur
     try:
         if _HTTP_REQUEST_COUNTER is not None:
             _HTTP_REQUEST_COUNTER.add(1, attributes=attrs)
+        if status_code >= 500 and _HTTP_ERROR_COUNTER is not None:
+            _HTTP_ERROR_COUNTER.add(1, attributes=attrs)
         if _HTTP_DURATION_HISTOGRAM is not None:
             _HTTP_DURATION_HISTOGRAM.record(float(duration_ms), attributes=attrs)
     except Exception:
@@ -288,6 +341,8 @@ def configure_logging() -> None:
         add_trace_id,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
+        add_component,
+        add_operation,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,

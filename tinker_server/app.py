@@ -23,6 +23,7 @@ from .config import config
 from .gateway import close_http_clients
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
 from .logging_context import (
+    classify_failure_reason,
     ensure_trace_id,
     extract_trace_id_from_traceparent,
     get_trace_id,
@@ -900,12 +901,47 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
     route = request.url.path
     start_s = time.perf_counter()
     status_code = 500
+    failure_error: Exception | None = None
+
+    def _log_request_observation(elapsed_ms: float) -> None:
+        if status_code >= 500:
+            reason = classify_failure_reason(failure_error or RuntimeError(f"http_{status_code}"))
+            logger.error(
+                "[http.request] failed method=%s route=%s status_code=%s elapsed_ms=%.3f failure_reason=%s error_type=%s next_action=%s",
+                method,
+                route,
+                int(status_code),
+                float(elapsed_ms),
+                reason,
+                type(failure_error).__name__ if failure_error is not None else "HTTPStatusError",
+                "check_logs_and_trace",
+            )
+            return
+        if status_code >= 400:
+            logger.warning(
+                "[http.request] client_error method=%s route=%s status_code=%s elapsed_ms=%.3f",
+                method,
+                route,
+                int(status_code),
+                float(elapsed_ms),
+            )
+            return
+        logger.info(
+            "[http.request] completed method=%s route=%s status_code=%s elapsed_ms=%.3f",
+            method,
+            route,
+            int(status_code),
+            float(elapsed_ms),
+        )
 
     if tracer is None:
         try:
             response = await call_next(request)
             status_code = int(getattr(response, "status_code", 500))
             return response
+        except Exception as e:
+            failure_error = e
+            raise
         finally:
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
@@ -914,6 +950,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 status_code=status_code,
                 duration_ms=elapsed_ms,
             )
+            _log_request_observation(elapsed_ms)
 
     try:
         from opentelemetry.propagate import extract
@@ -923,6 +960,9 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             response = await call_next(request)
             status_code = int(getattr(response, "status_code", 500))
             return response
+        except Exception as e:
+            failure_error = e
+            raise
         finally:
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
@@ -931,6 +971,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 status_code=status_code,
                 duration_ms=elapsed_ms,
             )
+            _log_request_observation(elapsed_ms)
 
     context = extract(dict(request.headers))
     span_name = f"{method} {route}"
@@ -963,6 +1004,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 span.set_status(Status(StatusCode.ERROR, f"http.status_code={status_code}"))
             return response
         except Exception as e:
+            failure_error = e
             if isinstance(e, HTTPException):
                 try:
                     status_code = int(e.status_code)
@@ -983,6 +1025,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 status_code=status_code,
                 duration_ms=elapsed_ms,
             )
+            _log_request_observation(elapsed_ms)
 
 
 @app.middleware("http")

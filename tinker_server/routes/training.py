@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
-from ..logging_context import set_request_id
+from ..logging_context import classify_failure_reason, set_request_id
 
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
@@ -498,6 +498,7 @@ async def _do_create_model(
     """Background task to create training model."""
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -583,7 +584,15 @@ async def _do_create_model(
             )
 
     except Exception as e:
-        logger.exception(f"[create_model] Failed: {e}")
+        logger.exception(
+            "[create_model] failed request_id=%s model_id=%s base_model=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(model_id),
+            str(request.base_model),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_actor",
+        )
         # Clean up session if it was created
         if training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
@@ -810,6 +819,7 @@ async def _do_create_model_from_state(
 ) -> None:
     """Background task to create model and load checkpoint."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -908,7 +918,15 @@ async def _do_create_model_from_state(
         future_store.resolve(request_id, response.model_dump())
 
     except Exception as e:
-        logger.exception(f"[create_model_from_state] Failed: {e}")
+        logger.exception(
+            "[create_model_from_state] failed request_id=%s model_id=%s base_model=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(_generate_model_id(request.session_id, request.model_seq_id)),
+            str(request.base_model),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_checkpoint_path_and_training_actor",
+        )
         # Clean up session if it was created
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
         if training_manager and training_manager.get_session(model_id):
@@ -1108,7 +1126,14 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
             )
 
     except Exception as e:
-        logger.exception(f"[forward_backward] Failed for request_id={request_id}: {e}")
+        logger.exception(
+            "[forward_backward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_batch_shape",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1241,6 +1266,7 @@ async def _do_train_step(
 ) -> None:
     """Background task for train_step."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1257,12 +1283,10 @@ async def _do_train_step(
             f"[{session.model_id}] train_step start request_id={request_id} "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
         )
-        print(msg, flush=True)
         logger.info(msg)
         result = await training_engine.train_step(session, request)
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        print(msg, flush=True)
         logger.info(msg)
         future_store.resolve(request_id, result)
 
@@ -1278,7 +1302,14 @@ async def _do_train_step(
             )
 
     except Exception as e:
-        logger.exception(f"[train_step] Failed: {e}")
+        logger.exception(
+            "[train_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_actor",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1409,6 +1440,7 @@ async def _do_forward(
 ) -> None:
     """Background task for forward."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1422,7 +1454,14 @@ async def _do_forward(
         future_store.resolve(request_id, result)
 
     except Exception as e:
-        logger.exception(f"[forward] Failed: {e}")
+        logger.exception(
+            "[forward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_input_tokens",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1543,6 +1582,7 @@ async def optim_step(
 async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: str | None) -> None:
     """Background task for optim_step."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1555,17 +1595,22 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
-        print(msg, flush=True)
         logger.info(msg)
         result = await training_engine.optim_step(session, request)
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        print(msg, flush=True)
         logger.info(msg)
         future_store.resolve(request_id, result)
 
     except Exception as e:
-        logger.exception(f"[optim_step] Failed: {e}")
+        logger.exception(
+            "[optim_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_optimizer_state",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1779,6 +1824,7 @@ async def _do_save_weights_for_sampler(
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -2005,7 +2051,14 @@ async def _do_save_weights_for_sampler(
         future_store.resolve(request_id, response.model_dump())
 
     except Exception as e:
-        logger.exception(f"[save_weights_for_sampler] Failed: {e}")
+        logger.exception(
+            "[save_weights_for_sampler] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_checkpoint_export_and_inference_registration",
+        )
         future_store.fail(request_id, str(e))
 
 
