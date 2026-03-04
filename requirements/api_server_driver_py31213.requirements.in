@@ -9,6 +9,14 @@
 # - Must include `torch` on the driver to deserialize tensors from Ray object store.
 # - Must keep `ray` version aligned with the cluster.
 # - Python patch version must match the Ray cluster Python exactly (Ray is strict).
+#
+# Reference (why this exists):
+# - Legacy `/vePFS-Mindverse/share/code/tinker-server-auth/.venv_cpu` is missing `torch`
+#   (import fails) and will break Ray tensor deserialization on the driver.
+#
+# Installation note:
+# - `torch==2.9.1+cpu` may require the PyTorch CPU wheel index. Example:
+#   python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1+cpu'
 
 ray[default]==2.51.1
 torch==2.9.1+cpu

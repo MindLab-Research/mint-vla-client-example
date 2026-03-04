@@ -31,5 +31,9 @@ Reference artifact:
 - `requirements/api_server_driver_py31213.requirements.in` is the top-level dependency list.
 - `requirements/api_server_driver_py31213.freeze.txt` is the pinned snapshot captured from `mint-dev:/root/venv_k2_py31213` (Python 3.12.13).
 
+Legacy reference (do not reuse as-is):
+- `/vePFS-Mindverse/share/code/tinker-server-auth/.venv_cpu` (Python 3.10.12) does NOT have `torch` installed.
+  Importing `torch` fails, so this venv is not sufficient for Ray tensor deserialization on the driver.
+
 Rule:
 - Use the host venv for the API server / driver. Do not rely on the Mint image to "patch" the driver environment at runtime.
