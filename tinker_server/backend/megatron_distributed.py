@@ -70,6 +70,31 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except Exception:
+        return default
+
+
+def _collect_python_thread_stacks(*, limit: int = 64) -> str:
+    import sys
+    import traceback
+
+    lines: list[str] = []
+    threads_by_ident = {t.ident: t for t in threading.enumerate()}
+    frames = sys._current_frames()
+    for tid, frame in frames.items():
+        thread = threads_by_ident.get(tid)
+        tname = thread.name if thread is not None else "unknown"
+        lines.append(f"\n--- thread_id={tid} name={tname} ---\n")
+        lines.extend(traceback.format_stack(frame, limit=limit))
+    return "".join(lines)
+
+
 def _model_key_from_base_model(base_model: str) -> str:
     import re
 
@@ -212,7 +237,7 @@ class DistributedConfig:
             )
 
 
-@ray.remote(num_gpus=0)
+@ray.remote(num_gpus=0, num_cpus=0)
 def get_node_ip_and_free_port() -> tuple[str, int]:
     """Get node IP and free port for master address.
 
@@ -229,7 +254,7 @@ def get_node_ip_and_free_port() -> tuple[str, int]:
     return ip, port
 
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=1, num_cpus=0)
 class MegatronRankWorker:
     """Single-rank worker for distributed Megatron training.
 
@@ -391,6 +416,55 @@ class MegatronRankWorker:
             "enter_total": self._sticky_train_mode_enter_total,
             "reuse_total": self._sticky_train_mode_reuse_total,
         }
+
+    def _start_slow_op_watchdog(
+        self,
+        *,
+        op: str,
+        session_id: str | None,
+        extra: str = "",
+    ) -> tuple[threading.Event, threading.Thread] | None:
+        timeout_s = _env_float("MINT_MEGATRON_STACK_DUMP_TIMEOUT_S", 0.0)
+        if timeout_s <= 0:
+            return None
+        stack_limit = max(8, _env_int("MINT_MEGATRON_STACK_DUMP_LIMIT", 96))
+        stop_event = threading.Event()
+        started_at = time.perf_counter()
+
+        def _watch() -> None:
+            if stop_event.wait(timeout_s):
+                return
+            elapsed_s = time.perf_counter() - started_at
+            try:
+                stack_dump = _collect_python_thread_stacks(limit=stack_limit)
+            except Exception as e:
+                logger.error(
+                    f"[Rank {self.rank}] slow_op_watchdog failed to collect stacks "
+                    f"op={op} session={session_id} elapsed_s={elapsed_s:.3f}: {type(e).__name__}: {e}"
+                )
+                return
+            logger.error(
+                f"[Rank {self.rank}] slow_op_watchdog timeout op={op} "
+                f"session={session_id} elapsed_s={elapsed_s:.3f} {extra}\n{stack_dump}"
+            )
+
+        thread = threading.Thread(
+            target=_watch,
+            name=f"rank{self.rank}-{op}-watchdog",
+            daemon=True,
+        )
+        thread.start()
+        return stop_event, thread
+
+    def _stop_slow_op_watchdog(self, token: tuple[threading.Event, threading.Thread] | None) -> None:
+        if token is None:
+            return
+        stop_event, thread = token
+        stop_event.set()
+        try:
+            thread.join(timeout=0.05)
+        except Exception:
+            pass
 
     def get_rss_bytes(self) -> int:
         with open("/proc/self/statm", encoding="utf-8") as f:
@@ -1192,27 +1266,55 @@ class MegatronRankWorker:
 
         logger.info(f"[Rank {self.rank}] override_transformer_config: {override_tf_config}")
 
-        engine_config = McoreEngineConfig(
-            tensor_model_parallel_size=self.config.tensor_parallel_size,
-            pipeline_model_parallel_size=self.config.pipeline_parallel_size,
-            expert_model_parallel_size=self.config.expert_parallel_size,
-            expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
-            context_parallel_size=self.config.context_parallel_size,
-            param_offload=True,
-            optimizer_offload=True,
-            grad_offload=use_grad_offload,
-            dtype="bfloat16",  # Base dtype, FP8 handled via override_transformer_config
+        engine_kwargs: dict[str, object] = {
+            "tensor_model_parallel_size": self.config.tensor_parallel_size,
+            "pipeline_model_parallel_size": self.config.pipeline_parallel_size,
+            "expert_model_parallel_size": self.config.expert_parallel_size,
+            "expert_tensor_parallel_size": self.config.expert_tensor_parallel_size,
+            "context_parallel_size": self.config.context_parallel_size,
+            "param_offload": True,
+            "optimizer_offload": True,
+            "grad_offload": use_grad_offload,
+            "dtype": "bfloat16",  # Base dtype, FP8 handled via override_transformer_config
             # THD ("remove padding") path in TransformerEngine disables FlashAttention when there is
             # any padding between sequences; verl's THD preprocessing pads sequences for alignment,
             # causing long-context training to fall back to O(seq^2) softmax and OOM at ~38K tokens.
             #
             # Disable remove-padding for non-MLA models so FlashAttention can be selected in BSHD.
-            use_remove_padding=has_mla_attention,
-            use_mbridge=True,
-            vanilla_mbridge=False,  # Required for LoRA - enables provider initialization
-            use_distributed_optimizer=True,  # Keep distributed optimizer for efficiency
-            override_transformer_config=override_tf_config,
-        )
+            "use_remove_padding": has_mla_attention,
+            "use_mbridge": True,
+            "vanilla_mbridge": False,  # Required for LoRA - enables provider initialization
+            "use_distributed_optimizer": True,  # Keep distributed optimizer for efficiency
+            "override_transformer_config": override_tf_config,
+        }
+
+        # Compatibility: older verl branches do not expose EngineRouterReplayConfig nor
+        # McoreEngineConfig.router_replay. Skip router replay config in that case.
+        engine_fields = getattr(McoreEngineConfig, "__dataclass_fields__", {}) or {}
+        if "router_replay" in engine_fields:
+            router_replay_cfg = None
+            try:
+                from verl.workers.config.engine import EngineRouterReplayConfig
+
+                router_replay_cfg = EngineRouterReplayConfig(mode=self.config.router_replay_mode)
+            except Exception:
+                try:
+                    from verl.workers.config.actor import RouterReplayConfig
+
+                    router_replay_cfg = RouterReplayConfig(mode=self.config.router_replay_mode)
+                except Exception as e:
+                    logger.warning(
+                        f"[Rank {self.rank}] router_replay config unavailable; disabling router replay: {e}"
+                    )
+            if router_replay_cfg is not None:
+                engine_kwargs["router_replay"] = router_replay_cfg
+        elif self.config.router_replay_mode != "disabled":
+            logger.warning(
+                f"[Rank {self.rank}] McoreEngineConfig has no router_replay field; "
+                "router replay mode ignored"
+            )
+
+        engine_config = McoreEngineConfig(**engine_kwargs)
         print(
             f"[Rank {self.rank}] McoreEngineConfig: TP={engine_config.tensor_model_parallel_size}, "
             f"EP={engine_config.expert_model_parallel_size}, ETP={engine_config.expert_tensor_parallel_size}, "
@@ -1526,11 +1628,19 @@ class MegatronRankWorker:
         def _run_forward_backward_compute():
             nonlocal result, forward_backward_batch_ms
             t_fb0 = time.perf_counter()
-            result = self.engine.forward_backward_batch(
-                data=data,
-                loss_function=loss_function,
-                forward_only=False,
+            watchdog = self._start_slow_op_watchdog(
+                op="forward_backward_batch",
+                session_id=session_id,
+                extra=f"items={len(data_items)} loss_fn={loss_fn}",
             )
+            try:
+                result = self.engine.forward_backward_batch(
+                    data=data,
+                    loss_function=loss_function,
+                    forward_only=False,
+                )
+            finally:
+                self._stop_slow_op_watchdog(watchdog)
             forward_backward_batch_ms = (time.perf_counter() - t_fb0) * 1000.0
 
             if result:
@@ -2011,58 +2121,66 @@ class MegatronRankWorker:
         def _run_optim_core():
             nonlocal grad_norm, current_lr, optim_step_batch_ms
             t_opt0 = time.perf_counter()
-
-            # DEBUG: Check optimizer state size BEFORE step
-            if self.rank == 0:
-                from megatron.core.optimizer import ChainedOptimizer
-
-                optimizer = self.engine.optimizer
-                if optimizer is not None:
-                    def iter_optimizers(opt):
-                        if isinstance(opt, ChainedOptimizer):
-                            return opt.chained_optimizers
-                        return [opt]
-
-                    for i, _opt in enumerate(iter_optimizers(optimizer)):
-                        if hasattr(_opt, "optimizer") and _opt.optimizer is not None:
-                            inner_opt = _opt.optimizer
-                            state = inner_opt.state
-                            state_size = len(state) if hasattr(state, "__len__") else "unknown"
-                            first_state = None
-                            if state:
-                                first_param = next(iter(state), None)
-                                if first_param is not None:
-                                    first_state = {
-                                        k: v.shape if hasattr(v, "shape") else v
-                                        for k, v in state[first_param].items()
-                                    }
-                            print(
-                                f"[Rank {self.rank}] optim_step BEFORE: opt[{i}] state size = {state_size}, "
-                                f"first_state_keys = {first_state}",
-                                flush=True,
-                            )
-
-            grad_norm = self.engine.optimizer_step()
-            current_lr = self.engine.lr_scheduler_step()
-
+            watchdog = self._start_slow_op_watchdog(
+                op="optim_step_core",
+                session_id=session_id,
+                extra=f"lr={learning_rate}",
+            )
             try:
-                from verl.utils.megatron_utils import unwrap_model
 
-                model = unwrap_model(self.engine.module)
-                while isinstance(model, list):
-                    model = model[0]
-                self._zero_disabled_lora_params(
-                    model, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
-                )
-            except Exception:
-                pass
+                # DEBUG: Check optimizer state size BEFORE step
+                if self.rank == 0:
+                    from megatron.core.optimizer import ChainedOptimizer
 
-            self.log_memory_breakdown("after_optim_step")
-            optim_step_batch_ms = (time.perf_counter() - t_opt0) * 1000.0
+                    optimizer = self.engine.optimizer
+                    if optimizer is not None:
+                        def iter_optimizers(opt):
+                            if isinstance(opt, ChainedOptimizer):
+                                return opt.chained_optimizers
+                            return [opt]
 
-            if session_id is not None:
-                self._session_gradients[session_id] = None
-                logger.debug(f"[Rank {self.rank}] Marked gradients as consumed for session {session_id}")
+                        for i, _opt in enumerate(iter_optimizers(optimizer)):
+                            if hasattr(_opt, "optimizer") and _opt.optimizer is not None:
+                                inner_opt = _opt.optimizer
+                                state = inner_opt.state
+                                state_size = len(state) if hasattr(state, "__len__") else "unknown"
+                                first_state = None
+                                if state:
+                                    first_param = next(iter(state), None)
+                                    if first_param is not None:
+                                        first_state = {
+                                            k: v.shape if hasattr(v, "shape") else v
+                                            for k, v in state[first_param].items()
+                                        }
+                                print(
+                                    f"[Rank {self.rank}] optim_step BEFORE: opt[{i}] state size = {state_size}, "
+                                    f"first_state_keys = {first_state}",
+                                    flush=True,
+                                )
+
+                grad_norm = self.engine.optimizer_step()
+                current_lr = self.engine.lr_scheduler_step()
+
+                try:
+                    from verl.utils.megatron_utils import unwrap_model
+
+                    model = unwrap_model(self.engine.module)
+                    while isinstance(model, list):
+                        model = model[0]
+                    self._zero_disabled_lora_params(
+                        model, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+                    )
+                except Exception:
+                    pass
+
+                self.log_memory_breakdown("after_optim_step")
+                optim_step_batch_ms = (time.perf_counter() - t_opt0) * 1000.0
+
+                if session_id is not None:
+                    self._session_gradients[session_id] = None
+                    logger.debug(f"[Rank {self.rank}] Marked gradients as consumed for session {session_id}")
+            finally:
+                self._stop_slow_op_watchdog(watchdog)
 
         grad_norm = None
         current_lr = None
@@ -4320,7 +4438,7 @@ class MegatronSessionStateManager:
         return deleted
 
 
-@ray.remote(num_gpus=0)
+@ray.remote(num_gpus=0, num_cpus=0)
 class MegatronWorkerGroup:
     """Manages N distributed MegatronRankWorkers.
 
@@ -4365,6 +4483,63 @@ class MegatronWorkerGroup:
 
     def get_master_addr(self) -> str | None:
         return self._master_addr
+
+    def _start_slow_group_watchdog(
+        self,
+        *,
+        op: str,
+        session_id: str | None,
+        extra: str = "",
+    ) -> tuple[threading.Event, threading.Thread] | None:
+        timeout_s = _env_float("MINT_MEGATRON_STACK_DUMP_TIMEOUT_S", 0.0)
+        if timeout_s <= 0:
+            return None
+        stack_limit = max(8, _env_int("MINT_MEGATRON_STACK_DUMP_LIMIT", 96))
+        stop_event = threading.Event()
+        started_at = time.perf_counter()
+
+        def _watch() -> None:
+            if stop_event.wait(timeout_s):
+                return
+            elapsed_s = time.perf_counter() - started_at
+            try:
+                stack_dump = _collect_python_thread_stacks(limit=stack_limit)
+            except Exception as e:
+                logger.error(
+                    "[MegatronWorkerGroup] slow watchdog failed op=%s session=%s elapsed_s=%.3f: %s: %s",
+                    op,
+                    session_id,
+                    float(elapsed_s),
+                    type(e).__name__,
+                    e,
+                )
+                return
+            logger.error(
+                "[MegatronWorkerGroup] slow watchdog timeout op=%s session=%s elapsed_s=%.3f %s\n%s",
+                op,
+                session_id,
+                float(elapsed_s),
+                extra,
+                stack_dump,
+            )
+
+        thread = threading.Thread(
+            target=_watch,
+            name=f"mg-group-{op}-watchdog",
+            daemon=True,
+        )
+        thread.start()
+        return stop_event, thread
+
+    def _stop_slow_group_watchdog(self, token: tuple[threading.Event, threading.Thread] | None) -> None:
+        if token is None:
+            return
+        stop_event, thread = token
+        stop_event.set()
+        try:
+            thread.join(timeout=0.05)
+        except Exception:
+            pass
 
     def _initialize(self):
         """Create placement group, spawn workers, then initialize them all together."""
@@ -4467,12 +4642,16 @@ class MegatronWorkerGroup:
             if v is not None:
                 runtime_env["env_vars"][k] = v
 
-        # Forward DeepEP knobs into rank workers.
-        #
+        # Forward train-mode/diagnostic and DeepEP knobs into rank workers.
         # Rank workers run on GPU nodes; they do NOT inherit the API server's
-        # environment unless we explicitly forward selected env vars into the
-        # Ray runtime_env.
+        # environment unless we explicitly forward selected env vars.
         for k in (
+            "MINT_MEGATRON_STICKY_TRAIN_MODE",
+            "MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S",
+            "MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM",
+            "MINT_MEGATRON_STICKY_TIMING_DIAG",
+            "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
+            "MINT_MEGATRON_STACK_DUMP_LIMIT",
             "MINT_MEGATRON_ENABLE_DEEPEP",
             "MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE",
             "MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
@@ -4484,16 +4663,9 @@ class MegatronWorkerGroup:
                 runtime_env["env_vars"][k] = v
         if disable_nccl_ib or os.environ.get("MINT_NCCL_IB_DISABLE", "0") == "1":
             runtime_env["env_vars"]["NCCL_IB_DISABLE"] = "1"
-            # Volcano images can set an external NCCL net plugin (e.g. RDMA/SHARP) via env.
-            # When `train_nccl_ib_disable` is requested, force socket transport to avoid
-            # multi-node NCCL init instability.
-            runtime_env["env_vars"]["NCCL_NET"] = "Socket"
-            runtime_env["env_vars"]["NCCL_NET_PLUGIN"] = "none"
         else:
-            # Explicitly enable IB transport for distributed training. This overrides any
-            # inherited env from the worker pods (defaults should be IB when available).
+            # Keep default NCCL transport selection; only expose IB toggle.
             runtime_env["env_vars"]["NCCL_IB_DISABLE"] = "0"
-            runtime_env["env_vars"]["NCCL_NET"] = "IB"
 
         # Get master address from first bundle's node
         master_addr, master_port = ray.get(
@@ -4515,7 +4687,7 @@ class MegatronWorkerGroup:
             logger.info(f"[MegatronWorkerGroup] Spawning rank {rank}")
             worker = MegatronRankWorker.options(
                 num_gpus=1,  # Ray sets CUDA_VISIBLE_DEVICES before process starts
-                num_cpus=1,
+                num_cpus=0,
                 scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
                     placement_group=self.placement_group,
                     placement_group_bundle_index=rank,
@@ -4788,25 +4960,33 @@ class MegatronWorkerGroup:
         # Issue #44: Ensure correct session's LoRA weights are loaded before training
         # This saves outgoing session state and loads incoming session state
         effective_session_id = session_id or self._current_session
-        self._ensure_session_loaded(
-            effective_session_id,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
+        watchdog = self._start_slow_group_watchdog(
+            op="forward_backward",
+            session_id=effective_session_id,
+            extra=f"items={len(data_items)} loss_fn={loss_fn}",
         )
-        t1 = time.perf_counter() if timing else 0.0
-
-        # Send raw data_items to workers (TensorDict created locally on each worker
-        # to avoid Ray serialization issues with nested tensors)
-        t2 = time.perf_counter() if timing else 0.0
-        futures = [
-            w.forward_backward.remote(
-                data_items, loss_fn, loss_fn_config, rollout_correction_config, effective_session_id, reset_bias
+        try:
+            self._ensure_session_loaded(
+                effective_session_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
-            for w in self.workers
-        ]
-        results = ray.get(futures)
-        t3 = time.perf_counter() if timing else 0.0
+            t1 = time.perf_counter() if timing else 0.0
+
+            # Send raw data_items to workers (TensorDict created locally on each worker
+            # to avoid Ray serialization issues with nested tensors)
+            t2 = time.perf_counter() if timing else 0.0
+            futures = [
+                w.forward_backward.remote(
+                    data_items, loss_fn, loss_fn_config, rollout_correction_config, effective_session_id, reset_bias
+                )
+                for w in self.workers
+            ]
+            results = ray.get(futures)
+            t3 = time.perf_counter() if timing else 0.0
+        finally:
+            self._stop_slow_group_watchdog(watchdog)
         if timing:
             logger.info(
                 f"[MegatronWorkerGroup] forward_backward timing: "
@@ -5898,6 +6078,19 @@ def get_or_create_megatron_worker_group(
             for k in (
                 "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
                 "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+            ):
+                v = os.environ.get(k)
+                if v is not None:
+                    runtime_env["env_vars"][k] = v
+            # Forward sticky/diagnostic knobs into the detached Megatron actor
+            # so group-level watchdog and sticky behavior match server settings.
+            for k in (
+                "MINT_MEGATRON_STICKY_TRAIN_MODE",
+                "MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S",
+                "MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM",
+                "MINT_MEGATRON_STICKY_TIMING_DIAG",
+                "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
+                "MINT_MEGATRON_STACK_DUMP_LIMIT",
             ):
                 v = os.environ.get(k)
                 if v is not None:
