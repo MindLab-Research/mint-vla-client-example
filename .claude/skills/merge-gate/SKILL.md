@@ -540,7 +540,7 @@ gh pr create --base main --head develop --title "Release: <version>" --body-file
 | Issue | Solution |
 |-------|----------|
 | Pre-flight fails: 0 GPUs | Kill stale actors (see mint-dev skill section 6) |
-| Pre-flight fails: cluster disconnected | Reconnect: `ssh mint-dev "ray start --address='<IP>:6379'"` |
+| Pre-flight fails: cluster disconnected | Verify head reachable without starting a local raylet: `ssh mint-dev "ray status --address='<IP>:6379'"` |
 | Dense tests timeout | Check server logs, restart server |
 | MoE tests fail to start | Need 8 GPUs (TP=4), add worker via volcano-cluster |
 | MoE tests OOM | Kill vLLM, restart with fresh actor |
