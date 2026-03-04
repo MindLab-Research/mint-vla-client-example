@@ -2008,10 +2008,16 @@ class MegatronRankWorker:
                 logger.info(f"[Rank 0] Filtered {before - len(adapter_state)} MLP/expert params (export_adapter_weights)")
 
             # For MoE models exporting per-expert LoRA, the full per-expert tree can be
-            # extremely large (K2: ~140k tensors, ~77GB). In current Megatron-Bridge
-            # integration, expert LoRA weights are shared within each EP shard; exporting
-            # only one representative expert per EP shard is sufficient for vLLM, and
-            # vLLM will fill missing experts (patched via sitecustomize).
+            # extremely large (K2: ~140k tensors, ~77GB).
+            #
+            # Current vLLM hot-load support in this repo only supports:
+            # - full per-expert exports (all experts present), OR
+            # - "shared-expert" exports (expert 0 only) where vLLM broadcasts expert 0
+            #   weights to all experts at load time.
+            #
+            # A "one representative expert per EP shard" sparse export is not supported
+            # by the current vLLM loader patch (it fail-fast) because correct filling
+            # requires EP shard aware mapping.
             if model_is_moe and use_per_expert_lora:
                 import os
                 import re
@@ -2050,6 +2056,16 @@ class MegatronRankWorker:
                             for r in range(ep_size)
                             if (base + (1 if r < rem else 0)) > 0
                         }
+
+                        mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
+                        if mode not in {"1", "true", "yes"} and reps != {0}:
+                            raise RuntimeError(
+                                "Unsupported MoE LoRA sparse export: one representative expert per EP shard "
+                                "is not loadable by the current vLLM hot-load patch. "
+                                "Use either (1) full per-expert export by setting MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0, "
+                                "or (2) expert-0-only shared export by setting MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1."
+                                f" ep_size={ep_size} num_experts={num_experts} reps={sorted(reps)}"
+                            )
 
                         # Keep all non-expert keys + only representative expert keys.
                         expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
