@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     pass
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import server_config
+from tinker_server.config import config as server_config
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
 logger = logging.getLogger(__name__)

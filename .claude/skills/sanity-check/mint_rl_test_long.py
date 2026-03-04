@@ -125,6 +125,33 @@ def _install_tinker_future_debug() -> None:
     _dbg("installed tinker APIFuture request_id logger")
 
 
+def _patch_trust_remote_code_for_tokenizers() -> None:
+    """
+    Ensure non-interactive runs don't hang on tokenizer trust_remote_code prompts.
+
+    This only affects the local client process that runs this script.
+    """
+    try:
+        import tinker.lib.public_interfaces.sampling_client as sampling_client  # type: ignore
+    except Exception as e:
+        _dbg(f"cannot import tinker.lib.public_interfaces.sampling_client: {type(e).__name__}: {e}")
+        return
+
+    if getattr(sampling_client, "_mint_trust_remote_code_patched", False):
+        return
+
+    real_from_pretrained = sampling_client.AutoTokenizer.from_pretrained
+
+    def wrapped_from_pretrained(tokenizer_id: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        if tokenizer_id == "moonshotai/Moonlight-16B-A3B-Instruct":
+            kwargs.setdefault("trust_remote_code", True)
+        return real_from_pretrained(tokenizer_id, *args, **kwargs)
+
+    sampling_client.AutoTokenizer.from_pretrained = wrapped_from_pretrained  # type: ignore[method-assign]
+    sampling_client._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+    _dbg("patched AutoTokenizer.from_pretrained trust_remote_code for Moonlight tokenizer")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MinT RL arithmetic demo (long prompts)")
     parser.add_argument(
@@ -311,6 +338,7 @@ TIMEOUT_S = float(args.timeout_s)
 load_dotenv(override=False)
 
 _install_tinker_future_debug()
+_patch_trust_remote_code_for_tokenizers()
 
 print(f"TINKER_BASE_URL={os.environ.get('TINKER_BASE_URL')!r}")
 if os.environ.get("TINKER_API_KEY"):

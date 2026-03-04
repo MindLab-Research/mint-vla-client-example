@@ -332,6 +332,8 @@ MODEL_CONFIGS = {
         max_model_len=8192,  # 8K context
         is_mla=True,  # DeepSeek V3 MLA architecture
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
 }
 

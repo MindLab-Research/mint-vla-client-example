@@ -616,6 +616,13 @@ def _create_multinode_vllm_actor(
                         f"Installed vllm={getattr(vllm, '__version__', 'unknown')!r} does not support it "
                         f"(AsyncEngineArgs.__init__ signature={sig})."
                     )
+            all2all_backend_env = os.environ.get("MINT_VLLM_ALL2ALL_BACKEND", "").strip().lower()
+            default_all2all_backend = (
+                "deepep_high_throughput"
+                if self.enable_expert_parallel
+                else "allgather_reducescatter"
+            )
+            all2all_backend = all2all_backend_env or default_all2all_backend
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -623,6 +630,7 @@ def _create_multinode_vllm_actor(
                 data_parallel_size=self.data_parallel_size,
                 data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
                 enable_expert_parallel=self.enable_expert_parallel,
+                all2all_backend=all2all_backend,
                 distributed_executor_backend=distributed_executor_backend,
                 disable_custom_all_reduce=True,  # Avoid PyNcclCommunicator issues in multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
@@ -650,7 +658,7 @@ def _create_multinode_vllm_actor(
             logger.info(
                 f"Creating AsyncLLMEngine: "
                 f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
-                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, a2a_backend={all2all_backend}, "
                 f"backend={distributed_executor_backend}, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
                 f"fully_sharded_loras={fully_sharded_loras}, chunked_prefill={enable_chunked_prefill}, "
                 f"max_num_batched_tokens={max_num_batched_tokens}, "
@@ -1612,6 +1620,7 @@ class MultiNodeInferenceEngine:
                 * self.data_parallel_size
             )
             distributed_executor_backend = self.distributed_executor_backend
+            mp_pinned_node_ip: str | None = None
             if distributed_executor_backend == "mp":
                 # vLLM runs locally (single-node) inside this Ray actor and needs direct GPU access.
                 # Reserve all GPUs on a single node for this actor. vLLM will spawn local processes
@@ -1794,12 +1803,27 @@ class MultiNodeInferenceEngine:
                     f"[MultiNodeInferenceEngine] Volcano placement model={self.model_name} "
                     f"rq={volc_rq} nodes={node_ips}"
                 )
-                resources = compute_multinode_engine_resources(
-                    worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
-                )
-                controller_gpus = resources.controller_gpus
-                controller_cpus = resources.controller_cpus
-                total_required_gpus = resources.total_required_gpus
+                if distributed_executor_backend == "mp":
+                    # mp backend must run on a single node with all GPUs visible.
+                    if not node_ips:
+                        raise RuntimeError(
+                            f"no Volcano nodes selected for mp vLLM (rq={volc_rq}, required_gpus={worker_gpus})"
+                        )
+                    if len(node_ips) != 1:
+                        raise RuntimeError(
+                            f"mp vLLM requires exactly 1 node, got nodes={node_ips} (rq={volc_rq})"
+                        )
+                    mp_pinned_node_ip = node_ips[0]
+                    logger.info(
+                        f"[MultiNodeInferenceEngine] mp pin model={self.model_name} node={mp_pinned_node_ip}"
+                    )
+                else:
+                    resources = compute_multinode_engine_resources(
+                        worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
+                    )
+                    controller_gpus = resources.controller_gpus
+                    controller_cpus = resources.controller_cpus
+                    total_required_gpus = resources.total_required_gpus
 
             # Ensure shared adapter directory exists
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
@@ -1872,7 +1896,10 @@ class MultiNodeInferenceEngine:
                 }
             else:
                 # mp backend: no Ray child actors; schedule this actor directly onto 1 node with all GPUs.
-                scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
+                if mp_pinned_node_ip:
+                    scheduling_opts = {"resources": {f"node:{mp_pinned_node_ip}": 0.001}}
+                else:
+                    scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
@@ -1913,6 +1940,7 @@ class MultiNodeInferenceEngine:
                 "MINT_ENABLE_VLLM_IMPORT_PATCHES",
                 "MINT_VLLM_LOG_STATS",
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
+                "MINT_VLLM_ALL2ALL_BACKEND",
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",

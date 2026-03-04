@@ -920,6 +920,39 @@ class MegatronRankWorker:
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
                 f"top-{num_experts_per_tok} routing, permute_fusion=True"
             )
+            enable_deepep = (
+                _env_flag("MINT_MEGATRON_ENABLE_DEEPEP", default=False)
+                and int(getattr(self.config, "expert_parallel_size", 1) or 1) > 1
+            )
+            if enable_deepep:
+                moe_token_dispatcher_type = (
+                    os.environ.get("MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE", "flex").strip().lower()
+                )
+                override_tf_config["moe_token_dispatcher_type"] = moe_token_dispatcher_type
+                override_tf_config["moe_flex_dispatcher_backend"] = (
+                    os.environ.get("MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "deepep").strip().lower()
+                )
+                # NOTE: Megatron-LM still supports moe_enable_deepep but warns it's deprecated;
+                # keep it alongside moe_flex_dispatcher_backend for compatibility.
+                override_tf_config["moe_enable_deepep"] = True
+                override_tf_config["moe_router_dtype"] = (
+                    os.environ.get("MINT_MEGATRON_MOE_ROUTER_DTYPE", "fp32").strip().lower()
+                )
+                if moe_token_dispatcher_type != "alltoall":
+                    if override_tf_config.get("moe_shared_expert_overlap") is True:
+                        override_tf_config["moe_shared_expert_overlap"] = False
+                        logger.info(
+                            f"[Rank {self.rank}] Disabled moe_shared_expert_overlap for moe_token_dispatcher_type={moe_token_dispatcher_type}"
+                        )
+                sms = os.environ.get("MINT_MEGATRON_MOE_DEEPEP_NUM_SMS", "").strip()
+                if sms:
+                    override_tf_config["moe_deepep_num_sms"] = int(sms)
+                logger.info(
+                    f"[Rank {self.rank}] DeepEP enabled: dispatcher={override_tf_config['moe_token_dispatcher_type']}, "
+                    f"backend={override_tf_config['moe_flex_dispatcher_backend']}, "
+                    f"router_dtype={override_tf_config['moe_router_dtype']}, "
+                    f"deepep_num_sms={override_tf_config.get('moe_deepep_num_sms', 'default')}"
+                )
 
         override_tf_config["deallocate_pipeline_outputs"] = True
         grad_accum_fusion_available = False
@@ -4106,11 +4139,6 @@ class MegatronWorkerGroup:
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
-                # Fix flash-attn / TransformerEngine dynamic loading:
-                # flash_attn_2_cuda fails to import when libc10.so is not on the loader path,
-                # which leaves TE's flash_attn_func / flash_attn_varlen_func as None and crashes
-                # with "TypeError: 'NoneType' object is not callable".
-                "LD_LIBRARY_PATH": "/opt/venv/lib/python3.10/site-packages/torch/lib:/usr/local/cuda/lib64",
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
@@ -4124,6 +4152,22 @@ class MegatronWorkerGroup:
         for k in (
             "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
             "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
+
+        # Forward DeepEP knobs into rank workers.
+        #
+        # Rank workers run on GPU nodes; they do NOT inherit the API server's
+        # environment unless we explicitly forward selected env vars into the
+        # Ray runtime_env.
+        for k in (
+            "MINT_MEGATRON_ENABLE_DEEPEP",
+            "MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE",
+            "MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
+            "MINT_MEGATRON_MOE_ROUTER_DTYPE",
+            "MINT_MEGATRON_MOE_DEEPEP_NUM_SMS",
         ):
             v = os.environ.get(k)
             if v is not None:

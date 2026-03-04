@@ -30,6 +30,14 @@ DEFAULT_MAX_LORAS = 64  # GPU slots (~2.5GB for rank-32 Qwen-7B)
 DEFAULT_MAX_CPU_LORAS = 1024  # CPU cache for evicted adapters
 DEFAULT_MAX_LORA_RANK = 64  # Maximum supported rank
 
+# Env flag helper (keep local to avoid importing config parsing helpers).
+def _env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v not in {"0", "false", "no", "off"}
+
+
 # Well-known name for persistent vLLM actor
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
@@ -1249,7 +1257,10 @@ class MultiModelInferenceManager:
 
                 total_gpus = int(config.total_gpus)
                 pipeline_parallel_size = int(getattr(config, "inference_pp", 1) or 1)
-                enable_expert_parallel = bool(config.is_moe and config.inference_dp > 1)
+                enable_expert_parallel = _env_flag(
+                    "MINT_VLLM_ENABLE_EXPERT_PARALLEL",
+                    default=bool(config.is_moe and config.inference_dp > 1),
+                )
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
                     f"actor={actor_name}, TP={config.inference_tp}, PP={pipeline_parallel_size}, DP={config.inference_dp}, "

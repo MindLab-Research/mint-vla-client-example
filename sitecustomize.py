@@ -413,6 +413,55 @@ def _patch_vllm_lora_optimize_overlap_safe() -> None:
         Packed.optimize = optimize  # type: ignore[method-assign]
 
 
+def _patch_vllm_lora_pin_memory_overlap_safe() -> None:
+    """Avoid pin_memory() crash on overlapping MoE LoRA tensors.
+
+    vLLM pins LoRA tensors after packing/merging inside
+    `LoRAModelManager._create_merged_loras_inplace`:
+      lora.lora_b[index] = lora.lora_b[index].pin_memory()
+
+    When MoE LoRA weights are represented as `expand(...)` views (to avoid
+    materializing [num_experts, ...] tensors for shared-expert exports), calling
+    `pin_memory()` can fail with:
+      "unsupported operation: more than one element ... refers to a single
+       memory location"
+
+    Do not materialize the expanded tensor. Instead, leave it unpinned when
+    pinning fails due to internal overlap.
+    """
+
+    try:
+        import torch
+        from vllm.lora.model_manager import LoRAModelManager  # type: ignore
+    except Exception:
+        return
+
+    orig = getattr(LoRAModelManager, "_create_merged_loras_inplace", None)
+    if not callable(orig) or getattr(orig, "_tinker_pin_memory_overlap_safe", False):
+        return
+
+    def _create_merged_loras_inplace(self, lora_model):  # type: ignore[no-untyped-def]
+        orig_pin = torch.Tensor.pin_memory  # type: ignore[attr-defined]
+
+        def _safe_pin_memory(t, *args, **kwargs):  # type: ignore[no-untyped-def]
+            try:
+                return orig_pin(t, *args, **kwargs)
+            except RuntimeError as e:
+                msg = str(e)
+                if "more than one element of the written-to tensor refers to a single memory location" in msg:
+                    return t
+                raise
+
+        torch.Tensor.pin_memory = _safe_pin_memory  # type: ignore[assignment]
+        try:
+            return orig(self, lora_model)
+        finally:
+            torch.Tensor.pin_memory = orig_pin  # type: ignore[assignment]
+
+    _create_merged_loras_inplace._tinker_pin_memory_overlap_safe = True  # type: ignore[attr-defined]
+    LoRAModelManager._create_merged_loras_inplace = _create_merged_loras_inplace  # type: ignore[method-assign]
+
+
 def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
     """Ensure vLLM Ray workers start with our PYTHONPATH.
 
@@ -549,6 +598,7 @@ def _apply_vllm_worker_patches() -> None:
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
         _patch_vllm_pack_moe_sparse_ok()
     _patch_vllm_lora_optimize_overlap_safe()
+    _patch_vllm_lora_pin_memory_overlap_safe()
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
         _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
         _patch_vllm_skip_dummy_lora_setup_when_inactive()
