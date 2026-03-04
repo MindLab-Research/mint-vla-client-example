@@ -34,6 +34,5 @@ datasets==4.4.2
 tensordict==0.11.0
 torchdata==0.11.0
 
-einops
-onnxscript
+onnxscript==0.5.2
 codetiming==1.4.0

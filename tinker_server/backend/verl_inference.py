@@ -391,6 +391,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 pass  # May not have any LoRA loaded
 
             # Add new LoRA
+            await self._ensure_pack_moe_patched()
             await self.engine.add_lora(lora_request)
 
         async def add_lora_from_tensors(
@@ -447,6 +448,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
+            await self._ensure_pack_moe_patched()
             await self.engine.add_lora(lora_request)
             return adapter_path
 

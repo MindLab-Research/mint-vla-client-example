@@ -356,7 +356,7 @@ Upstream (remote) server config requirements:
 - If `get_server_capabilities` on the upstream does not include a routed model, the gateway treats it as misconfiguration and fails requests for that model.
 
 GPU-aware tuning knobs:
-- GPU types: Volcano uses A800 80GB; Aliyun uses L20X 140GB.
+- GPU types: Volcano uses A800 80GB; Aliyun uses H (SM90).
 - Tune per-model TP/EP/CP and vLLM memory caps in `tinker_server/backend/model_registry.py`.
 - For environment-specific tuning without code changes, set `MINT_MODEL_CONFIG_OVERRIDES_JSON`:
   ```bash
