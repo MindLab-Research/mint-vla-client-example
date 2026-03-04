@@ -213,8 +213,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             import inspect
             import sys
             # Allow EngineCoreClient to send function objects for collective_rpc.
-            # This is used only for internal worker patching and never exposed via HTTP.
-            os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+            #
+            # This is used only for internal worker patching (e.g. MoE LoRA pack_moe
+            # sparse/shared-expert support) and is not exposed as an HTTP surface.
+            #
+            # Security note:
+            # - vLLM names this flag "insecure" because enabling it relaxes
+            #   serialization restrictions for RPC payloads.
+            # - We keep it enabled by default for backwards compatibility, but allow
+            #   explicitly disabling it via MINT_VLLM_ALLOW_INSECURE_SERIALIZATION=0.
+            allow_insecure = os.environ.get("MINT_VLLM_ALLOW_INSECURE_SERIALIZATION", "1").strip().lower()
+            if allow_insecure not in {"0", "false", "no", "off"}:
+                os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
@@ -306,6 +316,13 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
         async def _ensure_pack_moe_patched(self) -> None:
             if self._mint_pack_moe_patched:
                 return
+            if os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION", "").strip() not in {"1", "true", "yes"}:
+                raise RuntimeError(
+                    "vLLM worker patching requires VLLM_ALLOW_INSECURE_SERIALIZATION=1 "
+                    "(EngineCore collective_rpc sends function objects). "
+                    "Set MINT_VLLM_ALLOW_INSECURE_SERIALIZATION=1 (default) or export full per-expert adapters "
+                    "by setting MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0."
+                )
             engine_core = getattr(self.engine, "engine_core", None)
             rpc = getattr(engine_core, "collective_rpc_async", None)
             if rpc is None:
