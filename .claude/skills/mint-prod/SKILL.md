@@ -555,9 +555,14 @@ sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 
 ## 5. Ray Cluster
 
-**Connect SSH server to cluster:**
+**DO NOT run `ray start` on `mint-prod-volcano`:**
+- This host is a driver/API bastion. Starting a local raylet makes it schedulable and can steal actor placement.
+- Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head without starting a local node.
+
+**Safe connectivity check (no local raylet):**
 ```bash
-ssh mint-prod-volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+ssh mint-prod-volcano "ray status --address='<RAY_HEAD_IP>:6379'"
+ssh mint-prod-volcano "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
 ```
 
 **Get Ray head IP from PFS:**
