@@ -26,12 +26,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# vLLM MoE LoRA support: tolerate missing expert adapters.
+# vLLM MoE LoRA support: tolerate shared-expert sparse adapters.
 #
 # vLLM's PackedLoRALayerWeights.pack_moe currently asserts that every expert has
 # (w1,w2,w3) LoRA weights present. Our adapter export can be sparse across
-# experts (e.g. only one representative expert per layer), which is semantically
-# equivalent to zero delta for missing experts.
+# experts when using "shared expert" export (expert 0 only): the exported expert
+# weights are intended to be broadcast to all experts at load time.
 #
 # We patch pack_moe inside vLLM TP worker processes via EngineCore.collective_rpc.
 def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
@@ -134,53 +134,19 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
             packed_scaling = [1.0, 1.0, 1.0]
         else:
-            # General sparse case: missing experts default to base weights (zero delta),
-            # explicitly provided experts override.
-            w1_lora_a = (
-                base_w1.lora_a.unsqueeze(0)
-                .expand((n_experts,) + tuple(base_w1.lora_a.shape))
-                .clone()
-            )
-            w2_lora_a = (
-                base_w2.lora_a.unsqueeze(0)
-                .expand((n_experts,) + tuple(base_w2.lora_a.shape))
-                .clone()
-            )
-            w3_lora_a = (
-                base_w3.lora_a.unsqueeze(0)
-                .expand((n_experts,) + tuple(base_w3.lora_a.shape))
-                .clone()
-            )
-            w1_lora_b = (
-                base_w1.lora_b.unsqueeze(0)
-                .expand((n_experts,) + tuple(base_w1.lora_b.shape))
-                .clone()
-            )
-            w2_lora_b = (
-                base_w2.lora_b.unsqueeze(0)
-                .expand((n_experts,) + tuple(base_w2.lora_b.shape))
-                .clone()
-            )
-            w3_lora_b = (
-                base_w3.lora_b.unsqueeze(0)
-                .expand((n_experts,) + tuple(base_w3.lora_b.shape))
-                .clone()
-            )
-
+            present_eids: set[int] = set()
             for eid in range(n_experts):
-                w1 = loras[eid * 3]
-                w2 = loras[eid * 3 + 1]
-                w3 = loras[eid * 3 + 2]
-                if w1 is not None:
-                    w1_lora_a[eid].copy_(w1.lora_a)
-                    w1_lora_b[eid].copy_(w1.lora_b)
-                if w2 is not None:
-                    w2_lora_a[eid].copy_(w2.lora_a)
-                    w2_lora_b[eid].copy_(w2.lora_b)
-                if w3 is not None:
-                    w3_lora_a[eid].copy_(w3.lora_a)
-                    w3_lora_b[eid].copy_(w3.lora_b)
-            packed_scaling = None
+                if (
+                    loras[eid * 3] is not None
+                    or loras[eid * 3 + 1] is not None
+                    or loras[eid * 3 + 2] is not None
+                ):
+                    present_eids.add(eid)
+            raise RuntimeError(
+                "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
+                f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
+            )
 
         return cls(
             module_name,
@@ -497,23 +463,33 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             adapter_path = temp_dir
 
             # DEBUG: Print tensor norms to trace LoRA values on vLLM side
-            print(f"[DEBUG vLLM add_lora_with_id] lora_int_id={lora_int_id}, state_dict has {len(state_dict)} keys", flush=True)
-            total_norm = 0.0
-            nonzero_count = 0
-            for k, v in list(state_dict.items())[:10]:
-                import torch
-                norm = float(v.norm().item()) if isinstance(v, torch.Tensor) else 0.0
-                total_norm += norm
-                if norm > 1e-8:
-                    nonzero_count += 1
-                print(f"[DEBUG vLLM add_lora_with_id] {k}: norm={norm:.6f}", flush=True)
-            print(f"[DEBUG vLLM add_lora_with_id] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}", flush=True)
+            debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
+            if debug:
+                print(
+                    f"[DEBUG vLLM add_lora_with_id] lora_int_id={lora_int_id}, state_dict has {len(state_dict)} keys",
+                    flush=True,
+                )
+                total_norm = 0.0
+                nonzero_count = 0
+                for k, v in list(state_dict.items())[:10]:
+                    import torch
+
+                    norm = float(v.norm().item()) if isinstance(v, torch.Tensor) else 0.0
+                    total_norm += norm
+                    if norm > 1e-8:
+                        nonzero_count += 1
+                    print(f"[DEBUG vLLM add_lora_with_id] {k}: norm={norm:.6f}", flush=True)
+                print(
+                    f"[DEBUG vLLM add_lora_with_id] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}",
+                    flush=True,
+                )
 
             # Save adapter files locally on worker node
             save_file(state_dict, os.path.join(adapter_path, "adapter_model.safetensors"))
             with open(os.path.join(adapter_path, "adapter_config.json"), "w") as f:
                 json.dump(peft_config, f, indent=2)
-            print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
+            if debug:
+                print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
 
             # Track path for this lora_int_id (needed for GPU/CPU swap in generate)
             self._lora_paths[lora_int_id] = adapter_path
@@ -549,7 +525,12 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             """
             from vllm.lora.request import LoRARequest
 
-            print(f"[DEBUG add_lora_from_path] lora_int_id={lora_int_id}, lora_path={lora_path}", flush=True)
+            debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
+            if debug:
+                print(
+                    f"[DEBUG add_lora_from_path] lora_int_id={lora_int_id}, lora_path={lora_path}",
+                    flush=True,
+                )
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,
@@ -561,7 +542,8 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             # Track path for generate_with_lora (needed for GPU/CPU swap)
             self._lora_paths[lora_int_id] = lora_path
-            print(f"[DEBUG add_lora_from_path] Stored path for lora_int_id={lora_int_id}", flush=True)
+            if debug:
+                print(f"[DEBUG add_lora_from_path] Stored path for lora_int_id={lora_int_id}", flush=True)
 
         async def generate_with_lora(
             self,

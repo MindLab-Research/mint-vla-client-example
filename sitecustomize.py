@@ -308,29 +308,19 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
             w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
             packed_scaling = [1.0, 1.0, 1.0]
         else:
-            # General sparse case: default missing experts to base weights, but allow
-            # explicitly-provided experts to override.
-            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape)).clone()
-            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape)).clone()
-            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape)).clone()
-            w1_lora_b = base_w1.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_b.shape)).clone()
-            w2_lora_b = base_w2.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_b.shape)).clone()
-            w3_lora_b = base_w3.lora_b.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_b.shape)).clone()
-
+            present_eids: set[int] = set()
             for eid in range(n_experts):
-                w1 = loras[eid * 3]
-                w2 = loras[eid * 3 + 1]
-                w3 = loras[eid * 3 + 2]
-                if w1 is not None:
-                    w1_lora_a[eid].copy_(w1.lora_a)
-                    w1_lora_b[eid].copy_(w1.lora_b)
-                if w2 is not None:
-                    w2_lora_a[eid].copy_(w2.lora_a)
-                    w2_lora_b[eid].copy_(w2.lora_b)
-                if w3 is not None:
-                    w3_lora_a[eid].copy_(w3.lora_a)
-                    w3_lora_b[eid].copy_(w3.lora_b)
-            packed_scaling = None
+                if (
+                    loras[eid * 3] is not None
+                    or loras[eid * 3 + 1] is not None
+                    or loras[eid * 3 + 2] is not None
+                ):
+                    present_eids.add(eid)
+            raise RuntimeError(
+                "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
+                f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
+            )
 
         return cls(
             module_name,
