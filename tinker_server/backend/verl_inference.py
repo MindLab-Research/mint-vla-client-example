@@ -155,6 +155,8 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
             packed_scaling = [1.0, 1.0, 1.0]
         else:
+            import torch
+
             present_eids: set[int] = set()
             for eid in range(n_experts):
                 if (
@@ -163,11 +165,130 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
                     or loras[eid * 3 + 2] is not None
                 ):
                     present_eids.add(eid)
-            raise RuntimeError(
-                "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
-                "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
-                f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
-            )
+
+            # Sparse export mode: one representative expert per EP shard (linear placement).
+            #
+            # Export format expectation:
+            # - loras has length n_experts * 3
+            # - only representative experts are present (non-None); all other experts are None
+            # - representatives are the first expert of each linear EP shard:
+            #     rep_eid = start(ep_rank) where:
+            #         base = n_experts // ep_size
+            #         rem  = n_experts % ep_size
+            #         start(r) = r * base + min(r, rem)
+            #
+            # We materialize full per-expert tensors directly on the target device (prefer GPU)
+            # to avoid host-CPU OOM when expanding a large adapter.
+            ep_size = len(present_eids)
+            if ep_size > 1:
+                base = n_experts // ep_size
+                rem = n_experts % ep_size
+                expected_reps = {
+                    (r * base + min(r, rem))
+                    for r in range(ep_size)
+                    if (base + (1 if r < rem else 0)) > 0
+                }
+                if present_eids == expected_reps:
+                    # Device selection: materialize on same device as base weights if possible.
+                    # If base weights are on CPU, move representatives to current CUDA device.
+                    device = getattr(base_w1.lora_a, "device", torch.device("cpu"))
+                    if device.type == "cpu":
+                        device = torch.device("cuda")
+
+                    def _to_dev(t: torch.Tensor) -> torch.Tensor:
+                        return t if t.device == device else t.to(device)
+
+                    # Pre-apply scaling and set packed_scaling=1 to avoid vLLM in-place optimize
+                    # touching overlapped views. We will materialize distinct per-expert tensors.
+                    w1_lora_a_out = torch.empty(
+                        (n_experts,) + tuple(base_w1.lora_a.shape),
+                        device=device,
+                        dtype=base_w1.lora_a.dtype,
+                    )
+                    w2_lora_a_out = torch.empty(
+                        (n_experts,) + tuple(base_w2.lora_a.shape),
+                        device=device,
+                        dtype=base_w2.lora_a.dtype,
+                    )
+                    w3_lora_a_out = torch.empty(
+                        (n_experts,) + tuple(base_w3.lora_a.shape),
+                        device=device,
+                        dtype=base_w3.lora_a.dtype,
+                    )
+
+                    w1_lora_b_out = torch.empty(
+                        (n_experts,) + tuple(base_w1.lora_b.shape),
+                        device=device,
+                        dtype=base_w1.lora_b.dtype,
+                    )
+                    w2_lora_b_out = torch.empty(
+                        (n_experts,) + tuple(base_w2.lora_b.shape),
+                        device=device,
+                        dtype=base_w2.lora_b.dtype,
+                    )
+                    w3_lora_b_out = torch.empty(
+                        (n_experts,) + tuple(base_w3.lora_b.shape),
+                        device=device,
+                        dtype=base_w3.lora_b.dtype,
+                    )
+
+                    for r in range(ep_size):
+                        start = r * base + min(r, rem)
+                        local = base + (1 if r < rem else 0)
+                        end = min(n_experts, start + local)
+                        if start >= end:
+                            continue
+
+                        rep_eid = start
+                        rep_w1 = loras[rep_eid * 3]
+                        rep_w2 = loras[rep_eid * 3 + 1]
+                        rep_w3 = loras[rep_eid * 3 + 2]
+                        if rep_w1 is None or rep_w2 is None or rep_w3 is None:
+                            raise RuntimeError(
+                                "Sparse EP-shard MoE LoRA missing representative expert tensors: "
+                                f"module={module_name!r} rep_eid={rep_eid} present_expert_ids={sorted(present_eids)}"
+                            )
+
+                        rep_w1_a = _to_dev(rep_w1.lora_a)
+                        rep_w2_a = _to_dev(rep_w2.lora_a)
+                        rep_w3_a = _to_dev(rep_w3.lora_a)
+
+                        rep_w1_b = _to_dev(rep_w1.lora_b) * float(
+                            getattr(rep_w1, "scaling", lora_alpha / rank)
+                        )
+                        rep_w2_b = _to_dev(rep_w2.lora_b) * float(
+                            getattr(rep_w2, "scaling", lora_alpha / rank)
+                        )
+                        rep_w3_b = _to_dev(rep_w3.lora_b) * float(
+                            getattr(rep_w3, "scaling", lora_alpha / rank)
+                        )
+
+                        sl = slice(start, end)
+                        w1_lora_a_out[sl].copy_(rep_w1_a.unsqueeze(0).expand((end - start,) + rep_w1_a.shape))
+                        w2_lora_a_out[sl].copy_(rep_w2_a.unsqueeze(0).expand((end - start,) + rep_w2_a.shape))
+                        w3_lora_a_out[sl].copy_(rep_w3_a.unsqueeze(0).expand((end - start,) + rep_w3_a.shape))
+
+                        w1_lora_b_out[sl].copy_(rep_w1_b.unsqueeze(0).expand((end - start,) + rep_w1_b.shape))
+                        w2_lora_b_out[sl].copy_(rep_w2_b.unsqueeze(0).expand((end - start,) + rep_w2_b.shape))
+                        w3_lora_b_out[sl].copy_(rep_w3_b.unsqueeze(0).expand((end - start,) + rep_w3_b.shape))
+
+                    w1_lora_a, w2_lora_a, w3_lora_a = w1_lora_a_out, w2_lora_a_out, w3_lora_a_out
+                    w1_lora_b, w2_lora_b, w3_lora_b = w1_lora_b_out, w2_lora_b_out, w3_lora_b_out
+                    packed_scaling = [1.0, 1.0, 1.0]
+                else:
+                    raise RuntimeError(
+                        "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                        "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export, "
+                        "(3) one-representative-per-EP-shard (linear placement). "
+                        f"module={module_name!r} n_experts={n_experts} ep_size={ep_size} "
+                        f"present_expert_ids={sorted(present_eids)} expected_reps={sorted(expected_reps)}"
+                    )
+            else:
+                raise RuntimeError(
+                    "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                    "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
+                    f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
+                )
 
         return cls(
             module_name,

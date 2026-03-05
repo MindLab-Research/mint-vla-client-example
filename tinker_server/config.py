@@ -1,10 +1,10 @@
 """Server configuration."""
 
+from __future__ import annotations
+
 import os
 import secrets
 from dataclasses import dataclass
-
-from .config_file import TinkerConfigFile, load_tinker_config_file
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -19,10 +19,17 @@ def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
 
 
-def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, TinkerConfigFile | None]:
+def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
     path = _env_nonempty(environ, "TINKER_CONFIG_PATH")
     if not path:
         return None, None
+    try:
+        from .config_file import load_tinker_config_file
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "TINKER_CONFIG_PATH is set but config parsing dependencies are missing "
+            f"(missing module: {e.name!r}). Install pydantic on this runtime or unset TINKER_CONFIG_PATH."
+        ) from e
     return path, load_tinker_config_file(path)
 
 

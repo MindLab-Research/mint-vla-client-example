@@ -823,7 +823,6 @@ class MegatronRankWorker:
             McoreEngineConfig,
             McoreOptimizerConfig,
         )
-        from verl.workers.config.engine import EngineRouterReplayConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
@@ -1066,7 +1065,6 @@ class MegatronRankWorker:
             expert_model_parallel_size=self.config.expert_parallel_size,
             expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
             context_parallel_size=self.config.context_parallel_size,
-            router_replay=EngineRouterReplayConfig(mode=self.config.router_replay_mode),
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
@@ -1984,8 +1982,71 @@ class MegatronRankWorker:
 
             expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
 
+            # Debug: verify whether "shared" expert LoRA weights are actually identical across
+            # expert-parallel (EP) shards. If they differ, "expert-0-only" export is not valid.
+            #
+            # We only gather small checksum scalars (not full tensors) to keep overhead low.
+            ep_group = None
+            ep_size = 1
+            ep_rank = 0
+            try:
+                from megatron.core import parallel_state as mpu
+
+                ep_size = int(mpu.get_expert_model_parallel_world_size())
+                ep_rank = int(mpu.get_expert_model_parallel_rank())
+                if ep_size > 1:
+                    ep_group = mpu.get_expert_model_parallel_group()
+            except Exception:
+                ep_group = None
+                ep_size = 1
+                ep_rank = 0
+
+            did_ep_checksum = False
             with self.engine.eval_mode():
                 for name, tensor in bridge.export_adapter_weights(self.engine.module, cpu=True, show_progress=False):
+                    if (
+                        (not did_ep_checksum)
+                        and ep_group is not None
+                        and ep_size > 1
+                        and use_per_expert_lora
+                        and ".mlp.experts." in name
+                        and ".mlp.shared_experts." not in name
+                        and name.endswith(".adapter.linear_in.weight")
+                    ):
+                        import torch
+                        import torch.distributed as dist
+
+                        # tensor is already on CPU here; compute checksum on CPU, then all_gather
+                        # the tiny checksum tensor on GPU/NCCL.
+                        t = tensor.detach()
+                        chk = torch.tensor(
+                            [
+                                float(ep_rank),
+                                float(t.float().sum().item()),
+                                float(t.float().mean().item()),
+                                float(t.float().abs().max().item()),
+                            ],
+                            device=torch.cuda.current_device(),
+                            dtype=torch.float32,
+                        )
+                        gathered = [torch.empty_like(chk) for _ in range(ep_size)]
+                        dist.all_gather(gathered, chk, group=ep_group)
+                        if self.rank == 0:
+                            rows = [
+                                (
+                                    int(g[0].item()),
+                                    float(g[1].item()),
+                                    float(g[2].item()),
+                                    float(g[3].item()),
+                                )
+                                for g in gathered
+                            ]
+                            rows = sorted(rows, key=lambda x: x[0])
+                            logger.info(
+                                f"[Rank 0] EP LoRA checksum probe ({name}): "
+                                f"ep_size={ep_size} rows={rows}"
+                            )
+                        did_ep_checksum = True
                     if self.rank == 0:
                         if shared_export:
                             m = expert_pat.search(name)
@@ -2023,13 +2084,12 @@ class MegatronRankWorker:
                 import re
 
                 if os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0":
-                    mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
-                    if mode not in {"1", "true", "yes"}:
-                        raise RuntimeError(
-                            "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT requires shared-expert semantics. "
-                            "If you want a full per-expert export, set MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0. "
-                            "Otherwise enable shared export via MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1."
-                        )
+                    # Sparse expert export: keep one representative expert per EP shard (linear placement).
+                    #
+                    # This reduces the export artifact size drastically (K2 full per-expert adapters are very large).
+                    # The downstream vLLM hot-load path must reconstruct full per-expert tensors at load time.
+                    #
+                    # If MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1 is also enabled, we additionally drop to expert-0-only.
 
                     # Determine EP size.
                     try:
@@ -2064,14 +2124,6 @@ class MegatronRankWorker:
                             for r in range(ep_size)
                             if (base + (1 if r < rem else 0)) > 0
                         }
-                        if reps != {0}:
-                            raise RuntimeError(
-                                "Unsupported MoE LoRA sparse export: one representative expert per EP shard "
-                                "is not loadable by the current vLLM hot-load patch. "
-                                "Use either (1) full per-expert export by setting MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0, "
-                                "or (2) expert-0-only shared export by setting MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1."
-                                f" ep_size={ep_size} num_experts={num_experts} reps={sorted(reps)}"
-                            )
 
                         # Keep all non-expert keys + only representative expert keys.
                         expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
@@ -2620,10 +2672,15 @@ class MegatronRankWorker:
         )
         expert_representatives = []
         if sparse_expert_export:
-            for i in range(ep_size):
-                s, e = _ep_rank_to_expert_range(i, ep_size=ep_size, num_experts=num_experts)
-                if s < e:
-                    expert_representatives.append(s)
+            # One representative expert per EP shard (linear placement).
+            # The vLLM hot-load patch reconstructs full per-expert tensors at load time.
+            base = num_experts // ep_size
+            rem = num_experts % ep_size
+            expert_representatives = [
+                (r * base + min(r, rem))
+                for r in range(ep_size)
+                if (base + (1 if r < rem else 0)) > 0
+            ]
 
         logger.info(
             f"[Rank 0] Processing {len(adapter_state)} params from adapter_state "
@@ -2684,7 +2741,14 @@ class MegatronRankWorker:
                             else:
                                 continue
 
-                            rep_experts = [expert_start] if sparse_expert_export else range(expert_start, expert_end)
+                            if sparse_expert_export:
+                                rep_experts = [
+                                    e
+                                    for e in expert_representatives
+                                    if expert_start <= e < expert_end
+                                ]
+                            else:
+                                rep_experts = range(expert_start, expert_end)
                             for expert_idx in rep_experts:
                                 gate_expert_name = gate_peft_name.replace(
                                     '.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.'
@@ -2709,7 +2773,14 @@ class MegatronRankWorker:
                             if expert_start >= expert_end:
                                 continue
 
-                            rep_experts = [expert_start] if sparse_expert_export else range(expert_start, expert_end)
+                            if sparse_expert_export:
+                                rep_experts = [
+                                    e
+                                    for e in expert_representatives
+                                    if expert_start <= e < expert_end
+                                ]
+                            else:
+                                rep_experts = range(expert_start, expert_end)
                             for expert_idx in rep_experts:
                                 # Insert expert index into path
                                 if '.mlp.gate_proj.' in peft_name:
@@ -5539,6 +5610,22 @@ def get_or_create_megatron_worker_group(
             raise RuntimeError(f"Failed to probe placement group {pg_name!r}: {e}") from e
 
         if orphan_pg is not None:
+            # Race guard: actor creation is not instantaneous. A concurrent request can
+            # observe `ray.get_actor(...)` as missing while the named actor is still
+            # being registered. Removing the placement group in that window will
+            # SIGTERM the in-flight Megatron workers (Ray reports: "placement group was removed").
+            import time
+
+            for _ in range(30):
+                try:
+                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                    logger.info(
+                        f"Megatron actor appeared after PG probe; reusing actor={actor_name} pg={pg_name}"
+                    )
+                    return actor
+                except ValueError:
+                    time.sleep(1)
+
             logger.warning(
                 f"Found orphan Megatron placement group without actor; removing to unblock recreate: {pg_name}"
             )

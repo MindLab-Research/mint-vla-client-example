@@ -205,6 +205,16 @@ def _parse_args() -> argparse.Namespace:
         help="Base model name (as listed by server capabilities)",
     )
     parser.add_argument(
+        "--lora-rank",
+        dest="lora_rank",
+        type=int,
+        default=int(os.environ.get("MINT_TEST_LORA_RANK", "0")),
+        help=(
+            "LoRA rank (default: 0=auto; env: MINT_TEST_LORA_RANK). "
+            "For K2, pick a value divisible by vLLM TP."
+        ),
+    )
+    parser.add_argument(
         "--inference-only",
         dest="inference_only",
         action="store_true",
@@ -412,9 +422,12 @@ BASE_MODEL = args.base_model
 
 inference_only = bool(args.inference_only)
 
-# Megatron LoRA sharding requires LoRA rank divisible by TP.
-# K2 is configured with TP=64; use rank=64 to satisfy divisibility.
-LORA_RANK = 64 if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else 16
+if int(getattr(args, "lora_rank", 0)) > 0:
+    LORA_RANK = int(args.lora_rank)
+else:
+    # Megatron LoRA sharding requires LoRA rank divisible by TP.
+    # Default K2 rank is 64 (divisible by TP=64 and TP=32).
+    LORA_RANK = 64 if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else 16
 
 train_mlp = args.train_mlp
 if train_mlp is None:
