@@ -5666,14 +5666,20 @@ def get_or_create_megatron_worker_group(
                 v = os.environ.get(k)
                 if v is not None:
                     runtime_env["env_vars"][k] = v
-            volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
-            if volc_rq:
-                from .volc_placement import list_node_ips_for_resource_queue
+            explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
+            if explicit_node_ips_csv:
+                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
+            else:
+                volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                if volc_rq:
+                    from .volc_placement import list_node_ips_for_resource_queue
 
-                node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
-                if not node_ips:
-                    raise RuntimeError(f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}")
-                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
+                    node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
+                    if not node_ips:
+                        raise RuntimeError(
+                            f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}"
+                        )
+                    runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
 
             timing = os.environ.get("MINT_TIMING_DIAG")
             if timing is not None:

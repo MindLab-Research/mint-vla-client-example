@@ -336,7 +336,7 @@ def _create_multinode_vllm_actor(
         num_cpus=1,
         max_concurrency=max_concurrency,
     )  # num_gpus=0: vLLM's internal Ray backend manages GPU allocation
-class MultiNodeVLLMEngine:
+    class MultiNodeVLLMEngine:
         """vLLM engine with native Ray backend for multi-node TP."""
 
         def __init__(
@@ -1890,19 +1890,36 @@ class MultiNodeInferenceEngine:
 
             node_ips: list[str] | None = None
             gpus_per_node = 8
-            k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
-            if self.model_name in k2_models:
-                volc_rq = os.environ.get("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                if not volc_rq:
+
+            # Preferred node pinning (e.g., for temporarily placing K2 vLLM workers onto C1 nodes
+            # when C2 is unavailable). If provided, it takes precedence over queue-based selection.
+            preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
+            if preferred_node_ips and distributed_executor_backend != "mp":
+                nodes_needed = (int(worker_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
+                if len(preferred_node_ips) < nodes_needed:
                     raise RuntimeError(
-                        "K2 multinode inference requires MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID to be set "
-                        "(expected to pin vLLM workers to queue C2)"
+                        f"MINT_MODEL_NODE_IPS_JSON too short for model={self.model_name!r}: "
+                        f"need {nodes_needed} nodes for worker_gpus={worker_gpus}, got {len(preferred_node_ips)}"
                     )
-            else:
-                volc_rq = (
-                    os.environ.get("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                    or os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                node_ips = preferred_node_ips[:nodes_needed]
+                volc_rq = ""
+                logger.info(
+                    f"[MultiNodeInferenceEngine] Using pinned node IPs for model={self.model_name} nodes={node_ips}"
                 )
+            else:
+                k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
+                if self.model_name in k2_models:
+                    volc_rq = os.environ.get("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                    if not volc_rq:
+                        raise RuntimeError(
+                            "K2 multinode inference requires MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID to be set "
+                            "(expected to pin vLLM workers to queue C2)"
+                        )
+                else:
+                    volc_rq = (
+                        os.environ.get("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                        or os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                    )
 
             if volc_rq:
                 from .volc_placement import select_free_nodes_for_resource_queue

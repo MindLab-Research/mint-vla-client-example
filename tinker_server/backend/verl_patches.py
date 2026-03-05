@@ -408,6 +408,50 @@ def _apply_rope_thd_cp_len_clamp_patch() -> None:
     print("[VERL_PATCH] Patched rope_utils._get_thd_freqs_on_this_cp_rank (clamp full_seqlen)")
 
 
+def _apply_yarn_rope_cp_seq_len_align_patch() -> None:
+    """Patch YarnRotaryEmbedding to build CP-aligned caches.
+
+    Megatron's `get_pos_emb_on_this_cp_rank()` reshapes the sequence dimension into
+    `2 * cp_size` partitions:
+
+        pos_emb.view(..., 2 * cp_size, -1, ...)
+
+    This requires the cached sequence length to be divisible by `2 * cp_size`.
+    For CP=3, the common 4096 cache length fails (4096 % 6 != 0), causing:
+
+        RuntimeError: shape '[6, -1, ...]' is invalid for input of size ...
+
+    Aligning the cache length upward is safe because the first `seq_len` positions
+    are unchanged (arange-based construction); we only compute extra tail positions.
+    """
+    try:
+        from megatron.core.models.common.embeddings import yarn_rotary_pos_embedding
+    except Exception as e:
+        logger.warning(
+            f"Could not import megatron yarn_rotary_pos_embedding; skipping Yarn RoPE CP align patch: "
+            f"{type(e).__name__}: {e}"
+        )
+        return
+
+    if getattr(yarn_rotary_pos_embedding, "_tinker_yarn_rope_cp_seq_len_align_patched", False):
+        return
+
+    original = yarn_rotary_pos_embedding.YarnRotaryEmbedding._set_cos_sin_cache
+
+    def patched(self, seq_len, offset, dtype, packed_seq=False):
+        cp_group = getattr(self, "cp_group", None)
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+            align = 2 * int(cp_group.size())
+            rem = int(seq_len) % align
+            if rem:
+                seq_len = int(seq_len) + (align - rem)
+        return original(self, seq_len, offset, dtype, packed_seq)
+
+    yarn_rotary_pos_embedding.YarnRotaryEmbedding._set_cos_sin_cache = patched  # type: ignore[assignment]
+    yarn_rotary_pos_embedding._tinker_yarn_rope_cp_seq_len_align_patched = True  # type: ignore[attr-defined]
+    print("[VERL_PATCH] Patched YarnRotaryEmbedding._set_cos_sin_cache (CP-aligned cache len)")
+
+
 def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
     """Patch verl preprocess_thd_no_padding for CP when input sequences are not explicitly padded.
 
@@ -712,6 +756,7 @@ def apply_verl_patches():
     # Apply external label patch first (fixes last-token logprob issue)
     _apply_external_label_patch()
     _apply_rope_thd_cp_len_clamp_patch()
+    _apply_yarn_rope_cp_seq_len_align_patch()
     _apply_preprocess_thd_no_padding_cp_short_seq_patch()
 
     # Store original method
