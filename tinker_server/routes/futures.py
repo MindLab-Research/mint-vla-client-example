@@ -112,7 +112,10 @@ async def retrieve_future(
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+            )
 
         try:
             upstream_resp = await forward_json(
@@ -183,7 +186,7 @@ async def retrieve_future(
         ):
             payload = dict(payload)
             payload["detail"] = GENERIC_ERROR_MESSAGE
-        if upstream_resp.status_code == 408 and isinstance(payload, dict) and "request_id" in payload:
+        if isinstance(payload, dict) and "request_id" in payload:
             payload = dict(payload)
             payload["request_id"] = body.request_id
         return payload

@@ -187,6 +187,35 @@ def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
     assert payload.get("request_id") == body.request_id
 
 
+def test_issue_182_gateway_request_id_overrides_upstream_200(monkeypatch):
+    import httpx
+    import tinker_server.gateway as gateway
+
+    monkeypatch.setattr(gateway, "decode_request_id", lambda rid: ("upstream-a", "raw-123"))
+    monkeypatch.setattr(
+        gateway,
+        "upstream_for_alias",
+        lambda alias: SimpleNamespace(alias=alias, base_url="http://upstream", auth_mode="none", api_key=None),
+    )
+
+    async def _forward_json(**kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={"request_id": "raw-123", "type": "create_model", "model_id": "m1", "backend": "megatron"},
+            headers={},
+        )
+
+    monkeypatch.setattr(gateway, "forward_json", _forward_json)
+    monkeypatch.setattr(gateway, "maybe_register_sampling_session_from_retrieve_future", lambda **kwargs: None)
+
+    body = FutureRetrieveRequest(request_id="gw:upstream-a:encoded-xyz")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 200
+    assert payload.get("request_id") == body.request_id
+
+
 def test_issue_182_scheduler_enabled_omits_queue_fields(monkeypatch):
     meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
