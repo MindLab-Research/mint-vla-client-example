@@ -173,6 +173,7 @@ class ServerConfig:
     gpu_memory_utilization: float = 0.85
     max_model_len: int | None = None
     session_inactivity_timeout_s: float | None = None
+    router_replay_mode: str = "disabled"  # Options: "disabled", "R2", "R3"
 
     # Multi-LoRA settings
     enable_multi_lora: bool = True  # Enable shared multi-LoRA engine
@@ -440,6 +441,11 @@ class ServerConfig:
                 0.0,
             ),
             training_actor_ready_timeout_s=actor_ready_timeout_s,
+            router_replay_mode=_pick_str(
+                "MINT_ROUTER_REPLAY_MODE",
+                None,
+                "disabled",
+            ),
             # Persistent prewarm settings
             prewarm_persistent_models_csv=_pick_str(
                 "MINT_PERSISTENT_MODELS",

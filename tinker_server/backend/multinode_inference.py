@@ -41,6 +41,7 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
@@ -661,6 +662,29 @@ class MultiNodeVLLMEngine:
             logger.info(
                 "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
             )
+            enable_return_routed_experts = (server_config.router_replay_mode == "R3")
+            if enable_return_routed_experts:
+                import inspect
+
+                sig = inspect.signature(AsyncEngineArgs.__init__)
+                has_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if "enable_return_routed_experts" not in sig.parameters and not has_kwargs:
+                    import vllm  # type: ignore
+
+                    raise RuntimeError(
+                        "router_replay_mode=R3 requires vLLM AsyncEngineArgs(enable_return_routed_experts=...). "
+                        f"Installed vllm={getattr(vllm, '__version__', 'unknown')!r} does not support it "
+                        f"(AsyncEngineArgs.__init__ signature={sig})."
+                    )
+            all2all_backend_env = os.environ.get("MINT_VLLM_ALL2ALL_BACKEND", "").strip().lower()
+            default_all2all_backend = (
+                "deepep_high_throughput"
+                if self.enable_expert_parallel
+                else "allgather_reducescatter"
+            )
+            all2all_backend = all2all_backend_env or default_all2all_backend
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -668,6 +692,7 @@ class MultiNodeVLLMEngine:
                 data_parallel_size=self.data_parallel_size,
                 data_parallel_backend="ray" if self.data_parallel_size > 1 else "mp",
                 enable_expert_parallel=self.enable_expert_parallel,
+                all2all_backend=all2all_backend,
                 distributed_executor_backend=distributed_executor_backend,
                 disable_custom_all_reduce=True,  # Avoid PyNcclCommunicator issues in multi-node
                 gpu_memory_utilization=self.gpu_memory_utilization,
@@ -689,12 +714,13 @@ class MultiNodeVLLMEngine:
                 max_cpu_loras=self.max_cpu_loras if self.enable_lora else None,
                 fully_sharded_loras=fully_sharded_loras if self.enable_lora else False,
                 lora_dtype=lora_dtype_resolved,
+                enable_return_routed_experts=enable_return_routed_experts,
             )
 
             logger.info(
                 f"Creating AsyncLLMEngine: "
                 f"TP={self.tensor_parallel_size}, PP={self.pipeline_parallel_size}, "
-                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
+                f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, a2a_backend={all2all_backend}, "
                 f"backend={distributed_executor_backend}, enable_lora={self.enable_lora}, gpu_util={self.gpu_memory_utilization}, "
                 f"fully_sharded_loras={fully_sharded_loras}, chunked_prefill={enable_chunked_prefill}, "
                 f"max_num_batched_tokens={max_num_batched_tokens}, "
@@ -1012,7 +1038,7 @@ class MultiNodeVLLMEngine:
                 # Use a positive value so per-token logprobs are populated.
                 logprobs=1 if logprobs else None,
                 n=n_req,
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -1244,18 +1270,27 @@ class MultiNodeVLLMEngine:
                             f"count={non_finite_count} samples(idx,token,lp)={non_finite_samples} "
                             f"token_preview={token_preview}"
                         )
+                routed_experts = None
+                raw_re = getattr(final_res.outputs[0], "routed_experts", None)  # type: ignore[union-attr]
+                if server_config.router_replay_mode == "R3" and raw_re is None:
+                    raise RuntimeError(
+                        "router_replay_mode=R3 but vLLM returned no routed_experts for single-output generate"
+                    )
+                if raw_re is not None:
+                    routed_experts = raw_re.tolist() if hasattr(raw_re, "tolist") else raw_re
 
                 # Determine stop reason
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":  # type: ignore[union-attr]
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 result = {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
+                    "routed_experts": routed_experts,
                 }
                 if outer_request_id == request_id:
                     await self._clear_progress(outer_request_id)
@@ -1334,11 +1369,19 @@ class MultiNodeVLLMEngine:
                                     "tail": out_token_ids[-8:] if len(out_token_ids) > 8 else out_token_ids[:],
                                 }
                         out_log_probs.append(lp_f)
+                out_routed_experts = None
+                raw_re = getattr(out, "routed_experts", None)
+                if server_config.router_replay_mode == "R3" and raw_re is None:
+                    raise RuntimeError(
+                        "router_replay_mode=R3 but vLLM returned no routed_experts for multi-output generate"
+                    )
+                if raw_re is not None:
+                    out_routed_experts = raw_re.tolist() if hasattr(raw_re, "tolist") else raw_re
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 multi_results.append(
@@ -1346,6 +1389,7 @@ class MultiNodeVLLMEngine:
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
                         "stop_reason": out_stop_reason,
+                        "routed_experts": out_routed_experts,
                     }
                 )
 
@@ -1602,6 +1646,7 @@ class GenerateResult:
     token_ids: list[int]
     logprobs: list[float] | None = None
     stop_reason: str | None = None
+    routed_experts: list | None = None
 
 
 class MultiNodeInferenceEngine:
@@ -1687,6 +1732,7 @@ class MultiNodeInferenceEngine:
                 * self.data_parallel_size
             )
             distributed_executor_backend = self.distributed_executor_backend
+            mp_pinned_node_ip: str | None = None
             if distributed_executor_backend == "mp":
                 # vLLM runs locally (single-node) inside this Ray actor and needs direct GPU access.
                 # Reserve all GPUs on a single node for this actor. vLLM will spawn local processes
@@ -1869,12 +1915,27 @@ class MultiNodeInferenceEngine:
                     f"[MultiNodeInferenceEngine] Volcano placement model={self.model_name} "
                     f"rq={volc_rq} nodes={node_ips}"
                 )
-                resources = compute_multinode_engine_resources(
-                    worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
-                )
-                controller_gpus = resources.controller_gpus
-                controller_cpus = resources.controller_cpus
-                total_required_gpus = resources.total_required_gpus
+                if distributed_executor_backend == "mp":
+                    # mp backend must run on a single node with all GPUs visible.
+                    if not node_ips:
+                        raise RuntimeError(
+                            f"no Volcano nodes selected for mp vLLM (rq={volc_rq}, required_gpus={worker_gpus})"
+                        )
+                    if len(node_ips) != 1:
+                        raise RuntimeError(
+                            f"mp vLLM requires exactly 1 node, got nodes={node_ips} (rq={volc_rq})"
+                        )
+                    mp_pinned_node_ip = node_ips[0]
+                    logger.info(
+                        f"[MultiNodeInferenceEngine] mp pin model={self.model_name} node={mp_pinned_node_ip}"
+                    )
+                else:
+                    resources = compute_multinode_engine_resources(
+                        worker_gpus, preferred_node_ips=node_ips, gpus_per_node=gpus_per_node
+                    )
+                    controller_gpus = resources.controller_gpus
+                    controller_cpus = resources.controller_cpus
+                    total_required_gpus = resources.total_required_gpus
 
             # Ensure shared adapter directory exists
             os.makedirs(self.shared_adapter_dir, exist_ok=True)
@@ -1947,7 +2008,10 @@ class MultiNodeInferenceEngine:
                 }
             else:
                 # mp backend: no Ray child actors; schedule this actor directly onto 1 node with all GPUs.
-                scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
+                if mp_pinned_node_ip:
+                    scheduling_opts = {"resources": {f"node:{mp_pinned_node_ip}": 0.001}}
+                else:
+                    scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
@@ -1988,6 +2052,7 @@ class MultiNodeInferenceEngine:
                 "MINT_ENABLE_VLLM_IMPORT_PATCHES",
                 "MINT_VLLM_LOG_STATS",
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
+                "MINT_VLLM_ALL2ALL_BACKEND",
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
@@ -2370,6 +2435,7 @@ class MultiNodeInferenceEngine:
             token_ids=result["token_ids"],
             logprobs=result.get("logprobs"),
             stop_reason=result.get("stop_reason"),
+            routed_experts=result.get("routed_experts"),
         )
 
     async def generate_many(
@@ -2461,6 +2527,7 @@ class MultiNodeInferenceEngine:
                 token_ids=r["token_ids"],
                 logprobs=r.get("logprobs"),
                 stop_reason=r.get("stop_reason"),
+                routed_experts=r.get("routed_experts"),
             )
             for r in raw_list
         ]

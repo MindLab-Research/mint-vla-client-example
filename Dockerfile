@@ -1,38 +1,43 @@
 # syntax=docker/dockerfile:1.6
 #
-# Mint runtime image (replacement for `mint:4`), used by:
-# - API server container
-# - Ray head/worker tasks
+# Mint runtime image (`mint:15-*`), used by:
+# - Ray head/worker tasks on Volcano/Aliyun (GPU worker image)
+# - (Optionally) an API server container, but in our deployments the API server / Ray driver
+#   typically runs on the host using a dedicated venv (see deployment_scales.md).
 #
 # This Dockerfile must not assume the build context contains tinker-server code.
 # (The platform build environment may only provide this Dockerfile.)
 
-ARG CUDA_IMAGE=nvidia/cuda:12.9.0-cudnn-devel-ubuntu22.04
-FROM ${CUDA_IMAGE}
+# Base image from the private Volcano registry with:
+# - torch 2.9.1+cu129
+# - DeepEP preinstalled (import names: `deep_ep`, `deep_ep_cpp`)
+# - vLLM 0.16.x preinstalled
+#
+# Pin by digest for reproducibility.
+ARG BASE_IMAGE=image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl@sha256:a4599b0ebbf8fed7fb469886d90ecf0b6be9b36e55ef31e4df329c7b2c1922c6
+FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-lc"]
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System deps: match volcano host baseline (Ubuntu 22.04) + build deps for python wheels.
+# System deps (keep minimal; avoid compiling large deps in this image).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    aria2 \
-    ca-certificates \
-    curl \
-    git \
-    python3 \
-    python3-dev \
-    python3-venv \
-    build-essential \
-    pkg-config \
-    ninja-build \
-    ibverbs-providers \
-    ibverbs-utils \
-    libibverbs-dev \
+  aria2 \
+  ca-certificates \
+  curl \
+  git \
+  build-essential \
+  ninja-build \
+  python3.12-venv \
+  ibverbs-providers \
+  ibverbs-utils \
+  libibverbs-dev \
   && rm -rf /var/lib/apt/lists/*
 
 # Virtualenv + tooling.
+# Use `--system-site-packages` so we can import torch/vLLM/DeepEP from the base image.
 ENV VIRTUAL_ENV=/opt/venv
-RUN python3 -m venv "${VIRTUAL_ENV}"
+RUN python -m venv --system-site-packages "${VIRTUAL_ENV}"
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 ARG PIP_VERSION=24.2
@@ -42,61 +47,49 @@ RUN python -m pip install --no-cache-dir --upgrade \
   "setuptools==${SETUPTOOLS_VERSION}" \
   wheel
 
-# Install torch/cu129 from PyTorch index (use PyPI for non-torch deps).
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu129
-ARG NVIDIA_PYPI_INDEX=https://pypi.nvidia.com
-ARG TORCH_VERSION=2.9.0+cu129
-ARG TORCHVISION_VERSION=0.24.0+cu129
-ARG TORCHAUDIO_VERSION=2.9.0+cu129
-# Work around a hash mismatch between the PyTorch simple index fragment and served bytes
-# for torch==2.9.0+cu129 (observed on 2026-01-27). Install torch via a direct wheel URL
-# (no fragment hash enforcement).
-ARG TORCH_WHEEL_URL=https://download.pytorch.org/whl/cu129/torch-2.9.0%2Bcu129-cp310-cp310-manylinux_2_28_x86_64.whl
-ARG TORCH_WHEEL_FILENAME=torch-2.9.0+cu129-cp310-cp310-manylinux_2_28_x86_64.whl
-RUN set -euo pipefail \
-  && aria2c -x 8 -s 8 -k 1M --max-tries=10 --retry-wait=2 \
-    -d /tmp -o "${TORCH_WHEEL_FILENAME}" "${TORCH_WHEEL_URL}" \
-  && python -m pip install --no-cache-dir \
-    --index-url https://pypi.org/simple \
-    --extra-index-url "${TORCH_INDEX_URL}" \
-    --extra-index-url "${NVIDIA_PYPI_INDEX}" \
-    "/tmp/${TORCH_WHEEL_FILENAME}" \
-  && rm -f "/tmp/${TORCH_WHEEL_FILENAME}"
+# Ensure torch shared libs are visible to CUDA extensions (flash-attn, transformer_engine, etc.).
+# Prefer the system-site-packages torch path from the base image.
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
-RUN python -m pip install --no-cache-dir \
-  --index-url https://pypi.org/simple \
-  --extra-index-url "${TORCH_INDEX_URL}" \
-  --extra-index-url "${NVIDIA_PYPI_INDEX}" \
-  "torchvision==${TORCHVISION_VERSION}" \
-  "torchaudio==${TORCHAUDIO_VERSION}"
+# Verify torch + DeepEP + vLLM from the base image.
+# NOTE: DeepEP's compiled extension is ABI-sensitive to torch; keep them consistent.
+RUN python -c "import torch; import deep_ep; import deep_ep_cpp; import vllm; print('torch.__version__:', torch.__version__); print('torch.version.cuda:', torch.version.cuda); print('deep_ep:', deep_ep.__file__); print('vllm:', getattr(vllm, '__version__', 'unknown')); assert torch.__version__.startswith('2.9.'), f\"expected torch 2.9.*, got {torch.__version__}\"; assert (torch.version.cuda or '').startswith('12.9'), f\"expected CUDA 12.9.*, got {torch.version.cuda}\""
 
-# Verify torch CUDA build + critical CUDA user-space package versions.
-# (Do not override torch's pinned nvidia-* deps: mismatched versions can silently break runtime.)
-RUN python - <<'PY'
-import importlib.metadata as im
+# DeepEP is SM90-centric upstream; for A800 (SM80) we need a build with SM90 features disabled.
+# Build selection:
+# - base: use DeepEP from the base image
+# - sm80: rebuild DeepEP in this image (DISABLE_SM90_FEATURES=1, TORCH_CUDA_ARCH_LIST=8.0),
+#         force-disable NVSHMEM kernels, and avoid a hard crash when RDMA hints are requested.
+ARG DEEPEP_VARIANT=base
+ARG DEEPEP_SOURCE_DIR=/home/dpsk_a2a/DeepEP
+RUN set -euo pipefail; \
+  if [ "${DEEPEP_VARIANT}" = "base" ]; then \
+    echo "DeepEP variant: base"; \
+  elif [ "${DEEPEP_VARIANT}" = "sm80" ]; then \
+    echo "DeepEP variant: sm80"; \
+    test -d "${DEEPEP_SOURCE_DIR}"; \
+    rm -rf /tmp/DeepEP; \
+    cp -a "${DEEPEP_SOURCE_DIR}" /tmp/DeepEP; \
+    python -c $'from __future__ import annotations\n\nimport os\nfrom pathlib import Path\n\nsetup_py = Path(\"/tmp/DeepEP/setup.py\")\nif not setup_py.exists():\n    raise SystemExit(f\"DeepEP setup.py not found at {setup_py}\")\nsetup_txt = setup_py.read_text(encoding=\"utf-8\")\n\nif \"Patched: force-disable NVSHMEM\" not in setup_txt:\n    lines = setup_txt.splitlines(True)\n    insert_at = None\n    for i, line in enumerate(lines):\n        if line.strip() == \"# NVSHMEM flags\":\n            insert_at = i\n            break\n    if insert_at is None:\n        raise SystemExit(\"DeepEP setup.py anchor not found: # NVSHMEM flags\")\n\n    nl = chr(10)\n    env_key = \"DISABLE_SM90_FEATURES\"\n    inject_lines = [\n        \"    # Patched: force-disable NVSHMEM when DISABLE_SM90_FEATURES=1 (SM80 build)\" + nl,\n        f\"    if int(os.getenv({env_key!r}, 0)):\" + nl,\n        \"        disable_nvshmem = True\" + nl,\n        nl,\n    ]\n    lines[insert_at:insert_at] = inject_lines\n    setup_py.write_text(\"\".join(lines), encoding=\"utf-8\")\n\ncfg = Path(\"/tmp/DeepEP/csrc/config.hpp\")\nif not cfg.exists():\n    raise SystemExit(f\"DeepEP config.hpp not found at {cfg}\")\ncfg_txt = cfg.read_text(encoding=\"utf-8\")\n\ncfg_lines = cfg_txt.splitlines(True)\nmatch_idxs = [i for i, line in enumerate(cfg_lines) if \"NVSHMEM is disable during compilation\" in line]\nif len(match_idxs) != 1:\n    raise SystemExit(\"DeepEP config.hpp needle not found for NVSHMEM-disabled RDMA hint\")\nidx = match_idxs[0]\nindent = cfg_lines[idx][: (len(cfg_lines[idx]) - len(cfg_lines[idx].lstrip()))]\ncfg_lines[idx] = indent + \"return 0;\" + chr(10)\ncfg.write_text(\"\".join(cfg_lines), encoding=\"utf-8\")\n'; \
+    DISABLE_SM90_FEATURES=1 TORCH_CUDA_ARCH_LIST=8.0 python -m pip install --no-cache-dir --no-deps --no-build-isolation --force-reinstall /tmp/DeepEP; \
+    python -c "import deep_ep_cpp; print('deep_ep_cpp:', getattr(deep_ep_cpp, '__file__', None)); print('deep_ep_cpp.is_sm90_compiled:', deep_ep_cpp.is_sm90_compiled()); assert deep_ep_cpp.is_sm90_compiled() is False"; \
+    rm -rf /tmp/DeepEP; \
+  else \
+    echo "ERROR: unknown DEEPEP_VARIANT='${DEEPEP_VARIANT}' (expected 'base' or 'sm80')" >&2; \
+    exit 1; \
+  fi
 
-import torch
-
-print("torch.__version__:", torch.__version__)
-print("torch.version.cuda:", torch.version.cuda)
-assert (torch.version.cuda or "").startswith("12.9"), f"expected CUDA 12.9.*, got {torch.version.cuda}"
-
-print("nvidia-cuda-nvrtc-cu12:", im.version("nvidia-cuda-nvrtc-cu12"))
-print("nvidia-nvjitlink-cu12:", im.version("nvidia-nvjitlink-cu12"))
-assert im.version("nvidia-cuda-nvrtc-cu12") == "12.9.86"
-assert im.version("nvidia-nvjitlink-cu12") == "12.9.86"
-PY
-
-# Core runtime deps used by the API server and Ray workers (versions from `ssh mint-dev` baseline).
-RUN python -m pip install --no-cache-dir \
-    "ray==2.51.1" \
-    "fastapi==0.121.2" \
+# Core runtime deps used by the API server and Ray driver processes.
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+    "ray[default]==2.51.1" \
+    "fastapi[standard]==0.121.2" \
     "uvicorn[standard]==0.38.0" \
     "pydantic==2.12.4" \
     "httpx==0.27.2" \
-    "transformers==4.57.1" \
+    "transformers==4.57.0" \
     "accelerate==1.11.0" \
-    "omegaconf==2.3.0" \
+    "einops" \
+    "onnxscript" \
     "codetiming==1.4.0" \
     "torchdata==0.11.0" \
     "datasets==4.4.2" \
@@ -104,57 +97,54 @@ RUN python -m pip install --no-cache-dir \
     "peft==0.18.0"
 
 # NVIDIA ModelOpt (import name: modelopt).
+ARG NVIDIA_PYPI_INDEX=https://pypi.nvidia.com
 ARG NVIDIA_MODELOPT_VERSION=0.41.0
 RUN python -m pip install --no-cache-dir \
-  --index-url "${NVIDIA_PYPI_INDEX}/simple" \
+  --index-url "${NVIDIA_PYPI_INDEX}" \
   --extra-index-url https://pypi.org/simple \
   --retries 10 \
   --timeout 60 \
+  --only-binary=:all: \
   "nvidia-modelopt==${NVIDIA_MODELOPT_VERSION}"
 
-# Build deps for editable Megatron installs (avoid PEP 517 build isolation re-downloading torch).
-RUN python -m pip install --no-cache-dir "pybind11"
+# `pybind11` is used by some training stacks and must come from a prebuilt wheel.
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+  --retries 10 --timeout 60 \
+  "pybind11"
 
-# Transformer Engine (Megatron dependency): install from NVIDIA index and verify the torch extension loads.
-ARG TRANSFORMER_ENGINE_VERSION=2.11.0
-RUN python -m pip install --no-cache-dir \
-  --index-url https://pypi.org/simple \
-  --extra-index-url "${NVIDIA_PYPI_INDEX}" \
-  --no-build-isolation \
-  "transformer-engine[pytorch,core_cu12]==${TRANSFORMER_ENGINE_VERSION}"
-RUN python -c "import transformer_engine; import transformer_engine.pytorch as te; print('transformer_engine.__version__:', getattr(transformer_engine, '__version__', 'unknown')); print('transformer_engine.pytorch:', te)"
+# OmegaConf requires antlr4-python3-runtime==4.9.* (and later runtimes are not compatible).
+# PyPI does not publish 4.9.* wheels, so install from sdist (reproducible source build, no runtime copies).
+RUN python -m pip install --no-cache-dir --only-binary=:all: --no-deps "omegaconf==2.3.0"
+RUN python -m pip install --no-cache-dir --no-build-isolation "antlr4-python3-runtime==4.9.3"
+RUN python -c "import antlr4; print('antlr4:', antlr4.__file__); import omegaconf; print('omegaconf:', omegaconf.__version__)"
 
-# vLLM: use a specific prebuilt wheel (matches volcano override commit g811cdf519).
-ARG VLLM_WHEEL_URL=https://wheels.vllm.ai/811cdf5197acb4d6ab42250a5b0f822887d1190a/vllm-0.13.0rc2.dev207%2Bg811cdf519-cp38-abi3-manylinux_2_31_x86_64.whl
-RUN python -m pip install --no-cache-dir --upgrade "${VLLM_WHEEL_URL}"
-
-# FlashAttention (optional accel used by some inference/training stacks).
-# Prefer a matching prebuilt wheel to avoid compiling CUDA extensions in the Docker build.
-ARG FLASH_ATTN_VERSION=2.8.3
-ARG FLASH_ATTN_WHEEL_URL=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3%2Bcu129torch2.9-cp310-cp310-linux_x86_64.whl
-RUN python -m pip install --no-cache-dir "${FLASH_ATTN_WHEEL_URL}"
-RUN python -c "import flash_attn; import flash_attn.flash_attn_interface; print('flash_attn', getattr(flash_attn, '__version__', 'unknown'))"
-
-# Megatron-LM + Megatron-Bridge + verl: install from pinned commits (clean, no local dirty state).
+# Megatron-LM + Megatron-Bridge + verl: clone from pinned commits (no local modifications).
 ARG MEGATRON_LM_REPO=https://github.com/NVIDIA/Megatron-LM.git
-ARG MEGATRON_LM_COMMIT=aa4ec99205a52187adead37cabceb678a2b6b975
+ARG MEGATRON_LM_COMMIT=0810e6390280672f9c87c388ce4f559571d54365
 ARG MEGATRON_BRIDGE_REPO=https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-# Includes HollowMan6 PRs (e.g. #1811, #1834) without requiring newer Megatron-LM experimental specs.
-ARG MEGATRON_BRIDGE_COMMIT=2e73984734ca17658b834633995a15b2536e1911
-ARG VERL_REPO=https://github.com/volcengine/verl.git
-# Includes vLLM LoRA import compatibility for vllm>=0.13 (vllm.lora.lora_model).
-ARG VERL_COMMIT=2bb42bae6078359c3fdc56ba6c7533e76fc05407
-RUN mkdir -p /workspace \
-  && git clone "${MEGATRON_LM_REPO}" /workspace/Megatron-LM \
-  && git -C /workspace/Megatron-LM checkout "${MEGATRON_LM_COMMIT}" \
-  && python -m pip install --no-cache-dir --no-build-isolation --no-deps -e /workspace/Megatron-LM \
-  && git clone "${MEGATRON_BRIDGE_REPO}" /workspace/Megatron-Bridge \
-  && git -C /workspace/Megatron-Bridge checkout "${MEGATRON_BRIDGE_COMMIT}" \
-  && python -m pip install --no-cache-dir --no-build-isolation --no-deps -e /workspace/Megatron-Bridge \
-  && git clone "${VERL_REPO}" /workspace/verl \
-  && git -C /workspace/verl checkout "${VERL_COMMIT}" \
-  && python -m pip install --no-cache-dir --no-build-isolation --no-deps -e /workspace/verl
+ARG MEGATRON_BRIDGE_COMMIT=0034ddaad7fae7c658c3df7e12d13522a4935770
+ARG VERL_REPO=https://github.com/verl-project/verl.git
+# Sync to the same git commit as `/vePFS-Mindverse/share/code/leixiang/verl` on Volcano.
+ARG VERL_COMMIT=9433f8a8f2771256ea4f8f94e4401bcfe9703228
+RUN set -euo pipefail \
+  && mkdir -p /workspace \
+  && git init /workspace/Megatron-LM \
+  && git -C /workspace/Megatron-LM remote add origin "${MEGATRON_LM_REPO}" \
+  && git -C /workspace/Megatron-LM fetch --depth=1 origin "${MEGATRON_LM_COMMIT}" \
+  && git -C /workspace/Megatron-LM checkout --detach FETCH_HEAD \
+  && git init /workspace/Megatron-Bridge \
+  && git -C /workspace/Megatron-Bridge remote add origin "${MEGATRON_BRIDGE_REPO}" \
+  && git -C /workspace/Megatron-Bridge fetch --depth=1 origin "${MEGATRON_BRIDGE_COMMIT}" \
+  && git -C /workspace/Megatron-Bridge checkout --detach FETCH_HEAD \
+  && git init /workspace/verl \
+  && git -C /workspace/verl remote add origin "${VERL_REPO}" \
+  && git -C /workspace/verl fetch --depth=1 origin "${VERL_COMMIT}" \
+  && git -C /workspace/verl checkout --detach FETCH_HEAD
+
+ENV PYTHONPATH="/workspace/Megatron-LM:/workspace/Megatron-Bridge/src:/workspace/Megatron-Bridge:/workspace/verl:${PYTHONPATH}"
+RUN python -c "import verl; print('verl:', verl.__file__)"
 
 # Default command is intentionally minimal; Ray task YAMLs and server ops override this.
 RUN python -c "import onnxscript, modelopt; print('onnxscript', getattr(onnxscript, '__version__', 'unknown')); print('modelopt', getattr(modelopt, '__version__', 'unknown'))"
-CMD ["bash", "-lc", "python -c 'import torch, vllm; print(torch.__version__, torch.version.cuda); print(vllm.__version__)' && sleep infinity"]
+RUN python -c "import torch, deep_ep_cpp, vllm; import ray; print('torch:', torch.__version__); print('ray:', ray.__version__); print('vllm:', getattr(vllm, '__version__', 'unknown'))"
+CMD ["bash", "-lc", "python -c 'import torch, deep_ep_cpp, vllm; print(torch.__version__, torch.version.cuda); print(getattr(vllm, \"__version__\", \"unknown\"))' && sleep infinity"]

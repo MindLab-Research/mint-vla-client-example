@@ -66,7 +66,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:12"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:14"
 ResourceQueueID: "<GPU_QUEUE_ID>"  # Prod prefers a800-mindverse-C1 (q-20251126180002-26lwz) or C2 (q-20260203101340-www2h). Set explicitly before submit.
 Framework: "Custom"
 

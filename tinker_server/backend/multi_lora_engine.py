@@ -30,11 +30,20 @@ DEFAULT_MAX_LORAS = 64  # GPU slots (~2.5GB for rank-32 Qwen-7B)
 DEFAULT_MAX_CPU_LORAS = 1024  # CPU cache for evicted adapters
 DEFAULT_MAX_LORA_RANK = 64  # Maximum supported rank
 
+# Env flag helper (keep local to avoid importing config parsing helpers).
+def _env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v not in {"0", "false", "no", "off"}
+
+
 # Well-known name for persistent vLLM actor
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
@@ -72,6 +81,7 @@ class GenerateResult:
     token_ids: list[int]
     logprobs: list[float] | None = None
     stop_reason: str | None = None
+    routed_experts: list | None = None
 
 
 class MultiLoRAInferenceEngine:
@@ -320,6 +330,7 @@ class MultiLoRAInferenceEngine:
             # Configure rollout with multi-LoRA support
             # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
             # Expert parallelism is enabled via engine_kwargs instead
+            enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
             rollout_config = RolloutConfig(
                 name="vllm",
                 tensor_model_parallel_size=self.tensor_parallel_size,
@@ -342,6 +353,7 @@ class MultiLoRAInferenceEngine:
                 expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
                 engine_kwargs=engine_kwargs,
                 quantization=self.quantization,  # "fp8" for FP8 models like K2
+                enable_rollout_routing_replay=enable_rollout_routing_replay,
             )
             if self.quantization:
                 logger.info(f"vLLM quantization enabled: {self.quantization}")
@@ -398,6 +410,7 @@ class MultiLoRAInferenceEngine:
                 node_rank=0,
                 gpus_per_node=total_gpus,
                 nnodes=1,
+                cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
             )
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
@@ -734,6 +747,7 @@ class MultiLoRAInferenceEngine:
             token_ids=result["token_ids"],
             logprobs=result.get("logprobs"),
             stop_reason=result.get("stop_reason"),
+            routed_experts=result.get("routed_experts"),
         )
 
     async def generate_many(
@@ -821,6 +835,7 @@ class MultiLoRAInferenceEngine:
                 token_ids=r["token_ids"],
                 logprobs=r.get("logprobs"),
                 stop_reason=r.get("stop_reason"),
+                routed_experts=r.get("routed_experts"),
             )
             for r in raw_list
         ]
@@ -1242,7 +1257,10 @@ class MultiModelInferenceManager:
 
                 total_gpus = int(config.total_gpus)
                 pipeline_parallel_size = int(getattr(config, "inference_pp", 1) or 1)
-                enable_expert_parallel = bool(config.is_moe and config.inference_dp > 1)
+                enable_expert_parallel = _env_flag(
+                    "MINT_VLLM_ENABLE_EXPERT_PARALLEL",
+                    default=bool(config.is_moe and config.inference_dp > 1),
+                )
                 logger.info(
                     f"Creating multi-node vLLM engine for model {model_name}: "
                     f"actor={actor_name}, TP={config.inference_tp}, PP={pipeline_parallel_size}, DP={config.inference_dp}, "

@@ -332,6 +332,8 @@ MODEL_CONFIGS = {
         max_model_len=8192,  # 8K context
         is_mla=True,  # DeepSeek V3 MLA architecture
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
 }
 
@@ -549,5 +551,6 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
         "moonshotai/Kimi-K2-Instruct",
+        "moonshotai/Moonlight-16B-A3B-Instruct",
     ]
     return [m for m in allowed if m in MODEL_CONFIGS]

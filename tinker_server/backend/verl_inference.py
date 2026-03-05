@@ -26,16 +26,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# vLLM MoE LoRA support: tolerate missing expert adapters.
+
+def _mint_present_expert_ids_from_keys(keys: list[str]) -> set[int]:
+    import re
+
+    expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
+    out: set[int] = set()
+    for k in keys:
+        m = expert_pat.search(k)
+        if m is not None:
+            out.add(int(m.group(1)))
+    return out
+
+
+def _mint_present_expert_ids_from_adapter_dir(adapter_dir: str) -> set[int]:
+    from safetensors import safe_open
+
+    path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    with safe_open(path, framework="pt", device="cpu") as f:
+        return _mint_present_expert_ids_from_keys(list(f.keys()))
+
+
+# vLLM MoE LoRA support: tolerate shared-expert sparse adapters.
 #
 # vLLM's PackedLoRALayerWeights.pack_moe currently asserts that every expert has
 # (w1,w2,w3) LoRA weights present. Our adapter export can be sparse across
-# experts (e.g. only one representative expert per layer), which is semantically
-# equivalent to zero delta for missing experts.
+# experts when using "shared expert" export (expert 0 only): the exported expert
+# weights are intended to be broadcast to all experts at load time.
 #
 # We patch pack_moe inside vLLM TP worker processes via EngineCore.collective_rpc.
 def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
-    import torch
+    import inspect
     from vllm.lora import lora_weights as lw  # type: ignore
 
     Packed = getattr(lw, "PackedLoRALayerWeights", None)
@@ -43,33 +64,53 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
     if Packed is None or LoRALayerWeights is None:
         raise RuntimeError("vLLM lora_weights types missing; cannot patch pack_moe")
 
-    current = getattr(Packed, "pack_moe", None)
-    if getattr(current, "__mint_sparse_ok__", False):
-        return "ok:already"
-
-    orig_cm = Packed.__dict__.get("pack_moe")
-    orig_fn = getattr(orig_cm, "__func__", None)
+    cm = Packed.__dict__.get("pack_moe")
+    orig_fn = getattr(cm, "__func__", None)
     if orig_fn is None:
         raise RuntimeError("vLLM pack_moe not found; cannot patch")
+    if getattr(orig_fn, "__mint_sparse_ok__", False):
+        return "ok:already"
 
-    def _zero_like(base: Any, module_name: str) -> Any:
-        return LoRALayerWeights(
-            module_name=str(getattr(base, "module_name", module_name)),
-            rank=int(getattr(base, "rank", 0)),
-            lora_alpha=int(getattr(base, "lora_alpha", 1)),
-            lora_a=torch.zeros_like(getattr(base, "lora_a")),
-            lora_b=torch.zeros_like(getattr(base, "lora_b")),
-            scaling=1.0,
+    try:
+        sig = inspect.signature(orig_fn)
+    except Exception as e:
+        raise RuntimeError(
+            f"Unable to inspect vLLM PackedLoRALayerWeights.pack_moe signature: {type(e).__name__}: {e}"
+        ) from e
+
+    has_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if "is_non_gated_moe" not in sig.parameters and not has_kwargs:
+        import vllm  # type: ignore
+
+        raise RuntimeError(
+            "vLLM PackedLoRALayerWeights.pack_moe signature mismatch for sparse-ok patch: "
+            f"expected 'is_non_gated_moe' kwarg (or **kwargs), got signature={sig}. "
+            f"installed_vllm_version={getattr(vllm, '__version__', 'unknown')!r}"
         )
 
-    def pack_moe_sparse_ok(cls, loras, module_name: str):  # type: ignore[no-untyped-def]
+    def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
+        if loras and all(l is not None for l in loras):
+            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
+
         if not loras or (len(loras) % 3) != 0:
-            return orig_fn(cls, loras, module_name)
+            raise RuntimeError(
+                f"Unexpected MoE LoRA pack_moe inputs for module={module_name!r}: len(loras)={len(loras)}"
+            )
 
         n_experts = len(loras) // 3
+
+        base_any = next((l for l in loras if l is not None), None)
+        if base_any is None:
+            raise RuntimeError(
+                f"MoE LoRA pack_moe got all-None loras for module={module_name!r}"
+            )
+        rank = int(getattr(base_any, "rank"))
+        lora_alpha = int(getattr(base_any, "lora_alpha"))
+
         base_w1 = next(
-            (loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None),
-            None,
+            (loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None), None
         )
         base_w2 = next(
             (loras[i * 3 + 1] for i in range(n_experts) if loras[i * 3 + 1] is not None),
@@ -80,18 +121,62 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
             None,
         )
         if base_w1 is None or base_w2 is None or base_w3 is None:
-            raise RuntimeError("MoE LoRA pack_moe missing base weights; cannot fill zeros")
+            raise RuntimeError(
+                f"MoE LoRA pack_moe missing base weight(s) for module={module_name!r}"
+            )
 
-        filled = list(loras)
-        for eid in range(n_experts):
-            i = eid * 3
-            if filled[i] is None:
-                filled[i] = _zero_like(base_w1, module_name)
-            if filled[i + 1] is None:
-                filled[i + 1] = _zero_like(base_w2, module_name)
-            if filled[i + 2] is None:
-                filled[i + 2] = _zero_like(base_w3, module_name)
-        return orig_fn(cls, filled, module_name)
+        only_expert0 = True
+        for eid in range(1, n_experts):
+            if (
+                loras[eid * 3] is not None
+                or loras[eid * 3 + 1] is not None
+                or loras[eid * 3 + 2] is not None
+            ):
+                only_expert0 = False
+                break
+
+        if only_expert0:
+            # Shared-expert export (expert 0 only): expand across experts without
+            # materializing full per-expert tensors.
+            #
+            # vLLM later calls optimize() (in-place scaling merge) on packed weights.
+            # expand(...) returns a view with internal overlap; avoid in-place ops by
+            # pre-applying scaling out-of-place and setting scaling=1.
+            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
+            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
+            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
+
+            w1_lora_b_base = base_w1.lora_b * float(getattr(base_w1, "scaling", lora_alpha / rank))
+            w2_lora_b_base = base_w2.lora_b * float(getattr(base_w2, "scaling", lora_alpha / rank))
+            w3_lora_b_base = base_w3.lora_b * float(getattr(base_w3, "scaling", lora_alpha / rank))
+            w1_lora_b = w1_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w1_lora_b_base.shape))
+            w2_lora_b = w2_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w2_lora_b_base.shape))
+            w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
+
+            packed_scaling = [1.0, 1.0, 1.0]
+        else:
+            present_eids: set[int] = set()
+            for eid in range(n_experts):
+                if (
+                    loras[eid * 3] is not None
+                    or loras[eid * 3 + 1] is not None
+                    or loras[eid * 3 + 2] is not None
+                ):
+                    present_eids.add(eid)
+            raise RuntimeError(
+                "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
+                f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
+            )
+
+        return cls(
+            module_name,
+            rank,
+            [lora_alpha, lora_alpha, lora_alpha],
+            [w1_lora_a, w2_lora_a, w3_lora_a],
+            [w1_lora_b, w2_lora_b, w3_lora_b],
+            scaling=packed_scaling,
+        )
 
     pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
@@ -100,6 +185,7 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 
 # Import model registry
@@ -121,16 +207,19 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
         max_loras: Maximum LoRAs in a single batch (default: 1).
                    Set > 1 for multi-LoRA concurrent inference.
         max_cpu_loras: Maximum LoRAs in CPU cache for swap (default: 0).
+
+    Returns:
+        Ray actor class (result of ray.remote() applied to the extended class).
     """
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServerBase
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
     from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
 
     # Capture in closure
     _max_loras = max_loras
     _max_cpu_loras = max_cpu_loras
 
-    @ray.remote(num_cpus=1)
-    class ExtendedVLLMHttpServer(vLLMHttpServerBase):
+    # Define the class WITHOUT @ray.remote decorator
+    class ExtendedVLLMHttpServer(vLLMHttpServer):
         """Extended vLLMHttpServer with hot LoRA loading support."""
 
         # Class-level config for multi-LoRA (captured from factory)
@@ -142,10 +231,21 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             # Set PYTHONPATH in OS environment so vLLM's TP workers inherit it
             # Ray's runtime_env only sets it for this process, not multiprocessing children
             import os
+            import inspect
             import sys
             # Allow EngineCoreClient to send function objects for collective_rpc.
-            # This is used only for internal worker patching and never exposed via HTTP.
-            os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+            #
+            # This is used only for internal worker patching (e.g. MoE LoRA pack_moe
+            # sparse/shared-expert support) and is not exposed as an HTTP surface.
+            #
+            # Security note:
+            # - vLLM names this flag "insecure" because enabling it relaxes
+            #   serialization restrictions for RPC payloads.
+            # - We keep it enabled by default for backwards compatibility, but allow
+            #   explicitly disabling it via MINT_VLLM_ALLOW_INSECURE_SERIALIZATION=0.
+            allow_insecure = os.environ.get("MINT_VLLM_ALLOW_INSECURE_SERIALIZATION", "1").strip().lower()
+            if allow_insecure not in {"0", "false", "no", "off"}:
+                os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
@@ -162,7 +262,36 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
-            super().__init__(*args, **kwargs)
+            # Re-import vLLMHttpServer after sys.path is fixed to get the correct version.
+            # Worker nodes may have an older verl in sys.path (/workspace/verl) that lacks
+            # cuda_visible_devices; the PFS version is now first after the sys.path fixup above.
+            import importlib
+            for _mod in list(sys.modules):
+                if _mod == "verl" or _mod.startswith("verl."):
+                    del sys.modules[_mod]
+            _vllm_server_mod = importlib.import_module("verl.workers.rollout.vllm_rollout.vllm_async_server")
+            _CorrectBase = _vllm_server_mod.vLLMHttpServer
+            print(
+                f"[ExtendedVLLMHttpServer] verl.__file__="
+                f"{getattr(sys.modules.get('verl'), '__file__', None)}",
+                flush=True,
+            )
+            print(
+                f"[ExtendedVLLMHttpServer] vllm_async_server.__file__="
+                f"{getattr(_vllm_server_mod, '__file__', None)}",
+                flush=True,
+            )
+            try:
+                sig = inspect.signature(_CorrectBase.__init__)
+            except (TypeError, ValueError):
+                sig = None
+            print(f"[ExtendedVLLMHttpServer] vLLMHttpServer.__init__ sig={sig}", flush=True)
+            print(f"[ExtendedVLLMHttpServer] Calling with args={args}, kwargs keys={list(kwargs.keys())}", flush=True)
+            if 'cuda_visible_devices' in kwargs:
+                print(f"[ExtendedVLLMHttpServer] cuda_visible_devices={kwargs['cuda_visible_devices']}", flush=True)
+            else:
+                print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
+            _CorrectBase.__init__(self, *args, **kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
@@ -171,6 +300,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "yes",
                 "y",
                 "on",
+            )
+            self._enable_rollout_routing_replay = bool(
+                getattr(self.config, "enable_rollout_routing_replay", False)
             )
             self._mint_pack_moe_patched = False
             self._progress_last: dict[str, float] = {}
@@ -239,9 +371,20 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 return False
 
+        async def is_ready(self) -> bool:
+            """Alias for is_engine_ready() for compatibility with multinode_inference.py."""
+            return await self.is_engine_ready()
+
         async def _ensure_pack_moe_patched(self) -> None:
             if self._mint_pack_moe_patched:
                 return
+            if os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION", "").strip() not in {"1", "true", "yes"}:
+                raise RuntimeError(
+                    "vLLM worker patching requires VLLM_ALLOW_INSECURE_SERIALIZATION=1 "
+                    "(EngineCore collective_rpc sends function objects). "
+                    "Set MINT_VLLM_ALLOW_INSECURE_SERIALIZATION=1 (default) or export full per-expert adapters "
+                    "by setting MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0."
+                )
             engine_core = getattr(self.engine, "engine_core", None)
             rpc = getattr(engine_core, "collective_rpc_async", None)
             if rpc is None:
@@ -250,6 +393,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if not results or any((not isinstance(r, str)) or (not r.startswith("ok:")) for r in results):
                 raise RuntimeError(f"vLLM worker pack_moe patch failed: {results}")
             self._mint_pack_moe_patched = True
+
+        async def _maybe_ensure_pack_moe_patched_for_adapter_dir(self, adapter_dir: object) -> None:
+            if not isinstance(adapter_dir, str) or not adapter_dir:
+                raise RuntimeError(f"vLLM LoRARequest missing lora_path: {adapter_dir!r}")
+            present = _mint_present_expert_ids_from_adapter_dir(adapter_dir)
+            if present == {0}:
+                await self._ensure_pack_moe_patched()
+
+        async def _maybe_ensure_pack_moe_patched_for_state_dict(self, state_dict: dict) -> None:
+            present = _mint_present_expert_ids_from_keys([str(k) for k in state_dict.keys()])
+            if present == {0}:
+                await self._ensure_pack_moe_patched()
 
         def _patch_lora_args(self, args):
             """Patch args Namespace with multi-LoRA config.
@@ -293,6 +448,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 pass  # May not have any LoRA loaded
 
             # Add new LoRA
+            await self._maybe_ensure_pack_moe_patched_for_adapter_dir(getattr(lora_request, "lora_path", None))
             await self.engine.add_lora(lora_request)
 
         async def add_lora_from_tensors(
@@ -349,6 +505,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -397,23 +554,33 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             adapter_path = temp_dir
 
             # DEBUG: Print tensor norms to trace LoRA values on vLLM side
-            print(f"[DEBUG vLLM add_lora_with_id] lora_int_id={lora_int_id}, state_dict has {len(state_dict)} keys", flush=True)
-            total_norm = 0.0
-            nonzero_count = 0
-            for k, v in list(state_dict.items())[:10]:
-                import torch
-                norm = float(v.norm().item()) if isinstance(v, torch.Tensor) else 0.0
-                total_norm += norm
-                if norm > 1e-8:
-                    nonzero_count += 1
-                print(f"[DEBUG vLLM add_lora_with_id] {k}: norm={norm:.6f}", flush=True)
-            print(f"[DEBUG vLLM add_lora_with_id] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}", flush=True)
+            debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
+            if debug:
+                print(
+                    f"[DEBUG vLLM add_lora_with_id] lora_int_id={lora_int_id}, state_dict has {len(state_dict)} keys",
+                    flush=True,
+                )
+                total_norm = 0.0
+                nonzero_count = 0
+                for k, v in list(state_dict.items())[:10]:
+                    import torch
+
+                    norm = float(v.norm().item()) if isinstance(v, torch.Tensor) else 0.0
+                    total_norm += norm
+                    if norm > 1e-8:
+                        nonzero_count += 1
+                    print(f"[DEBUG vLLM add_lora_with_id] {k}: norm={norm:.6f}", flush=True)
+                print(
+                    f"[DEBUG vLLM add_lora_with_id] Summary: {nonzero_count}/10 tensors non-zero, total_norm={total_norm:.6f}",
+                    flush=True,
+                )
 
             # Save adapter files locally on worker node
             save_file(state_dict, os.path.join(adapter_path, "adapter_model.safetensors"))
             with open(os.path.join(adapter_path, "adapter_config.json"), "w") as f:
                 json.dump(peft_config, f, indent=2)
-            print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
+            if debug:
+                print(f"[DEBUG vLLM add_lora_with_id] Saved to {adapter_path}", flush=True)
 
             # Track path for this lora_int_id (needed for GPU/CPU swap in generate)
             self._lora_paths[lora_int_id] = adapter_path
@@ -426,7 +593,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Add to engine (no need to remove - this is a new unique ID)
-            await self._ensure_pack_moe_patched()
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -449,19 +616,25 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             """
             from vllm.lora.request import LoRARequest
 
-            print(f"[DEBUG add_lora_from_path] lora_int_id={lora_int_id}, lora_path={lora_path}", flush=True)
+            debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
+            if debug:
+                print(
+                    f"[DEBUG add_lora_from_path] lora_int_id={lora_int_id}, lora_path={lora_path}",
+                    flush=True,
+                )
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,
                 lora_path=lora_path,
             )
 
-            await self._ensure_pack_moe_patched()
+            await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
             await self.engine.add_lora(lora_request)
 
             # Track path for generate_with_lora (needed for GPU/CPU swap)
             self._lora_paths[lora_int_id] = lora_path
-            print(f"[DEBUG add_lora_from_path] Stored path for lora_int_id={lora_int_id}", flush=True)
+            if debug:
+                print(f"[DEBUG add_lora_from_path] Stored path for lora_int_id={lora_int_id}", flush=True)
 
         async def generate_with_lora(
             self,
@@ -511,14 +684,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 )
 
             # Build sampling params
+            # vLLM requires n=1 for greedy sampling (temperature=0)
+            effective_n = 1 if temperature == 0 else max(1, int(n))
             sampling_params = SamplingParams(
                 max_tokens=effective_max_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
-                n=max(1, int(n)),
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                n=effective_n,
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -603,17 +778,27 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
                 self._progress_last.pop(request_id, None)
+                routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(final_res.outputs[0], "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
+                    if raw is not None:
+                        routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 # Determine stop reason
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
+                    "routed_experts": routed_experts,
                     "stop_reason": stop_reason,
                     "_timing_total_s": float(total_s),
                     "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -666,17 +851,27 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         lp[out_token_ids[i]].logprob
                         for i, lp in enumerate(out.logprobs)
                     ]
+                out_routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(out, "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
+                    if raw is not None:
+                        out_routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 outs.append(
                     {
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
+                        "routed_experts": out_routed_experts,
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -730,14 +925,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 )
 
             # Build sampling params
+            # vLLM requires n=1 for greedy sampling (temperature=0)
+            effective_n = 1 if temperature == 0 else max(1, int(n))
             sampling_params = SamplingParams(
                 max_tokens=effective_max_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=0 if logprobs else None,
-                n=max(1, int(n)),
-                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]),
+                n=effective_n,
+                **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
 
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
@@ -811,17 +1008,27 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
                 self._progress_last.pop(request_id, None)
+                routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(final_res.outputs[0], "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
+                    if raw is not None:
+                        routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 # Determine stop reason
                 stop_reason = "length"
                 if final_res.outputs[0].finish_reason == "stop":
                     stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
+                    "routed_experts": routed_experts,
                     "stop_reason": stop_reason,
                     "_timing_total_s": float(total_s),
                     "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -874,17 +1081,27 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         lp[out_token_ids[i]].logprob
                         for i, lp in enumerate(out.logprobs)
                     ]
+                out_routed_experts = None
+                if self._enable_rollout_routing_replay:
+                    raw = getattr(out, "routed_experts", None)
+                    if raw is None:
+                        raise RuntimeError(
+                            "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                        )
+                    if raw is not None:
+                        out_routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
 
                 out_stop_reason = "length"
                 if out.finish_reason == "stop":
                     out_stop_reason = "stop"
-                elif any(tid in [151645, 151643] for tid in out_token_ids[-3:]):
+                elif any(tid in [151645, 151643, 163586, 163585] for tid in out_token_ids[-3:]):
                     out_stop_reason = "stop"
 
                 outs.append(
                     {
                         "token_ids": out_token_ids,
                         "logprobs": out_log_probs,
+                        "routed_experts": out_routed_experts,
                         "stop_reason": out_stop_reason,
                         "_timing_total_s": float(total_s),
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
@@ -975,7 +1192,20 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     logprobs[token_ids[i]].logprob
                     for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                 ]
-            return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+            routed_experts = None
+            if self._enable_rollout_routing_replay:
+                raw = getattr(final_res.outputs[0], "routed_experts", None)
+                if raw is None:
+                    raise RuntimeError(
+                        "enable_rollout_routing_replay is set but vLLM returned no routed_experts"
+                    )
+                if raw is not None:
+                    routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
+            return TokenOutput(
+                token_ids=token_ids,
+                log_probs=log_probs,
+                routed_experts=routed_experts,
+            )
 
         async def compute_prompt_logprobs(
             self,
@@ -1589,7 +1819,8 @@ with open(result_file, "w") as f:
             else:
                 return "No logits captured"
 
-    return ExtendedVLLMHttpServer
+    # Apply ray.remote() dynamically, like verl does
+    return ray.remote(num_cpus=1)(ExtendedVLLMHttpServer)
 
 
 @dataclass
@@ -1598,6 +1829,7 @@ class GenerateResult:
 
     token_ids: list[int]
     log_probs: list[float] | None
+    routed_experts: list | None = None
 
 
 class VerlInferenceEngine:
@@ -1697,6 +1929,7 @@ class VerlInferenceEngine:
         # Create rollout config using dataclass
         # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
         # Expert parallelism is enabled via engine_kwargs instead
+        enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
         rollout_config = RolloutConfig(
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
@@ -1718,6 +1951,7 @@ class VerlInferenceEngine:
             data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
             expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
             engine_kwargs=engine_kwargs,
+            enable_rollout_routing_replay=enable_rollout_routing_replay,
         )
 
         # Create model config using dataclass
@@ -1756,6 +1990,7 @@ class VerlInferenceEngine:
             node_rank=0,
             gpus_per_node=total_gpus,
             nnodes=1,
+            cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
         )
 
         # Launch the server
@@ -1802,7 +2037,7 @@ class VerlInferenceEngine:
             "top_p": top_p,
             "logprobs": logprobs,
         }
-        sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643]))
+        sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]))
 
         # Call the Ray actor's generate method
         result = await self.server.generate.remote(
@@ -1814,6 +2049,11 @@ class VerlInferenceEngine:
         return GenerateResult(
             token_ids=list(result.token_ids),
             log_probs=list(result.log_probs) if result.log_probs else None,
+            routed_experts=(
+                result.routed_experts.tolist()
+                if getattr(result, "routed_experts", None) is not None and hasattr(result.routed_experts, "tolist")
+                else getattr(result, "routed_experts", None)
+            ),
         )
 
     async def compute_logprobs(

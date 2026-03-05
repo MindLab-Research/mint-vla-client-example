@@ -160,6 +160,7 @@ class DistributedConfig:
     expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
+    router_replay_mode: str = "disabled"
 
     @property
     def world_size(self) -> int:
@@ -817,7 +818,12 @@ class MegatronRankWorker:
             logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
-        from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+        from verl.workers.config import (
+            HFModelConfig,
+            McoreEngineConfig,
+            McoreOptimizerConfig,
+        )
+        from verl.workers.config.engine import EngineRouterReplayConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
@@ -914,6 +920,39 @@ class MegatronRankWorker:
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
                 f"top-{num_experts_per_tok} routing, permute_fusion=True"
             )
+            enable_deepep = (
+                _env_flag("MINT_MEGATRON_ENABLE_DEEPEP", default=False)
+                and int(getattr(self.config, "expert_parallel_size", 1) or 1) > 1
+            )
+            if enable_deepep:
+                moe_token_dispatcher_type = (
+                    os.environ.get("MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE", "flex").strip().lower()
+                )
+                override_tf_config["moe_token_dispatcher_type"] = moe_token_dispatcher_type
+                override_tf_config["moe_flex_dispatcher_backend"] = (
+                    os.environ.get("MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "deepep").strip().lower()
+                )
+                # NOTE: Megatron-LM still supports moe_enable_deepep but warns it's deprecated;
+                # keep it alongside moe_flex_dispatcher_backend for compatibility.
+                override_tf_config["moe_enable_deepep"] = True
+                override_tf_config["moe_router_dtype"] = (
+                    os.environ.get("MINT_MEGATRON_MOE_ROUTER_DTYPE", "fp32").strip().lower()
+                )
+                if moe_token_dispatcher_type != "alltoall":
+                    if override_tf_config.get("moe_shared_expert_overlap") is True:
+                        override_tf_config["moe_shared_expert_overlap"] = False
+                        logger.info(
+                            f"[Rank {self.rank}] Disabled moe_shared_expert_overlap for moe_token_dispatcher_type={moe_token_dispatcher_type}"
+                        )
+                sms = os.environ.get("MINT_MEGATRON_MOE_DEEPEP_NUM_SMS", "").strip()
+                if sms:
+                    override_tf_config["moe_deepep_num_sms"] = int(sms)
+                logger.info(
+                    f"[Rank {self.rank}] DeepEP enabled: dispatcher={override_tf_config['moe_token_dispatcher_type']}, "
+                    f"backend={override_tf_config['moe_flex_dispatcher_backend']}, "
+                    f"router_dtype={override_tf_config['moe_router_dtype']}, "
+                    f"deepep_num_sms={override_tf_config.get('moe_deepep_num_sms', 'default')}"
+                )
 
         override_tf_config["deallocate_pipeline_outputs"] = True
         grad_accum_fusion_available = False
@@ -1027,6 +1066,7 @@ class MegatronRankWorker:
             expert_model_parallel_size=self.config.expert_parallel_size,
             expert_tensor_parallel_size=self.config.expert_tensor_parallel_size,
             context_parallel_size=self.config.context_parallel_size,
+            router_replay=EngineRouterReplayConfig(mode=self.config.router_replay_mode),
             param_offload=True,
             optimizer_offload=True,
             grad_offload=use_grad_offload,
@@ -1264,6 +1304,7 @@ class MegatronRankWorker:
         data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
+        rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
     ) -> dict:
@@ -1276,6 +1317,7 @@ class MegatronRankWorker:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
             loss_fn_config: Config for loss function (e.g., {"epsilon": 0.2} for PPO).
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             session_id: Optional session ID for gradient isolation.
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
@@ -1332,9 +1374,15 @@ class MegatronRankWorker:
             loss_function = create_sft_loss_fn(return_logprobs=True)
         elif loss_fn == "ppo":
             epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(epsilon)
+            loss_function = create_ppo_loss_fn(
+                epsilon,
+                rollout_correction_config=rollout_correction_config,
+            )
         elif loss_fn == "importance_sampling":
-            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
+            loss_function = create_ppo_loss_fn(
+                epsilon=float("inf"),
+                rollout_correction_config=rollout_correction_config,
+            )
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
@@ -1574,6 +1622,8 @@ class MegatronRankWorker:
             logger.debug(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}")
 
             # Return CPU-safe scalars and loss_fn_outputs
+            routing_replay_enabled = int("routed_experts" in data.keys())
+            routing_replay_items = int(valid_count) if routing_replay_enabled else 0
             result_dict = {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
@@ -1582,6 +1632,8 @@ class MegatronRankWorker:
                 "n_ppo_results": int(n_ppo_results),
                 "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
+                "routing_replay_enabled": routing_replay_enabled,
+                "routing_replay_items": routing_replay_items,
             }
             # Add debug metrics if present
             if debug_metrics:
@@ -1956,15 +2008,29 @@ class MegatronRankWorker:
                 logger.info(f"[Rank 0] Filtered {before - len(adapter_state)} MLP/expert params (export_adapter_weights)")
 
             # For MoE models exporting per-expert LoRA, the full per-expert tree can be
-            # extremely large (K2: ~140k tensors, ~77GB). In current Megatron-Bridge
-            # integration, expert LoRA weights are shared within each EP shard; exporting
-            # only one representative expert per EP shard is sufficient for vLLM, and
-            # vLLM will fill missing experts (patched via sitecustomize).
+            # extremely large (K2: ~140k tensors, ~77GB).
+            #
+            # Current vLLM hot-load support in this repo only supports:
+            # - full per-expert exports (all experts present), OR
+            # - "shared-expert" exports (expert 0 only) where vLLM broadcasts expert 0
+            #   weights to all experts at load time.
+            #
+            # A "one representative expert per EP shard" sparse export is not supported
+            # by the current vLLM loader patch (it fail-fast) because correct filling
+            # requires EP shard aware mapping.
             if model_is_moe and use_per_expert_lora:
                 import os
                 import re
 
                 if os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0":
+                    mode = os.environ.get("MINT_MOE_LORA_SHARED_EXPERT_EXPORT", "1").strip().lower()
+                    if mode not in {"1", "true", "yes"}:
+                        raise RuntimeError(
+                            "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT requires shared-expert semantics. "
+                            "If you want a full per-expert export, set MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0. "
+                            "Otherwise enable shared export via MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1."
+                        )
+
                     # Determine EP size.
                     try:
                         from megatron.core import parallel_state as mpu
@@ -1998,6 +2064,14 @@ class MegatronRankWorker:
                             for r in range(ep_size)
                             if (base + (1 if r < rem else 0)) > 0
                         }
+                        if reps != {0}:
+                            raise RuntimeError(
+                                "Unsupported MoE LoRA sparse export: one representative expert per EP shard "
+                                "is not loadable by the current vLLM hot-load patch. "
+                                "Use either (1) full per-expert export by setting MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=0, "
+                                "or (2) expert-0-only shared export by setting MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1."
+                                f" ep_size={ep_size} num_experts={num_experts} reps={sorted(reps)}"
+                            )
 
                         # Keep all non-expert keys + only representative expert keys.
                         expert_pat = re.compile(r"\.mlp\.experts\.(\d+)\.")
@@ -4087,11 +4161,6 @@ class MegatronWorkerGroup:
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
-                # Fix flash-attn / TransformerEngine dynamic loading:
-                # flash_attn_2_cuda fails to import when libc10.so is not on the loader path,
-                # which leaves TE's flash_attn_func / flash_attn_varlen_func as None and crashes
-                # with "TypeError: 'NoneType' object is not callable".
-                "LD_LIBRARY_PATH": "/opt/venv/lib/python3.10/site-packages/torch/lib:/usr/local/cuda/lib64",
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
@@ -4105,6 +4174,22 @@ class MegatronWorkerGroup:
         for k in (
             "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
             "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
+
+        # Forward DeepEP knobs into rank workers.
+        #
+        # Rank workers run on GPU nodes; they do NOT inherit the API server's
+        # environment unless we explicitly forward selected env vars into the
+        # Ray runtime_env.
+        for k in (
+            "MINT_MEGATRON_ENABLE_DEEPEP",
+            "MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE",
+            "MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
+            "MINT_MEGATRON_MOE_ROUTER_DTYPE",
+            "MINT_MEGATRON_MOE_DEEPEP_NUM_SMS",
         ):
             v = os.environ.get(k)
             if v is not None:
@@ -4384,6 +4469,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
         *,
@@ -4397,6 +4483,7 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             session_id: Session ID for multi-tenant gradient isolation.
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
@@ -4425,7 +4512,9 @@ class MegatronWorkerGroup:
         # to avoid Ray serialization issues with nested tensors)
         t2 = time.perf_counter() if timing else 0.0
         futures = [
-            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id, reset_bias)
+            w.forward_backward.remote(
+                data_items, loss_fn, loss_fn_config, rollout_correction_config, effective_session_id, reset_bias
+            )
             for w in self.workers
         ]
         results = ray.get(futures)
@@ -4454,6 +4543,12 @@ class MegatronWorkerGroup:
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
+        metrics["routing_replay_enabled:mean"] = float(
+            rank0_result.get("routing_replay_enabled", 0.0)
+        )
+        metrics["routing_replay_items:sum"] = float(
+            rank0_result.get("routing_replay_items", 0.0)
+        )
 
         # Add PPO metrics if present (now pre-extracted as scalars)
         # importance_sampling uses PPO loss with epsilon=inf, so include it here
@@ -4508,6 +4603,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict | None = None,
         learning_rate: float | None = None,
         session_id: str | None = None,
         *,
@@ -4524,6 +4620,7 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             learning_rate: Optional LR override (defaults to current group's LR).
             session_id: Session ID for multi-tenant gradient isolation.
 
@@ -4538,6 +4635,7 @@ class MegatronWorkerGroup:
             data_items=data_items,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
+            rollout_correction_config=rollout_correction_config,
             session_id=effective_session_id,
             train_attn=train_attn,
             train_mlp=train_mlp,

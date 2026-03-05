@@ -504,17 +504,22 @@ sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 
 **Find Ray head task (if task ID unknown):**
 ```bash
-volc ml_task list --output json | jq '.[] | select(.Name | startswith("ray-head")) | {Id, Name, Status}'
+ssh mint-dev '/root/.volc/bin/volc ml_task list --output json --limit 200' | jq '.[] | select(.Name | startswith("ray-head")) | {Id, Name, Status}'
 ```
 
 **Get Ray head IP from task logs:**
 ```bash
-volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
+ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' | grep "Local node IP"
 ```
 
-**Connect SSH server to cluster:**
+**DO NOT run `ray start` on `mint-dev`:**
+- `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
+- Use `ray.init(address=...)` in Python or use Ray CLI commands that connect to the head without starting a local node.
+
+**Safe connectivity check (no local raylet):**
 ```bash
-ssh mint-dev "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+ssh mint-dev "ray status --address='<RAY_HEAD_IP>:6379'"
+ssh mint-dev "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
 ```
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
