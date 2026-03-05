@@ -278,6 +278,8 @@ async def retrieve_future(
         if queue_state_reason is None and status_field == "queued":
             if isinstance(queue_depth, int) and queue_depth > 0:
                 queue_state_reason = "queue_backlog"
+            elif queue_position is None:
+                queue_state_reason = "queue_position_unknown"
         if status_field == "queued":
             try:
                 from ..config import config as server_config
@@ -332,6 +334,8 @@ async def retrieve_future(
 
         extra_body.update(
             {
+                "request_id": body.request_id,
+                "type": "try_again",
                 "status": status_field,
                 "queue_state_reason": queue_state_reason,
                 "queue_position": queue_position,

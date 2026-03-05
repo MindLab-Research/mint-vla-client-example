@@ -63,9 +63,13 @@ def test_issue_182_pending_payload_queue_backlog_reason(monkeypatch):
     payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
 
     assert response.status_code == 408
+    assert payload.get("request_id") == "rid_queue"
+    assert payload.get("type") == "try_again"
     assert payload.get("status") == "queued"
     assert payload.get("queue_depth") == 5
     assert payload.get("queue_state_reason") == "queue_backlog"
+    assert payload.get("estimated_wait_s") == pytest.approx(6.0)
+    assert response.headers.get("X-Queue-ETA-S") == "6.000"
     assert payload.get("retry_after_s") == int(response.headers.get("Retry-After"))
 
 
@@ -84,8 +88,58 @@ def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
     payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
 
     assert response.status_code == 408
+    assert payload.get("request_id") == "rid_running"
+    assert payload.get("type") == "try_again"
     assert payload.get("status") == "prefill"
     assert payload.get("queue_state_reason") is None
+
+
+def test_issue_182_pending_payload_progress_headers(monkeypatch):
+    meta = {
+        "queue_state": "running",
+        "stage": "decode",
+        "op": "sampling.asample",
+        "progress": {"tokens_generated": 5, "max_tokens": 12},
+        "last_progress_at": 0.0,
+    }
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue(depth=0, position=None, ema_exec_s=None))
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+
+    body = FutureRetrieveRequest(request_id="rid_decode")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "decode"
+    assert payload.get("progress") == {"tokens_generated": 5, "max_tokens": 12}
+    assert response.headers.get("X-Queue-Tokens-Generated") == "5"
+    assert response.headers.get("X-Queue-Max-Tokens") == "12"
+
+
+def test_issue_182_pending_payload_queue_position_unknown_reason(monkeypatch):
+    meta = {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue(depth=None, position=None, ema_exec_s=None))
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+
+    body = FutureRetrieveRequest(request_id="rid_unknown_pos")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("queue_position") is None
+    assert payload.get("queue_depth") is None
+    assert payload.get("queue_state_reason") == "queue_position_unknown"
 
 
 def test_issue_182_pending_payload_queue_lookup_unavailable_maps_503(monkeypatch):
