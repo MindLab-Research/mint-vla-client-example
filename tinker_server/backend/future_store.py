@@ -336,13 +336,20 @@ def _get_or_create_ray_actor():
 
         def mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
+            now = time.time()
             if request_id in self._pending:
-                self._queued_at[request_id] = time.time()
+                self._queued_at[request_id] = now
+            m = self._meta.get(request_id) or {}
             if meta is not None:
-                m = self._meta.get(request_id) or {}
                 m.update(dict(meta))
-                self._meta[request_id] = m
-                self._update_op_from_meta(request_id, m)
+            if "queue_state" not in m:
+                m["queue_state"] = "queued"
+            if "stage" not in m:
+                m["stage"] = "queued"
+            if not isinstance(m.get("queued_at"), (int, float)):
+                m["queued_at"] = now
+            self._meta[request_id] = m
+            self._update_op_from_meta(request_id, m)
 
         def mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
@@ -353,6 +360,25 @@ def _get_or_create_ray_actor():
                 m.update(dict(meta))
                 self._meta[request_id] = m
                 self._update_op_from_meta(request_id, m)
+
+        def update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+            self._prune()
+            if meta is None:
+                return
+            exists = (
+                request_id in self._pending
+                or request_id in self._refs
+                or request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            )
+            if not exists:
+                return
+            m = self._meta.get(request_id) or {}
+            m.update(dict(meta))
+            self._meta[request_id] = m
+            self._update_op_from_meta(request_id, m)
 
         def attach_ref(self, request_id: str, ref: Any, meta: dict[str, Any] | None = None) -> None:
             self._prune()
@@ -638,6 +664,18 @@ class FutureStore:
             self._ray_actor = None
             actor = self._get_ray_actor()
             actor.mark_running.remote(request_id=request_id, meta=None if meta is None else dict(meta))
+
+    def update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+        actor = self._get_ray_actor()
+        import ray
+
+        payload = None if meta is None else dict(meta)
+        try:
+            actor.update_meta.remote(request_id=request_id, meta=payload)
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            actor.update_meta.remote(request_id=request_id, meta=payload)
 
     def forget(self, request_id: str) -> None:
         actor = self._get_ray_actor()

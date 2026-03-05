@@ -418,19 +418,6 @@ async def create_model(
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
 
-    # 1. 发送 pending 状态 - 任务已创建，等待执行
-    if webhook_url and user_id:
-        send_task_event(
-            webhook_url=webhook_url,
-            event_type=EventType.TASK_CREATED,  # pending
-            user_id=user_id,
-            session_id=model_id,
-            task_name=f"Training {request.base_model}",
-            task_type="training",
-            model_name=request.base_model,
-            config={"lora_rank": request.lora_config.rank if request.lora_config else None},
-        )
-
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_small_result_bytes
@@ -452,7 +439,7 @@ async def create_model(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "create_model"})
+        future_store.mark_queued(request_id, meta={"op": "training.create_model"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model",
@@ -460,6 +447,17 @@ async def create_model(
             user_id=user_id,
             webhook_url=webhook_url,
         )
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_CREATED,  # pending
+                user_id=user_id,
+                session_id=model_id,
+                task_name=f"Training {request.base_model}",
+                task_type="training",
+                model_name=request.base_model,
+                config={"lora_rank": request.lora_config.rank if request.lora_config else None},
+            )
         logger.info(
             "[create_model] enqueued request_id=%s op=%s model_id=%s base_model=%s bytes=%s",
             str(request_id),
@@ -472,6 +470,18 @@ async def create_model(
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_FAILED,
+                user_id=user_id,
+                session_id=model_id,
+                task_name=f"Training {request.base_model}",
+                task_type="training",
+                model_name=request.base_model,
+                error=f"enqueue_failed: {type(e).__name__}: {e}",
+                config={"lora_rank": request.lora_config.rank if request.lora_config else None},
+            )
         raise HTTPException(status_code=503, detail=f"Failed to enqueue create_model request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -774,7 +784,7 @@ async def create_model_from_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "create_model_from_state"})
+        future_store.mark_queued(request_id, meta={"op": "training.create_model_from_state"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model_from_state",
@@ -1020,7 +1030,10 @@ async def forward_backward(
         )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "forward_backward", "model_id": request.model_id})
+        future_store.mark_queued(
+            request_id,
+            meta={"op": "training.forward_backward", "model_id": request.model_id},
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.forward_backward",
@@ -1197,7 +1210,7 @@ async def train_step(
         )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "train_step", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.train_step",
@@ -1366,7 +1379,7 @@ async def forward(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "forward", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.forward",
@@ -1501,7 +1514,7 @@ async def optim_step(
         )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "optim_step", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.optim_step",
@@ -1723,7 +1736,8 @@ async def save_weights_for_sampler(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(
-            request_id, meta={"op": "save_weights_for_sampler", "model_id": request.model_id}
+            request_id,
+            meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
         )
         await api_work_queue.enqueue(
             request_id=request_id,

@@ -112,7 +112,10 @@ async def retrieve_future(
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+            )
 
         try:
             upstream_resp = await forward_json(
@@ -183,6 +186,9 @@ async def retrieve_future(
         ):
             payload = dict(payload)
             payload["detail"] = GENERIC_ERROR_MESSAGE
+        if isinstance(payload, dict) and "request_id" in payload:
+            payload = dict(payload)
+            payload["request_id"] = body.request_id
         return payload
 
     try:
@@ -220,8 +226,169 @@ async def retrieve_future(
                 except Exception:
                     pass
 
+        now = time.time()
+        extra_body: dict[str, Any] = {}
+        extra_headers: dict[str, str] = {}
+        queue_state = None
+        queue_state_reason = None
+        stage = None
+        queued_at = None
+        running_at = None
+        progress = None
+        max_tokens = None
+        last_progress_at = None
+        op = None
+        if isinstance(meta, dict):
+            queue_state = meta.get("queue_state")
+            queue_state_reason = meta.get("queue_state_reason")
+            stage = meta.get("stage")
+            queued_at = meta.get("queued_at")
+            running_at = meta.get("running_at")
+            progress = meta.get("progress")
+            max_tokens = meta.get("max_tokens")
+            last_progress_at = meta.get("last_progress_at")
+            op = meta.get("op")
+        if not isinstance(queue_state_reason, str) or not queue_state_reason.strip():
+            queue_state_reason = None
+
+        status_field = None
+        is_sampling = isinstance(op, str) and op.startswith("sampling.")
+        if is_sampling:
+            if stage in ("prefill", "decode"):
+                status_field = stage
+            elif queue_state == "queued":
+                status_field = "queued"
+            elif queue_state == "running":
+                status_field = "prefill"
+        else:
+            if queue_state in ("queued", "running"):
+                status_field = str(queue_state)
+
+        queue_position = None
+        queue_depth = None
+        estimated_wait_s = None
+        from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
+        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        try:
+            pos = await api_work_queue.find_position(body.request_id)
+        except ApiWorkQueueUnavailableError as e:
+            raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
+        if not scheduler_enabled and isinstance(pos, dict):
+            queue_depth = pos.get("depth")
+            if status_field == "queued":
+                queue_position = pos.get("position")
+        if isinstance(queue_depth, (int, float)):
+            queue_depth = int(queue_depth)
+        else:
+            queue_depth = None
+        if isinstance(queue_position, (int, float)):
+            queue_position = int(queue_position)
+        else:
+            queue_position = None
+        if scheduler_enabled and status_field == "queued":
+            queue_state_reason = "scheduler_enabled"
+            queue_depth = None
+            queue_position = None
+            estimated_wait_s = None
+        else:
+            if queue_state_reason is None and status_field == "queued":
+                if isinstance(queue_depth, int) and queue_depth > 0:
+                    queue_state_reason = "queue_backlog"
+                elif queue_position is None:
+                    queue_state_reason = "queue_position_unknown"
+            if status_field == "queued":
+                try:
+                    from ..config import config as server_config
+
+                    eta_state = await api_work_queue.get_eta_state(op if isinstance(op, str) else None)
+                    ema_exec_s = None
+                    if isinstance(eta_state, dict):
+                        ema_exec_s = eta_state.get("ema_exec_s")
+                    worker_count = int(server_config.api_work_queue_num_workers)
+                    if worker_count > 0 and isinstance(ema_exec_s, (int, float)) and queue_position is not None:
+                        estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
+                except ApiWorkQueueUnavailableError as e:
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+                except Exception as e:
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue ETA lookup failed: {type(e).__name__}: {e}") from e
+
+        progress_payload = None
+        if isinstance(progress, dict):
+            tg = progress.get("tokens_generated")
+            mx = progress.get("max_tokens")
+            if isinstance(tg, (int, float)) and isinstance(mx, (int, float)):
+                progress_payload = {
+                    "tokens_generated": int(tg),
+                    "max_tokens": int(mx),
+                }
+            if last_progress_at is None:
+                lp = progress.get("last_progress_at")
+                if isinstance(lp, (int, float)):
+                    last_progress_at = lp
+        if progress_payload is None and isinstance(max_tokens, (int, float)) and status_field == "decode":
+            progress_payload = {"tokens_generated": 0, "max_tokens": int(max_tokens)}
+
+        queued_for_s = None
+        running_for_s = None
+        last_progress_s = None
+        if isinstance(queued_at, (int, float)):
+            queued_for_s = max(0.0, now - float(queued_at))
+        if isinstance(running_at, (int, float)):
+            running_for_s = max(0.0, now - float(running_at))
+        if isinstance(last_progress_at, (int, float)):
+            last_progress_s = max(0.0, now - float(last_progress_at))
+
+        def _compute_retry_after_s() -> int:
+            if isinstance(estimated_wait_s, (int, float)) and float(estimated_wait_s) > 0:
+                v = float(estimated_wait_s) / 4.0
+                return int(max(1.0, min(30.0, v)))
+            if isinstance(queue_depth, int):
+                return int(max(1, min(10, queue_depth)))
+            return 1
+
+        retry_after_s = _compute_retry_after_s()
+
+        extra_body.update(
+            {
+                "request_id": body.request_id,
+                "type": "try_again",
+                "status": status_field,
+                "queue_state_reason": queue_state_reason,
+                "queue_position": queue_position,
+                "queue_depth": queue_depth,
+                "estimated_wait_s": estimated_wait_s,
+                "progress": progress_payload,
+                "queued_for_s": queued_for_s,
+                "running_for_s": running_for_s,
+                "last_progress_s": last_progress_s,
+            }
+        )
+
+        if status_field is not None:
+            extra_headers["X-Queue-Status"] = str(status_field)
+        if queue_position is not None:
+            extra_headers["X-Queue-Position"] = str(int(queue_position))
+        if queue_depth is not None:
+            extra_headers["X-Queue-Depth"] = str(int(queue_depth))
+        if estimated_wait_s is not None:
+            extra_headers["X-Queue-ETA-S"] = f"{float(estimated_wait_s):.3f}"
+        if isinstance(progress_payload, dict):
+            extra_headers["X-Queue-Tokens-Generated"] = str(int(progress_payload.get("tokens_generated", 0)))
+            extra_headers["X-Queue-Max-Tokens"] = str(int(progress_payload.get("max_tokens", 0)))
+
         # Tinker client expects HTTP 408 for pending
-        pending = pending_future_http_response()
+        pending = pending_future_http_response(
+            retry_after_s=retry_after_s,
+            extra_headers=extra_headers,
+            extra_body=extra_body,
+        )
         response.status_code = pending.status_code
         response.headers.update(pending.headers)
         return pending.body
