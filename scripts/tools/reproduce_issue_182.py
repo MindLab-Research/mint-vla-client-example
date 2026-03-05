@@ -9,6 +9,7 @@ import requests
 BASE_URL = os.environ.get("TINKER_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("TINKER_API_KEY", "dummy")
 BASE_MODEL = os.environ.get("ISSUE182_BASE_MODEL", "Qwen/Qwen3-0.6B")
+SCHEDULER_ENABLED = os.environ.get("MINT_SCHEDULER_ENABLE", "0").strip().lower() in ("1", "true", "yes", "y")
 
 
 def _headers() -> dict[str, str]:
@@ -72,6 +73,11 @@ def _check_pending_payload(body: dict, headers: dict[str, str]) -> None:
     if body.get("queue_state") != "active":
         raise RuntimeError(f"queue_state={body.get('queue_state')!r} expected 'active'")
 
+    if body.get("type") != "try_again":
+        raise RuntimeError(f"type={body.get('type')!r} expected 'try_again'")
+    if not isinstance(body.get("request_id"), str) or not body.get("request_id"):
+        raise RuntimeError(f"request_id={body.get('request_id')!r} expected non-empty str")
+
     status = body.get("status")
     if status not in ("queued", "prefill", "decode"):
         raise RuntimeError(f"status={status!r} expected queued|prefill|decode")
@@ -94,23 +100,40 @@ def _check_pending_payload(body: dict, headers: dict[str, str]) -> None:
         raise RuntimeError(f"retry_after_s={body.get('retry_after_s')!r} expected {ra_i}")
 
     qd = body.get("queue_depth")
-    if not isinstance(qd, int) or qd < 0:
-        raise RuntimeError(f"queue_depth={qd!r} expected int>=0")
-    if headers.get("X-Queue-Depth") is None:
-        raise RuntimeError("missing X-Queue-Depth header")
+    if SCHEDULER_ENABLED:
+        if qd is not None:
+            raise RuntimeError(f"queue_depth={qd!r} expected null when scheduler enabled")
+        if headers.get("X-Queue-Depth") is not None:
+            raise RuntimeError("unexpected X-Queue-Depth header when scheduler enabled")
+    else:
+        if qd is None:
+            if body.get("queue_state_reason") not in ("queue_position_unknown", "scheduler_enabled"):
+                raise RuntimeError(f"queue_depth={qd!r} expected int>=0 or null with queue_state_reason")
+        elif not isinstance(qd, int) or qd < 0:
+            raise RuntimeError(f"queue_depth={qd!r} expected int>=0")
+        if qd is not None and headers.get("X-Queue-Depth") is None:
+            raise RuntimeError("missing X-Queue-Depth header when queue_depth is set")
 
     if status == "queued":
         qp = body.get("queue_position")
-        if qp is not None:
-            if not isinstance(qp, int) or qp < 0:
-                raise RuntimeError(f"queue_position={qp!r} expected int>=0 or null")
-            if qd < 1:
-                raise RuntimeError(f"queue_depth={qd!r} expected >=1 when queue_position is set")
+        if SCHEDULER_ENABLED:
+            if qp is not None:
+                raise RuntimeError(f"queue_position={qp!r} expected null when scheduler enabled")
+        else:
+            if qp is not None:
+                if not isinstance(qp, int) or qp < 0:
+                    raise RuntimeError(f"queue_position={qp!r} expected int>=0 or null")
+                if isinstance(qd, int) and qd < 1:
+                    raise RuntimeError(f"queue_depth={qd!r} expected >=1 when queue_position is set")
         if isinstance(qd, int) and qd > 0:
             if body.get("queue_state_reason") != "queue_backlog":
                 raise RuntimeError(
                     f"queue_state_reason={body.get('queue_state_reason')!r} expected 'queue_backlog' when queue_depth>0"
                 )
+        if SCHEDULER_ENABLED and body.get("queue_state_reason") != "scheduler_enabled":
+            raise RuntimeError(
+                f"queue_state_reason={body.get('queue_state_reason')!r} expected 'scheduler_enabled' when scheduler enabled"
+            )
 
     prog = body.get("progress")
     if isinstance(prog, dict):
@@ -118,10 +141,27 @@ def _check_pending_payload(body: dict, headers: dict[str, str]) -> None:
         mx = prog.get("max_tokens")
         if not isinstance(tg, int) or not isinstance(mx, int) or tg < 0 or mx < 1 or tg > mx:
             raise RuntimeError(f"progress={prog!r} invalid")
+        if headers.get("X-Queue-Tokens-Generated") is None or headers.get("X-Queue-Max-Tokens") is None:
+            raise RuntimeError("missing progress headers when progress payload is present")
+    else:
+        if headers.get("X-Queue-Tokens-Generated") is not None or headers.get("X-Queue-Max-Tokens") is not None:
+            raise RuntimeError("unexpected progress headers when progress payload is missing")
+
+    eta = body.get("estimated_wait_s")
+    if eta is None:
+        if headers.get("X-Queue-ETA-S") is not None:
+            raise RuntimeError("unexpected X-Queue-ETA-S header when estimated_wait_s is null")
+    else:
+        if not isinstance(eta, (int, float)) or eta < 0:
+            raise RuntimeError(f"estimated_wait_s={eta!r} expected non-negative number")
+        if headers.get("X-Queue-ETA-S") is None:
+            raise RuntimeError("missing X-Queue-ETA-S header when estimated_wait_s is set")
 
 def _format_pending_line(body: dict, headers: dict[str, str]) -> str:
     return (
         "pending_fields "
+        f"request_id={body.get('request_id')!r} "
+        f"type={body.get('type')!r} "
         f"status={body.get('status')!r} "
         f"queue_state={body.get('queue_state')!r} "
         f"queue_state_reason={body.get('queue_state_reason')!r} "
@@ -132,6 +172,7 @@ def _format_pending_line(body: dict, headers: dict[str, str]) -> str:
         f"retry_after_s={body.get('retry_after_s')!r} "
         f"x_queue_depth={headers.get('X-Queue-Depth')!r} "
         f"x_queue_status={headers.get('X-Queue-Status')!r} "
+        f"x_queue_eta_s={headers.get('X-Queue-ETA-S')!r} "
         f"retry_after={headers.get('Retry-After')!r}"
     )
 
@@ -156,6 +197,7 @@ def main() -> int:
     pending_checked: set[str] = set()
 
     while request_ids and time.time() < deadline:
+        sleep_s = 1
         for rid in list(request_ids):
             r = _post(
                 "/api/v1/retrieve_future",
@@ -164,8 +206,19 @@ def main() -> int:
             )
             if r.status_code == 408:
                 saw_pending = True
+                try:
+                    ra_i = int(r.headers.get("Retry-After", "1"))
+                except Exception:
+                    ra_i = 1
+                if ra_i < 1:
+                    ra_i = 1
+                sleep_s = max(sleep_s, ra_i)
                 if rid not in pending_checked:
                     body = r.json()
+                    if body.get("request_id") != rid:
+                        return _fail(
+                            f"request_id mismatch: body={body.get('request_id')!r} expected {rid!r}"
+                        )
                     _check_pending_payload(body, r.headers)
                     _ok(_format_pending_line(body, r.headers))
                     pending_checked.add(rid)
@@ -176,7 +229,7 @@ def main() -> int:
             if isinstance(out, dict) and "error" in out:
                 return _fail(f"retrieve_future error={out.get('error')!r}")
             request_ids.remove(rid)
-        time.sleep(0.5)
+        time.sleep(sleep_s)
 
     if request_ids:
         return _fail(f"timeout waiting for requests: {request_ids!r}")

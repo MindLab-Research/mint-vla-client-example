@@ -183,6 +183,9 @@ async def retrieve_future(
         ):
             payload = dict(payload)
             payload["detail"] = GENERIC_ERROR_MESSAGE
+        if upstream_resp.status_code == 408 and isinstance(payload, dict) and "request_id" in payload:
+            payload = dict(payload)
+            payload["request_id"] = body.request_id
         return payload
 
     try:
@@ -246,24 +249,35 @@ async def retrieve_future(
             queue_state_reason = None
 
         status_field = None
-        if stage in ("prefill", "decode"):
-            status_field = stage
-        elif queue_state == "queued":
-            status_field = "queued"
-        elif queue_state == "running":
-            status_field = "prefill"
+        is_sampling = isinstance(op, str) and op.startswith("sampling.")
+        if is_sampling:
+            if stage in ("prefill", "decode"):
+                status_field = stage
+            elif queue_state == "queued":
+                status_field = "queued"
+            elif queue_state == "running":
+                status_field = "prefill"
+        else:
+            if queue_state in ("queued", "running"):
+                status_field = str(queue_state)
 
         queue_position = None
         queue_depth = None
         estimated_wait_s = None
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
+        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
         try:
             pos = await api_work_queue.find_position(body.request_id)
         except ApiWorkQueueUnavailableError as e:
             raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
-        if isinstance(pos, dict):
+        if not scheduler_enabled and isinstance(pos, dict):
             queue_depth = pos.get("depth")
             if status_field == "queued":
                 queue_position = pos.get("position")
@@ -275,26 +289,32 @@ async def retrieve_future(
             queue_position = int(queue_position)
         else:
             queue_position = None
-        if queue_state_reason is None and status_field == "queued":
-            if isinstance(queue_depth, int) and queue_depth > 0:
-                queue_state_reason = "queue_backlog"
-            elif queue_position is None:
-                queue_state_reason = "queue_position_unknown"
-        if status_field == "queued":
-            try:
-                from ..config import config as server_config
+        if scheduler_enabled and status_field == "queued":
+            queue_state_reason = "scheduler_enabled"
+            queue_depth = None
+            queue_position = None
+            estimated_wait_s = None
+        else:
+            if queue_state_reason is None and status_field == "queued":
+                if isinstance(queue_depth, int) and queue_depth > 0:
+                    queue_state_reason = "queue_backlog"
+                elif queue_position is None:
+                    queue_state_reason = "queue_position_unknown"
+            if status_field == "queued":
+                try:
+                    from ..config import config as server_config
 
-                eta_state = await api_work_queue.get_eta_state(op if isinstance(op, str) else None)
-                ema_exec_s = None
-                if isinstance(eta_state, dict):
-                    ema_exec_s = eta_state.get("ema_exec_s")
-                worker_count = int(server_config.api_work_queue_num_workers)
-                if worker_count > 0 and isinstance(ema_exec_s, (int, float)) and queue_position is not None:
-                    estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
-            except ApiWorkQueueUnavailableError as e:
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-            except Exception as e:
-                raise HTTPException(status_code=503, detail=f"ApiWorkQueue ETA lookup failed: {type(e).__name__}: {e}") from e
+                    eta_state = await api_work_queue.get_eta_state(op if isinstance(op, str) else None)
+                    ema_exec_s = None
+                    if isinstance(eta_state, dict):
+                        ema_exec_s = eta_state.get("ema_exec_s")
+                    worker_count = int(server_config.api_work_queue_num_workers)
+                    if worker_count > 0 and isinstance(ema_exec_s, (int, float)) and queue_position is not None:
+                        estimated_wait_s = (float(queue_position) + 1.0) * float(ema_exec_s) / float(worker_count)
+                except ApiWorkQueueUnavailableError as e:
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+                except Exception as e:
+                    raise HTTPException(status_code=503, detail=f"ApiWorkQueue ETA lookup failed: {type(e).__name__}: {e}") from e
 
         progress_payload = None
         if isinstance(progress, dict):
