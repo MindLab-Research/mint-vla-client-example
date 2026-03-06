@@ -8,6 +8,15 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config
+from ..logging_context import (
+    classify_failure_reason,
+    ensure_trace_id,
+    extract_trace_id_from_traceparent,
+    get_otel_tracer,
+    get_trace_id,
+    set_request_id,
+    set_trace_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +446,14 @@ def _get_or_create_ray_actor():
         async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> None:
             async with self._cv:
                 packed = dict(item)
+                request_id = packed.get("request_id")
+
+                # Log enqueue with request_id context
+                logger.info(
+                    f"[Queue] enqueue: request_id={request_id}, op={packed.get('op')}, "
+                    f"user_id={packed.get('user_id')}"
+                )
+
                 is_sched, domain, session_id = self._scheduler_item_info(packed)
                 if is_sched:
                     self._enqueue_scheduled(packed, domain=domain, session_id=session_id)
@@ -581,6 +598,15 @@ def _get_or_create_ray_actor():
                     break
 
                 self._dequeued += 1
+
+                # Log dequeue with request_id context
+                request_id = item.get("request_id")
+                logger.info(
+                    f"[Queue] dequeue: request_id={request_id}, op={item.get('op')}, "
+                    f"reason={dequeue_reason}, scheduler_domain={scheduler_domain}, "
+                    f"scheduler_session_id={scheduler_session_id}"
+                )
+
                 try:
                     import ray
 
@@ -787,25 +813,75 @@ class ApiWorkQueueClient:
         import ray
 
         actor = self._get_ray_actor()
+        tracer = get_otel_tracer()
         producer_job_id = None
         try:
             producer_job_id = str(ray.get_runtime_context().get_job_id())
         except Exception:
             producer_job_id = None
         item = {
+            # Keep external request_id semantics intact; this is the future key/API identifier.
             "request_id": str(request_id),
             "op": str(op),
             "request_json": bytes(request_json),
             "user_id": None if user_id is None else str(user_id),
             "webhook_url": None if webhook_url is None else str(webhook_url),
-            "extra": {} if extra is None else dict(extra),
+            "extra": {},
             "created_at": time.time(),
         }
-        # Ensure enqueue succeeds, otherwise the request can remain pending forever
-        # while capacity stays reserved.
-        ref = actor.enqueue.remote(item, producer_job_id)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
+        item_extra = {} if extra is None else dict(extra)
+        if not isinstance(item_extra.get("_trace_id"), str) or not item_extra.get("_trace_id"):
+            trace_id = get_trace_id() or ensure_trace_id()
+            item_extra["_trace_id"] = trace_id
+        if not isinstance(item_extra.get("_traceparent"), str) or not item_extra.get("_traceparent"):
+            try:
+                from opentelemetry import trace as otel_trace
+
+                span_ctx = otel_trace.get_current_span().get_span_context()
+                if span_ctx is not None and bool(getattr(span_ctx, "is_valid", False)):
+                    flags = int(getattr(span_ctx, "trace_flags", 1))
+                    item_extra["_traceparent"] = (
+                        f"00-{int(span_ctx.trace_id):032x}-{int(span_ctx.span_id):016x}-{flags:02x}"
+                    )
+            except Exception:
+                pass
+        item["extra"] = item_extra
+
+        async def _do_enqueue() -> None:
+            # Ensure enqueue succeeds, otherwise the request can remain pending forever
+            # while capacity stays reserved.
+            ref = actor.enqueue.remote(item, producer_job_id)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
+
+        if tracer is None:
+            await _do_enqueue()
+            return
+
+        try:
+            from opentelemetry.trace import SpanKind, Status, StatusCode
+        except Exception:
+            await _do_enqueue()
+            return
+
+        with tracer.start_as_current_span("queue.enqueue", kind=SpanKind.INTERNAL) as span:
+            span.set_attribute("component", "api_work_queue")
+            span.set_attribute("op", str(op))
+            span.set_attribute("request_id", str(request_id))
+            try:
+                await _do_enqueue()
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                logger.error(
+                    "[queue.enqueue] failed request_id=%s op=%s failure_reason=%s error_type=%s next_action=%s",
+                    str(request_id),
+                    str(op),
+                    classify_failure_reason(e),
+                    type(e).__name__,
+                    "check_api_work_queue_actor",
+                )
+                raise
 
     async def _dequeue(self) -> WorkItem:
         import asyncio
@@ -936,13 +1012,25 @@ class ApiWorkQueueClient:
                     )
 
                 logger.error(
-                    "[api_work_queue] dequeue failed (worker_idx=%s): %s: %s",
+                    "[api_work_queue] dequeue failed (worker_idx=%s): %s: %s failure_reason=%s next_action=%s",
                     int(worker_idx),
                     type(e).__name__,
                     e,
+                    classify_failure_reason(e),
+                    "retry_dequeue",
                 )
                 await asyncio.sleep(1.0)
                 continue
+
+            # Restore trace_id/request_id context for logging in worker.
+            item_trace_id = item.extra.get("_trace_id")
+            item_traceparent = item.extra.get("_traceparent")
+            trace_id = item_trace_id if isinstance(item_trace_id, str) else None
+            if trace_id is None and isinstance(item_traceparent, str):
+                trace_id = extract_trace_id_from_traceparent(item_traceparent)
+            set_trace_id(trace_id)
+            set_request_id(item.request_id)
+
             if str(item.op) == "training.create_model":
                 try:
                     age_s = max(0.0, time.time() - float(item.created_at))
@@ -1053,6 +1141,12 @@ class ApiWorkQueueClient:
                         "running_at": time.time(),
                     },
                 )
+                logger.debug(
+                    "[api_work_queue] mark_running request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
             except Exception as e:
                 logger.error(
                     "[api_work_queue] mark_running failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1127,7 +1221,53 @@ class ApiWorkQueueClient:
 
             try:
                 exec_start = time.perf_counter()
-                await ex(item)
+                logger.debug(
+                    "[api_work_queue] executing request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
+                tracer = get_otel_tracer()
+                if tracer is None:
+                    await ex(item)
+                else:
+                    try:
+                        from opentelemetry.trace import SpanKind, Status, StatusCode
+                        from opentelemetry.propagate import extract
+                    except Exception:
+                        # Best-effort: never block execution if OTel deps are unavailable.
+                        await ex(item)
+                    else:
+                        span_context = None
+                        traceparent = None
+                        if isinstance(item.extra, dict):
+                            traceparent = item.extra.get("_traceparent")
+                        if isinstance(traceparent, str) and traceparent:
+                            try:
+                                span_context = extract({"traceparent": traceparent})
+                            except Exception:
+                                span_context = None
+                        with tracer.start_as_current_span(
+                            "queue.execute",
+                            kind=SpanKind.INTERNAL,
+                            context=span_context,
+                        ) as span:
+                            span.set_attribute("component", "api_work_queue")
+                            span.set_attribute("op", str(item.op))
+                            span.set_attribute("request_id", str(item.request_id))
+                            span.set_attribute("worker_idx", int(worker_idx))
+                            try:
+                                await ex(item)
+                            except Exception as e:
+                                span.record_exception(e)
+                                span.set_status(Status(StatusCode.ERROR, str(e)))
+                                raise
+                logger.debug(
+                    "[api_work_queue] executor completed request_id=%s op=%s worker_idx=%s",
+                    str(item.request_id),
+                    str(item.op),
+                    int(worker_idx),
+                )
                 exec_elapsed = time.perf_counter() - exec_start
                 try:
                     actor = self._get_ray_actor()
@@ -1150,12 +1290,14 @@ class ApiWorkQueueClient:
                     )
             except Exception as e:
                 logger.error(
-                    "[api_work_queue] executor failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                    "[api_work_queue] executor failed (worker_idx=%s, request_id=%s, op=%s): %s: %s failure_reason=%s next_action=%s",
                     int(worker_idx),
                     str(item.request_id),
                     str(item.op),
                     type(e).__name__,
                     e,
+                    classify_failure_reason(e),
+                    "check_executor_and_future_store",
                 )
                 # Ensure the future does not remain pending forever.
                 try:

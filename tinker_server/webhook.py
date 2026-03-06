@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
+
+from .logging_context import classify_failure_reason, get_otel_tracer
 
 logger = logging.getLogger(__name__)
 
@@ -84,28 +87,77 @@ class WebhookClient:
             headers["X-Webhook-Secret"] = secret_key
 
         payload = event.to_dict()
+        tracer = get_otel_tracer()
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = requests.post(
-                    webhook_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
+                if tracer is not None:
+                    try:
+                        from opentelemetry.trace import SpanKind, Status, StatusCode
+                    except Exception:
+                        response = requests.post(
+                            webhook_url,
+                            json=payload,
+                            headers=headers,
+                            timeout=self.timeout,
+                        )
+                    else:
+                        with tracer.start_as_current_span("webhook.send", kind=SpanKind.CLIENT) as span:
+                            span.set_attribute("component", "webhook")
+                            span.set_attribute("event_type", str(event.event_type.value))
+                            span.set_attribute("attempt", int(attempt + 1))
+                            parsed = urlparse(str(webhook_url))
+                            span.set_attribute("peer.host", str(parsed.netloc))
+                            span.set_attribute("peer.scheme", str(parsed.scheme))
+                            response = requests.post(
+                                webhook_url,
+                                json=payload,
+                                headers=headers,
+                                timeout=self.timeout,
+                            )
+                            span.set_attribute("http.status_code", int(response.status_code))
+                            if int(response.status_code) >= 500:
+                                span.record_exception(RuntimeError(f"webhook status={response.status_code}"))
+                                span.set_status(Status(StatusCode.ERROR, f"http.status_code={response.status_code}"))
+                else:
+                    response = requests.post(
+                        webhook_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
 
                 if response.status_code == 200:
-                    logger.info(f"Webhook sent: {event.event_type.value} to {webhook_url}")
+                    logger.info(
+                        "[webhook.send] completed event_type=%s attempt=%s status_code=%s",
+                        str(event.event_type.value),
+                        int(attempt + 1),
+                        int(response.status_code),
+                    )
                     return True
                 else:
                     logger.warning(
-                        f"Webhook failed with status {response.status_code}: "
-                        f"{response.text[:200]}"
+                        "[webhook.send] non_200 event_type=%s attempt=%s status_code=%s response_snippet=%s",
+                        str(event.event_type.value),
+                        int(attempt + 1),
+                        int(response.status_code),
+                        str(response.text[:200]),
                     )
             except requests.exceptions.Timeout:
-                logger.warning(f"Webhook timeout (attempt {attempt + 1}): {webhook_url}")
+                logger.warning(
+                    "[webhook.send] timeout event_type=%s attempt=%s timeout_s=%s",
+                    str(event.event_type.value),
+                    int(attempt + 1),
+                    int(self.timeout),
+                )
             except requests.exceptions.RequestException as e:
-                logger.warning(f"Webhook error (attempt {attempt + 1}): {e}")
+                logger.warning(
+                    "[webhook.send] request_error event_type=%s attempt=%s error_type=%s failure_reason=%s",
+                    str(event.event_type.value),
+                    int(attempt + 1),
+                    type(e).__name__,
+                    classify_failure_reason(e),
+                )
 
         return False
 

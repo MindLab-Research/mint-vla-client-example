@@ -16,10 +16,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tensordict import TensorDict
+    pass
 
 import ray
 # NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
@@ -27,6 +27,7 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
+from ..logging_context import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,6 @@ def get_node_ip_and_free_port() -> tuple[str, int]:
     Uses Ray's node IP which correctly identifies the inter-node network interface.
     Self-contained to avoid module import issues on Ray workers.
     """
-    import socket
     import ray
     # Use Ray's IP detection which respects --node-ip-address and finds the correct interface
     ip = ray.util.get_node_ip_address()
@@ -322,7 +322,6 @@ class MegatronRankWorker:
         Returns a list of CPU tensors containing gradient data.
         Must be called while in train_mode context (gradients on GPU).
         """
-        import torch
         import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
@@ -354,7 +353,6 @@ class MegatronRankWorker:
         Args:
             grads: List of CPU tensors from _capture_gradients.
         """
-        import torch
         import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
@@ -517,7 +515,6 @@ class MegatronRankWorker:
         Clears all momentum and variance buffers so the new session starts fresh,
         without momentum contamination from previous sessions.
         """
-        import torch
         from megatron.core.optimizer import ChainedOptimizer
 
         optimizer = self.engine.optimizer
@@ -721,7 +718,8 @@ class MegatronRankWorker:
 
         logger.info(
             f"[Rank {self.rank}] initialize() starting: CUDA_VISIBLE_DEVICES={cuda_device!r}, "
-            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}"
+            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}, "
+            f"request_id={get_request_id() or '-'}"
         )
 
         if device_count != 1:
@@ -1274,7 +1272,6 @@ class MegatronRankWorker:
         """
         import torch
         import os
-        import socket
         import glob
 
         status = {
@@ -2347,7 +2344,7 @@ class MegatronRankWorker:
             from megatron.core import parallel_state as mpu
             etp_size = mpu.get_expert_tensor_parallel_world_size()
             logger.info(f"[Rank {self.rank}] ETP size: {etp_size}")
-        except Exception as e:
+        except Exception:
             # ETP not available, assume 1 (no expert tensor parallelism)
             etp_size = 1
 
@@ -2511,7 +2508,7 @@ class MegatronRankWorker:
                             f.write(f"Total params: {len(all_param_names)}\n")
                             f.write(f"LoRA params found: {len(lora_param_names)}\n")
                             f.write(f"TP size: {tp_size}, ETP size: {etp_size}, EP size: {ep_size}\n")
-                            f.write(f"LoRA params with shapes and norms:\n")
+                            f.write("LoRA params with shapes and norms:\n")
                             total_norm = 0.0
                             nonzero_count = 0
                             for n in lora_param_names[:50]:
@@ -2525,7 +2522,7 @@ class MegatronRankWorker:
                                         nonzero_count += 1
                                     f.write(f"  {n}: shape={shape}, norm={norm:.6f}, max={max_val:.6f}\n")
                             f.write(f"\nSummary: {nonzero_count}/{len(lora_param_names[:50])} tensors non-zero, total_norm={total_norm:.6f}\n")
-                            f.write(f"===\n")
+                            f.write("===\n")
                         # ALSO LOG TO STDOUT for visibility in server logs
                         logger.info(f"[Rank 0] LoRA TENSOR NORMS: {nonzero_count}/{len(lora_param_names[:50])} non-zero, total_norm={total_norm:.6f}")
                         for n in lora_param_names[:5]:
@@ -2719,7 +2716,6 @@ class MegatronRankWorker:
                 if use_per_expert_lora and num_experts > 0 and not is_shared_expert:
                     # Split fused gate_up_proj if needed, then expand with EP-aware indexing
                     if '.gate_up_proj_fused.' in peft_name:
-                        import torch
                         gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
                         up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
 
@@ -2832,7 +2828,6 @@ class MegatronRankWorker:
                 if use_per_expert_lora and num_experts > 0:
                     # First check if this is a fused gate_up_proj that needs splitting
                     if '.gate_up_proj_fused.' in peft_name:
-                        import torch
                         # Split the fused projection before expanding to per-expert
                         gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
                         up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
@@ -2893,7 +2888,6 @@ class MegatronRankWorker:
             # vLLM's MergedColumnParallelLinearWithLoRA expects separate gate_proj and up_proj
             # lora_A is duplicated, lora_B is split in half
             if '.gate_up_proj_fused.' in peft_name:
-                import torch
                 gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
                 up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
 
@@ -3138,7 +3132,6 @@ class MegatronRankWorker:
 
     def get_lora_weight_norm(self) -> float:
         """Compute L2 norm of all LoRA weights for debugging."""
-        import torch
         with self.engine.train_mode():
             from verl.utils.megatron_utils import unwrap_model
             model = unwrap_model(self.engine.module)
@@ -3160,7 +3153,6 @@ class MegatronRankWorker:
 
     def get_lora_weight_checksum(self) -> dict:
         """Compute checksum stats for LoRA weights (rank 0 only)."""
-        import torch
         with self.engine.train_mode():
             from verl.utils.megatron_utils import unwrap_model
             model = unwrap_model(self.engine.module)
@@ -3186,7 +3178,6 @@ class MegatronRankWorker:
 
     def get_base_weight_checksum(self, max_params: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA params (rank 0 only)."""
-        import torch
         with self.engine.train_mode():
             from verl.utils.megatron_utils import unwrap_model
             model = unwrap_model(self.engine.module)
@@ -3323,7 +3314,6 @@ class MegatronRankWorker:
         Returns:
             dict with status and count of reinitialized parameters.
         """
-        import torch
         import torch.nn.init as init
         from megatron.core.optimizer import ChainedOptimizer
 
@@ -4322,7 +4312,7 @@ class MegatronWorkerGroup:
 
         # Now initialize all workers simultaneously - they will reach
         # init_process_group barrier together, avoiding deadlock
-        logger.info(f"[MegatronWorkerGroup] Calling initialize() on all workers...")
+        logger.info("[MegatronWorkerGroup] Calling initialize() on all workers...")
         ray.get([w.initialize.remote() for w in self.workers])
 
         logger.info(f"[MegatronWorkerGroup] All {world_size} workers initialized and ready")
@@ -4387,7 +4377,7 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] Swapping session state on workers to {new_session_id}")
         futures = [w.swap_session_state.remote(new_session_id) for w in self.workers]
         ray.get(futures)
-        logger.info(f"[MegatronWorkerGroup] Session state swapped on all workers")
+        logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
 
     def _ensure_session_loaded(
         self,

@@ -20,11 +20,11 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
+from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
-    SampledSequence,
     SampleRequest,
     SampleResponse,
     UntypedAPIFuture,
@@ -537,11 +537,17 @@ async def asample(
 
     request_json = request.model_dump_json().encode("utf-8")
     payload_hash = _payload_hash(request_json)
-    request_id = uuid.uuid4().hex
-    created_pending = False
-
     if request.seq_id is not None:
         request_id = _deterministic_request_id(session_id, request.seq_id)
+    else:
+        request_id = uuid.uuid4().hex
+    created_pending = False
+
+    # Set request_id in context for logging
+    set_request_id(request_id)
+    logger.info(f"asample request received: session_id={session_id}, seq_id={request.seq_id}")
+
+    if request.seq_id is not None:
         for attempt in range(2):
             try:
                 ensure = future_store.ensure_pending(
@@ -633,6 +639,9 @@ async def _do_sample(
     request_id: str, request: SampleRequest, user_id: str | None
 ) -> None:
     """Background task to perform sampling."""
+    # Restore request_id context for logging
+    set_request_id(request_id)
+
     global _inflight_sample_tasks
     _inflight_sample_tasks += 1
     session_id: str | None = None
@@ -688,11 +697,11 @@ async def _do_sample(
                 resource_pool.mark_inflight(resource_pool_actor_name, +1)
 
                 logger.info(
-                    f"[sample path] request_id={request_id} session_id={session_id} "
+                    f"[sample path] session_id={session_id} "
                     f"prompt_tokens={len(token_ids)} num_samples={request.num_samples} stage=before_lora_load"
                 )
                 await _ensure_session_lora_loaded(engine, session_id)
-                logger.info(f"[sample path] request_id={request_id} session_id={session_id} stage=after_lora_load")
+                logger.info(f"[sample path] session_id={session_id} stage=after_lora_load")
 
                 gen_many = getattr(engine, "generate_many", None)
                 can_coalesce = (
@@ -704,13 +713,13 @@ async def _do_sample(
                     and request.num_samples <= _SAMPLE_COALESCE_MAX_SAMPLES
                 )
                 logger.info(
-                    f"[sample path] request_id={request_id} session_id={session_id} "
+                    f"[sample path] session_id={session_id} "
                     f"can_coalesce={can_coalesce} sample_coalesce={_SAMPLE_COALESCE} "
                     f"want_prompt_logprobs={want_prompt_logprobs} topk_prompt_logprobs={request.topk_prompt_logprobs} "
                     f"has_generate_many={gen_many is not None} num_samples={request.num_samples}"
                 )
                 if can_coalesce:
-                    logger.info(f"[sample path] request_id={request_id} branch=coalesced_generate")
+                    logger.info("[sample path] branch=coalesced_generate")
                     results = await _await_with_external_fail_abort(
                         engine=engine,
                         request_id=request_id,
@@ -728,7 +737,7 @@ async def _do_sample(
                         ),
                     )
                 elif request.num_samples == 1:
-                    logger.info(f"[sample path] request_id={request_id} branch=generate_single")
+                    logger.info("[sample path] branch=generate_single")
                     one_result = await _await_with_external_fail_abort(
                         engine=engine,
                         request_id=request_id,
@@ -748,7 +757,7 @@ async def _do_sample(
                 else:
                     if gen_many is None:
                         raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
-                    logger.info(f"[sample path] request_id={request_id} branch=generate_many")
+                    logger.info("[sample path] branch=generate_many")
                     results = await _await_with_external_fail_abort(
                         engine=engine,
                         request_id=request_id,
@@ -847,7 +856,7 @@ async def _do_sample(
 
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
             future_store.resolve(request_id, response.model_dump(exclude={"type"}))
-            logger.debug(f"Request {request_id} completed with {len(sequences)} sequences")
+            logger.info(f"Sampling completed: {len(sequences)} sequences generated")
 
             # Log usage - separate prefill and sampling tokens
             if user_id:
@@ -877,10 +886,23 @@ async def _do_sample(
         except asyncio.CancelledError:
             await _abort_engine_request(engine, request_id)
             future_store.fail(request_id, "sampling task cancelled")
+            logger.warning(
+                "[sampling.asample] canceled request_id=%s session_id=%s next_action=%s",
+                str(request_id),
+                str(session_id),
+                "caller_can_retry",
+            )
             raise
         except Exception as e:
             await _abort_engine_request(engine, request_id)
-            logger.exception(f"Request {request_id} failed: {e}")
+            logger.exception(
+                "[sampling.asample] failed request_id=%s session_id=%s failure_reason=%s error_type=%s next_action=%s",
+                str(request_id),
+                str(session_id),
+                classify_failure_reason(e),
+                type(e).__name__,
+                "check_sampling_session_and_vllm_actor",
+            )
             future_store.fail(request_id, str(e))
     finally:
         if resource_pool is not None and resource_pool_actor_name is not None:
@@ -1013,6 +1035,7 @@ async def _do_compute_logprobs(
     """Background task to compute logprobs."""
     session_id: str | None = None
     try:
+        set_request_id(request_id)
         if session_manager is None:
             raise RuntimeError("Session manager not initialized")
 
@@ -1067,7 +1090,14 @@ async def _do_compute_logprobs(
         )
 
     except Exception as e:
-        logger.exception(f"Request {request_id} failed: {e}")
+        logger.exception(
+            "[sampling.compute_logprobs] failed request_id=%s session_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(session_id or request.sampling_session_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_sampling_session_and_token_length",
+        )
         future_store.fail(request_id, str(e))
     finally:
         if session_manager is not None and session_id is not None:

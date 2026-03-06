@@ -37,6 +37,7 @@ from ..models.types import (
     SaveStateRequest,
     UntypedAPIFuture,
 )
+from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..webhook import EventType, send_task_event
 
@@ -329,8 +330,10 @@ async def _do_save_state(
     Also registers the model for sampling via multi-LoRA engine.
     """
     import json
+    session = None
 
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -453,19 +456,28 @@ async def _do_save_state(
             )
 
     except Exception as e:
-        logger.error(f"[save_state] Failed: {e}", exc_info=True)
+        logger.exception(
+            "[weights.save_state] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_checkpoint_path",
+        )
         future_store.fail(request_id, str(e))
 
         # 发送 failed 状态
         if webhook_url and user_id:
+            failed_session_id = session.model_id if session is not None else request.model_id
+            failed_model_name = session.base_model if session is not None else None
             send_task_event(
                 webhook_url=webhook_url,
                 event_type=EventType.TASK_FAILED,
                 user_id=user_id,
-                session_id=session.model_id,
-                task_name=f"Training {session.base_model}",
+                session_id=failed_session_id,
+                task_name=f"Training {failed_model_name or request.model_id}",
                 task_type="training",
-                model_name=session.base_model,
+                model_name=failed_model_name,
                 error=str(e),
             )
 
@@ -482,7 +494,9 @@ async def _do_save_weights(
     Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
+    session = None
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -601,15 +615,23 @@ async def _do_save_weights(
             )
 
     except Exception as e:
-        logger.error(f"[save_weights] Failed: {e}", exc_info=True)
+        logger.exception(
+            "[weights.save_weights] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_sampler_checkpoint_export",
+        )
         future_store.fail(request_id, str(e))
 
         if webhook_url and user_id:
+            failed_session_id = session.model_id if session is not None else request.model_id
             send_task_event(
                 webhook_url=webhook_url,
                 event_type=EventType.TASK_FAILED,
                 user_id=user_id,
-                session_id=request.model_id,
+                session_id=failed_session_id,
                 task_name="Save weights",
                 task_type="training",
                 model_name=None,
@@ -784,6 +806,7 @@ async def _do_load_state(
 ) -> None:
     """Background task to load state."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -818,7 +841,14 @@ async def _do_load_state(
         })
 
     except Exception as e:
-        logger.error(f"[load_state] Failed: {e}", exc_info=True)
+        logger.exception(
+            "[weights.load_state] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_checkpoint_contract_and_permissions",
+        )
         future_store.fail(request_id, str(e))
 
 

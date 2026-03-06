@@ -11,13 +11,26 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .backend.api_work_queue import ApiWorkQueueUnavailableError
+from .backend.capacity_manager import CapacityManagerUnavailableError
+from .backend.future_store import FutureStoreUnavailableError
 from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .config import config
+from .gateway import close_http_clients
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .logging_context import (
+    classify_failure_reason,
+    ensure_trace_id,
+    extract_trace_id_from_traceparent,
+    get_trace_id,
+    get_otel_tracer,
+    record_http_server_metrics,
+    set_trace_id,
+)
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
@@ -830,8 +843,6 @@ async def lifespan(app: FastAPI):
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
 
-    from .gateway import close_http_clients
-
     await close_http_clients()
 
 
@@ -843,19 +854,12 @@ app = FastAPI(
     docs_url=None,  # Disable built-in Swagger UI
 )
 
-from .backend.future_store import FutureStoreUnavailableError
-
-
 @app.exception_handler(FutureStoreUnavailableError)
 async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailableError) -> JSONResponse:
     return JSONResponse(
         status_code=503,
         content={"detail": "Ray unavailable: FutureStore requires Ray"},
     )
-
-
-from .backend.api_work_queue import ApiWorkQueueUnavailableError
-from .backend.capacity_manager import CapacityManagerUnavailableError
 
 
 @app.exception_handler(ApiWorkQueueUnavailableError)
@@ -890,6 +894,143 @@ def get_token_encryptor() -> TokenEncryptor | None:
 
 
 @app.middleware("http")
+async def otel_trace_metrics_middleware(request: Request, call_next):
+    """Manual OTel instrumentation for HTTP server traces and metrics."""
+    tracer = get_otel_tracer()
+    method = request.method
+    route = request.url.path
+    start_s = time.perf_counter()
+    status_code = 500
+    failure_error: Exception | None = None
+
+    def _log_request_observation(elapsed_ms: float) -> None:
+        if status_code >= 500:
+            reason = classify_failure_reason(failure_error or RuntimeError(f"http_{status_code}"))
+            logger.error(
+                "[http.request] failed method=%s route=%s status_code=%s elapsed_ms=%.3f failure_reason=%s error_type=%s next_action=%s",
+                method,
+                route,
+                int(status_code),
+                float(elapsed_ms),
+                reason,
+                type(failure_error).__name__ if failure_error is not None else "HTTPStatusError",
+                "check_logs_and_trace",
+            )
+            return
+        if status_code >= 400:
+            logger.warning(
+                "[http.request] client_error method=%s route=%s status_code=%s elapsed_ms=%.3f",
+                method,
+                route,
+                int(status_code),
+                float(elapsed_ms),
+            )
+            return
+        logger.info(
+            "[http.request] completed method=%s route=%s status_code=%s elapsed_ms=%.3f",
+            method,
+            route,
+            int(status_code),
+            float(elapsed_ms),
+        )
+
+    if tracer is None:
+        try:
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 500))
+            return response
+        except Exception as e:
+            failure_error = e
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            record_http_server_metrics(
+                method=method,
+                route=route,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+            )
+            _log_request_observation(elapsed_ms)
+
+    try:
+        from opentelemetry.propagate import extract
+        from opentelemetry.trace import SpanKind, Status, StatusCode
+    except Exception:
+        try:
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 500))
+            return response
+        except Exception as e:
+            failure_error = e
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            record_http_server_metrics(
+                method=method,
+                route=route,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+            )
+            _log_request_observation(elapsed_ms)
+
+    context = extract(dict(request.headers))
+    span_name = f"{method} {route}"
+    with tracer.start_as_current_span(span_name, context=context, kind=SpanKind.SERVER) as span:
+        span_ctx = span.get_span_context()
+        if span_ctx and getattr(span_ctx, "trace_id", 0):
+            trace_id = f"{int(span_ctx.trace_id):032x}"
+            set_trace_id(trace_id)
+            request.state.trace_id = trace_id
+        span.set_attribute("http.method", method)
+        span.set_attribute("http.route", route)
+        error_recorded = False
+
+        def _record_server_error(error: Exception, *, escaped: bool) -> None:
+            nonlocal error_recorded
+            span.record_exception(error, attributes={"exception.escaped": bool(escaped)})
+            error_recorded = True
+
+        try:
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 500))
+            span.set_attribute("http.status_code", status_code)
+            if status_code >= 500:
+                # FastAPI may convert errors into HTTP 5xx responses before they
+                # propagate here. Record a synthetic error so traces still include
+                # an explicit error record for server failures.
+                if not error_recorded:
+                    _record_server_error(
+                        RuntimeError(f"HTTP {status_code} response for {method} {route}"),
+                        escaped=False,
+                    )
+                span.set_status(Status(StatusCode.ERROR, f"http.status_code={status_code}"))
+            return response
+        except Exception as e:
+            failure_error = e
+            if isinstance(e, HTTPException):
+                try:
+                    status_code = int(e.status_code)
+                except Exception:
+                    status_code = 500
+            else:
+                status_code = 500
+            span.set_attribute("http.status_code", status_code)
+            if status_code >= 500:
+                _record_server_error(e, escaped=True)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            record_http_server_metrics(
+                method=method,
+                route=route,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+            )
+            _log_request_observation(elapsed_ms)
+
+
+@app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
     """Validate API key or sk- token from X-API-Key or Authorization header.
 
@@ -900,14 +1041,31 @@ async def api_key_auth_middleware(request: Request, call_next):
     If neither is configured, auth is disabled (dev mode).
     """
     path = request.url.path
+    traceparent_trace_id = extract_trace_id_from_traceparent(request.headers.get("traceparent"))
+    incoming_trace_id = traceparent_trace_id
+    if incoming_trace_id is None and get_trace_id() is None:
+        incoming_trace_id = request.headers.get("X-Trace-Id")
+    trace_id = ensure_trace_id(incoming_trace_id)
+    request.state.trace_id = trace_id
+
+    def _with_trace(response):
+        final_trace_id = ensure_trace_id(
+            getattr(request.state, "trace_id", None) or get_trace_id() or trace_id
+        )
+        request.state.trace_id = final_trace_id
+        response.headers["X-Trace-Id"] = final_trace_id
+        return response
+
+    async def _next_with_trace():
+        return _with_trace(await call_next(request))
 
     # Skip auth if no authentication configured (dev mode)
     if not config.auth_enabled:
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Skip auth for specific paths
     if path in UNAUTHENTICATED_PATHS:
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Special-case: allow unauthenticated checkpoint archive downloads when a valid,
     # short-lived signed token is provided in the URL (Tinker SDK expects a signed URL).
@@ -933,9 +1091,9 @@ async def api_key_auth_middleware(request: Request, call_next):
                     raise ValueError("token does not match request path")
 
                 request.state.user_data = {"user_id": payload.get("user_id")}
-                return await call_next(request)
+                return await _next_with_trace()
             except Exception:
-                return JSONResponse(status_code=401, content={"error": "Invalid download token"})
+                return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid download token"}))
 
     # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")
@@ -948,16 +1106,16 @@ async def api_key_auth_middleware(request: Request, call_next):
             api_key = auth_header
 
     if not api_key:
-        return JSONResponse(
+        return _with_trace(JSONResponse(
             status_code=401,
             content={"error": "Missing API key"},
-        )
+        ))
 
     # Method 1: Check hardcoded API key (admin)
     if config.validate_api_key(api_key):
         # Admin key - assign special "admin" user_id for checkpoint ownership
         request.state.user_data = {"user_id": "admin"}
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Method 2: Try sk- token decryption
     if api_key.startswith("sk-") and config.token_secret_key:
@@ -966,13 +1124,13 @@ async def api_key_auth_middleware(request: Request, call_next):
             user_data = encryptor.decrypt_token(api_key)
             if user_data is not None:
                 request.state.user_data = user_data
-                return await call_next(request)
+                return await _next_with_trace()
 
     # Neither method succeeded
-    return JSONResponse(
+    return _with_trace(JSONResponse(
         status_code=401,
         content={"error": "Invalid API key or token"},
-    )
+    ))
 
 
 # Register routes with API prefix
