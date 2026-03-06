@@ -155,6 +155,8 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
             packed_scaling = [1.0, 1.0, 1.0]
         else:
+            import torch
+
             present_eids: set[int] = set()
             for eid in range(n_experts):
                 if (
@@ -163,11 +165,130 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
                     or loras[eid * 3 + 2] is not None
                 ):
                     present_eids.add(eid)
-            raise RuntimeError(
-                "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
-                "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
-                f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
-            )
+
+            # Sparse export mode: one representative expert per EP shard (linear placement).
+            #
+            # Export format expectation:
+            # - loras has length n_experts * 3
+            # - only representative experts are present (non-None); all other experts are None
+            # - representatives are the first expert of each linear EP shard:
+            #     rep_eid = start(ep_rank) where:
+            #         base = n_experts // ep_size
+            #         rem  = n_experts % ep_size
+            #         start(r) = r * base + min(r, rem)
+            #
+            # We materialize full per-expert tensors directly on the target device (prefer GPU)
+            # to avoid host-CPU OOM when expanding a large adapter.
+            ep_size = len(present_eids)
+            if ep_size > 1:
+                base = n_experts // ep_size
+                rem = n_experts % ep_size
+                expected_reps = {
+                    (r * base + min(r, rem))
+                    for r in range(ep_size)
+                    if (base + (1 if r < rem else 0)) > 0
+                }
+                if present_eids == expected_reps:
+                    # Device selection: materialize on same device as base weights if possible.
+                    # If base weights are on CPU, move representatives to current CUDA device.
+                    device = getattr(base_w1.lora_a, "device", torch.device("cpu"))
+                    if device.type == "cpu":
+                        device = torch.device("cuda")
+
+                    def _to_dev(t: torch.Tensor) -> torch.Tensor:
+                        return t if t.device == device else t.to(device)
+
+                    # Pre-apply scaling and set packed_scaling=1 to avoid vLLM in-place optimize
+                    # touching overlapped views. We will materialize distinct per-expert tensors.
+                    w1_lora_a_out = torch.empty(
+                        (n_experts,) + tuple(base_w1.lora_a.shape),
+                        device=device,
+                        dtype=base_w1.lora_a.dtype,
+                    )
+                    w2_lora_a_out = torch.empty(
+                        (n_experts,) + tuple(base_w2.lora_a.shape),
+                        device=device,
+                        dtype=base_w2.lora_a.dtype,
+                    )
+                    w3_lora_a_out = torch.empty(
+                        (n_experts,) + tuple(base_w3.lora_a.shape),
+                        device=device,
+                        dtype=base_w3.lora_a.dtype,
+                    )
+
+                    w1_lora_b_out = torch.empty(
+                        (n_experts,) + tuple(base_w1.lora_b.shape),
+                        device=device,
+                        dtype=base_w1.lora_b.dtype,
+                    )
+                    w2_lora_b_out = torch.empty(
+                        (n_experts,) + tuple(base_w2.lora_b.shape),
+                        device=device,
+                        dtype=base_w2.lora_b.dtype,
+                    )
+                    w3_lora_b_out = torch.empty(
+                        (n_experts,) + tuple(base_w3.lora_b.shape),
+                        device=device,
+                        dtype=base_w3.lora_b.dtype,
+                    )
+
+                    for r in range(ep_size):
+                        start = r * base + min(r, rem)
+                        local = base + (1 if r < rem else 0)
+                        end = min(n_experts, start + local)
+                        if start >= end:
+                            continue
+
+                        rep_eid = start
+                        rep_w1 = loras[rep_eid * 3]
+                        rep_w2 = loras[rep_eid * 3 + 1]
+                        rep_w3 = loras[rep_eid * 3 + 2]
+                        if rep_w1 is None or rep_w2 is None or rep_w3 is None:
+                            raise RuntimeError(
+                                "Sparse EP-shard MoE LoRA missing representative expert tensors: "
+                                f"module={module_name!r} rep_eid={rep_eid} present_expert_ids={sorted(present_eids)}"
+                            )
+
+                        rep_w1_a = _to_dev(rep_w1.lora_a)
+                        rep_w2_a = _to_dev(rep_w2.lora_a)
+                        rep_w3_a = _to_dev(rep_w3.lora_a)
+
+                        rep_w1_b = _to_dev(rep_w1.lora_b) * float(
+                            getattr(rep_w1, "scaling", lora_alpha / rank)
+                        )
+                        rep_w2_b = _to_dev(rep_w2.lora_b) * float(
+                            getattr(rep_w2, "scaling", lora_alpha / rank)
+                        )
+                        rep_w3_b = _to_dev(rep_w3.lora_b) * float(
+                            getattr(rep_w3, "scaling", lora_alpha / rank)
+                        )
+
+                        sl = slice(start, end)
+                        w1_lora_a_out[sl].copy_(rep_w1_a.unsqueeze(0).expand((end - start,) + rep_w1_a.shape))
+                        w2_lora_a_out[sl].copy_(rep_w2_a.unsqueeze(0).expand((end - start,) + rep_w2_a.shape))
+                        w3_lora_a_out[sl].copy_(rep_w3_a.unsqueeze(0).expand((end - start,) + rep_w3_a.shape))
+
+                        w1_lora_b_out[sl].copy_(rep_w1_b.unsqueeze(0).expand((end - start,) + rep_w1_b.shape))
+                        w2_lora_b_out[sl].copy_(rep_w2_b.unsqueeze(0).expand((end - start,) + rep_w2_b.shape))
+                        w3_lora_b_out[sl].copy_(rep_w3_b.unsqueeze(0).expand((end - start,) + rep_w3_b.shape))
+
+                    w1_lora_a, w2_lora_a, w3_lora_a = w1_lora_a_out, w2_lora_a_out, w3_lora_a_out
+                    w1_lora_b, w2_lora_b, w3_lora_b = w1_lora_b_out, w2_lora_b_out, w3_lora_b_out
+                    packed_scaling = [1.0, 1.0, 1.0]
+                else:
+                    raise RuntimeError(
+                        "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                        "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export, "
+                        "(3) one-representative-per-EP-shard (linear placement). "
+                        f"module={module_name!r} n_experts={n_experts} ep_size={ep_size} "
+                        f"present_expert_ids={sorted(present_eids)} expected_reps={sorted(expected_reps)}"
+                    )
+            else:
+                raise RuntimeError(
+                    "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
+                    "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
+                    f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
+                )
 
         return cls(
             module_name,
@@ -305,6 +426,47 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 getattr(self.config, "enable_rollout_routing_replay", False)
             )
             self._mint_pack_moe_patched = False
+            self._progress_last: dict[str, float] = {}
+
+        def _progress_meta(self, tokens_generated: int, max_tokens: int) -> dict[str, Any]:
+            return {
+                "tokens_generated": int(tokens_generated),
+                "max_tokens": int(max_tokens),
+                "last_progress_at": time.time(),
+            }
+
+        async def _update_progress(
+            self,
+            *,
+            request_id: str,
+            tokens_generated: int,
+            max_tokens: int,
+            stage: str = "decode",
+            min_interval_s: float = 5.0,
+        ) -> None:
+            now = time.time()
+            last = self._progress_last.get(request_id)
+            if last is not None and (now - last) < min_interval_s:
+                return
+            self._progress_last[request_id] = now
+            try:
+                from tinker_server.backend.future_store import future_store
+
+                future_store.update_meta(
+                    request_id,
+                    meta={
+                        "stage": stage,
+                        "progress": self._progress_meta(tokens_generated, max_tokens),
+                        "last_progress_at": time.time(),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "verl_vllm_progress_update_failed request_id=%s err=%s: %s",
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
 
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
@@ -675,6 +837,24 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 request_id=request_id,
                 lora_request=lora_request,
             )
+            try:
+                from tinker_server.backend.future_store import future_store
+
+                future_store.update_meta(
+                    request_id,
+                    meta={
+                        "stage": "prefill",
+                        "progress": None,
+                        "max_tokens": int(effective_max_tokens),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "verl_vllm_prefill_meta_update_failed request_id=%s err=%s: %s",
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
 
             # Get final response
             if sampling_params.n == 1:
@@ -684,6 +864,21 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 async for output in generator:
                     if first_tok_s is None:
                         first_tok_s = time.perf_counter() - t0
+                    try:
+                        tokens_generated = len(output.outputs[0].token_ids)
+                        await self._update_progress(
+                            request_id=request_id,
+                            tokens_generated=tokens_generated,
+                            max_tokens=effective_max_tokens,
+                            stage="decode",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                            request_id,
+                            type(e).__name__,
+                            e,
+                        )
                     final_res = output
                 assert final_res is not None
                 total_s = time.perf_counter() - t0
@@ -703,6 +898,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         logprobs[token_ids[i]].logprob
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
+                self._progress_last.pop(request_id, None)
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(final_res.outputs[0], "routed_experts", None)
@@ -735,6 +931,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             async for output in generator:
                 if first_tok_s is None:
                     first_tok_s = time.perf_counter() - t0
+                try:
+                    lengths = [len(oo.token_ids) for oo in output.outputs]
+                    tokens_generated = min(lengths) if lengths else 0
+                    await self._update_progress(
+                        request_id=request_id,
+                        tokens_generated=tokens_generated,
+                        max_tokens=effective_max_tokens,
+                        stage="decode",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                        request_id,
+                        type(e).__name__,
+                        e,
+                    )
                 for out in output.outputs:
                     by_index[int(out.index)] = out
             total_s = time.perf_counter() - t0
@@ -786,6 +998,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                     }
                 )
+            self._progress_last.pop(request_id, None)
             return outs
 
         async def generate_base(
@@ -854,6 +1067,24 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 request_id=request_id,
                 lora_request=None,  # No LoRA = base model
             )
+            try:
+                from tinker_server.backend.future_store import future_store
+
+                future_store.update_meta(
+                    request_id,
+                    meta={
+                        "stage": "prefill",
+                        "progress": None,
+                        "max_tokens": int(effective_max_tokens),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "verl_vllm_prefill_meta_update_failed request_id=%s err=%s: %s",
+                    request_id,
+                    type(e).__name__,
+                    e,
+                )
 
             # Get final response
             if sampling_params.n == 1:
@@ -863,6 +1094,21 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 async for output in generator:
                     if first_tok_s is None:
                         first_tok_s = time.perf_counter() - t0
+                    try:
+                        tokens_generated = len(output.outputs[0].token_ids)
+                        await self._update_progress(
+                            request_id=request_id,
+                            tokens_generated=tokens_generated,
+                            max_tokens=effective_max_tokens,
+                            stage="decode",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                            request_id,
+                            type(e).__name__,
+                            e,
+                        )
                     final_res = output
                 assert final_res is not None
                 total_s = time.perf_counter() - t0
@@ -882,6 +1128,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         logprobs[token_ids[i]].logprob
                         for i, logprobs in enumerate(final_res.outputs[0].logprobs)
                     ]
+                self._progress_last.pop(request_id, None)
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(final_res.outputs[0], "routed_experts", None)
@@ -914,6 +1161,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             async for output in generator:
                 if first_tok_s is None:
                     first_tok_s = time.perf_counter() - t0
+                try:
+                    lengths = [len(oo.token_ids) for oo in output.outputs]
+                    tokens_generated = min(lengths) if lengths else 0
+                    await self._update_progress(
+                        request_id=request_id,
+                        tokens_generated=tokens_generated,
+                        max_tokens=effective_max_tokens,
+                        stage="decode",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "verl_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                        request_id,
+                        type(e).__name__,
+                        e,
+                    )
                 for out in output.outputs:
                     by_index[int(out.index)] = out
             total_s = time.perf_counter() - t0
@@ -965,6 +1228,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                         "_timing_first_tok_s": float(first_tok_s) if first_tok_s is not None else None,
                     }
                 )
+            self._progress_last.pop(request_id, None)
             return outs
 
         async def generate(

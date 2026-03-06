@@ -75,6 +75,8 @@ def _get_or_create_ray_actor():
             self._recent_dequeues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
             self._recent_enqueues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
             self._active_job_id: str | None = None
+            self._ema_exec_s_by_op: dict[str, float] = {}
+            self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
             self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
             self._scheduler_max_consecutive = max(
                 1,
@@ -100,7 +102,6 @@ def _get_or_create_ray_actor():
                 "wait_s_sum": 0.0,
                 "switch_reasons": {},
             }
-
         def _to_bool(self, v: Any) -> bool:
             if isinstance(v, bool):
                 return v
@@ -667,6 +668,38 @@ def _get_or_create_ray_actor():
                 "scheduler": self._scheduler_debug(),
             }
 
+        def find_position(self, request_id: str) -> dict[str, Any]:
+            rid = str(request_id)
+            pos = None
+            depth = len(self._items)
+            for idx, item in enumerate(self._items):
+                if str(item.get("request_id")) == rid:
+                    pos = idx
+                    break
+            return {"found": pos is not None, "position": pos, "depth": depth}
+
+        def record_execution_time(self, op: str, duration_s: float) -> None:
+            key = str(op).strip() or "unknown"
+            try:
+                d = float(duration_s)
+            except Exception:
+                return
+            if d <= 0:
+                return
+            alpha = self._ema_alpha
+            prev = self._ema_exec_s_by_op.get(key)
+            if prev is None:
+                self._ema_exec_s_by_op[key] = d
+            else:
+                self._ema_exec_s_by_op[key] = (alpha * d) + ((1.0 - alpha) * float(prev))
+
+        def get_eta_state(self, op: str | None = None) -> dict[str, Any]:
+            if op is None:
+                return {"ema_exec_s": None}
+            key = str(op).strip() or "unknown"
+            v = self._ema_exec_s_by_op.get(key)
+            return {"ema_exec_s": None if v is None else float(v)}
+
     # Keep the detached queue actor on the head node when possible. Losing this
     # actor drops all queued items (in-memory queue), which can leave futures
     # pending forever.
@@ -798,6 +831,39 @@ class ApiWorkQueueClient:
             extra=dict(item.get("extra") or {}),
             created_at=float(item.get("created_at", 0.0)),
         )
+
+    async def find_position(self, request_id: str) -> dict[str, Any]:
+        import asyncio
+        import ray
+
+        actor = self._get_ray_actor()
+        ref = actor.find_position.remote(request_id=str(request_id))
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+        if not isinstance(result, dict):
+            raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
+        return result
+
+    async def record_execution_time(self, op: str, duration_s: float) -> None:
+        import asyncio
+        import ray
+
+        actor = self._get_ray_actor()
+        ref = actor.record_execution_time.remote(str(op), float(duration_s))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+
+    async def get_eta_state(self, op: str | None) -> dict[str, Any]:
+        import asyncio
+        import ray
+
+        actor = self._get_ray_actor()
+        ref = actor.get_eta_state.remote(None if op is None else str(op))
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+        if not isinstance(result, dict):
+            raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(result)}")
+        return result
 
     async def start_workers(self, *, num_workers: int) -> None:
         import asyncio
@@ -977,7 +1043,16 @@ class ApiWorkQueueClient:
                 continue
 
             try:
-                future_store.mark_running(item.request_id, meta={"worker_idx": int(worker_idx), "op": item.op})
+                future_store.mark_running(
+                    item.request_id,
+                    meta={
+                        "worker_idx": int(worker_idx),
+                        "op": item.op,
+                        "queue_state": "running",
+                        "stage": "prefill",
+                        "running_at": time.time(),
+                    },
+                )
             except Exception as e:
                 logger.error(
                     "[api_work_queue] mark_running failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1051,7 +1126,21 @@ class ApiWorkQueueClient:
                 continue
 
             try:
+                exec_start = time.perf_counter()
                 await ex(item)
+                exec_elapsed = time.perf_counter() - exec_start
+                try:
+                    actor = self._get_ray_actor()
+                    actor.record_execution_time.remote(str(item.op), float(exec_elapsed))
+                except Exception as e:
+                    logger.warning(
+                        "[api_work_queue] record_execution_time failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e).__name__,
+                        e,
+                    )
                 if str(item.op) == "training.create_model":
                     logger.info(
                         "[api_work_queue] done request_id=%s op=%s worker_idx=%s",

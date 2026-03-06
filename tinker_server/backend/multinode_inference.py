@@ -31,6 +31,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
+    return {
+        "tokens_generated": int(tokens_generated),
+        "max_tokens": int(max_tokens),
+        "last_progress_at": time.time(),
+    }
+
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
@@ -410,6 +418,10 @@ def _create_multinode_vllm_actor(
             self._active_generates = 0
             self._active_generates_cond = asyncio.Condition()
             self._is_ready_timeout_s = float(os.environ.get("MINT_VLLM_IS_READY_TIMEOUT_S", "0.05"))
+            self._progress_by_outer: dict[str, dict[str, int]] = {}
+            self._progress_total_by_outer: dict[str, int] = {}
+            self._progress_last_by_outer: dict[str, float] = {}
+            self._progress_lock = asyncio.Lock()
             # vLLM's `max_num_seqs` is a hard cap on active sequences. Under multinode + long-context
             # + multi-sample (SamplingParams(n>1)), vLLM can hang when the server oversubscribes this
             # cap and relies on vLLM internal queueing. Use explicit admission control to avoid
@@ -503,6 +515,56 @@ def _create_multinode_vllm_actor(
                 self._active_generates -= 1
                 if self._active_generates == 0:
                     self._active_generates_cond.notify_all()
+
+        async def _update_progress(
+            self,
+            *,
+            outer_request_id: str,
+            sub_request_id: str | None,
+            tokens_generated: int,
+            max_tokens: int,
+            min_interval_s: float = 5.0,
+        ) -> None:
+            now = time.time()
+            async with self._progress_lock:
+                last = self._progress_last_by_outer.get(outer_request_id)
+                if last is not None and (now - last) < min_interval_s:
+                    return
+                self._progress_last_by_outer[outer_request_id] = now
+                if sub_request_id is not None:
+                    bucket = self._progress_by_outer.setdefault(outer_request_id, {})
+                    bucket[str(sub_request_id)] = int(tokens_generated)
+                    total = self._progress_total_by_outer.get(outer_request_id)
+                    values = list(bucket.values())
+                    if total is not None and len(values) < int(total):
+                        values.append(0)
+                    min_tokens = min(values) if values else int(tokens_generated)
+                else:
+                    min_tokens = int(tokens_generated)
+            try:
+                from .future_store import future_store
+
+                future_store.update_meta(
+                    outer_request_id,
+                    meta={
+                        "stage": "decode",
+                        "progress": _progress_meta(min_tokens, max_tokens),
+                        "last_progress_at": time.time(),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "multinode_vllm_progress_update_failed request_id=%s err=%s: %s",
+                    outer_request_id,
+                    type(e).__name__,
+                    e,
+                )
+
+        async def _clear_progress(self, outer_request_id: str) -> None:
+            async with self._progress_lock:
+                self._progress_by_outer.pop(outer_request_id, None)
+                self._progress_total_by_outer.pop(outer_request_id, None)
+                self._progress_last_by_outer.pop(outer_request_id, None)
 
         @asynccontextmanager
         async def _exclusive_engine_op(self):
@@ -863,6 +925,7 @@ def _create_multinode_vllm_actor(
             lora_int_id: int | None,
             lora_path: str | None,
             max_tokens: int,
+            outer_request_id: str | None = None,
             stop: object | None = None,
             temperature: float = 1.0,
             top_k: int = -1,
@@ -894,12 +957,15 @@ def _create_multinode_vllm_actor(
             from vllm.lora.request import LoRARequest
             from .vllm_stop import vllm_stop_kwargs
 
+            outer_request_id = str(outer_request_id or request_id)
             n_req = max(1, int(n))
             if n_req > 1 and self._multisample_mode in ("sequential_n1", "concurrent_n1"):
                 sub_ids = {f"{request_id}_s{i}" for i in range(n_req)}
                 try:
                     async with self._outer_to_subreq_lock:
                         self._outer_to_subreq_ids[request_id] = sub_ids
+                    async with self._progress_lock:
+                        self._progress_total_by_outer[outer_request_id] = int(n_req)
                     if self._multisample_mode == "sequential_n1":
                         outs: list[dict] = []
                         for i in range(n_req):
@@ -910,6 +976,7 @@ def _create_multinode_vllm_actor(
                                 lora_int_id=lora_int_id,
                                 lora_path=lora_path,
                                 max_tokens=max_tokens,
+                                outer_request_id=outer_request_id,
                                 stop=stop,
                                 temperature=temperature,
                                 top_k=top_k,
@@ -932,6 +999,7 @@ def _create_multinode_vllm_actor(
                                     lora_int_id=lora_int_id,
                                     lora_path=lora_path,
                                     max_tokens=max_tokens,
+                                    outer_request_id=outer_request_id,
                                     stop=stop,
                                     temperature=temperature,
                                     top_k=top_k,
@@ -950,6 +1018,7 @@ def _create_multinode_vllm_actor(
                 finally:
                     async with self._outer_to_subreq_lock:
                         self._outer_to_subreq_ids.pop(request_id, None)
+                    await self._clear_progress(outer_request_id)
 
             effective_max_tokens = int(max_tokens)
             if self.max_model_len is not None:
@@ -984,6 +1053,24 @@ def _create_multinode_vllm_actor(
                 )
 
             t0 = time.perf_counter()
+            try:
+                from .future_store import future_store
+
+                future_store.update_meta(
+                    outer_request_id,
+                    meta={
+                        "stage": "prefill",
+                        "progress": None,
+                        "max_tokens": int(effective_max_tokens),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "multinode_vllm_prefill_meta_update_failed request_id=%s err=%s: %s",
+                    outer_request_id,
+                    type(e).__name__,
+                    e,
+                )
             first_tok_s: float | None = None
             # Get final response
             async with self._maybe_generate_lock():
@@ -1086,6 +1173,26 @@ def _create_multinode_vllm_actor(
                                                     idx = -1
                                                 by_index[idx] = oo
                                         final_res = out
+                                        try:
+                                            if n_req == 1:
+                                                tokens_generated = len(out.outputs[0].token_ids)
+                                            else:
+                                                lengths = [len(oo.token_ids) for oo in out.outputs]
+                                                tokens_generated = min(lengths) if lengths else 0
+                                            sub_request_id = None if outer_request_id == request_id else request_id
+                                            await self._update_progress(
+                                                outer_request_id=outer_request_id,
+                                                sub_request_id=sub_request_id,
+                                                tokens_generated=tokens_generated,
+                                                max_tokens=effective_max_tokens,
+                                            )
+                                        except Exception as e:
+                                            logger.warning(
+                                                "multinode_vllm_progress_compute_failed request_id=%s err=%s: %s",
+                                                outer_request_id,
+                                                type(e).__name__,
+                                                e,
+                                            )
                                         if out.finished:
                                             break
                                 except Exception:
@@ -1179,12 +1286,15 @@ def _create_multinode_vllm_actor(
                 elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
-                return {
+                result = {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
                     "stop_reason": stop_reason,
                     "routed_experts": routed_experts,
                 }
+                if outer_request_id == request_id:
+                    await self._clear_progress(outer_request_id)
+                return result
 
             outs = list(final_res.outputs)  # type: ignore[union-attr]
             if len(outs) != n_req:
@@ -1290,6 +1400,8 @@ def _create_multinode_vllm_actor(
                     f"seq_token_preview={affected_seq_preview}"
                 )
 
+            if outer_request_id == request_id:
+                await self._clear_progress(outer_request_id)
             return multi_results
 
         async def compute_prompt_logprobs(
@@ -1778,19 +1890,36 @@ class MultiNodeInferenceEngine:
 
             node_ips: list[str] | None = None
             gpus_per_node = 8
-            k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
-            if self.model_name in k2_models:
-                volc_rq = os.environ.get("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                if not volc_rq:
+
+            # Preferred node pinning (e.g., for temporarily placing K2 vLLM workers onto C1 nodes
+            # when C2 is unavailable). If provided, it takes precedence over queue-based selection.
+            preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
+            if preferred_node_ips and distributed_executor_backend != "mp":
+                nodes_needed = (int(worker_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
+                if len(preferred_node_ips) < nodes_needed:
                     raise RuntimeError(
-                        "K2 multinode inference requires MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID to be set "
-                        "(expected to pin vLLM workers to queue C2)"
+                        f"MINT_MODEL_NODE_IPS_JSON too short for model={self.model_name!r}: "
+                        f"need {nodes_needed} nodes for worker_gpus={worker_gpus}, got {len(preferred_node_ips)}"
                     )
-            else:
-                volc_rq = (
-                    os.environ.get("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "").strip()
-                    or os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                node_ips = preferred_node_ips[:nodes_needed]
+                volc_rq = ""
+                logger.info(
+                    f"[MultiNodeInferenceEngine] Using pinned node IPs for model={self.model_name} nodes={node_ips}"
                 )
+            else:
+                k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
+                if self.model_name in k2_models:
+                    volc_rq = os.environ.get("MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                    if not volc_rq:
+                        raise RuntimeError(
+                            "K2 multinode inference requires MINT_K2_INFER_VOLC_RESOURCE_QUEUE_ID to be set "
+                            "(expected to pin vLLM workers to queue C2)"
+                        )
+                else:
+                    volc_rq = (
+                        os.environ.get("MINT_VLLM_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                        or os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                    )
 
             if volc_rq:
                 from .volc_placement import select_free_nodes_for_resource_queue
@@ -2276,6 +2405,7 @@ class MultiNodeInferenceEngine:
             lora_int_id=lora_id,
             lora_path=lora_path,
             max_tokens=max_tokens,
+            outer_request_id=request_id,
             stop=stop,
             temperature=temperature,
             top_k=top_k,
@@ -2361,6 +2491,7 @@ class MultiNodeInferenceEngine:
             lora_int_id=lora_id,
             lora_path=lora_path,
             max_tokens=max_tokens,
+            outer_request_id=request_id,
             stop=stop,
             temperature=temperature,
             top_k=top_k,

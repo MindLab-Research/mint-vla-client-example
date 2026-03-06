@@ -20,6 +20,14 @@ class _StubFutureStore:
         return {}
 
 
+class _StubApiWorkQueue:
+    async def find_position(self, request_id: str) -> dict:
+        return {"found": True, "position": None, "depth": 0}
+
+    async def get_eta_state(self, op: str | None) -> dict:
+        return {"ema_exec_s": None}
+
+
 def _request_with_admin_user():
     return SimpleNamespace(state=SimpleNamespace(user_data={"user_id": "admin"}), headers={})
 
@@ -35,6 +43,12 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
     monkeypatch.setattr(futures_route, "future_store", stub)
     monkeypatch.setattr(futures_route.time, "time", lambda: clock["now"])
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue())
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 1, raising=False)
 
     body = FutureRetrieveRequest(request_id="rid_pending")
 
@@ -42,7 +56,10 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
     first = anyio.run(futures_route.retrieve_future, body, _request_with_admin_user(), first_response)
     assert first_response.status_code == 408
     assert first_response.headers.get("X-Tinker-Poll-Throttled") is None
-    assert first == {"queue_state": "active"}
+    assert first.get("queue_state") == "active"
+    assert first.get("retry_after_s") == 1
+    assert first.get("request_id") == "rid_pending"
+    assert first.get("type") == "try_again"
     assert stub.status_calls == 1
     assert stub.meta_calls == 1
 
@@ -51,7 +68,7 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
     assert second_response.status_code == 408
     assert second_response.headers.get("Retry-After") == "1"
     assert second_response.headers.get("X-Tinker-Poll-Throttled") == "1"
-    assert second == {"queue_state": "active"}
+    assert second == {"queue_state": "active", "retry_after_s": 1}
     assert stub.status_calls == 1
     assert stub.meta_calls == 1
 
@@ -60,6 +77,9 @@ def test_pending_retrieve_short_circuits_repeat_polls(monkeypatch):
     third = anyio.run(futures_route.retrieve_future, body, _request_with_admin_user(), third_response)
     assert third_response.status_code == 408
     assert third_response.headers.get("X-Tinker-Poll-Throttled") is None
-    assert third == {"queue_state": "active"}
+    assert third.get("queue_state") == "active"
+    assert third.get("retry_after_s") == 1
+    assert third.get("request_id") == "rid_pending"
+    assert third.get("type") == "try_again"
     assert stub.status_calls == 2
     assert stub.meta_calls == 2
