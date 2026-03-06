@@ -537,7 +537,10 @@ async def asample(
 
     request_json = request.model_dump_json().encode("utf-8")
     payload_hash = _payload_hash(request_json)
-    request_id = uuid.uuid4().hex
+    if request.seq_id is not None:
+        request_id = _deterministic_request_id(session_id, request.seq_id)
+    else:
+        request_id = uuid.uuid4().hex
     created_pending = False
 
     # Set request_id in context for logging
@@ -545,7 +548,6 @@ async def asample(
     logger.info(f"asample request received: session_id={session_id}, seq_id={request.seq_id}")
 
     if request.seq_id is not None:
-        request_id = _deterministic_request_id(session_id, request.seq_id)
         for attempt in range(2):
             try:
                 ensure = future_store.ensure_pending(

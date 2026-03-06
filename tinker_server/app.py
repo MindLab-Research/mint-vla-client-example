@@ -978,7 +978,9 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
     with tracer.start_as_current_span(span_name, context=context, kind=SpanKind.SERVER) as span:
         span_ctx = span.get_span_context()
         if span_ctx and getattr(span_ctx, "trace_id", 0):
-            set_trace_id(f"{int(span_ctx.trace_id):032x}")
+            trace_id = f"{int(span_ctx.trace_id):032x}"
+            set_trace_id(trace_id)
+            request.state.trace_id = trace_id
         span.set_attribute("http.method", method)
         span.set_attribute("http.route", route)
         error_recorded = False
@@ -1047,7 +1049,11 @@ async def api_key_auth_middleware(request: Request, call_next):
     request.state.trace_id = trace_id
 
     def _with_trace(response):
-        response.headers.setdefault("X-Trace-Id", trace_id)
+        final_trace_id = ensure_trace_id(
+            getattr(request.state, "trace_id", None) or get_trace_id() or trace_id
+        )
+        request.state.trace_id = final_trace_id
+        response.headers["X-Trace-Id"] = final_trace_id
         return response
 
     async def _next_with_trace():

@@ -210,6 +210,38 @@ def test_asample_deterministic_request_id_dedup(monkeypatch):
     assert len(stub_q.calls) == 1
 
 
+def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypatch):
+    stub_fs = _StubFutureStore()
+    stub_cap = _StubCapacityManager()
+    stub_q = _StubApiWorkQueue()
+    request_id_bindings: list[str] = []
+
+    monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
+    monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(sampling_route, "set_request_id", lambda rid: request_id_bindings.append(rid))
+
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.result_size_estimator as rse
+
+    monkeypatch.setattr(cm, "capacity_manager", stub_cap)
+    monkeypatch.setattr(awq, "api_work_queue", stub_q)
+    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+
+    req = SampleRequest(
+        sampling_session_id="sess",
+        seq_id=42,
+        num_samples=1,
+        prompt=ModelInput.from_ints([1, 2, 3]),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    out = anyio.run(sampling_route.asample, req, _dummy_request("u"))
+    expected = sampling_route._deterministic_request_id("sess", 42)
+    assert out.request_id == expected
+    assert request_id_bindings == [expected]
+
+
 def test_asample_duplicate_payload_conflict(monkeypatch):
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
