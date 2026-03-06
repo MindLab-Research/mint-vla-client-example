@@ -8,6 +8,12 @@ from tinker_server.models.types import FutureRetrieveRequest
 from tinker_server.routes import futures as futures_route
 
 
+@pytest.fixture(autouse=True)
+def _reset_retrieve_future_caches(monkeypatch):
+    monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
+    monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
+
+
 class _StubFutureStore:
     def __init__(self, meta: dict):
         self._meta = dict(meta)

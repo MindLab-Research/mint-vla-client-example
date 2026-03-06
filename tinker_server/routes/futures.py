@@ -34,8 +34,22 @@ def _retrieve_grace_s() -> float:
         return 120.0
 
 
+def _retrieve_pending_min_poll_s() -> float:
+    v = (
+        os.environ.get("MINT_RETRIEVE_FUTURE_MIN_POLL_S")
+        or os.environ.get("TINKER_RETRIEVE_FUTURE_MIN_POLL_S")
+        or "1.0"
+    ).strip()
+    try:
+        return max(0.0, float(v))
+    except Exception:
+        return 1.0
+
+
 _RECENT_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_RECENT_MAX", "2048"))
 _RECENT: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+_PENDING_HINTS_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_PENDING_MAX", "8192"))
+_PENDING_HINTS: "OrderedDict[str, float]" = OrderedDict()
 
 
 def _recent_put(request_id: str, payload: Any) -> None:
@@ -61,6 +75,34 @@ def _recent_get(request_id: str) -> Any | None:
         return None
     _RECENT.move_to_end(request_id)
     return payload
+
+
+def _pending_hint_maybe_throttle(request_id: str) -> Any | None:
+    now = time.time()
+    next_probe_at = _PENDING_HINTS.get(request_id)
+    if next_probe_at is None:
+        return None
+    if now >= next_probe_at:
+        _PENDING_HINTS.move_to_end(request_id)
+        return None
+    retry_after_s = max(1, int(next_probe_at - now + 0.999))
+    return pending_future_http_response(retry_after_s=retry_after_s, throttled=True)
+
+
+def _pending_hint_note_pending(request_id: str) -> None:
+    min_poll_s = _retrieve_pending_min_poll_s()
+    if min_poll_s <= 0:
+        _PENDING_HINTS.pop(request_id, None)
+        return
+    _PENDING_HINTS[request_id] = time.time() + min_poll_s
+    _PENDING_HINTS.move_to_end(request_id)
+    while len(_PENDING_HINTS) > _PENDING_HINTS_MAX:
+        _PENDING_HINTS.popitem(last=False)
+
+
+def _pending_hint_clear(request_id: str) -> None:
+    _PENDING_HINTS.pop(request_id, None)
+
 
 GENERIC_ERROR_MESSAGE = "Operation failed. Contact administrator if issue persists."
 
@@ -107,6 +149,12 @@ async def retrieve_future(
     """
     from ..gateway import decode_request_id, forward_json, upstream_for_alias
 
+    throttled_pending = _pending_hint_maybe_throttle(body.request_id)
+    if throttled_pending is not None:
+        response.status_code = throttled_pending.status_code
+        response.headers.update(throttled_pending.headers)
+        return throttled_pending.body
+
     decoded = decode_request_id(body.request_id)
     if decoded is not None:
         upstream_alias, upstream_request_id = decoded
@@ -148,6 +196,7 @@ async def retrieve_future(
             and isinstance(payload.get("detail"), str)
             and "Unknown request_id:" in payload["detail"]
         ):
+            _pending_hint_clear(body.request_id)
             detail: object = GENERIC_ERROR_MESSAGE
             if _is_privileged(http_request):
                 detail = {
@@ -167,6 +216,11 @@ async def retrieve_future(
             upstream_request_id=upstream_request_id,
             payload=payload,
         )
+
+        if upstream_resp.status_code == 408:
+            _pending_hint_note_pending(body.request_id)
+        else:
+            _pending_hint_clear(body.request_id)
 
         # If the gateway uses an upstream credential (static_api_key), the upstream may treat
         # the request as privileged. Preserve local error-masking semantics based on the caller.
@@ -196,6 +250,7 @@ async def retrieve_future(
     except FutureStoreUnavailableError:
         raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
     except KeyError:
+        _pending_hint_clear(body.request_id)
         logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
         detail: object = f"Unknown request_id: {body.request_id}"
         if _is_privileged(http_request):
@@ -384,6 +439,7 @@ async def retrieve_future(
             extra_headers["X-Queue-Max-Tokens"] = str(int(progress_payload.get("max_tokens", 0)))
 
         # Tinker client expects HTTP 408 for pending
+        _pending_hint_note_pending(body.request_id)
         pending = pending_future_http_response(
             retry_after_s=retry_after_s,
             extra_headers=extra_headers,
@@ -393,9 +449,11 @@ async def retrieve_future(
         response.headers.update(pending.headers)
         return pending.body
     elif status == FutureStatus.EXPIRED:
+        _pending_hint_clear(body.request_id)
         logger.info("[retrieve_future] request_id=%s status=expired", body.request_id)
         return {"error": "Future expired", "category": "system"}
     elif status == FutureStatus.RETRIEVED:
+        _pending_hint_clear(body.request_id)
         cached = _recent_get(body.request_id)
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
@@ -403,6 +461,7 @@ async def retrieve_future(
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
+        _pending_hint_clear(body.request_id)
         error = future_store.get_error(body.request_id)
         # Only expose full error details to privileged users
         if _is_privileged(http_request):
@@ -426,6 +485,7 @@ async def retrieve_future(
             pass
         return payload
     else:
+        _pending_hint_clear(body.request_id)
         # DONE - return the result
         result = future_store.get_result(body.request_id)
         _recent_put(body.request_id, result)
