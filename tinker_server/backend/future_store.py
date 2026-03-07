@@ -117,7 +117,7 @@ def _get_or_create_ray_actor():
     except ValueError:
         pass
 
-    @ray.remote
+    @ray.remote(num_cpus=0)
     class _RayFutureStoreActor:
         def __init__(
             self, ttl_s: float, queue_ttl_s: float, done_ttl_s: float, tombstone_ttl_s: float

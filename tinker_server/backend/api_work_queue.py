@@ -71,7 +71,7 @@ def _get_or_create_ray_actor():
 
     max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "128"))
 
-    @ray.remote(max_concurrency=max_concurrency)
+    @ray.remote(num_cpus=0, max_concurrency=max_concurrency)
     class _RayApiWorkQueueActor:
         def __init__(self) -> None:
             import asyncio

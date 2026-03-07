@@ -31,7 +31,7 @@ def _get_or_create_actor():
     except ValueError:
         pass
 
-    @ray.remote
+    @ray.remote(num_cpus=0)
     class _SessionIndexStore:
         def __init__(self) -> None:
             self._sessions: dict[str, dict[str, Any]] = {}

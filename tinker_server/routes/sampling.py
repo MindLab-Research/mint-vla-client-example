@@ -683,7 +683,13 @@ async def _do_sample(
             if is_multi_lora:
                 # Multi-LoRA mode: handles both LoRA and base model sessions
                 # Get engine once; it is shared across samples.
+                logger.info(
+                    f"[sample path] request_id={request_id} session_id={session_id} stage=before_get_engine"
+                )
                 engine = await session_manager.get_engine_for_session(session_id)
+                logger.info(
+                    f"[sample path] request_id={request_id} session_id={session_id} stage=after_get_engine"
+                )
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
                 from ..backend.resource_pool import get_resource_pool

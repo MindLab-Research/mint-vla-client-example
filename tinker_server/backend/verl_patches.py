@@ -855,6 +855,9 @@ def apply_verl_patches():
     print("[VERL_PATCH] Applied verl MLA attention backend patch")
     logger.info("Applied verl MLA attention backend patch")
 
+    # Override stale Verl MLA QKV patch with logic matching the current Megatron runtime.
+    _apply_mla_get_query_key_value_patch()
+
     # Apply MLA value padding patch (enables FlashAttention 2 by making head_dim_qk == head_dim_v)
     _apply_mla_value_padding_patch()
 
@@ -894,6 +897,226 @@ def _apply_prepare_model_outputs_patch():
     MegatronEngineWithLMHead.prepare_model_outputs = patched_prepare_model_outputs
     print("[VERL_PATCH] Applied prepare_model_outputs patch (passes through all keys including topk)")
     logger.info("Applied prepare_model_outputs patch (passes through all keys)")
+
+
+def _apply_mla_get_query_key_value_patch():
+    import torch
+    from megatron.core import parallel_state, tensor_parallel
+
+    try:
+        from megatron.core.transformer.multi_latent_attention import (
+            MLASelfAttention,
+            apply_rotary_pos_emb,
+            deprecate_inference_params,
+            fused_apply_mla_rope_for_kv,
+            fused_apply_mla_rope_for_q,
+            gather_from_sequence_parallel_region,
+            gather_from_tensor_model_parallel_region,
+            scatter_to_sequence_parallel_region,
+        )
+    except ImportError:
+        logger.warning("MLASelfAttention not found, skipping MLA QKV patch")
+        return
+
+    original = MLASelfAttention.get_query_key_value_tensors
+    if getattr(original, "_tinker_mla_qkv_patch", False):
+        return
+
+    def patch_get_query_key_value_tensors(
+        self,
+        hidden_states,
+        key_value_states=None,
+        position_ids=None,
+        packed_seq_params=None,
+        inference_context=None,
+        *,
+        inference_params=None,
+    ):
+        assert hidden_states.ndim == 3, f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        if packed_seq_params is not None:
+            assert (
+                packed_seq_params.local_cp_size is None
+            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. Please disable hybrid_context_parallel."
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            inference_context, None, hidden_states, self.config, packed_seq_params
+        )
+
+        mscale = 1.0
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if self.config.rope_type == "rope":
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+        else:
+            if self.config.apply_rope_fusion:
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                )
+                rotary_pos_emb = None
+                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+                assert (
+                    fused_apply_mla_rope_for_q is not None
+                    and fused_apply_mla_rope_for_kv is not None
+                ), "Fused MLA RoPE apply is not imported successfully"
+            else:
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+            else:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q
+            if packed_seq_params.cu_seqlens_kv_padded is not None:
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+            else:
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+        else:
+            cu_seqlens_q = cu_seqlens_kv = None
+
+        if self.config.q_lora_rank is not None:
+            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            if q_compressed.size(-1) != self.config.q_lora_rank:
+                q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+                if self.config.sequence_parallel:
+                    q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+        else:
+            q_compressed = hidden_states
+
+        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
+            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            kv_compressed, k_pos_emb = torch.split(
+                kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+            if self.config.sequence_parallel:
+                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+        else:
+            kv_compressed, k_pos_emb = torch.split(
+                kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+            if parallel_state.get_tensor_model_parallel_world_size() > 1 and self.config.sequence_parallel:
+                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
+
+        if packed_seq_params is not None:
+            q_compressed = q_compressed.squeeze(1)
+            kv_compressed = kv_compressed.squeeze(1)
+            k_pos_emb = k_pos_emb.squeeze(1)
+
+        if self.config.q_lora_rank is not None:
+            q_compressed = self.q_layernorm(q_compressed)
+        kv_compressed = self.kv_layernorm(kv_compressed)
+
+        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
+            if self.config.q_lora_rank is not None:
+                q, _ = self.linear_q_up_proj(q_compressed)
+            else:
+                q, _ = self.linear_q_proj(q_compressed)
+            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+
+            kv, _ = self.linear_kv_up_proj(kv_compressed)
+            kv = kv.view(
+                *kv.size()[:-1],
+                self.num_attention_heads_per_partition,
+                self.config.qk_head_dim + self.config.v_head_dim,
+            )
+
+            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+            if self.config.apply_rope_fusion:
+                cp_rank = self.pg_collection.cp.rank()
+                cp_size = self.pg_collection.cp.size()
+                query = fused_apply_mla_rope_for_q(
+                    q,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_head_dim,
+                    self.config.qk_pos_emb_head_dim,
+                    cu_seqlens_q,
+                    cp_rank,
+                    cp_size,
+                )
+                key, value = fused_apply_mla_rope_for_kv(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                    cu_seqlens_kv,
+                    cp_rank,
+                    cp_size,
+                )
+            else:
+                q_len = q.size()[0]
+                if inference_context is not None:
+                    sequence_start = inference_context.sequence_len_offset
+                    sequence_end = sequence_start + q_len
+                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+                elif packed_seq_params is None or parallel_state.get_context_parallel_world_size() == 1:
+                    rotary_pos_emb = rotary_pos_emb[0:q_len]
+
+                q_no_pe, q_pos_emb = torch.split(
+                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+                )
+                k_no_pe, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+
+                if packed_seq_params is not None:
+                    q_pos_emb = q_pos_emb.squeeze(1)
+                    q_no_pe = q_no_pe.squeeze(1)
+                    k_no_pe = k_no_pe.squeeze(1)
+                    value = value.squeeze(1)
+
+                q_pos_emb = apply_rotary_pos_emb(
+                    q_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_q,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                )
+                k_pos_emb = apply_rotary_pos_emb(
+                    k_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                )
+                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+                if packed_seq_params is not None:
+                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
+                    key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                else:
+                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                    key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+
+            query = query.contiguous()
+            key = key.contiguous()
+            value = value.contiguous()
+            return query, key, value
+
+        if self.recompute_up_proj:
+            quantization = self.config.fp8 or self.config.fp4
+            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
+            query, key, value = self.qkv_up_checkpoint.checkpoint(
+                qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            )
+        else:
+            query, key, value = qkv_up_proj_and_rope_apply(
+                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            )
+
+        return query, key, value, q_compressed, kv_compressed
+
+    patch_get_query_key_value_tensors._tinker_mla_qkv_patch = True  # type: ignore[attr-defined]
+    MLASelfAttention.get_query_key_value_tensors = patch_get_query_key_value_tensors
+    logger.info("Applied MLA get_query_key_value_tensors patch aligned with current Megatron runtime")
 
 
 def _apply_mla_value_padding_patch():
@@ -976,17 +1199,47 @@ def _apply_mla_value_padding_patch():
 
             return output
 
-        # Temporarily replace core_attention.forward method and expected head_dim
+        original_get_qkv = self.get_query_key_value_tensors
+        had_instance_get_qkv = "get_query_key_value_tensors" in getattr(self, "__dict__", {})
+
+        def compat_get_query_key_value_tensors(*a, **kw):
+            result = original_get_qkv(*a, **kw)
+            if not isinstance(result, tuple):
+                raise RuntimeError(
+                    "MLA get_query_key_value_tensors returned a non-tuple result: "
+                    f"type={type(result).__name__}"
+                )
+            if len(result) == 5:
+                return result
+            if len(result) == 3:
+                if getattr(self.config, "experimental_attention_variant", None) == "dsa":
+                    raise RuntimeError(
+                        "MLA get_query_key_value_tensors returned 3 values but DSA requires "
+                        "q_compressed and kv_compressed"
+                    )
+                query, key, value = result
+                return query, key, value, None, None
+            raise RuntimeError(
+                "MLA get_query_key_value_tensors returned an unexpected tuple length: "
+                f"len={len(result)}"
+            )
+
+        # Temporarily replace core_attention.forward, expected head_dim, and QKV return arity
         core_attn_module.forward = padded_core_attention_forward
+        self.get_query_key_value_tensors = compat_get_query_key_value_tensors
         if original_v_head_dim is not None:
             core_attn_module.hidden_size_per_attention_head_v = q_head_dim  # Change 128 -> 192
         try:
             result = original_forward(self, *args, **kwargs)
         finally:
-            # Restore original forward method and head_dim
+            # Restore original forward method, head_dim, and QKV getter
             core_attn_module.forward = original_core_attn_forward
             if original_v_head_dim is not None:
                 core_attn_module.hidden_size_per_attention_head_v = original_v_head_dim
+            if had_instance_get_qkv:
+                self.get_query_key_value_tensors = original_get_qkv
+            else:
+                delattr(self, "get_query_key_value_tensors")
 
         return result
 

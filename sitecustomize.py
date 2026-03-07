@@ -158,16 +158,19 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
     """Avoid expensive dummy-LoRA warmup during profiling runs.
 
-    In vLLM v1, `GPUModelRunner.profile_run()` calls `_dummy_run(..., is_profile=True)`
-    with `activate_lora=False` by default. However, `maybe_dummy_run_with_lora(...)`
-    can still create dummy LoRAs unconditionally, which is extremely expensive for
-    large MoE models (e.g. K2) and can stall engine startup.
+    vLLM has changed the `maybe_dummy_run_with_lora(...)` signature across releases.
+    Older builds passed `activate_lora: bool`; newer ones pass
+    `num_active_loras: int` plus `mapping_type`. In both cases, the inactive path
+    should skip dummy-LoRA setup entirely. If we misread the arguments, vLLM ends
+    up creating MoE dummy LoRAs during profiling, which is extremely expensive for
+    large models (e.g. K2) and can stall engine startup after weights finish loading.
 
     This patch keeps the existing behavior when LoRA is actually activated, but
-    skips dummy-LoRA setup/selection when `activate_lora=False`.
+    skips dummy-LoRA setup/selection when the current call is inactive.
     """
 
     from contextlib import contextmanager
+    import inspect
 
     import vllm.v1.worker.lora_model_runner_mixin as mixin_mod
 
@@ -180,6 +183,7 @@ def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
         raise RuntimeError("vLLM LoRAModelRunnerMixin missing maybe_dummy_run_with_lora")
     if getattr(original, "_tinker_patched_skip_dummy_inactive", False):
         return
+    original_sig = inspect.signature(original)
 
     @contextmanager
     def maybe_dummy_run_with_lora(  # type: ignore[no-untyped-def]
@@ -187,11 +191,32 @@ def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
         lora_config,
         num_scheduled_tokens,
         num_sampled_tokens,
-        activate_lora: bool = True,
-        remove_lora: bool = True,
+        *args,
+        **kwargs,
     ):
-        if lora_config is not None and not activate_lora:
-            self.maybe_remove_all_loras(lora_config)
+        bound = original_sig.bind_partial(
+            self,
+            lora_config,
+            num_scheduled_tokens,
+            num_sampled_tokens,
+            *args,
+            **kwargs,
+        )
+        arguments = bound.arguments
+        remove_lora = bool(arguments.get("remove_lora", True))
+        if "activate_lora" in original_sig.parameters:
+            inactive = not bool(arguments.get("activate_lora", True))
+        elif "num_active_loras" in original_sig.parameters:
+            inactive = int(arguments.get("num_active_loras", 0)) <= 0
+        else:
+            raise RuntimeError(
+                "vLLM maybe_dummy_run_with_lora signature missing both "
+                "`activate_lora` and `num_active_loras`"
+            )
+
+        if inactive:
+            if lora_config is not None and remove_lora:
+                self.maybe_remove_all_loras(lora_config)
             yield
             return
 
@@ -200,13 +225,540 @@ def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
             lora_config,
             num_scheduled_tokens,
             num_sampled_tokens,
-            activate_lora,
-            remove_lora,
+            *args,
+            **kwargs,
         ):
             yield
 
     maybe_dummy_run_with_lora._tinker_patched_skip_dummy_inactive = True  # type: ignore[attr-defined]
     cls.maybe_dummy_run_with_lora = maybe_dummy_run_with_lora  # type: ignore[method-assign]
+
+
+def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
+    """Disable dummy active-LoRA profiling during worker startup.
+
+    K2 on the current vLLM build crashes during profile-time fused MoE LoRA
+    startup in `fused_moe_lora_op.py` with illegal CUDA memory access. This
+    happens before any real adapter is loaded, while `_dummy_run(...)` is
+    capturing a synthetic `num_active_loras > 0` path. Keep real LoRA behavior
+    intact, but force profile-time dummy runs down the no-active-LoRA path.
+    """
+
+    import vllm.v1.worker.gpu_model_runner as gpu_model_runner_mod
+
+    cls = getattr(gpu_model_runner_mod, "GPUModelRunner", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing GPUModelRunner")
+
+    original = getattr(cls, "_dummy_run", None)
+    if original is None:
+        raise RuntimeError("vLLM GPUModelRunner missing _dummy_run")
+    if getattr(original, "_tinker_patched_disable_profile_dummy_loras", False):
+        return
+
+    def _dummy_run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        is_profile = bool(kwargs.get("is_profile", False))
+        activate_lora = bool(kwargs.get("activate_lora", False))
+        if not is_profile and activate_lora:
+            return original(self, *args, **kwargs)
+
+        kwargs["num_active_loras"] = 0
+        original_lora_config = getattr(self, "lora_config", None)
+        old_bypass = os.environ.get("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP")
+        try:
+            if original_lora_config is not None:
+                self.maybe_remove_all_loras(original_lora_config)
+            self.lora_config = None
+            os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = "1"
+            return original(self, *args, **kwargs)
+        finally:
+            self.lora_config = original_lora_config
+            if old_bypass is None:
+                os.environ.pop("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", None)
+            else:
+                os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = old_bypass
+
+    _dummy_run._tinker_patched_disable_profile_dummy_loras = True  # type: ignore[attr-defined]
+    cls._dummy_run = _dummy_run  # type: ignore[method-assign]
+
+
+def _patch_vllm_fused_moe_lora_profile_noop() -> None:
+    """Skip fused MoE LoRA custom op during startup/profile dummy runs.
+
+    K2 startup currently trips CUDA illegal-address faults inside
+    `fused_moe_lora_op._fused_moe_lora(...)`. During profile-only dummy runs the
+    op's numeric result is irrelevant; only shape flow matters. Under the scoped
+    env flag set by `_patch_vllm_profile_run_disable_dummy_active_loras()`,
+    convert the op into a no-op so startup can continue.
+    """
+
+    try:
+        import importlib
+
+        op = importlib.import_module("vllm.lora.ops.triton_ops.fused_moe_lora_op")
+        triton_ops = importlib.import_module("vllm.lora.ops.triton_ops")
+    except Exception:
+        return
+
+    def _wrap_noop(original):  # type: ignore[no-untyped-def]
+        if not callable(original) or getattr(original, "_tinker_profile_noop", False):
+            return original
+
+        def wrapped(*args, **kwargs):  # type: ignore[no-untyped-def]
+            if not _env_flag("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", default=False):
+                return original(*args, **kwargs)
+            return None
+
+        wrapped._tinker_profile_noop = True  # type: ignore[attr-defined]
+        return wrapped
+
+    for name in (
+        "_fused_moe_lora",
+        "_fused_moe_lora_shrink",
+        "_fused_moe_lora_expand",
+        "fused_moe_lora",
+        "fused_moe_lora_shrink",
+        "fused_moe_lora_expand",
+    ):
+        if hasattr(op, name):
+            setattr(op, name, _wrap_noop(getattr(op, name)))
+        if hasattr(triton_ops, name):
+            setattr(triton_ops, name, _wrap_noop(getattr(triton_ops, name)))
+
+    try:
+        punica_gpu = importlib.import_module("vllm.lora.punica_wrapper.punica_gpu")
+    except Exception:
+        return
+    for name in ("fused_moe_lora",):
+        if hasattr(punica_gpu, name):
+            setattr(punica_gpu, name, _wrap_noop(getattr(punica_gpu, name)))
+
+
+def _patch_vllm_profile_run_scope_bypass_fused_moe_lora() -> None:
+    """Scope fused-MoE-LoRA bypass to vLLM startup profiling.
+
+    `GPUModelRunner.profile_run()` is the stable startup path that exercises the
+    fused MoE LoRA kernels before any real user request is served. Set a narrow
+    env guard around that call so `_fused_moe_lora(...)` can be a no-op only
+    during profiling, while real inference/training retains LoRA behavior.
+    """
+
+    import vllm.v1.worker.gpu_model_runner as gpu_model_runner_mod
+
+    cls = getattr(gpu_model_runner_mod, "GPUModelRunner", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing GPUModelRunner")
+
+    original = getattr(cls, "profile_run", None)
+    if not callable(original) or getattr(original, "_tinker_profile_scope_bypass", False):
+        return
+
+    def profile_run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        old = os.environ.get("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP")
+        os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = "1"
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if old is None:
+                os.environ.pop("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", None)
+            else:
+                os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = old
+
+    profile_run._tinker_profile_scope_bypass = True  # type: ignore[attr-defined]
+    cls.profile_run = profile_run  # type: ignore[method-assign]
+
+
+def _patch_vllm_unquantized_moe_startup_use_naive_batched_experts() -> None:
+    """Route startup-only unquantized batched MoE away from Triton.
+
+    After the fused-MoE-LoRA startup bypasses, K2 still reaches Triton-backed
+    unquantized batched MoE during profile/warmup on A800 and can crash with a
+    CUDA illegal-memory-access fault. Under the same startup-only env guard,
+    switch just that path to the in-tree `NaiveBatchedExperts` reference kernel.
+    Real serving keeps the normal Triton backend.
+    """
+
+    import vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method as method_mod
+    from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
+        NaiveBatchedExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEActivationFormat,
+    )
+
+    cls = getattr(method_mod, "UnquantizedFusedMoEMethod", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing UnquantizedFusedMoEMethod")
+
+    original = getattr(cls, "select_gemm_impl", None)
+    if not callable(original):
+        raise RuntimeError("vLLM UnquantizedFusedMoEMethod missing select_gemm_impl")
+    if getattr(original, "_tinker_patched_startup_naive_batched", False):
+        return
+
+    def select_gemm_impl(self, prepare_finalize, layer):  # type: ignore[no-untyped-def]
+        assert self.moe_quant_config is not None
+        if (
+            _env_flag("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", default=False)
+            and prepare_finalize.activation_format
+            == FusedMoEActivationFormat.BatchedExperts
+        ):
+            method_mod.logger.info_once(
+                "Using NaiveBatchedExperts for startup-only unquantized MoE",
+                scope="local",
+            )
+            return NaiveBatchedExperts(
+                max_num_tokens=self.moe.max_num_tokens,
+                num_dispatchers=prepare_finalize.num_dispatchers(),
+                quant_config=self.moe_quant_config,
+            )
+        return original(self, prepare_finalize, layer)
+
+    select_gemm_impl._tinker_patched_startup_naive_batched = True  # type: ignore[attr-defined]
+    cls.select_gemm_impl = select_gemm_impl  # type: ignore[method-assign]
+
+
+def _patch_vllm_fused_moe_forward_startup_fake() -> None:
+    """Bypass fused MoE execution during startup-only dummy runs.
+
+    The K2 startup crash still reaches Triton MoE kernels through
+    `FusedMoE.forward_native(...)` even after lower-level LoRA and GEMM
+    selection patches. Under the same startup-only env guard, return zero
+    outputs with the correct shapes instead of executing any fused MoE kernel.
+    """
+
+    import torch
+    import vllm.model_executor.layers.fused_moe.layer as layer_mod
+
+    cls = getattr(layer_mod, "FusedMoE", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing FusedMoE")
+
+    original = getattr(cls, "forward_native", None)
+    if not callable(original):
+        raise RuntimeError("vLLM FusedMoE missing forward_native")
+    if getattr(original, "_tinker_patched_startup_fake_forward", False):
+        return
+
+    def forward_native(self, hidden_states, router_logits):  # type: ignore[no-untyped-def]
+        if not _env_flag("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", default=False):
+            return original(self, hidden_states, router_logits)
+
+        layer_mod.logger.info_once(
+            "Bypassing FusedMoE.forward_native during startup-only dummy runs",
+            scope="local",
+        )
+        fused_out = torch.zeros_like(hidden_states)
+        if self.shared_experts is None:
+            return fused_out
+        return torch.zeros_like(hidden_states), fused_out
+
+    forward_native._tinker_patched_startup_fake_forward = True  # type: ignore[attr-defined]
+    cls.forward_native = forward_native  # type: ignore[method-assign]
+
+
+def _patch_vllm_invoke_fused_moe_kernel_startup_noop() -> bool:
+    """Skip the Triton fused-MoE kernel during startup-only dummy runs."""
+
+    import vllm.model_executor.layers.fused_moe.fused_moe as fused_moe_mod
+
+    original = getattr(fused_moe_mod, "invoke_fused_moe_kernel", None)
+    if not callable(original):
+        return False
+    if getattr(original, "_tinker_patched_startup_noop", False):
+        return True
+
+    def invoke_fused_moe_kernel(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if not _env_flag("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", default=False):
+            return original(*args, **kwargs)
+
+        if len(args) < 3:
+            raise RuntimeError(
+                "vLLM invoke_fused_moe_kernel startup noop expected output tensor as third positional arg"
+            )
+        output = args[2]
+        fused_moe_mod.logger.info_once(
+            "Bypassing invoke_fused_moe_kernel during startup-only dummy runs",
+            scope="local",
+        )
+        output.zero_()
+        return None
+
+    invoke_fused_moe_kernel._tinker_patched_startup_noop = True  # type: ignore[attr-defined]
+    fused_moe_mod.invoke_fused_moe_kernel = invoke_fused_moe_kernel  # type: ignore[assignment]
+    return True
+
+
+def _patch_vllm_device_memory_profiler_skip_exit_measure() -> None:
+    """Avoid post-load memory measurement hanging worker startup.
+
+    On the current K2 bringup, workers can finish loading all checkpoint shards
+    and then stall inside `DeviceMemoryProfiler.__exit__()` while querying
+    `current_platform.get_current_memory_usage(...)`. This metric is only used
+    for logging; skipping the exit-time re-measure keeps startup moving without
+    changing model execution.
+    """
+
+    import vllm.utils.mem_utils as mem_utils_mod
+
+    cls = getattr(mem_utils_mod, "DeviceMemoryProfiler", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing DeviceMemoryProfiler")
+
+    original = getattr(cls, "__exit__", None)
+    if original is None:
+        raise RuntimeError("vLLM DeviceMemoryProfiler missing __exit__")
+    if getattr(original, "_tinker_patched_skip_exit_measure", False):
+        return
+
+    def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore[no-untyped-def]
+        self.final_memory = self.initial_memory
+        self.consumed_memory = 0
+        import gc
+        gc.collect()
+
+    __exit__._tinker_patched_skip_exit_measure = True  # type: ignore[attr-defined]
+    cls.__exit__ = __exit__  # type: ignore[method-assign]
+
+
+def _patch_vllm_skip_startup_memory_profile() -> None:
+    """Skip vLLM startup memory profiling on the current K2 path.
+
+    The current profile-time forward pass is not stable on A800 K2 startup.
+    For eager-mode startup with an explicit gpu_memory_utilization cap, a
+    conservative KV-cache budget can still be computed as:
+
+        requested_memory - weights_memory
+
+    where `requested_memory` already encodes the configured utilization cap and
+    `weights_memory` is the measured torch memory used by loaded weights.
+    """
+
+    import gc
+
+    import vllm.v1.worker.gpu_worker as gpu_worker_mod
+
+    cls = getattr(gpu_worker_mod, "Worker", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing GPU Worker")
+
+    original = getattr(cls, "determine_available_memory", None)
+    if not callable(original) or getattr(original, "_tinker_skip_startup_profile", False):
+        return
+
+    def determine_available_memory(self):  # type: ignore[no-untyped-def]
+        import torch
+
+        weights_memory = int(getattr(self.model_runner, "model_memory_usage", 0))
+        requested_memory = int(getattr(self, "requested_memory", 0))
+        current_free_memory = int(torch.cuda.mem_get_info()[0])
+        kv_headroom_bytes = 2 << 30
+        available_kv_cache_memory_bytes = min(
+            requested_memory - weights_memory,
+            current_free_memory - kv_headroom_bytes,
+        )
+        if available_kv_cache_memory_bytes <= 0:
+            raise RuntimeError(
+                "Skipping startup profile left no KV-cache budget: "
+                f"requested_memory={requested_memory}, "
+                f"weights_memory={weights_memory}, "
+                f"current_free_memory={current_free_memory}, "
+                f"kv_headroom_bytes={kv_headroom_bytes}"
+            )
+        self.non_torch_memory = 0
+        self.peak_activation_memory = 0
+        self.available_kv_cache_memory_bytes = available_kv_cache_memory_bytes
+        gc.collect()
+        return available_kv_cache_memory_bytes
+
+    determine_available_memory._tinker_skip_startup_profile = True  # type: ignore[attr-defined]
+    cls.determine_available_memory = determine_available_memory  # type: ignore[method-assign]
+
+
+def _patch_vllm_dummy_lora_weights_use_empty() -> None:
+    """Speed up vLLM startup by avoiding huge CPU memset in dummy LoRA weights.
+
+    vLLM's memory-profiling path can create large dummy LoRA weights via
+    `torch.zeros(...)` on CPU (pin_memory), which is extremely slow for large
+    MoE models. For profiling, the values are irrelevant; only shapes and
+    allocations matter. Use `torch.empty(...)` to keep allocations but avoid
+    the expensive initialization.
+    """
+
+    import torch
+    from vllm.lora import lora_weights as lw  # type: ignore
+
+    LoRALayerWeights = getattr(lw, "LoRALayerWeights", None)
+    if LoRALayerWeights is None:
+        raise RuntimeError("vLLM LoRALayerWeights missing; cannot patch dummy lora")
+
+    original = getattr(LoRALayerWeights, "create_dummy_lora_weights", None)
+    if original is None:
+        raise RuntimeError("vLLM create_dummy_lora_weights missing; cannot patch")
+    if getattr(original, "_tinker_patched_dummy_empty", False):
+        return
+
+    is_pin_memory_available = getattr(lw, "is_pin_memory_available", None)
+    if is_pin_memory_available is None:
+        raise RuntimeError("vLLM is_pin_memory_available missing; cannot patch")
+
+    @classmethod
+    def create_dummy_lora_weights(  # type: ignore[no-untyped-def]
+        cls,
+        module_name,
+        input_dim,
+        output_dim,
+        rank,
+        dtype,
+        device,
+    ):
+        pin_memory = str(device) == "cpu" and is_pin_memory_available()
+        lora_a = torch.empty(
+            (rank, input_dim),
+            dtype=dtype,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        lora_b = torch.empty(
+            (output_dim, rank),
+            dtype=dtype,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        return cls(
+            module_name,
+            rank=rank,
+            lora_alpha=1,
+            lora_a=lora_a,
+            lora_b=lora_b,
+        )
+
+    create_dummy_lora_weights._tinker_patched_dummy_empty = True  # type: ignore[attr-defined]
+    LoRALayerWeights.create_dummy_lora_weights = create_dummy_lora_weights  # type: ignore[method-assign]
+
+
+def _patch_vllm_lora_from_tensors_disable_pin_memory() -> None:
+    """Disable LoRA load-time pinning without replacing vLLM method signatures.
+
+    vLLM computes the load-time pinning decision inside `LoRAModel.
+    from_lora_tensors()` via the module-local `is_pin_memory_available()`
+    import. Replacing the whole classmethod is brittle because newer vLLM
+    builds can add kwargs such as `skip_prefixes`. Patch only the pinning
+    predicate so the upstream implementation and signature stay intact.
+    """
+
+    import vllm.lora.lora_model as lora_model  # type: ignore
+
+    current = getattr(lora_model, "is_pin_memory_available", None)
+    if current is None or getattr(current, "_tinker_disable_pin_memory", False):
+        return
+
+    def _disabled_pin_memory() -> bool:
+        return False
+
+    _disabled_pin_memory._tinker_disable_pin_memory = True  # type: ignore[attr-defined]
+    lora_model.is_pin_memory_available = _disabled_pin_memory  # type: ignore[assignment]
+
+
+def _patch_vllm_worker_lora_load_to_device() -> None:
+    """Load LoRA tensors directly onto the worker device.
+
+    vLLM's default worker path loads adapter tensors onto CPU first, then
+    pins/transfers them later. For large sparse MoE K2 adapters this becomes a
+    long per-worker bottleneck during `add_lora()`. Loading directly to the
+    target CUDA device avoids the CPU pinning path and substantially reduces
+    load latency.
+    """
+
+    from vllm.lora.worker_manager import WorkerLoRAManager
+
+    original = getattr(WorkerLoRAManager, "_load_adapter", None)
+    if not callable(original) or getattr(original, "_tinker_load_to_device", False):
+        return
+
+    def _load_adapter(self, lora_request):  # type: ignore[no-untyped-def]
+        try:
+            supported_lora_modules = self._adapter_manager.supported_lora_modules
+            packed_modules_mapping = self._adapter_manager.packed_modules_mapping
+            expected_lora_lst = []
+            for module in supported_lora_modules:
+                if module in packed_modules_mapping:
+                    expected_lora_lst.extend(packed_modules_mapping[module])
+                else:
+                    expected_lora_lst.append(module)
+                if module == "experts":
+                    expected_lora_lst.append(module)
+            expected_lora_modules = set(expected_lora_lst)
+
+            from vllm.lora.peft_helper import PEFTHelper
+            from vllm.lora.utils import get_adapter_absolute_path
+
+            lora_path = get_adapter_absolute_path(lora_request.lora_path)
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                self.max_position_embeddings,
+                lora_request.tensorizer_config_dict,
+            )
+            peft_helper.validate_legal(self.lora_config)
+
+            model = self._adapter_manager.model
+            hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
+            device = str(self.device)
+            return self._lora_model_cls.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device=device,
+                dtype=self.lora_config.lora_dtype,
+                model_vocab_size=self.vocab_size,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=hf_to_vllm_mapper,
+            )
+        except FileNotFoundError as e:
+            raise ValueError(
+                f"Loading lora {lora_request.lora_name} failed: No adapter found for {lora_request.lora_path}"
+            ) from e
+
+    _load_adapter._tinker_load_to_device = True  # type: ignore[attr-defined]
+    WorkerLoRAManager._load_adapter = _load_adapter  # type: ignore[method-assign]
+
+
+class _SparseShardTensor:
+    def __init__(
+        self,
+        shard_tensors,
+        shard_starts: tuple[int, ...],
+        num_experts: int,
+        scale_factors=None,
+    ):  # type: ignore[no-untyped-def]
+        if not shard_tensors:
+            raise RuntimeError("Sparse shard tensor requires representative tensors")
+        self._tinker_sparse_shards = tuple(shard_tensors)
+        self._tinker_shard_starts = tuple(int(x) for x in shard_starts)
+        self._tinker_num_experts = int(num_experts)
+        self._tinker_scale_factors = None if scale_factors is None else tuple(float(x) for x in scale_factors)
+        first = shard_tensors[0]
+        self.shape = (len(shard_tensors),) + tuple(first.shape)
+        self.device = first.device
+
+    def map(self, fn):  # type: ignore[no-untyped-def]
+        return _SparseShardTensor(
+            tuple(fn(t) for t in self._tinker_sparse_shards),
+            self._tinker_shard_starts,
+            self._tinker_num_experts,
+            self._tinker_scale_factors,
+        )
+
+    def get_rep(self, rep_idx: int):  # type: ignore[no-untyped-def]
+        rep_idx = int(rep_idx)
+        rep = self._tinker_sparse_shards[rep_idx]
+        if self._tinker_scale_factors is None:
+            return rep
+        return rep * self._tinker_scale_factors[rep_idx]
+
+    def pin_memory(self):  # type: ignore[no-untyped-def]
+        return self
 
 
 def _patch_vllm_pack_moe_sparse_ok() -> None:
@@ -308,19 +860,70 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
             w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
             packed_scaling = [1.0, 1.0, 1.0]
         else:
-            present_eids: set[int] = set()
-            for eid in range(n_experts):
-                if (
-                    loras[eid * 3] is not None
-                    or loras[eid * 3 + 1] is not None
-                    or loras[eid * 3 + 2] is not None
-                ):
-                    present_eids.add(eid)
-            raise RuntimeError(
-                "Unsupported sparse MoE LoRA adapter sparsity pattern for vLLM pack_moe. "
-                "Supported patterns: (1) all experts present, (2) expert-0-only shared-expert export. "
-                f"module={module_name!r} n_experts={n_experts} present_expert_ids={sorted(present_eids)}"
-            )
+            import torch
+
+            present_w1 = {eid: loras[eid * 3] for eid in range(n_experts) if loras[eid * 3] is not None}
+            present_w2 = {eid: loras[eid * 3 + 1] for eid in range(n_experts) if loras[eid * 3 + 1] is not None}
+            present_w3 = {eid: loras[eid * 3 + 2] for eid in range(n_experts) if loras[eid * 3 + 2] is not None}
+            present_eids = sorted(set(present_w1) | set(present_w2) | set(present_w3))
+            if not present_eids:
+                raise RuntimeError(f"MoE LoRA pack_moe got no present experts for module={module_name!r}")
+            if set(present_w1) != set(present_w2) or set(present_w1) != set(present_w3):
+                raise RuntimeError(
+                    "Sparse MoE LoRA adapter has inconsistent expert coverage across w1/w2/w3. "
+                    f"module={module_name!r} w1={sorted(present_w1)} w2={sorted(present_w2)} w3={sorted(present_w3)}"
+                )
+
+            shard_starts = present_eids
+            shard_ends = [*shard_starts[1:], n_experts]
+            shard_spans = list(zip(shard_starts, shard_ends))
+            expected_rep_count = len(shard_starts)
+            if (
+                shard_starts[0] != 0
+                or any(start >= end for start, end in shard_spans)
+                or n_experts % expected_rep_count != 0
+            ):
+                raise RuntimeError(
+                    "Unsupported sparse MoE LoRA shard layout for vLLM pack_moe. "
+                    f"module={module_name!r} n_experts={n_experts} present_expert_ids={present_eids}"
+                )
+            shard_size = n_experts // expected_rep_count
+            expected_starts = list(range(0, n_experts, shard_size))
+            if shard_starts != expected_starts:
+                raise RuntimeError(
+                    "Sparse MoE LoRA adapter representatives do not match EP-shard boundaries. "
+                    f"module={module_name!r} n_experts={n_experts} "
+                    f"present_expert_ids={present_eids} expected_present_expert_ids={expected_starts}"
+                )
+
+            def _shard_lora_a(present: dict[int, object]):  # type: ignore[no-untyped-def]
+                return _SparseShardTensor(
+                    tuple(present[start].lora_a for start, _ in shard_spans),  # type: ignore[index,attr-defined]
+                    tuple(shard_starts),
+                    int(n_experts),
+                )
+
+            def _shard_lora_b(present: dict[int, object]):  # type: ignore[no-untyped-def]
+                return _SparseShardTensor(
+                    tuple(
+                        present[start].lora_b  # type: ignore[index,attr-defined]
+                        for start, _ in shard_spans
+                    ),
+                    tuple(shard_starts),
+                    int(n_experts),
+                    tuple(
+                        float(getattr(present[start], "scaling", lora_alpha / rank))  # type: ignore[index,attr-defined]
+                        for start, _ in shard_spans
+                    ),
+                )
+
+            w1_lora_a = _shard_lora_a(present_w1)
+            w2_lora_a = _shard_lora_a(present_w2)
+            w3_lora_a = _shard_lora_a(present_w3)
+            w1_lora_b = _shard_lora_b(present_w1)
+            w2_lora_b = _shard_lora_b(present_w2)
+            w3_lora_b = _shard_lora_b(present_w3)
+            packed_scaling = [1.0, 1.0, 1.0]
 
         return cls(
             module_name,
@@ -333,6 +936,203 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
 
     pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
+
+
+def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
+    import vllm.lora.layers.fused_moe as fused_moe_mod  # type: ignore
+
+    def _get_spans(tensor: "torch.Tensor", num_experts: int) -> list[tuple[int, int]] | None:  # type: ignore[name-defined]
+        starts = getattr(tensor, "_tinker_shard_starts", None)
+        if starts is None:
+            return None
+        starts = [int(x) for x in starts]
+        if not starts:
+            raise RuntimeError("Sparse MoE shard metadata is empty")
+        if starts[0] != 0:
+            raise RuntimeError(f"Sparse MoE shard metadata must start at expert 0: starts={starts}")
+        if starts != sorted(starts):
+            raise RuntimeError(f"Sparse MoE shard metadata must be sorted: starts={starts}")
+        if int(getattr(tensor, "_tinker_num_experts", num_experts)) != num_experts:
+            raise RuntimeError(
+                "Sparse MoE shard metadata num_experts mismatch: "
+                f"tensor_num_experts={getattr(tensor, '_tinker_num_experts', None)} expected={num_experts}"
+            )
+        if tensor.shape[0] != len(starts):
+            raise RuntimeError(
+                "Sparse MoE shard metadata length mismatch: "
+                f"tensor.shape[0]={tensor.shape[0]} starts={starts}"
+            )
+        ends = [*starts[1:], num_experts]
+        spans = list(zip(starts, ends))
+        for start, end in spans:
+            if start < 0 or end <= start or end > num_experts:
+                raise RuntimeError(
+                    "Sparse MoE shard span is invalid: "
+                    f"spans={spans} num_experts={num_experts}"
+                )
+        return spans
+
+    def _copy_sparse(dst: "torch.Tensor", index: int, src: "torch.Tensor", spans: list[tuple[int, int]]) -> None:  # type: ignore[name-defined]
+        for rep_idx, (start, end) in enumerate(spans):
+            expert_count = end - start
+            if hasattr(src, "_tinker_sparse_shards"):
+                rep = src.get_rep(rep_idx)
+            else:
+                rep = src[rep_idx : rep_idx + 1]
+            target = dst[index, start:end]
+            if rep.ndim == target.ndim - 1:
+                rep = rep.unsqueeze(0)
+            elif rep.ndim != target.ndim:
+                raise RuntimeError(
+                    "Sparse MoE representative rank mismatch: "
+                    f"rep.shape={tuple(rep.shape)} target.shape={tuple(target.shape)} "
+                    f"rep_idx={rep_idx} span=({start},{end})"
+                )
+            if rep.shape[0] == 1:
+                expanded = rep.expand(expert_count, *rep.shape[1:])
+            elif rep.shape[0] == expert_count:
+                expanded = rep
+            else:
+                raise RuntimeError(
+                    "Sparse MoE representative leading dimension mismatch: "
+                    f"rep.shape={tuple(rep.shape)} expert_count={expert_count} "
+                    f"rep_idx={rep_idx} span=({start},{end})"
+                )
+            target_view = target[(slice(None),) + tuple(slice(0, dim) for dim in expanded.shape[1:])]
+            if tuple(target_view.shape) != tuple(expanded.shape):
+                raise RuntimeError(
+                    "Sparse MoE target slice mismatch: "
+                    f"target_view.shape={tuple(target_view.shape)} expanded.shape={tuple(expanded.shape)} "
+                    f"rep_idx={rep_idx} span=({start},{end})"
+                )
+            target_view.copy_(expanded, non_blocking=True)
+
+    def _slice_sparse(src, slicer, reshape_fn=None):  # type: ignore[no-untyped-def]
+        if hasattr(src, "_tinker_sparse_shards"):
+            if reshape_fn is None:
+                return src.map(slicer)
+            return src.map(lambda t: slicer(reshape_fn(t)))
+        return slicer(src)
+
+    cls = getattr(fused_moe_mod, "FusedMoEWithLoRA", None)
+    if cls is None:
+        raise RuntimeError("vLLM fused_moe missing FusedMoEWithLoRA")
+    original = getattr(cls, "set_lora", None)
+    if not callable(original):
+        raise RuntimeError("vLLM FusedMoEWithLoRA.set_lora missing")
+    if not getattr(original, "_tinker_sparse_shards", False):
+
+        def set_lora(self, index: int, lora_a, lora_b):  # type: ignore[no-untyped-def]
+            assert isinstance(lora_a, list)
+            assert isinstance(lora_b, list)
+            spans = _get_spans(lora_a[0], int(self.w13_lora_a_stacked[0].shape[1]))
+            if spans is None:
+                return original(self, index, lora_a, lora_b)
+
+            self.reset_lora(index)
+            self.adapter_enabled[index] = 1
+
+            w1_lora_a, w2_lora_a, w3_lora_a = lora_a
+            w1_lora_b, w2_lora_b, w3_lora_b = lora_b
+
+            sliced_w1_lora_a = _slice_sparse(
+                w1_lora_a,
+                self._slice_w13_a,
+                reshape_fn=lambda t: t.reshape(1, -1, t.shape[-1]),
+            )
+            sliced_w1_lora_b = _slice_sparse(
+                w1_lora_b,
+                self._slice_w13_b,
+                reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
+            )
+            sliced_w3_lora_a = _slice_sparse(
+                w3_lora_a,
+                self._slice_w13_a,
+                reshape_fn=lambda t: t.reshape(1, -1, t.shape[-1]),
+            )
+            sliced_w3_lora_b = _slice_sparse(
+                w3_lora_b,
+                self._slice_w13_b,
+                reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
+            )
+            sliced_w2_lora_a = _slice_sparse(
+                w2_lora_a,
+                self._slice_w2_a,
+                reshape_fn=lambda t: t.reshape(1, -1, t.shape[-1]),
+            )
+            sliced_w2_lora_b = _slice_sparse(
+                w2_lora_b,
+                self._slice_w2_b,
+                reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
+            )
+
+            _copy_sparse(self.w13_lora_a_stacked[0], index, sliced_w1_lora_a, spans)
+            _copy_sparse(self.w13_lora_a_stacked[1], index, sliced_w3_lora_a, spans)
+            _copy_sparse(self.w13_lora_b_stacked[0], index, sliced_w1_lora_b, spans)
+            _copy_sparse(self.w13_lora_b_stacked[1], index, sliced_w3_lora_b, spans)
+            _copy_sparse(self.w2_lora_a_stacked[0], index, sliced_w2_lora_a, spans)
+            _copy_sparse(self.w2_lora_b_stacked[0], index, sliced_w2_lora_b, spans)
+
+        set_lora._tinker_sparse_shards = True  # type: ignore[attr-defined]
+        cls.set_lora = set_lora  # type: ignore[method-assign]
+
+    cls3d = getattr(fused_moe_mod, "FusedMoE3DWithLoRA", None)
+    if cls3d is None:
+        raise RuntimeError("vLLM fused_moe missing FusedMoE3DWithLoRA")
+    original3d = getattr(cls3d, "set_lora", None)
+    if not callable(original3d):
+        raise RuntimeError("vLLM FusedMoE3DWithLoRA.set_lora missing")
+    if not getattr(original3d, "_tinker_sparse_shards", False):
+
+        def set_lora_3d(self, index: int, lora_a, lora_b):  # type: ignore[no-untyped-def]
+            assert isinstance(lora_a, list)
+            assert isinstance(lora_b, list)
+            assert len(lora_a) == len(lora_b) == 2
+            num_experts = int(self.w13_lora_a_stacked[0].shape[1])
+            spans = _get_spans(lora_a[0], num_experts)
+            if spans is None:
+                return original3d(self, index, lora_a, lora_b)
+
+            self.reset_lora(index)
+            self.adapter_enabled[index] = 1
+
+            w13_lora_a, w2_lora_a = lora_a
+            w13_lora_b, w2_lora_b = lora_b
+            src_experts = len(spans)
+            if not hasattr(w13_lora_a, "_tinker_sparse_shards"):
+                w13_lora_a = w13_lora_a.reshape(src_experts, -1, w13_lora_a.shape[-1])
+                w2_lora_a = w2_lora_a.reshape(src_experts, -1, w2_lora_a.shape[-1])
+                w13_lora_b = w13_lora_b.reshape(w13_lora_b.shape[0], src_experts, -1).permute(1, 0, 2)
+                w2_lora_b = w2_lora_b.reshape(w2_lora_b.shape[0], src_experts, -1).permute(1, 0, 2)
+
+            sliced_w13_lora_a = _slice_sparse(
+                w13_lora_a,
+                self._slice_w13_a,
+                reshape_fn=lambda t: t.reshape(1, -1, t.shape[-1]),
+            )
+            sliced_w13_lora_b = _slice_sparse(
+                w13_lora_b,
+                self._slice_w13_b,
+                reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
+            )
+            sliced_w2_lora_a = _slice_sparse(
+                w2_lora_a,
+                self._slice_w2_a,
+                reshape_fn=lambda t: t.reshape(1, -1, t.shape[-1]),
+            )
+            sliced_w2_lora_b = _slice_sparse(
+                w2_lora_b,
+                self._slice_w2_b,
+                reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
+            )
+
+            _copy_sparse(self.w13_lora_a_stacked[0], index, sliced_w13_lora_a, spans)
+            _copy_sparse(self.w2_lora_a_stacked[0], index, sliced_w2_lora_a, spans)
+            _copy_sparse(self.w13_lora_b_stacked[0], index, sliced_w13_lora_b, spans)
+            _copy_sparse(self.w2_lora_b_stacked[0], index, sliced_w2_lora_b, spans)
+
+        set_lora_3d._tinker_sparse_shards = True  # type: ignore[attr-defined]
+        cls3d.set_lora = set_lora_3d  # type: ignore[method-assign]
 
 
 def _patch_vllm_lora_optimize_overlap_safe() -> None:
@@ -587,11 +1387,21 @@ def _apply_vllm_worker_patches() -> None:
     _patch_vllm_ray_env_carry_over_pythonpath()
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
         _patch_vllm_pack_moe_sparse_ok()
+        _patch_vllm_fused_moe_set_lora_sparse_shards()
+    _patch_vllm_lora_from_tensors_disable_pin_memory()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
         _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
         _patch_vllm_skip_dummy_lora_setup_when_inactive()
+        _patch_vllm_profile_run_disable_dummy_active_loras()
+        _patch_vllm_fused_moe_lora_profile_noop()
+        _patch_vllm_profile_run_scope_bypass_fused_moe_lora()
+        if not _patch_vllm_invoke_fused_moe_kernel_startup_noop():
+            _patch_vllm_fused_moe_forward_startup_fake()
+        _patch_vllm_device_memory_profiler_skip_exit_measure()
+        _patch_vllm_skip_startup_memory_profile()
+        _patch_vllm_dummy_lora_weights_use_empty()
         _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
 
 

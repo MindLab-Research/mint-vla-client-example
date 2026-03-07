@@ -135,6 +135,20 @@ async def _cleanup_stale_actors() -> None:
 
                     # Actor is alive - register it with ResourcePool
                     # Determine actor type and GPU count from name/diagnostics
+                    def _pg_total_gpus(actor_name: str) -> int | None:
+                        try:
+                            pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                            info = ray.util.placement_group_table(pg)
+                        except Exception:
+                            return None
+                        bundles = info.get("bundles") or {}
+                        total = sum(
+                            int(b.get("GPU", 0) or 0)
+                            for b in bundles.values()
+                            if isinstance(b, dict)
+                        )
+                        return total or None
+
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
@@ -147,6 +161,7 @@ async def _cleanup_stale_actors() -> None:
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
+                        num_gpus = _pg_total_gpus(name) or num_gpus
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -170,9 +185,12 @@ async def _cleanup_stale_actors() -> None:
                             base_model = diag.get("base_model", "") or base_model
                         except Exception:
                             pass
+                        num_gpus = _pg_total_gpus(name) or num_gpus
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
+
+                    from tinker_server.backend.model_registry import is_persistent_model
 
                     resource_pool.register(
                         actor_name=name,
@@ -181,6 +199,7 @@ async def _cleanup_stale_actors() -> None:
                         actor_handle=actor,
                         namespace=PERSISTENT_NAMESPACE,
                         base_model=base_model,
+                        protected=bool(base_model and is_persistent_model(base_model)),
                     )
                     # Mark as ready since the actor passed health check
                     resource_pool.mark_ready(name)
@@ -208,6 +227,20 @@ async def _cleanup_stale_actors() -> None:
                         f"Actor {name} __ray_ready__ timed out; registering without marking ready"
                     )
                     try:
+                        def _pg_total_gpus(actor_name: str) -> int | None:
+                            try:
+                                pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                                info = ray.util.placement_group_table(pg)
+                            except Exception:
+                                return None
+                            bundles = info.get("bundles") or {}
+                            total = sum(
+                                int(b.get("GPU", 0) or 0)
+                                for b in bundles.values()
+                                if isinstance(b, dict)
+                            )
+                            return total or None
+
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
                             num_gpus = 1
@@ -220,6 +253,7 @@ async def _cleanup_stale_actors() -> None:
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
+                            num_gpus = _pg_total_gpus(name) or num_gpus
                         elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -234,9 +268,12 @@ async def _cleanup_stale_actors() -> None:
                                 num_gpus = cfg.train_gpus
                             else:
                                 num_gpus = 8
+                            num_gpus = _pg_total_gpus(name) or num_gpus
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
+
+                        from tinker_server.backend.model_registry import is_persistent_model
 
                         resource_pool.register(
                             actor_name=name,
@@ -245,6 +282,7 @@ async def _cleanup_stale_actors() -> None:
                             actor_handle=actor,
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=base_model,
+                            protected=bool(base_model and is_persistent_model(base_model)),
                             metadata={"startup_reconcile": "__ray_ready__timeout"},
                         )
                         registered += 1
@@ -717,7 +755,15 @@ async def lifespan(app: FastAPI):
     )
 
     async def _exec_sampling_asample(item):
+        logger.info(
+            "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
+            str(item.request_id),
+        )
         req = SampleRequest.model_validate_json(item.request_json)
+        logger.info(
+            "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
+            str(item.request_id),
+        )
         await sampling._do_sample(item.request_id, req, item.user_id)
 
     async def _exec_sampling_compute_logprobs(item):

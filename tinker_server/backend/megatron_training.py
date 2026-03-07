@@ -106,9 +106,11 @@ def tinker_to_tensordict(
             Creating tensors directly on GPU avoids CPU-to-GPU copy issues with nested tensors.
         dp_size: Optional data-parallel size override for loss normalization.
     """
-    def _extract_list(field_name: str, field: dict | None, item_index: int) -> list | None:
+    def _extract_list(field_name: str, field: dict | list | None, item_index: int) -> list | None:
         if field is None:
             return None
+        if isinstance(field, list):
+            return field
         if not isinstance(field, dict):
             raise ValueError(f"Item {item_index}: {field_name} must be a dict with 'data'")
         if "data" not in field:

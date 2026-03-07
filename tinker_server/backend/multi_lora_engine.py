@@ -282,10 +282,15 @@ class MultiLoRAInferenceEngine:
 
             # Ensure GPUs available, evicting idle actors if needed (LRU)
             # This is critical to prevent server hangs when no GPUs are free.
-            from tinker_server.backend.resource_pool import get_resource_pool
+            from tinker_server.backend.resource_pool import get_resource_pool, ActorType
             resource_pool = get_resource_pool()
             try:
-                await asyncio.to_thread(resource_pool.ensure_gpus_available, total_gpus)
+                await asyncio.to_thread(
+                    resource_pool.ensure_gpus_available,
+                    total_gpus,
+                    600,
+                    exclude_actor_types=(ActorType.MEGATRON,),
+                )
             except ValueError as e:
                 # Unable to free enough GPUs even after eviction
                 logger.error(f"Cannot create vLLM actor: {e}")
@@ -1147,6 +1152,7 @@ class MultiModelInferenceManager:
         """
         lock = await self._get_model_lock(model_name)
         async with lock:
+            logger.info("get_engine model=%s stage=entered_lock", model_name)
             if model_name in self._engines:
                 engine = self._engines[model_name]
                 # Check if actor is still alive before returning cached engine
@@ -1159,6 +1165,7 @@ class MultiModelInferenceManager:
                         else:
                             await asyncio.to_thread(ray.get, actor_handle.is_ready.remote(), timeout=5)
                         # Actor alive, return cached engine
+                        logger.info("get_engine model=%s stage=return_cached_engine", model_name)
                         return engine
                     except SystemExit as e:
                         if getattr(e, "code", None) == 15:
@@ -1313,7 +1320,9 @@ class MultiModelInferenceManager:
                     quantization=quantization,
                 )
 
+            logger.info("get_engine model=%s stage=before_engine_initialize", model_name)
             await engine.initialize()
+            logger.info("get_engine model=%s stage=after_engine_initialize", model_name)
 
             self._engines[model_name] = engine
             persistent_csv = os.environ.get("MINT_PERSISTENT_MODELS", "").strip()

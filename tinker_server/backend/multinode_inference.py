@@ -739,7 +739,9 @@ def _create_multinode_vllm_actor(
             Semantics:
             - Returns False when the engine is busy (cannot safely probe EngineCore).
               Callers must treat False as "not ready / unknown", not as "dead".
-            - When idle, performs a cheap EngineCore probe to avoid false positives.
+            - When idle, returns True without touching EngineCore. (EngineCore probes
+              can hang indefinitely under Ray distributed executor and will block
+              the actor event loop, preventing later `generate()` calls.)
             """
             if not self._initialized or self.engine is None:
                 return False
@@ -755,8 +757,6 @@ def _create_multinode_vllm_actor(
                     async with self._active_generates_cond:
                         if self._active_generates > 0:
                             return False
-                    # When idle, probe EngineCore via a cheap RPC.
-                    await self.engine.list_loras()
                     return True
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
@@ -1861,6 +1861,23 @@ class MultiNodeInferenceEngine:
                         return
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
+                try:
+                    stale_pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
+                except Exception:
+                    stale_pg = None
+                if stale_pg is not None:
+                    logger.warning(
+                        "Removing stale placement group for actor_name=%s before recreation",
+                        self.actor_name,
+                    )
+                    try:
+                        ray.util.remove_placement_group(stale_pg)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed removing stale placement group for actor_name=%s: %s",
+                            self.actor_name,
+                            e,
+                        )
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -1966,7 +1983,12 @@ class MultiNodeInferenceEngine:
                 f"DP={self.data_parallel_size}, expert_parallel={self.enable_expert_parallel}, "
                 f"controller_gpus={controller_gpus}, worker_gpus={worker_gpus})"
             )
-            await asyncio.to_thread(resource_pool.ensure_gpus_available, total_required_gpus, 300)
+            await asyncio.to_thread(
+                resource_pool.ensure_gpus_available,
+                total_required_gpus,
+                300,
+                exclude_actor_types=(ActorType.MEGATRON,),
+            )
 
             # Step 2: Create a detached placement group and capture child tasks.
             #
@@ -2046,6 +2068,8 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
                 "VLLM_DISABLE_PYNCCL": "1",
             }
+            if "CUDA_LAUNCH_BLOCKING" in os.environ:
+                env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
             if "VLLM_USE_V1" in os.environ:
                 env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
@@ -2321,7 +2345,18 @@ class MultiNodeInferenceEngine:
         if not self._initialized:
             await self.initialize()
 
+        logger.info(
+            "add_lora_for_session_from_path start sampling_session_id=%s path=%s stage=before_registry_allocate",
+            sampling_session_id,
+            lora_path,
+        )
         lora_id = await self.registry.allocate(sampling_session_id, lora_path)
+        logger.info(
+            "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_registry_allocate",
+            sampling_session_id,
+            lora_path,
+            lora_id,
+        )
 
         start_time = time.time()
         try:
@@ -2330,7 +2365,19 @@ class MultiNodeInferenceEngine:
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
             )
+            logger.info(
+                "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_add_lora_remote",
+                sampling_session_id,
+                lora_path,
+                lora_id,
+            )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+            logger.info(
+                "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_add_lora_wait",
+                sampling_session_id,
+                lora_path,
+                lora_id,
+            )
         except Exception:
             print(
                 "[vLLM add_lora_for_session_from_path failed] "
