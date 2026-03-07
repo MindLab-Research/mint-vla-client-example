@@ -337,7 +337,7 @@ class ServerConfig:
             sampling_sample_coalesce_max_batch=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_BATCH",
                 file_sampling.sample_coalesce_max_batch if file_sampling is not None else None,
-                128,
+                32,
             ),
             sampling_sample_coalesce_max_samples=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
@@ -400,7 +400,7 @@ class ServerConfig:
             api_work_queue_num_workers=_pick_int(
                 "TINKER_API_WORK_QUEUE_NUM_WORKERS",
                 None,
-                32,
+                128,
             ),
             api_work_queue_reap_interval_s=_pick_float(
                 "TINKER_API_WORK_QUEUE_REAP_INTERVAL_S",
