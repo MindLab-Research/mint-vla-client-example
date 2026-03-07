@@ -205,7 +205,7 @@ class ServerConfig:
     capacity_manager_actor_name: str = "tinker_capacity_manager"
     api_work_queue_actor_name: str = "tinker_api_work_queue"
     capacity_queue_bytes_budget: int = 512 * 1024 * 1024
-    api_work_queue_num_workers: int = 32
+    api_work_queue_num_workers: int = 128
     api_work_queue_reap_interval_s: float = 5.0
 
     # Training settings (backend/verl_training.py)
@@ -337,7 +337,7 @@ class ServerConfig:
             sampling_sample_coalesce_max_batch=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_BATCH",
                 file_sampling.sample_coalesce_max_batch if file_sampling is not None else None,
-                32,
+                128,
             ),
             sampling_sample_coalesce_max_samples=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_SAMPLES",
