@@ -16,3 +16,5 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - Auto eviction and GPU allocation: `eviction.md`
 - Authentication and model access: `auth-access.md`
 - Design constraints and change checklist: `constraints-checklist.md`
+- VLA user-facing API guide: `vla_tinker_api_guide.md`
+- VLA implementation plan: `vla_implementation_plan.md`
