@@ -47,6 +47,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _http_route_label(request: Request) -> str:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if isinstance(route_path, str) and route_path:
+        return route_path
+    return request.url.path
+
+
 async def _cleanup_stale_actors() -> None:
     """Clean up stale Ray actors and register alive ones with ResourcePool.
 
@@ -944,7 +952,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
     """Manual OTel instrumentation for HTTP server traces and metrics."""
     tracer = get_otel_tracer()
     method = request.method
-    route = request.url.path
+    route = _http_route_label(request)
     start_s = time.perf_counter()
     status_code = 500
     failure_error: Exception | None = None
@@ -989,6 +997,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             failure_error = e
             raise
         finally:
+            route = _http_route_label(request)
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
                 method=method,
@@ -1010,6 +1019,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             failure_error = e
             raise
         finally:
+            route = _http_route_label(request)
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
                 method=method,
@@ -1038,8 +1048,14 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
 
         try:
             response = await call_next(request)
+            route = _http_route_label(request)
             status_code = int(getattr(response, "status_code", 500))
+            try:
+                span.update_name(f"{method} {route}")
+            except Exception:
+                pass
             span.set_attribute("http.status_code", status_code)
+            span.set_attribute("http.route", route)
             if status_code >= 500:
                 # FastAPI may convert errors into HTTP 5xx responses before they
                 # propagate here. Record a synthetic error so traces still include
@@ -1060,12 +1076,19 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                     status_code = 500
             else:
                 status_code = 500
+            route = _http_route_label(request)
+            try:
+                span.update_name(f"{method} {route}")
+            except Exception:
+                pass
             span.set_attribute("http.status_code", status_code)
+            span.set_attribute("http.route", route)
             if status_code >= 500:
                 _record_server_error(e, escaped=True)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
             raise
         finally:
+            route = _http_route_label(request)
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
                 method=method,

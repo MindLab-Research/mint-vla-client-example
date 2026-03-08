@@ -399,6 +399,7 @@ async def create_model(
             model_id=model_id,
             upstream_alias=upstream.alias,
             base_model=request.base_model,
+            owner_id=user_id,
         )
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
@@ -756,6 +757,7 @@ async def create_model_from_state(
             model_id=model_id,
             upstream_alias=upstream.alias,
             base_model=request.base_model,
+            owner_id=user_id,
         )
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
@@ -1416,6 +1418,12 @@ async def forward(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="forward",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
@@ -1425,6 +1433,7 @@ async def forward(
             request_json=request_json,
             user_id=None,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1786,6 +1795,13 @@ async def save_weights_for_sampler(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="save_weights_for_sampler",
+            seq_id=request.seq_id,
+        )
+        scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(
@@ -1798,7 +1814,7 @@ async def save_weights_for_sampler(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
-            extra={"prefer_tinker": bool(prefer_tinker)},
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
