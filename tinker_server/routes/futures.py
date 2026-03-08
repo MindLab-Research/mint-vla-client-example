@@ -52,6 +52,24 @@ _PENDING_HINTS_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_PENDING_MAX", "819
 _PENDING_HINTS: "OrderedDict[str, float]" = OrderedDict()
 
 
+def _cached_response(status_code: int, headers: dict[str, str], body: Any) -> dict[str, Any]:
+    return {
+        "__cached_status_code__": int(status_code),
+        "__cached_headers__": dict(headers),
+        "__cached_body__": body,
+    }
+
+
+def _apply_cached_response(cached: Any, response: Response) -> Any:
+    if not isinstance(cached, dict) or "__cached_body__" not in cached:
+        return cached
+    response.status_code = int(cached.get("__cached_status_code__", 200))
+    headers = cached.get("__cached_headers__", {})
+    if isinstance(headers, dict):
+        response.headers.update(headers)
+    return cached["__cached_body__"]
+
+
 def _recent_put(request_id: str, payload: Any) -> None:
     now = time.time()
     _RECENT[request_id] = (now, payload)
@@ -157,6 +175,12 @@ async def retrieve_future(
 
     decoded = decode_request_id(body.request_id)
     if decoded is not None:
+        # Check cache first for gateway-routed futures
+        cached = _recent_get(body.request_id)
+        if cached is not None:
+            logger.info("[retrieve_future] request_id=%s gateway_cache_hit=true", body.request_id)
+            return _apply_cached_response(cached, response)
+
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
@@ -243,6 +267,15 @@ async def retrieve_future(
         if isinstance(payload, dict) and "request_id" in payload:
             payload = dict(payload)
             payload["request_id"] = body.request_id
+        if upstream_resp.status_code != 408:
+            _recent_put(
+                body.request_id,
+                _cached_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=payload,
+                ),
+            )
         return payload
 
     try:
@@ -457,7 +490,7 @@ async def retrieve_future(
         cached = _recent_get(body.request_id)
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
-            return cached
+            return _apply_cached_response(cached, response)
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
