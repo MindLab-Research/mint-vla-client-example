@@ -360,7 +360,7 @@ GPU-aware tuning knobs:
 - Tune per-model TP/EP/CP and vLLM memory caps in `tinker_server/backend/model_registry.py`.
 - For environment-specific tuning without code changes, set `MINT_MODEL_CONFIG_OVERRIDES_JSON`:
   ```bash
-  export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"vllm_distributed_executor_backend":"ray"}}'
+  export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":2048,"vllm_distributed_executor_backend":"ray"}}'
   ```
 
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
