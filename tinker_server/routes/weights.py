@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from ..backend.future_store import future_store
 from ..checkpoints import (
@@ -95,6 +96,112 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     """Convert to mint://{model_id}/ URI (legacy format)."""
     return f"mint://{model_id}/{checkpoint_name}"
+
+
+async def _close_upstream_response(response, client) -> None:
+    try:
+        await response.aclose()
+    finally:
+        await client.aclose()
+
+
+async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
+    from ..gateway import forward_json, remote_training_model, upstream_for_alias
+
+    remote = remote_training_model(model_id)
+    if remote is None:
+        return None
+
+    upstream_alias, base_model = remote
+    upstream = upstream_for_alias(upstream_alias)
+    if upstream is None:
+        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+    user_data = _get_user_data(request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+    try:
+        resp = await forward_json(
+            upstream=upstream,
+            method="GET",
+            path=request.url.path,
+            incoming_headers=dict(request.headers),
+            json_body=None,
+            timeout_s=30.0,
+        )
+    except Exception:
+        logger.exception("Upstream checkpoint list failed: %s", upstream_alias)
+        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint list failed")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return CheckpointsListResponse.model_validate(resp.json())
+
+
+async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: str, request: Request, direct: bool):
+    from ..gateway import forward_request, remote_training_model, upstream_for_alias
+
+    remote = remote_training_model(model_id)
+    if remote is None:
+        return None
+
+    upstream_alias, base_model = remote
+    upstream = upstream_for_alias(upstream_alias)
+    if upstream is None:
+        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+    user_data = _get_user_data(request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+    params = dict(request.query_params)
+    if direct:
+        params["direct"] = "1"
+
+    try:
+        client, resp = await forward_request(
+            upstream=upstream,
+            method="GET",
+            path=request.url.path,
+            incoming_headers=dict(request.headers),
+            params=params,
+            timeout_s=600.0,
+            stream=True,
+        )
+    except Exception:
+        logger.exception("Upstream checkpoint archive failed: %s", upstream_alias)
+        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint archive failed")
+
+    if resp.status_code >= 400:
+        text = await resp.aread()
+        await _close_upstream_response(resp, client)
+        raise HTTPException(status_code=resp.status_code, detail=text.decode("utf-8", errors="replace"))
+
+    if resp.status_code in (301, 302, 303, 307, 308):
+        location = resp.headers.get("location")
+        headers = {}
+        expires = resp.headers.get("expires")
+        if expires:
+            headers["Expires"] = expires
+        await _close_upstream_response(resp, client)
+        if not location:
+            raise HTTPException(status_code=502, detail="Upstream checkpoint archive redirect missing Location header")
+        return RedirectResponse(url=location, status_code=resp.status_code, headers=headers)
+
+    response_headers = {}
+    for name in ("Content-Disposition", "Content-Length", "Expires"):
+        value = resp.headers.get(name)
+        if value:
+            response_headers[name] = value
+
+    return StreamingResponse(
+        resp.aiter_bytes(),
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+        headers=response_headers,
+        background=BackgroundTask(_close_upstream_response, resp, client),
+    )
 
 
 # =============================================================================
@@ -1006,6 +1113,10 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     Works for both active training sessions and saved checkpoints.
     Ownership verified via metadata.json (admin can access all).
     """
+    remote_response = await _forward_remote_checkpoint_route(model_id=model_id, request=request)
+    if remote_response is not None:
+        return remote_response
+
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
     from ..client_compat import checkpoint_uri, prefer_tinker_uri
@@ -1278,6 +1389,15 @@ async def download_checkpoint_archive(
     Ownership verified via metadata.json (admin can download all).
     """
     import subprocess
+
+    remote_response = await _forward_remote_checkpoint_archive(
+        model_id=model_id,
+        checkpoint_id=checkpoint_id,
+        request=request,
+        direct=direct,
+    )
+    if remote_response is not None:
+        return remote_response
 
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
