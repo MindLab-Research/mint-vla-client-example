@@ -23,8 +23,9 @@ def _reset_gateway_and_cache():
     futures_route._PENDING_HINTS.clear()
 
 
-def _request_stub():
-    return SimpleNamespace(state=SimpleNamespace(user_data={"user_id": "admin"}), headers={})
+def _request_stub(*, admin: bool = True):
+    user_data = {"user_id": "admin"} if admin else None
+    return SimpleNamespace(state=SimpleNamespace(user_data=user_data), headers={})
 
 
 def _response_stub():
@@ -154,3 +155,87 @@ async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
     response2 = _response_stub()
     await futures_route.retrieve_future(body, _request_stub(), response2)
     assert forward_call_count == 2
+
+
+@pytest.mark.anyio
+async def test_gateway_retrieve_future_cached_response_preserves_public_error_and_gateway_request_id(monkeypatch):
+    """Cached retries should preserve post-processed error masking and request_id rewriting."""
+    _reset_gateway_and_cache()
+
+    cfg = {
+        "model_to_upstream": {"test-model": "test-upstream"},
+        "upstreams": {
+            "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
+        },
+    }
+    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: False)
+
+    forward_call_count = 0
+
+    async def mock_forward_json(*args, **kwargs):
+        nonlocal forward_call_count
+        forward_call_count += 1
+        return _mock_upstream_response(
+            200,
+            {"error": "sensitive internal detail", "category": "system", "request_id": "upstream-123"},
+        )
+
+    import tinker_server.gateway as gw
+    monkeypatch.setattr(gw, "forward_json", mock_forward_json)
+
+    body = FutureRetrieveRequest(request_id="gw:test-upstream:upstream-123")
+
+    response1 = _response_stub()
+    payload1 = await futures_route.retrieve_future(body, _request_stub(admin=False), response1)
+    response2 = _response_stub()
+    payload2 = await futures_route.retrieve_future(body, _request_stub(admin=False), response2)
+
+    expected = {
+        "error": futures_route.GENERIC_ERROR_MESSAGE,
+        "category": "system",
+        "request_id": body.request_id,
+    }
+    assert payload1 == expected
+    assert payload2 == expected
+    assert response2.status_code == 200
+    assert forward_call_count == 1
+
+
+@pytest.mark.anyio
+async def test_gateway_retrieve_future_cached_response_preserves_terminal_status_and_public_detail(monkeypatch):
+    """Cached retries should preserve non-200 terminal status and masked detail."""
+    _reset_gateway_and_cache()
+
+    cfg = {
+        "model_to_upstream": {"test-model": "test-upstream"},
+        "upstreams": {
+            "test-upstream": {"base_url": "http://test:8000", "auth_mode": "none"}
+        },
+    }
+    monkeypatch.setenv("TINKER_GATEWAY_CONFIG_JSON", json.dumps(cfg))
+    monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: False)
+
+    forward_call_count = 0
+
+    async def mock_forward_json(*args, **kwargs):
+        nonlocal forward_call_count
+        forward_call_count += 1
+        return _mock_upstream_response(503, {"detail": "internal upstream detail"})
+
+    import tinker_server.gateway as gw
+    monkeypatch.setattr(gw, "forward_json", mock_forward_json)
+
+    body = FutureRetrieveRequest(request_id="gw:test-upstream:upstream-503")
+
+    response1 = _response_stub()
+    payload1 = await futures_route.retrieve_future(body, _request_stub(admin=False), response1)
+    response2 = _response_stub()
+    payload2 = await futures_route.retrieve_future(body, _request_stub(admin=False), response2)
+
+    expected = {"detail": futures_route.GENERIC_ERROR_MESSAGE}
+    assert response1.status_code == 503
+    assert payload1 == expected
+    assert response2.status_code == 503
+    assert payload2 == expected
+    assert forward_call_count == 1
