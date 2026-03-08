@@ -99,6 +99,50 @@ def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     return f"mint://{model_id}/{checkpoint_name}"
 
 
+def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None) -> None:
+    if request_user_id == "admin":
+        return
+    if request_user_id is None:
+        if owner_id is None:
+            return
+        raise HTTPException(status_code=403, detail="Access denied")
+    if owner_id == request_user_id:
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _build_sdk_archive_redirect_response(
+    *,
+    request: Request,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_id: str,
+) -> RedirectResponse:
+    from ..config import config
+    from ..download_tokens import make_archive_download_token
+
+    secret = (config.token_secret_key or config.api_key or "").strip()
+    direct_url_obj = request.url.include_query_params(direct="1")
+    if secret:
+        token, exp = make_archive_download_token(
+            secret=secret,
+            user_id=user_id,
+            model_id=model_id,
+            checkpoint_id=checkpoint_id,
+            ttl_s=15 * 60,
+        )
+        direct_url_obj = direct_url_obj.include_query_params(download_token=token)
+        expires = datetime.fromtimestamp(exp, tz=timezone.utc)
+    else:
+        expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return RedirectResponse(
+        url=str(direct_url_obj),
+        status_code=302,
+        headers={"Expires": expires_header},
+    )
+
+
 async def _close_upstream_response(response, client) -> None:
     try:
         await response.aclose()
@@ -107,13 +151,15 @@ async def _close_upstream_response(response, client) -> None:
 
 
 async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
-    from ..gateway import forward_json, remote_training_model, upstream_for_alias
+    from ..gateway import forward_json, remote_training_model_info, upstream_for_alias
 
-    remote = remote_training_model(model_id)
+    remote = remote_training_model_info(model_id)
     if remote is None:
         return None
 
-    upstream_alias, base_model = remote
+    upstream_alias = str(remote.get("upstream_alias") or "")
+    base_model = str(remote.get("base_model") or "")
+    owner_id = remote.get("owner_id")
     upstream = upstream_for_alias(upstream_alias)
     if upstream is None:
         raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
@@ -121,6 +167,7 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
     user_data = _get_user_data(request)
     if not can_access_model(base_model, user_data):
         raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    _require_checkpoint_owner(request_user_id=_get_user_id(request), owner_id=owner_id)
 
     try:
         resp = await forward_json(
@@ -147,13 +194,15 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
 
 
 async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: str, request: Request, direct: bool):
-    from ..gateway import forward_request, remote_training_model, upstream_for_alias
+    from ..gateway import forward_request, remote_training_model_info, upstream_for_alias
 
-    remote = remote_training_model(model_id)
+    remote = remote_training_model_info(model_id)
     if remote is None:
         return None
 
-    upstream_alias, base_model = remote
+    upstream_alias = str(remote.get("upstream_alias") or "")
+    base_model = str(remote.get("base_model") or "")
+    owner_id = remote.get("owner_id")
     upstream = upstream_for_alias(upstream_alias)
     if upstream is None:
         raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
@@ -161,6 +210,7 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
     user_data = _get_user_data(request)
     if not can_access_model(base_model, user_data):
         raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    _require_checkpoint_owner(request_user_id=_get_user_id(request), owner_id=owner_id)
 
     params = dict(request.query_params)
     if direct:
@@ -193,15 +243,20 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
         raise HTTPException(status_code=resp.status_code, detail=detail)
 
     if resp.status_code in (301, 302, 303, 307, 308):
-        location = resp.headers.get("location")
         headers = {}
         expires = resp.headers.get("expires")
         if expires:
             headers["Expires"] = expires
         await _close_upstream_response(resp, client)
-        if not location:
-            raise HTTPException(status_code=502, detail="Upstream checkpoint archive redirect missing Location header")
-        return RedirectResponse(url=location, status_code=resp.status_code, headers=headers)
+        redirect = _build_sdk_archive_redirect_response(
+            request=request,
+            user_id=_get_user_id(request),
+            model_id=model_id,
+            checkpoint_id=checkpoint_id,
+        )
+        redirect.status_code = resp.status_code
+        redirect.headers.update(headers)
+        return redirect
 
     response_headers = {}
     for name in ("Content-Disposition", "Content-Length", "Expires"):
@@ -1460,28 +1515,11 @@ async def download_checkpoint_archive(
         from ..client_compat import is_tinker_sdk_user_agent
 
         if is_tinker_sdk_user_agent(request.headers.get("user-agent")):
-            from ..config import config
-            from ..download_tokens import make_archive_download_token
-
-            secret = (config.token_secret_key or config.api_key or "").strip()
-            direct_url_obj = request.url.include_query_params(direct="1")
-            if secret:
-                token, exp = make_archive_download_token(
-                    secret=secret,
-                    user_id=user_id,
-                    model_id=model_id,
-                    checkpoint_id=checkpoint_id,
-                    ttl_s=15 * 60,
-                )
-                direct_url_obj = direct_url_obj.include_query_params(download_token=token)
-                expires = datetime.fromtimestamp(exp, tz=timezone.utc)
-            else:
-                expires = datetime.now(timezone.utc) + timedelta(minutes=15)
-            expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
-            return RedirectResponse(
-                url=str(direct_url_obj),
-                status_code=302,
-                headers={"Expires": expires_header},
+            return _build_sdk_archive_redirect_response(
+                request=request,
+                user_id=user_id,
+                model_id=model_id,
+                checkpoint_id=checkpoint_id,
             )
 
     def stream_tar_gz():

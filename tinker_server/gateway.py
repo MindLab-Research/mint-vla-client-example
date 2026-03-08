@@ -198,7 +198,7 @@ async def forward_file(
 
 
 _remote_sampling_sessions: dict[str, tuple[str, str]] = {}  # sampling_session_id -> (upstream_alias, base_model)
-_remote_training_models: dict[str, tuple[str, str]] = {}  # model_id -> (upstream_alias, base_model)
+_remote_training_models: dict[str, dict[str, str | None]] = {}  # model_id -> routing metadata
 _pending_save_weights_for_sampler: dict[tuple[str, str], tuple[float, str]] = {}  # (up_alias, up_req_id) -> (ts, base_model)
 
 
@@ -303,8 +303,19 @@ def unregister_remote_sampling_session(sampling_session_id: str) -> None:
         )
 
 
-def register_remote_training_model(*, model_id: str, upstream_alias: str, base_model: str) -> None:
-    _remote_training_models[model_id] = (upstream_alias, base_model)
+def register_remote_training_model(
+    *,
+    model_id: str,
+    upstream_alias: str,
+    base_model: str,
+    owner_id: str | None = None,
+) -> None:
+    info: dict[str, str | None] = {
+        "upstream_alias": upstream_alias,
+        "base_model": base_model,
+        "owner_id": owner_id,
+    }
+    _remote_training_models[model_id] = info
     cfg = get_gateway_config()
     if cfg is None or not cfg.model_to_upstream:
         return
@@ -317,6 +328,7 @@ def register_remote_training_model(*, model_id: str, upstream_alias: str, base_m
             model_id=model_id,
             upstream_alias=upstream_alias,
             base_model=base_model,
+            owner_id=owner_id,
         )
     except Exception as e:
         _remote_training_models.pop(model_id, None)
@@ -327,10 +339,10 @@ def register_remote_training_model(*, model_id: str, upstream_alias: str, base_m
         )
 
 
-def remote_training_model(model_id: str) -> tuple[str, str] | None:
+def remote_training_model_info(model_id: str) -> dict[str, str | None] | None:
     cached = _remote_training_models.get(model_id)
     if cached is not None:
-        return cached
+        return dict(cached)
     cfg = get_gateway_config()
     if cfg is None or not cfg.model_to_upstream:
         return None
@@ -339,15 +351,29 @@ def remote_training_model(model_id: str) -> tuple[str, str] | None:
 
         from .backend import gateway_session_store
 
-        info = gateway_session_store.get_training_model(model_id)
+        info = gateway_session_store.get_training_model_info(model_id)
         if info is not None:
-            _remote_training_models[model_id] = info
-        return info
+            _remote_training_models[model_id] = dict(info)
+            return dict(info)
+        return None
     except Exception as e:
         raise HTTPException(
             status_code=503,
             detail="Gateway session store unavailable",
         )
+
+
+def remote_training_model(model_id: str) -> tuple[str, str] | None:
+    info = remote_training_model_info(model_id)
+    if info is None:
+        return None
+    upstream_alias = info.get("upstream_alias")
+    base_model = info.get("base_model")
+    if not isinstance(upstream_alias, str) or not isinstance(base_model, str):
+        return None
+    if not upstream_alias or not base_model:
+        return None
+    return upstream_alias, base_model
 
 
 def unregister_remote_training_model(model_id: str) -> None:

@@ -18,12 +18,30 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
+def _client_with_user(user_data: dict | None) -> TestClient:
+    from tinker_server.routes import weights as weights_routes
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_user(request, call_next):
+        request.state.user_data = user_data
+        return await call_next(request)
+
+    app.include_router(weights_routes.router, prefix="/api/v1")
+    return TestClient(app)
+
+
 def test_issue_276_gateway_list_checkpoints_proxies_remote(monkeypatch) -> None:
     import tinker_server.gateway as gw
     from tinker_server.gateway import Upstream
     from tinker_server.routes import weights as wt
 
-    monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-0.6B"))
+    monkeypatch.setattr(
+        gw,
+        "remote_training_model_info",
+        lambda _model_id: {"upstream_alias": "up", "base_model": "Qwen/Qwen3-0.6B", "owner_id": None},
+    )
     monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: Upstream("up", "http://upstream.example", "none"))
     monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
 
@@ -64,7 +82,11 @@ def test_issue_276_gateway_list_checkpoints_remote_error_passthrough(monkeypatch
     from tinker_server.gateway import Upstream
     from tinker_server.routes import weights as wt
 
-    monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-0.6B"))
+    monkeypatch.setattr(
+        gw,
+        "remote_training_model_info",
+        lambda _model_id: {"upstream_alias": "up", "base_model": "Qwen/Qwen3-0.6B", "owner_id": None},
+    )
     monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: Upstream("up", "http://upstream.example", "none"))
     monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
 
@@ -83,7 +105,11 @@ def test_issue_276_gateway_archive_redirect_proxies_remote(monkeypatch) -> None:
     from tinker_server.gateway import Upstream
     from tinker_server.routes import weights as wt
 
-    monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-0.6B"))
+    monkeypatch.setattr(
+        gw,
+        "remote_training_model_info",
+        lambda _model_id: {"upstream_alias": "up", "base_model": "Qwen/Qwen3-0.6B", "owner_id": None},
+    )
     monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: Upstream("up", "http://upstream.example", "none"))
     monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
 
@@ -106,7 +132,8 @@ def test_issue_276_gateway_archive_redirect_proxies_remote(monkeypatch) -> None:
         follow_redirects=False,
     )
     assert resp.status_code == 302
-    assert resp.headers["location"] == "https://upstream.example/archive.tar.gz"
+    assert resp.headers["location"].startswith("http://testserver/api/v1/training_runs/run-276/checkpoints/weights/ckpt_123/archive?direct=1")
+    assert "upstream.example" not in resp.headers["location"]
     assert resp.headers["expires"] == "Sun, 08 Mar 2026 00:15:00 GMT"
 
 
@@ -115,7 +142,11 @@ def test_issue_276_gateway_archive_direct_download_proxies_remote(monkeypatch) -
     from tinker_server.gateway import Upstream
     from tinker_server.routes import weights as wt
 
-    monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-0.6B"))
+    monkeypatch.setattr(
+        gw,
+        "remote_training_model_info",
+        lambda _model_id: {"upstream_alias": "up", "base_model": "Qwen/Qwen3-0.6B", "owner_id": None},
+    )
     monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: Upstream("up", "http://upstream.example", "none"))
     monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
 
@@ -152,7 +183,11 @@ def test_issue_276_gateway_archive_remote_error_passthrough(monkeypatch, status_
     from tinker_server.gateway import Upstream
     from tinker_server.routes import weights as wt
 
-    monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-0.6B"))
+    monkeypatch.setattr(
+        gw,
+        "remote_training_model_info",
+        lambda _model_id: {"upstream_alias": "up", "base_model": "Qwen/Qwen3-0.6B", "owner_id": None},
+    )
     monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: Upstream("up", "http://upstream.example", "none"))
     monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
 
@@ -164,3 +199,30 @@ def test_issue_276_gateway_archive_remote_error_passthrough(monkeypatch, status_
     resp = _client().get("/api/v1/training_runs/run-276/checkpoints/weights/ckpt_123/archive?direct=1")
     assert resp.status_code == status_code
     assert resp.json() == {"detail": detail}
+
+
+def test_issue_276_gateway_remote_checkpoint_owner_mismatch_denied_before_forward(monkeypatch) -> None:
+    import tinker_server.gateway as gw
+    from tinker_server.gateway import Upstream
+    from tinker_server.routes import weights as wt
+
+    monkeypatch.setattr(
+        gw,
+        "remote_training_model_info",
+        lambda _model_id: {"upstream_alias": "up", "base_model": "Qwen/Qwen3-0.6B", "owner_id": "owner-a"},
+    )
+    monkeypatch.setattr(
+        gw,
+        "upstream_for_alias",
+        lambda _alias: Upstream("up", "http://upstream.example", "static_api_key", api_key="secret"),
+    )
+    monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
+
+    async def _unexpected_forward_json(**_kwargs):
+        raise AssertionError("checkpoint list should fail closed before upstream forwarding")
+
+    monkeypatch.setattr(gw, "forward_json", _unexpected_forward_json)
+
+    resp = _client_with_user({"user_id": "owner-b"}).get("/api/v1/training_runs/run-276/checkpoints")
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Access denied"}
