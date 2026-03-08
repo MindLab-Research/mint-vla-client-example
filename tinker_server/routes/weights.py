@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -135,7 +136,13 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
         raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint list failed")
 
     if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        try:
+            payload = resp.json()
+        except Exception:
+            detail = resp.text
+        else:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        raise HTTPException(status_code=resp.status_code, detail=detail)
     return CheckpointsListResponse.model_validate(resp.json())
 
 
@@ -176,7 +183,14 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
     if resp.status_code >= 400:
         text = await resp.aread()
         await _close_upstream_response(resp, client)
-        raise HTTPException(status_code=resp.status_code, detail=text.decode("utf-8", errors="replace"))
+        decoded = text.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(decoded)
+        except Exception:
+            detail = decoded
+        else:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        raise HTTPException(status_code=resp.status_code, detail=detail)
 
     if resp.status_code in (301, 302, 303, 307, 308):
         location = resp.headers.get("location")

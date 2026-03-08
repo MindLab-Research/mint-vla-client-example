@@ -59,6 +59,25 @@ def test_issue_276_gateway_list_checkpoints_proxies_remote(monkeypatch) -> None:
     assert payload["checkpoints"][0]["checkpoint_id"] == "weights/ckpt_123"
 
 
+def test_issue_276_gateway_list_checkpoints_remote_error_passthrough(monkeypatch) -> None:
+    import tinker_server.gateway as gw
+    from tinker_server.gateway import Upstream
+    from tinker_server.routes import weights as wt
+
+    monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-0.6B"))
+    monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: Upstream("up", "http://upstream.example", "none"))
+    monkeypatch.setattr(wt, "can_access_model", lambda *_args, **_kwargs: True)
+
+    async def _fake_forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s):
+        return httpx.Response(404, json={"detail": "Checkpoint not found upstream"})
+
+    monkeypatch.setattr(gw, "forward_json", _fake_forward_json)
+
+    resp = _client().get("/api/v1/training_runs/run-276/checkpoints")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Checkpoint not found upstream"}
+
+
 def test_issue_276_gateway_archive_redirect_proxies_remote(monkeypatch) -> None:
     import tinker_server.gateway as gw
     from tinker_server.gateway import Upstream
@@ -144,4 +163,4 @@ def test_issue_276_gateway_archive_remote_error_passthrough(monkeypatch, status_
 
     resp = _client().get("/api/v1/training_runs/run-276/checkpoints/weights/ckpt_123/archive?direct=1")
     assert resp.status_code == status_code
-    assert detail in resp.text
+    assert resp.json() == {"detail": detail}

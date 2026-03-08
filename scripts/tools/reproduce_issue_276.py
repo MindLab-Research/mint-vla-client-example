@@ -100,16 +100,24 @@ PY
         raise RuntimeError(f"gateway_session_store seed missing confirmation: {proc.stdout!r}")
 
 
-def _ensure_upstream_model_root(*, model_id: str) -> None:
+def _promote_uploaded_checkpoint(*, model_id: str, checkpoint_id: str) -> None:
     proc = subprocess.run(
-        ["ssh", MINT_DEV_HOST, f"mkdir -p {CHECKPOINTS_DIR}/anonymous/{model_id}"],
+        [
+            "ssh",
+            MINT_DEV_HOST,
+            (
+                f"mkdir -p {CHECKPOINTS_DIR}/anonymous/{model_id} && "
+                f"rm -rf {CHECKPOINTS_DIR}/anonymous/{model_id}/{checkpoint_id} && "
+                f"mv {CHECKPOINTS_DIR}/anonymous/{checkpoint_id} {CHECKPOINTS_DIR}/anonymous/{model_id}/{checkpoint_id}"
+            ),
+        ],
         capture_output=True,
         text=True,
         timeout=HTTP_TIMEOUT_S,
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            f"failed to create upstream model root rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+            f"failed to place uploaded checkpoint under model root rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
         )
 
 
@@ -141,8 +149,8 @@ def main() -> int:
             if resp.status_code != 200:
                 return _fail(f"{label} healthz returned {resp.status_code}: {resp.text[:500]!r}")
 
-        _ensure_upstream_model_root(model_id=model_id)
         checkpoint_id = _upload_training_checkpoint(model_id=model_id)
+        _promote_uploaded_checkpoint(model_id=model_id, checkpoint_id=checkpoint_id)
         _seed_gateway_remote_training_model(model_id=model_id)
 
         listed_resp = requests.get(
