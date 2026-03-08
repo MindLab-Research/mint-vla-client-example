@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import json
 import os
 import random
@@ -29,12 +30,175 @@ from tinker.lib.retry_handler import RetryConfig
 
 DEFAULT_TIMEOUT_S = float(os.environ.get("MINT_TEST_TIMEOUT_S", "10800"))
 _LAST_REQUEST_ID_BY_TYPE: dict[str, str] = {}
+_TIMING_EVENTS: list[dict[str, Any]] = []
+_TIMING_JSONL_PATH: Path | None = None
+_TIMING_SUMMARY_JSON_PATH: Path | None = None
+_TIMING_SUMMARY_MD_PATH: Path | None = None
+_TIMING_REPORT_WRITTEN = False
+_EXPERIMENT_WALL_START = time.time()
 
 
 def _dbg(msg: str) -> None:
     print(f"[debug] {msg}", flush=True)
 
-def _result_with_heartbeat(fut: Any, *, label: str, timeout_s: float) -> Any:
+def _ts_utc() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _default_stage_name(label: str) -> str:
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", label)
+    s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
+    return s2.replace(" ", "_").replace("-", "_").lower()
+
+
+def _append_timing_event(
+    stage: str,
+    *,
+    elapsed_s: float,
+    status: str,
+    step_idx: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    rec: dict[str, Any] = {
+        "ts_utc": _ts_utc(),
+        "stage": stage,
+        "elapsed_s": round(float(elapsed_s), 3),
+        "status": status,
+    }
+    base_model = globals().get("BASE_MODEL")
+    if base_model:
+        rec["base_model"] = base_model
+    if step_idx is not None:
+        rec["step"] = int(step_idx) + 1
+    if extra:
+        for key, value in extra.items():
+            if value is None:
+                continue
+            rec[key] = value if isinstance(value, (str, int, float, bool, list, dict)) else str(value)
+    _TIMING_EVENTS.append(rec)
+    if _TIMING_JSONL_PATH is None:
+        return
+    with open(_TIMING_JSONL_PATH, "a", encoding="utf-8") as f:
+        json.dump(rec, f, sort_keys=True, ensure_ascii=True)
+        f.write("\n")
+
+
+def _timing_summary() -> dict[str, Any]:
+    per_stage: dict[str, list[dict[str, Any]]] = {}
+    for rec in _TIMING_EVENTS:
+        per_stage.setdefault(str(rec["stage"]), []).append(rec)
+
+    stage_summaries: list[dict[str, Any]] = []
+    for stage, recs in per_stage.items():
+        elapsed = sorted(float(rec["elapsed_s"]) for rec in recs)
+        total_s = sum(elapsed)
+        count = len(elapsed)
+        ok_count = sum(1 for rec in recs if rec.get("status") == "ok")
+        error_count = sum(1 for rec in recs if rec.get("status") == "error")
+        stage_summaries.append(
+            {
+                "stage": stage,
+                "count": count,
+                "ok_count": ok_count,
+                "error_count": error_count,
+                "total_s": round(total_s, 3),
+                "avg_s": round(total_s / count, 3),
+                "p50_s": round(elapsed[count // 2], 3),
+                "max_s": round(elapsed[-1], 3),
+            }
+        )
+
+    stage_summaries.sort(key=lambda item: (-float(item["total_s"]), str(item["stage"])))
+    return {
+        "base_model": globals().get("BASE_MODEL"),
+        "event_count": len(_TIMING_EVENTS),
+        "wall_clock_s": round(time.time() - _EXPERIMENT_WALL_START, 3),
+        "stages": stage_summaries,
+    }
+
+
+def _write_timing_reports() -> None:
+    global _TIMING_REPORT_WRITTEN
+    if _TIMING_REPORT_WRITTEN or _TIMING_SUMMARY_JSON_PATH is None or _TIMING_SUMMARY_MD_PATH is None:
+        return
+
+    summary = _timing_summary()
+    with open(_TIMING_SUMMARY_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=True)
+        f.write("\n")
+
+    md_lines = [
+        "# Timing Report",
+        "",
+        f"- base_model: `{summary.get('base_model')}`",
+        f"- wall_clock_s: `{summary['wall_clock_s']}`",
+        f"- event_count: `{summary['event_count']}`",
+        "",
+        "| stage | count | ok | error | total_s | avg_s | p50_s | max_s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for item in summary["stages"]:
+        md_lines.append(
+            f"| {item['stage']} | {item['count']} | {item['ok_count']} | {item['error_count']} | "
+            f"{item['total_s']:.3f} | {item['avg_s']:.3f} | {item['p50_s']:.3f} | {item['max_s']:.3f} |"
+        )
+    with open(_TIMING_SUMMARY_MD_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines) + "\n")
+
+    print("Timing summary:")
+    for item in summary["stages"]:
+        print(
+            f"[timing] stage={item['stage']} count={item['count']} ok={item['ok_count']} "
+            f"error={item['error_count']} total_s={item['total_s']:.3f} "
+            f"avg_s={item['avg_s']:.3f} p50_s={item['p50_s']:.3f} max_s={item['max_s']:.3f}"
+        )
+    print(f"[timing] wall_clock_s={summary['wall_clock_s']:.3f} event_count={summary['event_count']}")
+    print(f"[timing] timing_events_jsonl={_TIMING_JSONL_PATH}")
+    print(f"[timing] timing_summary_json={_TIMING_SUMMARY_JSON_PATH}")
+    print(f"[timing] timing_summary_md={_TIMING_SUMMARY_MD_PATH}")
+    _TIMING_REPORT_WRITTEN = True
+
+
+def _time_call(
+    fn: Any,
+    *,
+    stage_name: str,
+    step_idx: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> Any:
+    start = time.time()
+    try:
+        result = fn()
+    except Exception as e:
+        event_extra = dict(extra or {})
+        event_extra["error_type"] = type(e).__name__
+        _append_timing_event(
+            stage_name,
+            elapsed_s=time.time() - start,
+            status="error",
+            step_idx=step_idx,
+            extra=event_extra,
+        )
+        raise
+    _append_timing_event(
+        stage_name,
+        elapsed_s=time.time() - start,
+        status="ok",
+        step_idx=step_idx,
+        extra=extra,
+    )
+    return result
+
+
+def _result_with_heartbeat(
+    fut: Any,
+    *,
+    label: str,
+    timeout_s: float,
+    stage_name: str | None = None,
+    step_idx: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> Any:
     # Prefer polling an underlying concurrent Future so we can print heartbeats
     # even if the public `.result(timeout=...)` doesn't respect timeouts.
     cfut = None
@@ -53,26 +217,56 @@ def _result_with_heartbeat(fut: Any, *, label: str, timeout_s: float) -> Any:
 
     start = time.time()
     last_print = 0.0
-    while True:
-        elapsed = time.time() - start
-        if timeout_s > 0 and elapsed >= timeout_s:
-            return fut.result(timeout=0.01)
-        if cfut is not None:
-            if cfut.done():
-                return cfut.result()
-        else:
-            try:
-                return fut.result(timeout=0.2)
-            except TimeoutError:
-                pass
-        if elapsed - last_print >= 10.0:
-            rid = _LAST_REQUEST_ID_BY_TYPE.get(label)
-            if rid:
-                _dbg(f"waiting label={label} request_id={rid} elapsed_s={elapsed:.1f}")
+    stage = stage_name or _default_stage_name(label)
+    try:
+        while True:
+            elapsed = time.time() - start
+            if timeout_s > 0 and elapsed >= timeout_s:
+                result = fut.result(timeout=0.01)
+                break
+            if cfut is not None:
+                if cfut.done():
+                    result = cfut.result()
+                    break
             else:
-                _dbg(f"waiting label={label} elapsed_s={elapsed:.1f}")
-            last_print = elapsed
-        time.sleep(0.2)
+                try:
+                    result = fut.result(timeout=0.2)
+                    break
+                except TimeoutError:
+                    pass
+            if elapsed - last_print >= 10.0:
+                rid = _LAST_REQUEST_ID_BY_TYPE.get(label)
+                if rid:
+                    _dbg(f"waiting label={label} request_id={rid} elapsed_s={elapsed:.1f}")
+                else:
+                    _dbg(f"waiting label={label} elapsed_s={elapsed:.1f}")
+                last_print = elapsed
+            time.sleep(0.2)
+    except Exception as e:
+        event_extra = dict(extra or {})
+        event_extra["label"] = label
+        event_extra["request_id"] = _LAST_REQUEST_ID_BY_TYPE.get(label)
+        event_extra["error_type"] = type(e).__name__
+        _append_timing_event(
+            stage,
+            elapsed_s=time.time() - start,
+            status="error",
+            step_idx=step_idx,
+            extra=event_extra,
+        )
+        raise
+
+    event_extra = dict(extra or {})
+    event_extra["label"] = label
+    event_extra["request_id"] = _LAST_REQUEST_ID_BY_TYPE.get(label)
+    _append_timing_event(
+        stage,
+        elapsed_s=time.time() - start,
+        status="ok",
+        step_idx=step_idx,
+        extra=event_extra,
+    )
+    return result
 
 
 def _install_tinker_future_debug() -> None:
@@ -326,16 +520,23 @@ EXPERIMENT_ROOT = Path(os.environ.get("MINT_TEST_EXPERIMENT_ROOT", "/tmp/mint_rl
 EXPERIMENT_DIR = EXPERIMENT_ROOT / EXPERIMENT_TIMESTAMP
 EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
 print(f"Experiment directory: {EXPERIMENT_DIR}")
+_TIMING_JSONL_PATH = EXPERIMENT_DIR / "timing_events.jsonl"
+_TIMING_SUMMARY_JSON_PATH = EXPERIMENT_DIR / "timing_summary.json"
+_TIMING_SUMMARY_MD_PATH = EXPERIMENT_DIR / "timing_summary.md"
+atexit.register(_write_timing_reports)
 
 # Create the service client
-service_client = mint.ServiceClient()
+service_client = _time_call(mint.ServiceClient, stage_name="create_service_client")
 _dbg(f"client_session_id={getattr(getattr(service_client, 'holder', None), '_session_id', None)!r}")
 
 # List available models
 print("Connected to MinT server!")
 print("\nAvailable models:")
 try:
-    capabilities = service_client.get_server_capabilities()
+    capabilities = _time_call(
+        service_client.get_server_capabilities,
+        stage_name="get_server_capabilities",
+    )
     for model in capabilities.supported_models:
         print(f"  - {model.model_name}")
 except Exception as e:
@@ -376,27 +577,38 @@ if use_hf_tokenizer:
     print(f"Tokenizer loaded from HF: {tokenizer_model}")
     print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
 else:
-    tokenizer_training_client = service_client.create_lora_training_client(
-        base_model=tokenizer_source_model,
-        rank=LORA_RANK,
-        train_mlp=train_mlp if tokenizer_source_model == BASE_MODEL else False,
-        train_attn=train_attn if tokenizer_source_model == BASE_MODEL else True,
-        train_unembed=train_unembed if tokenizer_source_model == BASE_MODEL else False,
+    tokenizer_training_client = _time_call(
+        lambda: service_client.create_lora_training_client(
+            base_model=tokenizer_source_model,
+            rank=LORA_RANK,
+            train_mlp=train_mlp if tokenizer_source_model == BASE_MODEL else False,
+            train_attn=train_attn if tokenizer_source_model == BASE_MODEL else True,
+            train_unembed=train_unembed if tokenizer_source_model == BASE_MODEL else False,
+        ),
+        stage_name="create_tokenizer_training_client",
+        extra={"tokenizer_source_model": tokenizer_source_model},
     )
     print(f"Tokenizer training client created for: {tokenizer_source_model}")
     _dbg(f"tokenizer_training_model_id={getattr(tokenizer_training_client, 'model_id', None)!r}")
 
-    tokenizer = tokenizer_training_client.get_tokenizer()
+    tokenizer = _time_call(
+        tokenizer_training_client.get_tokenizer,
+        stage_name="get_tokenizer",
+        extra={"tokenizer_source_model": tokenizer_source_model},
+    )
     print(f"Tokenizer vocabulary size: {tokenizer.vocab_size:,} tokens")
 
 training_client = None
 if not inference_only:
-    training_client = service_client.create_lora_training_client(
-        base_model=BASE_MODEL,
-        rank=LORA_RANK,
-        train_mlp=train_mlp,
-        train_attn=train_attn,
-        train_unembed=train_unembed,
+    training_client = _time_call(
+        lambda: service_client.create_lora_training_client(
+            base_model=BASE_MODEL,
+            rank=LORA_RANK,
+            train_mlp=train_mlp,
+            train_attn=train_attn,
+            train_unembed=train_unembed,
+        ),
+        stage_name="create_training_client",
     )
     print(f"Training client created for: {BASE_MODEL}")
     _dbg(f"training_model_id={getattr(training_client, 'model_id', None)!r}")
@@ -609,12 +821,20 @@ def _save_weights_and_get_sampling_client_with_retry(
             save_fut = training_client.save_weights_for_sampler(name=name)
             _dbg(f"save_weights_for_sampler submitted name={name!r}")
             sampling_path = _result_with_heartbeat(
-                save_fut, label="SaveWeightsForSampler", timeout_s=TIMEOUT_S
+                save_fut,
+                label="SaveWeightsForSampler",
+                timeout_s=TIMEOUT_S,
+                stage_name="save_weights_for_sampler",
+                extra={"name": name},
             ).path
-            sampling_client = service_client.create_sampling_client(
-                model_path=sampling_path,
-                base_model=base_model,
-                retry_config=SAMPLING_RETRY_CONFIG,
+            sampling_client = _time_call(
+                lambda: service_client.create_sampling_client(
+                    model_path=sampling_path,
+                    base_model=base_model,
+                    retry_config=SAMPLING_RETRY_CONFIG,
+                ),
+                stage_name="create_sampling_client",
+                extra={"name": name, "model_path": sampling_path},
             )
             _dbg(f"sampling_session_id={getattr(sampling_client, '_sampling_session_id', None)!r}")
             return sampling_client
@@ -808,15 +1028,19 @@ print()
 
 if inference_only:
     print("Inference-only mode: sampling on base model (no LoRA training).")
-    sampling_client = service_client.create_sampling_client(
-        base_model=BASE_MODEL,
-        retry_config=SAMPLING_RETRY_CONFIG,
+    sampling_client = _time_call(
+        lambda: service_client.create_sampling_client(
+            base_model=BASE_MODEL,
+            retry_config=SAMPLING_RETRY_CONFIG,
+        ),
+        stage_name="create_base_sampling_client",
     )
 
     all_rewards: list[float] = []
     all_lat_s: list[float] = []
 
     for step in range(NUM_RL_STEPS):
+        step_t0 = time.time()
         problems = [generate_rl_problem() for _ in range(BATCH_SIZE)]
         for question, answer in problems:
             prompt_tokens = _build_prompt_tokens(question)
@@ -836,7 +1060,12 @@ if inference_only:
                 ),
             )
             sample_result = _result_with_heartbeat(
-                sample_result, label="Sample", timeout_s=TIMEOUT_S
+                sample_result,
+                label="Sample",
+                timeout_s=TIMEOUT_S,
+                stage_name="sample",
+                step_idx=step,
+                extra={"mode": "inference_only"},
             )
             all_lat_s.append(time.time() - t0)
 
@@ -862,6 +1091,13 @@ if inference_only:
         if all_rewards:
             step_mean = sum(all_rewards) / len(all_rewards)
             print(f"[infer step {step + 1}] running_mean_reward={step_mean:.3f} (n={len(all_rewards)})")
+        _append_timing_event(
+            "inference_step_total",
+            elapsed_s=time.time() - step_t0,
+            status="ok",
+            step_idx=step,
+            extra={"num_problems": len(problems)},
+        )
 
     if all_lat_s:
         lat_p50 = sorted(all_lat_s)[len(all_lat_s) // 2]
@@ -872,6 +1108,7 @@ if inference_only:
     raise SystemExit(0)
 
 for step in range(NUM_RL_STEPS):
+    step_t0 = time.time()
     try:
         rl_sampling_client = _save_weights_and_get_sampling_client_with_retry(
             service_client,
@@ -907,7 +1144,12 @@ for step in range(NUM_RL_STEPS):
             ),
         )
         sample_result = _result_with_heartbeat(
-            sample_result, label="Sample", timeout_s=TIMEOUT_S
+            sample_result,
+            label="Sample",
+            timeout_s=TIMEOUT_S,
+            stage_name="sample",
+            step_idx=step,
+            extra={"mode": "training"},
         )
 
         group_rewards = []
@@ -997,13 +1239,25 @@ for step in range(NUM_RL_STEPS):
             loss_fn="importance_sampling",
         )
         _result_with_heartbeat(
-            fwdbwd_future, label="ForwardBackward", timeout_s=TIMEOUT_S
+            fwdbwd_future,
+            label="ForwardBackward",
+            timeout_s=TIMEOUT_S,
+            stage_name="forward_backward",
+            step_idx=step,
+            extra={"num_datums": len(training_datums)},
         )
 
         optim_future = training_client.optim_step(
             types.AdamParams(learning_rate=RL_LEARNING_RATE),
         )
-        _result_with_heartbeat(optim_future, label="OptimStep", timeout_s=TIMEOUT_S)
+        _result_with_heartbeat(
+            optim_future,
+            label="OptimStep",
+            timeout_s=TIMEOUT_S,
+            stage_name="optim_step",
+            step_idx=step,
+            extra={"num_datums": len(training_datums)},
+        )
 
     rl_metrics.append(
         {
@@ -1012,6 +1266,13 @@ for step in range(NUM_RL_STEPS):
             "accuracy": accuracy,
             "num_datums": len(training_datums),
         }
+    )
+    _append_timing_event(
+        "rl_step_total",
+        elapsed_s=time.time() - step_t0,
+        status="ok",
+        step_idx=step,
+        extra={"num_datums": len(training_datums), "avg_reward": round(avg_reward, 6)},
     )
 
     print(
@@ -1025,12 +1286,20 @@ final_path = training_client.save_weights_for_sampler(
     name="arithmetic-rl-final",
 )
 final_path = _result_with_heartbeat(
-    final_path, label="SaveWeightsForSampler", timeout_s=TIMEOUT_S
+    final_path,
+    label="SaveWeightsForSampler",
+    timeout_s=TIMEOUT_S,
+    stage_name="save_weights_for_sampler",
+    extra={"name": "arithmetic-rl-final"},
 ).path
-final_client = service_client.create_sampling_client(
-    model_path=final_path,
-    base_model=BASE_MODEL,
-    retry_config=SAMPLING_RETRY_CONFIG,
+final_client = _time_call(
+    lambda: service_client.create_sampling_client(
+        model_path=final_path,
+        base_model=BASE_MODEL,
+        retry_config=SAMPLING_RETRY_CONFIG,
+    ),
+    stage_name="create_sampling_client",
+    extra={"name": "arithmetic-rl-final", "model_path": final_path},
 )
 _dbg(f"final_sampling_session_id={getattr(final_client, '_sampling_session_id', None)!r}")
 
@@ -1065,7 +1334,13 @@ for question, correct in rl_test_problems:
             stop=STOP_TOKEN_IDS,
         ),
     )
-    result = _result_with_heartbeat(fut, label="EvalSample", timeout_s=TIMEOUT_S)
+    result = _result_with_heartbeat(
+        fut,
+        label="EvalSample",
+        timeout_s=TIMEOUT_S,
+        stage_name="eval_sample",
+        extra={"question": question},
+    )
 
     response_for_reward = tokenizer.decode(
         result.sequences[0].tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -1123,7 +1398,14 @@ if rl_metrics:
 
 if args.save_ckpt:
     # Save final RL checkpoint
-    rl_checkpoint = training_client.save_state(name="arithmetic-rl-final").result()
+    save_state_future = training_client.save_state(name="arithmetic-rl-final")
+    rl_checkpoint = _result_with_heartbeat(
+        save_state_future,
+        label="SaveState",
+        timeout_s=TIMEOUT_S,
+        stage_name="save_state",
+        extra={"name": "arithmetic-rl-final"},
+    )
     print(f"Final checkpoint: {rl_checkpoint.path}")
 
     ckpt_info = {
@@ -1134,6 +1416,9 @@ if args.save_ckpt:
         "final_resume_path": rl_checkpoint.path,
         "metrics_csv": str((EXPERIMENT_DIR / "rl_metrics.csv").resolve()),
         "plot_path": str((EXPERIMENT_DIR / "rl_training_results.png").resolve()),
+        "timing_events_jsonl": str((_TIMING_JSONL_PATH or (EXPERIMENT_DIR / "timing_events.jsonl")).resolve()),
+        "timing_summary_json": str((_TIMING_SUMMARY_JSON_PATH or (EXPERIMENT_DIR / "timing_summary.json")).resolve()),
+        "timing_summary_md": str((_TIMING_SUMMARY_MD_PATH or (EXPERIMENT_DIR / "timing_summary.md")).resolve()),
     }
     ckpt_path = (EXPERIMENT_DIR / "checkpoints.json").resolve()
     with open(ckpt_path, "w", encoding="utf-8") as f:

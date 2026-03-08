@@ -44,6 +44,10 @@ Feishu notifier:
 
 Artifacts (gitignored):
 - `results/sanity-check/<timestamp>/`
+- Per-model timing artifacts written by `mint_rl_test_long.py`:
+  - `timing_events.jsonl`
+  - `timing_summary.json`
+  - `timing_summary.md`
 
 ## Procedure
 
@@ -68,9 +72,14 @@ curl -sS -H "X-API-Key: $TINKER_API_KEY" "$TINKER_BASE_URL/api/v1/actors"
 
 Run sequentially (default models: 0.6B, 4B, 30B, 235B). Do this as an agent-run workflow,
 capturing stdout/stderr per model into `results/sanity-check/<timestamp>/`.
+For each model, set `MINT_TEST_EXPERIMENT_ROOT` to that model's artifact directory so the runner writes
+timing reports next to the captured logs instead of under `/tmp`.
 
 Example per-model command:
 ```bash
+RUN_DIR="results/sanity-check/<timestamp>/<model_slug>"
+mkdir -p "$RUN_DIR"
+MINT_TEST_EXPERIMENT_ROOT="$RUN_DIR" \
 python .claude/skills/sanity-check/mint_rl_test_long.py \
   --model <MODEL_NAME> \
   --num-rl-steps=1 \
@@ -80,6 +89,10 @@ python .claude/skills/sanity-check/mint_rl_test_long.py \
 ```
 
 Do not add `--inference-only`.
+After each run, preserve these timing outputs as evidence:
+- `timing_events.jsonl`: one record per timed stage call (sample, save_weights_for_sampler, forward_backward, optim_step, eval_sample, save_state, and client creation calls).
+- `timing_summary.json`: machine-readable per-stage aggregates.
+- `timing_summary.md`: human-readable stage table for quick inspection.
 
 ### 2) If any test fails: evidence first, then remediation
 
@@ -97,6 +110,7 @@ Do not add `--inference-only`.
 - Client-side (bad base URL/auth) -> fix env and rerun; still report as incident.
 - Capacity / scheduling (placement group pending, GPUs held by detached actors) -> kill the smallest relevant actor(s).
 - Server crash / exception -> collect traceback + request_id and file an issue (see below).
+- Timing-only degradation (no hard failure, but one stage is materially slower than the others) -> keep the timing report and call out the slow stage explicitly in the final Feishu report and any GitHub issue.
 
 After the workflow stabilizes (either fixed+rerun passes, or persistent failure), send a final Feishu report.
 
@@ -150,6 +164,7 @@ Invoke `issue-reporter` and include:
 - Model name and whether it was Volcano or Aliyun routed
 - Timestamps
 - Request IDs (from the test output, if present)
+- The timing summary for the run, especially the slowest stage and its `max_s`
 - Minimal relevant server log excerpt (no secrets)
 
 ## Feishu reporting
@@ -157,8 +172,22 @@ Invoke `issue-reporter` and include:
 Do not send START notifications. Send exactly one final report at the end (both PASS and incident runs).
 
 Required report style (message + evidence):
-- Must include: model outcomes (OK/FAIL), the failure surface (what component/operation failed), what ops was attempted and whether it changed anything, and the GitHub issue link if filed.
+- Must include: model outcomes (OK/FAIL), the failure surface (what component/operation failed), the timing surface (concrete durations taken from `timing_summary.json` / `timing_summary.md`), what ops was attempted and whether it changed anything, and the GitHub issue link if filed.
+- The final Feishu report is incomplete if it does not contain timing information.
+- Include at least one timing line per model run. Minimum acceptable content for each model:
+  - slowest stage name
+  - that stage's `max_s`
+  - total wall-clock time for the run
+- For failed runs, also name the failing stage if the timing report captured one; otherwise use the slowest completed stage and say the failure happened after or during that phase.
 - Must not include: local file paths, internal timestamps, base URLs/ports, log line numbers, or command transcripts.
+
+Required Feishu timing shape:
+```markdown
+- Qwen/Qwen3-4B-Instruct-2507: OK. Timing: slowest stage=`sample` max_s=`38.4` wall_clock_s=`91.2`.
+- Qwen/Qwen3-235B-A22B-Instruct-2507: FAIL in `create_model`. Timing: slowest completed stage=`save_weights_for_sampler` max_s=`412.7` wall_clock_s=`645.9`.
+```
+
+If the report omits those timing lines, treat the Feishu step as not done and rewrite the report before sending.
 
 Send via:
 ```bash
