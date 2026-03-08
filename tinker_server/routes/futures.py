@@ -157,6 +157,12 @@ async def retrieve_future(
 
     decoded = decode_request_id(body.request_id)
     if decoded is not None:
+        # Check cache first for gateway-routed futures
+        cached = _recent_get(body.request_id)
+        if cached is not None:
+            logger.info("[retrieve_future] request_id=%s gateway_cache_hit=true", body.request_id)
+            return cached
+
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
@@ -221,6 +227,8 @@ async def retrieve_future(
             _pending_hint_note_pending(body.request_id)
         else:
             _pending_hint_clear(body.request_id)
+            # Cache terminal responses (non-408) for gateway-routed futures
+            _recent_put(body.request_id, payload)
 
         # If the gateway uses an upstream credential (static_api_key), the upstream may treat
         # the request as privileged. Preserve local error-masking semantics based on the caller.
