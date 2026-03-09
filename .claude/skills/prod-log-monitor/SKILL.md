@@ -26,7 +26,7 @@ Monitor production deployments:
 ## Inputs
 
 Required environment variables (set on your workstation):
-- `MINT_BASE_URL` (example: `https://mint.macaron.im` or `http://localhost:18000` via SSH tunnel)
+- `MINT_BASE_URL` (example: `https://mint.macaron.xin` (China), `https://mint.macaron.im` (international), or `http://localhost:18000` via SSH tunnel)
 - `MINT_API_KEY` (do not print)
 
 Optional:

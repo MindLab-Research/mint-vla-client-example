@@ -214,7 +214,7 @@ class ServerConfig:
     capacity_manager_actor_name: str = "tinker_capacity_manager"
     api_work_queue_actor_name: str = "tinker_api_work_queue"
     capacity_queue_bytes_budget: int = 512 * 1024 * 1024
-    api_work_queue_num_workers: int = 32
+    api_work_queue_num_workers: int = 128
     api_work_queue_reap_interval_s: float = 5.0
 
     # Training settings (backend/verl_training.py)
@@ -414,7 +414,7 @@ class ServerConfig:
             api_work_queue_num_workers=_pick_int(
                 "TINKER_API_WORK_QUEUE_NUM_WORKERS",
                 None,
-                32,
+                128,
             ),
             api_work_queue_reap_interval_s=_pick_float(
                 "TINKER_API_WORK_QUEUE_REAP_INTERVAL_S",

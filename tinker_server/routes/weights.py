@@ -120,9 +120,26 @@ def _build_sdk_archive_redirect_response(
 ) -> RedirectResponse:
     from ..config import config
     from ..download_tokens import make_archive_download_token
+    from starlette.datastructures import URL
 
     secret = (config.token_secret_key or config.api_key or "").strip()
-    direct_url_obj = request.url.include_query_params(direct="1")
+
+    def _first_forwarded(value: str | None) -> str | None:
+        if not value:
+            return None
+        return value.split(",")[0].strip() or None
+
+    xf_proto = _first_forwarded(request.headers.get("x-forwarded-proto"))
+    xf_host = _first_forwarded(request.headers.get("x-forwarded-host"))
+    xf_port = _first_forwarded(request.headers.get("x-forwarded-port"))
+
+    scheme = xf_proto or request.url.scheme
+    host = xf_host or request.headers.get("host") or request.url.netloc
+    if xf_port and host and ":" not in host:
+        host = f"{host}:{xf_port}"
+
+    base = URL(f"{scheme}://{host}")
+    direct_url_obj = base.replace(path=request.url.path).include_query_params(direct="1")
     if secret:
         token, exp = make_archive_download_token(
             secret=secret,
@@ -1392,6 +1409,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     Ownership verified via metadata.json (admin can delete all).
     """
     user_id = _get_user_id(request)
+
     owner_dir = user_id or "anonymous"
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
     candidates = [
@@ -1467,8 +1485,21 @@ async def download_checkpoint_archive(
     )
     if remote_response is not None:
         return remote_response
+    from ..config import config
+    from ..download_tokens import verify_download_token
 
     user_id = _get_user_id(request)
+    if user_id is None:
+        download_token = request.query_params.get("download_token")
+        secret = (config.token_secret_key or config.api_key or "").strip()
+        payload = verify_download_token(download_token or "", secret=secret)
+        if (
+            isinstance(payload, dict)
+            and payload.get("model_id") == model_id
+            and payload.get("checkpoint_id") == checkpoint_id
+        ):
+            user_id = payload.get("user_id")
+
     owner_dir = user_id or "anonymous"
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
     candidates = [
@@ -1487,26 +1518,43 @@ async def download_checkpoint_archive(
         except OSError:
             pass
 
-    ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
-    if ckpt_path is None:
+    # Prefer a candidate whose metadata matches the requested type.
+    # This avoids false 404s when both "training" and "sampler" checkpoints share the same name.
+    import json
+
+    existing = [p for p in candidates if os.path.isdir(p)]
+    if not existing:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
-    metadata_path = os.path.join(ckpt_path, "metadata.json")
-    if not os.path.exists(metadata_path):
-        raise HTTPException(status_code=403, detail="Access denied")
-    try:
-        import json
+    ckpt_path: str | None = None
+    metadata: dict | None = None
+    saw_unowned = False
+    saw_unreadable_metadata = False
+    for p in existing:
+        metadata_path = os.path.join(p, "metadata.json")
+        if not os.path.exists(metadata_path):
+            saw_unreadable_metadata = True
+            continue
+        try:
+            with open(metadata_path) as f:
+                md = json.load(f)
+        except Exception:
+            saw_unreadable_metadata = True
+            continue
+        if md.get("model_id") != model_id:
+            continue
+        if expected_type is not None and md.get("checkpoint_type") != expected_type:
+            continue
+        if user_id != "admin" and md.get("owner_id") != user_id:
+            saw_unowned = True
+            continue
+        ckpt_path = p
+        metadata = md
+        break
 
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-    except Exception:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if metadata.get("model_id") != model_id:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-    if user_id != "admin" and metadata.get("owner_id") != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-    if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
+    if ckpt_path is None or metadata is None:
+        if saw_unowned or saw_unreadable_metadata:
+            raise HTTPException(status_code=403, detail="Access denied")
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
     # Tinker SDK expects this endpoint to respond with 302 + Location.

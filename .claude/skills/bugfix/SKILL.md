@@ -161,7 +161,8 @@ Examples that usually require doc updates:
 
 | Task | Command |
 |------|---------|
-| Reproduce on prod | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
+| Reproduce on prod (China) | `TINKER_BASE_URL=https://mint.macaron.xin TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
+| Reproduce on prod (international) | `TINKER_BASE_URL=https://mint.macaron.im TINKER_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
 | Reproduce on dev | `python scripts/tools/reproduce_issue_X.py` |
 | Prod logs (READ-ONLY) | `ssh mint-prod-volcano "tail -100 /tmp/tinker_server_auth.log"` |
 | Dev logs | `ssh mint-dev "tail -100 /tmp/tinker_server.log"` |
