@@ -117,7 +117,7 @@ def _get_or_create_ray_actor():
     except ValueError:
         pass
 
-    @ray.remote
+    @ray.remote(num_cpus=0)
     class _RayFutureStoreActor:
         def __init__(
             self, ttl_s: float, queue_ttl_s: float, done_ttl_s: float, tombstone_ttl_s: float
@@ -315,15 +315,41 @@ def _get_or_create_ray_actor():
             self._pending.add(request_id)
             self._created_at[request_id] = time.time()
 
+        def ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+            self._prune()
+            exists = (
+                request_id in self._pending
+                or request_id in self._refs
+                or request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            )
+            existing_meta = self._meta.get(request_id)
+            if exists:
+                return {"created": False, "meta": existing_meta}
+            self._pending.add(request_id)
+            self._created_at[request_id] = time.time()
+            if meta is not None:
+                self._meta[request_id] = dict(meta)
+            return {"created": True, "meta": existing_meta}
+
         def mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
+            now = time.time()
             if request_id in self._pending:
-                self._queued_at[request_id] = time.time()
+                self._queued_at[request_id] = now
+            m = self._meta.get(request_id) or {}
             if meta is not None:
-                m = self._meta.get(request_id) or {}
                 m.update(dict(meta))
-                self._meta[request_id] = m
-                self._update_op_from_meta(request_id, m)
+            if "queue_state" not in m:
+                m["queue_state"] = "queued"
+            if "stage" not in m:
+                m["stage"] = "queued"
+            if not isinstance(m.get("queued_at"), (int, float)):
+                m["queued_at"] = now
+            self._meta[request_id] = m
+            self._update_op_from_meta(request_id, m)
 
         def mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
             self._prune()
@@ -334,6 +360,25 @@ def _get_or_create_ray_actor():
                 m.update(dict(meta))
                 self._meta[request_id] = m
                 self._update_op_from_meta(request_id, m)
+
+        def update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+            self._prune()
+            if meta is None:
+                return
+            exists = (
+                request_id in self._pending
+                or request_id in self._refs
+                or request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            )
+            if not exists:
+                return
+            m = self._meta.get(request_id) or {}
+            m.update(dict(meta))
+            self._meta[request_id] = m
+            self._update_op_from_meta(request_id, m)
 
         def attach_ref(self, request_id: str, ref: Any, meta: dict[str, Any] | None = None) -> None:
             self._prune()
@@ -471,6 +516,9 @@ def _get_or_create_ray_actor():
             self._expired_at.pop(request_id, None)
             self._retrieved_at[request_id] = time.time()
 
+        def forget(self, request_id: str) -> None:
+            self._forget(request_id)
+
         def reap(self) -> dict[str, list[str]]:
             # Return request_ids that transitioned to terminal tombstones and must
             # release any external reservations.
@@ -583,6 +631,17 @@ class FutureStore:
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
         return str(request_id)
 
+    def ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        import ray
+
+        payload = None if meta is None else dict(meta)
+        try:
+            return ray.get(actor.ensure_pending.remote(request_id=str(request_id), meta=payload))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+
     def mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
         import ray
@@ -605,6 +664,28 @@ class FutureStore:
             self._ray_actor = None
             actor = self._get_ray_actor()
             actor.mark_running.remote(request_id=request_id, meta=None if meta is None else dict(meta))
+
+    def update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
+        actor = self._get_ray_actor()
+        import ray
+
+        payload = None if meta is None else dict(meta)
+        try:
+            actor.update_meta.remote(request_id=request_id, meta=payload)
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+            actor = self._get_ray_actor()
+            actor.update_meta.remote(request_id=request_id, meta=payload)
+
+    def forget(self, request_id: str) -> None:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            actor.forget.remote(request_id=request_id)
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def resolve(self, request_id: str, result: Any) -> None:
         actor = self._get_ray_actor()

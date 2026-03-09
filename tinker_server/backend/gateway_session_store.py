@@ -37,7 +37,7 @@ def _get_or_create_actor():
     class _GatewaySessionStoreActor:
         def __init__(self) -> None:
             self._sampling_sessions: dict[str, dict[str, str]] = {}
-            self._training_models: dict[str, dict[str, str]] = {}
+            self._training_models: dict[str, dict[str, str | None]] = {}
 
         def upsert_sampling_session(self, sampling_session_id: str, info: dict[str, str]) -> None:
             self._sampling_sessions[sampling_session_id] = dict(info)
@@ -48,10 +48,10 @@ def _get_or_create_actor():
         def delete_sampling_session(self, sampling_session_id: str) -> None:
             self._sampling_sessions.pop(sampling_session_id, None)
 
-        def upsert_training_model(self, model_id: str, info: dict[str, str]) -> None:
+        def upsert_training_model(self, model_id: str, info: dict[str, str | None]) -> None:
             self._training_models[model_id] = dict(info)
 
-        def get_training_model(self, model_id: str) -> dict[str, str] | None:
+        def get_training_model(self, model_id: str) -> dict[str, str | None] | None:
             return self._training_models.get(model_id)
 
         def delete_training_model(self, model_id: str) -> None:
@@ -156,7 +156,13 @@ def delete_sampling_session(sampling_session_id: str) -> None:
     ray.get(actor.delete_sampling_session.remote(sampling_session_id))
 
 
-def upsert_training_model(*, model_id: str, upstream_alias: str, base_model: str) -> None:
+def upsert_training_model(
+    *,
+    model_id: str,
+    upstream_alias: str,
+    base_model: str,
+    owner_id: str | None = None,
+) -> None:
     import ray
 
     _ensure_ray_initialized()
@@ -164,7 +170,11 @@ def upsert_training_model(*, model_id: str, upstream_alias: str, base_model: str
     ray.get(
         actor.upsert_training_model.remote(
             model_id,
-            {"upstream_alias": upstream_alias, "base_model": base_model},
+            {
+                "upstream_alias": upstream_alias,
+                "base_model": base_model,
+                "owner_id": owner_id,
+            },
         )
     )
 
@@ -184,6 +194,30 @@ def get_training_model(model_id: str) -> tuple[str, str] | None:
     if not upstream_alias or not base_model:
         return None
     return upstream_alias, base_model
+
+
+def get_training_model_info(model_id: str) -> dict[str, str | None] | None:
+    import ray
+
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    info = ray.get(actor.get_training_model.remote(model_id))
+    if not isinstance(info, dict):
+        return None
+    upstream_alias = info.get("upstream_alias")
+    base_model = info.get("base_model")
+    owner_id = info.get("owner_id")
+    if not isinstance(upstream_alias, str) or not isinstance(base_model, str):
+        return None
+    if owner_id is not None and not isinstance(owner_id, str):
+        return None
+    if not upstream_alias or not base_model:
+        return None
+    return {
+        "upstream_alias": upstream_alias,
+        "base_model": base_model,
+        "owner_id": owner_id,
+    }
 
 
 def delete_training_model(model_id: str) -> None:

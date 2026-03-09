@@ -319,6 +319,69 @@ def _install_tinker_future_debug() -> None:
     _dbg("installed tinker APIFuture request_id logger")
 
 
+def _patch_trust_remote_code_for_tokenizers(*, enable: bool) -> None:
+    """
+    Ensure non-interactive runs don't hang on tokenizer trust_remote_code prompts.
+
+    This only affects the local client process that runs this script.
+    """
+    if not enable:
+        return
+
+    # Patch transformers AutoTokenizer directly (this is what tinker uses internally).
+    try:
+        from transformers import AutoTokenizer as _HF_AutoTokenizer  # type: ignore
+    except Exception as e:
+        _dbg(f"cannot import transformers.AutoTokenizer: {type(e).__name__}: {e}")
+        _HF_AutoTokenizer = None
+
+    if _HF_AutoTokenizer is not None and not getattr(
+        _HF_AutoTokenizer, "_mint_trust_remote_code_patched", False
+    ):
+        cm = _HF_AutoTokenizer.__dict__.get("from_pretrained")
+        real_fn = getattr(cm, "__func__", None)
+        if real_fn is None:
+            # Fallback: already-resolved descriptor (should still work as a function).
+            real_fn = _HF_AutoTokenizer.from_pretrained  # type: ignore[assignment]
+
+        def wrapped_from_pretrained(cls, pretrained_model_name_or_path: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+            # Moonlight tokenizer requires custom code; always allow remote code when this
+            # script is explicitly running Moonlight.
+            kwargs.setdefault("trust_remote_code", True)
+            return real_fn(cls, pretrained_model_name_or_path, *args, **kwargs)
+
+        _HF_AutoTokenizer.from_pretrained = classmethod(wrapped_from_pretrained)  # type: ignore[method-assign]
+        _HF_AutoTokenizer._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+        _dbg("patched transformers.AutoTokenizer.from_pretrained trust_remote_code for Moonlight tokenizer")
+
+    # Best-effort: patch any re-exported AutoTokenizer under tinker too (older SDK variants).
+    try:
+        import tinker.lib.public_interfaces.sampling_client as sampling_client  # type: ignore
+    except Exception:
+        return
+
+    if getattr(sampling_client, "_mint_trust_remote_code_patched", False):
+        return
+    AutoTokenizer2 = getattr(sampling_client, "AutoTokenizer", None)
+    if AutoTokenizer2 is None:
+        return
+    if getattr(AutoTokenizer2, "_mint_trust_remote_code_patched", False):
+        sampling_client._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+        return
+    cm2 = AutoTokenizer2.__dict__.get("from_pretrained")
+    real2 = getattr(cm2, "__func__", None)
+    if real2 is None:
+        real2 = AutoTokenizer2.from_pretrained  # type: ignore[assignment]
+
+    def wrapped2(cls, pretrained_model_name_or_path: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        kwargs.setdefault("trust_remote_code", True)
+        return real2(cls, pretrained_model_name_or_path, *args, **kwargs)
+
+    AutoTokenizer2.from_pretrained = classmethod(wrapped2)  # type: ignore[method-assign]
+    AutoTokenizer2._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+    sampling_client._mint_trust_remote_code_patched = True  # type: ignore[attr-defined]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MinT RL arithmetic demo (long prompts)")
     parser.add_argument(
@@ -334,6 +397,16 @@ def _parse_args() -> argparse.Namespace:
         dest="base_model",
         default="Qwen/Qwen3-4B-Instruct-2507",
         help="Base model name (as listed by server capabilities)",
+    )
+    parser.add_argument(
+        "--lora-rank",
+        dest="lora_rank",
+        type=int,
+        default=int(os.environ.get("MINT_TEST_LORA_RANK", "0")),
+        help=(
+            "LoRA rank (default: 0=auto; env: MINT_TEST_LORA_RANK). "
+            "For K2, pick a value divisible by vLLM TP."
+        ),
     )
     parser.add_argument(
         "--inference-only",
@@ -505,6 +578,9 @@ TIMEOUT_S = float(args.timeout_s)
 load_dotenv(override=False)
 
 _install_tinker_future_debug()
+_patch_trust_remote_code_for_tokenizers(
+    enable=(args.base_model == "moonshotai/Moonlight-16B-A3B-Instruct"),
+)
 
 print(f"TINKER_BASE_URL={os.environ.get('TINKER_BASE_URL')!r}")
 if os.environ.get("TINKER_API_KEY"):
@@ -547,9 +623,12 @@ BASE_MODEL = args.base_model
 
 inference_only = bool(args.inference_only)
 
-# Megatron LoRA sharding requires LoRA rank divisible by TP.
-# K2 is configured with TP=64; use rank=64 to satisfy divisibility.
-LORA_RANK = 64 if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else 16
+if int(getattr(args, "lora_rank", 0)) > 0:
+    LORA_RANK = int(args.lora_rank)
+else:
+    # Megatron LoRA sharding requires LoRA rank divisible by TP.
+    # Default K2 rank is 64 (divisible by TP=64 and TP=32).
+    LORA_RANK = 64 if BASE_MODEL.startswith("moonshotai/Kimi-K2-") else 16
 
 train_mlp = args.train_mlp
 if train_mlp is None:

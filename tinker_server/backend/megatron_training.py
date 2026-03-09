@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     pass
 
 from tinker_server.backend.model_registry import get_model_config
+from tinker_server.config import config as server_config
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
 logger = logging.getLogger(__name__)
@@ -105,9 +106,11 @@ def tinker_to_tensordict(
             Creating tensors directly on GPU avoids CPU-to-GPU copy issues with nested tensors.
         dp_size: Optional data-parallel size override for loss normalization.
     """
-    def _extract_list(field_name: str, field: dict | None, item_index: int) -> list | None:
+    def _extract_list(field_name: str, field: dict | list | None, item_index: int) -> list | None:
         if field is None:
             return None
+        if isinstance(field, list):
+            return field
         if not isinstance(field, dict):
             raise ValueError(f"Item {item_index}: {field_name} must be a dict with 'data'")
         if "data" not in field:
@@ -134,6 +137,8 @@ def tinker_to_tensordict(
     response_advantages_list = []
     response_lens = []
     target_tokens_list = []  # External labels (correctly shifted, with true last token)
+    routed_experts_list = []
+    has_routed_experts = False
 
     max_len = 0
     has_external_labels = False
@@ -224,6 +229,35 @@ def tinker_to_tensordict(
         else:
             has_full_external_labels = False
             target_tokens_list.append(None)
+
+        # Router replay (R3): per-token routed expert indices
+        re_field = loss_fn_inputs.get("routed_experts")
+        if re_field is not None:
+            # re_field may be either:
+            #   - nested list [seq_len][layer_num][topk] (from SampledSequence.routed_experts directly)
+            #   - Tinker wire format dict {"data": flat_list, "shape": [S, L, K], "dtype": "int64"}
+            # vLLM only returns routed_experts for decode tokens (not prefill/prompt).
+            # Prepend zeros for the prompt tokens so shape[0] == tokens_len.
+            if isinstance(re_field, dict):
+                flat = re_field["data"]
+                shape = re_field["shape"]
+                if len(shape) != 3:
+                    raise ValueError(f"Item {item_index}: routed_experts shape must be [S, L, K], got {shape}")
+                re_tensor = torch.tensor(flat, dtype=torch.int64, device=device).reshape(shape)
+            else:
+                re_tensor = torch.tensor(re_field, dtype=torch.int64, device=device)
+            if re_tensor.ndim != 3:
+                raise ValueError(f"Item {item_index}: routed_experts must be shape [seq_len, layer_num, topk], got {list(re_tensor.shape)}")
+            if re_tensor.shape[0] < tokens_len:
+                pad_len = tokens_len - re_tensor.shape[0]
+                padding = torch.zeros((pad_len, re_tensor.shape[1], re_tensor.shape[2]), dtype=torch.int64, device=device)
+                re_tensor = torch.cat([padding, re_tensor], dim=0)
+            if re_tensor.shape[0] != tokens_len:
+                raise ValueError(f"Item {item_index}: routed_experts seq_len {re_tensor.shape[0]} != tokens length {tokens_len}")
+            routed_experts_list.append(re_tensor)
+            has_routed_experts = True
+        else:
+            routed_experts_list.append(None)
 
     if not input_ids_list:
         raise ValueError("No valid data items found")
@@ -321,6 +355,25 @@ def tinker_to_tensordict(
             logger.warning(
                 "[tinker_to_tensordict] Mixed target_tokens presence in batch; "
                 "skipping external labels to avoid TensorDict shape mismatch."
+            )
+
+    require_r3 = (server_config.router_replay_mode == "R3")
+    if require_r3:
+        missing = [i for i, re in enumerate(routed_experts_list) if re is None]
+        if missing:
+            raise ValueError(
+                "router_replay_mode=R3 requires routed_experts for every datum "
+                f"(missing item indexes: {missing})"
+            )
+
+    if has_routed_experts or require_r3:
+        if all(re is not None for re in routed_experts_list):
+            re_nested = torch.nested.as_nested_tensor(routed_experts_list, layout=torch.jagged)
+            td["routed_experts"] = re_nested
+            td.set_non_tensor("enable_routing_replay", True)
+        elif has_routed_experts:
+            logger.warning(
+                "[tinker_to_tensordict] Mixed routed_experts presence in batch; skipping R3"
             )
 
     # Add non-tensor metadata for verl's prepare_micro_batches
@@ -478,16 +531,20 @@ def create_loss_fn() -> Callable:
     return create_sft_loss_fn(return_logprobs=False)
 
 
-def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
+def create_ppo_loss_fn(
+    epsilon: float = 0.2,
+    rollout_correction_config: dict[str, Any] | None = None,
+) -> Callable:
     """Create PPO loss function by reusing verl's ppo_loss/agg_loss path."""
     import math
     import torch.nn.functional as F
-    from verl.workers.config import ActorConfig
+    from verl.trainer.config import RolloutCorrectionConfig
+    from verl.workers.config import ActorConfig, PolicyLossConfig
     from verl.workers.utils.losses import ppo_loss as verl_ppo_loss, _slice_response_from_unpad_output
 
     clip_ratio = float(epsilon)
     clip_ratio_c = 1e6 if math.isinf(clip_ratio) else 3.0
-    actor_config = ActorConfig(
+    actor_config_kwargs: dict[str, Any] = dict(
         strategy="tinker",
         rollout_n=1,
         use_dynamic_bsz=True,
@@ -496,6 +553,17 @@ def create_ppo_loss_fn(epsilon: float = 0.2) -> Callable:
         clip_ratio_high=clip_ratio,
         clip_ratio_c=clip_ratio_c,
     )
+
+    if isinstance(rollout_correction_config, dict):
+        # Keep only explicitly configured values so verl defaults can apply.
+        rollout_corr_clean = {k: v for k, v in rollout_correction_config.items() if v is not None}
+        bypass_mode = bool(rollout_corr_clean.get("bypass_mode", False))
+        actor_config_kwargs["policy_loss"] = PolicyLossConfig(
+            loss_mode="bypass_mode" if bypass_mode else "vanilla",
+            rollout_correction=RolloutCorrectionConfig(**rollout_corr_clean),
+        )
+
+    actor_config = ActorConfig(**actor_config_kwargs)
 
     def ppo_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """PPO clipped objective loss via verl's implementation.
@@ -847,6 +915,7 @@ class MegatronTrainingWorker:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict[str, Any] | None = None,
     ) -> dict:
         """Forward + backward pass via MegatronEngine.
 
@@ -854,6 +923,7 @@ class MegatronTrainingWorker:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
             loss_fn_config: Optional config (e.g., {"epsilon": 0.2} for PPO).
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
 
         Returns:
             Dict with loss_fn_outputs and metrics.
@@ -900,10 +970,16 @@ class MegatronTrainingWorker:
             loss_function = create_sft_loss_fn()
         elif loss_fn == "ppo":
             epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(epsilon)
+            loss_function = create_ppo_loss_fn(
+                epsilon,
+                rollout_correction_config=rollout_correction_config,
+            )
         elif loss_fn == "importance_sampling":
             # Importance sampling is PPO without clipping
-            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
+            loss_function = create_ppo_loss_fn(
+                epsilon=float("inf"),
+                rollout_correction_config=rollout_correction_config,
+            )
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 

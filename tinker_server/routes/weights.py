@@ -15,11 +15,13 @@ import logging
 import os
 import shutil
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from ..backend.future_store import future_store
 from ..checkpoints import (
@@ -37,6 +39,7 @@ from ..models.types import (
     SaveStateRequest,
     UntypedAPIFuture,
 )
+from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..webhook import EventType, send_task_event
 
@@ -94,6 +97,197 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     """Convert to mint://{model_id}/ URI (legacy format)."""
     return f"mint://{model_id}/{checkpoint_name}"
+
+
+def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None) -> None:
+    if request_user_id == "admin":
+        return
+    if request_user_id is None:
+        if owner_id is None:
+            return
+        raise HTTPException(status_code=403, detail="Access denied")
+    if owner_id == request_user_id:
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _build_sdk_archive_redirect_response(
+    *,
+    request: Request,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_id: str,
+) -> RedirectResponse:
+    from ..config import config
+    from ..download_tokens import make_archive_download_token
+    from starlette.datastructures import URL
+
+    secret = (config.token_secret_key or config.api_key or "").strip()
+
+    def _first_forwarded(value: str | None) -> str | None:
+        if not value:
+            return None
+        return value.split(",")[0].strip() or None
+
+    xf_proto = _first_forwarded(request.headers.get("x-forwarded-proto"))
+    xf_host = _first_forwarded(request.headers.get("x-forwarded-host"))
+    xf_port = _first_forwarded(request.headers.get("x-forwarded-port"))
+
+    scheme = xf_proto or request.url.scheme
+    host = xf_host or request.headers.get("host") or request.url.netloc
+    if xf_port and host and ":" not in host:
+        host = f"{host}:{xf_port}"
+
+    base = URL(f"{scheme}://{host}")
+    direct_url_obj = base.replace(path=request.url.path).include_query_params(direct="1")
+    if secret:
+        token, exp = make_archive_download_token(
+            secret=secret,
+            user_id=user_id,
+            model_id=model_id,
+            checkpoint_id=checkpoint_id,
+            ttl_s=15 * 60,
+        )
+        direct_url_obj = direct_url_obj.include_query_params(download_token=token)
+        expires = datetime.fromtimestamp(exp, tz=timezone.utc)
+    else:
+        expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return RedirectResponse(
+        url=str(direct_url_obj),
+        status_code=302,
+        headers={"Expires": expires_header},
+    )
+
+
+async def _close_upstream_response(response, client) -> None:
+    try:
+        await response.aclose()
+    finally:
+        await client.aclose()
+
+
+async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
+    from ..gateway import forward_json, remote_training_model_info, upstream_for_alias
+
+    remote = remote_training_model_info(model_id)
+    if remote is None:
+        return None
+
+    upstream_alias = str(remote.get("upstream_alias") or "")
+    base_model = str(remote.get("base_model") or "")
+    owner_id = remote.get("owner_id")
+    upstream = upstream_for_alias(upstream_alias)
+    if upstream is None:
+        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+    user_data = _get_user_data(request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    _require_checkpoint_owner(request_user_id=_get_user_id(request), owner_id=owner_id)
+
+    try:
+        resp = await forward_json(
+            upstream=upstream,
+            method="GET",
+            path=request.url.path,
+            incoming_headers=dict(request.headers),
+            json_body=None,
+            timeout_s=30.0,
+        )
+    except Exception:
+        logger.exception("Upstream checkpoint list failed: %s", upstream_alias)
+        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint list failed")
+
+    if resp.status_code >= 400:
+        try:
+            payload = resp.json()
+        except Exception:
+            detail = resp.text
+        else:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return CheckpointsListResponse.model_validate(resp.json())
+
+
+async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: str, request: Request, direct: bool):
+    from ..gateway import forward_request, remote_training_model_info, upstream_for_alias
+
+    remote = remote_training_model_info(model_id)
+    if remote is None:
+        return None
+
+    upstream_alias = str(remote.get("upstream_alias") or "")
+    base_model = str(remote.get("base_model") or "")
+    owner_id = remote.get("owner_id")
+    upstream = upstream_for_alias(upstream_alias)
+    if upstream is None:
+        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+    user_data = _get_user_data(request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    _require_checkpoint_owner(request_user_id=_get_user_id(request), owner_id=owner_id)
+
+    params = dict(request.query_params)
+    if direct:
+        params["direct"] = "1"
+
+    try:
+        client, resp = await forward_request(
+            upstream=upstream,
+            method="GET",
+            path=request.url.path,
+            incoming_headers=dict(request.headers),
+            params=params,
+            timeout_s=600.0,
+            stream=True,
+        )
+    except Exception:
+        logger.exception("Upstream checkpoint archive failed: %s", upstream_alias)
+        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint archive failed")
+
+    if resp.status_code >= 400:
+        text = await resp.aread()
+        await _close_upstream_response(resp, client)
+        decoded = text.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(decoded)
+        except Exception:
+            detail = decoded
+        else:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+
+    if resp.status_code in (301, 302, 303, 307, 308):
+        headers = {}
+        expires = resp.headers.get("expires")
+        if expires:
+            headers["Expires"] = expires
+        await _close_upstream_response(resp, client)
+        redirect = _build_sdk_archive_redirect_response(
+            request=request,
+            user_id=_get_user_id(request),
+            model_id=model_id,
+            checkpoint_id=checkpoint_id,
+        )
+        redirect.status_code = resp.status_code
+        redirect.headers.update(headers)
+        return redirect
+
+    response_headers = {}
+    for name in ("Content-Disposition", "Content-Length", "Expires"):
+        value = resp.headers.get(name)
+        if value:
+            response_headers[name] = value
+
+    return StreamingResponse(
+        resp.aiter_bytes(),
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+        headers=response_headers,
+        background=BackgroundTask(_close_upstream_response, resp, client),
+    )
 
 
 # =============================================================================
@@ -189,7 +383,7 @@ async def save_weights(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "save_weights", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.save_weights",
@@ -298,7 +492,7 @@ async def save_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "save_state", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.save_state",
@@ -329,8 +523,10 @@ async def _do_save_state(
     Also registers the model for sampling via multi-LoRA engine.
     """
     import json
+    session = None
 
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -453,19 +649,28 @@ async def _do_save_state(
             )
 
     except Exception as e:
-        logger.error(f"[save_state] Failed: {e}", exc_info=True)
+        logger.exception(
+            "[weights.save_state] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_checkpoint_path",
+        )
         future_store.fail(request_id, str(e))
 
         # 发送 failed 状态
         if webhook_url and user_id:
+            failed_session_id = session.model_id if session is not None else request.model_id
+            failed_model_name = session.base_model if session is not None else None
             send_task_event(
                 webhook_url=webhook_url,
                 event_type=EventType.TASK_FAILED,
                 user_id=user_id,
-                session_id=session.model_id,
-                task_name=f"Training {session.base_model}",
+                session_id=failed_session_id,
+                task_name=f"Training {failed_model_name or request.model_id}",
                 task_type="training",
-                model_name=session.base_model,
+                model_name=failed_model_name,
                 error=str(e),
             )
 
@@ -482,7 +687,9 @@ async def _do_save_weights(
     Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
+    session = None
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -601,15 +808,23 @@ async def _do_save_weights(
             )
 
     except Exception as e:
-        logger.error(f"[save_weights] Failed: {e}", exc_info=True)
+        logger.exception(
+            "[weights.save_weights] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_sampler_checkpoint_export",
+        )
         future_store.fail(request_id, str(e))
 
         if webhook_url and user_id:
+            failed_session_id = session.model_id if session is not None else request.model_id
             send_task_event(
                 webhook_url=webhook_url,
                 event_type=EventType.TASK_FAILED,
                 user_id=user_id,
-                session_id=request.model_id,
+                session_id=failed_session_id,
                 task_name="Save weights",
                 task_type="training",
                 model_name=None,
@@ -762,7 +977,7 @@ async def load_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "load_state", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="weights.load_state",
@@ -784,6 +999,7 @@ async def _do_load_state(
 ) -> None:
     """Background task to load state."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -818,7 +1034,14 @@ async def _do_load_state(
         })
 
     except Exception as e:
-        logger.error(f"[load_state] Failed: {e}", exc_info=True)
+        logger.exception(
+            "[weights.load_state] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_checkpoint_contract_and_permissions",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -976,6 +1199,10 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     Works for both active training sessions and saved checkpoints.
     Ownership verified via metadata.json (admin can access all).
     """
+    remote_response = await _forward_remote_checkpoint_route(model_id=model_id, request=request)
+    if remote_response is not None:
+        return remote_response
+
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
     from ..client_compat import checkpoint_uri, prefer_tinker_uri
@@ -1250,6 +1477,14 @@ async def download_checkpoint_archive(
     """
     import subprocess
 
+    remote_response = await _forward_remote_checkpoint_archive(
+        model_id=model_id,
+        checkpoint_id=checkpoint_id,
+        request=request,
+        direct=direct,
+    )
+    if remote_response is not None:
+        return remote_response
     from ..config import config
     from ..download_tokens import verify_download_token
 
@@ -1328,44 +1563,11 @@ async def download_checkpoint_archive(
         from ..client_compat import is_tinker_sdk_user_agent
 
         if is_tinker_sdk_user_agent(request.headers.get("user-agent")):
-            from ..download_tokens import make_archive_download_token
-            from starlette.datastructures import URL
-
-            secret = (config.token_secret_key or config.api_key or "").strip()
-
-            def _first_forwarded(value: str | None) -> str | None:
-                if not value:
-                    return None
-                return value.split(",")[0].strip() or None
-
-            xf_proto = _first_forwarded(request.headers.get("x-forwarded-proto"))
-            xf_host = _first_forwarded(request.headers.get("x-forwarded-host"))
-            xf_port = _first_forwarded(request.headers.get("x-forwarded-port"))
-
-            scheme = xf_proto or request.url.scheme
-            host = xf_host or request.headers.get("host") or request.url.netloc
-            if xf_port and host and ":" not in host:
-                host = f"{host}:{xf_port}"
-
-            base = URL(f"{scheme}://{host}")
-            direct_url_obj = base.replace(path=request.url.path).include_query_params(direct="1")
-            if secret:
-                token, exp = make_archive_download_token(
-                    secret=secret,
-                    user_id=user_id,
-                    model_id=model_id,
-                    checkpoint_id=checkpoint_id,
-                    ttl_s=15 * 60,
-                )
-                direct_url_obj = direct_url_obj.include_query_params(download_token=token)
-                expires = datetime.fromtimestamp(exp, tz=timezone.utc)
-            else:
-                expires = datetime.now(timezone.utc) + timedelta(minutes=15)
-            expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
-            return RedirectResponse(
-                url=str(direct_url_obj),
-                status_code=302,
-                headers={"Expires": expires_header},
+            return _build_sdk_archive_redirect_response(
+                request=request,
+                user_id=user_id,
+                model_id=model_id,
+                checkpoint_id=checkpoint_id,
             )
 
     def stream_tar_gz():

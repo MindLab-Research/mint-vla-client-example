@@ -10,10 +10,23 @@ class PendingFutureHttpResponse:
     body: dict
 
 
-def pending_future_http_response(*, retry_after_s: int = 1) -> PendingFutureHttpResponse:
+def pending_future_http_response(
+    *,
+    retry_after_s: int = 1,
+    throttled: bool = False,
+    extra_headers: dict[str, str] | None = None,
+    extra_body: dict | None = None,
+) -> PendingFutureHttpResponse:
+    headers = {"Retry-After": str(int(retry_after_s))}
+    if throttled:
+        headers["X-Tinker-Poll-Throttled"] = "1"
+    if extra_headers:
+        headers.update({str(k): str(v) for k, v in extra_headers.items()})
+    body = {"queue_state": "active", "retry_after_s": int(retry_after_s)}
+    if extra_body:
+        body.update(dict(extra_body))
     return PendingFutureHttpResponse(
         status_code=408,
-        headers={"Retry-After": str(int(retry_after_s))},
-        body={"queue_state": "active"},
+        headers=headers,
+        body=body,
     )
-

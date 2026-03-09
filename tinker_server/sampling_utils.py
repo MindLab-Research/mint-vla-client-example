@@ -4,7 +4,10 @@ from typing import Any, Literal, Sequence
 
 StopReason = Literal["length", "stop", "eos"]
 
-DEFAULT_EOS_TOKENS: frozenset[int] = frozenset({151645, 151643})
+# Default stop/EOS tokens:
+# - Qwen-style: 151645, 151643
+# - Moonlight: <|im_end|>=163586, [EOS]=163585
+DEFAULT_EOS_TOKENS: frozenset[int] = frozenset({151645, 151643, 163586, 163585})
 
 from .models.types import SampledSequence
 
@@ -58,8 +61,16 @@ def sampled_sequence_from_result(result: Any) -> SampledSequence:
     - optional stop_reason
     """
     logprobs = getattr(result, "logprobs", None) or getattr(result, "log_probs", None)
+    routed_experts = getattr(result, "routed_experts", None)
+    if routed_experts is not None and hasattr(routed_experts, "tolist"):
+        routed_experts = routed_experts.tolist()
     stop_reason = resolve_stop_reason(
         stop_reason=getattr(result, "stop_reason", None),
         token_ids=result.token_ids,
     )
-    return SampledSequence(tokens=result.token_ids, logprobs=logprobs, stop_reason=stop_reason)
+    return SampledSequence(
+        tokens=result.token_ids,
+        logprobs=logprobs,
+        routed_experts=routed_experts,
+        stop_reason=stop_reason,
+    )

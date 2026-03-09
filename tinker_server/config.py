@@ -1,10 +1,10 @@
 """Server configuration."""
 
+from __future__ import annotations
+
 import os
 import secrets
 from dataclasses import dataclass
-
-from .config_file import TinkerConfigFile, load_tinker_config_file
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -19,10 +19,17 @@ def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
 
 
-def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, TinkerConfigFile | None]:
+def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
     path = _env_nonempty(environ, "TINKER_CONFIG_PATH")
     if not path:
         return None, None
+    try:
+        from .config_file import load_tinker_config_file
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "TINKER_CONFIG_PATH is set but config parsing dependencies are missing "
+            f"(missing module: {e.name!r}). Install pydantic on this runtime or unset TINKER_CONFIG_PATH."
+        ) from e
     return path, load_tinker_config_file(path)
 
 
@@ -173,6 +180,7 @@ class ServerConfig:
     gpu_memory_utilization: float = 0.85
     max_model_len: int | None = None
     session_inactivity_timeout_s: float | None = None
+    router_replay_mode: str = "disabled"  # Options: "disabled", "R2", "R3"
 
     # Multi-LoRA settings
     enable_multi_lora: bool = True  # Enable shared multi-LoRA engine
@@ -187,6 +195,7 @@ class ServerConfig:
     sampling_sample_coalesce_window_ms: float = 2.0
     sampling_sample_coalesce_max_batch: int = 32
     sampling_sample_coalesce_max_samples: int = 16
+    sampling_require_seq_id: bool = False
 
     # ResourcePool settings (backend/resource_pool.py)
     resource_pool_min_actor_age_s: int = 300
@@ -344,6 +353,11 @@ class ServerConfig:
                 file_sampling.sample_coalesce_max_samples if file_sampling is not None else None,
                 16,
             ),
+            sampling_require_seq_id=_pick_bool(
+                "TINKER_SAMPLE_REQUIRE_SEQ_ID",
+                file_sampling.require_seq_id if file_sampling is not None else None,
+                False,
+            ),
             # ResourcePool settings
             resource_pool_min_actor_age_s=_pick_int(
                 "MINT_MIN_ACTOR_AGE",
@@ -434,6 +448,11 @@ class ServerConfig:
                 0.0,
             ),
             training_actor_ready_timeout_s=actor_ready_timeout_s,
+            router_replay_mode=_pick_str(
+                "MINT_ROUTER_REPLAY_MODE",
+                None,
+                "disabled",
+            ),
             # Persistent prewarm settings
             prewarm_persistent_models_csv=_pick_str(
                 "MINT_PERSISTENT_MODELS",

@@ -42,6 +42,29 @@ Async endpoints must use the admission layer before creating futures:
 
 On admission failure, the API must return HTTP 429 with a structured overload reason (for example `queue_bytes_budget_exceeded` or `object_store_budget_exceeded`). Overload is explicit; the server must not allow unbounded backlog to grow until OOM.
 
+## Training queue scheduling (session-aware mode)
+
+By default, the detached API work queue behaves like FIFO. For chunked training bursts, `api_work_queue` also supports a session-aware scheduler path for selected ops:
+
+- `training.forward_backward`
+- `training.optim_step`
+- `training.train_step`
+
+The training route tags these requests with `extra` metadata:
+
+- `scheduler_enabled`
+- `scheduler_domain` (typically `"{backend}:{base_model}"`)
+- `scheduler_session_key` (uses server-side `model_id`)
+
+When enabled (`MINT_SCHEDULER_ENABLE=1`), tagged requests are grouped into per-domain/per-session subqueues. Scheduling semantics:
+
+- Same session preserves FIFO order.
+- Across sessions, selection is fairness-based (`MINT_SCHEDULER_FAIRNESS=oldest|rr`) with starvation guard (`MINT_SCHEDULER_STARVATION_S`).
+- Sticky bursts are bounded by `MINT_SCHEDULER_MAX_CONSECUTIVE`.
+- Optional coalescing window (`MINT_SCHEDULER_COALESCE_MS`) briefly waits for another chunk from the previous session before switching.
+
+This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for these tagged training ops to reduce cross-session thrash, while preserving per-session ordering and bounded fairness.
+
 ## Reaping and reservation release
 
 `tinker_server/app.py` runs a reaper loop that calls `FutureStore.reap()` and releases any external reservations for request_ids that transitioned to terminal tombstones (expired or timed out). This is what prevents reservation leaks when clients do not retrieve futures.

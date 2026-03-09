@@ -27,6 +27,7 @@ class TrainingSession:
     base_model: str
     user_id: str | None = None
     lora_config: LoRAConfig | None = None
+    rollout_correction_config: dict[str, Any] | None = None
     user_metadata: dict = field(default_factory=dict)
     learning_rate: float = 1e-4
 
@@ -51,6 +52,7 @@ class TrainingSession:
             "base_model": self.base_model,
             "user_id": self.user_id,
             "lora_config": self.lora_config.model_dump() if self.lora_config else None,
+            "rollout_correction_config": self.rollout_correction_config,
             "user_metadata": self.user_metadata,
             "current_step": self.current_step,
             "total_samples_processed": self.total_samples_processed,
@@ -78,6 +80,7 @@ class TrainingSessionManager:
         model_seq_id: int,
         base_model: str,
         lora_config: LoRAConfig | None = None,
+        rollout_correction_config: dict[str, Any] | None = None,
         user_metadata: dict | None = None,
         user_id: str | None = None,
         learning_rate: float = 1e-4,
@@ -90,6 +93,7 @@ class TrainingSessionManager:
             model_seq_id: Model sequence number within session.
             base_model: Base model name.
             lora_config: Optional LoRA configuration.
+            rollout_correction_config: Optional session-level rollout correction policy.
             user_metadata: Optional user metadata.
             learning_rate: Learning rate for optimizer.
 
@@ -109,6 +113,7 @@ class TrainingSessionManager:
             base_model=base_model,
             user_id=user_id,
             lora_config=lora_config,
+            rollout_correction_config=rollout_correction_config,
             user_metadata=user_metadata or {},
             learning_rate=learning_rate,
         )

@@ -24,10 +24,12 @@ import os
 import time
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+
+from ..logging_context import classify_failure_reason, set_request_id
 
 from ..backend.future_store import future_store
 from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
@@ -118,6 +120,7 @@ def _restore_training_session(model_id: str):
                 model_seq_id=int(info.get("model_seq_id", 0)),
                 base_model=str(info.get("base_model", "")),
                 lora_config=lora_cfg,
+                rollout_correction_config=info.get("rollout_correction_config"),
                 user_metadata=info.get("user_metadata") or {},
                 user_id=info.get("user_id"),
                 learning_rate=float(info.get("learning_rate", 1e-4)),
@@ -247,6 +250,85 @@ def _get_max_model_len(base_model: str | None) -> int:
             ),
         )
 
+def _validate_rollout_correction_config_or_400(
+    *,
+    base_model: str,
+    rollout_correction_config: Any,
+) -> None:
+    if rollout_correction_config is None:
+        return
+
+    from ..backend.model_registry import get_model_config
+
+    if not bool(get_model_config(base_model).is_moe):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "rollout_correction_config is only supported on Megatron backend (MoE models); "
+                f"base_model={base_model!r} is not configured as MoE"
+            ),
+        )
+
+    try:
+        cfg = rollout_correction_config.model_dump(exclude_none=True)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="rollout_correction_config must be a pydantic model compatible with .model_dump()",
+        )
+
+    try:
+        from verl.trainer.config import RolloutCorrectionConfig as VerlRolloutCorrectionConfig
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "rollout_correction_config requires verl to be installed on the API server "
+                f"(import failed: {type(e).__name__}: {e})"
+            ),
+        )
+
+    try:
+        VerlRolloutCorrectionConfig(**cfg)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid rollout_correction_config for verl: {type(e).__name__}: {e}",
+        )
+
+
+def _build_training_scheduler_extra(
+    *,
+    session: Any,
+    model_id: str,
+    training_op: str,
+    seq_id: int | None = None,
+) -> dict[str, Any]:
+    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    backend = str(getattr(session, "backend", "") or "unknown")
+    base_model = str(getattr(session, "base_model", "") or "")
+    domain_key = base_model if base_model else str(model_id)
+    extra: dict[str, Any] = {
+        "scheduler_enabled": bool(enabled),
+        "scheduler_domain": f"{backend}:{domain_key}",
+        # Scheduler session key is model_id (server-side training session identity),
+        # not the user-provided create_model session_id string.
+        "scheduler_session_key": str(model_id),
+        "training_op": str(training_op),
+    }
+    if seq_id is not None:
+        try:
+            extra["seq_id"] = int(seq_id)
+        except Exception:
+            extra["seq_id"] = None
+    return extra
+
 
 # =============================================================================
 # create_model - async
@@ -263,6 +345,11 @@ async def create_model(
 
     base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
     request = request.model_copy(update={"base_model": base_model})
+
+    _validate_rollout_correction_config_or_400(
+        base_model=request.base_model,
+        rollout_correction_config=request.rollout_correction_config,
+    )
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -312,6 +399,7 @@ async def create_model(
             model_id=model_id,
             upstream_alias=upstream.alias,
             base_model=request.base_model,
+            owner_id=user_id,
         )
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
@@ -332,19 +420,6 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
-
-    # 1. 发送 pending 状态 - 任务已创建，等待执行
-    if webhook_url and user_id:
-        send_task_event(
-            webhook_url=webhook_url,
-            event_type=EventType.TASK_CREATED,  # pending
-            user_id=user_id,
-            session_id=model_id,
-            task_name=f"Training {request.base_model}",
-            task_type="training",
-            model_name=request.base_model,
-            config={"lora_rank": request.lora_config.rank if request.lora_config else None},
-        )
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
@@ -367,7 +442,7 @@ async def create_model(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "create_model"})
+        future_store.mark_queued(request_id, meta={"op": "training.create_model"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model",
@@ -375,6 +450,17 @@ async def create_model(
             user_id=user_id,
             webhook_url=webhook_url,
         )
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_CREATED,  # pending
+                user_id=user_id,
+                session_id=model_id,
+                task_name=f"Training {request.base_model}",
+                task_type="training",
+                model_name=request.base_model,
+                config={"lora_rank": request.lora_config.rank if request.lora_config else None},
+            )
         logger.info(
             "[create_model] enqueued request_id=%s op=%s model_id=%s base_model=%s bytes=%s",
             str(request_id),
@@ -387,6 +473,18 @@ async def create_model(
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
+        if webhook_url and user_id:
+            send_task_event(
+                webhook_url=webhook_url,
+                event_type=EventType.TASK_FAILED,
+                user_id=user_id,
+                session_id=model_id,
+                task_name=f"Training {request.base_model}",
+                task_type="training",
+                model_name=request.base_model,
+                error=f"enqueue_failed: {type(e).__name__}: {e}",
+                config={"lora_rank": request.lora_config.rank if request.lora_config else None},
+            )
         raise HTTPException(status_code=503, detail=f"Failed to enqueue create_model request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -401,6 +499,7 @@ async def _do_create_model(
     """Background task to create training model."""
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -419,6 +518,9 @@ async def _do_create_model(
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
+            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
@@ -436,6 +538,9 @@ async def _do_create_model(
                 "model_seq_id": request.model_seq_id,
                 "base_model": request.base_model,
                 "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
@@ -480,7 +585,15 @@ async def _do_create_model(
             )
 
     except Exception as e:
-        logger.exception(f"[create_model] Failed: {e}")
+        logger.exception(
+            "[create_model] failed request_id=%s model_id=%s base_model=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(model_id),
+            str(request.base_model),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_actor",
+        )
         # Clean up session if it was created
         if training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
@@ -546,6 +659,11 @@ async def create_model_from_state(
 
     base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
     request = request.model_copy(update={"base_model": base_model})
+
+    _validate_rollout_correction_config_or_400(
+        base_model=request.base_model,
+        rollout_correction_config=request.rollout_correction_config,
+    )
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -639,6 +757,7 @@ async def create_model_from_state(
             model_id=model_id,
             upstream_alias=upstream.alias,
             base_model=request.base_model,
+            owner_id=user_id,
         )
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
@@ -678,7 +797,7 @@ async def create_model_from_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "create_model_from_state"})
+        future_store.mark_queued(request_id, meta={"op": "training.create_model_from_state"})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model_from_state",
@@ -702,6 +821,7 @@ async def _do_create_model_from_state(
 ) -> None:
     """Background task to create model and load checkpoint."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -734,6 +854,9 @@ async def _do_create_model_from_state(
             model_seq_id=request.model_seq_id,
             base_model=request.base_model,
             lora_config=request.lora_config,
+            rollout_correction_config=request.rollout_correction_config.model_dump(exclude_none=True)
+            if request.rollout_correction_config
+            else None,
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
@@ -758,6 +881,9 @@ async def _do_create_model_from_state(
                 "model_seq_id": request.model_seq_id,
                 "base_model": request.base_model,
                 "lora_config": request.lora_config.model_dump() if request.lora_config else None,
+                "rollout_correction_config": request.rollout_correction_config.model_dump(exclude_none=True)
+                if request.rollout_correction_config
+                else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
                 "backend": session.backend,
@@ -794,7 +920,15 @@ async def _do_create_model_from_state(
         future_store.resolve(request_id, response.model_dump())
 
     except Exception as e:
-        logger.exception(f"[create_model_from_state] Failed: {e}")
+        logger.exception(
+            "[create_model_from_state] failed request_id=%s model_id=%s base_model=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(_generate_model_id(request.session_id, request.model_seq_id)),
+            str(request.base_model),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_checkpoint_path_and_training_actor",
+        )
         # Clean up session if it was created
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
         if training_manager and training_manager.get_session(model_id):
@@ -892,12 +1026,18 @@ async def forward_backward(
             ),
         )
 
+    user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+
+    # Set request_id in context for logging
+    set_request_id(request_id)
+    logger.info(f"forward_backward request received: model_id={request.model_id}")
+
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -911,15 +1051,25 @@ async def forward_backward(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="forward_backward",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "forward_backward", "model_id": request.model_id})
+        future_store.mark_queued(
+            request_id,
+            meta={"op": "training.forward_backward", "model_id": request.model_id},
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.forward_backward",
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -932,6 +1082,9 @@ async def forward_backward(
 
 async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest, user_id: str | None) -> None:
     """Background task for forward_backward."""
+    # Restore request_id context for logging
+    set_request_id(request_id)
+
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
@@ -953,18 +1106,16 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
-        msg = (
-            f"[{session.model_id}] forward_backward start request_id={request_id} "
+        logger.info(
+            f"[{session.model_id}] forward_backward start: "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
             f"loss_fn={request.forward_backward_input.loss_fn}"
         )
-        print(msg, flush=True)
-        logger.info(msg)
         result = await training_engine.forward_backward(session, request)
         elapsed_s = time.time() - t0
-        msg = f"[{session.model_id}] forward_backward done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        print(msg, flush=True)
-        logger.info(msg)
+        logger.info(
+            f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
+        )
         future_store.resolve(request_id, result)
 
         # Log usage
@@ -979,7 +1130,14 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
             )
 
     except Exception as e:
-        logger.exception(f"[forward_backward] Failed: {e}")
+        logger.exception(
+            "[forward_backward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_batch_shape",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1081,15 +1239,22 @@ async def train_step(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="train_step",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "train_step", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.train_step",
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1105,6 +1270,7 @@ async def _do_train_step(
 ) -> None:
     """Background task for train_step."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1121,12 +1287,10 @@ async def _do_train_step(
             f"[{session.model_id}] train_step start request_id={request_id} "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
         )
-        print(msg, flush=True)
         logger.info(msg)
         result = await training_engine.train_step(session, request)
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        print(msg, flush=True)
         logger.info(msg)
         future_store.resolve(request_id, result)
 
@@ -1142,7 +1306,14 @@ async def _do_train_step(
             )
 
     except Exception as e:
-        logger.exception(f"[train_step] Failed: {e}")
+        logger.exception(
+            "[train_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_actor",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1249,15 +1420,22 @@ async def forward(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="forward",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "forward", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.forward",
             request_json=request_json,
             user_id=None,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1273,6 +1451,7 @@ async def _do_forward(
 ) -> None:
     """Background task for forward."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1286,7 +1465,14 @@ async def _do_forward(
         future_store.resolve(request_id, result)
 
     except Exception as e:
-        logger.exception(f"[forward] Failed: {e}")
+        logger.exception(
+            "[forward] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_input_tokens",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1378,15 +1564,22 @@ async def optim_step(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="optim_step",
+            seq_id=request.seq_id,
+        )
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "optim_step", "model_id": request.model_id})
+        future_store.mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.optim_step",
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1400,6 +1593,7 @@ async def optim_step(
 async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: str | None) -> None:
     """Background task for optim_step."""
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1412,17 +1606,22 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
-        print(msg, flush=True)
         logger.info(msg)
         result = await training_engine.optim_step(session, request)
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
-        print(msg, flush=True)
         logger.info(msg)
         future_store.resolve(request_id, result)
 
     except Exception as e:
-        logger.exception(f"[optim_step] Failed: {e}")
+        logger.exception(
+            "[optim_step] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_training_session_and_optimizer_state",
+        )
         future_store.fail(request_id, str(e))
 
 
@@ -1598,10 +1797,18 @@ async def save_weights_for_sampler(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="save_weights_for_sampler",
+            seq_id=request.seq_id,
+        )
+        scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(
-            request_id, meta={"op": "save_weights_for_sampler", "model_id": request.model_id}
+            request_id,
+            meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
         )
         await api_work_queue.enqueue(
             request_id=request_id,
@@ -1609,7 +1816,7 @@ async def save_weights_for_sampler(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
-            extra={"prefer_tinker": bool(prefer_tinker)},
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1635,6 +1842,7 @@ async def _do_save_weights_for_sampler(
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
     try:
+        set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -1861,7 +2069,14 @@ async def _do_save_weights_for_sampler(
         future_store.resolve(request_id, response.model_dump())
 
     except Exception as e:
-        logger.exception(f"[save_weights_for_sampler] Failed: {e}")
+        logger.exception(
+            "[save_weights_for_sampler] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
+            str(request_id),
+            str(request.model_id),
+            classify_failure_reason(e),
+            type(e).__name__,
+            "check_checkpoint_export_and_inference_registration",
+        )
         future_store.fail(request_id, str(e))
 
 

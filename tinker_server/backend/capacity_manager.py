@@ -67,7 +67,7 @@ def _get_or_create_ray_actor():
 
     queue_bytes_budget = int(getattr(server_config, "capacity_queue_bytes_budget", 512 * 1024 * 1024))
 
-    @ray.remote
+    @ray.remote(num_cpus=0)
     class _RayCapacityManagerActor:
         def __init__(self, *, queue_bytes_budget: int) -> None:
             self._queue_bytes_budget = int(queue_bytes_budget)

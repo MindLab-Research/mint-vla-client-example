@@ -11,13 +11,26 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .backend.api_work_queue import ApiWorkQueueUnavailableError
+from .backend.capacity_manager import CapacityManagerUnavailableError
+from .backend.future_store import FutureStoreUnavailableError
 from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .config import config
+from .gateway import close_http_clients
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .logging_context import (
+    classify_failure_reason,
+    ensure_trace_id,
+    extract_trace_id_from_traceparent,
+    get_trace_id,
+    get_otel_tracer,
+    record_http_server_metrics,
+    set_trace_id,
+)
 from .ray_utils import init_ray
 from .routes import futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
@@ -32,6 +45,14 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _http_route_label(request: Request) -> str:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if isinstance(route_path, str) and route_path:
+        return route_path
+    return request.url.path
 
 
 async def _cleanup_stale_actors() -> None:
@@ -122,6 +143,20 @@ async def _cleanup_stale_actors() -> None:
 
                     # Actor is alive - register it with ResourcePool
                     # Determine actor type and GPU count from name/diagnostics
+                    def _pg_total_gpus(actor_name: str) -> int | None:
+                        try:
+                            pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                            info = ray.util.placement_group_table(pg)
+                        except Exception:
+                            return None
+                        bundles = info.get("bundles") or {}
+                        total = sum(
+                            int(b.get("GPU", 0) or 0)
+                            for b in bundles.values()
+                            if isinstance(b, dict)
+                        )
+                        return total or None
+
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
@@ -134,6 +169,7 @@ async def _cleanup_stale_actors() -> None:
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
+                        num_gpus = _pg_total_gpus(name) or num_gpus
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -157,9 +193,12 @@ async def _cleanup_stale_actors() -> None:
                             base_model = diag.get("base_model", "") or base_model
                         except Exception:
                             pass
+                        num_gpus = _pg_total_gpus(name) or num_gpus
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
+
+                    from tinker_server.backend.model_registry import is_persistent_model
 
                     resource_pool.register(
                         actor_name=name,
@@ -168,6 +207,7 @@ async def _cleanup_stale_actors() -> None:
                         actor_handle=actor,
                         namespace=PERSISTENT_NAMESPACE,
                         base_model=base_model,
+                        protected=bool(base_model and is_persistent_model(base_model)),
                     )
                     # Mark as ready since the actor passed health check
                     resource_pool.mark_ready(name)
@@ -195,6 +235,20 @@ async def _cleanup_stale_actors() -> None:
                         f"Actor {name} __ray_ready__ timed out; registering without marking ready"
                     )
                     try:
+                        def _pg_total_gpus(actor_name: str) -> int | None:
+                            try:
+                                pg = ray.util.get_placement_group(f"{actor_name}_pg")
+                                info = ray.util.placement_group_table(pg)
+                            except Exception:
+                                return None
+                            bundles = info.get("bundles") or {}
+                            total = sum(
+                                int(b.get("GPU", 0) or 0)
+                                for b in bundles.values()
+                                if isinstance(b, dict)
+                            )
+                            return total or None
+
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
                             num_gpus = 1
@@ -207,6 +261,7 @@ async def _cleanup_stale_actors() -> None:
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
+                            num_gpus = _pg_total_gpus(name) or num_gpus
                         elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -221,9 +276,12 @@ async def _cleanup_stale_actors() -> None:
                                 num_gpus = cfg.train_gpus
                             else:
                                 num_gpus = 8
+                            num_gpus = _pg_total_gpus(name) or num_gpus
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
+
+                        from tinker_server.backend.model_registry import is_persistent_model
 
                         resource_pool.register(
                             actor_name=name,
@@ -232,6 +290,7 @@ async def _cleanup_stale_actors() -> None:
                             actor_handle=actor,
                             namespace=PERSISTENT_NAMESPACE,
                             base_model=base_model,
+                            protected=bool(base_model and is_persistent_model(base_model)),
                             metadata={"startup_reconcile": "__ray_ready__timeout"},
                         )
                         registered += 1
@@ -704,7 +763,15 @@ async def lifespan(app: FastAPI):
     )
 
     async def _exec_sampling_asample(item):
+        logger.info(
+            "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
+            str(item.request_id),
+        )
         req = SampleRequest.model_validate_json(item.request_json)
+        logger.info(
+            "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
+            str(item.request_id),
+        )
         await sampling._do_sample(item.request_id, req, item.user_id)
 
     async def _exec_sampling_compute_logprobs(item):
@@ -830,8 +897,6 @@ async def lifespan(app: FastAPI):
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
 
-    from .gateway import close_http_clients
-
     await close_http_clients()
 
 
@@ -843,19 +908,12 @@ app = FastAPI(
     docs_url=None,  # Disable built-in Swagger UI
 )
 
-from .backend.future_store import FutureStoreUnavailableError
-
-
 @app.exception_handler(FutureStoreUnavailableError)
 async def future_store_unavailable_handler(_: Request, __: FutureStoreUnavailableError) -> JSONResponse:
     return JSONResponse(
         status_code=503,
         content={"detail": "Ray unavailable: FutureStore requires Ray"},
     )
-
-
-from .backend.api_work_queue import ApiWorkQueueUnavailableError
-from .backend.capacity_manager import CapacityManagerUnavailableError
 
 
 @app.exception_handler(ApiWorkQueueUnavailableError)
@@ -890,6 +948,158 @@ def get_token_encryptor() -> TokenEncryptor | None:
 
 
 @app.middleware("http")
+async def otel_trace_metrics_middleware(request: Request, call_next):
+    """Manual OTel instrumentation for HTTP server traces and metrics."""
+    tracer = get_otel_tracer()
+    method = request.method
+    route = _http_route_label(request)
+    start_s = time.perf_counter()
+    status_code = 500
+    failure_error: Exception | None = None
+
+    def _log_request_observation(elapsed_ms: float) -> None:
+        if status_code >= 500:
+            reason = classify_failure_reason(failure_error or RuntimeError(f"http_{status_code}"))
+            logger.error(
+                "[http.request] failed method=%s route=%s status_code=%s elapsed_ms=%.3f failure_reason=%s error_type=%s next_action=%s",
+                method,
+                route,
+                int(status_code),
+                float(elapsed_ms),
+                reason,
+                type(failure_error).__name__ if failure_error is not None else "HTTPStatusError",
+                "check_logs_and_trace",
+            )
+            return
+        if status_code >= 400:
+            logger.warning(
+                "[http.request] client_error method=%s route=%s status_code=%s elapsed_ms=%.3f",
+                method,
+                route,
+                int(status_code),
+                float(elapsed_ms),
+            )
+            return
+        logger.info(
+            "[http.request] completed method=%s route=%s status_code=%s elapsed_ms=%.3f",
+            method,
+            route,
+            int(status_code),
+            float(elapsed_ms),
+        )
+
+    if tracer is None:
+        try:
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 500))
+            return response
+        except Exception as e:
+            failure_error = e
+            raise
+        finally:
+            route = _http_route_label(request)
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            record_http_server_metrics(
+                method=method,
+                route=route,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+            )
+            _log_request_observation(elapsed_ms)
+
+    try:
+        from opentelemetry.propagate import extract
+        from opentelemetry.trace import SpanKind, Status, StatusCode
+    except Exception:
+        try:
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 500))
+            return response
+        except Exception as e:
+            failure_error = e
+            raise
+        finally:
+            route = _http_route_label(request)
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            record_http_server_metrics(
+                method=method,
+                route=route,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+            )
+            _log_request_observation(elapsed_ms)
+
+    context = extract(dict(request.headers))
+    span_name = f"{method} {route}"
+    with tracer.start_as_current_span(span_name, context=context, kind=SpanKind.SERVER) as span:
+        span_ctx = span.get_span_context()
+        if span_ctx and getattr(span_ctx, "trace_id", 0):
+            trace_id = f"{int(span_ctx.trace_id):032x}"
+            set_trace_id(trace_id)
+            request.state.trace_id = trace_id
+        span.set_attribute("http.method", method)
+        span.set_attribute("http.route", route)
+        error_recorded = False
+
+        def _record_server_error(error: Exception, *, escaped: bool) -> None:
+            nonlocal error_recorded
+            span.record_exception(error, attributes={"exception.escaped": bool(escaped)})
+            error_recorded = True
+
+        try:
+            response = await call_next(request)
+            route = _http_route_label(request)
+            status_code = int(getattr(response, "status_code", 500))
+            try:
+                span.update_name(f"{method} {route}")
+            except Exception:
+                pass
+            span.set_attribute("http.status_code", status_code)
+            span.set_attribute("http.route", route)
+            if status_code >= 500:
+                # FastAPI may convert errors into HTTP 5xx responses before they
+                # propagate here. Record a synthetic error so traces still include
+                # an explicit error record for server failures.
+                if not error_recorded:
+                    _record_server_error(
+                        RuntimeError(f"HTTP {status_code} response for {method} {route}"),
+                        escaped=False,
+                    )
+                span.set_status(Status(StatusCode.ERROR, f"http.status_code={status_code}"))
+            return response
+        except Exception as e:
+            failure_error = e
+            if isinstance(e, HTTPException):
+                try:
+                    status_code = int(e.status_code)
+                except Exception:
+                    status_code = 500
+            else:
+                status_code = 500
+            route = _http_route_label(request)
+            try:
+                span.update_name(f"{method} {route}")
+            except Exception:
+                pass
+            span.set_attribute("http.status_code", status_code)
+            span.set_attribute("http.route", route)
+            if status_code >= 500:
+                _record_server_error(e, escaped=True)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        finally:
+            route = _http_route_label(request)
+            elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+            record_http_server_metrics(
+                method=method,
+                route=route,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+            )
+            _log_request_observation(elapsed_ms)
+
+
+@app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
     """Validate API key or sk- token from X-API-Key or Authorization header.
 
@@ -900,14 +1110,31 @@ async def api_key_auth_middleware(request: Request, call_next):
     If neither is configured, auth is disabled (dev mode).
     """
     path = request.url.path
+    traceparent_trace_id = extract_trace_id_from_traceparent(request.headers.get("traceparent"))
+    incoming_trace_id = traceparent_trace_id
+    if incoming_trace_id is None and get_trace_id() is None:
+        incoming_trace_id = request.headers.get("X-Trace-Id")
+    trace_id = ensure_trace_id(incoming_trace_id)
+    request.state.trace_id = trace_id
+
+    def _with_trace(response):
+        final_trace_id = ensure_trace_id(
+            getattr(request.state, "trace_id", None) or get_trace_id() or trace_id
+        )
+        request.state.trace_id = final_trace_id
+        response.headers["X-Trace-Id"] = final_trace_id
+        return response
+
+    async def _next_with_trace():
+        return _with_trace(await call_next(request))
 
     # Skip auth if no authentication configured (dev mode)
     if not config.auth_enabled:
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Skip auth for specific paths
     if path in UNAUTHENTICATED_PATHS:
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Special-case: allow unauthenticated checkpoint archive downloads when a valid,
     # short-lived signed token is provided in the URL (Tinker SDK expects a signed URL).
@@ -933,9 +1160,9 @@ async def api_key_auth_middleware(request: Request, call_next):
                     raise ValueError("token does not match request path")
 
                 request.state.user_data = {"user_id": payload.get("user_id")}
-                return await call_next(request)
+                return await _next_with_trace()
             except Exception:
-                return JSONResponse(status_code=401, content={"error": "Invalid download token"})
+                return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid download token"}))
 
     # Try X-API-Key header first, then Authorization header
     api_key = request.headers.get("X-API-Key", "")
@@ -948,16 +1175,16 @@ async def api_key_auth_middleware(request: Request, call_next):
             api_key = auth_header
 
     if not api_key:
-        return JSONResponse(
+        return _with_trace(JSONResponse(
             status_code=401,
             content={"error": "Missing API key"},
-        )
+        ))
 
     # Method 1: Check hardcoded API key (admin)
     if config.validate_api_key(api_key):
         # Admin key - assign special "admin" user_id for checkpoint ownership
         request.state.user_data = {"user_id": "admin"}
-        return await call_next(request)
+        return await _next_with_trace()
 
     # Method 2: Try sk- token decryption
     if api_key.startswith("sk-") and config.token_secret_key:
@@ -966,13 +1193,13 @@ async def api_key_auth_middleware(request: Request, call_next):
             user_data = encryptor.decrypt_token(api_key)
             if user_data is not None:
                 request.state.user_data = user_data
-                return await call_next(request)
+                return await _next_with_trace()
 
     # Neither method succeeded
-    return JSONResponse(
+    return _with_trace(JSONResponse(
         status_code=401,
         content={"error": "Invalid API key or token"},
-    )
+    ))
 
 
 # Register routes with API prefix

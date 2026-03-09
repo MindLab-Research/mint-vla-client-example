@@ -77,48 +77,56 @@ def main() -> int:
             return _fail(f"create_sampling_session missing sampling_session_id: {sampling!r}")
 
         for prompt_len in (4096, 8192, 16384):
-            fut = _post_json(
-                f"{BASE_URL}/api/v1/asample",
-                {
-                    "sampling_session_id": sampling_session_id,
-                    "seq_id": 0,
-                    "num_samples": 1,
-                    "prompt": {"chunks": [{"tokens": _make_prompt_tokens(prompt_len), "type": "encoded_text"}]},
-                    "sampling_params": {
-                        "max_tokens": 1,
-                        "temperature": 0.0,
-                        "top_k": -1,
-                        "top_p": 1.0,
+            for max_tokens in (1, 16, 64):
+                seq_id = uuid.uuid4().int % 1000000000
+                fut = _post_json(
+                    f"{BASE_URL}/api/v1/asample",
+                    {
+                        "sampling_session_id": sampling_session_id,
+                        "seq_id": seq_id,
+                        "num_samples": 1,
+                        "prompt": {"chunks": [{"tokens": _make_prompt_tokens(prompt_len), "type": "encoded_text"}]},
+                        "sampling_params": {
+                            "max_tokens": max_tokens,
+                            "temperature": 0.0,
+                            "top_k": -1,
+                            "top_p": 1.0,
+                        },
                     },
-                },
-                timeout_s=30.0,
-            )
-            request_id = fut.get("request_id")
-            if not request_id:
-                return _fail(f"asample missing request_id: {fut!r}")
+                    timeout_s=30.0,
+                )
+                request_id = fut.get("request_id")
+                if not request_id:
+                    return _fail(f"asample missing request_id: {fut!r}")
 
-            resp = requests.post(
-                f"{BASE_URL}/api/v1/retrieve_future",
-                headers=_headers(),
-                json={"request_id": request_id},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                # Completed before first poll; make the request heavier and try again.
-                continue
-            if resp.status_code != 408:
-                return _fail(f"retrieve_future status_code={resp.status_code} expected 408: {resp.text[:200]!r}")
+                resp = requests.post(
+                    f"{BASE_URL}/api/v1/retrieve_future",
+                    headers=_headers(),
+                    json={"request_id": request_id},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    # Completed before first poll; make the request heavier and try again.
+                    continue
+                if resp.status_code != 408:
+                    return _fail(f"retrieve_future status_code={resp.status_code} expected 408: {resp.text[:200]!r}")
 
-            ra = resp.headers.get("Retry-After")
-            if ra != "1":
-                return _fail(f"Retry-After={ra!r} expected '1' (headers={dict(resp.headers)!r})")
+                ra = resp.headers.get("Retry-After")
+                try:
+                    ra_i = int(ra)
+                except Exception:
+                    return _fail(f"Retry-After={ra!r} expected int header (headers={dict(resp.headers)!r})")
+                if ra_i < 1:
+                    return _fail(f"Retry-After={ra_i!r} expected >= 1 (headers={dict(resp.headers)!r})")
 
-            body = resp.json()
-            if body != {"queue_state": "active"}:
-                return _fail(f"body={body!r} expected {{'queue_state': 'active'}}")
+                body = resp.json()
+                if not (isinstance(body, dict) and body.get("queue_state") == "active"):
+                    return _fail(f"body={body!r} expected queue_state='active'")
+                if "retry_after_s" in body and body.get("retry_after_s") != ra_i:
+                    return _fail(f"retry_after_s={body.get('retry_after_s')!r} expected {ra_i}")
 
-            print("PASS")
-            return 0
+                print("PASS")
+                return 0
 
         return _fail("retrieve_future returned 200 on first poll for all attempts (cannot observe 408 headers)")
     except Exception as e:

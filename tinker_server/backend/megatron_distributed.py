@@ -16,10 +16,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tensordict import TensorDict
+    pass
 
 import ray
 # NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
@@ -27,6 +27,7 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
+from ..logging_context import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ class DistributedConfig:
     expert_tensor_parallel_size: int | None = None  # None = use TP, 1 = no expert splitting
     context_parallel_size: int = 1
     use_fp8: bool = False  # FP8 quantization for K2 and similar models
+    router_replay_mode: str = "disabled"
 
     @property
     def world_size(self) -> int:
@@ -207,7 +209,6 @@ def get_node_ip_and_free_port() -> tuple[str, int]:
     Uses Ray's node IP which correctly identifies the inter-node network interface.
     Self-contained to avoid module import issues on Ray workers.
     """
-    import socket
     import ray
     # Use Ray's IP detection which respects --node-ip-address and finds the correct interface
     ip = ray.util.get_node_ip_address()
@@ -321,7 +322,6 @@ class MegatronRankWorker:
         Returns a list of CPU tensors containing gradient data.
         Must be called while in train_mode context (gradients on GPU).
         """
-        import torch
         import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
@@ -353,7 +353,6 @@ class MegatronRankWorker:
         Args:
             grads: List of CPU tensors from _capture_gradients.
         """
-        import torch
         import logging
         from megatron.core.distributed import DistributedDataParallel as DDP
 
@@ -516,7 +515,6 @@ class MegatronRankWorker:
         Clears all momentum and variance buffers so the new session starts fresh,
         without momentum contamination from previous sessions.
         """
-        import torch
         from megatron.core.optimizer import ChainedOptimizer
 
         optimizer = self.engine.optimizer
@@ -720,7 +718,8 @@ class MegatronRankWorker:
 
         logger.info(
             f"[Rank {self.rank}] initialize() starting: CUDA_VISIBLE_DEVICES={cuda_device!r}, "
-            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}"
+            f"ray_gpu_ids={ray_gpu_ids}, torch.cuda.device_count()={device_count}, "
+            f"request_id={get_request_id() or '-'}"
         )
 
         if device_count != 1:
@@ -817,7 +816,11 @@ class MegatronRankWorker:
             logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
-        from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+        from verl.workers.config import (
+            HFModelConfig,
+            McoreEngineConfig,
+            McoreOptimizerConfig,
+        )
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
         from transformers import AutoConfig
@@ -914,6 +917,39 @@ class MegatronRankWorker:
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
                 f"top-{num_experts_per_tok} routing, permute_fusion=True"
             )
+            enable_deepep = (
+                _env_flag("MINT_MEGATRON_ENABLE_DEEPEP", default=False)
+                and int(getattr(self.config, "expert_parallel_size", 1) or 1) > 1
+            )
+            if enable_deepep:
+                moe_token_dispatcher_type = (
+                    os.environ.get("MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE", "flex").strip().lower()
+                )
+                override_tf_config["moe_token_dispatcher_type"] = moe_token_dispatcher_type
+                override_tf_config["moe_flex_dispatcher_backend"] = (
+                    os.environ.get("MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "deepep").strip().lower()
+                )
+                # NOTE: Megatron-LM still supports moe_enable_deepep but warns it's deprecated;
+                # keep it alongside moe_flex_dispatcher_backend for compatibility.
+                override_tf_config["moe_enable_deepep"] = True
+                override_tf_config["moe_router_dtype"] = (
+                    os.environ.get("MINT_MEGATRON_MOE_ROUTER_DTYPE", "fp32").strip().lower()
+                )
+                if moe_token_dispatcher_type != "alltoall":
+                    if override_tf_config.get("moe_shared_expert_overlap") is True:
+                        override_tf_config["moe_shared_expert_overlap"] = False
+                        logger.info(
+                            f"[Rank {self.rank}] Disabled moe_shared_expert_overlap for moe_token_dispatcher_type={moe_token_dispatcher_type}"
+                        )
+                sms = os.environ.get("MINT_MEGATRON_MOE_DEEPEP_NUM_SMS", "").strip()
+                if sms:
+                    override_tf_config["moe_deepep_num_sms"] = int(sms)
+                logger.info(
+                    f"[Rank {self.rank}] DeepEP enabled: dispatcher={override_tf_config['moe_token_dispatcher_type']}, "
+                    f"backend={override_tf_config['moe_flex_dispatcher_backend']}, "
+                    f"router_dtype={override_tf_config['moe_router_dtype']}, "
+                    f"deepep_num_sms={override_tf_config.get('moe_deepep_num_sms', 'default')}"
+                )
 
         override_tf_config["deallocate_pipeline_outputs"] = True
         grad_accum_fusion_available = False
@@ -1236,7 +1272,6 @@ class MegatronRankWorker:
         """
         import torch
         import os
-        import socket
         import glob
 
         status = {
@@ -1264,6 +1299,7 @@ class MegatronRankWorker:
         data_items: list[dict],
         loss_fn: str,
         loss_fn_config: dict,
+        rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
     ) -> dict:
@@ -1276,6 +1312,7 @@ class MegatronRankWorker:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
             loss_fn_config: Config for loss function (e.g., {"epsilon": 0.2} for PPO).
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             session_id: Optional session ID for gradient isolation.
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
@@ -1332,9 +1369,15 @@ class MegatronRankWorker:
             loss_function = create_sft_loss_fn(return_logprobs=True)
         elif loss_fn == "ppo":
             epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(epsilon)
+            loss_function = create_ppo_loss_fn(
+                epsilon,
+                rollout_correction_config=rollout_correction_config,
+            )
         elif loss_fn == "importance_sampling":
-            loss_function = create_ppo_loss_fn(epsilon=float("inf"))
+            loss_function = create_ppo_loss_fn(
+                epsilon=float("inf"),
+                rollout_correction_config=rollout_correction_config,
+            )
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
@@ -1574,6 +1617,8 @@ class MegatronRankWorker:
             logger.debug(f"[Rank {self.rank} DEBUG] Extracted debug_metrics: {debug_metrics}")
 
             # Return CPU-safe scalars and loss_fn_outputs
+            routing_replay_enabled = int("routed_experts" in data.keys())
+            routing_replay_items = int(valid_count) if routing_replay_enabled else 0
             result_dict = {
                 "loss_value": float(loss_value),
                 "num_tokens": int(num_tokens),
@@ -1582,6 +1627,8 @@ class MegatronRankWorker:
                 "n_ppo_results": int(n_ppo_results),
                 "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
+                "routing_replay_enabled": routing_replay_enabled,
+                "routing_replay_items": routing_replay_items,
             }
             # Add debug metrics if present
             if debug_metrics:
@@ -1932,8 +1979,71 @@ class MegatronRankWorker:
 
             expert_pat = re.compile(r"\.mlp\.(?:shared_)?experts\.(\d+)\.")
 
+            # Debug: verify whether "shared" expert LoRA weights are actually identical across
+            # expert-parallel (EP) shards. If they differ, "expert-0-only" export is not valid.
+            #
+            # We only gather small checksum scalars (not full tensors) to keep overhead low.
+            ep_group = None
+            ep_size = 1
+            ep_rank = 0
+            try:
+                from megatron.core import parallel_state as mpu
+
+                ep_size = int(mpu.get_expert_model_parallel_world_size())
+                ep_rank = int(mpu.get_expert_model_parallel_rank())
+                if ep_size > 1:
+                    ep_group = mpu.get_expert_model_parallel_group()
+            except Exception:
+                ep_group = None
+                ep_size = 1
+                ep_rank = 0
+
+            did_ep_checksum = False
             with self.engine.eval_mode():
                 for name, tensor in bridge.export_adapter_weights(self.engine.module, cpu=True, show_progress=False):
+                    if (
+                        (not did_ep_checksum)
+                        and ep_group is not None
+                        and ep_size > 1
+                        and use_per_expert_lora
+                        and ".mlp.experts." in name
+                        and ".mlp.shared_experts." not in name
+                        and name.endswith(".adapter.linear_in.weight")
+                    ):
+                        import torch
+                        import torch.distributed as dist
+
+                        # tensor is already on CPU here; compute checksum on CPU, then all_gather
+                        # the tiny checksum tensor on GPU/NCCL.
+                        t = tensor.detach()
+                        chk = torch.tensor(
+                            [
+                                float(ep_rank),
+                                float(t.float().sum().item()),
+                                float(t.float().mean().item()),
+                                float(t.float().abs().max().item()),
+                            ],
+                            device=torch.cuda.current_device(),
+                            dtype=torch.float32,
+                        )
+                        gathered = [torch.empty_like(chk) for _ in range(ep_size)]
+                        dist.all_gather(gathered, chk, group=ep_group)
+                        if self.rank == 0:
+                            rows = [
+                                (
+                                    int(g[0].item()),
+                                    float(g[1].item()),
+                                    float(g[2].item()),
+                                    float(g[3].item()),
+                                )
+                                for g in gathered
+                            ]
+                            rows = sorted(rows, key=lambda x: x[0])
+                            logger.info(
+                                f"[Rank 0] EP LoRA checksum probe ({name}): "
+                                f"ep_size={ep_size} rows={rows}"
+                            )
+                        did_ep_checksum = True
                     if self.rank == 0:
                         if shared_export:
                             m = expert_pat.search(name)
@@ -1956,15 +2066,28 @@ class MegatronRankWorker:
                 logger.info(f"[Rank 0] Filtered {before - len(adapter_state)} MLP/expert params (export_adapter_weights)")
 
             # For MoE models exporting per-expert LoRA, the full per-expert tree can be
-            # extremely large (K2: ~140k tensors, ~77GB). In current Megatron-Bridge
-            # integration, expert LoRA weights are shared within each EP shard; exporting
-            # only one representative expert per EP shard is sufficient for vLLM, and
-            # vLLM will fill missing experts (patched via sitecustomize).
+            # extremely large (K2: ~140k tensors, ~77GB).
+            #
+            # Current vLLM hot-load support in this repo only supports:
+            # - full per-expert exports (all experts present), OR
+            # - "shared-expert" exports (expert 0 only) where vLLM broadcasts expert 0
+            #   weights to all experts at load time.
+            #
+            # A "one representative expert per EP shard" sparse export is not supported
+            # by the current vLLM loader patch (it fail-fast) because correct filling
+            # requires EP shard aware mapping.
             if model_is_moe and use_per_expert_lora:
                 import os
                 import re
 
                 if os.environ.get("MINT_MOE_LORA_SPARSE_EXPERT_EXPORT", "1").strip() != "0":
+                    # Sparse expert export: keep one representative expert per EP shard (linear placement).
+                    #
+                    # This reduces the export artifact size drastically (K2 full per-expert adapters are very large).
+                    # The downstream vLLM hot-load path must reconstruct full per-expert tensors at load time.
+                    #
+                    # If MINT_MOE_LORA_SHARED_EXPERT_EXPORT=1 is also enabled, we additionally drop to expert-0-only.
+
                     # Determine EP size.
                     try:
                         from megatron.core import parallel_state as mpu
@@ -2221,7 +2344,7 @@ class MegatronRankWorker:
             from megatron.core import parallel_state as mpu
             etp_size = mpu.get_expert_tensor_parallel_world_size()
             logger.info(f"[Rank {self.rank}] ETP size: {etp_size}")
-        except Exception as e:
+        except Exception:
             # ETP not available, assume 1 (no expert tensor parallelism)
             etp_size = 1
 
@@ -2385,7 +2508,7 @@ class MegatronRankWorker:
                             f.write(f"Total params: {len(all_param_names)}\n")
                             f.write(f"LoRA params found: {len(lora_param_names)}\n")
                             f.write(f"TP size: {tp_size}, ETP size: {etp_size}, EP size: {ep_size}\n")
-                            f.write(f"LoRA params with shapes and norms:\n")
+                            f.write("LoRA params with shapes and norms:\n")
                             total_norm = 0.0
                             nonzero_count = 0
                             for n in lora_param_names[:50]:
@@ -2399,7 +2522,7 @@ class MegatronRankWorker:
                                         nonzero_count += 1
                                     f.write(f"  {n}: shape={shape}, norm={norm:.6f}, max={max_val:.6f}\n")
                             f.write(f"\nSummary: {nonzero_count}/{len(lora_param_names[:50])} tensors non-zero, total_norm={total_norm:.6f}\n")
-                            f.write(f"===\n")
+                            f.write("===\n")
                         # ALSO LOG TO STDOUT for visibility in server logs
                         logger.info(f"[Rank 0] LoRA TENSOR NORMS: {nonzero_count}/{len(lora_param_names[:50])} non-zero, total_norm={total_norm:.6f}")
                         for n in lora_param_names[:5]:
@@ -2546,10 +2669,15 @@ class MegatronRankWorker:
         )
         expert_representatives = []
         if sparse_expert_export:
-            for i in range(ep_size):
-                s, e = _ep_rank_to_expert_range(i, ep_size=ep_size, num_experts=num_experts)
-                if s < e:
-                    expert_representatives.append(s)
+            # One representative expert per EP shard (linear placement).
+            # The vLLM hot-load patch reconstructs full per-expert tensors at load time.
+            base = num_experts // ep_size
+            rem = num_experts % ep_size
+            expert_representatives = [
+                (r * base + min(r, rem))
+                for r in range(ep_size)
+                if (base + (1 if r < rem else 0)) > 0
+            ]
 
         logger.info(
             f"[Rank 0] Processing {len(adapter_state)} params from adapter_state "
@@ -2588,7 +2716,6 @@ class MegatronRankWorker:
                 if use_per_expert_lora and num_experts > 0 and not is_shared_expert:
                     # Split fused gate_up_proj if needed, then expand with EP-aware indexing
                     if '.gate_up_proj_fused.' in peft_name:
-                        import torch
                         gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
                         up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
 
@@ -2610,7 +2737,14 @@ class MegatronRankWorker:
                             else:
                                 continue
 
-                            rep_experts = [expert_start] if sparse_expert_export else range(expert_start, expert_end)
+                            if sparse_expert_export:
+                                rep_experts = [
+                                    e
+                                    for e in expert_representatives
+                                    if expert_start <= e < expert_end
+                                ]
+                            else:
+                                rep_experts = range(expert_start, expert_end)
                             for expert_idx in rep_experts:
                                 gate_expert_name = gate_peft_name.replace(
                                     '.mlp.gate_proj.', f'.mlp.experts.{expert_idx}.gate_proj.'
@@ -2635,7 +2769,14 @@ class MegatronRankWorker:
                             if expert_start >= expert_end:
                                 continue
 
-                            rep_experts = [expert_start] if sparse_expert_export else range(expert_start, expert_end)
+                            if sparse_expert_export:
+                                rep_experts = [
+                                    e
+                                    for e in expert_representatives
+                                    if expert_start <= e < expert_end
+                                ]
+                            else:
+                                rep_experts = range(expert_start, expert_end)
                             for expert_idx in rep_experts:
                                 # Insert expert index into path
                                 if '.mlp.gate_proj.' in peft_name:
@@ -2687,7 +2828,6 @@ class MegatronRankWorker:
                 if use_per_expert_lora and num_experts > 0:
                     # First check if this is a fused gate_up_proj that needs splitting
                     if '.gate_up_proj_fused.' in peft_name:
-                        import torch
                         # Split the fused projection before expanding to per-expert
                         gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
                         up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
@@ -2748,7 +2888,6 @@ class MegatronRankWorker:
             # vLLM's MergedColumnParallelLinearWithLoRA expects separate gate_proj and up_proj
             # lora_A is duplicated, lora_B is split in half
             if '.gate_up_proj_fused.' in peft_name:
-                import torch
                 gate_peft_name = peft_name.replace('.gate_up_proj_fused.', '.gate_proj.')
                 up_peft_name = peft_name.replace('.gate_up_proj_fused.', '.up_proj.')
 
@@ -2993,7 +3132,6 @@ class MegatronRankWorker:
 
     def get_lora_weight_norm(self) -> float:
         """Compute L2 norm of all LoRA weights for debugging."""
-        import torch
         with self.engine.train_mode():
             from verl.utils.megatron_utils import unwrap_model
             model = unwrap_model(self.engine.module)
@@ -3015,7 +3153,6 @@ class MegatronRankWorker:
 
     def get_lora_weight_checksum(self) -> dict:
         """Compute checksum stats for LoRA weights (rank 0 only)."""
-        import torch
         with self.engine.train_mode():
             from verl.utils.megatron_utils import unwrap_model
             model = unwrap_model(self.engine.module)
@@ -3041,7 +3178,6 @@ class MegatronRankWorker:
 
     def get_base_weight_checksum(self, max_params: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA params (rank 0 only)."""
-        import torch
         with self.engine.train_mode():
             from verl.utils.megatron_utils import unwrap_model
             model = unwrap_model(self.engine.module)
@@ -3178,7 +3314,6 @@ class MegatronRankWorker:
         Returns:
             dict with status and count of reinitialized parameters.
         """
-        import torch
         import torch.nn.init as init
         from megatron.core.optimizer import ChainedOptimizer
 
@@ -4087,11 +4222,6 @@ class MegatronWorkerGroup:
                 "TRANSFORMERS_OFFLINE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",  # Avoid stale bytecode on PFS
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
-                # Fix flash-attn / TransformerEngine dynamic loading:
-                # flash_attn_2_cuda fails to import when libc10.so is not on the loader path,
-                # which leaves TE's flash_attn_func / flash_attn_varlen_func as None and crashes
-                # with "TypeError: 'NoneType' object is not callable".
-                "LD_LIBRARY_PATH": "/opt/venv/lib/python3.10/site-packages/torch/lib:/usr/local/cuda/lib64",
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
@@ -4105,6 +4235,22 @@ class MegatronWorkerGroup:
         for k in (
             "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
             "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+        ):
+            v = os.environ.get(k)
+            if v is not None:
+                runtime_env["env_vars"][k] = v
+
+        # Forward DeepEP knobs into rank workers.
+        #
+        # Rank workers run on GPU nodes; they do NOT inherit the API server's
+        # environment unless we explicitly forward selected env vars into the
+        # Ray runtime_env.
+        for k in (
+            "MINT_MEGATRON_ENABLE_DEEPEP",
+            "MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE",
+            "MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
+            "MINT_MEGATRON_MOE_ROUTER_DTYPE",
+            "MINT_MEGATRON_MOE_DEEPEP_NUM_SMS",
         ):
             v = os.environ.get(k)
             if v is not None:
@@ -4166,7 +4312,7 @@ class MegatronWorkerGroup:
 
         # Now initialize all workers simultaneously - they will reach
         # init_process_group barrier together, avoiding deadlock
-        logger.info(f"[MegatronWorkerGroup] Calling initialize() on all workers...")
+        logger.info("[MegatronWorkerGroup] Calling initialize() on all workers...")
         ray.get([w.initialize.remote() for w in self.workers])
 
         logger.info(f"[MegatronWorkerGroup] All {world_size} workers initialized and ready")
@@ -4231,7 +4377,7 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] Swapping session state on workers to {new_session_id}")
         futures = [w.swap_session_state.remote(new_session_id) for w in self.workers]
         ray.get(futures)
-        logger.info(f"[MegatronWorkerGroup] Session state swapped on all workers")
+        logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
 
     def _ensure_session_loaded(
         self,
@@ -4384,6 +4530,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
         *,
@@ -4397,6 +4544,7 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             session_id: Session ID for multi-tenant gradient isolation.
             reset_bias: If True, reset expert_bias to zero before forward pass.
                 If None, uses MINT_RESET_EXPERT_BIAS (default False for training).
@@ -4425,7 +4573,9 @@ class MegatronWorkerGroup:
         # to avoid Ray serialization issues with nested tensors)
         t2 = time.perf_counter() if timing else 0.0
         futures = [
-            w.forward_backward.remote(data_items, loss_fn, loss_fn_config, effective_session_id, reset_bias)
+            w.forward_backward.remote(
+                data_items, loss_fn, loss_fn_config, rollout_correction_config, effective_session_id, reset_bias
+            )
             for w in self.workers
         ]
         results = ray.get(futures)
@@ -4454,6 +4604,12 @@ class MegatronWorkerGroup:
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
+        metrics["routing_replay_enabled:mean"] = float(
+            rank0_result.get("routing_replay_enabled", 0.0)
+        )
+        metrics["routing_replay_items:sum"] = float(
+            rank0_result.get("routing_replay_items", 0.0)
+        )
 
         # Add PPO metrics if present (now pre-extracted as scalars)
         # importance_sampling uses PPO loss with epsilon=inf, so include it here
@@ -4508,6 +4664,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
+        rollout_correction_config: dict | None = None,
         learning_rate: float | None = None,
         session_id: str | None = None,
         *,
@@ -4524,6 +4681,7 @@ class MegatronWorkerGroup:
             data_items: List of Tinker Datum dicts.
             loss_fn: Loss function type.
             loss_fn_config: Optional loss config.
+            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
             learning_rate: Optional LR override (defaults to current group's LR).
             session_id: Session ID for multi-tenant gradient isolation.
 
@@ -4538,6 +4696,7 @@ class MegatronWorkerGroup:
             data_items=data_items,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
+            rollout_correction_config=rollout_correction_config,
             session_id=effective_session_id,
             train_attn=train_attn,
             train_mlp=train_mlp,
@@ -5441,6 +5600,22 @@ def get_or_create_megatron_worker_group(
             raise RuntimeError(f"Failed to probe placement group {pg_name!r}: {e}") from e
 
         if orphan_pg is not None:
+            # Race guard: actor creation is not instantaneous. A concurrent request can
+            # observe `ray.get_actor(...)` as missing while the named actor is still
+            # being registered. Removing the placement group in that window will
+            # SIGTERM the in-flight Megatron workers (Ray reports: "placement group was removed").
+            import time
+
+            for _ in range(30):
+                try:
+                    actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                    logger.info(
+                        f"Megatron actor appeared after PG probe; reusing actor={actor_name} pg={pg_name}"
+                    )
+                    return actor
+                except ValueError:
+                    time.sleep(1)
+
             logger.warning(
                 f"Found orphan Megatron placement group without actor; removing to unblock recreate: {pg_name}"
             )
@@ -5481,14 +5656,20 @@ def get_or_create_megatron_worker_group(
                 v = os.environ.get(k)
                 if v is not None:
                     runtime_env["env_vars"][k] = v
-            volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
-            if volc_rq:
-                from .volc_placement import list_node_ips_for_resource_queue
+            explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
+            if explicit_node_ips_csv:
+                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
+            else:
+                volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
+                if volc_rq:
+                    from .volc_placement import list_node_ips_for_resource_queue
 
-                node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
-                if not node_ips:
-                    raise RuntimeError(f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}")
-                runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
+                    node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
+                    if not node_ips:
+                        raise RuntimeError(
+                            f"no Ray GPU nodes found for MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID={volc_rq}"
+                        )
+                    runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = ",".join(node_ips)
 
             timing = os.environ.get("MINT_TIMING_DIAG")
             if timing is not None:

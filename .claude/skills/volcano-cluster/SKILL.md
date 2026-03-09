@@ -240,9 +240,13 @@ PY
    ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
    ```
 
-5. **Connect SSH server to cluster:**
+5. **DO NOT run `ray start` on `mint-dev`:**
+   - `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
+   - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head without starting a local node.
+
    ```bash
-   ssh mint-dev "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+   ssh mint-dev "ray status --address='<RAY_HEAD_IP>:6379'"
+   ssh mint-dev "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
    ```
 
 ### Production Cluster
@@ -282,9 +286,13 @@ PY
      /root/.volc/bin/volc ml_task submit -c "$tmp" --output json'
    ```
 
-4. **Connect SSH server to cluster:**
+4. **DO NOT run `ray start` on `mint-prod-volcano`:**
+   - This host is a driver/API bastion. Starting a local raylet makes it schedulable and can steal actor placement.
+   - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head without starting a local node.
+
    ```bash
-ssh mint-prod-volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+   ssh mint-prod-volcano "ray status --address='<RAY_HEAD_IP>:6379'"
+   ssh mint-prod-volcano "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
    ```
 
 ---
@@ -312,14 +320,13 @@ ssh mint-prod-volcano '/root/.volc/bin/volc ml_task cancel --id <head_task_id>'
 
 **WARNING:** Production tasks include "prod" in names. Never cancel prod tasks for dev work.
 
-### Disconnect SSH Server from Cluster
+### If you accidentally started a local raylet on a driver/bastion
+
+This should not be needed in normal operation.
 
 ```bash
-# Dev
-ssh mint-dev "ray stop"
-
-# Prod
-ssh mint-prod-volcano "ray stop"
+ssh mint-dev "ray stop || true"
+ssh mint-prod-volcano "ray stop || true"
 ```
 
 ---

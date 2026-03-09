@@ -190,9 +190,14 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
-    # Default profile is kept for H200-style deployment.
-    # For Volcano A800 profile, use MINT_MODEL_CONFIG_OVERRIDES_JSON with:
-    # `configs/volcano_a800_235b_overrides.json`.
+    # Default profile is kept for the H-card single-node vLLM deployment shape:
+    # - Inference: TP=8 on one 8-GPU node via backend="mp"
+    # - Training: TP=4, PP=2, EP=2 (16 GPUs)
+    # For Volcano A800, use MINT_MODEL_CONFIG_OVERRIDES_JSON with:
+    # `./.claude/skills/volcano-cluster/configs/volcano_a800_235b_overrides.json`
+    # to switch to the documented multi-node A800 shape:
+    # - Inference: TP=16 via backend="ray" (16 GPUs)
+    # - Training: TP=4, PP=1, EP=8 (32 GPUs)
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
         num_parameters=235.0,
         is_moe=True,
@@ -332,6 +337,8 @@ MODEL_CONFIGS = {
         max_model_len=8192,  # 8K context
         is_mla=True,  # DeepSeek V3 MLA architecture
         gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
     ),
 }
 
@@ -549,5 +556,6 @@ def list_supported_models() -> list[str]:
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
         "moonshotai/Kimi-K2-Instruct",
+        "moonshotai/Moonlight-16B-A3B-Instruct",
     ]
     return [m for m in allowed if m in MODEL_CONFIGS]

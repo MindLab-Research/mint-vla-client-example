@@ -375,11 +375,11 @@ Upstream (remote) server config requirements:
 - If `get_server_capabilities` on the upstream does not include a routed model, the gateway treats it as misconfiguration and fails requests for that model.
 
 GPU-aware tuning knobs:
-- GPU types: Volcano uses A800 80GB; Aliyun uses L20X 140GB.
+- GPU types: Volcano uses A800 80GB; Aliyun uses H (SM90).
 - Tune per-model TP/EP/CP and vLLM memory caps in `tinker_server/backend/model_registry.py`.
 - For environment-specific tuning without code changes, set `MINT_MODEL_CONFIG_OVERRIDES_JSON`:
   ```bash
-  export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16}}'
+  export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":2048,"vllm_distributed_executor_backend":"ray"}}'
   ```
 
 **IMPORTANT:** `PYTHONPATH` must prioritize `tinker-server-auth` to override pip-installed `tinker-server`. Without this, auth middleware is bypassed.
@@ -574,9 +574,14 @@ sleep 80 && curl -s http://localhost:18000/api/v1/healthz
 
 ## 5. Ray Cluster
 
-**Connect SSH server to cluster:**
+**DO NOT run `ray start` on `mint-prod-volcano`:**
+- This host is a driver/API bastion. Starting a local raylet makes it schedulable and can steal actor placement.
+- Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head without starting a local node.
+
+**Safe connectivity check (no local raylet):**
 ```bash
-ssh mint-prod-volcano "ray start --address='<RAY_HEAD_IP>:6379' --num-gpus=0"
+ssh mint-prod-volcano "ray status --address='<RAY_HEAD_IP>:6379'"
+ssh mint-prod-volcano "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
 ```
 
 **Get Ray head IP from PFS:**

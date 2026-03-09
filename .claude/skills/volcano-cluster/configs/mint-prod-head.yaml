@@ -36,7 +36,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:12"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:15-sm80"
 ResourceQueueID: "q-20251225183621-m2297"  # CPU queue for head node
 Framework: "Custom"
 

@@ -113,18 +113,22 @@ def decode_request_id(request_id: str) -> tuple[str, str] | None:
 
 def _pick_auth_headers(*, incoming_headers: dict[str, str], upstream: Upstream) -> dict[str, str]:
     incoming_lower = {k.lower(): v for k, v in incoming_headers.items()}
+    forwarded: dict[str, str] = {}
+    user_agent = (incoming_headers.get("User-Agent") or incoming_lower.get("user-agent") or "").strip()
+    if user_agent:
+        forwarded["User-Agent"] = user_agent
     if upstream.auth_mode == "none":
-        return {}
+        return forwarded
     if upstream.auth_mode == "static_api_key":
-        return {"X-API-Key": upstream.api_key or ""}
+        return {**forwarded, "X-API-Key": upstream.api_key or ""}
     if upstream.auth_mode == "pass_through":
         api_key = (incoming_headers.get("X-API-Key") or incoming_lower.get("x-api-key") or "").strip()
         if api_key:
-            return {"X-API-Key": api_key}
+            return {**forwarded, "X-API-Key": api_key}
         auth = (incoming_headers.get("Authorization") or incoming_lower.get("authorization") or "").strip()
         if auth:
-            return {"Authorization": auth}
-        return {}
+            return {**forwarded, "Authorization": auth}
+        return forwarded
     raise ValueError(
         f"TINKER_GATEWAY_CONFIG_JSON: unsupported auth_mode={upstream.auth_mode!r} for {upstream.alias!r}"
     )
@@ -147,6 +151,23 @@ async def forward_json(
             client = httpx.AsyncClient(base_url=upstream.base_url)
             _http_clients[key] = client
     return await client.request(method, path, headers=headers, json=json_body, timeout=timeout_s)
+
+
+async def forward_request(
+    *,
+    upstream: Upstream,
+    method: str,
+    path: str,
+    incoming_headers: dict[str, str],
+    params: dict[str, Any] | None = None,
+    timeout_s: float = 30.0,
+    stream: bool = False,
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    client = httpx.AsyncClient(base_url=upstream.base_url, timeout=timeout_s)
+    request = client.build_request(method, path, headers=headers, params=params)
+    response = await client.send(request, stream=stream, follow_redirects=False)
+    return client, response
 
 
 async def close_http_clients() -> None:
@@ -177,7 +198,7 @@ async def forward_file(
 
 
 _remote_sampling_sessions: dict[str, tuple[str, str]] = {}  # sampling_session_id -> (upstream_alias, base_model)
-_remote_training_models: dict[str, tuple[str, str]] = {}  # model_id -> (upstream_alias, base_model)
+_remote_training_models: dict[str, dict[str, str | None]] = {}  # model_id -> routing metadata
 _pending_save_weights_for_sampler: dict[tuple[str, str], tuple[float, str]] = {}  # (up_alias, up_req_id) -> (ts, base_model)
 
 
@@ -282,8 +303,19 @@ def unregister_remote_sampling_session(sampling_session_id: str) -> None:
         )
 
 
-def register_remote_training_model(*, model_id: str, upstream_alias: str, base_model: str) -> None:
-    _remote_training_models[model_id] = (upstream_alias, base_model)
+def register_remote_training_model(
+    *,
+    model_id: str,
+    upstream_alias: str,
+    base_model: str,
+    owner_id: str | None = None,
+) -> None:
+    info: dict[str, str | None] = {
+        "upstream_alias": upstream_alias,
+        "base_model": base_model,
+        "owner_id": owner_id,
+    }
+    _remote_training_models[model_id] = info
     cfg = get_gateway_config()
     if cfg is None or not cfg.model_to_upstream:
         return
@@ -296,6 +328,7 @@ def register_remote_training_model(*, model_id: str, upstream_alias: str, base_m
             model_id=model_id,
             upstream_alias=upstream_alias,
             base_model=base_model,
+            owner_id=owner_id,
         )
     except Exception as e:
         _remote_training_models.pop(model_id, None)
@@ -306,10 +339,10 @@ def register_remote_training_model(*, model_id: str, upstream_alias: str, base_m
         )
 
 
-def remote_training_model(model_id: str) -> tuple[str, str] | None:
+def remote_training_model_info(model_id: str) -> dict[str, str | None] | None:
     cached = _remote_training_models.get(model_id)
     if cached is not None:
-        return cached
+        return dict(cached)
     cfg = get_gateway_config()
     if cfg is None or not cfg.model_to_upstream:
         return None
@@ -318,15 +351,29 @@ def remote_training_model(model_id: str) -> tuple[str, str] | None:
 
         from .backend import gateway_session_store
 
-        info = gateway_session_store.get_training_model(model_id)
+        info = gateway_session_store.get_training_model_info(model_id)
         if info is not None:
-            _remote_training_models[model_id] = info
-        return info
+            _remote_training_models[model_id] = dict(info)
+            return dict(info)
+        return None
     except Exception as e:
         raise HTTPException(
             status_code=503,
             detail="Gateway session store unavailable",
         )
+
+
+def remote_training_model(model_id: str) -> tuple[str, str] | None:
+    info = remote_training_model_info(model_id)
+    if info is None:
+        return None
+    upstream_alias = info.get("upstream_alias")
+    base_model = info.get("base_model")
+    if not isinstance(upstream_alias, str) or not isinstance(base_model, str):
+        return None
+    if not upstream_alias or not base_model:
+        return None
+    return upstream_alias, base_model
 
 
 def unregister_remote_training_model(model_id: str) -> None:

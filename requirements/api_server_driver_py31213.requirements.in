@@ -1,0 +1,38 @@
+# API server / Ray driver venv (CPU).
+#
+# Scope:
+# - Installed into a host venv (for example on `mint-dev` driver).
+# - Used by the API server process and by Ray driver utilities (ray start/join, ray.init).
+# - NOT used by GPU workers (those use the Mint Docker image).
+#
+# Notes:
+# - Must include `torch` on the driver to deserialize tensors from Ray object store.
+# - Must keep `ray` version aligned with the cluster.
+# - Python patch version must match the Ray cluster Python exactly (Ray is strict).
+#
+# Reference (why this exists):
+# - Legacy `/vePFS-Mindverse/share/code/tinker-server-auth/.venv_cpu` is missing `torch`
+#   (import fails) and will break Ray tensor deserialization on the driver.
+#
+# Installation note:
+# - `torch==2.9.1+cpu` may require the PyTorch CPU wheel index. Example:
+#   python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1+cpu'
+
+ray[default]==2.51.1
+torch==2.9.1+cpu
+
+fastapi[standard]==0.121.2
+uvicorn[standard]==0.38.0
+pydantic==2.12.4
+httpx==0.27.2
+
+transformers==4.57.0
+accelerate==1.12.0
+peft==0.18.0
+
+datasets==4.4.2
+tensordict==0.11.0
+torchdata==0.11.0
+
+onnxscript==0.5.2
+codetiming==1.4.0

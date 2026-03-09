@@ -82,7 +82,7 @@ Current deployment plan:
 
 GPU differences that affect per-model parallelism and vLLM memory caps:
 - Volcano: A800 80GB
-- Aliyun: L20X 140GB
+- Aliyun: H (SM90)
 
 Gateway config example (set on the router only):
 ```bash
