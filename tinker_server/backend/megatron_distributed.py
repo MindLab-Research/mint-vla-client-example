@@ -370,22 +370,40 @@ class MegatronRankWorker:
                         )
 
             # -- ctx.__exit__: triggers GPU->CPU model parameter offload --
+            # Use try/finally to ensure bookkeeping cleanup happens even if __exit__ fails.
+            # This prevents stale ctx handles from being reused after partial failures.
+            exit_error = None
             t0 = time.perf_counter()
-            self._sticky_train_mode_ctx.__exit__(None, None, None)
-            exit_s = time.perf_counter() - t0
-
-            # -- Reset all sticky bookkeeping --
-            self._sticky_train_mode_ctx = None
-            self._sticky_train_mode_session_id = None
-            self._sticky_train_mode_last_used_s = 0.0
-            self._sticky_train_mode_exit_total += 1
-            released = True
+            try:
+                self._sticky_train_mode_ctx.__exit__(None, None, None)
+                exit_s = time.perf_counter() - t0
+                released = True
+            except Exception as e:
+                exit_s = time.perf_counter() - t0
+                exit_error = e
+                logger.error(
+                    f"[Rank {self.rank}] sticky_train_mode __exit__ failed "
+                    f"(session={active_session}, reason={reason}): {e}",
+                    exc_info=True,
+                )
+            finally:
+                # -- Reset all sticky bookkeeping (fail-closed) --
+                # CRITICAL: Clear state even if __exit__ failed, to prevent reuse of broken ctx.
+                self._sticky_train_mode_ctx = None
+                self._sticky_train_mode_session_id = None
+                self._sticky_train_mode_last_used_s = 0.0
+                self._sticky_train_mode_exit_total += 1
 
             if self._sticky_train_mode_diag:
                 logger.info(
                     f"[Rank {self.rank}] sticky_train_mode release: reason={reason} "
-                    f"exit_ms={exit_s * 1000.0:.2f} snapshot_count={snap_count}"
+                    f"exit_ms={exit_s * 1000.0:.2f} snapshot_count={snap_count} "
+                    f"exit_error={exit_error is not None}"
                 )
+
+            # Re-raise __exit__ error after cleanup
+            if exit_error is not None:
+                raise exit_error
 
         return {
             "released": released,

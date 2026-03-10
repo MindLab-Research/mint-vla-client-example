@@ -484,3 +484,51 @@ def test_issue_193_cleanup_error_preserves_original_error(monkeypatch):
             raise original_error
 
 
+# ---------------------------------------------------------------------------
+# Test 13: __exit__ failure clears sticky state (fail-closed)
+# ---------------------------------------------------------------------------
+
+def test_issue_193_exit_failure_clears_sticky_state(monkeypatch):
+    """When ctx.__exit__() fails, sticky bookkeeping must still be cleared
+    to prevent reuse of a broken context handle."""
+    worker, state = _make_worker(monkeypatch)
+
+    # Make __exit__ raise an error
+    class ExitError(RuntimeError):
+        pass
+
+    original_exit_method = _FakeTrainMode.__exit__
+
+    def failing_exit(self, exc_type, exc, tb):
+        state["exit"] += 1
+        raise ExitError("__exit__ failed")
+
+    # Patch the _FakeTrainMode's __exit__
+    _FakeTrainMode.__exit__ = failing_exit  # type: ignore[method-assign]
+
+    try:
+        # Open sticky context
+        worker._ensure_sticky_train_mode(session_id="s1", reason="test")
+        assert worker._sticky_train_mode_ctx is not None
+        assert worker._sticky_train_mode_session_id == "s1"
+
+        # Release should fail but still clear state
+        import pytest
+        with pytest.raises(ExitError, match="__exit__ failed"):
+            worker._release_sticky_train_mode(reason="test", snapshot_gradients=False)
+
+        # Verify state was cleared despite __exit__ failure (fail-closed)
+        assert worker._sticky_train_mode_ctx is None
+        assert worker._sticky_train_mode_session_id is None
+        assert worker._sticky_train_mode_last_used_s == 0.0
+
+        # Next call should do fresh enter, not attempt to reuse broken ctx
+        # Restore __exit__ first so fresh enter works
+        _FakeTrainMode.__exit__ = original_exit_method
+        result = worker._ensure_sticky_train_mode(session_id="s1", reason="test")
+        assert result["reused"] is False
+    finally:
+        # Always restore to avoid polluting other tests
+        _FakeTrainMode.__exit__ = original_exit_method
+
+
