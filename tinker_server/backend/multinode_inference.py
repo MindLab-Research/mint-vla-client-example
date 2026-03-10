@@ -1773,6 +1773,23 @@ class MultiNodeInferenceEngine:
                 persistent_models = {m.strip() for m in persistent_csv.split(",") if m.strip()}
                 is_persistent = self.model_name in persistent_models
 
+            def _attach_existing_actor(existing_actor_handle) -> None:
+                self.engine = existing_actor_handle
+                self._initialized = True
+                from tinker_server.backend.resource_pool import get_resource_pool, ActorType
+
+                resource_pool = get_resource_pool()
+                resource_pool.register(
+                    actor_name=self.actor_name,
+                    actor_type=ActorType.VLLM,
+                    num_gpus=total_required_gpus,
+                    actor_handle=self.engine,
+                    namespace=PERSISTENT_NAMESPACE,
+                    base_model=self.model_path,
+                    protected=is_persistent,
+                )
+                resource_pool.mark_ready(self.actor_name)
+
             # Try to connect to existing actor
             existing_actor = None
             try:
@@ -1780,13 +1797,15 @@ class MultiNodeInferenceEngine:
                 try:
                     is_ready = await asyncio.to_thread(ray.get, existing_actor.is_ready.remote(), timeout=30)
                 except ray.exceptions.GetTimeoutError:
-                    # During large vLLM initialization the actor event loop can be blocked, so a
-                    # readiness probe may time out. Treat this as "not ready" and fall back to
-                    # waiting on initialize(), rather than killing and recreating the actor.
+                    # A timed-out readiness probe means the actor exists but its event loop is
+                    # currently occupied. That happens both during long initialization and while
+                    # serving long requests. Reusing the detached actor lets later calls queue
+                    # behind the actor instead of wedging this session on initialize().
                     logger.warning(
-                        f"ray.get(is_ready) timed out for {self.actor_name}; treating as not-ready"
+                        f"ray.get(is_ready) timed out for {self.actor_name}; assuming existing actor is busy and reusing it"
                     )
-                    is_ready = False
+                    _attach_existing_actor(existing_actor)
+                    return
                 except ray.exceptions.RayTaskError as e:
                     logger.warning(
                         f"ray.get(is_ready) failed for {self.actor_name}: {type(e).__name__}: {e}; treating as not-ready"
@@ -1801,21 +1820,7 @@ class MultiNodeInferenceEngine:
                     is_ready = False
                 if is_ready:
                     logger.info(f"Connected to existing MultiNodeVLLMEngine: {self.actor_name}")
-                    self.engine = existing_actor
-                    self._initialized = True
-                    from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-
-                    resource_pool = get_resource_pool()
-                    resource_pool.register(
-                        actor_name=self.actor_name,
-                        actor_type=ActorType.VLLM,
-                        num_gpus=total_required_gpus,
-                        actor_handle=self.engine,
-                        namespace=PERSISTENT_NAMESPACE,
-                        base_model=self.model_path,
-                        protected=is_persistent,
-                    )
-                    resource_pool.mark_ready(self.actor_name)
+                    _attach_existing_actor(existing_actor)
                     return
                 else:
                     # vLLM engine initialization can take a long time. If an actor exists but is not
@@ -1843,21 +1848,7 @@ class MultiNodeInferenceEngine:
                         )
                     else:
                         logger.info(f"Connected to existing MultiNodeVLLMEngine after init: {self.actor_name}")
-                        self.engine = existing_actor
-                        self._initialized = True
-                        from tinker_server.backend.resource_pool import get_resource_pool, ActorType
-
-                        resource_pool = get_resource_pool()
-                        resource_pool.register(
-                            actor_name=self.actor_name,
-                            actor_type=ActorType.VLLM,
-                            num_gpus=total_required_gpus,
-                            actor_handle=self.engine,
-                            namespace=PERSISTENT_NAMESPACE,
-                            base_model=self.model_path,
-                            protected=is_persistent,
-                        )
-                        resource_pool.mark_ready(self.actor_name)
+                        _attach_existing_actor(existing_actor)
                         return
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
@@ -2117,6 +2108,17 @@ class MultiNodeInferenceEngine:
                 v = os.environ.get(k)
                 if v is not None:
                     env_vars[k] = v
+
+            if (
+                distributed_executor_backend == "ray"
+                and total_required_gpus >= 16
+                and "VLLM_DISABLE_RAY_COMPILED_DAG" not in env_vars
+            ):
+                # On Volcano 235B we have observed the opposite failure mode from startup OOM/crash:
+                # generate() completes inside vLLM (worker timing line emitted) but ray.get() on the
+                # driver side never receives the result and the request stays pending indefinitely.
+                # That points at Ray compiled DAG transport rather than model execution.
+                env_vars["VLLM_DISABLE_RAY_COMPILED_DAG"] = "1"
 
             # Performance defaults: do not disable prefix caching, grouped-topk, or
             # Ray compiled DAG in code. If stability requires toggling, do it via env.

@@ -1159,6 +1159,30 @@ class MultiModelInferenceManager:
                 # Handle both MultiLoRAInferenceEngine and MultiNodeInferenceEngine
                 actor_handle = getattr(engine, 'server', None) or getattr(engine, 'engine', None)
                 if actor_handle is not None:
+                    if not hasattr(engine, 'server'):
+                        # MultiNodeInferenceEngine actors serialize methods. Probing `is_ready()` here
+                        # can itself queue behind long-running generations and wedge unrelated
+                        # sessions before they even reach `after_get_engine`. Use the detached
+                        # actor name lookup instead: it is cheap, avoids queuing on the actor,
+                        # and still lets us drop dead cached handles before reuse.
+                        from .multinode_inference import PERSISTENT_NAMESPACE
+
+                        actor_name = getattr(engine, "actor_name", None)
+                        if actor_name:
+                            try:
+                                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                            except (ValueError, ray.exceptions.RayActorError):
+                                logger.warning(
+                                    "Cached multi-node vLLM engine for %s has no live named actor, recreating",
+                                    model_name,
+                                )
+                                del self._engines[model_name]
+                            else:
+                                logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
+                                return engine
+                        else:
+                            logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
+                            return engine
                     try:
                         if hasattr(engine, 'server'):
                             await asyncio.to_thread(ray.get, actor_handle.__ray_ready__.remote(), timeout=5)
