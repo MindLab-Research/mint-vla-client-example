@@ -1389,19 +1389,25 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_pack_moe_sparse_ok()
         _patch_vllm_fused_moe_set_lora_sparse_shards()
     _patch_vllm_lora_from_tensors_disable_pin_memory()
+    _patch_vllm_worker_lora_load_to_device()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
+    # These startup-profile patches are not specific to fully-sharded LoRAs.
+    # Qwen3-235B on Volcano crashes in vLLM's dummy fused-MoE LoRA profile path
+    # during determine_available_memory() before any real adapter is loaded.
+    # Keep the actual fully-sharded slicing patch opt-in, but always apply the
+    # startup-only safeguards when worker import patches are enabled.
+    _patch_vllm_skip_dummy_lora_setup_when_inactive()
+    _patch_vllm_profile_run_disable_dummy_active_loras()
+    _patch_vllm_fused_moe_lora_profile_noop()
+    _patch_vllm_profile_run_scope_bypass_fused_moe_lora()
+    if not _patch_vllm_invoke_fused_moe_kernel_startup_noop():
+        _patch_vllm_fused_moe_forward_startup_fake()
+    _patch_vllm_device_memory_profiler_skip_exit_measure()
+    _patch_vllm_skip_startup_memory_profile()
+    _patch_vllm_dummy_lora_weights_use_empty()
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
         _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
-        _patch_vllm_skip_dummy_lora_setup_when_inactive()
-        _patch_vllm_profile_run_disable_dummy_active_loras()
-        _patch_vllm_fused_moe_lora_profile_noop()
-        _patch_vllm_profile_run_scope_bypass_fused_moe_lora()
-        if not _patch_vllm_invoke_fused_moe_kernel_startup_noop():
-            _patch_vllm_fused_moe_forward_startup_fake()
-        _patch_vllm_device_memory_profiler_skip_exit_measure()
-        _patch_vllm_skip_startup_memory_profile()
-        _patch_vllm_dummy_lora_weights_use_empty()
         _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
 
 
