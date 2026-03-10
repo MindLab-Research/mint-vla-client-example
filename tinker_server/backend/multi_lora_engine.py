@@ -710,6 +710,10 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Generate with session-specific LoRA
+            logger.info(
+                "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
+                request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
+            )
             ref = self.server.generate_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
@@ -723,6 +727,10 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Generate with base model (no LoRA)
+            logger.info(
+                "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
+                request_id, self.actor_name, len(prompt_ids), max_tokens,
+            )
             ref = self.server.generate_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
@@ -734,7 +742,14 @@ class MultiLoRAInferenceEngine:
                 logprobs=logprobs,
             )
 
-        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        t0_ray = time.time()
+        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
+        ray_elapsed = time.time() - t0_ray
+        if ray_elapsed > 30.0:
+            logger.warning(
+                "[generate slow] req=%s actor=%s ray_get_elapsed=%.1fs",
+                request_id, self.actor_name, ray_elapsed,
+            )
 
         timing_total_s = result.get("_timing_total_s")
         if timing_total_s is not None:

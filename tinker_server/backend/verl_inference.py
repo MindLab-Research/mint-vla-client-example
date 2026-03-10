@@ -857,6 +857,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 lora_path=lora_path,
             )
 
+            logger.info(
+                "[vLLM actor] generate_with_lora ENTER req=%s prompt_len=%d max_tokens=%d effective_max=%d n=%d lora_id=%d",
+                request_id, len(prompt_ids), max_tokens, effective_max_tokens, effective_n, lora_int_id,
+            )
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -887,7 +891,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 t0 = time.perf_counter()
                 first_tok_s: float | None = None
                 final_res = None
+                last_progress_log = t0
                 async for output in generator:
+                    now = time.perf_counter()
+                    if first_tok_s is None:
+                        first_tok_s = now - t0
+                        logger.info(
+                            "[vLLM actor] generate_with_lora FIRST_TOKEN req=%s prefill_s=%.3f lora_id=%d",
+                            request_id, first_tok_s, lora_int_id,
+                        )
+                    elif now - last_progress_log >= 30.0:
+                        tokens_so_far = len(output.outputs[0].token_ids)
+                        logger.info(
+                            "[vLLM actor] generate_with_lora PROGRESS req=%s elapsed=%.1fs tokens=%d",
+                            request_id, now - t0, tokens_so_far,
+                        )
+                        last_progress_log = now
                     if first_tok_s is None:
                         first_tok_s = time.perf_counter() - t0
                     try:
@@ -1087,6 +1106,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
 
             # Generate WITHOUT LoRA request (base model)
+            logger.info(
+                "[vLLM actor] generate_base ENTER req=%s prompt_len=%d max_tokens=%d effective_max=%d n=%d",
+                request_id, len(prompt_ids), max_tokens, effective_max_tokens, effective_n,
+            )
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -1117,7 +1140,22 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 t0 = time.perf_counter()
                 first_tok_s: float | None = None
                 final_res = None
+                last_progress_log = t0
                 async for output in generator:
+                    now = time.perf_counter()
+                    if first_tok_s is None:
+                        first_tok_s = now - t0
+                        logger.info(
+                            "[vLLM actor] generate_base FIRST_TOKEN req=%s prefill_s=%.3f",
+                            request_id, first_tok_s,
+                        )
+                    elif now - last_progress_log >= 30.0:
+                        tokens_so_far = len(output.outputs[0].token_ids)
+                        logger.info(
+                            "[vLLM actor] generate_base PROGRESS req=%s elapsed=%.1fs tokens=%d",
+                            request_id, now - t0, tokens_so_far,
+                        )
+                        last_progress_log = now
                     if first_tok_s is None:
                         first_tok_s = time.perf_counter() - t0
                     try:
