@@ -434,9 +434,9 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     for k in dropped:
                         call_kwargs.pop(k, None)
                     if dropped:
-                        print(
-                            f"[ExtendedVLLMHttpServer] Dropping unsupported kwargs for base __init__: {dropped}",
-                            flush=True,
+                        logger.warning(
+                            "[ExtendedVLLMHttpServer] dropping unsupported kwargs for base __init__: %s",
+                            dropped,
                         )
             super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)

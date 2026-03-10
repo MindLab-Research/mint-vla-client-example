@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import logging
 import os
@@ -39,6 +40,15 @@ def _ray_namespace() -> str:
 
 def _ray_api_work_queue_actor_name() -> str:
     return str(getattr(server_config, "api_work_queue_actor_name", "tinker_api_work_queue"))
+
+
+def _in_event_loop_thread() -> bool:
+    """Return True when called from a thread currently running an asyncio loop."""
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,7 @@ def _get_or_create_ray_actor():
     # If a stale detached actor exists with the same name, get_if_exists=True
     # can keep handing back the same broken handle forever. Kill it first.
     if existing_actor is not None:
+        in_event_loop_thread = _in_event_loop_thread()
         try:
             ray.kill(existing_actor, no_restart=True)
         except Exception as e:
@@ -111,6 +122,14 @@ def _get_or_create_ray_actor():
                     ray.kill(probe, no_restart=True)
                 except Exception:
                     pass
+                if in_event_loop_thread:
+                    # This function is synchronous. If invoked on an asyncio loop thread,
+                    # avoid blocking the loop with sleep-based polling.
+                    logger.debug(
+                        "[api_work_queue] skip stale actor settle sleep in event-loop thread actor=%s",
+                        actor_name,
+                    )
+                    break
                 time.sleep(0.2)
 
     max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "128"))

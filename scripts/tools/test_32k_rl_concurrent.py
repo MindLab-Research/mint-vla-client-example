@@ -183,6 +183,22 @@ def _wait_future(
                 on_heartbeat(elapsed)
 
 
+def _extract_compute_logprobs(logprobs_result: Any) -> list[float | None]:
+    if isinstance(logprobs_result, list):
+        out = logprobs_result
+    elif hasattr(logprobs_result, "logprobs"):
+        out = getattr(logprobs_result, "logprobs")
+    else:
+        raise RuntimeError(
+            f"compute_logprobs() returned unexpected type: {type(logprobs_result).__name__}"
+        )
+    if not isinstance(out, list):
+        raise RuntimeError(
+            f"compute_logprobs().logprobs is not a list: {type(out).__name__}"
+        )
+    return out
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
@@ -480,7 +496,7 @@ def _run_single(
                     if compute_logprobs:
                         clp_t0 = time.time()
                         clp_future = sampling_client.compute_logprobs(types.ModelInput.from_ints(tokens=prompt_tokens))
-                        _wait_future(
+                        clp_result = _wait_future(
                             clp_future,
                             label=f"compute_logprobs model={model} session={session_idx} step {step+1}/{cfg.steps} prompt {p_idx+1}/{cfg.prompts_per_step}",
                             heartbeat_s=cfg.heartbeat_s,
@@ -491,12 +507,32 @@ def _run_single(
                                 label=f"compute_logprobs prompt={p_idx}",
                             ),
                         )
+                        clp_logprobs = _extract_compute_logprobs(clp_result)
+                        if len(clp_logprobs) != len(prompt_tokens):
+                            raise RuntimeError(
+                                "compute_logprobs() length mismatch: "
+                                f"prompt_len={len(prompt_tokens)} logprobs_len={len(clp_logprobs)}"
+                            )
+                        if clp_logprobs and clp_logprobs[0] is not None:
+                            raise RuntimeError("compute_logprobs() first token logprob must be None")
+                        non_null_count = 0
+                        for i, lp in enumerate(clp_logprobs):
+                            if lp is None:
+                                continue
+                            if not isinstance(lp, (int, float)):
+                                raise RuntimeError(
+                                    f"compute_logprobs() invalid logprob at idx={i}: type={type(lp).__name__}"
+                                )
+                            non_null_count += 1
+                        if len(clp_logprobs) > 1 and non_null_count == 0:
+                            raise RuntimeError("compute_logprobs() returned no usable token logprobs")
                         _emit(
                             STAGE_COMPUTE_LOGPROBS,
                             step_idx=step,
                             elapsed_s=time.time() - clp_t0,
                             prompt_idx=p_idx,
                             prompt_len=len(prompt_tokens),
+                            non_null_logprobs=non_null_count,
                         )
                     print(
                         f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p_idx+1}/{cfg.prompts_per_step} "
