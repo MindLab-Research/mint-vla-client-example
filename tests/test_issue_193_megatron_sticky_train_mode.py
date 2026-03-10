@@ -8,6 +8,7 @@ import pytest
 from tinker_server.backend.megatron_distributed import (
     DistributedConfig,
     MegatronRankWorker,
+    MegatronWorkerGroup,
     _GRADIENTS_CONSUMED,
 )
 
@@ -835,9 +836,15 @@ def test_issue_193_shutdown_cleanup_survives_release_failure(monkeypatch):
         worker._session_optimizer_states["s1"] = {"state": "data"}
         worker._current_session_id = "s1"
 
-        # Patch torch.distributed so shutdown doesn't require real NCCL
+        # Mock torch.distributed: is_initialized→True, spy on destroy_process_group
         import torch
-        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        dpg_called = {"count": 0}
+
+        def spy_destroy():
+            dpg_called["count"] += 1
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "destroy_process_group", spy_destroy)
 
         # shutdown() should NOT raise -- release error is caught
         worker.shutdown()
@@ -846,6 +853,8 @@ def test_issue_193_shutdown_cleanup_survives_release_failure(monkeypatch):
         assert len(worker._session_gradients) == 0
         assert len(worker._session_optimizer_states) == 0
         assert worker._current_session_id is None
+        # Verify: destroy_process_group was called (finally guarantee)
+        assert dpg_called["count"] == 1
     finally:
         _FakeTrainMode.__exit__ = original_exit_method
 
@@ -934,3 +943,44 @@ def test_issue_193_snapshot_failure_on_idle_timeout_is_fail_loud(monkeypatch):
     assert worker._sticky_train_mode_ctx is not None
     assert worker._sticky_train_mode_session_id == "s1"
     assert state["exit"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 22: partial worker swap failure invalidates _current_session
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_invalidates_current_session(monkeypatch):
+    """When _swap_session_on_workers fails (some workers may have swapped),
+    _current_session must be set to None to prevent the 'already loaded'
+    early-return from masking a split-state condition across ranks."""
+    import ray as ray_module
+
+    # Build a minimal group object without calling __init__ (which does
+    # heavy Ray initialization).  We only need _current_session, workers,
+    # and the _swap_session_on_workers method.
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "s1"
+
+    # Mock workers with Ray-like remote interface
+    class _FakeRemoteMethod:
+        @staticmethod
+        def remote(new_session_id):
+            return f"future-{new_session_id}"
+
+    class _FakeWorker:
+        swap_session_state = _FakeRemoteMethod()
+
+    group.workers = [_FakeWorker(), _FakeWorker()]
+
+    # Mock ray.get to simulate partial failure
+    def mock_ray_get(futures, **kwargs):
+        raise RuntimeError("Worker 1 failed during swap_session_state")
+
+    monkeypatch.setattr(ray_module, "get", mock_ray_get)
+
+    with pytest.raises(RuntimeError, match="Worker 1 failed"):
+        group._swap_session_on_workers("s2")
+
+    # _current_session must be None -- prevents "already loaded" early-return
+    assert group._current_session is None

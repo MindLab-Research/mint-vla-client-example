@@ -4941,12 +4941,34 @@ class MegatronWorkerGroup:
 
         Must be called during session switch to ensure optimizer momentum isolation.
 
+        If any worker fails, sets ``_current_session = None`` to invalidate the
+        group-level session cache and prevent the "already loaded" early-return
+        from masking a split-state condition across ranks.
+
         Args:
             new_session_id: Session ID to switch to.
+
+        Raises:
+            Exception: Re-raises the first worker error after invalidating
+                ``_current_session``.
         """
         logger.info(f"[MegatronWorkerGroup] Swapping session state on workers to {new_session_id}")
         futures = [w.swap_session_state.remote(new_session_id) for w in self.workers]
-        ray.get(futures)
+        try:
+            ray.get(futures)
+        except Exception:
+            # Some workers may have swapped while others failed.
+            # Invalidate _current_session so the next request cannot hit the
+            # "already loaded" early-return (line 4974) and must re-evaluate.
+            logger.error(
+                "[MegatronWorkerGroup] Partial failure during session swap to %s "
+                "(old_session=%s). Setting _current_session=None to force "
+                "re-evaluation on next request.",
+                new_session_id,
+                self._current_session,
+            )
+            self._current_session = None
+            raise
         logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
 
     def _ensure_session_loaded(
