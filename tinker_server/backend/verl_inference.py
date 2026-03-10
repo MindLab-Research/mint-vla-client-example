@@ -2101,6 +2101,11 @@ class VerlInferenceEngine:
         max_num_batched_tokens = cfg.max_num_batched_tokens
         if max_num_batched_tokens is None:
             max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
+        # vLLM v1 SchedulerConfig requires max_num_batched_tokens >= max_model_len.
+        # With enable_chunked_prefill=True (default), vLLM still chunks prefill internally,
+        # so memory behavior is preserved — this floor only prevents the hard validation rejection.
+        if max_num_batched_tokens < max_model_len:
+            max_num_batched_tokens = max_model_len
         # verl calculates max_model_len = prompt_length + response_length
         # We split evenly, but this does NOT restrict actual prompt/response sizes:
         # - The split only affects verl's default max_new_tokens (response_length)
