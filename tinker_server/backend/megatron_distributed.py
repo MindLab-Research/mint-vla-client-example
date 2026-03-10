@@ -935,8 +935,8 @@ class MegatronRankWorker:
                 #
                 # Three cases:
                 # 1. Not in cache → capture (first forward_backward hasn't run)
-                # 2. In cache AND not None → preserve (valid gradients from forward_backward)
-                # 3. In cache AND None → don't capture (consumed by optim_step, keep None)
+                # 2. In cache AND valid list → preserve (valid gradients from forward_backward)
+                # 3. In cache AND _GRADIENTS_CONSUMED → preserve sentinel (consumed by optim_step)
                 cached = self._session_gradients.get(self._current_session_id)
                 if self._current_session_id not in self._session_gradients:
                     grads = self._capture_gradients()
@@ -945,14 +945,20 @@ class MegatronRankWorker:
                         f"[Rank {self.rank}] Captured gradients for session {self._current_session_id}: "
                         f"{len(grads)} buffers"
                     )
-                elif cached is not None:
+                elif cached is not None and cached is not _GRADIENTS_CONSUMED:
                     logger.debug(
                         f"[Rank {self.rank}] Preserving existing gradients for session {self._current_session_id}"
                     )
-                else:
-                    # cached is None (consumed by optim_step) - keep as None
+                elif cached is _GRADIENTS_CONSUMED:
+                    # Gradients consumed by optim_step - preserve sentinel
                     logger.debug(
-                        f"[Rank {self.rank}] Session {self._current_session_id} gradients were consumed, keeping None"
+                        f"[Rank {self.rank}] Session {self._current_session_id} gradients were consumed, "
+                        "preserving _GRADIENTS_CONSUMED sentinel"
+                    )
+                else:
+                    # cached is None (should not happen with current logic, but handle defensively)
+                    logger.debug(
+                        f"[Rank {self.rank}] Session {self._current_session_id} has None gradients"
                     )
 
                 # Always capture optimizer state (not affected by train_mode zeroing)
@@ -964,15 +970,20 @@ class MegatronRankWorker:
                 )
 
             # Restore incoming session's gradients (or zero for new session)
-            # None means gradients were consumed by optim_step - zero them
+            # _GRADIENTS_CONSUMED means gradients were consumed by optim_step - zero them
             cached_incoming = self._session_gradients.get(new_session_id)
-            if cached_incoming is not None:
+            if cached_incoming is not None and cached_incoming is not _GRADIENTS_CONSUMED:
                 self._restore_gradients(cached_incoming)
                 logger.debug(f"[Rank {self.rank}] Restored gradients for session {new_session_id}")
             else:
                 # New session OR gradients consumed - zero gradients
                 self.engine.optimizer_zero_grad()
-                logger.debug(f"[Rank {self.rank}] Session {new_session_id} - zeroed gradients")
+                if cached_incoming is _GRADIENTS_CONSUMED:
+                    logger.debug(
+                        f"[Rank {self.rank}] Session {new_session_id} gradients were consumed, zeroed gradients"
+                    )
+                else:
+                    logger.debug(f"[Rank {self.rank}] Session {new_session_id} - zeroed gradients (new session)")
 
             # Restore incoming session's optimizer state (or reset for new session)
             if new_session_id in self._session_optimizer_states:

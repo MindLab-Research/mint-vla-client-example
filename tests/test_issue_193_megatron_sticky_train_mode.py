@@ -272,3 +272,113 @@ def test_issue_193_error_does_not_snapshot_gradients(monkeypatch):
 
     assert capture_called["count"] == 0
     assert state["exit"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 10: swap_session_state preserves _GRADIENTS_CONSUMED sentinel
+# ---------------------------------------------------------------------------
+
+def test_issue_193_swap_session_preserves_consumed_sentinel(monkeypatch):
+    """When swapping away from a session with _GRADIENTS_CONSUMED, the sentinel
+    must be preserved (not overwritten with captured GPU data). When swapping back,
+    the sentinel must NOT be passed to _restore_gradients."""
+    worker, state = _make_worker(monkeypatch)
+
+    restore_called = {"count": 0, "last_arg": None}
+    zero_grad_called = {"count": 0}
+    capture_grad_called = {"count": 0}
+    capture_opt_called = {"count": 0}
+
+    def fake_restore(grads):
+        restore_called["count"] += 1
+        restore_called["last_arg"] = grads
+
+    def fake_zero_grad():
+        zero_grad_called["count"] += 1
+
+    def fake_capture_grad():
+        capture_grad_called["count"] += 1
+        return ["should-not-capture"]
+
+    def fake_capture_opt():
+        capture_opt_called["count"] += 1
+        return {}
+
+    def fake_restore_opt(state):
+        pass
+
+    def fake_reset_opt():
+        pass
+
+    worker._restore_gradients = fake_restore  # type: ignore[method-assign]
+    worker._capture_gradients = fake_capture_grad  # type: ignore[method-assign]
+    worker._capture_optimizer_state = fake_capture_opt  # type: ignore[method-assign]
+    worker._restore_optimizer_state = fake_restore_opt  # type: ignore[method-assign]
+    worker._reset_optimizer_state = fake_reset_opt  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = fake_zero_grad  # type: ignore[method-assign]
+
+    # Simulate: s1 gradients consumed by optim_step
+    worker._session_gradients["s1"] = _GRADIENTS_CONSUMED
+    worker._current_session_id = "s1"
+
+    # Swap to s2 (should preserve s1's sentinel, not overwrite with capture)
+    worker.swap_session_state("s2")
+
+    # Verify s1's sentinel survived (not overwritten by _capture_gradients)
+    assert worker._session_gradients["s1"] is _GRADIENTS_CONSUMED
+    # Verify _capture_gradients was NOT called for s1 (sentinel branch)
+    assert capture_grad_called["count"] == 0
+
+    # Swap back to s1 (should zero gradients, NOT restore sentinel)
+    worker.swap_session_state("s1")
+
+    # Verify _restore_gradients was NOT called with sentinel
+    assert restore_called["count"] == 0  # s2 was new, no restore; s1 is consumed, no restore
+    assert zero_grad_called["count"] == 2  # once for s2 (new), once for s1 (consumed)
+
+
+# ---------------------------------------------------------------------------
+# Test 11: swap_session_state does not pass sentinel to _restore_gradients
+# ---------------------------------------------------------------------------
+
+def test_issue_193_swap_session_does_not_restore_sentinel(monkeypatch):
+    """Regression test: ensure swap_session_state checks for _GRADIENTS_CONSUMED
+    before calling _restore_gradients."""
+    worker, state = _make_worker(monkeypatch)
+
+    restore_called = {"count": 0, "received_sentinel": False}
+
+    def fake_restore(grads):
+        restore_called["count"] += 1
+        if grads is _GRADIENTS_CONSUMED:
+            restore_called["received_sentinel"] = True
+
+    def fake_capture_grad():
+        return []
+
+    def fake_capture_opt():
+        return {}
+
+    def fake_restore_opt(state):
+        pass
+
+    def fake_reset_opt():
+        pass
+
+    worker._restore_gradients = fake_restore  # type: ignore[method-assign]
+    worker._capture_gradients = fake_capture_grad  # type: ignore[method-assign]
+    worker._capture_optimizer_state = fake_capture_opt  # type: ignore[method-assign]
+    worker._restore_optimizer_state = fake_restore_opt  # type: ignore[method-assign]
+    worker._reset_optimizer_state = fake_reset_opt  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: None  # type: ignore[method-assign]
+
+    # Setup: s1 has consumed gradients
+    worker._session_gradients["s1"] = _GRADIENTS_CONSUMED
+    worker._current_session_id = "s2"
+
+    # Swap to s1 (should zero, not restore)
+    worker.swap_session_state("s1")
+
+    # Verify sentinel was NOT passed to _restore_gradients
+    assert not restore_called["received_sentinel"]
+
