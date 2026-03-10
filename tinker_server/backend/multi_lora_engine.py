@@ -394,6 +394,8 @@ class MultiLoRAInferenceEngine:
                 "HF_HUB_OFFLINE": "1",
                 **otel_env_vars(),
             }
+            if total_gpus >= 16:
+                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
 
             actor_options: dict[str, object] = {
                 "num_gpus": total_gpus,

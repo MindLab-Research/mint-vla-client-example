@@ -1389,7 +1389,8 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_pack_moe_sparse_ok()
         _patch_vllm_fused_moe_set_lora_sparse_shards()
     _patch_vllm_lora_from_tensors_disable_pin_memory()
-    _patch_vllm_worker_lora_load_to_device()
+    if _env_flag("MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE", default=False):
+        _patch_vllm_worker_lora_load_to_device()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
     # These startup-profile patches are not specific to fully-sharded LoRAs.

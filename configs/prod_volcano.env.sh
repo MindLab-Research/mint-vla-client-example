@@ -25,10 +25,10 @@ export MINT_SCHEDULER_ENABLE=1
 export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.37.90","Qwen/Qwen3-4B-Instruct-2507":"192.168.37.90","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.88"}'
 export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.90"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.90"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.88"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.92","192.168.37.93","192.168.37.94","192.168.37.95"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.92","192.168.37.93","192.168.37.94","192.168.37.95"]}'
 
-export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-235B-A22B-Thinking-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-0.6B":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"},"Qwen/Qwen3-4B-Instruct-2507":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"}}'
+export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-235B-A22B-Thinking-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-30B-A3B-Instruct-2507":{"gpu_memory_utilization":0.87,"max_lora_rank":16,"max_loras":1,"max_cpu_loras":2},"Qwen/Qwen3-0.6B":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"},"Qwen/Qwen3-4B-Instruct-2507":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"}}'
 
 export TINKER_ENABLE_MULTI_LORA=1
-export MINT_VLLM_ENABLE_CHUNKED_PREFILL=0
+export MINT_VLLM_ENABLE_CHUNKED_PREFILL=1
 export MINT_VLLM_ENABLE_PREFIX_CACHING=1
 export MINT_VLLM_FULLY_SHARDED_LORAS=1
 export MINT_VLLM_ADMISSION_CONTROL=1

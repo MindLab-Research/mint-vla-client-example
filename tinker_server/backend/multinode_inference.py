@@ -2070,6 +2070,8 @@ class MultiNodeInferenceEngine:
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+            if total_required_gpus >= 16:
+                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
             if "VLLM_USE_V1" in os.environ:
                 env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
             else:
