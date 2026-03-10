@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# Mint runtime image (`mint:15-*`), used by:
+# Mint runtime image (`mint:16-*`), used by:
 # - Ray head/worker tasks on Volcano/Aliyun (GPU worker image)
 # - (Optionally) an API server container, but in our deployments the API server / Ray driver
 #   typically runs on the host using a dedicated venv (see deployment_scales.md).
@@ -86,6 +86,10 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: \
     "uvicorn[standard]==0.38.0" \
     "pydantic==2.12.4" \
     "httpx==0.27.2" \
+    "structlog>=25.5.0" \
+    "opentelemetry-api>=1.39.1" \
+    "opentelemetry-sdk>=1.39.1" \
+    "opentelemetry-exporter-otlp>=1.39.1" \
     "transformers==4.57.0" \
     "accelerate==1.11.0" \
     "einops" \
