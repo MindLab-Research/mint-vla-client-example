@@ -1817,11 +1817,18 @@ class MegatronRankWorker:
                         snapshot_gradients=False,
                     )
                 except Exception as cleanup_error:
-                    # _release_sticky_train_mode already logged the full traceback;
-                    # only log a brief summary here to avoid duplicate stacks.
+                    # _release_sticky_train_mode logs full traceback for __exit__
+                    # failures internally; only add exc_info here as a safety net
+                    # for errors from other paths (future refactors, snapshot, etc.).
                     logger.warning(
-                        f"[Rank {self.rank}] sticky cleanup failed during "
-                        f"forward_backward error handling: {type(cleanup_error).__name__}: {cleanup_error}"
+                        "[Rank %d] sticky cleanup failed during forward_backward "
+                        "error handling: reason=%s session=%s error_type=%s: %s",
+                        self.rank,
+                        "forward_backward_error",
+                        session_id,
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                        exc_info=not isinstance(cleanup_error, (RuntimeError, OSError)),
                     )
                 # Always re-raise the original error, not the cleanup error
                 raise original_error
@@ -2352,11 +2359,18 @@ class MegatronRankWorker:
                         snapshot_gradients=False,
                     )
                 except Exception as cleanup_error:
-                    # _release_sticky_train_mode already logged the full traceback;
-                    # only log a brief summary here to avoid duplicate stacks.
+                    # _release_sticky_train_mode logs full traceback for __exit__
+                    # failures internally; only add exc_info here as a safety net
+                    # for errors from other paths (future refactors, snapshot, etc.).
                     logger.warning(
-                        f"[Rank {self.rank}] sticky cleanup failed during "
-                        f"optim_step error handling: {type(cleanup_error).__name__}: {cleanup_error}"
+                        "[Rank %d] sticky cleanup failed during optim_step "
+                        "error handling: reason=%s session=%s error_type=%s: %s",
+                        self.rank,
+                        "optim_step_error",
+                        session_id,
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                        exc_info=not isinstance(cleanup_error, (RuntimeError, OSError)),
                     )
                 # Always re-raise the original error, not the cleanup error
                 raise original_error

@@ -1,3 +1,4 @@
+import logging
 import time
 import sys
 from unittest.mock import patch
@@ -575,3 +576,141 @@ def test_issue_193_exit_failure_clears_sticky_state(monkeypatch):
         _FakeTrainMode.__exit__ = original_exit_method
 
 
+# ---------------------------------------------------------------------------
+# Test 14: forward_backward() business error + __exit__ failure (real method)
+# ---------------------------------------------------------------------------
+
+def test_issue_193_forward_backward_error_plus_exit_failure(monkeypatch):
+    """Call real forward_backward() where forward_backward_batch() AND
+    ctx.__exit__() both fail.  The original business error must be raised,
+    sticky state must be cleared (fail-closed), and next call must do
+    fresh enter."""
+    worker, state = _make_worker(monkeypatch)
+    _prepare_worker_for_forward_backward(worker, monkeypatch)
+
+    class ComputeError(RuntimeError):
+        pass
+
+    class ExitError(RuntimeError):
+        pass
+
+    original_exit_method = _FakeTrainMode.__exit__
+
+    def failing_fbb(*args, **kwargs):
+        raise ComputeError("GPU compute failed")
+
+    def failing_exit(self, exc_type, exc, tb):
+        state["exit"] += 1
+        raise ExitError("__exit__ failed during cleanup")
+
+    worker.engine.forward_backward_batch = failing_fbb  # type: ignore[method-assign]
+    _FakeTrainMode.__exit__ = failing_exit  # type: ignore[method-assign]
+
+    try:
+        # Business error (ComputeError) must be raised, not ExitError
+        with pytest.raises(ComputeError, match="GPU compute failed"):
+            worker.forward_backward(
+                data_items=[{"model_input": {"input_ids": [1, 2, 3]}}],
+                loss_fn="cross_entropy",
+                loss_fn_config={},
+                session_id="s1",
+            )
+
+        # Verify: sticky state cleaned despite double failure (fail-closed)
+        assert worker._sticky_train_mode_ctx is None
+        assert worker._sticky_train_mode_session_id is None
+
+        # Next call must be fresh enter (restore __exit__ so it works)
+        _FakeTrainMode.__exit__ = original_exit_method
+        result = worker._ensure_sticky_train_mode(session_id="s1", reason="test")
+        assert result["reused"] is False
+    finally:
+        _FakeTrainMode.__exit__ = original_exit_method
+
+
+# ---------------------------------------------------------------------------
+# Test 15: CLOSE_ON_OPTIM=0 + optim_step error → no stale ctx
+# ---------------------------------------------------------------------------
+
+def test_issue_193_close_on_optim_off_error_clears_ctx(monkeypatch):
+    """With CLOSE_ON_OPTIM=0, a successful optim_step keeps ctx open.
+    But an erroring optim_step must still release the ctx (no stale handle)."""
+    worker, state = _make_worker(monkeypatch, close_on_optim="0")
+    _prepare_worker_for_optim_step(worker)
+
+    class OptimError(RuntimeError):
+        pass
+
+    def failing_optimizer_step():
+        raise OptimError("Optimizer diverged")
+
+    worker.engine.optimizer_step = failing_optimizer_step  # type: ignore[method-assign]
+
+    with pytest.raises(OptimError, match="Optimizer diverged"):
+        worker.optim_step(learning_rate=1e-4, session_id="s1")
+
+    # Even with CLOSE_ON_OPTIM=0, error path must clear sticky state
+    assert worker._sticky_train_mode_ctx is None
+    assert worker._sticky_train_mode_session_id is None
+    assert state["enter"] == 1
+    assert state["exit"] == 1
+
+    # Next call: fresh enter, not reuse of broken ctx
+    result = worker._ensure_sticky_train_mode(session_id="s1", reason="test")
+    assert result["reused"] is False
+    assert state["enter"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Cleanup failure log observability (structured fields present)
+# ---------------------------------------------------------------------------
+
+def test_issue_193_cleanup_failure_log_has_structured_fields(monkeypatch, caplog):
+    """When cleanup fails during optim_step error handling, the emitted
+    warning log must contain reason, session_id, rank, and error_type
+    for alert aggregation and incident triage."""
+    worker, state = _make_worker(monkeypatch)
+    _prepare_worker_for_optim_step(worker)
+
+    class OptimError(RuntimeError):
+        pass
+
+    class ExitError(RuntimeError):
+        pass
+
+    original_exit_method = _FakeTrainMode.__exit__
+
+    def failing_optimizer_step():
+        raise OptimError("Optimizer diverged")
+
+    def failing_exit(self, exc_type, exc, tb):
+        state["exit"] += 1
+        raise ExitError("__exit__ cleanup boom")
+
+    worker.engine.optimizer_step = failing_optimizer_step  # type: ignore[method-assign]
+    _FakeTrainMode.__exit__ = failing_exit  # type: ignore[method-assign]
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(OptimError, match="Optimizer diverged"):
+                worker.optim_step(learning_rate=1e-4, session_id="s1")
+
+        # Find the outer cleanup warning (not the inner __exit__ error)
+        cleanup_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "sticky cleanup failed" in r.getMessage()
+        ]
+        assert len(cleanup_warnings) >= 1, (
+            f"Expected at least one cleanup warning, got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+        msg = cleanup_warnings[0].getMessage()
+        # Verify structured fields are present for alert aggregation
+        assert "reason=optim_step_error" in msg
+        assert "session=s1" in msg
+        assert "Rank 0" in msg  # rank
+        assert "error_type=ExitError" in msg
+    finally:
+        _FakeTrainMode.__exit__ = original_exit_method
