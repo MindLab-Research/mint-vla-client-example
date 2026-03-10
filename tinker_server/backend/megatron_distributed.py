@@ -297,7 +297,9 @@ class MegatronRankWorker:
         self.config = distributed_config
         self.engine = None  # Set in initialize()
         self._current_session_id = None
-        self._session_gradients: dict[str, list[torch.Tensor]] = {}  # Per-session gradient storage (CPU)
+        # Per-session gradient storage (CPU).
+        # Values: list[torch.Tensor] (valid gradients) or _GRADIENTS_CONSUMED (consumed by optim_step)
+        self._session_gradients: dict[str, list[torch.Tensor] | object] = {}
         self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
         self._sticky_train_mode_enabled = _env_flag("MINT_MEGATRON_STICKY_TRAIN_MODE", default=False)
         self._sticky_train_mode_idle_timeout_s = _env_float("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S", default=15.0)
@@ -1786,14 +1788,24 @@ class MegatronRankWorker:
 
             try:
                 _run_forward_backward_compute()
-            except Exception:
+            except Exception as original_error:
                 # On error, GPU state is undefined -- release sticky context without
                 # snapshotting gradients (would persist garbage).
-                self._release_sticky_train_mode(
-                    reason="forward_backward_error",
-                    snapshot_gradients=False,
-                )
-                raise
+                # Wrap cleanup in try/except to prevent cleanup errors from masking
+                # the original business error.
+                try:
+                    self._release_sticky_train_mode(
+                        reason="forward_backward_error",
+                        snapshot_gradients=False,
+                    )
+                except Exception as cleanup_error:
+                    logger.error(
+                        f"[Rank {self.rank}] Failed to release sticky train_mode during "
+                        f"forward_backward error cleanup: {cleanup_error}",
+                        exc_info=True,
+                    )
+                # Always re-raise the original error, not the cleanup error
+                raise original_error
         else:
             tm_enter_t0 = time.perf_counter()
             with self.engine.train_mode():
@@ -2310,14 +2322,24 @@ class MegatronRankWorker:
 
             try:
                 _run_optim_core()
-            except Exception:
+            except Exception as original_error:
                 # On error, GPU state is undefined -- release sticky context without
                 # snapshotting gradients (would persist garbage).
-                self._release_sticky_train_mode(
-                    reason="optim_step_error",
-                    snapshot_gradients=False,
-                )
-                raise
+                # Wrap cleanup in try/except to prevent cleanup errors from masking
+                # the original business error.
+                try:
+                    self._release_sticky_train_mode(
+                        reason="optim_step_error",
+                        snapshot_gradients=False,
+                    )
+                except Exception as cleanup_error:
+                    logger.error(
+                        f"[Rank {self.rank}] Failed to release sticky train_mode during "
+                        f"optim_step error cleanup: {cleanup_error}",
+                        exc_info=True,
+                    )
+                # Always re-raise the original error, not the cleanup error
+                raise original_error
 
             if self._sticky_train_mode_close_on_optim:
                 released = self._release_sticky_train_mode(
