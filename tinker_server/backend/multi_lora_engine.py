@@ -317,6 +317,11 @@ class MultiLoRAInferenceEngine:
             max_num_batched_tokens = model_cfg.max_num_batched_tokens
             if max_num_batched_tokens is None:
                 max_num_batched_tokens = 4096 if max_model_len >= 32768 else 8192
+            # vLLM v1 SchedulerConfig requires max_num_batched_tokens >= max_model_len.
+            # With enable_chunked_prefill=True (default), vLLM still chunks prefill internally,
+            # so memory behavior is preserved — this floor only prevents the hard validation rejection.
+            if max_num_batched_tokens < max_model_len:
+                max_num_batched_tokens = max_model_len
             # verl calculates max_model_len = prompt_length + response_length
             # We split evenly, but this does NOT restrict actual prompt/response sizes:
             # - The split only affects verl's default max_new_tokens (response_length)
@@ -382,10 +387,12 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+            from ..config import otel_env_vars
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
+                **otel_env_vars(),
             }
 
             actor_options: dict[str, object] = {
@@ -708,6 +715,10 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Generate with session-specific LoRA
+            logger.info(
+                "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
+                request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
+            )
             ref = self.server.generate_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
@@ -721,6 +732,10 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Generate with base model (no LoRA)
+            logger.info(
+                "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
+                request_id, self.actor_name, len(prompt_ids), max_tokens,
+            )
             ref = self.server.generate_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
@@ -732,7 +747,14 @@ class MultiLoRAInferenceEngine:
                 logprobs=logprobs,
             )
 
-        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        t0_ray = time.time()
+        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
+        ray_elapsed = time.time() - t0_ray
+        if ray_elapsed > 30.0:
+            logger.warning(
+                "[generate slow] req=%s actor=%s ray_get_elapsed=%.1fs",
+                request_id, self.actor_name, ray_elapsed,
+            )
 
         timing_total_s = result.get("_timing_total_s")
         if timing_total_s is not None:

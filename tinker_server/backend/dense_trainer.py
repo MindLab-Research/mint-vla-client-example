@@ -181,6 +181,7 @@ def get_or_create_dense_trainer(
 
             if actor is None:
                 pool.ensure_gpus_available(DEFAULT_NUM_GPUS)
+                from ..config import otel_env_vars
                 runtime_env = {
                     "env_vars": {
                         "PYTHONPATH": PFS_PYTHONPATH_DENSE,
@@ -189,6 +190,7 @@ def get_or_create_dense_trainer(
                         "TRANSFORMERS_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                        **otel_env_vars(),
                     }
                 }
                 pg = _get_or_create_pg(actor_name)

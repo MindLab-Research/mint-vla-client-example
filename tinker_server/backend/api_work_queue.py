@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import logging
 import os
@@ -52,31 +53,59 @@ class WorkItem:
     created_at: float
 
 
+
 def _get_or_create_ray_actor():
     import ray
 
     actor_name = _ray_api_work_queue_actor_name()
     try:
         actor = ray.get_actor(actor_name, namespace=_ray_namespace())
-        try:
-            # Ensure the handle is actually usable. A dead named actor can still
-            # be discoverable via `ray.get_actor`, but any call will raise
-            # ActorDiedError and enqueue will fail with 503.
-            ray.get(actor.stats.remote(), timeout=1.0)
-            return actor
-        except Exception:
-            pass
+        # Quick liveness probe: if the actor is mid-restart, stats() will hang
+        # until Ray finishes re-initializing it. Use a short timeout so the
+        # request path fails fast with 503 instead of blocking.
+        ray.get(actor.stats.remote(), timeout=1.0)
+        return actor
     except ValueError:
-        pass
+        logger.info("[api_work_queue] actor %s not found; creating", actor_name)
+    except ray.exceptions.GetTimeoutError:
+        logger.warning(
+            "[api_work_queue] actor %s alive but unresponsive (possibly restarting); failing fast",
+            actor_name,
+        )
+        raise ApiWorkQueueUnavailableError(
+            f"queue actor {actor_name} unresponsive (restarting?)"
+        )
+    except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+        logger.warning(
+            "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
+            actor_name,
+            type(e).__name__,
+            e,
+        )
+        raise ApiWorkQueueUnavailableError(
+            f"queue actor {actor_name} restarting ({type(e).__name__})"
+        ) from e
+    except Exception as e:
+        logger.warning(
+            "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
+            actor_name,
+            type(e).__name__,
+            e,
+        )
 
     max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "128"))
+    max_restarts = int(os.environ.get("MINT_API_WORK_QUEUE_MAX_RESTARTS", "3"))
 
-    @ray.remote(num_cpus=0, max_concurrency=max_concurrency)
+    @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=max_restarts)
     class _RayApiWorkQueueActor:
         def __init__(self) -> None:
             import asyncio
             from collections import deque
 
+            logger.warning(
+                "[api_work_queue] actor (re)initializing (max_restarts=%d)",
+                max_restarts,
+            )
             self._items = deque()
             self._cv = asyncio.Condition()
             self._enqueued = 0
@@ -782,12 +811,6 @@ class ApiWorkQueueClient:
 
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
-
-        if self._ray_actor is not None:
-            try:
-                ray.get(self._ray_actor.stats.remote(), timeout=1.0)
-            except Exception:
-                self._ray_actor = None
 
         if self._ray_actor is None:
             try:

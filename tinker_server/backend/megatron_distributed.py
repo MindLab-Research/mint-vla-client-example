@@ -4214,6 +4214,7 @@ class MegatronWorkerGroup:
             is_mla = False
             disable_nccl_ib = False
 
+        from ..config import otel_env_vars
         runtime_env = {
             "env_vars": {
                 "PYTHONPATH": PFS_PYTHONPATH,
@@ -4228,6 +4229,7 @@ class MegatronWorkerGroup:
                 # Allow TE DotProductAttention backends; Megatron flash attention asserts these are 0.
                 "NVTE_FUSED_ATTN": "0" if is_mla else "1",
                 "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
+                **otel_env_vars(),
             },
         }
 
@@ -5644,6 +5646,7 @@ def get_or_create_megatron_worker_group(
                     "TRANSFORMERS_OFFLINE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
+                    **otel_env_vars(),
                 }
             }
 

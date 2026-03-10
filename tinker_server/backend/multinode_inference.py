@@ -597,6 +597,12 @@ def _create_multinode_vllm_actor(
             if max_num_batched_tokens is None:
                 max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
             max_num_batched_tokens = int(os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_num_batched_tokens)))
+            # vLLM v1 SchedulerConfig requires max_num_batched_tokens >= max_model_len.
+            # With enable_chunked_prefill=True (default), vLLM still chunks prefill internally,
+            # so memory behavior is preserved — this floor only prevents the hard validation rejection.
+            effective_max_model_len = self.max_model_len or 0
+            if max_num_batched_tokens < effective_max_model_len:
+                max_num_batched_tokens = effective_max_model_len
             enable_chunked_prefill = _env_flag("MINT_VLLM_ENABLE_CHUNKED_PREFILL", default=True)
             enable_prefix_caching = _env_flag("MINT_VLLM_ENABLE_PREFIX_CACHING", default=True)
             if distributed_executor_backend not in ("ray", "mp"):
@@ -2043,6 +2049,7 @@ class MultiNodeInferenceEngine:
                 else:
                     scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
+            from ..config import otel_env_vars
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
@@ -2058,6 +2065,7 @@ class MultiNodeInferenceEngine:
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
                 "VLLM_DISABLE_PYNCCL": "1",
+                **otel_env_vars(),
             }
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
