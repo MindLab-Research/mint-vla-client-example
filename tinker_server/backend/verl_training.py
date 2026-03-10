@@ -1446,6 +1446,80 @@ class VerlTrainingEngine:
         resource_pool.touch(actor_name)
         resource_pool.set_session(actor_name, session.model_id)
 
+    def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
+        """Resolve session base model to a local path (same policy as create_training_session)."""
+        requested_model = session.base_model or self.default_base_model
+        if requested_model and not requested_model.startswith("/"):
+            base_model = self._resolve_hf_model_path(requested_model)
+            if base_model:
+                return base_model, requested_model
+            return self.default_base_model, requested_model
+        return requested_model, requested_model
+
+    async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
+        """Rebind a dense trainer actor after eviction/death."""
+        from .dense_trainer import get_or_create_dense_trainer
+
+        model_id = session.model_id
+        base_model, name_key = self._resolve_session_base_model(session)
+        lora_rank = (
+            session.lora_config.rank if session.lora_config else self.default_lora_rank
+        )
+        dense = await asyncio.to_thread(
+            get_or_create_dense_trainer,
+            training_worker_cls=TrainingWorker,
+            base_model=base_model,
+            model_key=name_key,
+            lora_rank=lora_rank,
+            learning_rate=session.learning_rate,
+            session_id=session.model_id,
+        )
+        self._workers[model_id] = dense.actor
+        self._resource_pool_actor_names[model_id] = dense.actor_name
+        self._touch_actor(session)
+        logger.warning(
+            "[%s] rebound dense trainer actor=%s reason=%s base_model=%s",
+            model_id,
+            dense.actor_name,
+            reason,
+            base_model,
+        )
+        return dense.actor
+
+    async def _get_live_worker(self, session: "TrainingSession", *, op: str) -> ray.actor.ActorHandle:
+        """Return a live worker handle, rebinding dense trainers when evicted."""
+        model_id = session.model_id
+        worker = self._workers.get(model_id)
+        if worker is None:
+            if session.backend == "peft":
+                return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
+            raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
+
+        # Megatron workers are managed by a persistent group; keep existing behavior.
+        if session.backend != "peft":
+            return worker
+
+        # Dense trainer can be evicted by ResourcePool between RL stages.
+        try:
+            await asyncio.to_thread(ray.get, worker.heartbeat.remote(), timeout=5)
+            return worker
+        except ray.exceptions.GetTimeoutError:
+            # Busy actor is still healthy; proceed with original handle.
+            self._touch_actor(session)
+            return worker
+        except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+            logger.warning(
+                "[%s] dense worker unhealthy before op=%s: %s: %s; attempting rebind",
+                model_id,
+                op,
+                type(e).__name__,
+                e,
+            )
+            return await self._recover_dense_worker(
+                session,
+                reason=f"{op}:{type(e).__name__}",
+            )
+
     async def _await_with_keepalive(
         self,
         awaitable,
@@ -1777,7 +1851,7 @@ class VerlTrainingEngine:
             Dict with loss_fn_outputs and metrics.
         """
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="forward_backward")
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
@@ -1844,7 +1918,7 @@ class VerlTrainingEngine:
             Dict with loss_fn_outputs (including logprobs) and metrics.
         """
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="forward")
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
@@ -1887,7 +1961,7 @@ class VerlTrainingEngine:
             Dict with tokenizer configuration.
         """
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="get_tokenizer_info")
 
         result = await worker.get_tokenizer_info.remote()
 
@@ -1908,7 +1982,7 @@ class VerlTrainingEngine:
             Dict with metrics.
         """
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="optim_step")
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
@@ -1967,7 +2041,7 @@ class VerlTrainingEngine:
         from .model_registry import get_model_config
 
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="train_step")
 
         # Mark actor as recently used to prevent LRU eviction during training
         self._touch_actor(session)
@@ -2093,9 +2167,10 @@ class VerlTrainingEngine:
         import ray
 
         model_id = session.model_id
-        worker = self._workers.get(model_id)
-        if worker is None:
-            logger.warning(f"[{model_id}] reset_expert_bias: No worker found")
+        try:
+            worker = await self._get_live_worker(session, op="reset_expert_bias")
+        except Exception as e:
+            logger.warning(f"[{model_id}] reset_expert_bias: No live worker ({type(e).__name__}: {e})")
             return {"modules_reset": 0}
 
         # Mark actor as recently used
@@ -2160,7 +2235,7 @@ class VerlTrainingEngine:
         import ray
 
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="save_dense_lora_weights_for_sampler")
         abs_path = os.path.abspath(save_path)
 
         try:
@@ -2200,7 +2275,7 @@ class VerlTrainingEngine:
         import ray
 
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="save_lora_weights_for_sampler")
         abs_path = os.path.abspath(save_path)
 
         try:
@@ -2267,7 +2342,7 @@ class VerlTrainingEngine:
         from .model_registry import get_model_config
 
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="save_weights")
         abs_path = os.path.abspath(save_path)
 
         # Save on worker - returns metadata
@@ -2318,7 +2393,7 @@ class VerlTrainingEngine:
         import ray
 
         model_id = session.model_id
-        worker = self._workers[model_id]
+        worker = await self._get_live_worker(session, op="load_weights")
 
         # Remote call to load checkpoint
         # Must use ray.get() in executor since await on ObjectRef doesn't await completion

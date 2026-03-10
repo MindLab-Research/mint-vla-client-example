@@ -335,12 +335,25 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
     from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
 
+    def _unwrap_ray_actor_class(cls):
+        """Return the underlying Python class if `cls` is a Ray ActorClass."""
+        try:
+            md = getattr(cls, "__ray_metadata__", None)
+            modified = getattr(md, "modified_class", None)
+            if isinstance(modified, type):
+                return modified
+        except Exception:
+            pass
+        return cls
+
+    _BaseVLLMHttpServer = _unwrap_ray_actor_class(vLLMHttpServer)
+
     # Capture in closure
     _max_loras = max_loras
     _max_cpu_loras = max_cpu_loras
 
     # Define the class WITHOUT @ray.remote decorator
-    class ExtendedVLLMHttpServer(vLLMHttpServer):
+    class ExtendedVLLMHttpServer(_BaseVLLMHttpServer):
         """Extended vLLMHttpServer with hot LoRA loading support."""
 
         # Class-level config for multi-LoRA (captured from factory)
@@ -383,27 +396,17 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
-            # Re-import vLLMHttpServer after sys.path is fixed to get the correct version.
-            # Worker nodes may have an older verl in sys.path (/workspace/verl) that lacks
-            # cuda_visible_devices; the PFS version is now first after the sys.path fixup above.
-            import importlib
-            for _mod in list(sys.modules):
-                if _mod == "verl" or _mod.startswith("verl."):
-                    del sys.modules[_mod]
-            _vllm_server_mod = importlib.import_module("verl.workers.rollout.vllm_rollout.vllm_async_server")
-            _CorrectBase = _vllm_server_mod.vLLMHttpServer
+            # Always initialize through current MRO parent. Calling __init__ on a
+            # separately re-imported class can break class identity and trigger:
+            # "super(type, obj): obj must be an instance or subtype of type".
+            _parent_cls = type(self).__mro__[1]
+            parent_file = inspect.getsourcefile(_parent_cls)
             print(
-                f"[ExtendedVLLMHttpServer] verl.__file__="
-                f"{getattr(sys.modules.get('verl'), '__file__', None)}",
-                flush=True,
-            )
-            print(
-                f"[ExtendedVLLMHttpServer] vllm_async_server.__file__="
-                f"{getattr(_vllm_server_mod, '__file__', None)}",
+                f"[ExtendedVLLMHttpServer] parent_cls={_parent_cls.__module__}.{_parent_cls.__qualname__} file={parent_file}",
                 flush=True,
             )
             try:
-                sig = inspect.signature(_CorrectBase.__init__)
+                sig = inspect.signature(_parent_cls.__init__)
             except (TypeError, ValueError):
                 sig = None
             print(f"[ExtendedVLLMHttpServer] vLLMHttpServer.__init__ sig={sig}", flush=True)
@@ -412,7 +415,30 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 print(f"[ExtendedVLLMHttpServer] cuda_visible_devices={kwargs['cuda_visible_devices']}", flush=True)
             else:
                 print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
-            _CorrectBase.__init__(self, *args, **kwargs)
+            call_kwargs = dict(kwargs)
+            if sig is not None:
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+                if not accepts_var_kw:
+                    accepted = {
+                        name for name, p in sig.parameters.items()
+                        if name != "self"
+                        and p.kind in (
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.KEYWORD_ONLY,
+                        )
+                    }
+                    dropped = [k for k in list(call_kwargs.keys()) if k not in accepted]
+                    for k in dropped:
+                        call_kwargs.pop(k, None)
+                    if dropped:
+                        print(
+                            f"[ExtendedVLLMHttpServer] Dropping unsupported kwargs for base __init__: {dropped}",
+                            flush=True,
+                        )
+            super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (

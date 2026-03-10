@@ -56,6 +56,7 @@ def _get_or_create_ray_actor():
     import ray
 
     actor_name = _ray_api_work_queue_actor_name()
+    existing_actor = None
     try:
         actor = ray.get_actor(actor_name, namespace=_ray_namespace())
         try:
@@ -64,10 +65,53 @@ def _get_or_create_ray_actor():
             # ActorDiedError and enqueue will fail with 503.
             ray.get(actor.stats.remote(), timeout=1.0)
             return actor
-        except Exception:
-            pass
+        except Exception as e:
+            existing_actor = actor
+            logger.warning(
+                "[api_work_queue] existing detached actor %s is unhealthy (%s: %s); forcing recreation",
+                actor_name,
+                type(e).__name__,
+                e,
+            )
     except ValueError:
         pass
+    except Exception as e:
+        logger.warning(
+            "[api_work_queue] failed to fetch detached actor %s (%s: %s); recreating",
+            actor_name,
+            type(e).__name__,
+            e,
+        )
+
+    # If a stale detached actor exists with the same name, get_if_exists=True
+    # can keep handing back the same broken handle forever. Kill it first.
+    if existing_actor is not None:
+        try:
+            ray.kill(existing_actor, no_restart=True)
+        except Exception as e:
+            logger.warning(
+                "[api_work_queue] failed to kill stale actor %s (%s: %s)",
+                actor_name,
+                type(e).__name__,
+                e,
+            )
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                probe = ray.get_actor(actor_name, namespace=_ray_namespace())
+            except ValueError:
+                break
+            except Exception:
+                break
+            try:
+                ray.get(probe.stats.remote(), timeout=0.5)
+                return probe
+            except Exception:
+                try:
+                    ray.kill(probe, no_restart=True)
+                except Exception:
+                    pass
+                time.sleep(0.2)
 
     max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "128"))
 
