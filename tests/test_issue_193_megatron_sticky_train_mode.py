@@ -714,3 +714,61 @@ def test_issue_193_cleanup_failure_log_has_structured_fields(monkeypatch, caplog
         assert "error_type=ExitError" in msg
     finally:
         _FakeTrainMode.__exit__ = original_exit_method
+
+
+# ---------------------------------------------------------------------------
+# Test 17: forward_backward cleanup failure log observability
+# ---------------------------------------------------------------------------
+
+def test_issue_193_forward_backward_cleanup_log_has_structured_fields(monkeypatch, caplog):
+    """Mirror of Test 16 for the forward_backward path: when cleanup fails
+    during forward_backward error handling, the emitted warning must contain
+    reason, session_id, rank, and error_type."""
+    worker, state = _make_worker(monkeypatch)
+    _prepare_worker_for_forward_backward(worker, monkeypatch)
+
+    class ComputeError(RuntimeError):
+        pass
+
+    class ExitError(RuntimeError):
+        pass
+
+    original_exit_method = _FakeTrainMode.__exit__
+
+    def failing_fbb(*args, **kwargs):
+        raise ComputeError("GPU compute failed")
+
+    def failing_exit(self, exc_type, exc, tb):
+        state["exit"] += 1
+        raise ExitError("__exit__ cleanup boom")
+
+    worker.engine.forward_backward_batch = failing_fbb  # type: ignore[method-assign]
+    _FakeTrainMode.__exit__ = failing_exit  # type: ignore[method-assign]
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ComputeError, match="GPU compute failed"):
+                worker.forward_backward(
+                    data_items=[{"model_input": {"input_ids": [1, 2, 3]}}],
+                    loss_fn="cross_entropy",
+                    loss_fn_config={},
+                    session_id="s1",
+                )
+
+        cleanup_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "sticky cleanup failed" in r.getMessage()
+        ]
+        assert len(cleanup_warnings) >= 1, (
+            f"Expected at least one cleanup warning, got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+        msg = cleanup_warnings[0].getMessage()
+        assert "reason=forward_backward_error" in msg
+        assert "session=s1" in msg
+        assert "Rank 0" in msg
+        assert "error_type=ExitError" in msg
+    finally:
+        _FakeTrainMode.__exit__ = original_exit_method

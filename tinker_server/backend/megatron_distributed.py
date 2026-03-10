@@ -1817,9 +1817,6 @@ class MegatronRankWorker:
                         snapshot_gradients=False,
                     )
                 except Exception as cleanup_error:
-                    # _release_sticky_train_mode logs full traceback for __exit__
-                    # failures internally; only add exc_info here as a safety net
-                    # for errors from other paths (future refactors, snapshot, etc.).
                     logger.warning(
                         "[Rank %d] sticky cleanup failed during forward_backward "
                         "error handling: reason=%s session=%s error_type=%s: %s",
@@ -1828,7 +1825,7 @@ class MegatronRankWorker:
                         session_id,
                         type(cleanup_error).__name__,
                         cleanup_error,
-                        exc_info=not isinstance(cleanup_error, (RuntimeError, OSError)),
+                        exc_info=True,
                     )
                 # Always re-raise the original error, not the cleanup error
                 raise original_error
@@ -2359,9 +2356,6 @@ class MegatronRankWorker:
                         snapshot_gradients=False,
                     )
                 except Exception as cleanup_error:
-                    # _release_sticky_train_mode logs full traceback for __exit__
-                    # failures internally; only add exc_info here as a safety net
-                    # for errors from other paths (future refactors, snapshot, etc.).
                     logger.warning(
                         "[Rank %d] sticky cleanup failed during optim_step "
                         "error handling: reason=%s session=%s error_type=%s: %s",
@@ -2370,7 +2364,7 @@ class MegatronRankWorker:
                         session_id,
                         type(cleanup_error).__name__,
                         cleanup_error,
-                        exc_info=not isinstance(cleanup_error, (RuntimeError, OSError)),
+                        exc_info=True,
                     )
                 # Always re-raise the original error, not the cleanup error
                 raise original_error
