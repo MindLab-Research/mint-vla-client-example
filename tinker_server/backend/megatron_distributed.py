@@ -1817,10 +1817,11 @@ class MegatronRankWorker:
                         snapshot_gradients=False,
                     )
                 except Exception as cleanup_error:
-                    logger.error(
-                        f"[Rank {self.rank}] Failed to release sticky train_mode during "
-                        f"forward_backward error cleanup: {cleanup_error}",
-                        exc_info=True,
+                    # _release_sticky_train_mode already logged the full traceback;
+                    # only log a brief summary here to avoid duplicate stacks.
+                    logger.warning(
+                        f"[Rank {self.rank}] sticky cleanup failed during "
+                        f"forward_backward error handling: {type(cleanup_error).__name__}: {cleanup_error}"
                     )
                 # Always re-raise the original error, not the cleanup error
                 raise original_error
@@ -2351,10 +2352,11 @@ class MegatronRankWorker:
                         snapshot_gradients=False,
                     )
                 except Exception as cleanup_error:
-                    logger.error(
-                        f"[Rank {self.rank}] Failed to release sticky train_mode during "
-                        f"optim_step error cleanup: {cleanup_error}",
-                        exc_info=True,
+                    # _release_sticky_train_mode already logged the full traceback;
+                    # only log a brief summary here to avoid duplicate stacks.
+                    logger.warning(
+                        f"[Rank {self.rank}] sticky cleanup failed during "
+                        f"optim_step error handling: {type(cleanup_error).__name__}: {cleanup_error}"
                     )
                 # Always re-raise the original error, not the cleanup error
                 raise original_error

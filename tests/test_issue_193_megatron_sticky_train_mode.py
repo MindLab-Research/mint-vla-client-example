@@ -1,4 +1,8 @@
 import time
+import sys
+from unittest.mock import patch
+
+import pytest
 
 from tinker_server.backend.megatron_distributed import (
     DistributedConfig,
@@ -24,9 +28,21 @@ class _FakeTrainMode:
 class _FakeEngine:
     def __init__(self, state: dict):
         self._state = state
+        self.optimizer = None  # Needed by optim_step debug code
 
     def train_mode(self):
         return _FakeTrainMode(self._state)
+
+    def forward_backward_batch(self, *args, **kwargs):
+        """Default no-op; override in tests to raise."""
+        return {"loss": [], "metrics": {}}
+
+    def optimizer_step(self):
+        """Default no-op; override in tests to raise."""
+        return 0.0
+
+    def lr_scheduler_step(self):
+        return 1e-4
 
 
 def _make_worker(
@@ -52,6 +68,66 @@ def _make_worker(
     )
     worker.engine = _FakeEngine(state)
     return worker, state
+
+
+def _prepare_worker_for_optim_step(worker):
+    """Attach minimal stubs so worker.optim_step() reaches the sticky path."""
+    worker.log_memory_breakdown = lambda tag: None
+    worker._start_slow_op_watchdog = lambda **kw: None
+    worker._stop_slow_op_watchdog = lambda w: None
+    worker._zero_disabled_lora_params = lambda *a, **kw: None
+
+
+def _prepare_worker_for_forward_backward(worker, monkeypatch):
+    """Attach minimal stubs so worker.forward_backward() reaches the sticky path.
+
+    Patches heavy imports (torch.cuda, verl, model_config) that are impossible
+    to satisfy in a unit test environment without GPU.
+    """
+    worker.log_memory_breakdown = lambda tag: None
+    worker._start_slow_op_watchdog = lambda **kw: None
+    worker._stop_slow_op_watchdog = lambda w: None
+    worker._is_output_rank = lambda: False
+    worker._resolve_reset_bias = lambda val, default: False
+
+    # Patch the heavy imports inside forward_backward body:
+    # 1. tinker_to_tensordict -> returns a dummy
+    # 2. create_sft_loss_fn -> returns a dummy
+    # 3. torch.cuda.current_device -> returns 0
+    # 4. torch.ones -> returns a no-op object
+    # 5. torch.cuda.synchronize -> no-op
+    # 6. get_model_config -> returns object with max_model_len
+
+    import types
+
+    class _FakeModelConfig:
+        max_model_len = 2048
+
+    fake_training = types.ModuleType("tinker_server.backend.megatron_training")
+    fake_training.create_sft_loss_fn = lambda **kw: (lambda *a, **k: None)  # type: ignore
+    fake_training.create_ppo_loss_fn = lambda *a, **kw: (lambda *a2, **k2: None)  # type: ignore
+    fake_training.tinker_to_tensordict = lambda *a, **kw: "fake_tensordict"  # type: ignore
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.megatron_training", fake_training)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.get_model_config",
+        lambda model: _FakeModelConfig(),
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.flatten_encoded_text_chunks",
+        lambda model_input: model_input.get("input_ids", [1, 2, 3]),
+    )
+
+    # Patch torch.cuda calls (forward_backward does a CUDA health check)
+    import torch
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    original_ones = torch.ones
+    def patched_ones(*args, **kwargs):
+        # Strip device= to avoid CUDA requirement
+        kwargs.pop("device", None)
+        return original_ones(*args, **kwargs)
+    monkeypatch.setattr(torch, "ones", patched_ones)
 
 
 # ---------------------------------------------------------------------------
@@ -202,110 +278,76 @@ def test_issue_193_valid_gradients_still_snapshot_on_release(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 7: Sticky ctx cleaned up on forward_backward error
+# Test 7: forward_backward() error triggers sticky cleanup (real method)
 # ---------------------------------------------------------------------------
 
 def test_issue_193_sticky_cleanup_on_forward_backward_error(monkeypatch):
-    """When forward_backward computation raises, the sticky ctx must be released
-    so the next call gets a fresh enter (not reuse of a broken ctx).
-
-    This test verifies the try/except block in forward_backward sticky path
-    actually catches exceptions and calls _release_sticky_train_mode."""
+    """Call the real forward_backward() with a failing engine.forward_backward_batch().
+    Verifies the try/except in the sticky path actually fires."""
     worker, state = _make_worker(monkeypatch)
+    _prepare_worker_for_forward_backward(worker, monkeypatch)
 
-    # Track whether _release_sticky_train_mode was called
-    release_called = {"count": 0, "reason": None, "snapshot": None}
-    original_release = worker._release_sticky_train_mode
-
-    def tracked_release(*, reason, snapshot_gradients):
-        release_called["count"] += 1
-        release_called["reason"] = reason
-        release_called["snapshot"] = snapshot_gradients
-        return original_release(reason=reason, snapshot_gradients=snapshot_gradients)
-
-    worker._release_sticky_train_mode = tracked_release  # type: ignore[method-assign]
-
-    # Ensure sticky context is open
-    worker._ensure_sticky_train_mode(session_id="s1", reason="test")
-    assert state["enter"] == 1
-    assert worker._sticky_train_mode_ctx is not None
-
-    # Simulate computation error by directly calling the error path
-    # (mimics what happens when _run_forward_backward_compute raises)
+    # Make forward_backward_batch raise
     class ComputeError(RuntimeError):
         pass
 
-    try:
-        raise ComputeError("Simulated forward_backward error")
-    except ComputeError:
-        # This is what the try/except block in forward_backward does
-        worker._release_sticky_train_mode(
-            reason="forward_backward_error",
-            snapshot_gradients=False,
-        )
-        # Verify the exception would be re-raised
-        import sys
-        exc_info = sys.exc_info()
-        assert exc_info[0] is ComputeError
+    def failing_fbb(*args, **kwargs):
+        raise ComputeError("GPU compute failed")
 
-    # Verify ctx was released with correct parameters
-    assert release_called["count"] == 1
-    assert release_called["reason"] == "forward_backward_error"
-    assert release_called["snapshot"] is False
+    worker.engine.forward_backward_batch = failing_fbb  # type: ignore[method-assign]
+
+    # Call the real method -- should raise ComputeError and clean up sticky ctx
+    with pytest.raises(ComputeError, match="GPU compute failed"):
+        worker.forward_backward(
+            data_items=[{"model_input": {"input_ids": [1, 2, 3]}}],
+            loss_fn="cross_entropy",
+            loss_fn_config={},
+            session_id="s1",
+        )
+
+    # Verify: sticky ctx released, state cleaned
+    assert state["enter"] == 1
     assert state["exit"] == 1
     assert worker._sticky_train_mode_ctx is None
+    assert worker._sticky_train_mode_session_id is None
 
-    # Next call should do a fresh enter, not reuse
-    result = worker._ensure_sticky_train_mode(session_id="s1", reason="forward_backward")
+    # Verify: next call is fresh enter (not reuse of broken ctx)
+    result = worker._ensure_sticky_train_mode(session_id="s1", reason="test")
     assert result["reused"] is False
     assert state["enter"] == 2
 
 
 # ---------------------------------------------------------------------------
-# Test 8: Sticky ctx cleaned up on optim_step error
+# Test 8: optim_step() error triggers sticky cleanup (real method)
 # ---------------------------------------------------------------------------
 
 def test_issue_193_sticky_cleanup_on_optim_step_error(monkeypatch):
-    """Same as test 7 but for optim_step error path."""
+    """Call the real optim_step() with a failing engine.optimizer_step().
+    Verifies the try/except in the sticky path actually fires."""
     worker, state = _make_worker(monkeypatch)
+    _prepare_worker_for_optim_step(worker)
 
-    release_called = {"count": 0, "reason": None, "snapshot": None}
-    original_release = worker._release_sticky_train_mode
-
-    def tracked_release(*, reason, snapshot_gradients):
-        release_called["count"] += 1
-        release_called["reason"] = reason
-        release_called["snapshot"] = snapshot_gradients
-        return original_release(reason=reason, snapshot_gradients=snapshot_gradients)
-
-    worker._release_sticky_train_mode = tracked_release  # type: ignore[method-assign]
-
-    worker._ensure_sticky_train_mode(session_id="s1", reason="test")
-    assert state["enter"] == 1
-
-    # Simulate optim_step error path
+    # Make optimizer_step raise
     class OptimError(RuntimeError):
         pass
 
-    try:
-        raise OptimError("Simulated optimizer_step error")
-    except OptimError:
-        worker._release_sticky_train_mode(
-            reason="optim_step_error",
-            snapshot_gradients=False,
-        )
-        import sys
-        exc_info = sys.exc_info()
-        assert exc_info[0] is OptimError
+    def failing_optimizer_step():
+        raise OptimError("Optimizer diverged")
 
-    # Verify cleanup
-    assert release_called["count"] == 1
-    assert release_called["reason"] == "optim_step_error"
-    assert release_called["snapshot"] is False
+    worker.engine.optimizer_step = failing_optimizer_step  # type: ignore[method-assign]
+
+    # Call the real method -- should raise OptimError and clean up sticky ctx
+    with pytest.raises(OptimError, match="Optimizer diverged"):
+        worker.optim_step(learning_rate=1e-4, session_id="s1")
+
+    # Verify: sticky ctx released, state cleaned
+    assert state["enter"] == 1
     assert state["exit"] == 1
     assert worker._sticky_train_mode_ctx is None
+    assert worker._sticky_train_mode_session_id is None
 
-    result = worker._ensure_sticky_train_mode(session_id="s1", reason="optim_step")
+    # Verify: next call is fresh enter
+    result = worker._ensure_sticky_train_mode(session_id="s1", reason="test")
     assert result["reused"] is False
     assert state["enter"] == 2
 
@@ -445,43 +487,44 @@ def test_issue_193_swap_session_does_not_restore_sentinel(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 12: Cleanup error does not mask original error
+# Test 12: Cleanup error does not mask original error (real optim_step)
 # ---------------------------------------------------------------------------
 
 def test_issue_193_cleanup_error_preserves_original_error(monkeypatch):
-    """When cleanup (_release_sticky_train_mode) fails during exception handling,
-    the original business error must still be raised, not the cleanup error."""
+    """Call real optim_step() where optimizer_step() AND __exit__() both fail.
+    The original business error must be raised, not the cleanup error.
+    Sticky state must still be cleared (fail-closed)."""
     worker, state = _make_worker(monkeypatch)
+    _prepare_worker_for_optim_step(worker)
 
-    # Make _release_sticky_train_mode raise an error
-    def failing_release(*, reason, snapshot_gradients):
-        raise RuntimeError("Cleanup failed")
-
-    worker._release_sticky_train_mode = failing_release  # type: ignore[method-assign]
-
-    # Ensure sticky context is open
-    worker._ensure_sticky_train_mode(session_id="s1", reason="test")
-
-    # Simulate original error
-    class OriginalError(ValueError):
+    class OptimError(RuntimeError):
         pass
 
-    import pytest
-    # The original error should be raised, not the cleanup error
-    with pytest.raises(OriginalError, match="Original business error"):
-        try:
-            raise OriginalError("Original business error")
-        except OriginalError as original_error:
-            # This mimics the except block in forward_backward/optim_step
-            try:
-                worker._release_sticky_train_mode(
-                    reason="forward_backward_error",
-                    snapshot_gradients=False,
-                )
-            except Exception:
-                pass  # Cleanup error is caught and logged
-            # Original error is re-raised
-            raise original_error
+    class ExitError(RuntimeError):
+        pass
+
+    original_exit_method = _FakeTrainMode.__exit__
+
+    def failing_optimizer_step():
+        raise OptimError("Optimizer diverged")
+
+    def failing_exit(self, exc_type, exc, tb):
+        state["exit"] += 1
+        raise ExitError("__exit__ failed during cleanup")
+
+    worker.engine.optimizer_step = failing_optimizer_step  # type: ignore[method-assign]
+    _FakeTrainMode.__exit__ = failing_exit  # type: ignore[method-assign]
+
+    try:
+        # Business error (OptimError) should be raised, not ExitError
+        with pytest.raises(OptimError, match="Optimizer diverged"):
+            worker.optim_step(learning_rate=1e-4, session_id="s1")
+
+        # Verify: sticky state cleaned despite double failure (fail-closed)
+        assert worker._sticky_train_mode_ctx is None
+        assert worker._sticky_train_mode_session_id is None
+    finally:
+        _FakeTrainMode.__exit__ = original_exit_method
 
 
 # ---------------------------------------------------------------------------
