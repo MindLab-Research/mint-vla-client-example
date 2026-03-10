@@ -43,6 +43,11 @@ PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
 _megatron_create_locks: dict[str, threading.Lock] = {}
 _megatron_create_locks_guard = threading.Lock()
 
+# Sentinel indicating that optim_step has consumed the session's gradients.
+# Using a unique object() (not None) so dict.get() returning None ("never cached")
+# is distinguishable from "consumed".  All consumers must check with `is`.
+_GRADIENTS_CONSUMED = object()
+
 
 def _get_megatron_create_lock(actor_name: str) -> threading.Lock:
     with _megatron_create_locks_guard:
@@ -311,25 +316,63 @@ class MegatronRankWorker:
         return bool(self._sticky_train_mode_enabled and session_id)
 
     def _release_sticky_train_mode(self, *, reason: str, snapshot_gradients: bool) -> dict:
+        """Release (close) the currently open sticky train_mode() context.
+
+        Two responsibilities before calling ctx.__exit__():
+          1. Optionally snapshot GPU gradients to CPU (if snapshot_gradients=True),
+             so the session's accumulated gradients survive the offload.
+             Skipped when gradients were already consumed (_GRADIENTS_CONSUMED).
+          2. Call ctx.__exit__() which triggers GPU->CPU model parameter offload (~620ms).
+
+        Idempotent: if no ctx is open, returns {"released": False} without side effects.
+
+        Args:
+            reason: Why we're releasing. Used in diagnostic logs. Common values:
+                "session_change", "idle_timeout", "optim_step_complete",
+                "forward_backward_error", "optim_step_error", "swap_session_state".
+            snapshot_gradients: Whether to capture GPU gradients to CPU before exit.
+                True  -- on session switch / idle timeout (gradients still useful).
+                False -- after optim_step (gradients consumed) or on error (GPU state
+                         undefined; snapshotting would persist garbage).
+
+        Returns:
+            dict with: released, exit_s, snapshot_count, exit_total, session_id.
+        """
         released = False
         exit_s = 0.0
         snap_count = 0
         active_session = self._sticky_train_mode_session_id
         if self._sticky_train_mode_ctx is not None:
+            # -- Optional gradient snapshot before __exit__ destroys GPU state --
             if snapshot_gradients and active_session is not None:
-                try:
-                    captured = self._capture_gradients()
-                    self._session_gradients[active_session] = captured
-                    snap_count = len(captured)
-                except Exception as e:
-                    logger.warning(
-                        f"[Rank {self.rank}] sticky_train_mode snapshot failed "
-                        f"(session={active_session}, reason={reason}): {e}"
+                # Guard: if optim_step already consumed the gradients
+                # (_GRADIENTS_CONSUMED sentinel), skip snapshot.  Capturing
+                # post-optimizer residual GPU data would revive stale gradients
+                # and cause double-apply on the next forward_backward.
+                existing = self._session_gradients.get(active_session)
+                if existing is _GRADIENTS_CONSUMED:
+                    logger.debug(
+                        f"[Rank {self.rank}] sticky_train_mode release: "
+                        f"skipping gradient snapshot for session={active_session} "
+                        f"(already consumed by optim_step), reason={reason}"
                     )
+                else:
+                    try:
+                        captured = self._capture_gradients()
+                        self._session_gradients[active_session] = captured
+                        snap_count = len(captured)
+                    except Exception as e:
+                        logger.warning(
+                            f"[Rank {self.rank}] sticky_train_mode snapshot failed "
+                            f"(session={active_session}, reason={reason}): {e}"
+                        )
 
+            # -- ctx.__exit__: triggers GPU->CPU model parameter offload --
             t0 = time.perf_counter()
             self._sticky_train_mode_ctx.__exit__(None, None, None)
             exit_s = time.perf_counter() - t0
+
+            # -- Reset all sticky bookkeeping --
             self._sticky_train_mode_ctx = None
             self._sticky_train_mode_session_id = None
             self._sticky_train_mode_last_used_s = 0.0
@@ -351,6 +394,37 @@ class MegatronRankWorker:
         }
 
     def _ensure_sticky_train_mode(self, *, session_id: str, reason: str) -> dict:
+        """Ensure a train_mode() context is open for the given session_id.
+
+        Three mutually exclusive outcomes:
+          1. Reuse  -- ctx already open for same session, not expired -> zero IO cost.
+          2. Rotate -- ctx open for a different session or idle-expired
+                       -> release old ctx (snapshot gradients), then fresh enter.
+          3. Enter  -- no ctx -> fresh enter (CPU->GPU weight load, ~620ms).
+
+        Why this method exists:
+          With param_offload=True, train_mode().__enter__ triggers a full model
+          CPU->GPU transfer and __exit__ triggers the reverse.  Without sticky mode,
+          each forward_backward / optim_step call independently enters/exits,
+          producing 2*(N+1) full-model round-trips for N chunks per step.
+          Sticky mode reuses one open context across chunks, exiting only once
+          at step end.
+
+        Args:
+            session_id: Which session this operation belongs to.  Used to detect
+                session changes that require rotating the context.
+            reason: Caller identifier ("forward_backward" / "optim_step") for
+                diagnostic logs.
+
+        Returns:
+            dict containing:
+              reused (bool): True if an existing ctx was reused (zero IO cost).
+              enter_s (float): Wall-clock seconds for fresh enter (0.0 if reused).
+              released_before_enter (bool): True if an old ctx was released first.
+              enter_total (int): Cumulative enter count.
+              reuse_total (int): Cumulative reuse count.
+        """
+        # -- Fast path: feature disabled or no session_id --
         if not self._sticky_enabled_for(session_id):
             return {
                 "reused": False,
@@ -362,6 +436,11 @@ class MegatronRankWorker:
 
         released_before_enter = False
         now = time.perf_counter()
+
+        # -- Phase 1: Check whether the existing ctx must be released --
+        # Two release triggers (either one suffices):
+        #   a) Session changed -> old session's GPU grads must be snapshot-saved first.
+        #   b) Idle timeout    -> holding GPU memory indefinitely is wasteful.
         if self._sticky_train_mode_ctx is not None:
             idle_s = (
                 now - self._sticky_train_mode_last_used_s
@@ -374,12 +453,17 @@ class MegatronRankWorker:
                 and idle_s > self._sticky_train_mode_idle_timeout_s
             )
             if session_changed or idle_expired:
+                # snapshot_gradients=True: GPU grads will be destroyed by __exit__,
+                # so capture them to CPU first (unless already _GRADIENTS_CONSUMED).
                 self._release_sticky_train_mode(
                     reason="session_change" if session_changed else "idle_timeout",
                     snapshot_gradients=True,
                 )
                 released_before_enter = True
 
+        # -- Phase 2: Reuse (ctx still alive = same session, not expired) --
+        # This is the performance-critical fast path: consecutive chunks within
+        # the same session hit this branch with zero IO cost.
         if self._sticky_train_mode_ctx is not None:
             self._sticky_train_mode_reuse_total += 1
             self._sticky_train_mode_last_used_s = time.perf_counter()
@@ -396,6 +480,10 @@ class MegatronRankWorker:
                 "reuse_total": self._sticky_train_mode_reuse_total,
             }
 
+        # -- Phase 3: Fresh enter (no ctx, or Phase 1 just released the old one) --
+        # ctx.__enter__() calls load_megatron_model_to_gpu():
+        #   - All model parameters: CPU -> GPU (PCIe DMA, ~620ms)
+        #   - Zero all GPU gradient buffers
         t0 = time.perf_counter()
         ctx = self.engine.train_mode()
         ctx.__enter__()
@@ -1673,7 +1761,7 @@ class MegatronRankWorker:
             train_mode_enter_ms = float(sticky.get("enter_s", 0.0)) * 1000.0
 
             cached_grads = self._session_gradients.get(session_id)
-            if cached_grads is not None and not train_mode_reused:
+            if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED and not train_mode_reused:
                 self._restore_gradients(cached_grads)
                 logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
             elif train_mode_reused:
@@ -1685,13 +1773,22 @@ class MegatronRankWorker:
                     "using zeroed grads from train_mode entry"
                 )
 
-            _run_forward_backward_compute()
+            try:
+                _run_forward_backward_compute()
+            except Exception:
+                # On error, GPU state is undefined -- release sticky context without
+                # snapshotting gradients (would persist garbage).
+                self._release_sticky_train_mode(
+                    reason="forward_backward_error",
+                    snapshot_gradients=False,
+                )
+                raise
         else:
             tm_enter_t0 = time.perf_counter()
             with self.engine.train_mode():
                 train_mode_enter_ms = (time.perf_counter() - tm_enter_t0) * 1000.0
                 cached_grads = self._session_gradients.get(session_id) if session_id else None
-                if cached_grads is not None:
+                if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
                     self._restore_gradients(cached_grads)
                     logger.debug(f"[Rank {self.rank}] Restored gradients for session {session_id}")
                 else:
@@ -2177,7 +2274,7 @@ class MegatronRankWorker:
                 optim_step_batch_ms = (time.perf_counter() - t_opt0) * 1000.0
 
                 if session_id is not None:
-                    self._session_gradients[session_id] = None
+                    self._session_gradients[session_id] = _GRADIENTS_CONSUMED
                     logger.debug(f"[Rank {self.rank}] Marked gradients as consumed for session {session_id}")
             finally:
                 self._stop_slow_op_watchdog(watchdog)
@@ -2190,7 +2287,7 @@ class MegatronRankWorker:
             train_mode_enter_ms = float(sticky.get("enter_s", 0.0)) * 1000.0
 
             cached_grads = self._session_gradients.get(session_id)
-            if cached_grads is not None and not train_mode_reused:
+            if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED and not train_mode_reused:
                 self._restore_gradients(cached_grads)
                 logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
             elif train_mode_reused:
@@ -2200,7 +2297,16 @@ class MegatronRankWorker:
                     f"session {session_id}, skip gradient restore"
                 )
 
-            _run_optim_core()
+            try:
+                _run_optim_core()
+            except Exception:
+                # On error, GPU state is undefined -- release sticky context without
+                # snapshotting gradients (would persist garbage).
+                self._release_sticky_train_mode(
+                    reason="optim_step_error",
+                    snapshot_gradients=False,
+                )
+                raise
 
             if self._sticky_train_mode_close_on_optim:
                 released = self._release_sticky_train_mode(
@@ -2213,7 +2319,7 @@ class MegatronRankWorker:
             with self.engine.train_mode():
                 train_mode_enter_ms = (time.perf_counter() - tm_enter_t0) * 1000.0
                 cached_grads = self._session_gradients.get(session_id) if session_id else None
-                if cached_grads is not None:
+                if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
                     self._restore_gradients(cached_grads)
                     logger.debug(f"[Rank {self.rank}] Restored gradients for optim_step, session {session_id}")
                 _run_optim_core()
