@@ -935,6 +935,11 @@ async def capacity_manager_unavailable_handler(_: Request, __: CapacityManagerUn
 # Paths that don't require authentication
 UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
 
+# Paths excluded from OTel span creation (high-frequency polling endpoints).
+# Set MINT_OTEL_EXCLUDE_NONE=1 to disable exclusions and trace everything.
+_OTEL_EXCLUDE_NONE = os.environ.get("MINT_OTEL_EXCLUDE_NONE", "").strip().lower() in ("1", "true", "yes")
+_OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {"/api/v1/retrieve_future", "/api/v1/healthz", "/api/v1/telemetry"}
+
 # Token encryptor for sk- token validation (initialized lazily)
 _token_encryptor: TokenEncryptor | None = None
 
@@ -988,7 +993,10 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             float(elapsed_ms),
         )
 
-    if tracer is None:
+    # Skip OTel span and request logging for high-frequency polling endpoints.
+    # Metrics are still recorded; only traces and per-request log lines are suppressed.
+    _skip_otel = route in _OTEL_EXCLUDED_PATHS
+    if tracer is None or _skip_otel:
         try:
             response = await call_next(request)
             status_code = int(getattr(response, "status_code", 500))
@@ -1005,7 +1013,8 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 status_code=status_code,
                 duration_ms=elapsed_ms,
             )
-            _log_request_observation(elapsed_ms)
+            if not _skip_otel:
+                _log_request_observation(elapsed_ms)
 
     try:
         from opentelemetry.propagate import extract

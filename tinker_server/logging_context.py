@@ -2,7 +2,7 @@
 
 Environment Variables:
     MINT_LOG_FILE: Log file path (default: /tmp/tinker_server.log)
-    MINT_LOG_MAX_BYTES: Max log file size before rotation (default: 10MB)
+    MINT_LOG_MAX_BYTES: Max log file size before rotation (default: 100MB)
     MINT_LOG_BACKUP_COUNT: Number of backup files to keep (default: 5)
     OTEL_EXPORTER_OTLP_ENDPOINT: Collector or APM endpoint (default: disabled)
     OTEL_EXPORTER_OTLP_HEADERS: OTLP headers (e.g. "x-byteapm-appkey=xxx")
@@ -331,7 +331,7 @@ def configure_logging() -> None:
     """Configure structlog + stdlib logging and optional OTLP exporters."""
     # Environment variables
     log_file = os.getenv("MINT_LOG_FILE", "/tmp/tinker_server.log")
-    log_max_bytes = int(os.getenv("MINT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10MB
+    log_max_bytes = int(os.getenv("MINT_LOG_MAX_BYTES", str(100 * 1024 * 1024)))  # 100MB
     log_backup_count = int(os.getenv("MINT_LOG_BACKUP_COUNT", "5"))
 
     # Configure structlog processors (shared for all outputs)

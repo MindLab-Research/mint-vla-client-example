@@ -2118,6 +2118,7 @@ class VerlInferenceEngine:
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+        from ..config import otel_env_vars
         self.server = ExtendedVLLMHttpServer.options(
             num_gpus=total_gpus,
             max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
@@ -2126,6 +2127,7 @@ class VerlInferenceEngine:
                     "PYTHONPATH": PFS_PYTHONPATH,
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
+                    **otel_env_vars(),
                 }
             },
         ).remote(
