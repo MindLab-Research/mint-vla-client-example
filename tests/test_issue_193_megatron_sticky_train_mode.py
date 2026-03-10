@@ -772,3 +772,71 @@ def test_issue_193_forward_backward_cleanup_log_has_structured_fields(monkeypatc
         assert "error_type=ExitError" in msg
     finally:
         _FakeTrainMode.__exit__ = original_exit_method
+
+
+# ---------------------------------------------------------------------------
+# Test 18: snapshot failure on session_change is fail-loud (not swallowed)
+# ---------------------------------------------------------------------------
+
+def test_issue_193_snapshot_failure_on_session_change_is_fail_loud(monkeypatch):
+    """When _ensure_sticky_train_mode triggers a session change and
+    _capture_gradients() fails, the error must propagate -- ctx must stay
+    open and gradients must NOT be silently lost."""
+    worker, state = _make_worker(monkeypatch)
+
+    class CaptureError(RuntimeError):
+        pass
+
+    def failing_capture():
+        raise CaptureError("GPU snapshot failed")
+
+    worker._capture_gradients = failing_capture  # type: ignore[method-assign]
+
+    # Open sticky ctx for s1
+    worker._ensure_sticky_train_mode(session_id="s1", reason="forward_backward")
+    assert state["enter"] == 1
+
+    # Switching to s2 triggers release(snapshot_gradients=True) for s1.
+    # Since _capture_gradients fails, the error must propagate.
+    with pytest.raises(CaptureError, match="GPU snapshot failed"):
+        worker._ensure_sticky_train_mode(session_id="s2", reason="forward_backward")
+
+    # Ctx must still be open (not released) -- gradients survive on GPU
+    assert worker._sticky_train_mode_ctx is not None
+    assert worker._sticky_train_mode_session_id == "s1"
+    assert state["exit"] == 0  # __exit__ was NOT called
+
+
+# ---------------------------------------------------------------------------
+# Test 19: snapshot failure on idle_timeout is fail-loud
+# ---------------------------------------------------------------------------
+
+def test_issue_193_snapshot_failure_on_idle_timeout_is_fail_loud(monkeypatch):
+    """When idle timeout triggers release with snapshot_gradients=True and
+    _capture_gradients() fails, the error must propagate -- ctx must stay
+    open for retry."""
+    worker, state = _make_worker(monkeypatch, idle_timeout_s="0.1")
+
+    class CaptureError(RuntimeError):
+        pass
+
+    def failing_capture():
+        raise CaptureError("GPU snapshot failed")
+
+    worker._capture_gradients = failing_capture  # type: ignore[method-assign]
+
+    # Open sticky ctx for s1
+    worker._ensure_sticky_train_mode(session_id="s1", reason="forward_backward")
+    assert state["enter"] == 1
+
+    # Force idle timeout
+    worker._sticky_train_mode_last_used_s = time.perf_counter() - 1.0
+
+    # Same session but timed out → release(snapshot=True) → capture fails
+    with pytest.raises(CaptureError, match="GPU snapshot failed"):
+        worker._ensure_sticky_train_mode(session_id="s1", reason="forward_backward")
+
+    # Ctx must still be open -- NOT silently released
+    assert worker._sticky_train_mode_ctx is not None
+    assert worker._sticky_train_mode_session_id == "s1"
+    assert state["exit"] == 0

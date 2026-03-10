@@ -359,15 +359,12 @@ class MegatronRankWorker:
                         f"(already consumed by optim_step), reason={reason}"
                     )
                 else:
-                    try:
-                        captured = self._capture_gradients()
-                        self._session_gradients[active_session] = captured
-                        snap_count = len(captured)
-                    except Exception as e:
-                        logger.warning(
-                            f"[Rank {self.rank}] sticky_train_mode snapshot failed "
-                            f"(session={active_session}, reason={reason}): {e}"
-                        )
+                    # Let _capture_gradients() failures propagate -- the ctx
+                    # stays open and bookkeeping is untouched, so the caller
+                    # can retry.  Swallowing would silently lose gradients.
+                    captured = self._capture_gradients()
+                    self._session_gradients[active_session] = captured
+                    snap_count = len(captured)
 
             # -- ctx.__exit__: triggers GPU->CPU model parameter offload --
             # Use try/finally to ensure bookkeeping cleanup happens even if __exit__ fails.
