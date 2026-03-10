@@ -2052,6 +2052,7 @@ class MultiNodeInferenceEngine:
                 else:
                     scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
+            from ..config import otel_env_vars
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
@@ -2067,6 +2068,7 @@ class MultiNodeInferenceEngine:
                 "RAY_CGRAPH_get_timeout": str(ray_cgraph_get_timeout),
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
                 "VLLM_DISABLE_PYNCCL": "1",
+                **otel_env_vars(),
             }
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]

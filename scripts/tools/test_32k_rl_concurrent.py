@@ -43,6 +43,7 @@ DEFAULT_MODELS = ",".join(
 STAGE_SAVE = "save_weights_and_get_sampling_client"
 STAGE_ROLLOUT = "rollout_sample"
 STAGE_ROLLOUT_ITEM = "rollout_sample_item"
+STAGE_COMPUTE_LOGPROBS = "compute_logprobs"
 STAGE_FORWARD_BACKWARD = "forward_backward"
 STAGE_OPTIM_STEP = "optim_step"
 STAGE_HEARTBEAT = "heartbeat"
@@ -58,6 +59,19 @@ def _coalesce(*values: str | None) -> str | None:
         if v:
             return v
     return None
+
+
+def _parse_bool_flag(v: str | int | bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v != 0
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid bool flag: {v!r}")
 
 
 def _load_env() -> None:
@@ -169,6 +183,22 @@ def _wait_future(
                 on_heartbeat(elapsed)
 
 
+def _extract_compute_logprobs(logprobs_result: Any) -> list[float | None]:
+    if isinstance(logprobs_result, list):
+        out = logprobs_result
+    elif hasattr(logprobs_result, "logprobs"):
+        out = getattr(logprobs_result, "logprobs")
+    else:
+        raise RuntimeError(
+            f"compute_logprobs() returned unexpected type: {type(logprobs_result).__name__}"
+        )
+    if not isinstance(out, list):
+        raise RuntimeError(
+            f"compute_logprobs().logprobs is not a list: {type(out).__name__}"
+        )
+    return out
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
@@ -181,7 +211,6 @@ def _parse_args() -> argparse.Namespace:
     p_single.add_argument("--jsonl-path", default=None, help="Write per-stage timing logs to this JSONL file")
     p_single.add_argument("--barrier-dir", default=None, help="Optional directory for step barrier files")
     p_single.add_argument("--barrier-sessions", type=int, default=0, help="Expected session count for step barrier")
-
     p_conc = sub.add_parser("concurrent", help="Run RL loops concurrently (default)")
     p_conc.add_argument("--base-url", default=None, help="MINT_BASE_URL/TINKER_BASE_URL override")
     p_conc.add_argument("--api-key", default=None, help="MINT_API_KEY/TINKER_API_KEY override")
@@ -224,6 +253,10 @@ def _parse_args() -> argparse.Namespace:
             help="If >0, split forward_backward into chunks of this size (gradient accumulates until optim_step)",
         )
         pp.add_argument("--future-heartbeat-s", type=float, default=60.0)
+        pp.add_argument("--prompt-logprobs", default="0", help="0/1: include prompt logprobs in sample()")
+        pp.add_argument("--compute-logprobs", default="0", help="0/1: call compute_logprobs() before sample()")
+        pp.add_argument("--trace-id", default=None, help="Optional fixed X-Trace-Id for all HTTP calls in this run")
+        pp.add_argument("--run-id", default=None, help="Optional run identifier for JSONL/report joins")
 
     return p.parse_args()
 
@@ -254,6 +287,10 @@ def _run_single(
     jsonl_path: Path | None = None,
     barrier_dir: Path | None = None,
     barrier_sessions: int = 0,
+    prompt_logprobs: bool = False,
+    compute_logprobs: bool = False,
+    trace_id: str | None = None,
+    run_id: str | None = None,
 ) -> int:
     import mint
     from mint import types
@@ -272,7 +309,13 @@ def _run_single(
             "elapsed_s": float(elapsed_s),
             "model": model,
             "pid": pid,
+            "prompt_logprobs": bool(prompt_logprobs),
+            "compute_logprobs": bool(compute_logprobs),
         }
+        if trace_id:
+            rec["trace_id"] = str(trace_id)
+        if run_id:
+            rec["run_id"] = str(run_id)
         rec.update(extra)
         writer.write(rec)
 
@@ -290,6 +333,8 @@ def _run_single(
                 "label": label,
                 "model": model,
                 "pid": pid,
+                "prompt_logprobs": bool(prompt_logprobs),
+                "compute_logprobs": bool(compute_logprobs),
             }
         )
 
@@ -312,6 +357,8 @@ def _run_single(
                     "event": "arrive",
                     "model": model,
                     "pid": pid,
+                    "prompt_logprobs": bool(prompt_logprobs),
+                    "compute_logprobs": bool(compute_logprobs),
                 }
             )
 
@@ -331,6 +378,8 @@ def _run_single(
                     "wait_s": float(time.time() - t0),
                     "model": model,
                     "pid": pid,
+                    "prompt_logprobs": bool(prompt_logprobs),
+                    "compute_logprobs": bool(compute_logprobs),
                 }
             )
 
@@ -343,6 +392,10 @@ def _run_single(
                 "stage": "start",
                 "model": model,
                 "pid": pid,
+                "prompt_logprobs": bool(prompt_logprobs),
+                "compute_logprobs": bool(compute_logprobs),
+                "trace_id": trace_id,
+                "run_id": run_id,
             }
         )
 
@@ -358,7 +411,14 @@ def _run_single(
         )
 
         random.seed(42 + int(session_idx))
-        service_client = mint.ServiceClient(base_url=base_url, api_key=api_key)
+        default_headers: dict[str, str] = {}
+        if trace_id:
+            default_headers["X-Trace-Id"] = str(trace_id)
+        service_client = mint.ServiceClient(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=default_headers,
+        )
 
         print(f"[{_ts()}] create_lora_training_client start base_model={model}", flush=True)
         training_client = service_client.create_lora_training_client(
@@ -433,6 +493,47 @@ def _run_single(
 
                 futures: list[tuple[int, int, list[int], float, concurrent.futures.Future]] = []
                 for p_idx, expected, prompt_len, prompt_tokens in chunk:
+                    if compute_logprobs:
+                        clp_t0 = time.time()
+                        clp_future = sampling_client.compute_logprobs(types.ModelInput.from_ints(tokens=prompt_tokens))
+                        clp_result = _wait_future(
+                            clp_future,
+                            label=f"compute_logprobs model={model} session={session_idx} step {step+1}/{cfg.steps} prompt {p_idx+1}/{cfg.prompts_per_step}",
+                            heartbeat_s=cfg.heartbeat_s,
+                            on_heartbeat=lambda elapsed: _heartbeat(
+                                stage=STAGE_COMPUTE_LOGPROBS,
+                                step_idx=step,
+                                elapsed_s=elapsed,
+                                label=f"compute_logprobs prompt={p_idx}",
+                            ),
+                        )
+                        clp_logprobs = _extract_compute_logprobs(clp_result)
+                        if len(clp_logprobs) != len(prompt_tokens):
+                            raise RuntimeError(
+                                "compute_logprobs() length mismatch: "
+                                f"prompt_len={len(prompt_tokens)} logprobs_len={len(clp_logprobs)}"
+                            )
+                        if clp_logprobs and clp_logprobs[0] is not None:
+                            raise RuntimeError("compute_logprobs() first token logprob must be None")
+                        non_null_count = 0
+                        for i, lp in enumerate(clp_logprobs):
+                            if lp is None:
+                                continue
+                            if not isinstance(lp, (int, float)):
+                                raise RuntimeError(
+                                    f"compute_logprobs() invalid logprob at idx={i}: type={type(lp).__name__}"
+                                )
+                            non_null_count += 1
+                        if len(clp_logprobs) > 1 and non_null_count == 0:
+                            raise RuntimeError("compute_logprobs() returned no usable token logprobs")
+                        _emit(
+                            STAGE_COMPUTE_LOGPROBS,
+                            step_idx=step,
+                            elapsed_s=time.time() - clp_t0,
+                            prompt_idx=p_idx,
+                            prompt_len=len(prompt_tokens),
+                            non_null_logprobs=non_null_count,
+                        )
                     print(
                         f"[{_ts()}] step {step+1}/{cfg.steps}: rollout prompt {p_idx+1}/{cfg.prompts_per_step} "
                         f"num_samples={cfg.samples_per_prompt} prompt_len={prompt_len}",
@@ -454,6 +555,7 @@ def _run_single(
                                     top_k=-1,
                                     top_p=1.0,
                                 ),
+                                include_prompt_logprobs=bool(prompt_logprobs),
                             ),
                         )
                     )
@@ -632,6 +734,10 @@ def _run_single(
                     "stage": "end",
                     "model": model,
                     "pid": pid,
+                    "prompt_logprobs": bool(prompt_logprobs),
+                    "compute_logprobs": bool(compute_logprobs),
+                    "trace_id": trace_id,
+                    "run_id": run_id,
                 }
             )
         return 0
@@ -642,6 +748,7 @@ def _run_single(
 
 _SUMMARY_STAGES = [
     STAGE_SAVE,
+    STAGE_COMPUTE_LOGPROBS,
     STAGE_ROLLOUT,
     STAGE_FORWARD_BACKWARD,
     STAGE_OPTIM_STEP,
@@ -693,10 +800,26 @@ def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
 def _write_summary(*, run_dir: Path, model: str, num_sessions: int, cfg: RLConfig, sessions: dict[int, Path]) -> None:
     by_session: dict[str, dict[str, dict[str, float | int | None]]] = {}
     all_values: dict[str, list[float]] = {stage: [] for stage in _SUMMARY_STAGES}
+    run_ids: set[str] = set()
+    trace_ids: set[str] = set()
+    prompt_logprobs_flag: bool | None = None
+    compute_logprobs_flag: bool | None = None
 
     for session_idx, jsonl_path in sorted(sessions.items()):
         vals: dict[str, list[float]] = {stage: [] for stage in _SUMMARY_STAGES}
         for rec in _iter_jsonl(jsonl_path):
+            rid = rec.get("run_id")
+            if isinstance(rid, str) and rid:
+                run_ids.add(rid)
+            tid = rec.get("trace_id")
+            if isinstance(tid, str) and tid:
+                trace_ids.add(tid)
+            plp = rec.get("prompt_logprobs")
+            if isinstance(plp, bool):
+                prompt_logprobs_flag = plp if prompt_logprobs_flag is None else prompt_logprobs_flag
+            clp = rec.get("compute_logprobs")
+            if isinstance(clp, bool):
+                compute_logprobs_flag = clp if compute_logprobs_flag is None else compute_logprobs_flag
             stage = rec.get("stage")
             if stage not in _SUMMARY_STAGES:
                 continue
@@ -723,7 +846,11 @@ def _write_summary(*, run_dir: Path, model: str, num_sessions: int, cfg: RLConfi
             "rollout_max_inflight": cfg.rollout_max_inflight,
             "train_microbatch": cfg.train_microbatch,
             "future_heartbeat_s": cfg.heartbeat_s,
+            "prompt_logprobs": prompt_logprobs_flag,
+            "compute_logprobs": compute_logprobs_flag,
         },
+        "run_ids": sorted(run_ids),
+        "trace_ids": sorted(trace_ids),
         "by_session": by_session,
         "all_sessions": {stage: _stage_stats(v) for stage, v in all_values.items()},
     }
@@ -742,6 +869,10 @@ def _run_multi_session(
     heartbeat_s: float,
     stall_timeout_s: float,
     sync_steps: bool,
+    prompt_logprobs: bool,
+    compute_logprobs: bool,
+    trace_id: str | None = None,
+    run_id: str | None = None,
 ) -> int:
     if num_sessions < 2:
         print("--num-sessions must be >= 2", file=sys.stderr)
@@ -817,7 +948,15 @@ def _run_multi_session(
             str(cfg.train_microbatch),
             "--future-heartbeat-s",
             str(cfg.heartbeat_s),
+            "--prompt-logprobs",
+            "1" if prompt_logprobs else "0",
+            "--compute-logprobs",
+            "1" if compute_logprobs else "0",
         ]
+        if trace_id:
+            argv += ["--trace-id", str(trace_id)]
+        if run_id:
+            argv += ["--run-id", str(run_id)]
         if barrier_dir:
             argv += ["--barrier-dir", str(barrier_dir), "--barrier-sessions", str(num_sessions)]
 
@@ -949,6 +1088,10 @@ def main() -> int:
         barrier_dir = Path(args.barrier_dir) if getattr(args, "barrier_dir", None) else None
         barrier_sessions = int(getattr(args, "barrier_sessions", 0) or 0)
         session_idx = int(getattr(args, "session_idx", 0) or 0)
+        prompt_logprobs = _parse_bool_flag(getattr(args, "prompt_logprobs", "0"))
+        compute_logprobs = _parse_bool_flag(getattr(args, "compute_logprobs", "0"))
+        trace_id = _coalesce(getattr(args, "trace_id", None), os.environ.get("MINT_TRACE_ID"))
+        run_id = _coalesce(getattr(args, "run_id", None), os.environ.get("MINT_RUN_ID"))
         try:
             return _run_single(
                 base_url=base_url,
@@ -959,6 +1102,10 @@ def main() -> int:
                 jsonl_path=jsonl_path,
                 barrier_dir=barrier_dir,
                 barrier_sessions=barrier_sessions,
+                prompt_logprobs=bool(prompt_logprobs),
+                compute_logprobs=bool(compute_logprobs),
+                trace_id=trace_id,
+                run_id=run_id,
             )
         except Exception as e:
             print(
@@ -971,6 +1118,10 @@ def main() -> int:
         base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"), DEFAULT_BASE_URL)
         api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
         cfg = _rl_cfg_from_args(args)
+        prompt_logprobs = _parse_bool_flag(getattr(args, "prompt_logprobs", "0"))
+        compute_logprobs = _parse_bool_flag(getattr(args, "compute_logprobs", "0"))
+        trace_id = _coalesce(getattr(args, "trace_id", None), os.environ.get("MINT_TRACE_ID"))
+        run_id = _coalesce(getattr(args, "run_id", None), os.environ.get("MINT_RUN_ID"))
         run_dir = Path(args.run_dir or f"/tmp/32k_rl_multi_session.{int(time.time())}")
         try:
             return _run_multi_session(
@@ -984,6 +1135,10 @@ def main() -> int:
                 heartbeat_s=float(args.heartbeat_s),
                 stall_timeout_s=float(args.stall_timeout_s),
                 sync_steps=bool(args.sync_steps),
+                prompt_logprobs=bool(prompt_logprobs),
+                compute_logprobs=bool(compute_logprobs),
+                trace_id=trace_id,
+                run_id=run_id,
             )
         except Exception as e:
             print(f"[{_ts()}] error multi-session model={args.model} {type(e).__name__}: {e}", flush=True)
@@ -996,6 +1151,10 @@ def main() -> int:
     base_url = _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("TINKER_BASE_URL"), DEFAULT_BASE_URL)
     api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("TINKER_API_KEY"))
     cfg = _rl_cfg_from_args(args)
+    prompt_logprobs = _parse_bool_flag(getattr(args, "prompt_logprobs", "0"))
+    compute_logprobs = _parse_bool_flag(getattr(args, "compute_logprobs", "0"))
+    trace_id = _coalesce(getattr(args, "trace_id", None), os.environ.get("MINT_TRACE_ID"))
+    run_id = _coalesce(getattr(args, "run_id", None), os.environ.get("MINT_RUN_ID"))
 
     models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
     if not models:
@@ -1060,7 +1219,15 @@ def main() -> int:
             str(cfg.train_microbatch),
             "--future-heartbeat-s",
             str(cfg.heartbeat_s),
+            "--prompt-logprobs",
+            "1" if prompt_logprobs else "0",
+            "--compute-logprobs",
+            "1" if compute_logprobs else "0",
         ]
+        if trace_id:
+            argv += ["--trace-id", str(trace_id)]
+        if run_id:
+            argv += ["--run-id", str(run_id)]
 
         proc = subprocess.Popen(
             argv,
