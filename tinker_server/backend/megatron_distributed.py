@@ -4519,15 +4519,22 @@ class MegatronRankWorker:
     def shutdown(self):
         """Clean shutdown of distributed process."""
         import torch
-        if self._sticky_train_mode_ctx is not None:
-            self._release_sticky_train_mode(reason="shutdown", snapshot_gradients=False)
-        # Clear session state
-        self._session_gradients.clear()
-        self._session_optimizer_states.clear()
-        self._current_session_id = None
+        try:
+            if self._sticky_train_mode_ctx is not None:
+                self._release_sticky_train_mode(reason="shutdown", snapshot_gradients=False)
+        except Exception as e:
+            logger.warning(
+                "[Rank %d] sticky release failed during shutdown: %s: %s",
+                self.rank, type(e).__name__, e,
+            )
+        finally:
+            # Clear session state and process group regardless of release outcome
+            self._session_gradients.clear()
+            self._session_optimizer_states.clear()
+            self._current_session_id = None
 
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
 
 
 

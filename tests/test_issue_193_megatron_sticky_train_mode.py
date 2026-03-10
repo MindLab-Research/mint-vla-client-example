@@ -808,6 +808,100 @@ def test_issue_193_snapshot_failure_on_session_change_is_fail_loud(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Test 20: shutdown() completes cleanup even when release fails
+# ---------------------------------------------------------------------------
+
+def test_issue_193_shutdown_cleanup_survives_release_failure(monkeypatch):
+    """When _release_sticky_train_mode raises during shutdown(), the
+    session caches must still be cleared and destroy_process_group must
+    still be called (via finally)."""
+    worker, state = _make_worker(monkeypatch)
+
+    class ExitError(RuntimeError):
+        pass
+
+    original_exit_method = _FakeTrainMode.__exit__
+
+    def failing_exit(self, exc_type, exc, tb):
+        state["exit"] += 1
+        raise ExitError("__exit__ failed")
+
+    _FakeTrainMode.__exit__ = failing_exit  # type: ignore[method-assign]
+
+    try:
+        # Open sticky ctx and populate session caches
+        worker._ensure_sticky_train_mode(session_id="s1", reason="test")
+        worker._session_gradients["s1"] = ["some-grads"]
+        worker._session_optimizer_states["s1"] = {"state": "data"}
+        worker._current_session_id = "s1"
+
+        # Patch torch.distributed so shutdown doesn't require real NCCL
+        import torch
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+        # shutdown() should NOT raise -- release error is caught
+        worker.shutdown()
+
+        # Verify: session caches cleared despite release failure
+        assert len(worker._session_gradients) == 0
+        assert len(worker._session_optimizer_states) == 0
+        assert worker._current_session_id is None
+    finally:
+        _FakeTrainMode.__exit__ = original_exit_method
+
+
+# ---------------------------------------------------------------------------
+# Test 21: swap_session_state snapshot failure is fail-loud
+# ---------------------------------------------------------------------------
+
+def test_issue_193_swap_session_snapshot_failure_is_fail_loud(monkeypatch):
+    """When swap_session_state calls _release_sticky_train_mode with
+    snapshot_gradients=True and _capture_gradients() fails, the error
+    must propagate -- not silently lose gradients and proceed."""
+    worker, state = _make_worker(monkeypatch)
+
+    class CaptureError(RuntimeError):
+        pass
+
+    capture_count = {"n": 0}
+
+    def failing_capture():
+        capture_count["n"] += 1
+        raise CaptureError("GPU snapshot failed")
+
+    def fake_capture_opt():
+        return {}
+
+    def fake_restore_opt(s):
+        pass
+
+    def fake_reset_opt():
+        pass
+
+    # Open sticky ctx for s1
+    worker._ensure_sticky_train_mode(session_id="s1", reason="forward_backward")
+    assert state["enter"] == 1
+
+    # Now inject the failure -- swap_session_state will call
+    # _release_sticky_train_mode(snapshot_gradients=True), which calls
+    # _capture_gradients() → fails
+    worker._capture_gradients = failing_capture  # type: ignore[method-assign]
+    worker._capture_optimizer_state = fake_capture_opt  # type: ignore[method-assign]
+    worker._restore_optimizer_state = fake_restore_opt  # type: ignore[method-assign]
+    worker._reset_optimizer_state = fake_reset_opt  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: None  # type: ignore[method-assign]
+
+    with pytest.raises(CaptureError, match="GPU snapshot failed"):
+        worker.swap_session_state("s2")
+
+    # Ctx must still be open -- swap did not silently proceed
+    assert worker._sticky_train_mode_ctx is not None
+    assert worker._sticky_train_mode_session_id == "s1"
+    assert state["exit"] == 0
+    assert capture_count["n"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Test 19: snapshot failure on idle_timeout is fail-loud
 # ---------------------------------------------------------------------------
 
