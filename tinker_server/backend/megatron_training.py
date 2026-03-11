@@ -790,6 +790,9 @@ class MegatronTrainingWorker:
             learning_rate: Initial learning rate.
             config: Optional full MegatronTrainingConfig.
         """
+        from ..logging_context import init_actor_observability
+
+        init_actor_observability()
         self.base_model = base_model
         self.lora_rank = lora_rank
         self.learning_rate = learning_rate

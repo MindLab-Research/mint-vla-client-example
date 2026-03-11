@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 from . import ray_kill
-from ..logging_context import get_request_id
+from ..logging_context import get_request_id, init_actor_observability
 
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
@@ -274,6 +274,7 @@ class TrainingWorker:
             idle_timeout: Seconds of inactivity before self-termination.
                           Set to 0 to disable auto-termination.
         """
+        init_actor_observability()
         torch = _get_torch()
         self.device = torch.device("cuda")
         self._base_model = base_model  # Store for get_lora_config()

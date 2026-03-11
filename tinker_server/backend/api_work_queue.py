@@ -15,6 +15,7 @@ from ..logging_context import (
     extract_trace_id_from_traceparent,
     get_otel_tracer,
     get_trace_id,
+    init_actor_observability,
     set_request_id,
     set_trace_id,
 )
@@ -102,6 +103,7 @@ def _get_or_create_ray_actor():
             import asyncio
             from collections import deque
 
+            init_actor_observability()
             logger.warning(
                 "[api_work_queue] actor (re)initializing (max_restarts=%d)",
                 max_restarts,
