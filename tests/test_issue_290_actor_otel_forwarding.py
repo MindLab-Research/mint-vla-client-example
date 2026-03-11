@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from tinker_server.config import otel_env_vars
 
@@ -34,3 +35,8 @@ def test_issue_290_all_actor_runtime_env_call_otel_env_vars():
         text = (repo_root / rel_path).read_text(encoding="utf-8")
         got = text.count("otel_env_vars()")
         assert got >= min_count, f"{rel_path} should contain >= {min_count} otel_env_vars() calls, got {got}"
+        assert re.search(
+            r"^\s*from\s+[.\w]+config\s+import\s+.*\botel_env_vars\b",
+            text,
+            flags=re.MULTILINE,
+        ), f"{rel_path} must import otel_env_vars to avoid NameError at runtime"
