@@ -305,7 +305,7 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 

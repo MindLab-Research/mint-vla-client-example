@@ -42,7 +42,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 

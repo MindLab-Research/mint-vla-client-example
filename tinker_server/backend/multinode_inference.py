@@ -40,7 +40,7 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
     }
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
@@ -2055,6 +2055,7 @@ class MultiNodeInferenceEngine:
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                **otel_env_vars(),
                 # Some environments import tvm_ffi during vLLM init and try to JIT-build a
                 # torch c-dlpack addon on every Ray worker process, which can spawn dozens
                 # of concurrent compilers and stall engine startup. Disable the optional
