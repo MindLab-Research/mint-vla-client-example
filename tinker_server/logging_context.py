@@ -20,6 +20,7 @@ import logging
 import logging.handlers
 import os
 import re
+import socket
 import sys
 import threading
 import uuid
@@ -47,6 +48,54 @@ _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
 _ACTOR_OBS_LOCK = threading.Lock()
+
+
+def _detect_hostname() -> str:
+    try:
+        name = socket.gethostname()
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except Exception:
+        pass
+    return "unknown-host"
+
+
+_HOSTNAME = _detect_hostname()
+
+
+def _coerce_file_line(pathname: object, lineno: object) -> tuple[str, int, str]:
+    path = str(pathname).strip() if isinstance(pathname, str) and pathname.strip() else "<unknown>"
+    try:
+        line = int(lineno) if lineno is not None else 0
+    except Exception:
+        line = 0
+    if line <= 0:
+        line = 1
+    return path, line, f"{path}:{line}"
+
+
+class _ContextEnrichmentFilter(logging.Filter):
+    """Inject request/trace/host/callsite fields for all handlers (including OTLP)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = get_request_id() or "-"
+        if not hasattr(record, "trace_id"):
+            record.trace_id = get_trace_id() or _get_current_otel_trace_id() or "-"
+
+        current_hostname = getattr(record, "hostname", None)
+        if not isinstance(current_hostname, str) or not current_hostname.strip():
+            record.hostname = _HOSTNAME
+
+        current_file_line = getattr(record, "file_line", None)
+        if not isinstance(current_file_line, str) or not current_file_line.strip() or current_file_line.endswith(":0"):
+            path, line, file_line = _coerce_file_line(getattr(record, "pathname", None), getattr(record, "lineno", None))
+            record.pathname = path
+            record.lineno = line
+            record.file_line = file_line
+            if path != "<unknown>":
+                record.filename = os.path.basename(path)
+        return True
 
 
 def set_request_id(request_id: str | None) -> None:
@@ -141,6 +190,14 @@ def add_trace_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> d
     """Structlog processor to add trace_id to all log events."""
     trace_id = get_trace_id() or _get_current_otel_trace_id()
     event_dict["trace_id"] = trace_id if trace_id else "-"
+    return event_dict
+
+
+def add_hostname(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Structlog processor to add hostname to all log events."""
+    hostname = event_dict.get("hostname")
+    if not isinstance(hostname, str) or not hostname.strip():
+        event_dict["hostname"] = _HOSTNAME
     return event_dict
 
 
@@ -240,7 +297,8 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         return
 
     service_name = (os.getenv("OTEL_SERVICE_NAME") or "mint").strip()
-    resource = Resource.create({"service.name": service_name})
+    # Use explicit resource attributes only; avoid default detector payloads.
+    resource = Resource(attributes={"service.name": service_name})
     headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
     app_key = (os.getenv("MINT_APMPLUS_APP_KEY") or "").strip()
     if app_key and "x-byteapm-appkey" not in headers:
@@ -289,7 +347,9 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         if not _OTEL_LOG_HANDLER_ATTACHED:
             level_name = (os.getenv("OTEL_LOG_LEVEL") or "INFO").upper()
             level = getattr(logging, level_name, logging.INFO)
-            root_logger.addHandler(LoggingHandler(level=level, logger_provider=logger_provider))
+            otel_handler = LoggingHandler(level=level, logger_provider=logger_provider)
+            otel_handler.addFilter(_ContextEnrichmentFilter())
+            root_logger.addHandler(otel_handler)
             _OTEL_LOG_HANDLER_ATTACHED = True
 
         # Optional logging instrumentation: do not fail if package is absent.
@@ -349,15 +409,7 @@ def _configure_stdlib_logging(
     fmt = "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s trace_id=%(trace_id)s %(message)s"
     datefmt = "%Y-%m-%dT%H:%M:%S%z"
 
-    class _ContextFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            if not hasattr(record, "request_id"):
-                record.request_id = get_request_id() or "-"
-            if not hasattr(record, "trace_id"):
-                record.trace_id = get_trace_id() or _get_current_otel_trace_id() or "-"
-            return True
-
-    context_filter = _ContextFilter()
+    context_filter = _ContextEnrichmentFilter()
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
@@ -410,6 +462,7 @@ def configure_logging() -> None:
         structlog.contextvars.merge_contextvars,
         add_request_id,
         add_trace_id,
+        add_hostname,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         add_component,
@@ -432,9 +485,11 @@ def configure_logging() -> None:
     root_logger.setLevel(logging.DEBUG)  # Capture all levels, handlers will filter
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
+    context_filter = _ContextEnrichmentFilter()
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
+    console_handler.addFilter(context_filter)
     console_handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             foreign_pre_chain=shared_processors,
@@ -453,6 +508,7 @@ def configure_logging() -> None:
             backupCount=log_backup_count,
         )
         file_handler.setLevel(logging.DEBUG)
+        file_handler.addFilter(context_filter)
         file_handler.setFormatter(
             structlog.stdlib.ProcessorFormatter(
                 foreign_pre_chain=shared_processors,

@@ -2051,13 +2051,11 @@ class MultiNodeInferenceEngine:
                 else:
                     scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
 
-            from ..config import otel_env_vars
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                **otel_env_vars(),
                 # Some environments import tvm_ffi during vLLM init and try to JIT-build a
                 # torch c-dlpack addon on every Ray worker process, which can spawn dozens
                 # of concurrent compilers and stall engine startup. Disable the optional

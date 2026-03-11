@@ -387,7 +387,6 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ..config import otel_env_vars
             env_vars = {
                 "PYTHONPATH": PFS_PYTHONPATH,
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
