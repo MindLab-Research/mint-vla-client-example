@@ -1521,6 +1521,65 @@ class VerlTrainingEngine:
                 reason=f"{op}:{type(e).__name__}",
             )
 
+    def _strict_megatron_save_meta_enabled(self) -> bool:
+        """Whether invalid save metadata should fail the request for megatron."""
+        raw = os.environ.get("MINT_MEGATRON_STRICT_SAVE_META", "1").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _update_session_step_monotonic(
+        self,
+        session: "TrainingSession",
+        meta: Any,
+        *,
+        op: str,
+        strict: bool = False,
+    ) -> None:
+        """Monotonic, type-safe current_step update from worker metadata."""
+        model_id = session.model_id
+        if not isinstance(meta, dict):
+            msg = (
+                f"[{model_id}] {op}: invalid meta type {type(meta).__name__}; "
+                f"current_step={session.current_step}"
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+            return
+
+        if "current_step" not in meta:
+            msg = (
+                f"[{model_id}] {op}: meta missing current_step; "
+                f"current_step={session.current_step}"
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+            return
+
+        meta_step = meta.get("current_step")
+        if not isinstance(meta_step, int) or isinstance(meta_step, bool):
+            msg = (
+                f"[{model_id}] {op}: invalid current_step type={type(meta_step).__name__} "
+                f"value={meta_step!r}; current_step={session.current_step}"
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+            return
+
+        prev_step = session.current_step
+        next_step = max(prev_step, meta_step)
+        if meta_step < prev_step:
+            logger.warning(
+                "[%s] %s: stale current_step=%s < existing=%s; keep monotonic value=%s",
+                model_id,
+                op,
+                meta_step,
+                prev_step,
+                next_step,
+            )
+        session.current_step = next_step
+
     async def _await_with_keepalive(
         self,
         awaitable,
@@ -2310,7 +2369,13 @@ class VerlTrainingEngine:
             train_unembed=train_unembed,
         )
         meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
-        session.current_step = meta.get("current_step", session.current_step)
+        strict_meta = self._strict_megatron_save_meta_enabled()
+        self._update_session_step_monotonic(
+            session,
+            meta,
+            op="save_lora_weights_for_sampler",
+            strict=strict_meta,
+        )
 
         logger.info(f"[{model_id}] save_lora_weights_for_sampler: {abs_path}")
         return abs_path
@@ -2365,13 +2430,30 @@ class VerlTrainingEngine:
 
         loop = asyncio.get_running_loop()
         if session.backend == "megatron":
-            meta_ref = worker.save_checkpoint.remote(abs_path, use_per_expert_lora=use_per_expert_lora)
+            lora_cfg = getattr(session, "lora_config", None)
+            train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+            train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+            train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+            meta_ref = worker.save_checkpoint.remote(
+                abs_path,
+                use_per_expert_lora=use_per_expert_lora,
+                session_id=session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
         else:
             meta_ref = worker.save_checkpoint.remote(abs_path)
         meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
 
         # Update session state
-        session.current_step = meta.get("current_step", session.current_step)
+        strict_meta = bool(session.backend == "megatron" and self._strict_megatron_save_meta_enabled())
+        self._update_session_step_monotonic(
+            session,
+            meta,
+            op="save_weights",
+            strict=strict_meta,
+        )
 
         logger.info(f"[{model_id}] save_weights: {abs_path}")
         return abs_path

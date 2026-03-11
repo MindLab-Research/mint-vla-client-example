@@ -663,6 +663,89 @@ def test_issue_193_close_on_optim_off_error_clears_ctx(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Test 15b: CLOSE_ON_OPTIM=0 still clears gradients between steps
+# ---------------------------------------------------------------------------
+
+def test_issue_193_close_on_optim_off_clears_gradients_before_reused_forward(monkeypatch):
+    """With CLOSE_ON_OPTIM=0, sticky ctx is reused across steps.
+    optim_step must still clear gradients to prevent stale cross-step accumulation."""
+    worker, state = _make_worker(monkeypatch, close_on_optim="0")
+    _prepare_worker_for_forward_backward(worker, monkeypatch)
+    _prepare_worker_for_optim_step(worker)
+
+    grad_state = {"dirty": False, "zero_calls": 0}
+
+    def fake_forward_backward_batch(*args, **kwargs):
+        if grad_state["dirty"]:
+            raise RuntimeError("stale gradients leaked across steps")
+        # Simulate backward pass leaving gradients populated.
+        grad_state["dirty"] = True
+        return {"loss": [], "metrics": {}}
+
+    def fake_optimizer_step():
+        # Simulate a backend optimizer that DOES NOT clear gradients by itself.
+        return 0.0
+
+    def fake_optimizer_zero_grad():
+        grad_state["dirty"] = False
+        grad_state["zero_calls"] += 1
+
+    worker.engine.forward_backward_batch = fake_forward_backward_batch  # type: ignore[method-assign]
+    worker.engine.optimizer_step = fake_optimizer_step  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = fake_optimizer_zero_grad  # type: ignore[method-assign]
+
+    payload = [{"model_input": {"input_ids": [1, 2, 3]}}]
+
+    # Step 1 backward leaves gradients dirty.
+    worker.forward_backward(
+        data_items=payload,
+        loss_fn="cross_entropy",
+        loss_fn_config={},
+        session_id="s1",
+    )
+    assert grad_state["dirty"] is True
+
+    # Step 1 optimizer must clear gradients even when ctx is kept open.
+    worker.optim_step(learning_rate=1e-4, session_id="s1")
+    assert grad_state["dirty"] is False
+    assert grad_state["zero_calls"] >= 1
+
+    # Step 2 backward reuses sticky ctx but must start from clean gradients.
+    worker.forward_backward(
+        data_items=payload,
+        loss_fn="cross_entropy",
+        loss_fn_config={},
+        session_id="s1",
+    )
+    assert state["enter"] == 1  # sticky context reused
+    assert state["exit"] == 0   # CLOSE_ON_OPTIM=0 keeps context open
+
+
+def test_issue_193_gradient_clear_failure_is_fail_loud_and_releases_ctx(monkeypatch):
+    """Gradient clear failure after optim_step must fail-loud and release sticky ctx."""
+    worker, state = _make_worker(monkeypatch, close_on_optim="0")
+    _prepare_worker_for_optim_step(worker)
+
+    def fake_optimizer_step():
+        return 0.0
+
+    def failing_optimizer_zero_grad():
+        raise RuntimeError("optimizer_zero_grad boom")
+
+    worker.engine.optimizer_step = fake_optimizer_step  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = failing_optimizer_zero_grad  # type: ignore[method-assign]
+    worker.engine.optimizer = None
+
+    with pytest.raises(RuntimeError, match="Failed to clear gradients after optim_step"):
+        worker.optim_step(learning_rate=1e-4, session_id="s1")
+
+    assert worker._sticky_train_mode_ctx is None
+    assert worker._sticky_train_mode_session_id is None
+    assert state["enter"] == 1
+    assert state["exit"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Test 16: Cleanup failure log observability (structured fields present)
 # ---------------------------------------------------------------------------
 
@@ -984,3 +1067,427 @@ def test_issue_193_partial_swap_invalidates_current_session(monkeypatch):
 
     # _current_session must be None -- prevents "already loaded" early-return
     assert group._current_session is None
+
+
+def _make_group_with_unknown_session_after_partial_swap(monkeypatch):
+    """Build a minimal MegatronWorkerGroup and force partial swap failure."""
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "s1"
+
+    class _FakeRemoteMethod:
+        @staticmethod
+        def remote(new_session_id):
+            return f"future-{new_session_id}"
+
+    class _FakeWorker:
+        swap_session_state = _FakeRemoteMethod()
+
+    group.workers = [_FakeWorker(), _FakeWorker()]
+
+    def mock_ray_get(futures, **kwargs):
+        raise RuntimeError("Worker 1 failed during swap_session_state")
+
+    monkeypatch.setattr(ray_module, "get", mock_ray_get)
+
+    with pytest.raises(RuntimeError, match="Worker 1 failed"):
+        group._swap_session_on_workers("s2")
+
+    assert group._current_session is None
+    assert group._session_unknown_due_to_partial_swap is True
+    return group
+
+
+# ---------------------------------------------------------------------------
+# Test 23: forward_backward rejects implicit session when state is unknown
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_requires_explicit_session_for_forward_backward(monkeypatch):
+    group = _make_group_with_unknown_session_after_partial_swap(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit session_id required"):
+        group.forward_backward(data_items=[], session_id=None)
+
+
+# ---------------------------------------------------------------------------
+# Test 24: forward rejects implicit session when state is unknown
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_requires_explicit_session_for_forward(monkeypatch):
+    group = _make_group_with_unknown_session_after_partial_swap(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit session_id required"):
+        group.forward(data_items=[], session_id=None)
+
+
+# ---------------------------------------------------------------------------
+# Test 25: optim_step rejects implicit session when state is unknown
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_requires_explicit_session_for_optim_step(monkeypatch):
+    group = _make_group_with_unknown_session_after_partial_swap(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit session_id required"):
+        group.optim_step(learning_rate=1e-4, session_id=None)
+
+
+# ---------------------------------------------------------------------------
+# Test 26: save_checkpoint rejects implicit session when state is unknown
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_requires_explicit_session_for_save_checkpoint(monkeypatch):
+    group = _make_group_with_unknown_session_after_partial_swap(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit session_id required"):
+        group.save_checkpoint("/tmp/fake_ckpt", session_id=None)
+
+
+# ---------------------------------------------------------------------------
+# Test 27: save_lora_weights rejects implicit session when state is unknown
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_requires_explicit_session_for_save_lora_weights(monkeypatch):
+    group = _make_group_with_unknown_session_after_partial_swap(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit session_id required"):
+        group.save_lora_weights("/tmp/fake_lora", session_id=None)
+
+
+def _make_group_with_current_session(current_session: str | None = "s1"):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = current_session
+    group._session_unknown_due_to_partial_swap = False
+    return group
+
+
+# ---------------------------------------------------------------------------
+# Test 28: empty string session_id must not fallback in forward
+# ---------------------------------------------------------------------------
+
+def test_issue_193_empty_session_id_rejected_in_forward():
+    group = _make_group_with_current_session("s1")
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        group.forward(data_items=[], session_id="")
+
+
+# ---------------------------------------------------------------------------
+# Test 29: empty string session_id must not fallback in train_step
+# ---------------------------------------------------------------------------
+
+def test_issue_193_empty_session_id_rejected_in_train_step():
+    group = _make_group_with_current_session("s1")
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        group.train_step(data_items=[], session_id="")
+
+
+def test_issue_193_whitespace_session_id_rejected():
+    group = _make_group_with_current_session("s1")
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        group.forward(data_items=[], session_id="   ")
+
+
+def test_issue_193_no_session_loaded_has_distinct_error_from_partial_swap():
+    group = _make_group_with_current_session(current_session=None)
+
+    with pytest.raises(ValueError, match="no session loaded"):
+        group.forward_backward(data_items=[], session_id=None)
+
+    with pytest.raises(ValueError, match="no session loaded"):
+        group.forward(data_items=[], session_id=None)
+
+    with pytest.raises(ValueError, match="no session loaded"):
+        group.train_step(data_items=[], session_id=None)
+
+    with pytest.raises(ValueError, match="no session loaded"):
+        group.optim_step(learning_rate=1e-4, session_id=None)
+
+    with pytest.raises(ValueError, match="no session loaded"):
+        group.save_checkpoint("/tmp/fake_ckpt", session_id=None)
+
+    with pytest.raises(ValueError, match="no session loaded"):
+        group.save_lora_weights("/tmp/fake_lora", session_id=None)
+
+
+# ---------------------------------------------------------------------------
+# Test 30: partial swap can recover with explicit session for checkpoint save
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = None
+    group._step_count = 12
+    group._actual_rank = 16
+
+    ensure_calls: list[tuple[str, dict]] = []
+
+    def fake_ensure_session_loaded(session_id, **kwargs):
+        ensure_calls.append((session_id, kwargs))
+
+    group._ensure_session_loaded = fake_ensure_session_loaded
+
+    class _FakeSaveCheckpointRemoteMethod:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora):
+            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora))
+            return f"future-{len(self.calls)}"
+
+    class _FakeWorker:
+        def __init__(self):
+            self.save_checkpoint = _FakeSaveCheckpointRemoteMethod()
+
+    worker_0 = _FakeWorker()
+    worker_1 = _FakeWorker()
+    group.workers = [worker_0, worker_1]
+
+    def mock_ray_get(futures, timeout=None):
+        assert len(futures) == 2
+        assert timeout is not None
+        return [{"current_step": 12}, {}]
+
+    monkeypatch.setattr(ray_module, "get", mock_ray_get)
+
+    result = group.save_checkpoint(
+        "/tmp/recovery_ckpt",
+        use_per_expert_lora=True,
+        session_id="recovered_session",
+        train_attn=False,
+        train_mlp=True,
+        train_unembed=False,
+    )
+
+    assert result["current_step"] == 12
+    assert ensure_calls == [
+        (
+            "recovered_session",
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert worker_0.save_checkpoint.calls == [
+        ("/tmp/recovery_ckpt", 12, 16, True)
+    ]
+    assert worker_1.save_checkpoint.calls == [
+        ("/tmp/recovery_ckpt", 12, 16, True)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Test 31: partial swap can recover with explicit session for forward
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_explicit_session_recovers_forward(monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = None
+
+    ensure_calls: list[tuple[str, dict]] = []
+
+    def fake_ensure_session_loaded(session_id, **kwargs):
+        ensure_calls.append((session_id, kwargs))
+
+    group._ensure_session_loaded = fake_ensure_session_loaded
+
+    class _FakeForwardRemoteMethod:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, data_items, reset_bias):
+            self.calls.append((data_items, reset_bias))
+            return "future-forward"
+
+    class _FakeWorker:
+        def __init__(self):
+            self.forward = _FakeForwardRemoteMethod()
+
+    worker = _FakeWorker()
+    group.workers = [worker]
+
+    def mock_ray_get(futures, **kwargs):
+        assert futures == ["future-forward"]
+        return [
+            {
+                "loss_value": 0.0,
+                "num_tokens": 0,
+                "valid_count": 0,
+                "loss_fn_outputs": [],
+            }
+        ]
+
+    monkeypatch.setattr(ray_module, "get", mock_ray_get)
+
+    result = group.forward(
+        data_items=[],
+        session_id="recovered_session",
+        train_attn=False,
+        train_mlp=True,
+        train_unembed=False,
+    )
+
+    assert ensure_calls == [
+        (
+            "recovered_session",
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert worker.forward.calls == [([], None)]
+    assert result["metrics"]["num_samples:sum"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test 32: partial swap can recover with explicit session for optim_step
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = None
+    group._step_count = 5
+
+    ensure_calls: list[tuple[str, dict]] = []
+
+    def fake_ensure_session_loaded(session_id, **kwargs):
+        ensure_calls.append((session_id, kwargs))
+
+    group._ensure_session_loaded = fake_ensure_session_loaded
+
+    class _FakeOptimStepRemoteMethod:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, learning_rate, session_id, **kwargs):
+            self.calls.append((learning_rate, session_id, kwargs))
+            return "future-optim"
+
+    class _FakeWorker:
+        def __init__(self):
+            self.optim_step = _FakeOptimStepRemoteMethod()
+
+    worker = _FakeWorker()
+    group.workers = [worker]
+
+    def mock_ray_get(futures, **kwargs):
+        assert futures == ["future-optim"]
+        return [{"grad_norm": 1.5, "lr": 2e-4}]
+
+    monkeypatch.setattr(ray_module, "get", mock_ray_get)
+
+    result = group.optim_step(
+        learning_rate=2e-4,
+        session_id="recovered_session",
+        train_attn=False,
+        train_mlp=True,
+        train_unembed=False,
+    )
+
+    assert ensure_calls == [
+        (
+            "recovered_session",
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert worker.optim_step.calls == [
+        (
+            2e-4,
+            "recovered_session",
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert result["metrics"]["step"] == 6
+    assert result["metrics"]["grad_norm"] == 1.5
+
+
+# ---------------------------------------------------------------------------
+# Test 33: partial swap can recover with explicit session for save_lora_weights
+# ---------------------------------------------------------------------------
+
+def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = None
+    group._step_count = 9
+    group._actual_rank = 8
+
+    ensure_calls: list[tuple[str, dict]] = []
+
+    def fake_ensure_session_loaded(session_id, **kwargs):
+        ensure_calls.append((session_id, kwargs))
+
+    group._ensure_session_loaded = fake_ensure_session_loaded
+
+    class _FakeSaveLoraRemoteMethod:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora):
+            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora))
+            return "future-save-lora"
+
+    class _FakeWorker:
+        def __init__(self):
+            self.save_lora_weights = _FakeSaveLoraRemoteMethod()
+
+    worker = _FakeWorker()
+    group.workers = [worker]
+
+    def mock_ray_get(futures, timeout=None):
+        assert futures == ["future-save-lora"]
+        assert timeout is not None
+        return [{"current_step": 9}]
+
+    monkeypatch.setattr(ray_module, "get", mock_ray_get)
+
+    result = group.save_lora_weights(
+        "/tmp/recovery_lora",
+        use_per_expert_lora=True,
+        session_id="recovered_session",
+        train_attn=False,
+        train_mlp=True,
+        train_unembed=False,
+    )
+
+    assert result["current_step"] == 9
+    assert ensure_calls == [
+        (
+            "recovered_session",
+            {
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
+        )
+    ]
+    assert worker.save_lora_weights.calls == [
+        ("/tmp/recovery_lora", 9, 8, True)
+    ]

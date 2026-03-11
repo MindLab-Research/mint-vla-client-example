@@ -702,6 +702,52 @@ class MegatronRankWorker:
             )
         logger.debug(f"[Rank {self.rank}] Restored {idx} gradient buffers")
 
+    def _clear_optimizer_gradients(self, *, session_id: str | None, reason: str) -> None:
+        """Clear gradient buffers after optimizer_step in a backend-safe way.
+
+        Fail-loud on unrecoverable clear failures to avoid silent gradient leakage.
+        """
+        errors: list[str] = []
+
+        if hasattr(self.engine, "optimizer_zero_grad"):
+            try:
+                self.engine.optimizer_zero_grad()
+                logger.debug(
+                    f"[Rank {self.rank}] Cleared gradients via optimizer_zero_grad "
+                    f"(session={session_id}, reason={reason})"
+                )
+                return
+            except Exception as e:
+                errors.append(f"optimizer_zero_grad failed: {type(e).__name__}: {e}")
+                logger.warning(
+                    f"[Rank {self.rank}] optimizer_zero_grad failed, trying fallback "
+                    f"(session={session_id}, reason={reason}): {type(e).__name__}: {e}"
+                )
+
+        optimizer = getattr(self.engine, "optimizer", None)
+        if optimizer is not None:
+            try:
+                try:
+                    optimizer.zero_grad(set_to_none=True)
+                except TypeError:
+                    optimizer.zero_grad()
+                logger.debug(
+                    f"[Rank {self.rank}] Cleared gradients via optimizer.zero_grad "
+                    f"(session={session_id}, reason={reason})"
+                )
+                return
+            except Exception as e:
+                errors.append(f"optimizer.zero_grad failed: {type(e).__name__}: {e}")
+
+        if optimizer is None:
+            errors.append("optimizer unavailable")
+
+        detail = "; ".join(errors) if errors else "unknown clear failure"
+        raise RuntimeError(
+            f"[Rank {self.rank}] Failed to clear gradients after optim_step "
+            f"(session={session_id}, reason={reason}): {detail}"
+        )
+
     def _capture_optimizer_state(self) -> dict:
         """Capture optimizer state (momentum, variance) to CPU.
 
@@ -2319,6 +2365,14 @@ class MegatronRankWorker:
                 if session_id is not None:
                     self._session_gradients[session_id] = _GRADIENTS_CONSUMED
                     logger.debug(f"[Rank {self.rank}] Marked gradients as consumed for session {session_id}")
+
+                # Safety: some optimizer_step implementations do not clear gradients.
+                # Explicitly zero here to prevent stale cross-step accumulation when
+                # sticky context is reused (e.g. CLOSE_ON_OPTIM=0).
+                self._clear_optimizer_gradients(
+                    session_id=session_id,
+                    reason="post_optim_step",
+                )
             finally:
                 self._stop_slow_op_watchdog(watchdog)
 
@@ -4636,6 +4690,7 @@ class MegatronWorkerGroup:
         self.placement_group = None
         self._step_count = 0
         self._current_session: str | None = None  # Phase 6: session tracking
+        self._session_unknown_due_to_partial_swap = False
         self._actual_rank: int | None = None  # Phase 7: actual LoRA rank for current session
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
         self._master_addr: str | None = None
@@ -4956,18 +5011,23 @@ class MegatronWorkerGroup:
         futures = [w.swap_session_state.remote(new_session_id) for w in self.workers]
         try:
             ray.get(futures)
-        except Exception:
+        except Exception as e:
             # Some workers may have swapped while others failed.
             # Invalidate _current_session so the next request cannot hit the
             # "already loaded" early-return (line 4974) and must re-evaluate.
             logger.error(
                 "[MegatronWorkerGroup] Partial failure during session swap to %s "
-                "(old_session=%s). Setting _current_session=None to force "
-                "re-evaluation on next request.",
+                "(old_session=%s, workers=%d, error_type=%s, error=%r). "
+                "Setting _current_session=None to force re-evaluation on next request.",
                 new_session_id,
                 self._current_session,
+                len(self.workers),
+                type(e).__name__,
+                e,
+                exc_info=True,
             )
             self._current_session = None
+            self._session_unknown_due_to_partial_swap = True
             raise
         logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
 
@@ -5105,6 +5165,7 @@ class MegatronWorkerGroup:
         )
 
         self._current_session = session_id
+        self._session_unknown_due_to_partial_swap = False
         if timing:
             t1 = time.perf_counter()
             logger.info(
@@ -5116,6 +5177,26 @@ class MegatronWorkerGroup:
                 f"total_s={t1 - t0:.3f} "
                 f"session_exists={session_exists}"
             )
+
+    def _resolve_required_session_id(self, session_id: str | None, *, op: str) -> str:
+        """Resolve session_id with fail-closed behavior for unknown group state."""
+        if session_id is not None and session_id.strip() == "":
+            raise ValueError(f"session_id must be non-empty when provided (op={op})")
+        effective_session_id = session_id if session_id is not None else self._current_session
+        if effective_session_id is not None and effective_session_id.strip() == "":
+            raise ValueError(
+                f"resolved session_id is empty; refusing to run (op={op})"
+            )
+        if effective_session_id is None:
+            if getattr(self, "_session_unknown_due_to_partial_swap", False):
+                raise RuntimeError(
+                    "session state unknown after swap failure; explicit session_id required "
+                    f"(op={op})"
+                )
+            raise ValueError(
+                f"no session loaded; explicit session_id required (op={op})"
+            )
+        return effective_session_id
 
     def forward_backward(
         self,
@@ -5152,7 +5233,10 @@ class MegatronWorkerGroup:
 
         # Issue #44: Ensure correct session's LoRA weights are loaded before training
         # This saves outgoing session state and loads incoming session state
-        effective_session_id = session_id or self._current_session
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="forward_backward",
+        )
         watchdog = self._start_slow_group_watchdog(
             op="forward_backward",
             session_id=effective_session_id,
@@ -5296,9 +5380,10 @@ class MegatronWorkerGroup:
         Returns:
             forward_backward result dict with optim_step metrics merged in.
         """
-        effective_session_id = session_id or self._current_session
-        if effective_session_id is None:
-            raise ValueError("train_step requires session_id (no current session set)")
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="train_step",
+        )
 
         fb_result = self.forward_backward(
             data_items=data_items,
@@ -5351,7 +5436,10 @@ class MegatronWorkerGroup:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
         # Issue #44: Ensure correct session's LoRA weights are loaded before forward
-        effective_session_id = session_id or self._current_session
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="forward",
+        )
         self._ensure_session_loaded(
             effective_session_id,
             train_attn=train_attn,
@@ -5445,7 +5533,10 @@ class MegatronWorkerGroup:
         t0 = time.perf_counter() if timing else 0.0
 
         # Issue #44: Ensure correct session's LoRA weights are loaded before optim step
-        effective_session_id = session_id or self._current_session
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="optim_step",
+        )
         self._ensure_session_loaded(
             effective_session_id,
             train_attn=train_attn,
@@ -5807,14 +5898,16 @@ class MegatronWorkerGroup:
         Returns:
             Dict with training metadata (from rank 0).
         """
-        effective_session_id = session_id or self._current_session
-        if effective_session_id is not None:
-            self._ensure_session_loaded(
-                effective_session_id,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-            )
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="save_checkpoint",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         logger.info(
             f"[MegatronWorkerGroup] save_checkpoint: {save_path} "
@@ -5852,14 +5945,16 @@ class MegatronWorkerGroup:
 
         Must call ALL workers because get_lora_state_dict uses NCCL collectives.
         """
-        effective_session_id = session_id or self._current_session
-        if effective_session_id is not None:
-            self._ensure_session_loaded(
-                effective_session_id,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-            )
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="save_lora_weights",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         logger.info(
             f"[MegatronWorkerGroup] save_lora_weights: {save_path} "
@@ -6049,6 +6144,7 @@ class MegatronWorkerGroup:
 
         # 3. Update session tracking (Phase 7: include actual_rank)
         self._current_session = new_session_id
+        self._session_unknown_due_to_partial_swap = False
         self._step_count = 0
         self.learning_rate = new_learning_rate
         self._actual_rank = new_actual_rank if new_actual_rank is not None else self.lora_rank
