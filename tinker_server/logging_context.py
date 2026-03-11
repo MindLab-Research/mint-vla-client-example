@@ -297,7 +297,8 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         return
 
     service_name = (os.getenv("OTEL_SERVICE_NAME") or "mint").strip()
-    resource = Resource.create({"service.name": service_name})
+    # Use explicit resource attributes only; avoid default detector payloads.
+    resource = Resource(attributes={"service.name": service_name})
     headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
     app_key = (os.getenv("MINT_APMPLUS_APP_KEY") or "").strip()
     if app_key and "x-byteapm-appkey" not in headers:
