@@ -14,6 +14,8 @@ def test_issue_187_create_model_from_state_rejects_sampler_checkpoint_with_optim
     # Patch checkpoints root for this test module (resolver reads from checkpoints.py).
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
+    checkpoints_module.PERSISTENT_CHECKPOINTS_DIR = str(tmp_path)
+    checkpoints_module.RUNTIME_CHECKPOINTS_DIR = str(tmp_path / "runtime")
 
     run_id = "run-187-cmfs"
     ckpt_name = "sampler-0001"

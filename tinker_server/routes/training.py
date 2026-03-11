@@ -32,7 +32,17 @@ from fastapi.concurrency import run_in_threadpool
 from ..logging_context import classify_failure_reason, set_request_id
 
 from ..backend.future_store import future_store
-from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
+from ..checkpoints import (
+    build_ephemeral_checkpoint_dir,
+    build_persistent_cache_dir,
+    checkpoint_has_optimizer_state,
+    create_checkpoint_archive,
+    ensure_checkpoint_path_allowed,
+    materialize_persistent_checkpoint,
+    mirror_checkpoint_to_persistent_store,
+    resolve_checkpoint_path,
+    write_checkpoint_metadata,
+)
 from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -633,16 +643,11 @@ def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
     resolved = resolve_checkpoint_path(state_uri, user_id=user_id)
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
-    if not is_admin:
-        resolved_real = os.path.realpath(resolved)
-        checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-        if not resolved_real.startswith(checkpoints_real + os.sep):
-            raise HTTPException(status_code=403, detail="Access denied")
-        owner_dir = user_id or "anonymous"
-        allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, owner_dir))
-        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
-            raise HTTPException(status_code=403, detail="Access denied")
-    return resolved
+    try:
+        ensure_checkpoint_path_allowed(resolved, user_id=user_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return materialize_persistent_checkpoint(resolved)
 
 
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
@@ -829,14 +834,6 @@ async def _do_create_model_from_state(
 
         # Resolve state path (before creating a session/actor)
         load_path = _resolve_state_path(request.state_path, user_id=user_id)
-        if user_id and user_id != "admin":
-            load_real = os.path.realpath(load_path)
-            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
-                allowed_real + os.sep
-            ):
-                raise PermissionError("Access denied")
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(load_path):
             raise FileNotFoundError(f"Checkpoint not found: {request.state_path}")
 
@@ -1852,19 +1849,23 @@ async def _do_save_weights_for_sampler(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        from ..checkpoints import get_checkpoints_dir
-
-        checkpoints_root = get_checkpoints_dir()
-        owner_dir = None if user_id == "admin" else (user_id or "anonymous")
-        checkpoint_dir = checkpoints_root if owner_dir is None else os.path.join(checkpoints_root, owner_dir)
-
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path
             checkpoint_name = request.path
+            save_path = build_persistent_cache_dir(
+                user_id=None if user_id == "admin" else user_id,
+                model_id=session.model_id,
+                checkpoint_name=checkpoint_name,
+            )
         else:
             # Ephemeral save - generate unique temp name
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
+            save_path = build_ephemeral_checkpoint_dir(
+                user_id=None if user_id == "admin" else user_id,
+                model_id=session.model_id,
+                checkpoint_name=checkpoint_name,
+            )
 
         use_per_expert_lora = bool(request.use_per_expert_lora)
         train_mlp = bool(getattr(getattr(session, "lora_config", None), "train_mlp", False))
@@ -1888,17 +1889,18 @@ async def _do_save_weights_for_sampler(
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
-            checkpoint_base_dir=checkpoint_dir,
+            checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
             use_per_expert_lora=use_per_expert_lora,
         )
-
-        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
 
         if checkpoint_has_optimizer_state(save_path):
             raise RuntimeError(
                 f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
             )
 
+        ttl_seconds = request.ttl_seconds
+        if request.path is None and ttl_seconds is None:
+            ttl_seconds = None
         write_checkpoint_metadata(
             save_path,
             {
@@ -1912,8 +1914,36 @@ async def _do_save_weights_for_sampler(
                 "optimizer_present": False,
                 "backend": session.backend,
                 "type": "sampler",
+                "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
+                "ttl_seconds": request.ttl_seconds,
             },
         )
+
+        persistent_path = None
+        if request.path is not None:
+            persistent_path = mirror_checkpoint_to_persistent_store(
+                save_path,
+                user_id=None if user_id == "admin" else user_id,
+                model_id=session.model_id,
+                checkpoint_name=checkpoint_name,
+            )
+            write_checkpoint_metadata(
+                persistent_path,
+                {
+                    "checkpoint_id": checkpoint_name,
+                    "owner_id": user_id,
+                    "model_id": session.model_id,
+                    "model_name": session.base_model,
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "step": session.current_step,
+                    "checkpoint_type": "sampler",
+                    "optimizer_present": False,
+                    "backend": session.backend,
+                    "type": "sampler",
+                    "storage_tier": "persistent_tos",
+                    "ttl_seconds": request.ttl_seconds,
+                },
+            )
 
         from ..client_compat import checkpoint_uri
 

@@ -235,7 +235,7 @@ class ServerConfig:
 
     # Docs / internal paths
     doc_path: str | None = None  # MINT_DOC_PATH
-    checkpoint_dir: str = "/vePFS-Mindverse/share/code/tinker-server/checkpoints"  # TINKER_CHECKPOINT_DIR
+    checkpoint_dir: str = "/tos-mindverse/tinker_checkpoints"  # TINKER_CHECKPOINT_DIR
 
     # Config file (TINKER_CONFIG_PATH)
     config_path: str | None = None

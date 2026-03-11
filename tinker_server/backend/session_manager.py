@@ -275,23 +275,11 @@ class SessionManager:
         Returns:
             Absolute filesystem path to adapter directory.
         """
-        from ..checkpoints import get_checkpoints_dir
-
-        checkpoint_dir = get_checkpoints_dir()
-
+        if model_path.startswith(("tinker://", "mint://", "ckpt_")):
+            raise ValueError("Checkpoint URIs must be resolved before SessionManager.create_session")
         if model_path.startswith("file://"):
-            return model_path[7:]  # Strip file:// prefix
-        elif model_path.startswith("tinker://"):
-            # tinker://{model_id}/{checkpoint_name}
-            path_part = model_path[len("tinker://"):]
-            return os.path.join(checkpoint_dir, path_part)
-        elif model_path.startswith("mint://"):
-            # Legacy mint://{model_id}/{checkpoint_name}
-            path_part = model_path[len("mint://"):]
-            return os.path.join(checkpoint_dir, path_part)
-        else:
-            # Assume absolute path
-            return model_path
+            return model_path[7:]
+        return model_path
 
     def create_session_with_engine(
         self,
