@@ -70,6 +70,9 @@ def _get_or_create_ray_actor():
     @ray.remote(num_cpus=0)
     class _RayCapacityManagerActor:
         def __init__(self, *, queue_bytes_budget: int) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
             self._queue_bytes_budget = int(queue_bytes_budget)
             self._queue_bytes_reserved = 0
             self._object_store_bytes_reserved = 0

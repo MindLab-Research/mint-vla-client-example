@@ -27,7 +27,7 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
-from ..logging_context import get_request_id
+from ..logging_context import get_request_id, init_actor_observability
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +246,7 @@ class MegatronRankWorker:
         All workers must be created first, then initialize() called on all
         simultaneously so they can reach init_process_group barrier together.
         """
+        init_actor_observability()
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
@@ -4114,6 +4115,7 @@ class MegatronWorkerGroup:
         learning_rate: float,
         distributed_config: DistributedConfig | None = None,
     ):
+        init_actor_observability()
         self.base_model = base_model
         self.lora_rank = lora_rank  # This is max_lora_rank for Phase 7
         self.learning_rate = learning_rate

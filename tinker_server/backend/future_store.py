@@ -122,6 +122,9 @@ def _get_or_create_ray_actor():
         def __init__(
             self, ttl_s: float, queue_ttl_s: float, done_ttl_s: float, tombstone_ttl_s: float
         ) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
             self._pending: set[str] = set()
             self._result_refs: dict[str, Any] = {}
             self._errors: dict[str, str] = {}

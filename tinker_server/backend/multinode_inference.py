@@ -42,6 +42,7 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
+from tinker_server.logging_context import init_actor_observability
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
@@ -353,6 +354,7 @@ def _create_multinode_vllm_actor(
             kv_cache_dtype: str | None = None,
             max_num_batched_tokens: int | None = None,
         ):
+            init_actor_observability()
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
             self.pipeline_parallel_size = pipeline_parallel_size
