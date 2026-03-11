@@ -938,7 +938,14 @@ UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
 # Paths excluded from OTel span creation (high-frequency polling endpoints).
 # Set MINT_OTEL_EXCLUDE_NONE=1 to disable exclusions and trace everything.
 _OTEL_EXCLUDE_NONE = os.environ.get("MINT_OTEL_EXCLUDE_NONE", "").strip().lower() in ("1", "true", "yes")
-_OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {"/api/v1/retrieve_future", "/api/v1/healthz", "/api/v1/telemetry"}
+_OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {
+    "/api/v1/retrieve_future",
+    "/api/v1/healthz",
+    "/api/v1/telemetry",
+    "/api/v1/session_heartbeat",
+    "/api/v1/internal/admission_stats",
+    "/internal/admission_stats",
+}
 
 # Token encryptor for sk- token validation (initialized lazily)
 _token_encryptor: TokenEncryptor | None = None
