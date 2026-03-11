@@ -18,11 +18,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+from ..checkpoints import get_persistent_search_roots
 from ..usage_logger import get_usage_logger
-from ..config import config as server_config
-
-# Checkpoint directory (shared filesystem)
-CHECKPOINTS_DIR = server_config.checkpoint_dir
 
 router = APIRouter()
 
@@ -498,25 +495,26 @@ def _scan_checkpoints(user_id: str | None) -> list[CheckpointInfo]:
     """
     checkpoints = []
 
-    if not os.path.exists(CHECKPOINTS_DIR):
-        return checkpoints
-
     # Determine which directories to scan
     if user_id == "admin":
         # Admin sees all - scan all top-level directories
-        top_level_dirs = [
-            d for d in os.listdir(CHECKPOINTS_DIR)
-            if os.path.isdir(os.path.join(CHECKPOINTS_DIR, d))
-        ]
+        top_level_dirs: list[tuple[str, str]] = []
+        for root in get_persistent_search_roots():
+            if not os.path.isdir(root):
+                continue
+            top_level_dirs.extend(
+                (root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+            )
     else:
         # Regular user - only scan their own directory
-        user_dir = os.path.join(CHECKPOINTS_DIR, user_id)
-        if not os.path.exists(user_dir):
-            return checkpoints
-        top_level_dirs = [user_id]
+        top_level_dirs = []
+        for root in get_persistent_search_roots():
+            user_dir = os.path.join(root, user_id)
+            if os.path.isdir(user_dir):
+                top_level_dirs.append((root, user_id))
 
-    for top_level in top_level_dirs:
-        top_path = os.path.join(CHECKPOINTS_DIR, top_level)
+    for root, top_level in top_level_dirs:
+        top_path = os.path.join(root, top_level)
 
         for sub_dir in os.listdir(top_path):
             sub_path = os.path.join(top_path, sub_dir)
@@ -587,35 +585,35 @@ def _resolve_checkpoint_path(checkpoint_id: str) -> str | None:
 
     Scans all directories to find matching checkpoint_id.
     """
-    if not os.path.exists(CHECKPOINTS_DIR):
-        return None
-
     # Search all checkpoint directories
-    for top_level in os.listdir(CHECKPOINTS_DIR):
-        top_path = os.path.join(CHECKPOINTS_DIR, top_level)
-        if not os.path.isdir(top_path):
+    for root in get_persistent_search_roots():
+        if not os.path.isdir(root):
             continue
-
-        for sub_dir in os.listdir(top_path):
-            sub_path = os.path.join(top_path, sub_dir)
-            if not os.path.isdir(sub_path):
+        for top_level in os.listdir(root):
+            top_path = os.path.join(root, top_level)
+            if not os.path.isdir(top_path):
                 continue
 
-            # Check if this checkpoint matches
-            metadata_path = os.path.join(sub_path, "metadata.json")
-            if os.path.exists(metadata_path):
-                try:
-                    with open(metadata_path) as f:
-                        metadata = json.load(f)
-                    if metadata.get("checkpoint_id") == checkpoint_id:
-                        return sub_path
-                except (json.JSONDecodeError, OSError):
-                    pass
+            for sub_dir in os.listdir(top_path):
+                sub_path = os.path.join(top_path, sub_dir)
+                if not os.path.isdir(sub_path):
+                    continue
 
-            # Check legacy format
-            legacy_id = f"{top_level}_{sub_dir}"
-            if legacy_id == checkpoint_id:
-                return sub_path
+                # Check if this checkpoint matches
+                metadata_path = os.path.join(sub_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path) as f:
+                            metadata = json.load(f)
+                        if metadata.get("checkpoint_id") == checkpoint_id:
+                            return sub_path
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                # Check legacy format
+                legacy_id = f"{top_level}_{sub_dir}"
+                if legacy_id == checkpoint_id:
+                    return sub_path
 
     return None
 

@@ -695,26 +695,24 @@ def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     Returns:
         Absolute filesystem path to adapter directory.
     """
-    from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
+    from ..checkpoints import (
+        ensure_checkpoint_path_allowed,
+        materialize_persistent_checkpoint,
+        resolve_checkpoint_uri,
+    )
 
     is_admin = user_id == "admin"
     if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    checkpoint_dir = get_checkpoints_dir()
-    resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
+    resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id)
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
-    if not is_admin:
-        resolved_real = os.path.realpath(resolved)
-        checkpoints_real = os.path.realpath(checkpoint_dir)
-        if not resolved_real.startswith(checkpoints_real + os.sep):
-            raise HTTPException(status_code=403, detail="Access denied")
-        owner_dir = user_id or "anonymous"
-        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, owner_dir))
-        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
-            raise HTTPException(status_code=403, detail="Access denied")
-    return resolved
+    try:
+        ensure_checkpoint_path_allowed(resolved, user_id=user_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return materialize_persistent_checkpoint(resolved)
 
 
 def _infer_base_model_from_adapter(adapter_path: str) -> str | None:
