@@ -1,0 +1,1048 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mint Ops Console</title>
+  <style>
+    :root {
+      --bg-0: #f4f7f9;
+      --bg-1: #eef5f7;
+      --panel: #ffffff;
+      --text: #112026;
+      --muted: #5f7077;
+      --line: #d7e3e8;
+      --ok: #1f8f5f;
+      --warn: #bd7b1a;
+      --bad: #c03a2b;
+      --ink: #083344;
+      --accent: #0f766e;
+      --accent-2: #155e75;
+      --shadow: 0 10px 30px rgba(8, 39, 52, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Avenir Next", "Helvetica Neue", sans-serif;
+      background:
+        radial-gradient(circle at 10% -20%, #d3f8ef 0%, transparent 45%),
+        radial-gradient(circle at 90% -30%, #d7f0ff 0%, transparent 42%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-0));
+      min-height: 100vh;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: linear-gradient(180deg, #0f1723 0%, #102430 100%);
+      color: #d8ebf5;
+      padding: 18px 14px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+    }
+    .brand {
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+      font-size: 14px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #8ecfe6;
+      margin-bottom: 10px;
+    }
+    .title {
+      font-size: 22px;
+      line-height: 1.15;
+      margin: 0 0 14px;
+      color: #f2fbff;
+      font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+      font-weight: 700;
+    }
+    .tab-btn {
+      width: 100%;
+      border: 1px solid transparent;
+      background: rgba(255, 255, 255, 0.02);
+      color: #d8ebf5;
+      border-radius: 10px;
+      padding: 11px 12px;
+      text-align: left;
+      font-size: 14px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: all 160ms ease;
+    }
+    .tab-btn:hover { background: rgba(255, 255, 255, 0.08); }
+    .tab-btn.active {
+      border-color: rgba(148, 220, 255, 0.35);
+      background: linear-gradient(135deg, rgba(20, 115, 142, 0.42), rgba(12, 68, 86, 0.42));
+      transform: translateX(2px);
+    }
+    .badge {
+      background: rgba(255, 255, 255, 0.16);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      padding: 0 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      line-height: 20px;
+      min-width: 26px;
+      text-align: center;
+    }
+    .side-meta {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px dashed rgba(255,255,255,0.18);
+      font-size: 12px;
+      color: #a8c2ce;
+      line-height: 1.5;
+    }
+    .main {
+      padding: 20px 20px 28px;
+      max-width: 100%;
+      overflow-x: hidden;
+    }
+    .topbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .btn {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 140ms ease;
+      box-shadow: 0 2px 0 rgba(17, 32, 38, 0.03);
+    }
+    .btn:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+    .btn.primary { background: linear-gradient(135deg, #0f766e, #155e75); color: #fff; border-color: #0f766e; }
+    .btn.warn { background: linear-gradient(135deg, #efb84d, #d2872d); color: #1e1e1e; border-color: #c57d22; }
+    .btn.danger { background: linear-gradient(135deg, #e4664b, #cc4427); color: #fff; border-color: #bc321b; }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
+    .hint { font-size: 12px; color: var(--muted); }
+    .tab-panel {
+      display: none;
+      animation: rise 260ms ease both;
+    }
+    .tab-panel.active { display: block; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      padding: 10px 12px;
+      box-shadow: var(--shadow);
+    }
+    .card .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .card .v { margin-top: 4px; font-size: 24px; font-weight: 700; color: var(--ink); font-family: "Space Grotesk", "IBM Plex Sans", sans-serif; }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      margin-bottom: 12px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .panel h3 {
+      margin: 0;
+      padding: 12px 14px;
+      font-size: 15px;
+      color: var(--accent-2);
+      background: linear-gradient(90deg, rgba(15,118,110,0.08), rgba(255,255,255,0));
+      border-bottom: 1px solid var(--line);
+    }
+    .panel .body { padding: 12px 14px 14px; }
+    .table-wrap { overflow: auto; max-height: 440px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 7px;
+      border-bottom: 1px solid #eaf0f3;
+      vertical-align: top;
+      word-break: break-word;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #f8fbfd;
+      color: #385563;
+      font-weight: 700;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      background: #fff;
+    }
+    .pill.ok { color: var(--ok); border-color: rgba(31,143,95,0.25); }
+    .pill.warn { color: var(--warn); border-color: rgba(189,123,26,0.25); }
+    .pill.bad { color: var(--bad); border-color: rgba(192,58,43,0.28); }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .form-row.single { grid-template-columns: 1fr; }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 5px;
+      font-weight: 600;
+    }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #fff;
+      padding: 8px 9px;
+      font-size: 13px;
+      color: var(--text);
+      font-family: "IBM Plex Sans", sans-serif;
+    }
+    textarea { min-height: 100px; resize: vertical; }
+    .checks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .check {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .check input { width: 14px; height: 14px; margin: 0; }
+    pre.result {
+      margin: 8px 0 0;
+      background: #0f1723;
+      color: #d4f0ff;
+      border-radius: 10px;
+      border: 1px solid #253343;
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      padding: 10px;
+      max-height: 300px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+    .todo {
+      border: 1px dashed #95a8b2;
+      border-radius: 10px;
+      padding: 10px;
+      background: linear-gradient(135deg, rgba(255,248,231,0.68), rgba(255,255,255,0.8));
+      color: #6b5c35;
+      font-size: 13px;
+    }
+    .mono { font-family: "IBM Plex Mono", "Consolas", monospace; }
+    .center { text-align: center; }
+    .link-btn {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--accent-2);
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .link-btn:hover { background: #f2f8fb; }
+    .split {
+      display: grid;
+      grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr);
+      gap: 12px;
+    }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(10, 18, 24, 0.5);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 999;
+      padding: 18px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: min(980px, 96vw);
+      max-height: 86vh;
+      overflow: auto;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+    }
+    .modal-hd {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding: 11px 14px;
+      position: sticky;
+      top: 0;
+      background: #fff;
+      z-index: 2;
+    }
+    .modal-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--accent-2);
+      margin: 0;
+    }
+    .modal-bd { padding: 12px 14px; }
+    .modal-list {
+      margin: 0;
+      padding-left: 18px;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    @media (max-width: 1080px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar {
+        position: relative;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+      }
+      .tabs {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+      .tab-btn { margin-bottom: 0; }
+      .split, .grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">mint.ops</div>
+      <h1 class="title">Deployment Console</h1>
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="dashboard">Dashboard <span class="badge" id="badgeNodes">-</span></button>
+        <button class="tab-btn" data-tab="deploy">Deploy <span class="badge" id="badgeActors">-</span></button>
+        <button class="tab-btn" data-tab="cronjob">Cronjob <span class="badge">TODO</span></button>
+      </div>
+      <div class="side-meta">
+        <div>Generated: <span class="mono" id="metaGenerated">-</span></div>
+        <div>Host: <span class="mono" id="metaHost">-</span></div>
+        <div>Ray: <span class="mono" id="metaRay">-</span></div>
+        <div>PID: <span class="mono" id="metaPid">-</span></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <button class="btn primary" id="refreshBtn">Refresh Snapshot</button>
+        <span class="hint" id="refreshHint">ready</span>
+        <label class="check"><input type="checkbox" id="autoRefresh" /> auto refresh</label>
+        <select id="autoRefreshSec" style="width:auto">
+          <option value="5">5s</option>
+          <option value="10" selected>10s</option>
+          <option value="20">20s</option>
+          <option value="30">30s</option>
+        </select>
+      </div>
+
+      <section class="tab-panel active" data-tab="dashboard">
+        <div class="cards">
+          <div class="card"><div class="k">GPU Total</div><div class="v" id="cardGpuTotal">-</div></div>
+          <div class="card"><div class="k">GPU Available</div><div class="v" id="cardGpuAvail">-</div></div>
+          <div class="card"><div class="k">Nodes Alive</div><div class="v" id="cardNodesAlive">-</div></div>
+          <div class="card"><div class="k">Pending PG</div><div class="v" id="cardPgPending">-</div></div>
+          <div class="card"><div class="k">Managed Actors</div><div class="v" id="cardActors">-</div></div>
+          <div class="card"><div class="k">Not Ready Actors</div><div class="v" id="cardNotReadyActors">-</div></div>
+          <div class="card"><div class="k">Healthz</div><div class="v" id="cardHealthz">-</div></div>
+        </div>
+        <div class="panel">
+          <h3>Actor Readiness (Not Ready)</h3>
+          <div class="body">
+            <div class="hint" id="readinessSummary">-</div>
+            <div class="table-wrap" style="margin-top:8px">
+              <table>
+                <thead><tr><th>source</th><th>actor_type</th><th>model</th><th>status</th><th>detail</th></tr></thead>
+                <tbody id="readinessBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Nodes / GPU / Actor Distribution</h3>
+          <div class="body table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ip</th><th>state</th><th>gpu_total</th><th>gpu_reserved</th><th>gpu_idle_est</th><th>gpu_used_pct(est)</th><th>actors</th><th>pg_labels</th><th>model_hints</th><th>detail</th>
+                </tr>
+              </thead>
+              <tbody id="nodesBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="split">
+          <div class="panel">
+            <h3>Placement Groups Distribution</h3>
+            <div class="body table-wrap">
+              <table>
+                <thead><tr><th>name</th><th>state</th><th>gpu</th><th>bundles</th><th>strategy</th><th>node_distribution</th></tr></thead>
+                <tbody id="pgBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <h3>Actors Distribution / Status</h3>
+            <div class="body table-wrap">
+              <table>
+                <thead><tr><th>actor</th><th>type</th><th>model</th><th>gpu</th><th>idle_s</th><th>status</th><th>protected</th><th>detail</th></tr></thead>
+                <tbody id="actorsBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-tab="deploy">
+        <div class="grid-2">
+          <div class="panel">
+            <h3>2.1 Node Scale</h3>
+            <div class="body">
+              <div class="todo">TODO: 节点增减（接 Volcano/Aliyun 集群生命周期接口）。当前版本先提供 Dashboard 可视化和 PG/Actor 运维操作。</div>
+            </div>
+          </div>
+          <div class="panel">
+            <h3>2.2 Placement Group</h3>
+            <div class="body">
+              <div class="form-row single">
+                <div>
+                  <label>PG names (comma separated, optional)</label>
+                  <input id="pgNames" placeholder="pg_a,pg_b" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div>
+                  <label>state filter</label>
+                  <select id="pgState">
+                    <option value="">(none)</option>
+                    <option value="PENDING">PENDING</option>
+                    <option value="CREATED">CREATED</option>
+                  </select>
+                </div>
+                <div>
+                  <label>wait / restart flush</label>
+                  <input id="restartWait" type="number" min="10" step="1" value="60" />
+                </div>
+              </div>
+              <div class="checks">
+                <label class="check"><input id="pgOnlyGpu" type="checkbox" checked /> only GPU PG</label>
+                <label class="check"><input id="restartCleanDirty" type="checkbox" /> clean dirty run_server</label>
+              </div>
+              <div class="topbar" style="margin-bottom:0">
+                <button class="btn" id="pgPreviewBtn">Preview Remove</button>
+                <button class="btn warn" id="pgApplyBtn">Apply Remove</button>
+                <button class="btn" id="serverRestartBtn">Restart Server (flush config)</button>
+              </div>
+              <pre class="result" id="pgResult">ready</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>2.3 Actor Operations</h3>
+          <div class="body">
+            <div class="form-row">
+              <div>
+                <label>actor type</label>
+                <select id="actorType">
+                  <option value="vllm">vllm</option>
+                  <option value="megatron">megatron</option>
+                  <option value="dense">dense</option>
+                  <option value="all">all</option>
+                </select>
+              </div>
+              <div>
+                <label>model name (optional)</label>
+                <input id="actorModel" placeholder="Qwen/Qwen3-30B-A3B-Instruct-2507" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div>
+                <label>rebuild kind</label>
+                <select id="rebuildKind">
+                  <option value="training" selected>training (Megatron/Dense)</option>
+                  <option value="vllm">vllm</option>
+                </select>
+              </div>
+              <div>
+                <label>rebuild model</label>
+                <select id="rebuildModel"></select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div>
+                <label>lora rank (training only)</label>
+                <input id="rebuildLoraRank" type="number" min="1" step="1" value="16" />
+              </div>
+              <div>
+                <label>poll timeout seconds</label>
+                <input id="rebuildPollTimeout" type="number" min="30" step="10" value="1800" />
+              </div>
+            </div>
+            <div class="topbar" style="margin-bottom:0">
+              <button class="btn danger" id="actorKillBtn">Kill Actor(s)</button>
+              <button class="btn warn" id="actorRebuildBtn">Rebuild Actor</button>
+            </div>
+            <pre class="result" id="actorResult">ready</pre>
+            <div class="table-wrap" style="margin-top:10px">
+              <table>
+                <thead><tr><th>actor</th><th>type</th><th>model</th><th>gpu</th><th>creating</th><th>action</th></tr></thead>
+                <tbody id="deployActorsBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-tab="cronjob">
+        <div class="panel">
+          <h3>Cronjob</h3>
+          <div class="body">
+            <div class="todo">TODO: 定时任务编排（例如健康巡检、Actor 回收、状态归档）。下一步可以把 `verify` 和 `status` 组合成可配置 cron 策略。</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="modal-backdrop" id="detailModal">
+    <div class="modal">
+      <div class="modal-hd">
+        <h4 class="modal-title" id="detailModalTitle">Detail</h4>
+        <button class="btn" id="detailModalClose">Close</button>
+      </div>
+      <div class="modal-bd" id="detailModalBody"></div>
+    </div>
+  </div>
+
+  <script id="initialSnapshot" type="application/json">__INITIAL_SNAPSHOT_JSON__</script>
+  <script>
+    const ACTOR_LIMIT = __ACTOR_LIMIT__;
+    let state = { snapshot: JSON.parse(document.getElementById('initialSnapshot').textContent || '{}') };
+    let autoTimer = null;
+
+    function esc(v) {
+      return String(v ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+    function n(v, d=0) {
+      const x = Number(v);
+      return Number.isFinite(x) ? x : d;
+    }
+    function asList(v) {
+      return Array.isArray(v) ? v : [];
+    }
+    function statusPill(text, kind) {
+      const cls = kind || 'warn';
+      return `<span class="pill ${cls}">${esc(text)}</span>`;
+    }
+    function pretty(obj) {
+      try { return JSON.stringify(obj, null, 2); } catch (_) { return String(obj); }
+    }
+    async function apiGetJson(path) {
+      const resp = await fetch(path);
+      const body = await resp.json().catch(() => ({ ok: false, error: 'invalid json' }));
+      if (!resp.ok) {
+        throw new Error(body.error || ('HTTP ' + resp.status));
+      }
+      return body;
+    }
+    async function apiPost(path, payload) {
+      const resp = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {}),
+      });
+      const body = await resp.json().catch(() => ({ ok: false, error: 'invalid json' }));
+      if (!resp.ok) {
+        throw new Error(body.error || ('HTTP ' + resp.status));
+      }
+      return body;
+    }
+    function setHint(msg) {
+      document.getElementById('refreshHint').textContent = msg;
+    }
+    function attachTabs() {
+      const buttons = Array.from(document.querySelectorAll('.tab-btn'));
+      const panels = Array.from(document.querySelectorAll('.tab-panel'));
+      for (const btn of buttons) {
+        btn.addEventListener('click', () => {
+          const tab = btn.getAttribute('data-tab');
+          buttons.forEach(x => x.classList.toggle('active', x === btn));
+          panels.forEach(p => p.classList.toggle('active', p.getAttribute('data-tab') === tab));
+        });
+      }
+    }
+    function renderMeta(snap) {
+      document.getElementById('metaGenerated').textContent = String(snap.generated_at_utc || '-');
+      document.getElementById('metaHost').textContent = String(snap.host || '-');
+      document.getElementById('metaRay').textContent = String(snap.ray_address || '-');
+      document.getElementById('metaPid').textContent = String((snap.server_process || {}).pid || '-');
+    }
+    function renderCards(snap) {
+      const summary = snap.summary || {};
+      document.getElementById('cardGpuTotal').textContent = String(summary.gpu_total ?? '-');
+      document.getElementById('cardGpuAvail').textContent = String(summary.gpu_available ?? '-');
+      document.getElementById('cardNodesAlive').textContent = String(summary.gpu_nodes_alive ?? '-');
+      document.getElementById('cardPgPending').textContent = String(summary.pending_placement_groups ?? '-');
+      document.getElementById('cardActors').textContent = String(summary.managed_actors ?? '-');
+      const expectedNotReady = n(summary.not_ready_expected_actors, 0);
+      const creatingManaged = n(summary.creating_actors, 0);
+      const notReadyText = creatingManaged > expectedNotReady
+        ? `${expectedNotReady} (+${creatingManaged - expectedNotReady} creating)`
+        : String(expectedNotReady);
+      document.getElementById('cardNotReadyActors').textContent = notReadyText;
+      document.getElementById('cardHealthz').textContent = String((snap.http || {}).healthz_status ?? '-');
+      document.getElementById('badgeNodes').textContent = String(asList((snap.ray || {}).nodes).length);
+      document.getElementById('badgeActors').textContent = String(asList(((snap.http || {}).actors || {}).actors).length);
+    }
+    function renderReadiness(snap) {
+      const readiness = snap.actor_readiness || {};
+      const counts = readiness.counts || {};
+      const notReadyExpected = asList(readiness.not_ready_expected);
+      const creatingManaged = asList(readiness.creating_managed);
+      const summaryParts = [
+        `expected_total=${n(counts.expected_total, 0)}`,
+        `expected_not_ready=${n(counts.expected_not_ready, notReadyExpected.length)}`,
+        `creating_managed=${n(counts.creating_managed, creatingManaged.length)}`,
+      ];
+      const gatewaySkipped = n(counts.gateway_routed_skipped, 0);
+      const unknownSkipped = n(counts.unknown_model_skipped, 0);
+      const inferDisabled = n(counts.inference_disabled_by_multi_lora, 0);
+      if (gatewaySkipped > 0) summaryParts.push(`gateway_routed_skipped=${gatewaySkipped}`);
+      if (unknownSkipped > 0) summaryParts.push(`unknown_model_skipped=${unknownSkipped}`);
+      if (inferDisabled > 0) summaryParts.push('inference_prewarm_disabled');
+      document.getElementById('readinessSummary').textContent = summaryParts.join(' | ');
+
+      const rows = [];
+      for (const item of notReadyExpected) {
+        const status = String(item.status || 'missing');
+        const cls = status === 'creating' ? 'warn' : 'bad';
+        const detail = `ready=${n(item.ready_count, 0)}, creating=${n(item.creating_count, 0)}`;
+        rows.push(`<tr>
+          <td>${esc(item.source || 'expected')}</td>
+          <td>${esc(item.actor_type || '-')}</td>
+          <td>${esc(item.model || '-')}</td>
+          <td>${statusPill(status, cls)}</td>
+          <td class="mono">${esc(detail)}</td>
+        </tr>`);
+      }
+      for (const item of creatingManaged) {
+        rows.push(`<tr>
+          <td>managed_actor</td>
+          <td>${esc(item.actor_type || '-')}</td>
+          <td>${esc(item.base_model_hf || item.base_model_raw || '-')}</td>
+          <td>${statusPill('creating', 'warn')}</td>
+          <td class="mono">${esc(item.actor_name || '-')}</td>
+        </tr>`);
+      }
+      document.getElementById('readinessBody').innerHTML =
+        rows.join('') || "<tr><td colspan='5'>all expected actors ready</td></tr>";
+    }
+    function upsertRebuildModelOption(model, defaultKind) {
+      const sel = document.getElementById('rebuildModel');
+      if (!sel) return;
+      const m = String(model || '').trim();
+      if (!m) return;
+      const kind = String(defaultKind || 'training').trim() || 'training';
+      const options = Array.from(sel.options || []);
+      const exists = options.some((x) => String(x.value || '') === m);
+      if (exists) return;
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      opt.setAttribute('data-default-kind', kind);
+      sel.appendChild(opt);
+    }
+    function populateRebuildModelOptions(snap) {
+      const sel = document.getElementById('rebuildModel');
+      if (!sel) return;
+      const prev = String(sel.value || '').trim();
+      const options = asList(((snap.ops_ui || {}).rebuild_model_options));
+      sel.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = options.length ? 'Select model...' : 'No model options';
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      sel.appendChild(placeholder);
+
+      for (const item of options) {
+        const model = String(item.model || '').trim();
+        if (!model) continue;
+        const opt = document.createElement('option');
+        opt.value = model;
+        opt.textContent = model;
+        opt.setAttribute('data-default-kind', String(item.default_kind || 'training'));
+        sel.appendChild(opt);
+      }
+
+      if (prev) {
+        upsertRebuildModelOption(prev, 'training');
+        sel.value = prev;
+      } else if (options.length > 0) {
+        const first = String((options[0] || {}).model || '').trim();
+        if (first) sel.value = first;
+      }
+
+      if (sel.value) {
+        const selected = sel.selectedOptions && sel.selectedOptions[0];
+        const kind = selected ? String(selected.getAttribute('data-default-kind') || '') : '';
+        if (kind === 'vllm' || kind === 'training') {
+          document.getElementById('rebuildKind').value = kind;
+        }
+      }
+    }
+    function renderNodesTable(snap) {
+      const nodes = asList((snap.ray || {}).nodes);
+      const rows = nodes.map((node) => {
+        const total = n(node.gpu_total);
+        const reserved = n(node.gpu_reserved);
+        const usedPct = total > 0 ? (100 * reserved / total) : 0;
+        const pgLabels = asList(node.pg_labels).slice(0, 5).join(', ') || '-';
+        const actorNames = asList(node.ray_actor_names);
+        const modelHints = asList(node.model_hints).join(', ') || '-';
+        const alive = !!node.alive;
+        return `<tr>
+          <td class="mono">${esc(node.ip || '-')}</td>
+          <td>${statusPill(alive ? 'alive' : 'dead', alive ? 'ok' : 'bad')}</td>
+          <td>${total}</td>
+          <td>${reserved}</td>
+          <td>${n(node.gpu_idle_est)}</td>
+          <td>${usedPct.toFixed(1)}%</td>
+          <td>${n(node.ray_actor_count)}</td>
+          <td>${esc(pgLabels)}</td>
+          <td>${esc(modelHints)}</td>
+          <td class="center">${actorNames.length ? `<button class="link-btn view-node-actors" data-ip="${esc(node.ip || '')}">View</button>` : '-'}</td>
+        </tr>`;
+      });
+      document.getElementById('nodesBody').innerHTML = rows.join('') || "<tr><td colspan='10'>no nodes</td></tr>";
+    }
+    function renderPgTable(snap) {
+      const pgs = asList((snap.ray || {}).placement_groups).slice(0, ACTOR_LIMIT);
+      const rows = pgs.map((pg) => {
+        const distObj = pg.node_distribution || {};
+        const dist = Object.keys(distObj).map((ip) => `${ip}:${Number((distObj[ip] || {}).gpu || 0)}`).join(', ') || '-';
+        const state = String(pg.state || 'UNKNOWN');
+        const cls = state === 'CREATED' ? 'ok' : (state === 'PENDING' ? 'warn' : 'bad');
+        return `<tr>
+          <td class="mono">${esc(pg.name || '-')}</td>
+          <td>${statusPill(state, cls)}</td>
+          <td>${n(pg.requested_gpu)}</td>
+          <td>${n(pg.bundle_count)}</td>
+          <td>${esc(pg.strategy || '-')}</td>
+          <td>${esc(dist)}</td>
+        </tr>`;
+      });
+      document.getElementById('pgBody').innerHTML = rows.join('') || "<tr><td colspan='6'>no placement groups</td></tr>";
+    }
+    function renderActorsTable(snap) {
+      const actorsPayload = (snap.http || {}).actors || {};
+      const actors = asList(actorsPayload.actors).slice(0, ACTOR_LIMIT);
+      const rows = actors.map((a) => {
+        const creating = !!a.creating;
+        const cls = creating ? 'warn' : 'ok';
+        const actorName = String(a.actor_name || '');
+        return `<tr>
+          <td class="mono">${esc(actorName || '-')}</td>
+          <td>${esc(a.actor_type || '-')}</td>
+          <td>${esc(a.base_model || '-')}</td>
+          <td>${n(a.num_gpus)}</td>
+          <td>${n(a.idle_time).toFixed(1)}</td>
+          <td>${statusPill(creating ? 'creating/pending' : 'ready', cls)}</td>
+          <td>${a.protected ? 'yes' : 'no'}</td>
+          <td class="center">${actorName ? `<button class="link-btn view-actor-detail" data-actor="${esc(actorName)}">Detail</button>` : '-'}</td>
+        </tr>`;
+      });
+      document.getElementById('actorsBody').innerHTML = rows.join('') || "<tr><td colspan='8'>no managed actors</td></tr>";
+
+      const deployRows = actors.map((a) => `<tr>
+        <td class="mono">${esc(a.actor_name || '-')}</td>
+        <td>${esc(a.actor_type || '-')}</td>
+        <td>${esc(a.base_model || '-')}</td>
+        <td>${n(a.num_gpus)}</td>
+        <td>${a.creating ? 'yes' : 'no'}</td>
+        <td>
+          <button class="btn danger quick-kill" data-type="${esc(a.actor_type || '')}" data-model="${esc(a.base_model || '')}">kill</button>
+          <button class="btn warn quick-rebuild" data-type="${esc(a.actor_type || '')}" data-model="${esc(a.base_model || '')}">rebuild</button>
+        </td>
+      </tr>`);
+      document.getElementById('deployActorsBody').innerHTML = deployRows.join('') || "<tr><td colspan='6'>no managed actors</td></tr>";
+    }
+    function renderAll() {
+      const snap = state.snapshot || {};
+      renderMeta(snap);
+      renderCards(snap);
+      renderReadiness(snap);
+      populateRebuildModelOptions(snap);
+      renderNodesTable(snap);
+      renderPgTable(snap);
+      renderActorsTable(snap);
+    }
+    async function refreshSnapshot(force) {
+      setHint(force ? 'refreshing...' : 'loading...');
+      const btn = document.getElementById('refreshBtn');
+      btn.disabled = true;
+      try {
+        const data = await apiGetJson('/api/v1/status?format=json' + (force ? '&refresh=1' : ''));
+        state.snapshot = data;
+        renderAll();
+        setHint('updated: ' + (data.generated_at_utc || '-'));
+      } catch (err) {
+        setHint('refresh failed: ' + (err && err.message ? err.message : String(err)));
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    function parseCsv(input) {
+      return String(input || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    }
+    function setResult(id, data) {
+      document.getElementById(id).textContent = pretty(data);
+    }
+    function openDetailModal(title, html) {
+      document.getElementById('detailModalTitle').textContent = title || 'Detail';
+      document.getElementById('detailModalBody').innerHTML = html || '';
+      document.getElementById('detailModal').classList.add('open');
+    }
+    function closeDetailModal() {
+      document.getElementById('detailModal').classList.remove('open');
+    }
+    function findNodeByIp(ip) {
+      const nodes = asList(((state.snapshot || {}).ray || {}).nodes);
+      return nodes.find((x) => String(x.ip || '') === String(ip || '')) || null;
+    }
+    function findActorByName(actorName) {
+      const actors = asList((((state.snapshot || {}).http || {}).actors || {}).actors);
+      return actors.find((x) => String(x.actor_name || '') === String(actorName || '')) || null;
+    }
+    async function runPgRemove(apply) {
+      const names = parseCsv(document.getElementById('pgNames').value);
+      const state = String(document.getElementById('pgState').value || '');
+      const onlyGpu = !!document.getElementById('pgOnlyGpu').checked;
+      const payload = { names, state, only_gpu: onlyGpu, apply: !!apply };
+      setResult('pgResult', { status: 'running', payload });
+      try {
+        const data = await apiPost('/api/v1/deploy/pg/remove', payload);
+        setResult('pgResult', data);
+        await refreshSnapshot(true);
+      } catch (err) {
+        setResult('pgResult', { ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    }
+    async function runActorKill(actorType, modelName) {
+      const payload = { actor_type: actorType, model_name: modelName || '' };
+      setResult('actorResult', { status: 'running', payload });
+      try {
+        const data = await apiPost('/api/v1/deploy/actor/kill', payload);
+        setResult('actorResult', data);
+        await refreshSnapshot(true);
+      } catch (err) {
+        setResult('actorResult', { ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    }
+    async function runActorRebuild(kind, modelName) {
+      const model = String(modelName || '').trim();
+      if (!model) {
+        setResult('actorResult', { ok: false, error: 'model is required for rebuild' });
+        return;
+      }
+      const payload = {
+        kind: String(kind || 'training'),
+        model,
+        lora_rank: Number(document.getElementById('rebuildLoraRank').value || '16'),
+        poll_timeout_s: Number(document.getElementById('rebuildPollTimeout').value || '1800'),
+        poll_interval_s: 2.0,
+        sample_ping: false,
+      };
+      setResult('actorResult', { status: 'running', payload });
+      try {
+        const data = await apiPost('/api/v1/deploy/actor/rebuild', payload);
+        setResult('actorResult', data);
+        await refreshSnapshot(true);
+      } catch (err) {
+        setResult('actorResult', { ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    }
+    async function runServerRestart() {
+      const cleanDirty = !!document.getElementById('restartCleanDirty').checked;
+      const waitS = Number(document.getElementById('restartWait').value || '60');
+      setResult('pgResult', { status: 'running', action: 'server restart', clean_dirty: cleanDirty, wait_healthz_s: waitS });
+      try {
+        const data = await apiPost('/api/v1/deploy/server/restart', {
+          clean_dirty: cleanDirty,
+          wait_healthz_s: waitS,
+        });
+        setResult('pgResult', data);
+        await refreshSnapshot(true);
+      } catch (err) {
+        setResult('pgResult', { ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    }
+    function bindActions() {
+      document.getElementById('refreshBtn').addEventListener('click', () => refreshSnapshot(true));
+      document.getElementById('pgPreviewBtn').addEventListener('click', () => runPgRemove(false));
+      document.getElementById('pgApplyBtn').addEventListener('click', async () => {
+        if (!window.confirm('Apply placement group removal now?')) return;
+        await runPgRemove(true);
+      });
+      document.getElementById('serverRestartBtn').addEventListener('click', async () => {
+        if (!window.confirm('Restart tinker-server now?')) return;
+        await runServerRestart();
+      });
+      document.getElementById('actorKillBtn').addEventListener('click', async () => {
+        const actorType = String(document.getElementById('actorType').value || '').trim();
+        const model = String(document.getElementById('actorModel').value || '').trim();
+        if (!window.confirm(`Kill actor_type=${actorType}${model ? (' model=' + model) : ''} ?`)) return;
+        await runActorKill(actorType, model);
+      });
+      document.getElementById('actorRebuildBtn').addEventListener('click', async () => {
+        const kind = String(document.getElementById('rebuildKind').value || 'training').trim();
+        const model = String(document.getElementById('rebuildModel').value || '').trim();
+        if (!model) {
+          setResult('actorResult', { ok: false, error: 'rebuild model is required' });
+          return;
+        }
+        if (!window.confirm(`Rebuild ${kind} actor for model=${model} ?`)) return;
+        await runActorRebuild(kind, model);
+      });
+      document.getElementById('deployActorsBody').addEventListener('click', async (ev) => {
+        const target = ev.target;
+        if (!target || !(target instanceof HTMLElement)) return;
+        const actorType = String(target.getAttribute('data-type') || '').trim();
+        const model = String(target.getAttribute('data-model') || '').trim();
+        if (target.classList.contains('quick-kill')) {
+          if (!actorType) return;
+          if (!window.confirm(`Kill actor_type=${actorType} model=${model || '-'} ?`)) return;
+          await runActorKill(actorType, model);
+          return;
+        }
+        if (target.classList.contains('quick-rebuild')) {
+          if (!model) return;
+          const kind = actorType === 'vllm' ? 'vllm' : 'training';
+          document.getElementById('rebuildKind').value = kind;
+          upsertRebuildModelOption(model, kind);
+          document.getElementById('rebuildModel').value = model;
+          if (!window.confirm(`Rebuild ${kind} actor for model=${model} ?`)) return;
+          await runActorRebuild(kind, model);
+        }
+      });
+      document.getElementById('nodesBody').addEventListener('click', (ev) => {
+        const target = ev.target;
+        if (!target || !(target instanceof HTMLElement)) return;
+        if (!target.classList.contains('view-node-actors')) return;
+        const ip = String(target.getAttribute('data-ip') || '').trim();
+        const node = findNodeByIp(ip);
+        if (!node) return;
+        const names = asList(node.ray_actor_names);
+        const listHtml = names.length
+          ? `<ol class="modal-list">${names.map((x) => `<li class="mono">${esc(x)}</li>`).join('')}</ol>`
+          : '<div class="hint">No actors on this node.</div>';
+        openDetailModal(`Actors on ${ip || '-'}`, listHtml);
+      });
+      document.getElementById('actorsBody').addEventListener('click', (ev) => {
+        const target = ev.target;
+        if (!target || !(target instanceof HTMLElement)) return;
+        if (!target.classList.contains('view-actor-detail')) return;
+        const actor = String(target.getAttribute('data-actor') || '').trim();
+        const item = findActorByName(actor);
+        if (!item) return;
+        openDetailModal(`Actor: ${actor}`, `<pre class="result">${esc(pretty(item))}</pre>`);
+      });
+      document.getElementById('detailModalClose').addEventListener('click', closeDetailModal);
+      document.getElementById('detailModal').addEventListener('click', (ev) => {
+        const backdrop = document.getElementById('detailModal');
+        if (ev.target === backdrop) closeDetailModal();
+      });
+      document.getElementById('rebuildModel').addEventListener('change', (ev) => {
+        const target = ev.target;
+        if (!target || !(target instanceof HTMLSelectElement)) return;
+        const selected = target.selectedOptions && target.selectedOptions[0];
+        const kind = selected ? String(selected.getAttribute('data-default-kind') || '') : '';
+        if (kind === 'vllm' || kind === 'training') {
+          document.getElementById('rebuildKind').value = kind;
+        }
+      });
+      window.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') closeDetailModal();
+      });
+
+      function resetAutoTimer() {
+        if (autoTimer) {
+          clearInterval(autoTimer);
+          autoTimer = null;
+        }
+        const enabled = !!document.getElementById('autoRefresh').checked;
+        const sec = Number(document.getElementById('autoRefreshSec').value || '10');
+        if (!enabled || !Number.isFinite(sec) || sec <= 0) {
+          return;
+        }
+        autoTimer = setInterval(() => {
+          refreshSnapshot(false).catch(() => null);
+        }, sec * 1000);
+      }
+      document.getElementById('autoRefresh').addEventListener('change', resetAutoTimer);
+      document.getElementById('autoRefreshSec').addEventListener('change', resetAutoTimer);
+    }
+
+    attachTabs();
+    bindActions();
+    renderAll();
+  </script>
+</body>
+</html>
