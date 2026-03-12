@@ -931,26 +931,10 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                 break
 
         if only_expert0:
-            # Shared-expert export: avoid materializing [num_experts, ...] tensors.
-            #
-            # vLLM later calls `optimize()` (in-place scaling merge) on packed LoRA
-            # weights. `expand(...)` returns a view with overlapping storage, so
-            # in-place ops (e.g., `lora_b *= scaling`) crash with:
-            #   "unsupported operation: more than one element ... refers to a single
-            #    memory location"
-            #
-            # Keep the non-materialized representation, but pre-apply scaling
-            # out-of-place and mark scaling=1 so vLLM's in-place optimize is a no-op.
-            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
-            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
-            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
-            w1_lora_b_base = base_w1.lora_b * float(getattr(base_w1, "scaling", lora_alpha / rank))
-            w2_lora_b_base = base_w2.lora_b * float(getattr(base_w2, "scaling", lora_alpha / rank))
-            w3_lora_b_base = base_w3.lora_b * float(getattr(base_w3, "scaling", lora_alpha / rank))
-            w1_lora_b = w1_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w1_lora_b_base.shape))
-            w2_lora_b = w2_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w2_lora_b_base.shape))
-            w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
-            packed_scaling = [1.0, 1.0, 1.0]
+            # Route single-expert exports through the sparse-shard path so
+            # fused_moe.set_lora consumes shard metadata instead of falling back
+            # to dense per-expert tensors.
+            return _build_sparse_from_representatives([0])
         else:
             import torch
 

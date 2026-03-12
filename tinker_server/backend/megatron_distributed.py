@@ -5637,6 +5637,8 @@ def get_or_create_megatron_worker_group(
         resource_pool.reserve_gpus(num_gpus)
 
         try:
+            from ..config import otel_env_vars
+
             # Runtime env for PFS code access
             runtime_env = {
                 "env_vars": {
