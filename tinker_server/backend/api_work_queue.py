@@ -974,6 +974,52 @@ class ApiWorkQueueClient:
             raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(result)}")
         return result
 
+    async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> None:
+        from .capacity_manager import capacity_manager
+        from .future_store import FutureStoreUnavailableError, future_store
+
+        try:
+            stale_request_ids = future_store.fail_stale_running_requests(
+                str(consumer_job_id),
+                "api server restarted while request was running",
+            )
+        except FutureStoreUnavailableError as e:
+            logger.warning(
+                "[api_work_queue] stale-running reconciliation unavailable consumer_job_id=%s: %s: %s",
+                str(consumer_job_id),
+                type(e).__name__,
+                e,
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                "[api_work_queue] stale-running reconciliation failed consumer_job_id=%s: %s: %s",
+                str(consumer_job_id),
+                type(e).__name__,
+                e,
+            )
+            return
+
+        if not stale_request_ids:
+            return
+
+        for request_id in stale_request_ids:
+            try:
+                capacity_manager.release_all(request_id)
+            except Exception as e:
+                logger.warning(
+                    "[api_work_queue] release_all failed for stale running request_id=%s consumer_job_id=%s: %s: %s",
+                    str(request_id),
+                    str(consumer_job_id),
+                    type(e).__name__,
+                    e,
+                )
+        logger.warning(
+            "[api_work_queue] failed %d stale running requests for previous consumer generation: %s",
+            len(stale_request_ids),
+            stale_request_ids,
+        )
+
     async def start_workers(self, *, num_workers: int) -> None:
         import asyncio
 
@@ -990,6 +1036,7 @@ class ApiWorkQueueClient:
             ref = actor.set_active_job_id.remote(job_id)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
+            await self._reconcile_stale_running_requests(job_id)
         except Exception as e:
             self._running = False
             self._consumer_job_id = None
@@ -1168,6 +1215,7 @@ class ApiWorkQueueClient:
                     item.request_id,
                     meta={
                         "worker_idx": int(worker_idx),
+                        "consumer_job_id": str(self._consumer_job_id),
                         "op": item.op,
                         "queue_state": "running",
                         "stage": "prefill",

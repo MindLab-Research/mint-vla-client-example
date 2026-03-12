@@ -508,16 +508,37 @@ def _get_or_create_ray_actor():
 
         def cleanup(self, request_id: str) -> None:
             self._pending.discard(request_id)
-            self._result_refs.pop(request_id, None)
-            self._errors.pop(request_id, None)
             self._refs.pop(request_id, None)
             self._meta.pop(request_id, None)
             self._created_at.pop(request_id, None)
             self._queued_at.pop(request_id, None)
             self._running_at.pop(request_id, None)
-            self._done_at.pop(request_id, None)
             self._expired_at.pop(request_id, None)
             self._retrieved_at[request_id] = time.time()
+
+        def fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
+            self._prune()
+            now = time.time()
+            active = str(active_consumer_job_id)
+            message = str(error)
+            failed: list[str] = []
+            for request_id in list(self._pending):
+                meta = self._meta.get(request_id)
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("queue_state") or "") != "running":
+                    continue
+                owner = str(meta.get("consumer_job_id") or "").strip()
+                if not owner or owner == active:
+                    continue
+                self._pending.discard(request_id)
+                self._refs.pop(request_id, None)
+                self._update_op_from_meta(request_id, meta)
+                self._meta.pop(request_id, None)
+                self._errors[request_id] = message
+                self._done_at[request_id] = now
+                failed.append(str(request_id))
+            return failed
 
         def forget(self, request_id: str) -> None:
             self._forget(request_id)
@@ -859,6 +880,24 @@ class FutureStore:
             self._ray_actor = None
             actor = self._get_ray_actor()
             actor.cleanup.remote(request_id=request_id)
+
+    def fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            out = ray.get(
+                actor.fail_stale_running_requests.remote(
+                    active_consumer_job_id=str(active_consumer_job_id),
+                    error=str(error),
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        if not isinstance(out, list):
+            raise TypeError(f"FutureStore.fail_stale_running_requests returned non-list: {type(out)}")
+        return [str(x) for x in out]
 
 
 future_store = FutureStore()
