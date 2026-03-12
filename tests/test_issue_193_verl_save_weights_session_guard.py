@@ -26,18 +26,26 @@ class _RecordingRemoteMethod:
         return self._ref
 
 
-class _FakeWorker:
+class _HeartbeatWorkerMixin:
+    def __init__(self):
+        self.heartbeat = _RecordingRemoteMethod("heartbeat-ref")
+
+
+class _FakeWorker(_HeartbeatWorkerMixin):
     def __init__(self, ref: str = "fake-save-checkpoint-ref"):
+        super().__init__()
         self.save_checkpoint = _RecordingRemoteMethod(ref)
 
 
-class _FakeSamplerWorker:
+class _FakeSamplerWorker(_HeartbeatWorkerMixin):
     def __init__(self, ref: str = "fake-save-lora-ref"):
+        super().__init__()
         self.save_lora_weights = _RecordingRemoteMethod(ref)
 
 
-class _FakeLoadWorker:
+class _FakeLoadWorker(_HeartbeatWorkerMixin):
     def __init__(self, ref: str = "fake-load-checkpoint-ref"):
+        super().__init__()
         self.load_checkpoint = _RecordingRemoteMethod(ref)
 
 
@@ -381,6 +389,7 @@ def test_issue_193_dense_save_weights_passes_explicit_session_id_and_keepalive(m
     worker = _FakeWorker(ref="dense-save-ref")
     engine._workers[model_id] = worker
     engine._resource_pool_actor_names[model_id] = "dense-actor"
+    monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
         model_id=model_id,
@@ -417,6 +426,7 @@ def test_issue_193_dense_save_lora_passes_explicit_session_id_and_keepalive(monk
     worker = _FakeSamplerWorker(ref="dense-save-lora-ref")
     engine._workers[model_id] = worker
     engine._resource_pool_actor_names[model_id] = "dense-actor"
+    monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
         model_id=model_id,
@@ -455,6 +465,7 @@ def test_issue_193_dense_load_weights_passes_explicit_session_id_and_keepalive(m
     worker = _FakeLoadWorker(ref="dense-load-ref")
     engine._workers[model_id] = worker
     engine._resource_pool_actor_names[model_id] = "shared-actor"
+    monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
         model_id=model_id,
