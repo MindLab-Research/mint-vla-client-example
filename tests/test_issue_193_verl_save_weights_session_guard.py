@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import sys
+import types
 
 import pytest
 
@@ -11,7 +13,7 @@ pytest.importorskip("ray")
 import ray
 
 from tinker_server.backend.training_session_manager import TrainingSession
-from tinker_server.backend.verl_training import VerlTrainingEngine
+from tinker_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
 
 
 class _RecordingRemoteMethod:
@@ -32,6 +34,74 @@ class _FakeWorker:
 class _FakeSamplerWorker:
     def __init__(self, ref: str = "fake-save-lora-ref"):
         self.save_lora_weights = _RecordingRemoteMethod(ref)
+
+
+class _FakeLoadWorker:
+    def __init__(self, ref: str = "fake-load-checkpoint-ref"):
+        self.load_checkpoint = _RecordingRemoteMethod(ref)
+
+
+def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_state(monkeypatch, tmp_path):
+    impl_cls = TrainingWorker.__ray_metadata__.modified_class
+    worker = object.__new__(impl_cls)
+
+    worker.device = "cpu"
+    worker.model = object()
+    worker._step_count = 0
+    worker._touch = lambda: None
+
+    ensure_calls: list[str] = []
+    reset_calls: list[float | None] = []
+
+    worker._ensure_session_loaded = lambda session_id: ensure_calls.append(session_id)
+    worker.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {
+        "status": "ok",
+        "learning_rate": learning_rate,
+    }
+
+    class _FakeOptimizer:
+        def load_state_dict(self, state):
+            raise AssertionError("optimizer state should not load when load_optimizer=False")
+
+    worker.optimizer = _FakeOptimizer()
+
+    ckpt_dir = tmp_path / "worker_ckpt"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "adapter_model.safetensors").write_bytes(b"stub")
+    (ckpt_dir / "training_meta.json").write_text('{"current_step": 17, "learning_rate": 0.0005}')
+
+    fake_safetensors_torch = types.ModuleType("safetensors.torch")
+    fake_safetensors_torch.load_file = lambda *args, **kwargs: {"fake": "state"}
+    fake_safetensors = types.ModuleType("safetensors")
+    fake_safetensors.torch = fake_safetensors_torch
+    monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
+    monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
+
+    fake_save_load = types.ModuleType("peft.utils.save_and_load")
+    fake_save_load.set_peft_model_state_dict = lambda model, state_dict: None
+    fake_peft_utils = types.ModuleType("peft.utils")
+    fake_peft_utils.save_and_load = fake_save_load
+    fake_peft = types.ModuleType("peft")
+    fake_peft.utils = fake_peft_utils
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+    monkeypatch.setitem(sys.modules, "peft.utils", fake_peft_utils)
+    monkeypatch.setitem(sys.modules, "peft.utils.save_and_load", fake_save_load)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.verl_training._get_torch",
+        lambda: SimpleNamespace(load=lambda *args, **kwargs: {"unexpected": True}),
+    )
+
+    meta = worker.load_checkpoint(
+        str(ckpt_dir),
+        load_optimizer=False,
+        session_id="existing_session",
+    )
+
+    assert meta["current_step"] == 17
+    assert ensure_calls == ["existing_session"]
+    assert reset_calls == [pytest.approx(5e-4)]
+    assert worker._step_count == 17
 
 
 def test_issue_193_megatron_save_weights_passes_explicit_session_id(monkeypatch):
@@ -108,12 +178,13 @@ def test_issue_193_megatron_save_weights_propagates_ray_get_errors_without_step_
     )
     session.current_step = 123
 
-    def fake_ray_get(ref, timeout=None):
-        assert ref == "fake-save-checkpoint-ref-error"
-        assert timeout is not None
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        assert awaitable == "fake-save-checkpoint-ref-error"
+        assert keepalive_session is session
+        assert timeout_s is not None
         raise raised_error
 
-    monkeypatch.setattr(ray, "get", fake_ray_get)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
 
     async def _run():
         return await engine.save_weights(
@@ -304,6 +375,169 @@ def test_issue_193_megatron_save_weights_concurrent_shared_actor_is_isolated(mon
     assert session_ids == {"model_shared_a", "model_shared_b"}
 
 
+def test_issue_193_dense_save_weights_passes_explicit_session_id_and_keepalive(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_dense_save"
+    worker = _FakeWorker(ref="dense-save-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "dense-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_dense_save",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+
+    keepalive_calls: list[tuple[object, str, float, float | None]] = []
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
+        return {"current_step": 17}
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+
+    async def _run():
+        return await engine.save_weights(session, "/tmp/issue_193_dense_ckpt")
+
+    saved_path = asyncio.run(_run())
+
+    assert saved_path == str(Path("/tmp/issue_193_dense_ckpt").resolve())
+    assert session.current_step == 17
+    assert keepalive_calls == [("dense-save-ref", model_id, 30.0, 300)]
+    args, kwargs = worker.save_checkpoint.calls[0]
+    assert args == (str(Path("/tmp/issue_193_dense_ckpt").resolve()),)
+    assert kwargs["session_id"] == model_id
+
+
+def test_issue_193_dense_save_lora_passes_explicit_session_id_and_keepalive(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_dense_lora"
+    worker = _FakeSamplerWorker(ref="dense-save-lora-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "dense-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_dense_lora",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+
+    keepalive_calls: list[tuple[object, str, float, float | None]] = []
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
+        return None
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+
+    async def _run():
+        return await engine.save_dense_lora_weights_for_sampler(
+            session=session,
+            save_path="/tmp/issue_193_dense_lora",
+        )
+
+    saved_path = asyncio.run(_run())
+
+    assert saved_path == str(Path("/tmp/issue_193_dense_lora").resolve())
+    assert keepalive_calls == [("dense-save-lora-ref", model_id, 30.0, 300)]
+    args, kwargs = worker.save_lora_weights.calls[0]
+    assert args == (str(Path("/tmp/issue_193_dense_lora").resolve()),)
+    assert kwargs["session_id"] == model_id
+
+
+def test_issue_193_dense_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_dense_load"
+    worker = _FakeLoadWorker(ref="dense-load-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "shared-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_dense_load",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+    session.learning_rate = 1e-4
+
+    keepalive_calls: list[tuple[object, str, float, float | None]] = []
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
+        return {"current_step": 23, "learning_rate": 2e-4}
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_dense_load",
+            load_optimizer=True,
+        )
+
+    asyncio.run(_run())
+
+    assert keepalive_calls == [("dense-load-ref", model_id, 30.0, 120)]
+    args, kwargs = worker.load_checkpoint.calls[0]
+    assert args == ("/tmp/issue_193_dense_load", True)
+    assert kwargs["session_id"] == model_id
+    assert session.current_step == 23
+    assert session.learning_rate == pytest.approx(2e-4)
+
+
+def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_load"
+    worker = _FakeLoadWorker(ref="megatron-load-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "megatron-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_load",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="megatron",
+        lora_config=SimpleNamespace(
+            train_attn=False,
+            train_mlp=True,
+            train_unembed=False,
+        ),
+    )
+
+    keepalive_calls: list[tuple[object, str, float, float | None]] = []
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
+        return {"current_step": 5, "learning_rate": 3e-4}
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_megatron_load",
+            load_optimizer=False,
+        )
+
+    asyncio.run(_run())
+
+    assert keepalive_calls == [("megatron-load-ref", model_id, 30.0, 120)]
+    args, kwargs = worker.load_checkpoint.calls[0]
+    assert args == ("/tmp/issue_193_megatron_load", False)
+    assert kwargs["session_id"] == model_id
+    assert kwargs["train_attn"] is False
+    assert kwargs["train_mlp"] is True
+    assert kwargs["train_unembed"] is False
+    assert session.current_step == 5
+    assert session.learning_rate == pytest.approx(3e-4)
+
+
 @pytest.mark.parametrize(
     "raised_error",
     [
@@ -330,12 +564,13 @@ def test_issue_193_save_lora_weights_for_sampler_propagates_errors_without_step_
     )
     session.current_step = 88
 
-    def fake_ray_get(ref, timeout=None):
-        assert ref == "fake-save-lora-ref-error"
-        assert timeout is not None
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        assert awaitable == "fake-save-lora-ref-error"
+        assert keepalive_session is session
+        assert timeout_s is not None
         raise raised_error
 
-    monkeypatch.setattr(ray, "get", fake_ray_get)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
 
     async def _run():
         return await engine.save_lora_weights_for_sampler(

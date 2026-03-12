@@ -522,6 +522,25 @@ class MegatronRankWorker:
             "reuse_total": self._sticky_train_mode_reuse_total,
         }
 
+    def _release_sticky_for_aux_mode_transition(
+        self,
+        *,
+        reason: str,
+        snapshot_gradients: bool = True,
+    ) -> None:
+        """Release sticky train_mode before entering an auxiliary mode context.
+
+        Auxiliary ops such as export/save/load paths may enter their own
+        `eval_mode()` / `train_mode()` contexts. Releasing here avoids nested
+        mode transitions while preserving accumulated gradients when possible.
+        """
+        if self._sticky_train_mode_ctx is None:
+            return
+        self._release_sticky_train_mode(
+            reason=reason,
+            snapshot_gradients=snapshot_gradients,
+        )
+
     def _start_slow_op_watchdog(
         self,
         *,
@@ -1849,6 +1868,7 @@ class MegatronRankWorker:
 
             try:
                 _run_forward_backward_compute()
+                self._sticky_train_mode_last_used_s = time.perf_counter()
             except Exception as original_error:
                 # On error, GPU state is undefined -- release sticky context without
                 # snapshotting gradients (would persist garbage).
@@ -2396,6 +2416,8 @@ class MegatronRankWorker:
 
             try:
                 _run_optim_core()
+                if self._sticky_train_mode_ctx is not None:
+                    self._sticky_train_mode_last_used_s = time.perf_counter()
             except Exception as original_error:
                 # On error, GPU state is undefined -- release sticky context without
                 # snapshotting gradients (would persist garbage).
@@ -2500,6 +2522,10 @@ class MegatronRankWorker:
         import os
 
         logger.info(f"[Rank {self.rank}] get_lora_state_dict: ENTRY")
+        self._release_sticky_for_aux_mode_transition(
+            reason="get_lora_state_dict",
+            snapshot_gradients=True,
+        )
 
         # ========== Try HollowMan Megatron-Bridge export_adapter_weights API ==========
         # This is enabled via USE_MBRIDGE_LORA_EXPORT=true environment variable which
@@ -4358,6 +4384,11 @@ class MegatronRankWorker:
         import torch
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
 
+        self._release_sticky_for_aux_mode_transition(
+            reason="load_optimizer_state",
+            snapshot_gradients=True,
+        )
+
         rank_path = _get_rank_checkpoint_path(checkpoint_path)
         optimizer_file = rank_path + "_optimizer.pt"
         if not os.path.isfile(optimizer_file):
@@ -4372,6 +4403,21 @@ class MegatronRankWorker:
         if self.rank == 0:
             return {"status": "ok", "optimizer_file": optimizer_file}
         return {}
+
+    def check_optimizer_state_exists(self, checkpoint_path: str) -> dict:
+        """Check whether this rank's optimizer shard exists on shared storage."""
+        import os
+
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+
+        rank_path = _get_rank_checkpoint_path(checkpoint_path)
+        optimizer_file = rank_path + "_optimizer.pt"
+        exists = os.path.isfile(optimizer_file)
+        return {
+            "rank": self.rank,
+            "exists": exists,
+            "optimizer_file": optimizer_file,
+        }
 
 
     # ========================================================================
@@ -4411,6 +4457,11 @@ class MegatronRankWorker:
         from tinker_server.backend.lora_utils import pad_lora_state_dict
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
         from verl.utils.megatron_utils import unwrap_model
+
+        self._release_sticky_for_aux_mode_transition(
+            reason="load_adapter_state",
+            snapshot_gradients=True,
+        )
 
         # Use train_mode context to ensure model is on GPU for loading
         with self.engine.train_mode():
@@ -4488,6 +4539,10 @@ class MegatronRankWorker:
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path, get_adapter_state_dict
 
         os.makedirs(checkpoint_path, exist_ok=True)
+        self._release_sticky_for_aux_mode_transition(
+            reason="save_adapter_state",
+            snapshot_gradients=True,
+        )
 
         # Use train_mode context to ensure model is on GPU for saving
         with self.engine.train_mode():
@@ -4517,9 +4572,8 @@ class MegatronRankWorker:
     def reset_optimizer(self, learning_rate: float | None = None) -> dict:
         """Reset optimizer state for a new session.
 
-        Updates learning rate and zeros gradients. Note: With distributed optimizer,
-        full momentum/variance reset is complex and often unnecessary - momentum
-        from prior training can actually help convergence.
+        Updates learning rate, zeros gradients, and clears optimizer momentum so
+        session-local state cannot leak across non-resume restores.
 
         Args:
             learning_rate: Optional new learning rate. If None, keeps current.
@@ -4537,13 +4591,13 @@ class MegatronRankWorker:
         # Zero gradients (always safe)
         self.engine.optimizer_zero_grad()
 
-        # Note: Full optimizer state reset (momentum/variance) is skipped for distributed
-        # optimizer because:
-        # 1. ProxyDict doesn't support standard iteration patterns
-        # 2. Momentum from prior training often helps convergence
-        # If full reset is needed, the actor should be killed and recreated.
+        # Clear momentum/variance buffers so future steps start from a clean optimizer.
+        self._reset_optimizer_state()
 
-        logger.info(f"[Rank {self.rank}] Reset optimizer (lr={learning_rate or self.learning_rate}, grads zeroed)")
+        logger.info(
+            f"[Rank {self.rank}] Reset optimizer "
+            f"(lr={learning_rate or self.learning_rate}, grads zeroed, state cleared)"
+        )
 
         if self.rank == 0:
             return {"status": "ok", "learning_rate": learning_rate or self.learning_rate}
@@ -5811,7 +5865,16 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}, new_session={new_session_id}")
         return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate, "actual_rank": self._actual_rank}
 
-    def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
+    def load_checkpoint(
+        self,
+        load_path: str,
+        load_optimizer: bool = True,
+        *,
+        session_id: str | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
         """Load checkpoint from path.
 
         Delegates to load_adapter_state which handles distributed loading.
@@ -5819,6 +5882,7 @@ class MegatronWorkerGroup:
         Args:
             load_path: Path to checkpoint directory.
             load_optimizer: Whether to restore optimizer state.
+            session_id: Target session to materialize before loading.
 
         Returns:
             Dict with load metadata.
@@ -5826,53 +5890,91 @@ class MegatronWorkerGroup:
         import json
         import os
 
-        logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
-
-        # Check what files exist in checkpoint directory
-        if os.path.isdir(load_path):
-            files = os.listdir(load_path)
-            logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(files)} files: {files[:10]}")
-
-            # Look for adapter checkpoint files (mp_rank_*_adapter.pt pattern)
-            adapter_files = [f for f in files if f.endswith("_adapter.pt")]
-            if adapter_files:
-                logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
-                # Delegate to load_adapter_state
-                result = self.load_adapter_state(load_path, actual_rank=self._actual_rank or self.lora_rank)
-                result["load_method"] = "load_adapter_state"
-
-                if load_optimizer:
-                    opt_results = ray.get(
-                        [w.load_optimizer_state.remote(load_path) for w in self.workers]
-                    )
-                    optimizer_restored = any(
-                        isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
-                    )
-                    if not optimizer_restored:
-                        raise RuntimeError(
-                            "Optimizer restore requested, but no rank reported optimizer restored"
-                        )
-                    result["optimizer_restored"] = True
-                else:
-                    result["optimizer_restored"] = False
-
-                meta_path = os.path.join(load_path, "training_meta.json")
-                if os.path.exists(meta_path):
-                    with open(meta_path, "r") as f:
-                        meta = json.load(f)
-                    result.update(meta)
-                    self._step_count = int(meta.get("current_step", self._step_count) or 0)
-                    self.learning_rate = float(meta.get("learning_rate", self.learning_rate) or self.learning_rate)
-
-                return result
-            else:
-                raise FileNotFoundError(
-                    f"Missing distributed adapter shards (mp_rank_*_adapter.pt) in: {load_path}"
-                )
-        else:
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="load_checkpoint",
+        )
+        if not os.path.isdir(load_path):
             raise FileNotFoundError(
                 f"Checkpoint path does not exist or is not a directory: {load_path}"
             )
+        files = os.listdir(load_path)
+        logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(files)} files: {files[:10]}")
+        adapter_files = [f for f in files if f.endswith("_adapter.pt")]
+        if not adapter_files:
+            raise FileNotFoundError(
+                f"Missing distributed adapter shards (mp_rank_*_adapter.pt) in: {load_path}"
+            )
+        if load_optimizer:
+            opt_presence = ray.get(
+                [w.check_optimizer_state_exists.remote(load_path) for w in self.workers]
+            )
+            missing = [
+                item.get("optimizer_file", "<unknown>")
+                for item in opt_presence
+                if not isinstance(item, dict) or not bool(item.get("exists"))
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    "Optimizer restore requested, but optimizer shard(s) not found: "
+                    + ", ".join(missing)
+                )
+        self._ensure_session_loaded(
+            effective_session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+
+        logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
+        logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
+
+        # Delegate to load_adapter_state
+        result = self.load_adapter_state(
+            load_path,
+            actual_rank=self._actual_rank or self.lora_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+        result["load_method"] = "load_adapter_state"
+
+        if load_optimizer:
+            opt_results = ray.get(
+                [w.load_optimizer_state.remote(load_path) for w in self.workers]
+            )
+            optimizer_restored = any(
+                isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
+            )
+            if not optimizer_restored:
+                raise RuntimeError(
+                    "Optimizer restore requested, but no rank reported optimizer restored"
+                )
+            result["optimizer_restored"] = True
+        else:
+            result["optimizer_restored"] = False
+
+        meta_path = os.path.join(load_path, "training_meta.json")
+        checkpoint_lr = self.learning_rate
+        checkpoint_step = self._step_count
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            result.update(meta)
+            checkpoint_step = int(meta.get("current_step", self._step_count) or 0)
+            checkpoint_lr = float(meta.get("learning_rate", self.learning_rate) or self.learning_rate)
+
+        if not load_optimizer:
+            ray.get([w.clear_session_state.remote(effective_session_id) for w in self.workers])
+            self.reset_optimizer(checkpoint_lr)
+            result["optimizer_reset"] = True
+        else:
+            result["optimizer_reset"] = False
+
+        self._step_count = checkpoint_step
+        self.learning_rate = checkpoint_lr
+
+        return result
 
 
     def save_checkpoint(
