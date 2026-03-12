@@ -1319,6 +1319,75 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
     assert group.learning_rate == pytest.approx(7e-4)
 
 
+def test_issue_193_load_checkpoint_invalid_meta_preserves_step_and_lr(tmp_path, monkeypatch, caplog):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "current_session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 99
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+
+    ensure_calls: list[tuple[str, dict]] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+    reset_calls: list[float | None] = []
+
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs))
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
+    group.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {"status": "ok"}
+
+    class _FakeClearRemoteMethod:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, session_id):
+            self.calls.append(session_id)
+            return {"status": "ok", "session_id": session_id}
+
+    class _FakeWorker:
+        def __init__(self):
+            self.clear_session_state = _FakeClearRemoteMethod()
+
+    worker_0 = _FakeWorker()
+    worker_1 = _FakeWorker()
+    group.workers = [worker_0, worker_1]
+
+    import ray as ray_module
+
+    monkeypatch.setattr(ray_module, "get", lambda futures, timeout=None: futures)
+
+    ckpt_dir = tmp_path / "megatron_invalid_meta"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_adapter.pt").write_bytes(b"stub")
+    (ckpt_dir / "training_meta.json").write_text('{"current_step": "bad", "learning_rate": "oops"}')
+
+    with caplog.at_level(logging.WARNING):
+        result = group.load_checkpoint(
+            str(ckpt_dir),
+            load_optimizer=False,
+            session_id="target_session",
+        )
+
+    assert ensure_calls == [("target_session", {"train_attn": None, "train_mlp": None, "train_unembed": None})]
+    assert load_adapter_calls == [
+        (
+            str(ckpt_dir),
+            {"actual_rank": 8, "train_attn": None, "train_mlp": None, "train_unembed": None},
+        )
+    ]
+    assert worker_0.clear_session_state.calls == ["target_session"]
+    assert worker_1.clear_session_state.calls == ["target_session"]
+    assert reset_calls == [pytest.approx(1e-4)]
+    assert result["current_step"] == "bad"
+    assert result["learning_rate"] == "oops"
+    assert group._step_count == 99
+    assert group.learning_rate == pytest.approx(1e-4)
+    assert any("Invalid current_step" in rec.getMessage() for rec in caplog.records)
+    assert any("Invalid learning_rate" in rec.getMessage() for rec in caplog.records)
+
+
 def _make_group_with_current_session(current_session: str | None = "s1"):
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)

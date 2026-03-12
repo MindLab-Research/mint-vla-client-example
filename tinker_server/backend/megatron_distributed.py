@@ -5959,10 +5959,41 @@ class MegatronWorkerGroup:
         checkpoint_step = self._step_count
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
-                meta = json.load(f)
-            result.update(meta)
-            checkpoint_step = int(meta.get("current_step", self._step_count) or 0)
-            checkpoint_lr = float(meta.get("learning_rate", self.learning_rate) or self.learning_rate)
+                loaded_meta = json.load(f)
+            if isinstance(loaded_meta, dict):
+                meta = loaded_meta
+                result.update(meta)
+                if "current_step" in meta:
+                    meta_step = meta["current_step"]
+                    if isinstance(meta_step, int) and not isinstance(meta_step, bool):
+                        checkpoint_step = meta_step
+                    else:
+                        logger.warning(
+                            "[MegatronWorkerGroup] Invalid current_step type=%s value=%r in %s; "
+                            "preserving step=%s",
+                            type(meta_step).__name__,
+                            meta_step,
+                            meta_path,
+                            checkpoint_step,
+                        )
+                checkpoint_lr_value = meta.get("learning_rate", checkpoint_lr)
+                try:
+                    checkpoint_lr = float(checkpoint_lr_value)
+                except Exception:
+                    logger.warning(
+                        "[MegatronWorkerGroup] Invalid learning_rate value=%r in %s; "
+                        "preserving lr=%s",
+                        checkpoint_lr_value,
+                        meta_path,
+                        checkpoint_lr,
+                    )
+            else:
+                logger.warning(
+                    "[MegatronWorkerGroup] Invalid checkpoint metadata type %s in %s; "
+                    "preserving step/lr state",
+                    type(loaded_meta).__name__,
+                    meta_path,
+                )
 
         if not load_optimizer:
             ray.get([w.clear_session_state.remote(effective_session_id) for w in self.workers])

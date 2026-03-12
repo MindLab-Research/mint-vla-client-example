@@ -112,6 +112,72 @@ def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_stat
     assert worker._step_count == 17
 
 
+def test_issue_193_training_worker_load_checkpoint_invalid_meta_preserves_step_and_lr(monkeypatch, tmp_path, caplog):
+    impl_cls = TrainingWorker.__ray_metadata__.modified_class
+    worker = object.__new__(impl_cls)
+
+    worker.device = "cpu"
+    worker.model = object()
+    worker._step_count = 33
+    worker._touch = lambda: None
+
+    ensure_calls: list[str] = []
+    reset_calls: list[float | None] = []
+
+    worker._ensure_session_loaded = lambda session_id: ensure_calls.append(session_id)
+    worker.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {
+        "status": "ok",
+        "learning_rate": learning_rate,
+    }
+
+    class _FakeOptimizer:
+        def load_state_dict(self, state):
+            raise AssertionError("optimizer state should not load when load_optimizer=False")
+
+    worker.optimizer = _FakeOptimizer()
+
+    ckpt_dir = tmp_path / "worker_ckpt_invalid_meta"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "adapter_model.safetensors").write_bytes(b"stub")
+    (ckpt_dir / "training_meta.json").write_text('{"current_step": "bad", "learning_rate": "oops"}')
+
+    fake_safetensors_torch = types.ModuleType("safetensors.torch")
+    fake_safetensors_torch.load_file = lambda *args, **kwargs: {"fake": "state"}
+    fake_safetensors = types.ModuleType("safetensors")
+    fake_safetensors.torch = fake_safetensors_torch
+    monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
+    monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
+
+    fake_save_load = types.ModuleType("peft.utils.save_and_load")
+    fake_save_load.set_peft_model_state_dict = lambda model, state_dict: None
+    fake_peft_utils = types.ModuleType("peft.utils")
+    fake_peft_utils.save_and_load = fake_save_load
+    fake_peft = types.ModuleType("peft")
+    fake_peft.utils = fake_peft_utils
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+    monkeypatch.setitem(sys.modules, "peft.utils", fake_peft_utils)
+    monkeypatch.setitem(sys.modules, "peft.utils.save_and_load", fake_save_load)
+
+    monkeypatch.setattr(
+        "tinker_server.backend.verl_training._get_torch",
+        lambda: SimpleNamespace(load=lambda *args, **kwargs: {"unexpected": True}),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        meta = worker.load_checkpoint(
+            str(ckpt_dir),
+            load_optimizer=False,
+            session_id="existing_session",
+        )
+
+    assert meta["current_step"] == "bad"
+    assert ensure_calls == ["existing_session"]
+    assert reset_calls == [None]
+    assert worker._step_count == 33
+    assert any("Invalid current_step" in rec.getMessage() for rec in caplog.records)
+    assert any("Invalid learning_rate" in rec.getMessage() for rec in caplog.records)
+
+
 def test_issue_193_megatron_save_weights_passes_explicit_session_id(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193"
@@ -501,6 +567,92 @@ def test_issue_193_dense_load_weights_passes_explicit_session_id_and_keepalive(m
     assert session.learning_rate == pytest.approx(2e-4)
 
 
+def test_issue_193_dense_save_weights_fails_loud_when_worker_died(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_dense_save_dead"
+    worker = _FakeWorker(ref="dense-save-ref-dead")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "dead-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_dense_save_dead",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+
+    monkeypatch.setattr(
+        ray,
+        "get",
+        lambda ref, timeout=None: (_ for _ in ()).throw(ray.exceptions.ActorDiedError()),
+    )
+
+    async def fail_recover(*args, **kwargs):
+        raise AssertionError("save_weights must not auto-recover a dead dense worker")
+
+    monkeypatch.setattr(engine, "_recover_dense_worker", fail_recover)
+
+    async def _run():
+        await engine.save_weights(session, "/tmp/issue_193_dense_ckpt_dead")
+
+    with pytest.raises(RuntimeError, match="Reload from a checkpoint before retrying"):
+        asyncio.run(_run())
+
+
+def test_issue_193_dense_load_weights_rebinds_after_worker_death(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_dense_load_recover"
+    dead_worker = _FakeLoadWorker(ref="dead-load-ref")
+    recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
+    engine._workers[model_id] = dead_worker
+    engine._resource_pool_actor_names[model_id] = "dead-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_dense_load_recover",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+
+    monkeypatch.setattr(
+        ray,
+        "get",
+        lambda ref, timeout=None: (_ for _ in ()).throw(ray.exceptions.ActorDiedError()),
+    )
+
+    async def fake_recover(recover_session, *, reason):
+        assert recover_session is session
+        assert reason == "load_weights:ActorDiedError"
+        return recovered_worker
+
+    keepalive_calls: list[tuple[object, str, float, float | None]] = []
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
+        return {"current_step": 11, "learning_rate": 3e-4}
+
+    monkeypatch.setattr(engine, "_recover_dense_worker", fake_recover)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_dense_load_recover",
+            load_optimizer=True,
+        )
+
+    asyncio.run(_run())
+
+    assert keepalive_calls == [("recovered-load-ref", model_id, 30.0, 120)]
+    assert recovered_worker.load_checkpoint.calls == [
+        (("/tmp/issue_193_dense_load_recover", True), {"session_id": model_id})
+    ]
+    assert session.current_step == 11
+    assert session.learning_rate == pytest.approx(3e-4)
+
+
 def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepalive(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_load"
@@ -547,6 +699,55 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     assert kwargs["train_unembed"] is False
     assert session.current_step == 5
     assert session.learning_rate == pytest.approx(3e-4)
+
+
+@pytest.mark.parametrize(
+    "meta_payload",
+    [
+        {},
+        {"current_step": "42", "learning_rate": "oops"},
+        ["not-a-dict"],
+    ],
+    ids=["missing_current_step", "current_step_wrong_type", "meta_wrong_type"],
+)
+def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch, caplog, meta_payload):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_invalid_meta_load"
+    worker = _FakeLoadWorker(ref="invalid-meta-load-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "shared-actor"
+    monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_invalid_meta_load",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-0.6B",
+        backend="peft",
+    )
+    session.current_step = 77
+    session.learning_rate = 1.5e-4
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        assert awaitable == "invalid-meta-load-ref"
+        assert keepalive_session is session
+        return meta_payload
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_invalid_meta_load",
+            load_optimizer=True,
+        )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(_run())
+
+    assert session.current_step == 77
+    assert session.learning_rate == pytest.approx(1.5e-4)
+    assert any("load_weights" in rec.getMessage() for rec in caplog.records)
 
 
 @pytest.mark.parametrize(

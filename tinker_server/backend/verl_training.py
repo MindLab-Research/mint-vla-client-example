@@ -1122,18 +1122,45 @@ class TrainingWorker:
         logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
 
         # 3. Load and return metadata
-        meta = {}
+        meta: dict[str, object] = {}
         meta_path = os.path.join(load_path, "training_meta.json")
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
-                meta = json.load(f)
-            self._step_count = meta.get("current_step", 0)
-            logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+                loaded_meta = json.load(f)
+            if isinstance(loaded_meta, dict):
+                meta = loaded_meta
+            else:
+                logger.warning(
+                    "[TrainingWorker] Invalid checkpoint metadata type %s in %s; "
+                    "preserving existing step/lr state",
+                    type(loaded_meta).__name__,
+                    meta_path,
+                )
+
+        if "current_step" in meta:
+            meta_step = meta["current_step"]
+            if isinstance(meta_step, int) and not isinstance(meta_step, bool):
+                self._step_count = meta_step
+                logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+            else:
+                logger.warning(
+                    "[TrainingWorker] Invalid current_step type=%s value=%r in %s; "
+                    "preserving existing step=%s",
+                    type(meta_step).__name__,
+                    meta_step,
+                    meta_path,
+                    self._step_count,
+                )
 
         checkpoint_lr = meta.get("learning_rate")
         try:
             checkpoint_lr = float(checkpoint_lr) if checkpoint_lr is not None else None
         except Exception:
+            logger.warning(
+                "[TrainingWorker] Invalid learning_rate value=%r in %s; preserving optimizer lr",
+                checkpoint_lr,
+                meta_path,
+            )
             checkpoint_lr = None
 
         if load_optimizer:
@@ -1518,12 +1545,18 @@ class VerlTrainingEngine:
         )
         return dense.actor
 
-    async def _get_live_worker(self, session: "TrainingSession", *, op: str) -> ray.actor.ActorHandle:
+    async def _get_live_worker(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        allow_recover: bool = False,
+    ) -> ray.actor.ActorHandle:
         """Return a live worker handle, rebinding dense trainers when evicted."""
         model_id = session.model_id
         worker = self._workers.get(model_id)
         if worker is None:
-            if session.backend == "peft":
+            if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
 
@@ -1540,6 +1573,12 @@ class VerlTrainingEngine:
             self._touch_actor(session)
             return worker
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+            if not allow_recover:
+                raise RuntimeError(
+                    f"[{model_id}] dense worker became unavailable before op={op}; "
+                    "refusing automatic recovery because in-memory session state may be lost. "
+                    "Reload from a checkpoint before retrying."
+                ) from e
             logger.warning(
                 "[%s] dense worker unhealthy before op=%s: %s: %s; attempting rebind",
                 model_id,
@@ -1610,6 +1649,60 @@ class VerlTrainingEngine:
                 next_step,
             )
         session.current_step = next_step
+
+    def _update_session_from_load_meta(
+        self,
+        session: "TrainingSession",
+        meta: Any,
+        *,
+        op: str,
+    ) -> None:
+        """Best-effort load metadata application without polluting session state."""
+        model_id = session.model_id
+        if not isinstance(meta, dict):
+            logger.warning(
+                "[%s] %s: invalid meta type %s; preserving current_step=%s lr=%s",
+                model_id,
+                op,
+                type(meta).__name__,
+                session.current_step,
+                session.learning_rate,
+            )
+            return
+
+        meta_step = meta.get("current_step")
+        if isinstance(meta_step, int) and not isinstance(meta_step, bool):
+            session.current_step = meta_step
+        elif "current_step" in meta:
+            logger.warning(
+                "[%s] %s: invalid current_step type=%s value=%r; preserving current_step=%s",
+                model_id,
+                op,
+                type(meta_step).__name__,
+                meta_step,
+                session.current_step,
+            )
+        else:
+            logger.warning(
+                "[%s] %s: meta missing current_step; preserving current_step=%s",
+                model_id,
+                op,
+                session.current_step,
+            )
+
+        if "learning_rate" not in meta:
+            return
+        try:
+            session.learning_rate = float(meta["learning_rate"])
+        except Exception:
+            logger.warning(
+                "[%s] %s: invalid learning_rate type=%s value=%r; preserving learning_rate=%s",
+                model_id,
+                op,
+                type(meta["learning_rate"]).__name__,
+                meta["learning_rate"],
+                session.learning_rate,
+            )
 
     async def _await_with_keepalive(
         self,
@@ -2509,7 +2602,11 @@ class VerlTrainingEngine:
             load_optimizer: Whether to restore optimizer state.
         """
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="load_weights")
+        worker = await self._get_live_worker(
+            session,
+            op="load_weights",
+            allow_recover=(session.backend == "peft"),
+        )
 
         # Remote call to load checkpoint while keeping the pooled actor marked active.
         kwargs: dict[str, object] = {"session_id": session.model_id}
@@ -2526,12 +2623,13 @@ class VerlTrainingEngine:
             timeout_s=120,
         )
 
-        # Update session state from loaded metadata
-        session.current_step = meta.get("current_step", 0)
-        try:
-            session.learning_rate = float(meta.get("learning_rate", session.learning_rate))
-        except Exception:
-            pass
+        # Update session state from loaded metadata without polluting existing
+        # client-side state when old/corrupt checkpoints omit metadata.
+        self._update_session_from_load_meta(
+            session,
+            meta,
+            op="load_weights",
+        )
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
