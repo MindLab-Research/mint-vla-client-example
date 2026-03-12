@@ -174,6 +174,8 @@
     }
     .panel .body { padding: 12px 14px 14px; }
     .table-wrap { overflow: auto; max-height: 440px; }
+    .deploy-panel .body { padding-bottom: 18px; }
+    .deploy-table-wrap { max-height: none; overflow: visible; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -373,7 +375,7 @@
     <main class="main">
       <div class="topbar">
         <button class="btn primary" id="refreshBtn">Refresh Snapshot</button>
-        <span class="hint" id="refreshHint">ready</span>
+        <span class="hint" id="refreshHint">loading snapshot...</span>
         <label class="check"><input type="checkbox" id="autoRefresh" /> auto refresh</label>
         <select id="autoRefreshSec" style="width:auto">
           <option value="5">5s</option>
@@ -443,99 +445,14 @@
       </section>
 
       <section class="tab-panel" data-tab="deploy">
-        <div class="grid-2">
-          <div class="panel">
-            <h3>2.1 Node Scale</h3>
-            <div class="body">
-              <div class="todo">TODO: 节点增减（接 Volcano/Aliyun 集群生命周期接口）。当前版本先提供 Dashboard 可视化和 PG/Actor 运维操作。</div>
-            </div>
-          </div>
-          <div class="panel">
-            <h3>2.2 Placement Group</h3>
-            <div class="body">
-              <div class="form-row single">
-                <div>
-                  <label>PG names (comma separated, optional)</label>
-                  <input id="pgNames" placeholder="pg_a,pg_b" />
-                </div>
-              </div>
-              <div class="form-row">
-                <div>
-                  <label>state filter</label>
-                  <select id="pgState">
-                    <option value="">(none)</option>
-                    <option value="PENDING">PENDING</option>
-                    <option value="CREATED">CREATED</option>
-                  </select>
-                </div>
-                <div>
-                  <label>wait / restart flush</label>
-                  <input id="restartWait" type="number" min="10" step="1" value="60" />
-                </div>
-              </div>
-              <div class="checks">
-                <label class="check"><input id="pgOnlyGpu" type="checkbox" checked /> only GPU PG</label>
-                <label class="check"><input id="restartCleanDirty" type="checkbox" /> clean dirty run_server</label>
-              </div>
-              <div class="topbar" style="margin-bottom:0">
-                <button class="btn" id="pgPreviewBtn">Preview Remove</button>
-                <button class="btn warn" id="pgApplyBtn">Apply Remove</button>
-                <button class="btn" id="serverRestartBtn">Restart Server (flush config)</button>
-              </div>
-              <pre class="result" id="pgResult">ready</pre>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <h3>2.3 Actor Operations</h3>
+        <div class="panel deploy-panel">
+          <h3>Actor Operations</h3>
           <div class="body">
-            <div class="form-row">
-              <div>
-                <label>actor type</label>
-                <select id="actorType">
-                  <option value="vllm">vllm</option>
-                  <option value="megatron">megatron</option>
-                  <option value="dense">dense</option>
-                  <option value="all">all</option>
-                </select>
-              </div>
-              <div>
-                <label>model name (optional)</label>
-                <input id="actorModel" placeholder="Qwen/Qwen3-30B-A3B-Instruct-2507" />
-              </div>
-            </div>
-            <div class="form-row">
-              <div>
-                <label>rebuild kind</label>
-                <select id="rebuildKind">
-                  <option value="training" selected>training (Megatron/Dense)</option>
-                  <option value="vllm">vllm</option>
-                </select>
-              </div>
-              <div>
-                <label>rebuild model</label>
-                <select id="rebuildModel"></select>
-              </div>
-            </div>
-            <div class="form-row">
-              <div>
-                <label>lora rank (training only)</label>
-                <input id="rebuildLoraRank" type="number" min="1" step="1" value="16" />
-              </div>
-              <div>
-                <label>poll timeout seconds</label>
-                <input id="rebuildPollTimeout" type="number" min="30" step="10" value="1800" />
-              </div>
-            </div>
-            <div class="topbar" style="margin-bottom:0">
-              <button class="btn danger" id="actorKillBtn">Kill Actor(s)</button>
-              <button class="btn warn" id="actorRebuildBtn">Rebuild Actor</button>
-            </div>
+            <div class="hint" style="margin-bottom:10px">Use the row actions below. Actor selection is driven by the live snapshot.</div>
             <pre class="result" id="actorResult">ready</pre>
-            <div class="table-wrap" style="margin-top:10px">
+            <div class="table-wrap deploy-table-wrap" style="margin-top:10px">
               <table>
-                <thead><tr><th>actor</th><th>type</th><th>model</th><th>gpu</th><th>creating</th><th>action</th></tr></thead>
+                <thead><tr><th>actor</th><th>type</th><th>model</th><th>gpu</th><th>status</th><th>action</th></tr></thead>
                 <tbody id="deployActorsBody"></tbody>
               </table>
             </div>
@@ -587,6 +504,14 @@
     function statusPill(text, kind) {
       const cls = kind || 'warn';
       return `<span class="pill ${cls}">${esc(text)}</span>`;
+    }
+    function deployStatusPill(actor) {
+      const status = String(actor && actor.ops_status || (actor && actor.creating ? 'creating' : 'unknown')).trim();
+      if (status === 'ready') return statusPill('ready', 'ok');
+      if (status === 'pending_pg') return statusPill('pending_pg', 'warn');
+      if (status === 'creating') return statusPill('creating', 'warn');
+      if (status === 'ray_not_alive') return statusPill('ray_not_alive', 'bad');
+      return statusPill(status || 'unknown', 'bad');
     }
     function pretty(obj) {
       try { return JSON.stringify(obj, null, 2); } catch (_) { return String(obj); }
@@ -691,59 +616,8 @@
       document.getElementById('readinessBody').innerHTML =
         rows.join('') || "<tr><td colspan='5'>all expected actors ready</td></tr>";
     }
-    function upsertRebuildModelOption(model, defaultKind) {
-      const sel = document.getElementById('rebuildModel');
-      if (!sel) return;
-      const m = String(model || '').trim();
-      if (!m) return;
-      const kind = String(defaultKind || 'training').trim() || 'training';
-      const options = Array.from(sel.options || []);
-      const exists = options.some((x) => String(x.value || '') === m);
-      if (exists) return;
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m;
-      opt.setAttribute('data-default-kind', kind);
-      sel.appendChild(opt);
-    }
-    function populateRebuildModelOptions(snap) {
-      const sel = document.getElementById('rebuildModel');
-      if (!sel) return;
-      const prev = String(sel.value || '').trim();
-      const options = asList(((snap.ops_ui || {}).rebuild_model_options));
-      sel.innerHTML = '';
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = options.length ? 'Select model...' : 'No model options';
-      placeholder.disabled = true;
-      placeholder.selected = true;
-      sel.appendChild(placeholder);
-
-      for (const item of options) {
-        const model = String(item.model || '').trim();
-        if (!model) continue;
-        const opt = document.createElement('option');
-        opt.value = model;
-        opt.textContent = model;
-        opt.setAttribute('data-default-kind', String(item.default_kind || 'training'));
-        sel.appendChild(opt);
-      }
-
-      if (prev) {
-        upsertRebuildModelOption(prev, 'training');
-        sel.value = prev;
-      } else if (options.length > 0) {
-        const first = String((options[0] || {}).model || '').trim();
-        if (first) sel.value = first;
-      }
-
-      if (sel.value) {
-        const selected = sel.selectedOptions && sel.selectedOptions[0];
-        const kind = selected ? String(selected.getAttribute('data-default-kind') || '') : '';
-        if (kind === 'vllm' || kind === 'training') {
-          document.getElementById('rebuildKind').value = kind;
-        }
-      }
+    function defaultRebuildKind(actorType) {
+      return String(actorType || '').trim() === 'vllm' ? 'vllm' : 'training';
     }
     function renderNodesTable(snap) {
       const nodes = asList((snap.ray || {}).nodes);
@@ -813,9 +687,9 @@
         <td>${esc(a.actor_type || '-')}</td>
         <td>${esc(a.base_model || '-')}</td>
         <td>${n(a.num_gpus)}</td>
-        <td>${a.creating ? 'yes' : 'no'}</td>
+        <td>${deployStatusPill(a)}</td>
         <td>
-          <button class="btn danger quick-kill" data-type="${esc(a.actor_type || '')}" data-model="${esc(a.base_model || '')}">kill</button>
+          <button class="btn danger quick-recycle" data-type="${esc(a.actor_type || '')}" data-model="${esc(a.base_model || '')}">recycle</button>
           <button class="btn warn quick-rebuild" data-type="${esc(a.actor_type || '')}" data-model="${esc(a.base_model || '')}">rebuild</button>
         </td>
       </tr>`);
@@ -826,7 +700,6 @@
       renderMeta(snap);
       renderCards(snap);
       renderReadiness(snap);
-      populateRebuildModelOptions(snap);
       renderNodesTable(snap);
       renderPgTable(snap);
       renderActorsTable(snap);
@@ -871,25 +744,11 @@
       const actors = asList((((state.snapshot || {}).http || {}).actors || {}).actors);
       return actors.find((x) => String(x.actor_name || '') === String(actorName || '')) || null;
     }
-    async function runPgRemove(apply) {
-      const names = parseCsv(document.getElementById('pgNames').value);
-      const state = String(document.getElementById('pgState').value || '');
-      const onlyGpu = !!document.getElementById('pgOnlyGpu').checked;
-      const payload = { names, state, only_gpu: onlyGpu, apply: !!apply };
-      setResult('pgResult', { status: 'running', payload });
-      try {
-        const data = await apiPost('/api/v1/deploy/pg/remove', payload);
-        setResult('pgResult', data);
-        await refreshSnapshot(true);
-      } catch (err) {
-        setResult('pgResult', { ok: false, error: String(err && err.message ? err.message : err) });
-      }
-    }
-    async function runActorKill(actorType, modelName) {
+    async function runActorRecycle(actorType, modelName) {
       const payload = { actor_type: actorType, model_name: modelName || '' };
       setResult('actorResult', { status: 'running', payload });
       try {
-        const data = await apiPost('/api/v1/deploy/actor/kill', payload);
+        const data = await apiPost('/api/v1/deploy/actor/recycle', payload);
         setResult('actorResult', data);
         await refreshSnapshot(true);
       } catch (err) {
@@ -905,8 +764,8 @@
       const payload = {
         kind: String(kind || 'training'),
         model,
-        lora_rank: Number(document.getElementById('rebuildLoraRank').value || '16'),
-        poll_timeout_s: Number(document.getElementById('rebuildPollTimeout').value || '1800'),
+        lora_rank: 16,
+        poll_timeout_s: 1800,
         poll_interval_s: 2.0,
         sample_ping: false,
       };
@@ -919,65 +778,22 @@
         setResult('actorResult', { ok: false, error: String(err && err.message ? err.message : err) });
       }
     }
-    async function runServerRestart() {
-      const cleanDirty = !!document.getElementById('restartCleanDirty').checked;
-      const waitS = Number(document.getElementById('restartWait').value || '60');
-      setResult('pgResult', { status: 'running', action: 'server restart', clean_dirty: cleanDirty, wait_healthz_s: waitS });
-      try {
-        const data = await apiPost('/api/v1/deploy/server/restart', {
-          clean_dirty: cleanDirty,
-          wait_healthz_s: waitS,
-        });
-        setResult('pgResult', data);
-        await refreshSnapshot(true);
-      } catch (err) {
-        setResult('pgResult', { ok: false, error: String(err && err.message ? err.message : err) });
-      }
-    }
     function bindActions() {
       document.getElementById('refreshBtn').addEventListener('click', () => refreshSnapshot(true));
-      document.getElementById('pgPreviewBtn').addEventListener('click', () => runPgRemove(false));
-      document.getElementById('pgApplyBtn').addEventListener('click', async () => {
-        if (!window.confirm('Apply placement group removal now?')) return;
-        await runPgRemove(true);
-      });
-      document.getElementById('serverRestartBtn').addEventListener('click', async () => {
-        if (!window.confirm('Restart tinker-server now?')) return;
-        await runServerRestart();
-      });
-      document.getElementById('actorKillBtn').addEventListener('click', async () => {
-        const actorType = String(document.getElementById('actorType').value || '').trim();
-        const model = String(document.getElementById('actorModel').value || '').trim();
-        if (!window.confirm(`Kill actor_type=${actorType}${model ? (' model=' + model) : ''} ?`)) return;
-        await runActorKill(actorType, model);
-      });
-      document.getElementById('actorRebuildBtn').addEventListener('click', async () => {
-        const kind = String(document.getElementById('rebuildKind').value || 'training').trim();
-        const model = String(document.getElementById('rebuildModel').value || '').trim();
-        if (!model) {
-          setResult('actorResult', { ok: false, error: 'rebuild model is required' });
-          return;
-        }
-        if (!window.confirm(`Rebuild ${kind} actor for model=${model} ?`)) return;
-        await runActorRebuild(kind, model);
-      });
       document.getElementById('deployActorsBody').addEventListener('click', async (ev) => {
         const target = ev.target;
         if (!target || !(target instanceof HTMLElement)) return;
         const actorType = String(target.getAttribute('data-type') || '').trim();
         const model = String(target.getAttribute('data-model') || '').trim();
-        if (target.classList.contains('quick-kill')) {
+        if (target.classList.contains('quick-recycle')) {
           if (!actorType) return;
-          if (!window.confirm(`Kill actor_type=${actorType} model=${model || '-'} ?`)) return;
-          await runActorKill(actorType, model);
+          if (!window.confirm(`Recycle actor_type=${actorType} model=${model || '-'} ? This also cleans matching PG.`)) return;
+          await runActorRecycle(actorType, model);
           return;
         }
         if (target.classList.contains('quick-rebuild')) {
           if (!model) return;
-          const kind = actorType === 'vllm' ? 'vllm' : 'training';
-          document.getElementById('rebuildKind').value = kind;
-          upsertRebuildModelOption(model, kind);
-          document.getElementById('rebuildModel').value = model;
+          const kind = defaultRebuildKind(actorType);
           if (!window.confirm(`Rebuild ${kind} actor for model=${model} ?`)) return;
           await runActorRebuild(kind, model);
         }
@@ -1009,15 +825,6 @@
         const backdrop = document.getElementById('detailModal');
         if (ev.target === backdrop) closeDetailModal();
       });
-      document.getElementById('rebuildModel').addEventListener('change', (ev) => {
-        const target = ev.target;
-        if (!target || !(target instanceof HTMLSelectElement)) return;
-        const selected = target.selectedOptions && target.selectedOptions[0];
-        const kind = selected ? String(selected.getAttribute('data-default-kind') || '') : '';
-        if (kind === 'vllm' || kind === 'training') {
-          document.getElementById('rebuildKind').value = kind;
-        }
-      });
       window.addEventListener('keydown', (ev) => {
         if (ev.key === 'Escape') closeDetailModal();
       });
@@ -1043,6 +850,12 @@
     attachTabs();
     bindActions();
     renderAll();
+    setHint('loading snapshot...');
+    setTimeout(() => {
+      refreshSnapshot(true).catch((err) => {
+        setHint('refresh failed: ' + (err && err.message ? err.message : String(err)));
+      });
+    }, 0);
   </script>
 </body>
 </html>

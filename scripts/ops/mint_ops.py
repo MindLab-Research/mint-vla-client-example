@@ -117,6 +117,11 @@ def _rewrite_or_append_output_flag(argv: list[str], flag: str, remote_path: str)
     return argv + [flag, remote_path]
 
 
+def _query_truthy(query: dict[str, list[str]], key: str) -> bool:
+    v = (query.get(key, [""])[0] or "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
 def _extract_port_from_tokens(tokens: list[str], flag: str) -> int | None:
     for i, tok in enumerate(tokens):
         if tok == flag and i + 1 < len(tokens):
@@ -263,6 +268,23 @@ def _serve_status_html(
     root_dir = html_path.parent
     html_name = html_path.name
 
+    def _load_snapshot_from_html() -> dict[str, Any]:
+        raw = html_path.read_text(encoding="utf-8")
+        marker_start = '<script id="initialSnapshot" type="application/json">'
+        marker_end = "</script>"
+        start = raw.find(marker_start)
+        if start < 0:
+            raise RuntimeError("initial snapshot marker not found in html report")
+        start += len(marker_start)
+        end = raw.find(marker_end, start)
+        if end < 0:
+            raise RuntimeError("initial snapshot closing marker not found in html report")
+        payload = raw[start:end]
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise RuntimeError("initial snapshot payload is not an object")
+        return data
+
     class _Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a: Any, **kw: Any) -> None:
             super().__init__(*a, directory=str(root_dir), **kw)
@@ -272,15 +294,63 @@ def _serve_status_html(
             super().end_headers()
 
         def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query)
             if self.path in ("/", ""):
                 self.send_response(302)
                 self.send_header("Location", f"/{html_name}")
                 self.end_headers()
                 return
+            if path in ("/healthz", "/api/v1/healthz"):
+                raw = json.dumps(
+                    {"ok": True, "service": "mint-ops-static", "now": dt.datetime.now(dt.timezone.utc).isoformat()},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            if path in ("/status.json", "/api/v1/status", "/api/v1/status.json"):
+                force_refresh = _query_truthy(query, "refresh")
+                if force_refresh and refresh_fn is not None:
+                    rc = int(refresh_fn())
+                    if rc != 0:
+                        raw = json.dumps(
+                            {"ok": False, "error": f"refresh failed rc={rc}"},
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
+                try:
+                    snap = _load_snapshot_from_html()
+                except Exception as e:
+                    raw = json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False).encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                fmt = (query.get("format", ["json"])[0] or "json").strip().lower()
+                if fmt == "json":
+                    raw = json.dumps(snap, ensure_ascii=False, indent=2).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
             return super().do_GET()
 
         def do_POST(self) -> None:
-            if self.path != "/refresh":
+            if self.path not in ("/refresh", "/api/v1/status/refresh"):
                 self.send_error(404, "Not Found")
                 return
             if refresh_fn is None:
@@ -354,6 +424,11 @@ def _serve_status_api(
     actor_limit = max(1, int(actor_limit))
     cache_ttl_s = max(0.0, float(cache_ttl_s))
 
+    def _cached_snapshot() -> dict[str, Any] | None:
+        with cache_lock:
+            cached = cache.get("snapshot")
+            return cached if isinstance(cached, dict) else None
+
     def _snapshot(force: bool) -> dict[str, Any]:
         now = time.time()
         with cache_lock:
@@ -367,10 +442,6 @@ def _serve_status_api(
             cache["snapshot"] = fresh
             cache["updated_ts"] = time.time()
         return fresh
-
-    def _query_truthy(query: dict[str, list[str]], key: str) -> bool:
-        v = (query.get(key, [""])[0] or "").strip().lower()
-        return v in {"1", "true", "yes", "y", "on"}
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         server_version = "MintOpsHTTP/1.0"
@@ -430,7 +501,7 @@ def _serve_status_api(
 
             if path in ("/status.html", "/status", "/api/v1/status.html"):
                 try:
-                    snap = _snapshot(force=force_refresh)
+                    snap = _snapshot(force=force_refresh) if force_refresh else (_cached_snapshot() or _bootstrap_snapshot())
                     html = _status_html(snap, actor_limit=actor_limit).encode("utf-8")
                     self._send_bytes(200, html, "text/html; charset=utf-8")
                 except Exception as e:
@@ -484,7 +555,7 @@ def _serve_status_api(
                     self._send_json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
                 return
 
-            if path in ("/api/v1/deploy/actor/kill",):
+            if path in ("/api/v1/deploy/actor/recycle", "/api/v1/deploy/actor/kill"):
                 try:
                     args = self._require_ops_args()
                     payload = self._read_json_body()
@@ -494,7 +565,7 @@ def _serve_status_api(
                         return
                     model_name_raw = payload.get("model_name", None)
                     model_name = str(model_name_raw).strip() if model_name_raw is not None else None
-                    data = _actor_kill_operation(args, actor_type=actor_type, model_name=model_name or None)
+                    data = _actor_recycle_operation(args, actor_type=actor_type, model_name=model_name or None)
                     self._send_json(200, {"ok": True, "result": data})
                 except ValueError as e:
                     self._send_json(400, {"ok": False, "error": str(e)})
@@ -610,7 +681,7 @@ def _serve_status_api(
     print("status page: /status.html")
     print("status api:  /api/v1/status?format=json|md|html")
     print(
-        "deploy api:  /api/v1/deploy/actor/kill | /api/v1/deploy/actor/rebuild | "
+        "deploy api:  /api/v1/deploy/actor/recycle | /api/v1/deploy/actor/rebuild | "
         "/api/v1/deploy/pg/remove | /api/v1/deploy/server/restart"
     )
     print("press Ctrl+C to stop")
@@ -673,9 +744,11 @@ def _maybe_exec_remote(args: argparse.Namespace) -> int | None:
                 local_html_out=Path(local_html_out) if local_html_out else None,
             )
 
-        rc = _refresh_remote()
-        if rc != 0:
-            return rc
+        Path(local_html_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(local_html_out).write_text(
+            _status_html(_bootstrap_snapshot(), actor_limit=max(1, args.actor_limit)),
+            encoding="utf-8",
+        )
 
         return _serve_status_html(
             html_path=Path(local_html_out),
@@ -805,8 +878,36 @@ def _http_json(
             return e.code, raw
 
 
+def _resolved_api_endpoint(args: argparse.Namespace) -> tuple[str, int]:
+    host = str(getattr(args, "api_host", "") or "").strip()
+    port = int(getattr(args, "port", 18000))
+
+    try:
+        proc = _pick_primary_server_process(args.program)
+    except Exception:
+        proc = None
+
+    proc_env = proc.get("env", {}) if isinstance(proc, dict) and isinstance(proc.get("env"), dict) else {}
+    proc_port_raw = str(proc_env.get("TINKER_PORT", "") or "").strip()
+    if proc_port_raw:
+        try:
+            port = int(proc_port_raw)
+        except ValueError:
+            pass
+
+    if not host:
+        proc_host = str(proc_env.get("TINKER_HOST", "") or "").strip()
+        if proc_host and proc_host not in {"0.0.0.0", "::", "[::]"}:
+            host = proc_host
+        else:
+            host = "127.0.0.1"
+
+    return host, port
+
+
 def _base_url(args: argparse.Namespace) -> str:
-    return f"http://localhost:{args.port}"
+    host, port = _resolved_api_endpoint(args)
+    return f"http://{host}:{port}"
 
 
 def _admin_headers(args: argparse.Namespace, *, required: bool) -> dict[str, str]:
@@ -1470,9 +1571,19 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     proc = _pick_primary_server_process(args.program)
     proc_env = proc.get("env", {}) if isinstance(proc.get("env", {}), dict) else {}
     key = _resolve_api_key(args, required=False)
+    api_host, api_port = _resolved_api_endpoint(args)
 
-    st_health, health_data = _api_healthz(args)
-    st_caps, caps_data = _api_capabilities(args)
+    try:
+        st_health, health_data = _api_healthz(args)
+    except Exception as e:
+        st_health = None
+        health_data = {"_error": repr(e)}
+
+    try:
+        st_caps, caps_data = _api_capabilities(args)
+    except Exception as e:
+        st_caps = None
+        caps_data = {"_error": repr(e)}
     actors_data: dict[str, Any] | str = {"_skipped": "no-auth"}
     if key:
         try:
@@ -1493,13 +1604,16 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     node_pg_gpu: defaultdict[str, float] = defaultdict(float)
     node_pg_names: defaultdict[str, list[str]] = defaultdict(list)
     pg_name_to_ips: dict[str, list[str]] = {}
+    pg_name_to_state: dict[str, str] = {}
     for pg in pgs:
         if pg["state"] == "REMOVED":
             continue
         pg_name = str(pg.get("name", "") or "")
+        pg_state = str(pg.get("state", "") or "").strip().upper()
         pg_ips = sorted([str(ip) for ip in (pg.get("node_distribution", {}) or {}).keys() if str(ip)])
         if pg_name:
             pg_name_to_ips[pg_name] = pg_ips
+            pg_name_to_state[pg_name] = pg_state
         for ip, info in pg["node_distribution"].items():
             gpu = float(info["gpu"])
             if gpu <= 0:
@@ -1510,10 +1624,14 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     managed_actors = actors_data.get("actors", []) if isinstance(actors_data, dict) else []
 
     actor_name_to_ips: defaultdict[str, set[str]] = defaultdict(set)
+    actor_name_to_ray_states: defaultdict[str, list[str]] = defaultdict(list)
     for a in actor_details.get("actors", []):
-        if str(a.get("state", "")).upper() != "ALIVE":
-            continue
         name = str(a.get("name") or "")
+        state = str(a.get("state", "") or "").strip().upper()
+        if name and state:
+            actor_name_to_ray_states[name].append(state)
+        if state != "ALIVE":
+            continue
         ip = str(a.get("ip") or "")
         if name and ip:
             actor_name_to_ips[name].add(ip)
@@ -1572,6 +1690,21 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     if not args.skip_machine_probe:
         probes = _collect_machine_probes(ray, nodes=nodes, timeout_s=args.timeout_s)
 
+    for m in managed_actors:
+        actor_name = str(m.get("actor_name") or "").strip()
+        pg_name = str(m.get("pg_name") or "").strip()
+        pg_state = pg_name_to_state.get(pg_name) if pg_name else None
+        ray_states = actor_name_to_ray_states.get(actor_name, [])
+        deploy_status, deploy_status_reason = _derive_managed_actor_status(
+            actor_payload=m,
+            pg_state=pg_state,
+            ray_states=ray_states,
+        )
+        m["ops_pg_state"] = pg_state
+        m["ops_ray_states"] = list(ray_states)
+        m["ops_status"] = deploy_status
+        m["ops_status_reason"] = deploy_status_reason
+
     actor_readiness = _compute_actor_readiness(proc_env=proc_env, managed_actors=managed_actors)
     rebuild_model_options = _build_rebuild_model_options(managed_actors=managed_actors)
     pending_pg_count = sum(1 for pg in pgs if pg["state"] == "PENDING")
@@ -1582,6 +1715,11 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "host": socket.gethostname(),
         "port": args.port,
         "ray_address": args.address,
+        "api_endpoint": {
+            "host": api_host,
+            "port": api_port,
+            "base_url": f"http://{api_host}:{api_port}",
+        },
         "server_process": {
             "pid": proc["pid"],
             "supervisor_process_name": proc["supervisor_process_name"],
@@ -1624,6 +1762,7 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             "managed_actor_counts_by_type": dict(managed_counts_by_type),
             "creating_actors": int(actor_readiness.get("counts", {}).get("creating_managed", 0)),
             "not_ready_expected_actors": int(actor_readiness.get("counts", {}).get("expected_not_ready", 0)),
+            "api_reachable": st_health is not None,
         },
     }
 
@@ -1772,6 +1911,46 @@ def _status_markdown(snapshot: dict[str, Any], *, actor_limit: int) -> str:
     lines.append("")
 
     return "\n".join(lines) + "\n"
+
+
+def _bootstrap_snapshot() -> dict[str, Any]:
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    return {
+        "generated_at_utc": now,
+        "host": "-",
+        "ray_address": "-",
+        "server_process": {},
+        "summary": {},
+        "http": {},
+        "ray": {},
+        "machine_probe": {},
+        "actor_readiness": {},
+        "ops_ui": {},
+        "bootstrap": True,
+    }
+
+
+def _derive_managed_actor_status(
+    *,
+    actor_payload: dict[str, Any],
+    pg_state: str | None,
+    ray_states: list[str],
+) -> tuple[str, str]:
+    actor_name = str(actor_payload.get("actor_name") or "").strip()
+    creating = bool(actor_payload.get("creating"))
+    normalized_ray_states = [str(x or "").strip().upper() for x in ray_states if str(x or "").strip()]
+    alive = any(x == "ALIVE" for x in normalized_ray_states)
+    pending = str(pg_state or "").strip().upper() == "PENDING"
+
+    if pending:
+        return "pending_pg", f"placement group pending for {actor_name or 'actor'}"
+    if creating:
+        return "creating", "resource pool marks actor as creating"
+    if alive:
+        return "ready", "ray actor alive"
+    if normalized_ray_states:
+        return "ray_not_alive", f"ray actor states={','.join(normalized_ray_states)}"
+    return "unknown", "actor tracked by resource pool but no alive ray actor observed"
 
 
 def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
@@ -1963,6 +2142,8 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
     }}
     .panel .body {{ padding: 12px 14px 14px; }}
     .table-wrap {{ overflow: auto; max-height: 440px; }}
+    .deploy-panel .body {{ padding-bottom: 18px; }}
+    .deploy-table-wrap {{ max-height: none; overflow: visible; }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -2106,7 +2287,7 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
     <main class="main">
       <div class="topbar">
         <button class="btn primary" id="refreshBtn">Refresh Snapshot</button>
-        <span class="hint" id="refreshHint">ready</span>
+        <span class="hint" id="refreshHint">loading snapshot...</span>
         <label class="check"><input type="checkbox" id="autoRefresh" /> auto refresh</label>
         <select id="autoRefreshSec" style="width:auto">
           <option value="5">5s</option>
@@ -2163,75 +2344,14 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
       </section>
 
       <section class="tab-panel" data-tab="deploy">
-        <div class="grid-2">
-          <div class="panel">
-            <h3>2.1 Node Scale</h3>
-            <div class="body">
-              <div class="todo">TODO: 节点增减（接 Volcano/Aliyun 集群生命周期接口）。当前版本先提供 Dashboard 可视化和 PG/Actor 运维操作。</div>
-            </div>
-          </div>
-          <div class="panel">
-            <h3>2.2 Placement Group</h3>
-            <div class="body">
-              <div class="form-row single">
-                <div>
-                  <label>PG names (comma separated, optional)</label>
-                  <input id="pgNames" placeholder="pg_a,pg_b" />
-                </div>
-              </div>
-              <div class="form-row">
-                <div>
-                  <label>state filter</label>
-                  <select id="pgState">
-                    <option value="">(none)</option>
-                    <option value="PENDING">PENDING</option>
-                    <option value="CREATED">CREATED</option>
-                  </select>
-                </div>
-                <div>
-                  <label>wait / restart flush</label>
-                  <input id="restartWait" type="number" min="10" step="1" value="60" />
-                </div>
-              </div>
-              <div class="checks">
-                <label class="check"><input id="pgOnlyGpu" type="checkbox" checked /> only GPU PG</label>
-                <label class="check"><input id="restartCleanDirty" type="checkbox" /> clean dirty run_server</label>
-              </div>
-              <div class="topbar" style="margin-bottom:0">
-                <button class="btn" id="pgPreviewBtn">Preview Remove</button>
-                <button class="btn warn" id="pgApplyBtn">Apply Remove</button>
-                <button class="btn" id="serverRestartBtn">Restart Server (flush config)</button>
-              </div>
-              <pre class="result" id="pgResult">ready</pre>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <h3>2.3 Actor Operations</h3>
+        <div class="panel deploy-panel">
+          <h3>Actor Operations</h3>
           <div class="body">
-            <div class="form-row">
-              <div>
-                <label>actor type</label>
-                <select id="actorType">
-                  <option value="vllm">vllm</option>
-                  <option value="megatron">megatron</option>
-                  <option value="dense">dense</option>
-                  <option value="all">all</option>
-                </select>
-              </div>
-              <div>
-                <label>model name (optional)</label>
-                <input id="actorModel" placeholder="Qwen/Qwen3-30B-A3B-Instruct-2507" />
-              </div>
-            </div>
-            <div class="topbar" style="margin-bottom:0">
-              <button class="btn danger" id="actorKillBtn">Kill Actor(s)</button>
-            </div>
+            <div class="hint" style="margin-bottom:10px">Use the row actions below. Actor selection is driven by the live snapshot.</div>
             <pre class="result" id="actorResult">ready</pre>
-            <div class="table-wrap" style="margin-top:10px">
+            <div class="table-wrap deploy-table-wrap" style="margin-top:10px">
               <table>
-                <thead><tr><th>actor</th><th>type</th><th>model</th><th>gpu</th><th>creating</th><th>action</th></tr></thead>
+                <thead><tr><th>actor</th><th>type</th><th>model</th><th>gpu</th><th>status</th><th>action</th></tr></thead>
                 <tbody id="deployActorsBody"></tbody>
               </table>
             </div>
@@ -2274,6 +2394,14 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
     function statusPill(text, kind) {{
       const cls = kind || 'warn';
       return `<span class="pill ${{cls}}">${{esc(text)}}</span>`;
+    }}
+    function deployStatusPill(actor) {{
+      const status = String(actor && actor.ops_status || (actor && actor.creating ? 'creating' : 'unknown')).trim();
+      if (status === 'ready') return statusPill('ready', 'ok');
+      if (status === 'pending_pg') return statusPill('pending_pg', 'warn');
+      if (status === 'creating') return statusPill('creating', 'warn');
+      if (status === 'ray_not_alive') return statusPill('ray_not_alive', 'bad');
+      return statusPill(status || 'unknown', 'bad');
     }}
     function pretty(obj) {{
       try {{ return JSON.stringify(obj, null, 2); }} catch (_) {{ return String(obj); }}
@@ -2391,10 +2519,16 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
         <td>${{esc(a.actor_type || '-')}}</td>
         <td>${{esc(a.base_model || '-')}}</td>
         <td>${{n(a.num_gpus)}}</td>
-        <td>${{a.creating ? 'yes' : 'no'}}</td>
-        <td><button class="btn danger quick-kill" data-type="${{esc(a.actor_type || '')}}" data-model="${{esc(a.base_model || '')}}">kill</button></td>
+        <td>${{deployStatusPill(a)}}</td>
+        <td>
+          <button class="btn danger quick-recycle" data-type="${{esc(a.actor_type || '')}}" data-model="${{esc(a.base_model || '')}}">recycle</button>
+          <button class="btn warn quick-rebuild" data-type="${{esc(a.actor_type || '')}}" data-model="${{esc(a.base_model || '')}}">rebuild</button>
+        </td>
       </tr>`);
       document.getElementById('deployActorsBody').innerHTML = deployRows.join('') || "<tr><td colspan='6'>no managed actors</td></tr>";
+    }}
+    function defaultRebuildKind(actorType) {{
+      return String(actorType || '').trim() === 'vllm' ? 'vllm' : 'training';
     }}
     function renderAll() {{
       const snap = state.snapshot || {{}};
@@ -2428,72 +2562,59 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
     function setResult(id, data) {{
       document.getElementById(id).textContent = pretty(data);
     }}
-    async function runPgRemove(apply) {{
-      const names = parseCsv(document.getElementById('pgNames').value);
-      const state = String(document.getElementById('pgState').value || '');
-      const onlyGpu = !!document.getElementById('pgOnlyGpu').checked;
-      const payload = {{ names, state, only_gpu: onlyGpu, apply: !!apply }};
-      setResult('pgResult', {{ status: 'running', payload }});
-      try {{
-        const data = await apiPost('/api/v1/deploy/pg/remove', payload);
-        setResult('pgResult', data);
-        await refreshSnapshot(true);
-      }} catch (err) {{
-        setResult('pgResult', {{ ok: false, error: String(err && err.message ? err.message : err) }});
-      }}
-    }}
-    async function runActorKill(actorType, modelName) {{
+    async function runActorRecycle(actorType, modelName) {{
       const payload = {{ actor_type: actorType, model_name: modelName || '' }};
       setResult('actorResult', {{ status: 'running', payload }});
       try {{
-        const data = await apiPost('/api/v1/deploy/actor/kill', payload);
+        const data = await apiPost('/api/v1/deploy/actor/recycle', payload);
         setResult('actorResult', data);
         await refreshSnapshot(true);
       }} catch (err) {{
         setResult('actorResult', {{ ok: false, error: String(err && err.message ? err.message : err) }});
       }}
     }}
-    async function runServerRestart() {{
-      const cleanDirty = !!document.getElementById('restartCleanDirty').checked;
-      const waitS = Number(document.getElementById('restartWait').value || '60');
-      setResult('pgResult', {{ status: 'running', action: 'server restart', clean_dirty: cleanDirty, wait_healthz_s: waitS }});
+    async function runActorRebuild(kind, modelName) {{
+      const model = String(modelName || '').trim();
+      if (!model) {{
+        setResult('actorResult', {{ ok: false, error: 'model is required for rebuild' }});
+        return;
+      }}
+      const payload = {{
+        kind: String(kind || 'training'),
+        model,
+        lora_rank: 16,
+        poll_timeout_s: 1800,
+        poll_interval_s: 2.0,
+        sample_ping: false,
+      }};
+      setResult('actorResult', {{ status: 'running', payload }});
       try {{
-        const data = await apiPost('/api/v1/deploy/server/restart', {{
-          clean_dirty: cleanDirty,
-          wait_healthz_s: waitS,
-        }});
-        setResult('pgResult', data);
+        const data = await apiPost('/api/v1/deploy/actor/rebuild', payload);
+        setResult('actorResult', data);
         await refreshSnapshot(true);
       }} catch (err) {{
-        setResult('pgResult', {{ ok: false, error: String(err && err.message ? err.message : err) }});
+        setResult('actorResult', {{ ok: false, error: String(err && err.message ? err.message : err) }});
       }}
     }}
     function bindActions() {{
       document.getElementById('refreshBtn').addEventListener('click', () => refreshSnapshot(true));
-      document.getElementById('pgPreviewBtn').addEventListener('click', () => runPgRemove(false));
-      document.getElementById('pgApplyBtn').addEventListener('click', async () => {{
-        if (!window.confirm('Apply placement group removal now?')) return;
-        await runPgRemove(true);
-      }});
-      document.getElementById('serverRestartBtn').addEventListener('click', async () => {{
-        if (!window.confirm('Restart tinker-server now?')) return;
-        await runServerRestart();
-      }});
-      document.getElementById('actorKillBtn').addEventListener('click', async () => {{
-        const actorType = String(document.getElementById('actorType').value || '').trim();
-        const model = String(document.getElementById('actorModel').value || '').trim();
-        if (!window.confirm(`Kill actor_type=${{actorType}}${{model ? (' model=' + model) : ''}} ?`)) return;
-        await runActorKill(actorType, model);
-      }});
       document.getElementById('deployActorsBody').addEventListener('click', async (ev) => {{
         const target = ev.target;
         if (!target || !(target instanceof HTMLElement)) return;
-        if (!target.classList.contains('quick-kill')) return;
         const actorType = String(target.getAttribute('data-type') || '').trim();
         const model = String(target.getAttribute('data-model') || '').trim();
-        if (!actorType) return;
-        if (!window.confirm(`Kill actor_type=${{actorType}} model=${{model || '-'}} ?`)) return;
-        await runActorKill(actorType, model);
+        if (target.classList.contains('quick-recycle')) {{
+          if (!actorType) return;
+          if (!window.confirm(`Recycle actor_type=${{actorType}} model=${{model || '-'}} ? This also cleans matching PG.`)) return;
+          await runActorRecycle(actorType, model);
+          return;
+        }}
+        if (target.classList.contains('quick-rebuild')) {{
+          if (!model) return;
+          const kind = defaultRebuildKind(actorType);
+          if (!window.confirm(`Rebuild ${{kind}} actor for model=${{model}} ?`)) return;
+          await runActorRebuild(kind, model);
+        }}
       }});
 
       function resetAutoTimer() {{
@@ -2517,6 +2638,12 @@ def _status_html(snapshot: dict[str, Any], *, actor_limit: int) -> str:
     attachTabs();
     bindActions();
     renderAll();
+    setHint('loading snapshot...');
+    setTimeout(() => {{
+      refreshSnapshot(true).catch((err) => {{
+        setHint('refresh failed: ' + (err && err.message ? err.message : String(err)));
+      }});
+    }}, 0);
   </script>
 </body>
 </html>
@@ -2550,13 +2677,6 @@ def _write_status_outputs(
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    snap = _status_snapshot(args)
-    md, _html_report = _write_status_outputs(args=args, snapshot=snap, print_messages=True)
-    if not args.md_out and not args.html_out and not args.serve:
-        print(md)
-    if args.json:
-        print(json.dumps(snap, ensure_ascii=False, indent=2))
-
     if args.serve:
         if args.html_out is None:
             return _serve_status_api(
@@ -2568,6 +2688,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 ops_args=args,
                 kill_stale_ops=bool(args.kill_stale_ops),
             )
+
+        Path(args.html_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.html_out).write_text(
+            _status_html(_bootstrap_snapshot(), actor_limit=max(1, args.actor_limit)),
+            encoding="utf-8",
+        )
 
         def _refresh_local() -> int:
             try:
@@ -2584,6 +2710,23 @@ def _cmd_status(args: argparse.Namespace) -> int:
             refresh_fn=_refresh_local,
             kill_stale_ops=bool(args.kill_stale_ops),
         )
+
+    snap = _status_snapshot(args)
+    api_endpoint = snap.get("api_endpoint", {}) if isinstance(snap, dict) else {}
+    healthz_status = ((snap.get("http", {}) if isinstance(snap, dict) else {}).get("healthz_status"))
+    healthz_body = ((snap.get("http", {}) if isinstance(snap, dict) else {}).get("healthz"))
+    if healthz_status is None:
+        print(
+            "warning: tinker-server healthz unreachable at "
+            f"{api_endpoint.get('base_url', _base_url(args))}; "
+            f"serving degraded snapshot with error={healthz_body!r}"
+        )
+    md, _html_report = _write_status_outputs(args=args, snapshot=snap, print_messages=True)
+    if not args.md_out and not args.html_out and not args.serve:
+        print(md)
+    if args.json:
+        print(json.dumps(snap, ensure_ascii=False, indent=2))
+
     return 0
 
 
@@ -2672,7 +2815,7 @@ def _server_restart_operation(
     }
 
 
-def _actor_kill_operation(
+def _actor_recycle_operation(
     args: argparse.Namespace,
     *,
     actor_type: str,
@@ -2690,7 +2833,11 @@ def _actor_kill_operation(
     )
     if st != 200 or not isinstance(data, dict):
         raise RuntimeError(f"POST /actors/kill failed status={st} body={data!r}")
-    return data
+    return {
+        **data,
+        "action": "recycle_actor",
+        "note": "recycle actor also cleans the actor's placement group when backend supports actor_name_pg cleanup",
+    }
 
 
 def _actor_rebuild_operation(
@@ -2837,8 +2984,8 @@ def _cmd_actor_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_actor_kill(args: argparse.Namespace) -> int:
-    data = _actor_kill_operation(
+def _cmd_actor_recycle(args: argparse.Namespace) -> int:
+    data = _actor_recycle_operation(
         args,
         actor_type=str(args.actor_type),
         model_name=str(args.model_name) if args.model_name else None,
@@ -2961,6 +3108,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Mint unified ops CLI")
     p.add_argument("--host", default=None, help="SSH host to run command remotely")
     p.add_argument("--remote-python", default=DEFAULT_REMOTE_PYTHON, help="Remote python path for --host mode")
+    p.add_argument("--api-host", default=None, help="Override tinker-server HTTP host (default: infer from run_server env, else 127.0.0.1)")
     p.add_argument("--port", type=int, default=18000, help="tinker-server API port")
     p.add_argument("--address", default="auto", help="Ray address")
     p.add_argument("--timeout-s", type=float, default=20.0, help="HTTP/RPC timeout")
@@ -3031,10 +3179,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model-name", default=None, help="Filter base model")
     sp.set_defaults(func=_cmd_actor_list)
 
-    sp = sub.add_parser("actor-kill", help="Kill managed actors via /api/v1/actors/kill")
+    sp = sub.add_parser("actor-recycle", help="Recycle managed actors via /api/v1/actors/kill (actor + matching PG cleanup)")
     sp.add_argument("--actor-type", required=True, choices=["vllm", "megatron", "dense", "all"], help="Actor type")
     sp.add_argument("--model-name", default=None, help="Optional model_name filter")
-    sp.set_defaults(func=_cmd_actor_kill)
+    sp.set_defaults(func=_cmd_actor_recycle)
+
+    sp = sub.add_parser("actor-kill", help="Legacy alias of actor-recycle")
+    sp.add_argument("--actor-type", required=True, choices=["vllm", "megatron", "dense", "all"], help="Actor type")
+    sp.add_argument("--model-name", default=None, help="Optional model_name filter")
+    sp.set_defaults(func=_cmd_actor_recycle)
 
     sp = sub.add_parser("actor-rebuild", help="Rebuild actor by forcing API creation path")
     sp.add_argument("--kind", choices=["vllm", "training"], default="vllm", help="Creation path kind")

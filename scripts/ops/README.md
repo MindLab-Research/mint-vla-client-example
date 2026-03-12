@@ -40,6 +40,10 @@ python scripts/ops/mint_ops.py --host mint-prod-volcano status \
 # open http://127.0.0.1:8765/status.html
 # default auto-cleans stale mint_ops on same port before bind (disable with --no-kill-stale-ops)
 
+# If tinker-server is not reachable via 127.0.0.1 on the remote host, pin the API host explicitly:
+python scripts/ops/mint_ops.py --host mint-prod-volcano --api-host 192.168.47.239 status \
+  --serve --direct --serve-port 8765
+
 # 1f) Dedicated ops HTTP server (status html/json/md + refresh endpoint)
 python scripts/ops/mint_ops.py ops-server --server-port 8765
 # curl http://127.0.0.1:8765/api/v1/status?format=json
@@ -52,7 +56,7 @@ python scripts/ops/mint_ops.py --host mint-prod-volcano server-restart --clean-d
 
 # 3) Actor operations
 python scripts/ops/mint_ops.py --host mint-prod-volcano actor-list
-python scripts/ops/mint_ops.py --host mint-prod-volcano actor-kill --actor-type vllm --model-name Qwen/Qwen3-30B-A3B-Instruct-2507
+python scripts/ops/mint_ops.py --host mint-prod-volcano actor-recycle --actor-type vllm --model-name Qwen/Qwen3-30B-A3B-Instruct-2507
 python scripts/ops/mint_ops.py --host mint-prod-volcano actor-rebuild --kind vllm --model Qwen/Qwen3-30B-A3B-Instruct-2507 --sample-ping
 
 # 4) Placement groups
@@ -78,7 +82,7 @@ python scripts/ops/mint_ops.py --host mint-prod-volcano verify --sampling-model 
 2. `Deploy`
    - `2.1 Node Scale`: TODO placeholder
    - `2.2 Placement Group`: preview/remove PG + restart server to flush config
-   - `2.3 Actor`: kill by actor type/model and quick-kill from actor table
+   - `2.3 Actor`: recycle by actor type/model and quick-recycle from actor table
    - `Rebuild Actor` model selector is a dropdown from repo model registry + current managed actors (no manual free-text needed)
 3. `Cronjob`
    - TODO placeholder
@@ -93,7 +97,7 @@ curl http://127.0.0.1:8765/api/v1/status?format=html
 curl -X POST http://127.0.0.1:8765/api/v1/status/refresh
 
 # deploy actions
-curl -X POST http://127.0.0.1:8765/api/v1/deploy/actor/kill \
+curl -X POST http://127.0.0.1:8765/api/v1/deploy/actor/recycle \
   -H 'Content-Type: application/json' \
   -d '{"actor_type":"vllm","model_name":"Qwen/Qwen3-30B-A3B-Instruct-2507"}'
 
