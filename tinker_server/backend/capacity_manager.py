@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import config as server_config
+from ..config import config as server_config, otel_env_vars
 
 
 class CapacityManagerUnavailableError(RuntimeError):
@@ -185,8 +185,17 @@ def _get_or_create_ray_actor():
             self._object_store_released.discard(request_id)
             return {"ok": True}
 
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": _ray_namespace(),
+        "lifetime": "detached",
+        "get_if_exists": True,
+    }
+    actor_otel_env = otel_env_vars()
+    if actor_otel_env:
+        options["runtime_env"] = {"env_vars": actor_otel_env}
     return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
-        name=actor_name, namespace=_ray_namespace(), lifetime="detached", get_if_exists=True
+        **options
     ).remote(queue_bytes_budget=queue_bytes_budget)
 
 

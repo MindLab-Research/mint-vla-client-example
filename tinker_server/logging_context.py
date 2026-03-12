@@ -11,6 +11,7 @@ Environment Variables:
     OTEL_METRIC_EXPORT_INTERVAL_MS: metrics export interval (default: 60000)
     OTEL_LOG_LEVEL: OTLP log handler level (default: INFO)
     MINT_APMPLUS_APP_KEY: optional shortcut for x-byteapm-appkey header
+    OTEL_APMPLUS_APP_KEY: legacy alias for MINT_APMPLUS_APP_KEY
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ import socket
 import sys
 import threading
 import uuid
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from typing import Any, TypeVar
 
 try:
     import structlog
@@ -48,6 +51,7 @@ _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
 _ACTOR_OBS_LOCK = threading.Lock()
+_T = TypeVar("_T")
 
 
 def _detect_hostname() -> str:
@@ -153,6 +157,27 @@ def _get_current_otel_trace_id() -> str | None:
         return None
 
 
+def get_current_traceparent() -> str | None:
+    """Return current W3C traceparent from active OTel span context."""
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        if span is None:
+            return None
+        span_context = span.get_span_context()
+        if not bool(getattr(span_context, "is_valid", False)):
+            return None
+        trace_id = int(getattr(span_context, "trace_id", 0))
+        span_id = int(getattr(span_context, "span_id", 0))
+        if trace_id == 0 or span_id == 0:
+            return None
+        flags = int(getattr(span_context, "trace_flags", 1))
+        return f"00-{trace_id:032x}-{span_id:016x}-{flags:02x}"
+    except Exception:
+        return None
+
+
 def extract_trace_id_from_traceparent(traceparent: str | None) -> str | None:
     """Extract trace_id from W3C traceparent header."""
     if not traceparent:
@@ -161,6 +186,13 @@ def extract_trace_id_from_traceparent(traceparent: str | None) -> str | None:
     if len(parts) != 4:
         return None
     return _normalize_trace_id(parts[1])
+
+
+def restore_trace_id_from_traceparent(traceparent: str | None) -> str | None:
+    """Restore trace_id context from W3C traceparent header."""
+    trace_id = extract_trace_id_from_traceparent(traceparent)
+    set_trace_id(trace_id)
+    return trace_id
 
 
 def ensure_trace_id(preferred_trace_id: str | None = None) -> str:
@@ -177,6 +209,89 @@ def ensure_trace_id(preferred_trace_id: str | None = None) -> str:
         trace_id = generate_trace_id()
     set_trace_id(trace_id)
     return trace_id
+
+
+def _normalize_context_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized == "-":
+        return None
+    return normalized
+
+
+@contextmanager
+def bind_request_trace_context(
+    *,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+) -> Iterator[None]:
+    """Temporarily bind request/trace IDs and restore previous context on exit."""
+    prev_request_id = get_request_id()
+    prev_trace_id = get_trace_id()
+    set_request_id(_normalize_context_id(request_id))
+    set_trace_id(_normalize_context_id(trace_id))
+    try:
+        yield
+    finally:
+        set_request_id(prev_request_id)
+        set_trace_id(prev_trace_id)
+
+
+def log_with_bound_context(
+    logger: logging.Logger,
+    message: str,
+    *,
+    request_id: str | None = None,
+    trace_id: str | None = None,
+    level: int = logging.INFO,
+) -> None:
+    """Emit one log line with explicit request/trace context."""
+    with bind_request_trace_context(request_id=request_id, trace_id=trace_id):
+        logger.log(int(level), message)
+
+
+async def run_async_with_otel_span(
+    span_name: str,
+    action: Callable[[], Awaitable[_T]],
+    *,
+    component: str | None = None,
+    op: str | None = None,
+    request_id: str | None = None,
+    attributes: dict[str, Any] | None = None,
+    context: Any | None = None,
+) -> _T:
+    """Run async action inside an OTEL span when tracer is available."""
+    tracer = get_otel_tracer()
+    if tracer is None:
+        return await action()
+
+    try:
+        from opentelemetry.trace import SpanKind, Status, StatusCode
+    except Exception:
+        return await action()
+
+    with tracer.start_as_current_span(str(span_name), kind=SpanKind.INTERNAL, context=context) as span:
+        if component:
+            span.set_attribute("component", str(component))
+        if op:
+            span.set_attribute("op", str(op))
+        if request_id:
+            span.set_attribute("request_id", str(request_id))
+        if attributes:
+            for key, value in attributes.items():
+                if value is None:
+                    continue
+                try:
+                    span.set_attribute(str(key), value)
+                except Exception:
+                    span.set_attribute(str(key), str(value))
+        try:
+            return await action()
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
 
 
 def add_request_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
@@ -300,7 +415,11 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     # Use explicit resource attributes only; avoid default detector payloads.
     resource = Resource(attributes={"service.name": service_name})
     headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
-    app_key = (os.getenv("MINT_APMPLUS_APP_KEY") or "").strip()
+    app_key = (
+        os.getenv("MINT_APMPLUS_APP_KEY")
+        or os.getenv("OTEL_APMPLUS_APP_KEY")
+        or ""
+    ).strip()
     if app_key and "x-byteapm-appkey" not in headers:
         headers["x-byteapm-appkey"] = app_key
     insecure = _parse_bool_env("OTEL_EXPORTER_OTLP_INSECURE", default=True)
@@ -557,6 +676,8 @@ def init_actor_observability() -> None:
             get_otel_tracer() is not None,
             bool((os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()),
             bool((os.getenv("OTEL_EXPORTER_OTLP_HEADERS") or "").strip()),
-            bool((os.getenv("MINT_APMPLUS_APP_KEY") or "").strip()),
+            bool(
+                (os.getenv("MINT_APMPLUS_APP_KEY") or os.getenv("OTEL_APMPLUS_APP_KEY") or "").strip()
+            ),
         )
         _ACTOR_OBS_INITIALIZED = True
