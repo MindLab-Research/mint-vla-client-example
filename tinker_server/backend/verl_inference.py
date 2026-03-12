@@ -307,7 +307,11 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
-from tinker_server.logging_context import init_actor_observability
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+)
 from tinker_server.ray_utils import init_ray
 
 # Import model registry
@@ -463,6 +467,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "last_progress_at": time.time(),
             }
 
+        def _bind_traceparent(self, traceparent: str | None) -> None:
+            if isinstance(traceparent, str) and traceparent:
+                restore_trace_id_from_traceparent(traceparent)
+
         async def _update_progress(
             self,
             *,
@@ -604,6 +612,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             state_dict: dict,
             peft_config: dict,
+            traceparent: str | None = None,
         ) -> str:
             """Add LoRA from tensors by saving to temp dir on worker node.
 
@@ -618,6 +627,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Path where adapter was saved on worker node.
             """
+            self._bind_traceparent(traceparent)
             import json
             import os
             import tempfile
@@ -677,6 +687,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             lora_int_id: int,
             state_dict: dict,
             peft_config: dict,
+            traceparent: str | None = None,
         ) -> str:
             """Add LoRA from tensors with specific lora_int_id.
 
@@ -691,6 +702,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Path where adapter was saved on worker node.
             """
+            self._bind_traceparent(traceparent)
             import json
             import os
             import tempfile
@@ -751,6 +763,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             lora_int_id: int,
             lora_path: str,
             lora_name: str,
+            traceparent: str | None = None,
         ) -> None:
             """Add LoRA from filesystem path with specific lora_int_id.
 
@@ -763,6 +776,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 lora_path: Path to PEFT adapter directory.
                 lora_name: Human-readable name for the adapter.
             """
+            self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
 
             debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
@@ -797,6 +811,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_p: float = 1.0,
             logprobs: bool = True,
             n: int = 1,
+            traceparent: str | None = None,
         ) -> dict | list[dict]:
             """Generate with a specific LoRA adapter.
 
@@ -816,6 +831,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1059,6 +1075,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_p: float = 1.0,
             logprobs: bool = True,
             n: int = 1,
+            traceparent: str | None = None,
         ) -> dict | list[dict]:
             """Generate using base model without any LoRA adapter.
 
@@ -1077,6 +1094,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from .vllm_stop import vllm_stop_kwargs
@@ -1303,12 +1321,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             sampling_params: dict,
             request_id: str,
             image_data: list | None = None,
+            traceparent: str | None = None,
         ):
             """Generate with user's max_tokens respected.
 
             Override of verl's generate() which ignores user's max_tokens.
             Uses min(user_max_tokens, max_model_len - prompt_len).
             """
+            self._bind_traceparent(traceparent)
             from typing import Optional
 
             from vllm import SamplingParams
@@ -1398,6 +1418,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             prompt_ids: list[int],
             request_id: str,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs for each token in the prompt.
 
@@ -1412,6 +1433,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of logprobs, length = len(prompt_ids).
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1570,6 +1592,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             lora_int_id: int,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs with specific LoRA adapter.
 
@@ -1583,6 +1606,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of logprobs, length = len(prompt_ids).
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1649,6 +1673,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             request_id: str,
             lora_int_id: int,
             k: int = 10,
+            traceparent: str | None = None,
         ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens with specific LoRA adapter.
 
@@ -1665,6 +1690,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of per-position top-k lists.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1727,6 +1753,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             prompt_ids: list[int],
             request_id: str,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs using base model without any LoRA adapter.
 
@@ -1739,6 +1766,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of logprobs, length = len(prompt_ids).
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
 
@@ -1790,6 +1818,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
+            traceparent: str | None = None,
         ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens using base model without any LoRA adapter.
 
@@ -1803,6 +1832,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of per-position top-k lists.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
 
@@ -2232,12 +2262,14 @@ class VerlInferenceEngine:
             "logprobs": logprobs,
         }
         sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]))
+        traceparent = get_current_traceparent()
 
         # Call the Ray actor's generate method
         result = await self.server.generate.remote(
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             request_id=request_id,
+            traceparent=traceparent,
         )
 
         return GenerateResult(
@@ -2270,10 +2302,12 @@ class VerlInferenceEngine:
         """
         if not self._initialized:
             await self.initialize()
+        traceparent = get_current_traceparent()
 
         result = await self.server.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
+            traceparent=traceparent,
         )
         return list(result)
 
@@ -2303,10 +2337,15 @@ class VerlInferenceEngine:
         state_dict = load_file(weights_path)
         with open(config_path, "r") as f:
             peft_config = json.load(f)
+        traceparent = get_current_traceparent()
 
         # Pass tensors via Ray to inference worker, which saves locally and loads
         # This handles distributed deployments where nodes have different filesystems
-        worker_path = await self.server.add_lora_from_tensors.remote(state_dict, peft_config)
+        worker_path = await self.server.add_lora_from_tensors.remote(
+            state_dict,
+            peft_config,
+            traceparent=traceparent,
+        )
 
         logger.info(f"Hot-loaded LoRA adapter (API: {adapter_path} -> Worker: {worker_path})")
 

@@ -174,6 +174,12 @@ def otel_env_vars() -> dict[str, str]:
         v = _env_nonempty(os.environ, k)
         if v is not None:
             out[k] = v
+    # Support legacy alias used by some deployments' .env files.
+    app_key = _env_nonempty(os.environ, "MINT_APMPLUS_APP_KEY") or _env_nonempty(
+        os.environ, "OTEL_APMPLUS_APP_KEY"
+    )
+    if app_key is not None:
+        out["MINT_APMPLUS_APP_KEY"] = app_key
     return out
 
 # When false (default), reject requests for base_model not in list_supported_models().

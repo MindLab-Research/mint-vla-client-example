@@ -27,7 +27,11 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
-from ..logging_context import get_request_id, init_actor_observability
+from ..logging_context import (
+    get_request_id,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +274,10 @@ class MegatronRankWorker:
         rss_pages = int(parts[1])
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
+
+    def _bind_traceparent(self, traceparent: str | None) -> None:
+        if isinstance(traceparent, str) and traceparent:
+            restore_trace_id_from_traceparent(traceparent)
 
     def log_memory_breakdown(self, phase: str) -> dict:
         """Log detailed GPU memory breakdown for profiling.
@@ -1193,7 +1201,7 @@ class MegatronRankWorker:
             import traceback
             logger.warning(f"[Rank {self.rank}] Warmup traceback: {traceback.format_exc()}")
 
-    def reset_expert_bias(self) -> dict:
+    def reset_expert_bias(self, traceparent: str | None = None) -> dict:
         """Reset expert_bias buffers to zero in all MoE router modules.
 
         The expert_bias buffer accumulates during training (via finalize_model_grads)
@@ -1213,6 +1221,8 @@ class MegatronRankWorker:
         import torch
         import sys
         import time
+
+        self._bind_traceparent(traceparent)
 
         # DEBUG: Write to stderr (should appear in Ray logs)
         print(f"[DEBUG {time.strftime('%H:%M:%S')}] reset_expert_bias ENTRY, rank={self.rank}", file=sys.stderr, flush=True)
@@ -1303,6 +1313,7 @@ class MegatronRankWorker:
         rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Run forward and backward pass on this rank's shard.
 
@@ -1327,6 +1338,7 @@ class MegatronRankWorker:
             create_sft_loss_fn, create_ppo_loss_fn, tinker_to_tensordict
         )
 
+        self._bind_traceparent(traceparent)
         reset_bias = self._resolve_reset_bias(reset_bias, default=False)
         output_rank = self._is_output_rank()
 
@@ -1334,7 +1346,7 @@ class MegatronRankWorker:
         # expert_bias accumulates during training but isn't exported to vLLM
         # Reset ensures Megatron routing matches vLLM routing for correct KL calculation
         if reset_bias:
-            self.reset_expert_bias()
+            self.reset_expert_bias(traceparent=traceparent)
 
         # Session state swap moved inside train_mode() - see below
 
@@ -1644,6 +1656,7 @@ class MegatronRankWorker:
         self,
         data_items: list[dict],
         reset_bias: bool | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Run forward pass only (no backward). Returns per-token logprobs.
 
@@ -1666,6 +1679,7 @@ class MegatronRankWorker:
         import torch
         from tinker_server.backend.megatron_training import tinker_to_tensordict
 
+        self._bind_traceparent(traceparent)
         reset_bias = self._resolve_reset_bias(reset_bias, default=True)
         output_rank = self._is_output_rank()
 
@@ -1673,7 +1687,7 @@ class MegatronRankWorker:
         # expert_bias accumulates during training but isn't exported to vLLM
         # Reset ensures Megatron routing matches vLLM routing
         if reset_bias:
-            self.reset_expert_bias()
+            self.reset_expert_bias(traceparent=traceparent)
 
         seq_lengths: list[int] = []
         for item_index, item in enumerate(data_items):
@@ -1814,6 +1828,7 @@ class MegatronRankWorker:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Run optimizer step (synchronized across ranks).
 
@@ -1825,6 +1840,7 @@ class MegatronRankWorker:
         BEFORE forward_backward/optim_step. This method only needs to restore
         this session's cached gradients from the most recent forward_backward.
         """
+        self._bind_traceparent(traceparent)
         train_attn = True if train_attn is None else bool(train_attn)
         train_mlp = True if train_mlp is None else bool(train_mlp)
         train_unembed = True if train_unembed is None else bool(train_unembed)
@@ -3295,6 +3311,7 @@ class MegatronRankWorker:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.
 
@@ -3315,6 +3332,7 @@ class MegatronRankWorker:
         Returns:
             dict with status and count of reinitialized parameters.
         """
+        self._bind_traceparent(traceparent)
         import torch.nn.init as init
         from megatron.core.optimizer import ChainedOptimizer
 
@@ -3630,6 +3648,7 @@ class MegatronRankWorker:
         step_count: int = 0,
         actual_rank: int | None = None,
         use_per_expert_lora: bool = False,
+        traceparent: str | None = None,
     ) -> dict:
         """Save checkpoint: LoRA weights + config + training metadata.
 
@@ -3646,6 +3665,7 @@ class MegatronRankWorker:
         Returns:
             Dict with training metadata (rank 0 only, others return empty).
         """
+        self._bind_traceparent(traceparent)
         import json
         import os
         import torch
@@ -3666,6 +3686,7 @@ class MegatronRankWorker:
             checkpoint_path=save_path,
             actual_rank=effective_rank,
             trainer_rank=self.lora_rank,
+            traceparent=traceparent,
         )
 
         # Save per-rank optimizer shard (distributed optimizer state lives on each rank).
@@ -3734,6 +3755,7 @@ class MegatronRankWorker:
         step_count: int = 0,
         actual_rank: int | None = None,
         use_per_expert_lora: bool = False,
+        traceparent: str | None = None,
     ) -> dict:
         """Save LoRA weights in PEFT format for sampling (no optimizer/resume artifacts).
 
@@ -3741,6 +3763,7 @@ class MegatronRankWorker:
         It intentionally avoids saving per-rank adapter shards and optimizer shards, because those
         are not required for sampling and can exceed memory/time budgets on large MoE models.
         """
+        self._bind_traceparent(traceparent)
         import json
         import os
 
@@ -3795,8 +3818,9 @@ class MegatronRankWorker:
         logger.info(f"[MegatronRankWorker] Saved LoRA weights to {abs_path} (step={step_count})")
         return meta
 
-    def load_optimizer_state(self, checkpoint_path: str) -> dict:
+    def load_optimizer_state(self, checkpoint_path: str, traceparent: str | None = None) -> dict:
         """Load per-rank optimizer shard from disk (if present)."""
+        self._bind_traceparent(traceparent)
         import os
 
         import torch
@@ -3830,6 +3854,7 @@ class MegatronRankWorker:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Load LoRA adapter weights from checkpoint.
 
@@ -3848,6 +3873,7 @@ class MegatronRankWorker:
         Returns:
             Dict with status info (rank 0 only returns meaningful data).
         """
+        self._bind_traceparent(traceparent)
         import os
 
         import torch
@@ -3904,7 +3930,11 @@ class MegatronRankWorker:
         return {}
 
     def save_adapter_state(
-        self, checkpoint_path: str, actual_rank: int | None = None, trainer_rank: int | None = None
+        self,
+        checkpoint_path: str,
+        actual_rank: int | None = None,
+        trainer_rank: int | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Save LoRA adapter weights to checkpoint.
 
@@ -3923,6 +3953,7 @@ class MegatronRankWorker:
         Returns:
             Dict with status info (rank 0 only returns meaningful data).
         """
+        self._bind_traceparent(traceparent)
         import os
         from pathlib import Path
 
@@ -3958,7 +3989,7 @@ class MegatronRankWorker:
             return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
         return {}
 
-    def reset_optimizer(self, learning_rate: float | None = None) -> dict:
+    def reset_optimizer(self, learning_rate: float | None = None, traceparent: str | None = None) -> dict:
         """Reset optimizer state for a new session.
 
         Updates learning rate and zeros gradients. Note: With distributed optimizer,
@@ -3971,6 +4002,7 @@ class MegatronRankWorker:
         Returns:
             Dict with status info.
         """
+        self._bind_traceparent(traceparent)
         # Update learning rate if specified
         if learning_rate is not None:
             self.learning_rate = learning_rate
@@ -4143,6 +4175,10 @@ class MegatronWorkerGroup:
 
     def get_master_addr(self) -> str | None:
         return self._master_addr
+
+    def _bind_traceparent(self, traceparent: str | None) -> None:
+        if isinstance(traceparent, str) and traceparent:
+            restore_trace_id_from_traceparent(traceparent)
 
     def _initialize(self):
         """Create placement group, spawn workers, then initialize them all together."""
@@ -4387,6 +4423,7 @@ class MegatronWorkerGroup:
     def _ensure_session_loaded(
         self,
         session_id: str | None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -4410,6 +4447,7 @@ class MegatronWorkerGroup:
         """
         if session_id is None:
             return
+        self._bind_traceparent(traceparent)
 
         if self._current_session == session_id:
             # Already loaded
@@ -4446,7 +4484,7 @@ class MegatronWorkerGroup:
         if self._current_session is not None:
             old_path = self._session_manager.get_session_path(self._current_session)
             logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
-            self.save_adapter_state(old_path)
+            self.save_adapter_state(old_path, traceparent=traceparent)
             # Save metadata (step count, learning rate, actual rank)
             self._session_manager.save_metadata(
                 self._current_session,
@@ -4475,6 +4513,7 @@ class MegatronWorkerGroup:
             self.load_adapter_state(
                 new_path,
                 actual_rank=actual_rank,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -4488,6 +4527,7 @@ class MegatronWorkerGroup:
             # New session: reinitialize LoRA weights
             logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
             self.reinit_lora_weights(
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -4500,7 +4540,7 @@ class MegatronWorkerGroup:
         # expert_bias is not saved/restored with LoRA checkpoints.
         t_bias0 = time.perf_counter() if timing else 0.0
         try:
-            self.reset_expert_bias()
+            self.reset_expert_bias(traceparent=traceparent)
         except Exception as e:
             logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for {session_id}: {e}")
         t_bias1 = time.perf_counter() if timing else 0.0
@@ -4538,6 +4578,7 @@ class MegatronWorkerGroup:
         rollout_correction_config: dict | None = None,
         session_id: str | None = None,
         reset_bias: bool | None = None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -4558,6 +4599,7 @@ class MegatronWorkerGroup:
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        self._bind_traceparent(traceparent)
         loss_fn_config = loss_fn_config or {}
 
         timing = _env_flag("MINT_TIMING_DIAG", default=False)
@@ -4568,6 +4610,7 @@ class MegatronWorkerGroup:
         effective_session_id = session_id or self._current_session
         self._ensure_session_loaded(
             effective_session_id,
+            traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -4579,7 +4622,13 @@ class MegatronWorkerGroup:
         t2 = time.perf_counter() if timing else 0.0
         futures = [
             w.forward_backward.remote(
-                data_items, loss_fn, loss_fn_config, rollout_correction_config, effective_session_id, reset_bias
+                data_items,
+                loss_fn,
+                loss_fn_config,
+                rollout_correction_config,
+                effective_session_id,
+                reset_bias,
+                traceparent=traceparent,
             )
             for w in self.workers
         ]
@@ -4672,6 +4721,7 @@ class MegatronWorkerGroup:
         rollout_correction_config: dict | None = None,
         learning_rate: float | None = None,
         session_id: str | None = None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -4693,6 +4743,7 @@ class MegatronWorkerGroup:
         Returns:
             forward_backward result dict with optim_step metrics merged in.
         """
+        self._bind_traceparent(traceparent)
         effective_session_id = session_id or self._current_session
         if effective_session_id is None:
             raise ValueError("train_step requires session_id (no current session set)")
@@ -4703,6 +4754,7 @@ class MegatronWorkerGroup:
             loss_fn_config=loss_fn_config,
             rollout_correction_config=rollout_correction_config,
             session_id=effective_session_id,
+            traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -4712,6 +4764,7 @@ class MegatronWorkerGroup:
         opt_result = self.optim_step(
             lr,
             session_id=effective_session_id,
+            traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -4727,6 +4780,7 @@ class MegatronWorkerGroup:
         data_items: list[dict],
         session_id: str | None = None,  # Accepted for API consistency with TrainingWorker
         reset_bias: bool | None = None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -4747,10 +4801,12 @@ class MegatronWorkerGroup:
         Returns:
             Dict with loss_fn_outputs (including per-token logprobs) and metrics.
         """
+        self._bind_traceparent(traceparent)
         # Issue #44: Ensure correct session's LoRA weights are loaded before forward
         effective_session_id = session_id or self._current_session
         self._ensure_session_loaded(
             effective_session_id,
+            traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -4758,7 +4814,7 @@ class MegatronWorkerGroup:
 
         # Send raw data_items to workers (TensorDict created locally on each worker
         # to avoid Ray serialization issues with nested tensors)
-        futures = [w.forward.remote(data_items, reset_bias) for w in self.workers]
+        futures = [w.forward.remote(data_items, reset_bias, traceparent=traceparent) for w in self.workers]
         results = ray.get(futures)
 
         # Pick the first non-empty result (pipeline last stage).
@@ -4821,6 +4877,7 @@ class MegatronWorkerGroup:
         self,
         learning_rate: float,
         session_id: str | None = None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -4838,6 +4895,7 @@ class MegatronWorkerGroup:
         Returns:
             Dict with metrics including grad_norm from rank 0.
         """
+        self._bind_traceparent(traceparent)
         timing = _env_flag("MINT_TIMING_DIAG", default=False)
         t0 = time.perf_counter() if timing else 0.0
 
@@ -4845,6 +4903,7 @@ class MegatronWorkerGroup:
         effective_session_id = session_id or self._current_session
         self._ensure_session_loaded(
             effective_session_id,
+            traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -4859,6 +4918,7 @@ class MegatronWorkerGroup:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                traceparent=traceparent,
             )
             for w in self.workers
         ]
@@ -4946,7 +5006,7 @@ class MegatronWorkerGroup:
             logger.error(f"[MegatronWorkerGroup] check_determinism_status failed: {e}")
             raise RuntimeError(f"check_determinism_status failed: {e}")
 
-    def reset_expert_bias(self) -> dict:
+    def reset_expert_bias(self, traceparent: str | None = None) -> dict:
         """Reset expert_bias buffers to zero in all MoE router modules across all workers.
 
         The expert_bias buffer accumulates during training to balance token distribution
@@ -4958,11 +5018,12 @@ class MegatronWorkerGroup:
         Returns:
             dict with reset count from rank 0
         """
+        self._bind_traceparent(traceparent)
         logger.info("[MegatronWorkerGroup] reset_expert_bias: ENTRY")
 
         try:
             # Call ALL workers to ensure distributed consistency
-            futures = [w.reset_expert_bias.remote() for w in self.workers]
+            futures = [w.reset_expert_bias.remote(traceparent=traceparent) for w in self.workers]
             results = ray.get(futures, timeout=60)
 
             # Rank 0's result has the count
@@ -5028,6 +5089,7 @@ class MegatronWorkerGroup:
         learning_rate: float | None = None,
         actual_rank: int | None = None,
         new_session_id: str | None = None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -5052,12 +5114,13 @@ class MegatronWorkerGroup:
         Returns:
             dict with status and total count of reinitialized parameters.
         """
+        self._bind_traceparent(traceparent)
         # Issue #44: Save current session's weights before reinitializing
         if self._current_session is not None and new_session_id is not None:
             old_path = self._session_manager.get_session_path(self._current_session)
             logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: saving current session {self._current_session} to {old_path}")
             try:
-                self.save_adapter_state(old_path)
+                self.save_adapter_state(old_path, traceparent=traceparent)
                 self._session_manager.save_metadata(
                     self._current_session,
                     step=self._step_count,
@@ -5079,6 +5142,7 @@ class MegatronWorkerGroup:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                traceparent=traceparent,
             )
             for w in self.workers
         ]
@@ -5109,7 +5173,12 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] reinit_lora_weights: reinitialized {total_reinit} params, reset {total_opt_state_reset} optimizer states, lr_updated={lr_updated}, actual_rank={self._actual_rank}, new_session={new_session_id}")
         return {"status": "ok", "reinit_count": total_reinit, "opt_state_reset": total_opt_state_reset, "lr_updated": lr_updated, "learning_rate": learning_rate, "actual_rank": self._actual_rank}
 
-    def load_checkpoint(self, load_path: str, load_optimizer: bool = True) -> dict:
+    def load_checkpoint(
+        self,
+        load_path: str,
+        load_optimizer: bool = True,
+        traceparent: str | None = None,
+    ) -> dict:
         """Load checkpoint from path.
 
         Delegates to load_adapter_state which handles distributed loading.
@@ -5121,6 +5190,7 @@ class MegatronWorkerGroup:
         Returns:
             Dict with load metadata.
         """
+        self._bind_traceparent(traceparent)
         import json
         import os
 
@@ -5136,12 +5206,16 @@ class MegatronWorkerGroup:
             if adapter_files:
                 logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
                 # Delegate to load_adapter_state
-                result = self.load_adapter_state(load_path, actual_rank=self._actual_rank or self.lora_rank)
+                result = self.load_adapter_state(
+                    load_path,
+                    actual_rank=self._actual_rank or self.lora_rank,
+                    traceparent=traceparent,
+                )
                 result["load_method"] = "load_adapter_state"
 
                 if load_optimizer:
                     opt_results = ray.get(
-                        [w.load_optimizer_state.remote(load_path) for w in self.workers]
+                        [w.load_optimizer_state.remote(load_path, traceparent=traceparent) for w in self.workers]
                     )
                     optimizer_restored = any(
                         isinstance(r, dict) and r.get("status") == "ok" for r in opt_results
@@ -5177,6 +5251,7 @@ class MegatronWorkerGroup:
         self,
         save_path: str,
         use_per_expert_lora: bool = False,
+        traceparent: str | None = None,
         *,
         session_id: str | None = None,
         train_attn: bool | None = None,
@@ -5196,10 +5271,12 @@ class MegatronWorkerGroup:
         Returns:
             Dict with training metadata (from rank 0).
         """
+        self._bind_traceparent(traceparent)
         effective_session_id = session_id or self._current_session
         if effective_session_id is not None:
             self._ensure_session_loaded(
                 effective_session_id,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -5211,7 +5288,16 @@ class MegatronWorkerGroup:
         )
         # Call ALL workers - get_lora_state_dict uses NCCL allgather
         # Rank 0 saves to disk, other ranks participate in collectives then return empty
-        futures = [w.save_checkpoint.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora) for w in self.workers]
+        futures = [
+            w.save_checkpoint.remote(
+                save_path,
+                self._step_count,
+                self._actual_rank,
+                use_per_expert_lora,
+                traceparent=traceparent,
+            )
+            for w in self.workers
+        ]
         world_size = len(self.workers)
         if world_size >= 32:
             default_timeout_s = 3600
@@ -5231,6 +5317,7 @@ class MegatronWorkerGroup:
         self,
         save_path: str,
         use_per_expert_lora: bool = False,
+        traceparent: str | None = None,
         *,
         session_id: str | None = None,
         train_attn: bool | None = None,
@@ -5241,10 +5328,12 @@ class MegatronWorkerGroup:
 
         Must call ALL workers because get_lora_state_dict uses NCCL collectives.
         """
+        self._bind_traceparent(traceparent)
         effective_session_id = session_id or self._current_session
         if effective_session_id is not None:
             self._ensure_session_loaded(
                 effective_session_id,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -5255,7 +5344,13 @@ class MegatronWorkerGroup:
             f"(session_id={effective_session_id}, actual_rank={self._actual_rank}, use_per_expert_lora={use_per_expert_lora})"
         )
         futures = [
-            w.save_lora_weights.remote(save_path, self._step_count, self._actual_rank, use_per_expert_lora)
+            w.save_lora_weights.remote(
+                save_path,
+                self._step_count,
+                self._actual_rank,
+                use_per_expert_lora,
+                traceparent=traceparent,
+            )
             for w in self.workers
         ]
         world_size = len(self.workers)
@@ -5295,6 +5390,7 @@ class MegatronWorkerGroup:
         self,
         checkpoint_path: str,
         actual_rank: int | None = None,
+        traceparent: str | None = None,
         *,
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
@@ -5315,6 +5411,7 @@ class MegatronWorkerGroup:
         Returns:
             Dict with status info from rank 0.
         """
+        self._bind_traceparent(traceparent)
         logger.info(
             f"[MegatronWorkerGroup] Loading adapter state from {checkpoint_path} "
             f"(actual_rank={actual_rank}, trainer_rank={self.lora_rank}, train_attn={train_attn}, train_mlp={train_mlp}, train_unembed={train_unembed})"
@@ -5327,6 +5424,7 @@ class MegatronWorkerGroup:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                traceparent=traceparent,
             )
             for w in self.workers
         ]
@@ -5337,7 +5435,10 @@ class MegatronWorkerGroup:
         return result
 
     def save_adapter_state(
-        self, checkpoint_path: str, actual_rank: int | None = None
+        self,
+        checkpoint_path: str,
+        actual_rank: int | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Save LoRA adapter weights to checkpoint from all workers.
 
@@ -5354,6 +5455,7 @@ class MegatronWorkerGroup:
         Returns:
             Dict with status info from rank 0.
         """
+        self._bind_traceparent(traceparent)
         effective_rank = actual_rank or self._actual_rank or self.lora_rank
         logger.info(
             f"[MegatronWorkerGroup] Saving adapter state to {checkpoint_path} "
@@ -5361,7 +5463,10 @@ class MegatronWorkerGroup:
         )
         futures = [
             w.save_adapter_state.remote(
-                checkpoint_path, actual_rank=effective_rank, trainer_rank=self.lora_rank
+                checkpoint_path,
+                actual_rank=effective_rank,
+                trainer_rank=self.lora_rank,
+                traceparent=traceparent,
             )
             for w in self.workers
         ]
@@ -5370,7 +5475,7 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] Adapter state saved: {result}")
         return result
 
-    def reset_optimizer(self, learning_rate: float | None = None) -> dict:
+    def reset_optimizer(self, learning_rate: float | None = None, traceparent: str | None = None) -> dict:
         """Reset optimizer state on all workers.
 
         Used for new sessions to start fresh without prior momentum.
@@ -5381,8 +5486,9 @@ class MegatronWorkerGroup:
         Returns:
             Dict with status info from rank 0.
         """
+        self._bind_traceparent(traceparent)
         logger.info(f"[MegatronWorkerGroup] Resetting optimizer (lr={learning_rate})")
-        futures = [w.reset_optimizer.remote(learning_rate) for w in self.workers]
+        futures = [w.reset_optimizer.remote(learning_rate, traceparent=traceparent) for w in self.workers]
         results = ray.get(futures)
         result = results[0]  # Rank 0 result
         self._step_count = 0  # Reset step counter for new session
