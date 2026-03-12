@@ -205,6 +205,7 @@ class MultiNodeLoRASlot:
     lora_int_id: int
     sampling_session_id: str
     adapter_path: str  # Shared filesystem path
+    session_ids: set[str] = field(default_factory=set)
     loaded_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
@@ -227,6 +228,20 @@ class MultiNodeLoRARegistry:
                     f"{self._session_to_id[sampling_session_id]}"
                 )
 
+            for lora_id, slot in self._id_to_slot.items():
+                if slot.adapter_path != adapter_path:
+                    continue
+                self._session_to_id[sampling_session_id] = lora_id
+                slot.session_ids.add(sampling_session_id)
+                slot.last_used = time.time()
+                logger.debug(
+                    "Reused lora_int_id=%s for session %s (adapter_path=%s)",
+                    lora_id,
+                    sampling_session_id,
+                    adapter_path,
+                )
+                return lora_id
+
             lora_id = self._next_id
             self._next_id += 1
 
@@ -235,6 +250,7 @@ class MultiNodeLoRARegistry:
                 lora_int_id=lora_id,
                 sampling_session_id=sampling_session_id,
                 adapter_path=adapter_path,
+                session_ids={sampling_session_id},
             )
 
             logger.debug(
@@ -256,15 +272,29 @@ class MultiNodeLoRARegistry:
             slot = self._id_to_slot.get(lora_id)
             return slot.adapter_path if slot else None
 
-    async def remove(self, lora_id: int) -> str | None:
-        """Remove a lora_int_id from the registry."""
+    async def remove_session(self, sampling_session_id: str) -> tuple[int | None, bool]:
+        """Remove a session mapping and report whether engine unload is needed."""
         async with self._lock:
-            slot = self._id_to_slot.pop(lora_id, None)
-            if slot:
-                self._session_to_id.pop(slot.sampling_session_id, None)
-                logger.debug(f"Removed lora_int_id={lora_id}")
-                return slot.sampling_session_id
-            return None
+            lora_id = self._session_to_id.pop(sampling_session_id, None)
+            if lora_id is None:
+                return None, False
+            slot = self._id_to_slot.get(lora_id)
+            if slot is None:
+                return lora_id, False
+            slot.session_ids.discard(sampling_session_id)
+            if slot.sampling_session_id == sampling_session_id and slot.session_ids:
+                slot.sampling_session_id = next(iter(slot.session_ids))
+            if slot.session_ids:
+                logger.debug(
+                    "Removed session %s from shared lora_int_id=%s (remaining_sessions=%s)",
+                    sampling_session_id,
+                    lora_id,
+                    sorted(slot.session_ids),
+                )
+                return lora_id, False
+            self._id_to_slot.pop(lora_id, None)
+            logger.debug("Removed final session %s for lora_int_id=%s", sampling_session_id, lora_id)
+            return lora_id, True
 
     async def count(self) -> int:
         """Get the number of registered sessions."""
@@ -2070,8 +2100,6 @@ class MultiNodeInferenceEngine:
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
-            if total_required_gpus >= 16:
-                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
             if "VLLM_USE_V1" in os.environ:
                 env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
             else:
@@ -2108,6 +2136,7 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENABLE_PREFIX_CACHING",
                 "MINT_VLLM_FULLY_SHARDED_LORAS",
                 "MINT_VLLM_LORA_DTYPE",
+                "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
                 "VLLM_DISABLE_RAY_COMPILED_DAG",
@@ -2328,7 +2357,7 @@ class MultiNodeInferenceEngine:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
             try:
-                await self.registry.remove(lora_id)
+                await self.registry.remove_session(sampling_session_id)
             except Exception as cleanup_e:
                 logger.warning(
                     f"Failed to roll back lora_int_id={lora_id} after add_lora failure: "
@@ -2405,7 +2434,7 @@ class MultiNodeInferenceEngine:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
             try:
-                await self.registry.remove(lora_id)
+                await self.registry.remove_session(sampling_session_id)
             except Exception as cleanup_e:
                 logger.warning(
                     f"Failed to roll back lora_int_id={lora_id} after add_lora failure: "
@@ -2743,14 +2772,22 @@ class MultiNodeInferenceEngine:
         if lora_id is None:
             return False
 
-        try:
-            ref = self.engine.remove_lora.remote(lora_id)
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-        except Exception as e:
-            logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
+        removed_lora_id, should_unload = await self.registry.remove_session(sampling_session_id)
+        if removed_lora_id is None:
+            return False
+        if should_unload:
+            try:
+                ref = self.engine.remove_lora.remote(removed_lora_id)
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+            except Exception as e:
+                logger.warning(f"Failed to remove LoRA {removed_lora_id} from engine: {e}")
 
-        await self.registry.remove(lora_id)
-        logger.info(f"Removed session {sampling_session_id} (lora_int_id={lora_id})")
+        logger.info(
+            "Removed session %s (lora_int_id=%s should_unload=%s)",
+            sampling_session_id,
+            removed_lora_id,
+            should_unload,
+        )
         return True
 
     async def shutdown(self, kill_actor: bool = False) -> None:
