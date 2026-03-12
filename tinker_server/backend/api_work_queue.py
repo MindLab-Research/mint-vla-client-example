@@ -94,7 +94,7 @@ def _get_or_create_ray_actor():
             e,
         )
 
-    max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "128"))
+    max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "256"))
     max_restarts = int(os.environ.get("MINT_API_WORK_QUEUE_MAX_RESTARTS", "3"))
 
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=max_restarts)
@@ -525,21 +525,29 @@ def _get_or_create_ray_actor():
         async def dequeue(self, consumer_job_id: str) -> dict[str, Any]:
             import asyncio
 
+            dequeue_poll_s = max(
+                0.05,
+                float(os.environ.get("MINT_API_WORK_QUEUE_DEQUEUE_POLL_S", "1.0")),
+            )
+
             async with self._cv:
                 while True:
-                    has_legacy = bool(self._items)
-                    now = time.time()
-                    sched_choice = self._pick_scheduled_candidate(now=now)
-
-                    if not has_legacy and sched_choice is None:
-                        await self._cv.wait()
-                        continue
-
                     if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
                         self._cv.notify(1)
                         raise RuntimeError(
                             f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
                         )
+
+                    has_legacy = bool(self._items)
+                    now = time.time()
+                    sched_choice = self._pick_scheduled_candidate(now=now)
+
+                    if not has_legacy and sched_choice is None:
+                        try:
+                            await asyncio.wait_for(self._cv.wait(), timeout=dequeue_poll_s)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
 
                     # Short coalescing wait: if we are about to switch sessions in a
                     # scheduled domain right after the previous pick, give the current
