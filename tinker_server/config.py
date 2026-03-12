@@ -154,8 +154,8 @@ else:
         PFS_HF_MODULES_PATH,
     )
 
-# OTEL env vars to forward into Ray actor runtime_env so actors can report
-# traces and logs to the same collector as the API server.  See issue #290.
+# OTEL env vars forwarded into Ray actors so actor-side logging/tracing
+# can use the same collector/auth as the API server process.
 _OTEL_FORWARD_KEYS = (
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_HEADERS",
@@ -163,13 +163,18 @@ _OTEL_FORWARD_KEYS = (
     "OTEL_SERVICE_NAME",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_LOG_LEVEL",
+    "MINT_APMPLUS_APP_KEY",
 )
 
 
 def otel_env_vars() -> dict[str, str]:
-    """Return OTEL env vars present in current process, for injection into actor runtime_env."""
-    return {k: os.environ[k] for k in _OTEL_FORWARD_KEYS if k in os.environ}
-
+    """Return non-empty OTEL env vars for Ray runtime_env injection."""
+    out: dict[str, str] = {}
+    for k in _OTEL_FORWARD_KEYS:
+        v = _env_nonempty(os.environ, k)
+        if v is not None:
+            out[k] = v
+    return out
 
 # When false (default), reject requests for base_model not in list_supported_models().
 ALLOW_UNSUPPORTED_MODELS = _parse_bool(_env_nonempty(os.environ, "ALLOW_UNSUPPORTED_MODELS") or "false")

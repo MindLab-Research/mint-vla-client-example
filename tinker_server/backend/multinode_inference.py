@@ -40,8 +40,9 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
     }
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
+from tinker_server.logging_context import init_actor_observability
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
@@ -383,6 +384,7 @@ def _create_multinode_vllm_actor(
             kv_cache_dtype: str | None = None,
             max_num_batched_tokens: int | None = None,
         ):
+            init_actor_observability()
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
             self.pipeline_parallel_size = pipeline_parallel_size
@@ -2100,6 +2102,8 @@ class MultiNodeInferenceEngine:
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+            if total_required_gpus >= 16:
+                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
             if "VLLM_USE_V1" in os.environ:
                 env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
             else:

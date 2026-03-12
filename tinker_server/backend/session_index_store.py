@@ -34,6 +34,9 @@ def _get_or_create_actor():
     @ray.remote(num_cpus=0)
     class _SessionIndexStore:
         def __init__(self) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
             self._sessions: dict[str, dict[str, Any]] = {}
             self._samplers: dict[str, dict[str, Any]] = {}
 

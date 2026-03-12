@@ -305,8 +305,9 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
+from tinker_server.logging_context import init_actor_observability
 from tinker_server.ray_utils import init_ray
 
 # Import model registry
@@ -362,6 +363,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
         def __init__(self, *args, **kwargs):
             """Initialize with VLLMHijack applied first."""
+            init_actor_observability()
             # Set PYTHONPATH in OS environment so vLLM's TP workers inherit it
             # Ray's runtime_env only sets it for this process, not multiprocessing children
             import os
