@@ -659,6 +659,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
+    from .checkpoints import get_checkpoint_reap_interval_s, reap_runtime_checkpoints
 
     future_store.ensure_ready()
 
@@ -871,6 +872,24 @@ async def lifespan(app: FastAPI):
 
     future_reaper_task = asyncio.create_task(_future_reaper_loop())
 
+    async def _checkpoint_reaper_loop() -> None:
+        while True:
+            await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
+            try:
+                reaped = reap_runtime_checkpoints()
+                total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
+                if total:
+                    logger.info(
+                        "checkpoint reaper removed ephemeral=%s persistent_cache=%s persistent=%s",
+                        len(reaped["ephemeral"]),
+                        len(reaped["persistent_cache"]),
+                        len(reaped["persistent"]),
+                    )
+            except Exception:
+                logger.exception("checkpoint reaper failed")
+
+    checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
+
     # ==========================================================================
     # Persistent actors: pre-create and protect at startup
     # ==========================================================================
@@ -882,7 +901,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     future_reaper_task.cancel()
-    await asyncio.gather(future_reaper_task, return_exceptions=True)
+    checkpoint_reaper_task.cancel()
+    await asyncio.gather(future_reaper_task, checkpoint_reaper_task, return_exceptions=True)
     await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 

@@ -26,10 +26,20 @@ from starlette.background import BackgroundTask
 from ..backend.future_store import future_store
 from ..checkpoints import (
     CHECKPOINTS_DIR,
+    build_persistent_cache_dir,
+    build_persistent_checkpoint_dir,
+    checkpoint_access_roots,
+    checkpoint_has_optimizer_state,
     create_checkpoint_archive,
+    ensure_checkpoint_path_allowed,
+    get_persistent_checkpoints_dir,
+    get_persistent_search_roots,
+    materialize_persistent_checkpoint,
+    mirror_checkpoint_to_persistent_store,
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
     validate_checkpoint_dir,
+    write_checkpoint_metadata,
 )
 from ..models.types import (
     CheckpointInfo,
@@ -91,7 +101,9 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
     Returns:
         Filesystem path.
     """
-    return resolve_checkpoint_path(mint_uri, user_id=user_id)
+    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id)
+    ensure_checkpoint_path_allowed(resolved, user_id=user_id)
+    return materialize_persistent_checkpoint(resolved)
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
@@ -109,6 +121,40 @@ def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | No
     if owner_id == request_user_id:
         return
     raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _persistent_owner_root(user_id: str | None) -> str:
+    return os.path.join(get_persistent_checkpoints_dir(), user_id or "anonymous")
+
+
+def _persistent_candidate_paths(*, model_id: str, checkpoint_name: str, user_id: str | None) -> list[str]:
+    candidates: list[str] = []
+    for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
+        owner_dir = user_id or "anonymous"
+        candidates.extend(
+            [
+                os.path.join(root, owner_dir, model_id, checkpoint_name),
+                os.path.join(root, model_id, checkpoint_name),
+                os.path.join(root, owner_dir, checkpoint_name),
+            ]
+        )
+        if user_id == "admin" and os.path.isdir(root):
+            try:
+                for owner in os.listdir(root):
+                    candidates.append(os.path.join(root, owner, model_id, checkpoint_name))
+                    candidates.append(os.path.join(root, owner, checkpoint_name))
+            except OSError:
+                pass
+    # Preserve order while dropping duplicates.
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(path)
+    return out
 
 
 def _build_sdk_archive_redirect_response(
@@ -541,8 +587,11 @@ async def _do_save_state(
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
-        owner_dir = user_id or "anonymous"
-        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, session.model_id, checkpoint_name)
+        save_path = build_persistent_cache_dir(
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
@@ -553,8 +602,6 @@ async def _do_save_state(
         # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
         # sync may not be complete yet. Create directory on API server to ensure it exists.
         os.makedirs(save_path, exist_ok=True)
-
-        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
 
         optimizer_present = bool(checkpoint_has_optimizer_state(save_path))
         if not optimizer_present:
@@ -573,8 +620,24 @@ async def _do_save_state(
             "optimizer_present": optimizer_present,
             "backend": session.backend,
             "type": "training",
+            "storage_tier": "persistent_cache",
+            "ttl_seconds": request.ttl_seconds,
         }
         write_checkpoint_metadata(save_path, metadata)
+
+        persistent_path = mirror_checkpoint_to_persistent_store(
+            save_path,
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
+        write_checkpoint_metadata(
+            persistent_path,
+            {
+                **metadata,
+                "storage_tier": "persistent_tos",
+            },
+        )
 
         # Register for sampling via path-based loading (avoids tensor transfer OOM)
         sampling_registered = False
@@ -629,7 +692,7 @@ async def _do_save_state(
             "path": selected_path,
             "mint_path": mint_path,
             "tinker_path": tinker_path,
-            "filesystem_path": save_path,
+            "filesystem_path": persistent_path,
             "type": "save_weights",
             "sampling_registered": sampling_registered,
             "checkpoint_type": "training",
@@ -704,22 +767,22 @@ async def _do_save_weights(
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
-        owner_dir = user_id or "anonymous"
-        checkpoint_base_dir = os.path.join(CHECKPOINTS_DIR, owner_dir)
-        save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        save_path = build_persistent_cache_dir(
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
 
         abs_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
-            checkpoint_base_dir=checkpoint_base_dir,
+            checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
             use_per_expert_lora=False,
         )
 
         os.makedirs(save_path, exist_ok=True)
-
-        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
 
         if checkpoint_has_optimizer_state(save_path):
             raise RuntimeError(
@@ -737,8 +800,24 @@ async def _do_save_weights(
             "optimizer_present": False,
             "backend": session.backend,
             "type": "sampler",
+            "storage_tier": "persistent_cache",
+            "ttl_seconds": request.ttl_seconds,
         }
         write_checkpoint_metadata(save_path, metadata)
+
+        persistent_path = mirror_checkpoint_to_persistent_store(
+            save_path,
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
+        write_checkpoint_metadata(
+            persistent_path,
+            {
+                **metadata,
+                "storage_tier": "persistent_tos",
+            },
+        )
 
         sampling_registered = False
         base_model = session.base_model
@@ -788,7 +867,7 @@ async def _do_save_weights(
                 "path": selected_path,
                 "mint_path": mint_path,
                 "tinker_path": tinker_path,
-                "filesystem_path": save_path,
+                "filesystem_path": persistent_path,
                 "type": "save_weights",
                 "sampling_registered": sampling_registered,
                 "checkpoint_type": "sampler",
@@ -869,14 +948,10 @@ async def load_state(
         json_body = request.model_dump()
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
             local_path = resolve_checkpoint_path(request.path, user_id=user_id)
-            if user_id and user_id != "admin":
-                load_real = os.path.realpath(local_path)
-                checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-                allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-                if load_real.startswith(checkpoints_real + os.sep) and not (
-                    load_real == allowed_real or load_real.startswith(allowed_real + os.sep)
-                ):
-                    raise HTTPException(status_code=403, detail="Access denied")
+            try:
+                ensure_checkpoint_path_allowed(local_path, user_id=user_id)
+            except PermissionError as e:
+                raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
                 import asyncio
                 import tempfile
@@ -1009,14 +1084,6 @@ async def _do_load_state(
 
         # Resolve path
         load_path = _resolve_mint_path(request.path, user_id=user_id)
-        if user_id and user_id != "admin":
-            load_real = os.path.realpath(load_path)
-            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
-                allowed_real + os.sep
-            ):
-                raise PermissionError("Access denied")
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
@@ -1067,7 +1134,7 @@ async def upload_checkpoint_archive(
     owner_dir = user_id or "anonymous"
 
     checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
-    parent_dir = os.path.join(CHECKPOINTS_DIR, owner_dir)
+    parent_dir = os.path.join(get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)[0], owner_dir)
     final_dir = os.path.join(parent_dir, checkpoint_id)
     tmp_dir = final_dir + ".tmp"
     tmp_archive: str | None = None
@@ -1167,9 +1234,9 @@ async def upload_checkpoint_archive(
             "optimizer_present": checkpoint_type == "training",
             "backend": None,
             "type": checkpoint_type,
+            "storage_tier": "persistent_tos",
         }
-        with open(os.path.join(tmp_dir, "metadata.json"), "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_checkpoint_metadata(tmp_dir, metadata)
 
         os.rename(tmp_dir, final_dir)
         return CheckpointUploadResponse(checkpoint_id=checkpoint_id, path=checkpoint_id)
@@ -1209,17 +1276,20 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
     prefer_tinker = prefer_tinker_uri(request)
 
-    candidate_paths: list[str] = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id),
-        os.path.join(CHECKPOINTS_DIR, model_id),  # legacy (pre user-scoping)
-    ]
-    if user_id == "admin":
-        candidate_paths = [os.path.join(CHECKPOINTS_DIR, model_id)]
-        try:
-            for owner in os.listdir(CHECKPOINTS_DIR):
-                candidate_paths.append(os.path.join(CHECKPOINTS_DIR, owner, model_id))
-        except OSError:
-            pass
+    candidate_paths: list[str] = []
+    for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
+        candidate_paths.extend(
+            [
+                os.path.join(root, owner_dir, model_id),
+                os.path.join(root, model_id),
+            ]
+        )
+        if user_id == "admin" and os.path.isdir(root):
+            try:
+                for owner in os.listdir(root):
+                    candidate_paths.append(os.path.join(root, owner, model_id))
+            except OSError:
+                pass
 
     if not any(os.path.exists(p) for p in candidate_paths):
         raise HTTPException(
@@ -1307,15 +1377,19 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     owner_roots: list[str]
     if user_id == "admin":
         try:
-            owner_roots = [
-                os.path.join(CHECKPOINTS_DIR, d)
-                for d in os.listdir(CHECKPOINTS_DIR)
-                if os.path.isdir(os.path.join(CHECKPOINTS_DIR, d))
-            ]
+            owner_roots = []
+            for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
+                if not os.path.isdir(root):
+                    continue
+                owner_roots.extend(
+                    os.path.join(root, d)
+                    for d in os.listdir(root)
+                    if os.path.isdir(os.path.join(root, d))
+                )
         except OSError:
             owner_roots = []
     else:
-        owner_roots = [os.path.join(CHECKPOINTS_DIR, owner_dir)]
+        owner_roots = [os.path.join(root, owner_dir) for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)]
 
     for root in owner_roots:
         if not os.path.isdir(root):
@@ -1410,23 +1484,8 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     """
     user_id = _get_user_id(request)
 
-    owner_dir = user_id or "anonymous"
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_name),
-        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_name),  # legacy
-        os.path.join(
-            CHECKPOINTS_DIR, owner_dir, checkpoint_name
-        ),  # uploaded /checkpoints/{owner}/{ckpt_id}
-    ]
-    if user_id == "admin":
-        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_name))
-        try:
-            for owner in os.listdir(CHECKPOINTS_DIR):
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_name))
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_name))
-        except OSError:
-            pass
+    candidates = _persistent_candidate_paths(model_id=model_id, checkpoint_name=checkpoint_name, user_id=user_id)
 
     ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
     if ckpt_path is None:
@@ -1500,23 +1559,8 @@ async def download_checkpoint_archive(
         ):
             user_id = payload.get("user_id")
 
-    owner_dir = user_id or "anonymous"
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_name),
-        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_name),  # legacy
-        os.path.join(
-            CHECKPOINTS_DIR, owner_dir, checkpoint_name
-        ),  # uploaded /checkpoints/{owner}/{ckpt_id}
-    ]
-    if user_id == "admin":
-        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_name))
-        try:
-            for owner in os.listdir(CHECKPOINTS_DIR):
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_name))
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_name))
-        except OSError:
-            pass
+    candidates = _persistent_candidate_paths(model_id=model_id, checkpoint_name=checkpoint_name, user_id=user_id)
 
     # Prefer a candidate whose metadata matches the requested type.
     # This avoids false 404s when both "training" and "sampler" checkpoints share the same name.

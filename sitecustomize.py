@@ -806,9 +806,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
         )
 
     def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
-        if loras and all(l is not None for l in loras):
-            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
-
+        timing = _env_flag("MINT_VLLM_TIMING_SET_LORA", default=False)
         if not loras or (len(loras) % 3) != 0:
             raise RuntimeError(
                 f"Unexpected MoE LoRA pack_moe inputs for module={module_name!r}: len(loras)={len(loras)}"
@@ -828,6 +826,100 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
         if base_w1 is None or base_w2 is None or base_w3 is None:
             raise RuntimeError(f"MoE LoRA pack_moe missing base weight(s) for module={module_name!r}")
 
+        def _same_lora(x, y):  # type: ignore[no-untyped-def]
+            def _first_value(t):  # type: ignore[no-untyped-def]
+                if int(t.numel()) == 0:
+                    return None
+                return t.reshape(-1)[0].item()
+
+            return (
+                int(getattr(x, "rank")) == int(getattr(y, "rank"))
+                and int(getattr(x, "lora_alpha")) == int(getattr(y, "lora_alpha"))
+                and float(getattr(x, "scaling", lora_alpha / rank))
+                == float(getattr(y, "scaling", lora_alpha / rank))
+                and tuple(x.lora_a.shape) == tuple(y.lora_a.shape)
+                and x.lora_a.dtype == y.lora_a.dtype
+                and tuple(x.lora_b.shape) == tuple(y.lora_b.shape)
+                and x.lora_b.dtype == y.lora_b.dtype
+                and _first_value(x.lora_a) == _first_value(y.lora_a)
+                and _first_value(x.lora_b) == _first_value(y.lora_b)
+            )
+
+        def _build_sparse_from_representatives(starts):  # type: ignore[no-untyped-def]
+            present_w1 = {eid: loras[eid * 3] for eid in starts}
+            present_w2 = {eid: loras[eid * 3 + 1] for eid in starts}
+            present_w3 = {eid: loras[eid * 3 + 2] for eid in starts}
+
+            def _shard_lora_a(present: dict[int, object]):  # type: ignore[no-untyped-def]
+                return _SparseShardTensor(
+                    tuple(present[start].lora_a for start in starts),  # type: ignore[index,attr-defined]
+                    tuple(starts),
+                    int(n_experts),
+                )
+
+            def _shard_lora_b(present: dict[int, object]):  # type: ignore[no-untyped-def]
+                return _SparseShardTensor(
+                    tuple(present[start].lora_b for start in starts),  # type: ignore[index,attr-defined]
+                    tuple(starts),
+                    int(n_experts),
+                    tuple(
+                        float(getattr(present[start], "scaling", lora_alpha / rank))  # type: ignore[index,attr-defined]
+                        for start in starts
+                    ),
+                )
+
+            return cls(
+                module_name,
+                rank,
+                [lora_alpha, lora_alpha, lora_alpha],
+                [
+                    _shard_lora_a(present_w1),
+                    _shard_lora_a(present_w2),
+                    _shard_lora_a(present_w3),
+                ],
+                [
+                    _shard_lora_b(present_w1),
+                    _shard_lora_b(present_w2),
+                    _shard_lora_b(present_w3),
+                ],
+                scaling=[1.0, 1.0, 1.0],
+            )
+
+        if all(l is not None for l in loras):
+            # Dense checkpoints can still be block-shared across contiguous expert
+            # ranges. If so, keep only one representative per contiguous block and
+            # reuse the sparse-shard set_lora path to avoid materializing the full
+            # [num_experts, ...] packed tensors.
+            t_detect0 = time.perf_counter() if timing else 0.0
+            shard_starts = [0]
+            rep_eid = 0
+            for eid in range(1, n_experts):
+                if not (
+                    _same_lora(loras[eid * 3], loras[rep_eid * 3])
+                    and _same_lora(loras[eid * 3 + 1], loras[rep_eid * 3 + 1])
+                    and _same_lora(loras[eid * 3 + 2], loras[rep_eid * 3 + 2])
+                ):
+                    shard_starts.append(eid)
+                    rep_eid = eid
+            t_detect1 = time.perf_counter() if timing else 0.0
+            if len(shard_starts) < n_experts:
+                t_build0 = time.perf_counter() if timing else 0.0
+                obj = _build_sparse_from_representatives(shard_starts)
+                t_build1 = time.perf_counter() if timing else 0.0
+                print(
+                    f"[vLLM dense pack_moe dedup] module={module_name} "
+                    f"n_experts={n_experts} reps={len(shard_starts)} starts={shard_starts}",
+                    flush=True,
+                )
+                if timing:
+                    print(
+                        f"[vLLM dense pack_moe dedup timing] module={module_name} "
+                        f"detect_s={t_detect1 - t_detect0:.6f} build_s={t_build1 - t_build0:.6f}",
+                        flush=True,
+                    )
+                return obj
+            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
+
         only_expert0 = True
         for eid in range(1, n_experts):
             if (
@@ -839,26 +931,10 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                 break
 
         if only_expert0:
-            # Shared-expert export: avoid materializing [num_experts, ...] tensors.
-            #
-            # vLLM later calls `optimize()` (in-place scaling merge) on packed LoRA
-            # weights. `expand(...)` returns a view with overlapping storage, so
-            # in-place ops (e.g., `lora_b *= scaling`) crash with:
-            #   "unsupported operation: more than one element ... refers to a single
-            #    memory location"
-            #
-            # Keep the non-materialized representation, but pre-apply scaling
-            # out-of-place and mark scaling=1 so vLLM's in-place optimize is a no-op.
-            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
-            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
-            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
-            w1_lora_b_base = base_w1.lora_b * float(getattr(base_w1, "scaling", lora_alpha / rank))
-            w2_lora_b_base = base_w2.lora_b * float(getattr(base_w2, "scaling", lora_alpha / rank))
-            w3_lora_b_base = base_w3.lora_b * float(getattr(base_w3, "scaling", lora_alpha / rank))
-            w1_lora_b = w1_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w1_lora_b_base.shape))
-            w2_lora_b = w2_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w2_lora_b_base.shape))
-            w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
-            packed_scaling = [1.0, 1.0, 1.0]
+            # Route single-expert exports through the sparse-shard path so
+            # fused_moe.set_lora consumes shard metadata instead of falling back
+            # to dense per-expert tensors.
+            return _build_sparse_from_representatives([0])
         else:
             import torch
 
@@ -895,44 +971,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                     f"module={module_name!r} n_experts={n_experts} "
                     f"present_expert_ids={present_eids} expected_present_expert_ids={expected_starts}"
                 )
-
-            def _shard_lora_a(present: dict[int, object]):  # type: ignore[no-untyped-def]
-                return _SparseShardTensor(
-                    tuple(present[start].lora_a for start, _ in shard_spans),  # type: ignore[index,attr-defined]
-                    tuple(shard_starts),
-                    int(n_experts),
-                )
-
-            def _shard_lora_b(present: dict[int, object]):  # type: ignore[no-untyped-def]
-                return _SparseShardTensor(
-                    tuple(
-                        present[start].lora_b  # type: ignore[index,attr-defined]
-                        for start, _ in shard_spans
-                    ),
-                    tuple(shard_starts),
-                    int(n_experts),
-                    tuple(
-                        float(getattr(present[start], "scaling", lora_alpha / rank))  # type: ignore[index,attr-defined]
-                        for start, _ in shard_spans
-                    ),
-                )
-
-            w1_lora_a = _shard_lora_a(present_w1)
-            w2_lora_a = _shard_lora_a(present_w2)
-            w3_lora_a = _shard_lora_a(present_w3)
-            w1_lora_b = _shard_lora_b(present_w1)
-            w2_lora_b = _shard_lora_b(present_w2)
-            w3_lora_b = _shard_lora_b(present_w3)
-            packed_scaling = [1.0, 1.0, 1.0]
-
-        return cls(
-            module_name,
-            rank,
-            [lora_alpha, lora_alpha, lora_alpha],
-            [w1_lora_a, w2_lora_a, w3_lora_a],
-            [w1_lora_b, w2_lora_b, w3_lora_b],
-            scaling=packed_scaling,
-        )
+            return _build_sparse_from_representatives(shard_starts)
 
     pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
@@ -1029,12 +1068,21 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             if spans is None:
                 return original(self, index, lora_a, lora_b)
 
+            module_tag = (
+                getattr(self, "prefix", None)
+                or getattr(getattr(self, "base_layer", None), "prefix", None)
+                or type(self).__name__
+            )
+
+            timing = _env_flag("MINT_VLLM_TIMING_SET_LORA", default=False)
+            t0 = time.perf_counter() if timing else 0.0
             self.reset_lora(index)
             self.adapter_enabled[index] = 1
 
             w1_lora_a, w2_lora_a, w3_lora_a = lora_a
             w1_lora_b, w2_lora_b, w3_lora_b = lora_b
 
+            t1 = time.perf_counter() if timing else 0.0
             sliced_w1_lora_a = _slice_sparse(
                 w1_lora_a,
                 self._slice_w13_a,
@@ -1065,13 +1113,36 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                 self._slice_w2_b,
                 reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
             )
+            t2 = time.perf_counter() if timing else 0.0
+            copy_times: list[tuple[str, float]] = []
 
-            _copy_sparse(self.w13_lora_a_stacked[0], index, sliced_w1_lora_a, spans)
-            _copy_sparse(self.w13_lora_a_stacked[1], index, sliced_w3_lora_a, spans)
-            _copy_sparse(self.w13_lora_b_stacked[0], index, sliced_w1_lora_b, spans)
-            _copy_sparse(self.w13_lora_b_stacked[1], index, sliced_w3_lora_b, spans)
-            _copy_sparse(self.w2_lora_a_stacked[0], index, sliced_w2_lora_a, spans)
-            _copy_sparse(self.w2_lora_b_stacked[0], index, sliced_w2_lora_b, spans)
+            def _timed_copy(name: str, dst, src):  # type: ignore[no-untyped-def]
+                c0 = time.perf_counter() if timing else 0.0
+                _copy_sparse(dst, index, src, spans)
+                c1 = time.perf_counter() if timing else 0.0
+                if timing:
+                    copy_times.append((name, c1 - c0))
+                    print(
+                        f"[vLLM sparse set_lora copy] module={module_tag} name={name} "
+                        f"reps={len(spans)} elapsed_s={c1 - c0:.6f}",
+                        flush=True,
+                    )
+
+            _timed_copy("w13_a_0", self.w13_lora_a_stacked[0], sliced_w1_lora_a)
+            _timed_copy("w13_a_1", self.w13_lora_a_stacked[1], sliced_w3_lora_a)
+            _timed_copy("w13_b_0", self.w13_lora_b_stacked[0], sliced_w1_lora_b)
+            _timed_copy("w13_b_1", self.w13_lora_b_stacked[1], sliced_w3_lora_b)
+            _timed_copy("w2_a_0", self.w2_lora_a_stacked[0], sliced_w2_lora_a)
+            _timed_copy("w2_b_0", self.w2_lora_b_stacked[0], sliced_w2_lora_b)
+            t3 = time.perf_counter() if timing else 0.0
+            if timing:
+                copy_breakdown = ",".join(f"{name}:{elapsed:.6f}" for name, elapsed in copy_times)
+                print(
+                    f"[vLLM sparse set_lora timing] module={module_tag} reps={len(spans)} "
+                    f"slice_s={t2 - t1:.6f} copy_s={t3 - t2:.6f} total_s={t3 - t0:.6f} "
+                    f"copy_breakdown={copy_breakdown}",
+                    flush=True,
+                )
 
         set_lora._tinker_sparse_shards = True  # type: ignore[attr-defined]
         cls.set_lora = set_lora  # type: ignore[method-assign]
@@ -1093,6 +1164,14 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             if spans is None:
                 return original3d(self, index, lora_a, lora_b)
 
+            module_tag = (
+                getattr(self, "prefix", None)
+                or getattr(getattr(self, "base_layer", None), "prefix", None)
+                or type(self).__name__
+            )
+
+            timing = _env_flag("MINT_VLLM_TIMING_SET_LORA", default=False)
+            t0 = time.perf_counter() if timing else 0.0
             self.reset_lora(index)
             self.adapter_enabled[index] = 1
 
@@ -1105,6 +1184,7 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                 w13_lora_b = w13_lora_b.reshape(w13_lora_b.shape[0], src_experts, -1).permute(1, 0, 2)
                 w2_lora_b = w2_lora_b.reshape(w2_lora_b.shape[0], src_experts, -1).permute(1, 0, 2)
 
+            t1 = time.perf_counter() if timing else 0.0
             sliced_w13_lora_a = _slice_sparse(
                 w13_lora_a,
                 self._slice_w13_a,
@@ -1125,11 +1205,34 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                 self._slice_w2_b,
                 reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
             )
+            t2 = time.perf_counter() if timing else 0.0
+            copy_times: list[tuple[str, float]] = []
 
-            _copy_sparse(self.w13_lora_a_stacked[0], index, sliced_w13_lora_a, spans)
-            _copy_sparse(self.w2_lora_a_stacked[0], index, sliced_w2_lora_a, spans)
-            _copy_sparse(self.w13_lora_b_stacked[0], index, sliced_w13_lora_b, spans)
-            _copy_sparse(self.w2_lora_b_stacked[0], index, sliced_w2_lora_b, spans)
+            def _timed_copy(name: str, dst, src):  # type: ignore[no-untyped-def]
+                c0 = time.perf_counter() if timing else 0.0
+                _copy_sparse(dst, index, src, spans)
+                c1 = time.perf_counter() if timing else 0.0
+                if timing:
+                    copy_times.append((name, c1 - c0))
+                    print(
+                        f"[vLLM sparse set_lora copy] module={module_tag} name={name} "
+                        f"reps={len(spans)} elapsed_s={c1 - c0:.6f}",
+                        flush=True,
+                    )
+
+            _timed_copy("w13_a_0", self.w13_lora_a_stacked[0], sliced_w13_lora_a)
+            _timed_copy("w2_a_0", self.w2_lora_a_stacked[0], sliced_w2_lora_a)
+            _timed_copy("w13_b_0", self.w13_lora_b_stacked[0], sliced_w13_lora_b)
+            _timed_copy("w2_b_0", self.w2_lora_b_stacked[0], sliced_w2_lora_b)
+            t3 = time.perf_counter() if timing else 0.0
+            if timing:
+                copy_breakdown = ",".join(f"{name}:{elapsed:.6f}" for name, elapsed in copy_times)
+                print(
+                    f"[vLLM sparse set_lora timing] module={module_tag} reps={len(spans)} "
+                    f"slice_s={t2 - t1:.6f} copy_s={t3 - t2:.6f} total_s={t3 - t0:.6f} "
+                    f"copy_breakdown={copy_breakdown}",
+                    flush=True,
+                )
 
         set_lora_3d._tinker_sparse_shards = True  # type: ignore[attr-defined]
         cls3d.set_lora = set_lora_3d  # type: ignore[method-assign]
