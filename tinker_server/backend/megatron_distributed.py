@@ -40,6 +40,7 @@ from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE,
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
+from tinker_server.backend.volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -116,45 +117,17 @@ def _model_key_from_base_model(base_model: str) -> str:
 
 
 def _preferred_worker_node_ips_for_model(base_model: str) -> list[str]:
-    raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-    except Exception:
-        logger.warning("MINT_MODEL_NODE_IPS_JSON is not valid JSON; ignoring")
-        return []
-    if not isinstance(data, dict):
-        logger.warning("MINT_MODEL_NODE_IPS_JSON must be a JSON object; ignoring")
-        return []
-
     model_key = _model_key_from_base_model(base_model)
-    candidates = None
-    for key in (model_key, model_key.lower(), base_model, base_model.lower()):
-        value = data.get(key)
-        if value is not None:
-            candidates = value
-            break
-    if not isinstance(candidates, list):
+    node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+        lookup_keys=[model_key, model_key.lower(), base_model, base_model.lower()],
+        env_var_name="MINT_MODEL_NODE_IPS_JSON",
+        context=f"[MegatronWorkerGroup] node pinning model={model_key}",
+    )
+    if not node_ips:
         return []
-
-    cleaned = [str(ip).strip() for ip in candidates if str(ip).strip()]
-    if not cleaned:
-        return []
-
-    try:
-        cluster = ray.cluster_resources() or {}
-    except Exception:
-        cluster = {}
-    usable = [ip for ip in cleaned if f"node:{ip}" in cluster]
-    if not usable:
-        logger.warning(f"[MegatronWorkerGroup] node pinning has no usable node IPs for model={model_key}")
-        return []
-    if len(usable) < len(cleaned):
-        skipped = [ip for ip in cleaned if ip not in usable]
-        logger.warning(f"[MegatronWorkerGroup] node pinning skipped missing nodes for model={model_key}: {skipped}")
-    logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {usable}")
-    return usable
+    logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {node_ips}")
+    return node_ips
 
 
 def _make_megatron_actor_name(base_model: str) -> str:
@@ -4898,6 +4871,14 @@ class MegatronWorkerGroup:
                         f"need {nodes_needed} nodes for world_size={world_size}, got {len(preferred_node_ips)}"
                     )
                 node_ips = preferred_node_ips[:nodes_needed]
+                required_by_node_ip: dict[str, int] = {}
+                for i in range(world_size):
+                    node_ip = node_ips[i // int(gpus_per_node)]
+                    required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
+                assert_node_ip_capacity(
+                    required_gpus_by_node_ip=required_by_node_ip,
+                    context=f"[MegatronWorkerGroup] node pinning base_model={self.base_model}",
+                )
                 bundles = build_node_affinity_gpu_bundles(
                     node_ips=node_ips,
                     gpus_per_node=gpus_per_node,

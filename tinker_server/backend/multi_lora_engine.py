@@ -21,6 +21,11 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from . import ray_kill
 from .lora_registry import LoRARegistry, LoRASlotInfo
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_node_ip_list,
+    parse_model_single_node_ip,
+)
 
 if TYPE_CHECKING:
     pass
@@ -1319,65 +1324,47 @@ class MultiModelInferenceManager:
 
             pinned_node_ip: str | None = None
             pinned_json = _read_process_env_var("MINT_VLLM_PINNED_NODE_IP_JSON")
-            normalized_keys: list[str] = []
             raw_node_ips = _read_process_env_var("MINT_MODEL_NODE_IPS_JSON")
-            normalized_node_ip_keys: list[str] = []
-            if pinned_json:
-                try:
-                    parsed = json.loads(pinned_json)
-                    if isinstance(parsed, dict):
-                        normalized = {str(k).strip(): v for k, v in parsed.items()}
-                        normalized_keys = list(normalized.keys())
-                        lookup_keys = [
-                            str(model_name).strip(),
-                            str(model_name).strip().lower(),
-                            str(actor_name).strip(),
-                            str(actor_name).strip().lower(),
-                        ]
-                        v = None
-                        for key in lookup_keys:
-                            v = normalized.get(key)
-                            if v is not None:
-                                break
-                        if isinstance(v, str) and v.strip():
-                            pinned_node_ip = v.strip()
-                except Exception:
-                    pinned_node_ip = None
-            if pinned_node_ip is None:
-                if raw_node_ips:
-                    try:
-                        parsed_node_ips = json.loads(raw_node_ips)
-                        if isinstance(parsed_node_ips, dict):
-                            normalized_node_ips = {str(k).strip(): v for k, v in parsed_node_ips.items()}
-                            normalized_node_ip_keys = list(normalized_node_ips.keys())
-                            for key in (
-                                str(model_name).strip(),
-                                str(model_name).strip().lower(),
-                                str(actor_name).strip(),
-                                str(actor_name).strip().lower(),
-                            ):
-                                value = normalized_node_ips.get(key)
-                                if isinstance(value, list) and value:
-                                    first_ip = str(value[0]).strip()
-                                    if first_ip:
-                                        pinned_node_ip = first_ip
-                                        break
-                    except Exception:
-                        pass
+            lookup_keys = [
+                str(model_name).strip(),
+                str(model_name).strip().lower(),
+                str(actor_name).strip(),
+                str(actor_name).strip().lower(),
+            ]
+            pinned_node_ip = parse_model_single_node_ip(
+                raw_json=pinned_json,
+                lookup_keys=lookup_keys,
+                env_var_name="MINT_VLLM_PINNED_NODE_IP_JSON",
+                context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
+            )
+            configured_node_ips = parse_model_node_ip_list(
+                raw_json=raw_node_ips,
+                lookup_keys=lookup_keys,
+                env_var_name="MINT_MODEL_NODE_IPS_JSON",
+                context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
+            )
+            if pinned_node_ip is None and configured_node_ips:
+                pinned_node_ip = configured_node_ips[0]
             logger.info(
-                "single_node_vllm_pin_lookup model=%r actor=%r pinned_json_present=%s pinned_node_ip=%s normalized_keys=%s raw_pinned_json=%r raw_model_node_ips=%r normalized_model_node_ip_keys=%s",
+                "single_node_vllm_pin_lookup model=%r actor=%r pinned_json_present=%s pinned_node_ip=%s lookup_keys=%s raw_pinned_json=%r raw_model_node_ips=%r configured_node_ips=%s",
                 model_name,
                 actor_name,
                 bool(pinned_json),
                 pinned_node_ip,
-                normalized_keys,
+                lookup_keys,
                 pinned_json,
                 raw_node_ips,
-                normalized_node_ip_keys,
+                configured_node_ips,
             )
 
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
+            total_gpus = int(config.inference_tp) * int(config.inference_dp)
+            if pinned_node_ip is not None:
+                assert_node_ip_capacity(
+                    required_gpus_by_node_ip={pinned_node_ip: total_gpus},
+                    context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
+                )
 
             # Determine max_loras: per-model override > MoE default (1) > global default
             model_max_loras_override = config.max_loras

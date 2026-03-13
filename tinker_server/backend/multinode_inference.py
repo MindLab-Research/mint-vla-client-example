@@ -49,6 +49,11 @@ from tinker_server.logging_context import (
 )
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_node_ip_list,
+    parse_model_single_node_ip,
+)
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
@@ -109,7 +114,11 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
         _patch_cls(cls)
 
 
-def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str, Any]:
+def _node_affinity_scheduling_opts_for_model(
+    model_name: str | None,
+    *,
+    required_gpus: int,
+) -> dict[str, Any]:
     """Optional single-node pinning for vLLM actors (mp backend).
 
     Use-case: pack MoE inference+training on the same 8-GPU node during prewarm.
@@ -118,28 +127,20 @@ def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str
     """
     if not model_name:
         return {}
-    mapping_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
-    if not mapping_json:
+    pinned_ip = parse_model_single_node_ip(
+        raw_json=os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON"),
+        lookup_keys=[model_name, model_name.lower()],
+        env_var_name="MINT_VLLM_PINNED_NODE_IP_JSON",
+        context=f"multinode_vllm_pin model={model_name}",
+    )
+    if pinned_ip is None:
         return {}
-
-    try:
-        mapping = json.loads(mapping_json)
-    except Exception:
-        return {}
-    if not isinstance(mapping, dict):
-        return {}
-    pinned_ip = mapping.get(model_name)
-    if not isinstance(pinned_ip, str) or not pinned_ip.strip():
-        return {}
-    pinned_ip = pinned_ip.strip()
+    assert_node_ip_capacity(
+        required_gpus_by_node_ip={pinned_ip: int(required_gpus)},
+        context=f"multinode_vllm_pin model={model_name}",
+    )
 
     node_res = f"node:{pinned_ip}"
-    try:
-        if node_res not in (ray.cluster_resources() or {}):
-            return {}
-    except Exception:
-        return {}
-
     logger.info(f"multinode_vllm_pin model={model_name} resources={node_res!r}")
     return {"resources": {node_res: 0.001}}
 
@@ -147,45 +148,16 @@ def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str
 def _preferred_worker_node_ips_for_model(model_name: str | None) -> list[str]:
     if not model_name:
         return []
-    raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
-    if not raw:
+    node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+        lookup_keys=[model_name, model_name.lower()],
+        env_var_name="MINT_MODEL_NODE_IPS_JSON",
+        context=f"multinode_vllm_node_pin model={model_name}",
+    )
+    if not node_ips:
         return []
-
-    try:
-        data = json.loads(raw)
-    except Exception:
-        logger.warning("MINT_MODEL_NODE_IPS_JSON is not valid JSON; ignoring")
-        return []
-    if not isinstance(data, dict):
-        logger.warning("MINT_MODEL_NODE_IPS_JSON must be a JSON object; ignoring")
-        return []
-
-    candidates = []
-    for key in (model_name, model_name.lower()):
-        value = data.get(key)
-        if value is not None:
-            candidates = value
-            break
-    if not isinstance(candidates, list):
-        return []
-
-    cleaned = [str(ip).strip() for ip in candidates if str(ip).strip()]
-    if not cleaned:
-        return []
-
-    try:
-        cluster = ray.cluster_resources() or {}
-    except Exception:
-        cluster = {}
-    usable = [ip for ip in cleaned if f"node:{ip}" in cluster]
-    if not usable:
-        logger.warning(f"multinode_vllm_node_pin model={model_name} has no usable node IPs")
-        return []
-    if len(usable) < len(cleaned):
-        skipped = [ip for ip in cleaned if ip not in usable]
-        logger.warning(f"multinode_vllm_node_pin model={model_name} skipped_missing_nodes={skipped}")
-    logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={usable}")
-    return usable
+    logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={node_ips}")
+    return node_ips
 
 
 def _raise_serializable_vllm_error(*, where: str, request_id: str, extra: dict[str, Any]) -> None:
@@ -1973,6 +1945,22 @@ class MultiNodeInferenceEngine:
             # when C2 is unavailable). If provided, it takes precedence over queue-based selection.
             preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
             if preferred_node_ips and distributed_executor_backend != "mp":
+                required_by_node_ip: dict[str, int] = {}
+                for bundle in resources.pg_bundles:
+                    if float(bundle.get("GPU", 0) or 0) <= 0:
+                        continue
+                    for key, value in bundle.items():
+                        if not isinstance(key, str) or not key.startswith("node:"):
+                            continue
+                        if float(value or 0) <= 0:
+                            continue
+                        node_ip = key.split("node:", 1)[1]
+                        required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
+                if required_by_node_ip:
+                    assert_node_ip_capacity(
+                        required_gpus_by_node_ip=required_by_node_ip,
+                        context=f"multinode_vllm_node_pin model={self.model_name}",
+                    )
                 nodes_needed = (int(worker_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
                 if len(preferred_node_ips) < nodes_needed:
                     raise RuntimeError(
@@ -2111,7 +2099,10 @@ class MultiNodeInferenceEngine:
                 if mp_pinned_node_ip:
                     scheduling_opts = {"resources": {f"node:{mp_pinned_node_ip}": 0.001}}
                 else:
-                    scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
+                    scheduling_opts = _node_affinity_scheduling_opts_for_model(
+                        self.model_name,
+                        required_gpus=int(worker_gpus),
+                    )
 
             from ..config import otel_env_vars
             env_vars = {
