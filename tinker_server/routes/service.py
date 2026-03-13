@@ -26,6 +26,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ..auth_identity import get_user_data as _request_user_data
+from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request, is_admin_user_data
 from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -59,20 +62,18 @@ session_manager: SessionManager | None = None
 
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state (set by auth middleware)."""
-    return getattr(request.state, "user_data", None)
+    return _request_user_data(request)
 
 
 def _get_user_id(request: Request) -> str | None:
-    user_data = _get_user_data(request)
-    if user_data:
-        return user_data.get("user_id")
-    return None
+    return _request_user_id(request)
 
 
-def _user_visible(request_user_id: str | None, owner: str | None) -> bool:
+def _user_visible(request_user_data: dict | None, owner: str | None) -> bool:
+    request_user_id = str(request_user_data.get("user_id")) if request_user_data and request_user_data.get("user_id") else None
     if request_user_id is None:
         return True
-    if request_user_id == "admin":
+    if is_admin_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
 
@@ -560,7 +561,7 @@ async def create_sampling_session(
 
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
 async def get_session(session_id: str, http_request: Request) -> GetSessionResponse:
-    request_user_id = _get_user_id(http_request)
+    request_user_data = _get_user_data(http_request)
     info = None
     try:
         from ..backend.session_index_store import get_session_index
@@ -570,7 +571,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
     if isinstance(info, dict):
-        if not _user_visible(request_user_id, info.get("user_id")):
+        if not _user_visible(request_user_data, info.get("user_id")):
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
         return GetSessionResponse(
             training_run_ids=list(info.get("training_run_ids") or []),
@@ -578,7 +579,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
         )
 
     entry = sessions.get(session_id)
-    if entry and _user_visible(request_user_id, entry.get("user_id")):
+    if entry and _user_visible(request_user_data, entry.get("user_id")):
         return GetSessionResponse(training_run_ids=[], sampler_ids=[])
 
     raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
@@ -586,7 +587,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
 
 @router.get("/sessions", response_model=ListSessionsResponse)
 async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request = None) -> ListSessionsResponse:
-    request_user_id = _get_user_id(http_request) if http_request else None
+    request_user_data = _get_user_data(http_request) if http_request else None
     entries: list[dict] = []
     seen: set[str] = set()
 
@@ -601,7 +602,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
         sid = info.get("session_id")
         if not isinstance(sid, str) or not sid:
             continue
-        if not _user_visible(request_user_id, info.get("user_id")):
+        if not _user_visible(request_user_data, info.get("user_id")):
             continue
         entries.append({"session_id": sid, "created_at": info.get("created_at")})
         seen.add(sid)
@@ -609,7 +610,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
     for sid, entry in sessions.items():
         if sid in seen:
             continue
-        if not _user_visible(request_user_id, entry.get("user_id")):
+        if not _user_visible(request_user_data, entry.get("user_id")):
             continue
         entries.append({"session_id": sid, "created_at": entry.get("created_at")})
 
@@ -626,7 +627,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
 
 @router.get("/samplers/{sampler_id}", response_model=GetSamplerResponse)
 async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerResponse:
-    request_user_id = _get_user_id(http_request)
+    request_user_data = _get_user_data(http_request)
     info = None
     try:
         from ..backend.session_index_store import get_sampler_index
@@ -636,7 +637,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
     if isinstance(info, dict):
-        if not _user_visible(request_user_id, info.get("user_id")):
+        if not _user_visible(request_user_data, info.get("user_id")):
             raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
         base_model = info.get("base_model")
         if not base_model and session_manager is not None:
@@ -701,15 +702,15 @@ def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
         resolve_checkpoint_uri,
     )
 
-    is_admin = user_id == "admin"
+    is_admin = is_admin_request(http_request)
     if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id)
+    resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=is_admin)
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
-        ensure_checkpoint_path_allowed(resolved, user_id=user_id)
+        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
@@ -819,7 +820,7 @@ def _require_admin(request: Request) -> None:
     if not server_config.auth_enabled:
         return
     user_data = getattr(request.state, "user_data", None)
-    if not user_data or user_data.get("user_id") != "admin":
+    if not is_admin_user_data(user_data):
         raise HTTPException(status_code=403, detail="Admin access required")
 
 

@@ -6,6 +6,8 @@ Admin users (using hardcoded API keys) have full access to all models.
 
 from typing import Optional
 
+from .auth_identity import is_admin_user_data
+
 # Models that are restricted from MINT platform users
 RESTRICTED_MODELS = {
     "moonshotai/Kimi-K2-Instruct",
@@ -25,13 +27,11 @@ def is_mint_platform_user(user_data: Optional[dict]) -> bool:
     if user_data is None:
         return False
 
-    user_id = user_data.get("user_id")
-
-    # Admin users have user_id="admin"
-    if user_id == "admin":
+    if is_admin_user_data(user_data):
         return False
 
     # Any other user_id means it's a MINT platform user (sk- token)
+    user_id = user_data.get("user_id")
     return user_id is not None
 
 

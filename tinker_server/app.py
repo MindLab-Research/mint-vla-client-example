@@ -22,6 +22,7 @@ from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .config import config
 from .gateway import close_http_clients
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
 from .logging_context import (
     classify_failure_reason,
     ensure_trace_id,
@@ -773,11 +774,11 @@ async def lifespan(app: FastAPI):
             "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
             str(item.request_id),
         )
-        await sampling._do_sample(item.request_id, req, item.user_id)
+        await sampling._do_sample(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
 
     async def _exec_sampling_compute_logprobs(item):
         req = ComputeLogprobsRequest.model_validate_json(item.request_json)
-        await sampling._do_compute_logprobs(item.request_id, req, item.user_id)
+        await sampling._do_compute_logprobs(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
 
     async def _exec_training_create_model(item):
         req = CreateModelRequest.model_validate_json(item.request_json)
@@ -789,20 +790,21 @@ async def lifespan(app: FastAPI):
 
     async def _exec_training_train_step(item):
         req = TrainStepRequest.model_validate_json(item.request_json)
-        await training._do_train_step(item.request_id, req, item.user_id)
+        await training._do_train_step(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
 
     async def _exec_training_forward(item):
         req = ForwardRequest.model_validate_json(item.request_json)
-        await training._do_forward(item.request_id, req)
+        await training._do_forward(item.request_id, req, (item.extra or {}).get("gateway_auth"))
 
     async def _exec_training_forward_backward(item):
         req = ForwardBackwardRequest.model_validate_json(item.request_json)
-        await training._do_forward_backward(item.request_id, req, item.user_id)
+        await training._do_forward_backward(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
 
     async def _exec_training_save_weights_for_sampler(item):
         req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
         prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker)
+        is_admin = bool((item.extra or {}).get("is_admin"))
+        await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker, is_admin)
 
     async def _exec_training_optim_step(item):
         req = OptimStepRequest.model_validate_json(item.request_json)
@@ -916,6 +918,12 @@ async def lifespan(app: FastAPI):
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+
+    from .usage_store import close_usage_store
+
+    await close_usage_store()
+
+    from .gateway import close_http_clients
 
     await close_http_clients()
 
@@ -1139,14 +1147,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
-    """Validate API key or sk- token from X-API-Key or Authorization header.
-
-    Supports two authentication methods (checked in order):
-    1. Hardcoded API key (TINKER_API_KEY) - direct string comparison
-    2. Encrypted sk- tokens (TINKER_TOKEN_SECRET_KEY) - AES decryption
-
-    If neither is configured, auth is disabled (dev mode).
-    """
+    """Validate gateway-forwarded auth headers (preferred) with legacy fallback."""
     path = request.url.path
     traceparent_trace_id = extract_trace_id_from_traceparent(request.headers.get("traceparent"))
     incoming_trace_id = traceparent_trace_id
@@ -1166,11 +1167,7 @@ async def api_key_auth_middleware(request: Request, call_next):
     async def _next_with_trace():
         return _with_trace(await call_next(request))
 
-    # Skip auth if no authentication configured (dev mode)
-    if not config.auth_enabled:
-        return await _next_with_trace()
-
-    # Skip auth for specific paths
+    # Skip auth for specific paths.
     if path in UNAUTHENTICATED_PATHS:
         return await _next_with_trace()
 
@@ -1202,42 +1199,58 @@ async def api_key_auth_middleware(request: Request, call_next):
             except Exception:
                 return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid download token"}))
 
-    # Try X-API-Key header first, then Authorization header
-    api_key = request.headers.get("X-API-Key", "")
-    if not api_key:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            api_key = auth_header[7:]
-        elif auth_header.startswith("sk-"):
-            # Support direct Authorization: sk-xxx format
-            api_key = auth_header
+    if path.startswith(("/api/v1/", "/internal/")):
+        if has_gateway_auth_headers(dict(request.headers)):
+            try:
+                auth_ctx = extract_gateway_auth_context(
+                    request,
+                    internal_api_token=config.internal_api_token,
+                )
+            except HTTPException as exc:
+                return _with_trace(JSONResponse(status_code=exc.status_code, content={"error": exc.detail}))
+            request.state.gateway_auth = auth_ctx
+            request.state.user_data = {
+                "user_id": auth_ctx.user_id,
+                "user_role": auth_ctx.user_role,
+                "is_admin": auth_ctx.user_role == "admin",
+                "account_id": auth_ctx.account_id,
+                "apikey_id": auth_ctx.apikey_id,
+                "request_id": auth_ctx.request_id,
+            }
+            return await _next_with_trace()
 
-    if not api_key:
-        return _with_trace(JSONResponse(
-            status_code=401,
-            content={"error": "Missing API key"},
-        ))
+        # Legacy auth disabled => dev mode pass-through.
+        if not config.auth_enabled:
+            return await _next_with_trace()
 
-    # Method 1: Check hardcoded API key (admin)
-    if config.validate_api_key(api_key):
-        # Admin key - assign special "admin" user_id for checkpoint ownership
-        request.state.user_data = {"user_id": "admin"}
-        return await _next_with_trace()
+        api_key = request.headers.get("X-API-Key", "")
+        if not api_key:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                api_key = auth_header[7:]
+            elif auth_header.startswith("sk-"):
+                api_key = auth_header
 
-    # Method 2: Try sk- token decryption
-    if api_key.startswith("sk-") and config.token_secret_key:
-        encryptor = get_token_encryptor()
-        if encryptor:
-            user_data = encryptor.decrypt_token(api_key)
-            if user_data is not None:
-                request.state.user_data = user_data
-                return await _next_with_trace()
+        if not api_key:
+            return _with_trace(JSONResponse(status_code=401, content={"error": "Missing API key"}))
 
-    # Neither method succeeded
-    return _with_trace(JSONResponse(
-        status_code=401,
-        content={"error": "Invalid API key or token"},
-    ))
+        if config.validate_api_key(api_key):
+            request.state.user_data = {"user_id": "admin", "user_role": "admin", "is_admin": True}
+            return await _next_with_trace()
+
+        if api_key.startswith("sk-") and config.token_secret_key:
+            encryptor = get_token_encryptor()
+            if encryptor:
+                user_data = encryptor.decrypt_token(api_key)
+                if user_data is not None:
+                    if "user_role" not in user_data:
+                        user_data["user_role"] = "admin" if user_data.get("user_id") == "admin" else "user"
+                    if "is_admin" not in user_data:
+                        user_data["is_admin"] = user_data.get("user_role") == "admin"
+                    request.state.user_data = user_data
+                    return await _next_with_trace()
+        return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid API key or token"}))
+    return await _next_with_trace()
 
 
 # Register routes with API prefix

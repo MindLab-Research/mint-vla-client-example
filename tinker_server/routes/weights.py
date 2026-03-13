@@ -23,6 +23,9 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from ..auth_identity import get_user_data as _request_user_data
+from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request
 from ..backend.future_store import future_store
 from ..checkpoints import (
     CHECKPOINTS_DIR,
@@ -69,15 +72,12 @@ inference_manager: SessionManager | None = None  # For multi-LoRA sampling regis
 
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state."""
-    return getattr(request.state, "user_data", None)
+    return _request_user_data(request)
 
 
 def _get_user_id(request: Request) -> str | None:
     """Extract user_id from request state."""
-    user_data = _get_user_data(request)
-    if user_data:
-        return user_data.get("user_id")
-    return None
+    return _request_user_id(request)
 
 
 def _get_webhook_url(request: Request) -> str | None:
@@ -88,7 +88,7 @@ def _get_webhook_url(request: Request) -> str | None:
     return None
 
 
-def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
+def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
     """Convert path identifier to filesystem path.
 
     Args:
@@ -101,8 +101,8 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
     Returns:
         Filesystem path.
     """
-    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id)
-    ensure_checkpoint_path_allowed(resolved, user_id=user_id)
+    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
+    ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
     return materialize_persistent_checkpoint(resolved)
 
 
@@ -111,8 +111,8 @@ def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     return f"mint://{model_id}/{checkpoint_name}"
 
 
-def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None) -> None:
-    if request_user_id == "admin":
+def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None, is_admin: bool = False) -> None:
+    if is_admin:
         return
     if request_user_id is None:
         if owner_id is None:
@@ -127,7 +127,13 @@ def _persistent_owner_root(user_id: str | None) -> str:
     return os.path.join(get_persistent_checkpoints_dir(), user_id or "anonymous")
 
 
-def _persistent_candidate_paths(*, model_id: str, checkpoint_name: str, user_id: str | None) -> list[str]:
+def _persistent_candidate_paths(
+    *,
+    model_id: str,
+    checkpoint_name: str,
+    user_id: str | None,
+    is_admin: bool = False,
+) -> list[str]:
     candidates: list[str] = []
     for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
         owner_dir = user_id or "anonymous"
@@ -138,7 +144,7 @@ def _persistent_candidate_paths(*, model_id: str, checkpoint_name: str, user_id:
                 os.path.join(root, owner_dir, checkpoint_name),
             ]
         )
-        if user_id == "admin" and os.path.isdir(root):
+        if is_admin and os.path.isdir(root):
             try:
                 for owner in os.listdir(root):
                     candidates.append(os.path.join(root, owner, model_id, checkpoint_name))
@@ -230,7 +236,11 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
     user_data = _get_user_data(request)
     if not can_access_model(base_model, user_data):
         raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
-    _require_checkpoint_owner(request_user_id=_get_user_id(request), owner_id=owner_id)
+    _require_checkpoint_owner(
+        request_user_id=_get_user_id(request),
+        owner_id=owner_id,
+        is_admin=is_admin_request(request),
+    )
 
     try:
         resp = await forward_json(
@@ -273,7 +283,11 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
     user_data = _get_user_data(request)
     if not can_access_model(base_model, user_data):
         raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
-    _require_checkpoint_owner(request_user_id=_get_user_id(request), owner_id=owner_id)
+    _require_checkpoint_owner(
+        request_user_id=_get_user_id(request),
+        owner_id=owner_id,
+        is_admin=is_admin_request(request),
+    )
 
     params = dict(request.query_params)
     if direct:
@@ -947,9 +961,9 @@ async def load_state(
         incoming_headers = dict(http_request.headers)
         json_body = request.model_dump()
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.path, user_id=user_id)
+            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
             try:
-                ensure_checkpoint_path_allowed(local_path, user_id=user_id)
+                ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=is_admin_request(http_request))
             except PermissionError as e:
                 raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
@@ -1019,7 +1033,7 @@ async def load_state(
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            load_path = _resolve_mint_path(request.path, user_id=user_id)
+            load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
             validate_checkpoint_load_contract(load_path, load_optimizer=True)
         except ValueError as e:
             raise HTTPException(
@@ -1083,7 +1097,7 @@ async def _do_load_state(
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
         # Resolve path
-        load_path = _resolve_mint_path(request.path, user_id=user_id)
+        load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
@@ -1284,7 +1298,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 os.path.join(root, model_id),
             ]
         )
-        if user_id == "admin" and os.path.isdir(root):
+        if is_admin_request(request) and os.path.isdir(root):
             try:
                 for owner in os.listdir(root):
                     candidate_paths.append(os.path.join(root, owner, model_id))
@@ -1323,7 +1337,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
             if metadata.get("model_id") != model_id:
                 continue
-            if user_id != "admin" and metadata.get("owner_id") != user_id:
+            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
                 continue
 
             # Try to parse step from directory name
@@ -1375,7 +1389,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
     # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
     owner_roots: list[str]
-    if user_id == "admin":
+    if is_admin_request(request):
         try:
             owner_roots = []
             for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
@@ -1412,7 +1426,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 continue
             if metadata.get("model_id") != model_id:
                 continue
-            if user_id != "admin" and metadata.get("owner_id") != user_id:
+            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
                 continue
             created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
             checkpoint_type = metadata.get("checkpoint_type")
@@ -1485,7 +1499,12 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     user_id = _get_user_id(request)
 
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = _persistent_candidate_paths(model_id=model_id, checkpoint_name=checkpoint_name, user_id=user_id)
+    candidates = _persistent_candidate_paths(
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        user_id=user_id,
+        is_admin=is_admin_request(request),
+    )
 
     ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
     if ckpt_path is None:
@@ -1504,7 +1523,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
 
     if metadata.get("model_id") != model_id:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-    if user_id != "admin" and metadata.get("owner_id") != user_id:
+    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
     if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
@@ -1560,7 +1579,12 @@ async def download_checkpoint_archive(
             user_id = payload.get("user_id")
 
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = _persistent_candidate_paths(model_id=model_id, checkpoint_name=checkpoint_name, user_id=user_id)
+    candidates = _persistent_candidate_paths(
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        user_id=user_id,
+        is_admin=is_admin_request(request),
+    )
 
     # Prefer a candidate whose metadata matches the requested type.
     # This avoids false 404s when both "training" and "sampler" checkpoints share the same name.
@@ -1589,7 +1613,7 @@ async def download_checkpoint_archive(
             continue
         if expected_type is not None and md.get("checkpoint_type") != expected_type:
             continue
-        if user_id != "admin" and md.get("owner_id") != user_id:
+        if not is_admin_request(request) and md.get("owner_id") != user_id:
             saw_unowned = True
             continue
         ckpt_path = p

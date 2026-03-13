@@ -312,9 +312,14 @@ def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:
         tf.add(checkpoint_dir, arcname=root, recursive=True)
 
 
-def _iter_metadata_paths(roots: list[str], *, user_id: str | None = None) -> list[str]:
+def _iter_metadata_paths(
+    roots: list[str],
+    *,
+    user_id: str | None = None,
+    is_admin: bool = False,
+) -> list[str]:
     patterns: list[str] = []
-    if user_id and user_id != "admin":
+    if user_id and not is_admin:
         base = os.path.join("", checkpoint_owner_dir(user_id))
         prefixes = [base]
     else:
@@ -352,9 +357,17 @@ def _iter_metadata_paths(roots: list[str], *, user_id: str | None = None) -> lis
 
 
 def resolve_checkpoint_id(
-    checkpoint_id: str, checkpoints_dir: str, *, user_id: str | None = None
+    checkpoint_id: str,
+    checkpoints_dir: str,
+    *,
+    user_id: str | None = None,
+    is_admin: bool = False,
 ) -> str | None:
-    for metadata_path in _iter_metadata_paths(get_resolution_roots(primary_root=checkpoints_dir), user_id=user_id):
+    for metadata_path in _iter_metadata_paths(
+        get_resolution_roots(primary_root=checkpoints_dir),
+        user_id=user_id,
+        is_admin=is_admin,
+    ):
         try:
             with open(metadata_path) as f:
                 metadata = json.load(f)
@@ -372,7 +385,13 @@ def _strip_tinker_checkpoint_kind(path_part: str) -> str:
     return path_part
 
 
-def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | None = None) -> str:
+def resolve_checkpoint_uri(
+    uri: str,
+    checkpoints_dir: str,
+    *,
+    user_id: str | None = None,
+    is_admin: bool = False,
+) -> str:
     if uri.startswith("file://"):
         return uri[7:]
 
@@ -380,7 +399,7 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
     owner_dir = checkpoint_owner_dir(user_id)
 
     if uri.startswith("ckpt_"):
-        resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=owner_dir)
+        resolved = resolve_checkpoint_id(uri, checkpoints_dir, user_id=owner_dir, is_admin=is_admin)
         return resolved or uri
 
     if uri.startswith("tinker://"):
@@ -390,7 +409,7 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
     else:
         return uri
 
-    if user_id == "admin":
+    if is_admin:
         for root in roots:
             legacy = os.path.join(root, path_part)
             if os.path.exists(legacy):
@@ -407,12 +426,16 @@ def resolve_checkpoint_uri(uri: str, checkpoints_dir: str, *, user_id: str | Non
     return os.path.join(get_persistent_checkpoints_dir(), owner_dir, path_part)
 
 
-def resolve_checkpoint_path(state_uri: str, *, user_id: str | None = None) -> str:
-    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR, user_id=user_id)
+def resolve_checkpoint_path(state_uri: str, *, user_id: str | None = None, is_admin: bool = False) -> str:
+    return resolve_checkpoint_uri(state_uri, CHECKPOINTS_DIR, user_id=user_id, is_admin=is_admin)
 
 
 def checkpoint_access_roots(
-    *, user_id: str | None, include_ephemeral: bool = True, include_cache: bool = True
+    *,
+    user_id: str | None,
+    is_admin: bool = False,
+    include_ephemeral: bool = True,
+    include_cache: bool = True,
 ) -> list[str]:
     roots = get_persistent_search_roots()
     if include_ephemeral:
@@ -420,7 +443,7 @@ def checkpoint_access_roots(
     if include_cache:
         roots.append(get_persistent_cache_dir())
 
-    if user_id == "admin":
+    if is_admin:
         return _dedupe_paths(roots)
 
     owner_dir = checkpoint_owner_dir(user_id)
@@ -431,12 +454,14 @@ def checkpoint_path_is_allowed(
     path: str,
     *,
     user_id: str | None,
+    is_admin: bool = False,
     include_ephemeral: bool = True,
     include_cache: bool = True,
 ) -> bool:
     real = os.path.realpath(path)
     for allowed_root in checkpoint_access_roots(
         user_id=user_id,
+        is_admin=is_admin,
         include_ephemeral=include_ephemeral,
         include_cache=include_cache,
     ):
@@ -450,14 +475,16 @@ def ensure_checkpoint_path_allowed(
     path: str,
     *,
     user_id: str | None,
+    is_admin: bool = False,
     include_ephemeral: bool = True,
     include_cache: bool = True,
 ) -> None:
-    if user_id == "admin":
+    if is_admin:
         return
     if not checkpoint_path_is_allowed(
         path,
         user_id=user_id,
+        is_admin=is_admin,
         include_ephemeral=include_ephemeral,
         include_cache=include_cache,
     ):
