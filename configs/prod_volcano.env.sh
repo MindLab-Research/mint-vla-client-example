@@ -8,13 +8,13 @@ export MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=1
 
 export TINKER_HOST=0.0.0.0
 export TINKER_PORT=18000
-export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
+export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
 
 export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_PREWARM_INFERENCE=1
 export MINT_PERSISTENT_PREWARM_TRAINING=1
-export MINT_PERSISTENT_TRAIN_LORA_RANK=16
+export MINT_PERSISTENT_TRAIN_LORA_RANK=64
 export MINT_PERSISTENT_TRAIN_LR=5e-5
 export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
 
@@ -31,7 +31,7 @@ export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwe
 export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
 export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"]}'
 
-export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-0.6B":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"},"Qwen/Qwen3-4B-Instruct-2507":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"}}'
+export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
 
 export TINKER_ENABLE_MULTI_LORA=1
 export MINT_ROUTER_REPLAY_MODE=disabled
@@ -55,7 +55,9 @@ export MINT_TIMING_DIAG=1
 export MINT_VERL_DIAGNOSTICS=1
 export MINT_LOG_KILL_STACK=1
 
-export PYTHONPATH=/vePFS-Mindverse/share/code/tinker-server-auth:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/megatron-bridge/src:/vePFS-Mindverse/share/huggingface/modules:/vePFS-Mindverse/share/code/tinker-server-auth/cpu-pydeps
+# API server imports from PFS overlays, including the PFS vLLM 0.16.0 package.
+# Ray actors keep using the image-bundled vLLM wheel because PFS_VLLM_PATH stays empty below.
+export PYTHONPATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg:/vePFS-Mindverse/share/code/tinker-server-auth:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/megatron-bridge/src:/vePFS-Mindverse/share/huggingface/modules:/vePFS-Mindverse/share/code/tinker-server-auth/cpu-pydeps
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export HF_HUB_OFFLINE=1
 export PYTHONDONTWRITEBYTECODE=1
