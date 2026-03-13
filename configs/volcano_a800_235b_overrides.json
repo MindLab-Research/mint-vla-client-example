@@ -5,7 +5,11 @@
     "train_tp": 4,
     "train_pp": 1,
     "train_ep": 8,
-    "max_num_batched_tokens": 2048,
+    "gpu_memory_utilization": 0.75,
+    "max_loras": 2,
+    "max_cpu_loras": 200,
+    "max_lora_rank": 64,
+    "max_num_batched_tokens": 256,
     "vllm_distributed_executor_backend": "ray"
   },
   "Qwen/Qwen3-235B-A22B-Thinking-2507": {
@@ -14,7 +18,11 @@
     "train_tp": 4,
     "train_pp": 1,
     "train_ep": 8,
-    "max_num_batched_tokens": 2048,
+    "gpu_memory_utilization": 0.75,
+    "max_loras": 2,
+    "max_cpu_loras": 200,
+    "max_lora_rank": 64,
+    "max_num_batched_tokens": 256,
     "vllm_distributed_executor_backend": "ray"
   }
 }

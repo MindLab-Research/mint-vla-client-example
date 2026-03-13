@@ -72,6 +72,70 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 
 ---
 
+## Python And PYTHONPATH Invariants
+
+For mint-dev API-host work, use the Python 3.12 venv:
+
+```bash
+/root/venv_k2_py31213/bin/python
+```
+
+Do not use system Python for Ray inspection, actor probes, or server startup.
+The dev Ray cluster is running Python 3.12, and host-side `ray.init(...)` with
+Python 3.10 will fail with version mismatch and waste time on fake errors.
+
+For API-server startup, use the full PFS Python path on the host:
+
+```bash
+export PYTHONPATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/$USER/tinker-server:/vePFS-Mindverse/share/huggingface/modules:/root/tinker_project/tinker-server
+```
+
+Reason:
+- actor `runtime_env` already gets full PFS `PYTHONPATH`
+- `verl_http` imports also happen on the API host before actor launch
+- repo-root-only `PYTHONPATH` creates fake import failures
+
+Do not pip-install packages until you have first verified that the API-host
+`PYTHONPATH` matches the intended PFS environment.
+
+## Placement Group Hygiene Is Mandatory
+
+Before any new actor placement attempt on mint-dev:
+
+1. List all non-REMOVED placement groups cluster-wide.
+2. If any owned stale or pending PG can reserve the target GPUs, remove it first.
+3. Only after that, check physical GPU occupancy on the target nodes.
+4. Only after both checks pass, start the server or actor.
+
+Hard rule:
+- Do not treat physically idle GPUs as sufficient evidence.
+- A stale PG is a real blocker even when every GPU shows `2 MiB`.
+- Do not retry placement until the stale PG is gone.
+
+Exact check pattern:
+
+```bash
+ssh mint-dev '/root/venv_k2_py31213/bin/python - <<'\''PY'\'''
+import ray, json
+from ray.util.placement_group import placement_group_table
+ray.init(address="192.168.37.134:6379", ignore_reinit_error=True)
+rows = []
+for pgid, info in placement_group_table().items():
+    if info.get("state") != "REMOVED":
+        rows.append({
+            "id": pgid,
+            "name": info.get("name"),
+            "state": info.get("state"),
+            "stats": info.get("stats"),
+        })
+print(json.dumps(rows, indent=2))
+PY'
+```
+
+If a stale PG is yours, remove it before any retry.
+
+---
+
 **Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. Set it explicitly before submitting any new dev worker tasks.
 
 ## Concurrent Dev Runs (Issue #83)
@@ -232,13 +296,13 @@ export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 
 ```bash
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PYTHONPATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/$USER/tinker-server:/vePFS-Mindverse/share/huggingface/modules:/root/tinker_project/tinker-server \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /root/venv_k2_py31213/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Stop Server
@@ -515,6 +579,12 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 **DO NOT run `ray start` on `mint-dev`:**
 - `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
 - Use `ray.init(address=...)` in Python or use Ray CLI commands that connect to the head without starting a local node.
+
+**Placement-group hygiene before retrying a large actor:**
+- If exact nodes are physically idle but `healthz` reports pending placement groups, inspect the global placement-group table before any retry.
+- Remove only placement groups you own, by exact actor-name namespace match.
+- Do not treat idle GPUs as proof that Ray has no logical reservations.
+- If you have not listed non-REMOVED PGs yet, you are not ready to start a new actor.
 
 **Safe connectivity check (no local raylet):**
 ```bash

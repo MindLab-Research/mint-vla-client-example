@@ -155,6 +155,107 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
         _patch_cls(cls)
 
 
+def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
+    """Bypass Ray compiled DAG for sample_tokens on PP=1 when explicitly enabled.
+
+    Keep the Ray backend and TP>1 placement, but avoid the compiled-DAG channel
+    path for the final execute_model/sample_tokens sequence. This is an
+    experiment-only escape hatch for cases where EngineCore wedges in
+    shared_memory_channel read/write during generation.
+    """
+
+    if not _env_flag("MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE", default=False):
+        return
+
+    import threading
+    from concurrent.futures import Future
+
+    import vllm.v1.executor.ray_executor as ray_exec_mod
+
+    cls = getattr(ray_exec_mod, "RayDistributedExecutor", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing RayDistributedExecutor")
+
+    original = getattr(cls, "sample_tokens", None)
+    if original is None:
+        raise RuntimeError("vLLM RayDistributedExecutor missing sample_tokens")
+    if getattr(original, "_tinker_patched_no_compiled_dag_sample", False):
+        return
+
+    completed_none = getattr(ray_exec_mod, "COMPLETED_NONE_FUTURE")
+
+    def _run_plain_collective(self, grammar_output):  # type: ignore[no-untyped-def]
+        scheduler_output = self.scheduler_output
+        if scheduler_output is None:
+            return None
+
+        self.scheduler_output = None
+        execute_out = self.collective_rpc(
+            "execute_model",
+            args=(scheduler_output,),
+            non_block=False,
+        )
+        # For sampler models this should be None on each worker; keep the path
+        # strict instead of adding any fallback behavior.
+        if self.uses_sampler and scheduler_output.total_num_scheduled_tokens:
+            if any(x is not None for x in execute_out):
+                raise RuntimeError(
+                    "Ray executor no-compiled-dag sample expected execute_model "
+                    "to return only None before sample_tokens"
+                )
+
+        sample_out = self.collective_rpc(
+            "sample_tokens",
+            args=(grammar_output,),
+            non_block=False,
+        )
+        if self.has_connector:
+            if self.kv_output_aggregator is None:
+                raise RuntimeError(
+                    "Ray executor no-compiled-dag sample requires "
+                    "kv_output_aggregator when connector is enabled"
+                )
+            return self.kv_output_aggregator.aggregate(sample_out)
+        return sample_out[0]
+
+    def sample_tokens(self, grammar_output, non_block: bool = False):  # type: ignore[no-untyped-def]
+        if self.parallel_config.pipeline_parallel_size != 1:
+            return original(self, grammar_output, non_block=non_block)
+
+        if self.scheduler_output is None:
+            return completed_none if non_block else None
+
+        if not getattr(self, "_tinker_logged_no_cdag_sample", False):
+            print(
+                "[mint patch] RayDistributedExecutor.sample_tokens using "
+                "no-compiled-dag fallback",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._tinker_logged_no_cdag_sample = True
+
+        if not non_block:
+            return _run_plain_collective(self, grammar_output)
+
+        fut: Future = Future()
+
+        def _runner() -> None:
+            try:
+                fut.set_result(_run_plain_collective(self, grammar_output))
+            except BaseException as e:
+                fut.set_exception(e)
+
+        threading.Thread(
+            target=_runner,
+            name="mint-ray-no-cdag-sample",
+            daemon=True,
+        ).start()
+        return fut
+
+    sample_tokens._tinker_patched_no_compiled_dag_sample = True  # type: ignore[attr-defined]
+    cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
+
+
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
     """Avoid expensive dummy-LoRA warmup during profiling runs.
 
@@ -250,26 +351,51 @@ def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
     if cls is None:
         raise RuntimeError("vLLM missing GPUModelRunner")
 
+    import inspect
+
     original = getattr(cls, "_dummy_run", None)
     if original is None:
         raise RuntimeError("vLLM GPUModelRunner missing _dummy_run")
     if getattr(original, "_tinker_patched_disable_profile_dummy_loras", False):
         return
+    try:
+        original_sig = inspect.signature(original)
+    except Exception:
+        original_sig = None
+
+    def _supports_kw(name: str) -> bool:
+        if original_sig is None:
+            return True
+        if name in original_sig.parameters:
+            return True
+        return any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in original_sig.parameters.values()
+        )
 
     def _dummy_run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         is_profile = bool(kwargs.get("is_profile", False))
         activate_lora = bool(kwargs.get("activate_lora", False))
-        if not is_profile and activate_lora:
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        num_experts = getattr(hf_config, "num_experts", 0) if hf_config is not None else 0
+        is_moe = bool(num_experts and int(num_experts) > 1)
+        if is_moe and not is_profile and activate_lora:
             return original(self, *args, **kwargs)
 
-        kwargs["num_active_loras"] = 0
+        if _supports_kw("num_active_loras"):
+            kwargs["num_active_loras"] = 0
+        else:
+            kwargs.pop("num_active_loras", None)
+        kwargs.pop("activate_lora", None)
         original_lora_config = getattr(self, "lora_config", None)
         old_bypass = os.environ.get("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP")
+        old_bypass_dense = os.environ.get("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP")
         try:
             if original_lora_config is not None:
                 self.maybe_remove_all_loras(original_lora_config)
             self.lora_config = None
             os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = "1"
+            os.environ["MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP"] = "1"
             return original(self, *args, **kwargs)
         finally:
             self.lora_config = original_lora_config
@@ -277,6 +403,10 @@ def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
                 os.environ.pop("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", None)
             else:
                 os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = old_bypass
+            if old_bypass_dense is None:
+                os.environ.pop("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP", None)
+            else:
+                os.environ["MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP"] = old_bypass_dense
 
     _dummy_run._tinker_patched_disable_profile_dummy_loras = True  # type: ignore[attr-defined]
     cls._dummy_run = _dummy_run  # type: ignore[method-assign]
@@ -332,6 +462,32 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
     for name in ("fused_moe_lora",):
         if hasattr(punica_gpu, name):
             setattr(punica_gpu, name, _wrap_noop(getattr(punica_gpu, name)))
+
+    add_lora_embedding = getattr(punica_gpu, "PunicaWrapperGPU", None)
+    add_lora_embedding = getattr(add_lora_embedding, "add_lora_embedding", None)
+    if callable(add_lora_embedding) and not getattr(add_lora_embedding, "_tinker_profile_noop", False):
+        def wrapped_add_lora_embedding(self, y, x, lora_b_stacked, add_inputs=True, **kwargs):  # type: ignore[no-untyped-def]
+            if _env_flag("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP", default=False):
+                return None
+            return add_lora_embedding(self, y, x, lora_b_stacked, add_inputs=add_inputs, **kwargs)
+
+        wrapped_add_lora_embedding._tinker_profile_noop = True  # type: ignore[attr-defined]
+        punica_gpu.PunicaWrapperGPU.add_lora_embedding = wrapped_add_lora_embedding  # type: ignore[method-assign]
+
+    try:
+        vocab_layer_mod = importlib.import_module("vllm.lora.layers.vocal_parallel_embedding")
+        vocab_cls = getattr(vocab_layer_mod, "VocabParallelEmbeddingWithLoRA", None)
+        vocab_forward = getattr(vocab_cls, "forward", None)
+    except Exception:
+        return
+    if callable(vocab_forward) and not getattr(vocab_forward, "_tinker_profile_noop", False):
+        def wrapped_vocab_forward(self, x):  # type: ignore[no-untyped-def]
+            if _env_flag("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP", default=False):
+                return self.base_layer.forward(x)
+            return vocab_forward(self, x)
+
+        wrapped_vocab_forward._tinker_profile_noop = True  # type: ignore[attr-defined]
+        vocab_cls.forward = wrapped_vocab_forward  # type: ignore[method-assign]
 
 
 def _patch_vllm_profile_run_scope_bypass_fused_moe_lora() -> None:
@@ -1496,6 +1652,7 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_worker_lora_load_to_device()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
+    _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
     # These startup-profile patches are not specific to fully-sharded LoRAs.
     # Qwen3-235B on Volcano crashes in vLLM's dummy fused-MoE LoRA profile path
     # during determine_available_memory() before any real adapter is loaded.

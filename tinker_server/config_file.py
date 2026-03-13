@@ -18,7 +18,19 @@ class _ServerSection(BaseModel):
     host: str | None = None
     port: int | None = None
 
-    usage_log_dir: str | None = None
+    internal_api_token: str | None = None
+    usage_log_dir: str | None = None  # deprecated, kept for compatibility
+    usage_backend: str | None = None
+    usage_pg_dsn: str | None = None
+    usage_pg_host: str | None = None
+    usage_pg_port: int | None = None
+    usage_pg_database: str | None = None
+    usage_pg_user: str | None = None
+    usage_pg_password: str | None = None
+    usage_pg_pool_min: int | None = None
+    usage_pg_pool_max: int | None = None
+    usage_write_timeout_ms: int | None = None
+    usage_pg_table: str | None = None
     skip_actor_cleanup: bool | None = None
 
     tensor_parallel_size: int | None = None

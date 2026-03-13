@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from ..config import otel_env_vars
+
 
 def _ray_namespace() -> str:
     return (
@@ -66,11 +68,18 @@ def _get_or_create_actor():
                 "training_models": dict(self._training_models),
             }
 
+    options: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "lifetime": "detached",
+    }
+    actor_otel_env = otel_env_vars()
+    if actor_otel_env:
+        options["runtime_env"] = {"env_vars": actor_otel_env}
+
     try:
         return _GatewaySessionStoreActor.options(
-            name=name,
-            namespace=namespace,
-            lifetime="detached",
+            **options
         ).remote()
     except Exception as e:
         # Concurrency: another process may have created the detached actor after our initial

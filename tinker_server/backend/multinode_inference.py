@@ -42,7 +42,11 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
-from tinker_server.logging_context import init_actor_observability
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+)
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
@@ -431,15 +435,16 @@ def _create_multinode_vllm_actor(
             # Serialize add_request() while still allowing concurrent in-flight requests.
             self._serialize_add_request = _env_flag("MINT_VLLM_SERIALIZE_ADD_REQUEST", default=True)
             self._add_request_lock = asyncio.Lock() if self._serialize_add_request else None
-            # For multinode, vLLM's `SamplingParams(n>1)` path has shown hangs even at low
-            # concurrency. Optionally implement multi-sample by issuing N independent n=1
-            # requests; rely on vLLM prefix caching to reuse the long prompt KV across calls.
+            # Multinode multi-sample can run either through vLLM's native `n>1` path or
+            # by expanding into repeated `n=1` requests. Default to the native path here so
+            # experiments measure real `SamplingParams(n>1)` behavior unless explicitly
+            # overridden by environment.
             #
             # Modes:
             # - "vllm_n": use `SamplingParams(n=N)` (default vLLM multisample)
             # - "sequential_n1": run N sequential `SamplingParams(n=1)` requests
             # - "concurrent_n1": run N concurrent `SamplingParams(n=1)` requests
-            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "concurrent_n1").strip().lower()
+            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "vllm_n").strip().lower()
             default_serialize_multisample = self._multisample_mode == "vllm_n"
             self._serialize_multisample = _env_flag(
                 "MINT_VLLM_SERIALIZE_MULTISAMPLE",
@@ -477,6 +482,10 @@ def _create_multinode_vllm_actor(
             rss_pages = int(parts[1])
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
+
+        def _bind_traceparent(self, traceparent: str | None) -> None:
+            if isinstance(traceparent, str) and traceparent:
+                restore_trace_id_from_traceparent(traceparent)
 
         @asynccontextmanager
         async def _reserve_seq_slots(self, n_req: int):
@@ -633,12 +642,6 @@ def _create_multinode_vllm_actor(
             if max_num_batched_tokens is None:
                 max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
             max_num_batched_tokens = int(os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_num_batched_tokens)))
-            # vLLM v1 SchedulerConfig requires max_num_batched_tokens >= max_model_len.
-            # With enable_chunked_prefill=True (default), vLLM still chunks prefill internally,
-            # so memory behavior is preserved — this floor only prevents the hard validation rejection.
-            effective_max_model_len = self.max_model_len or 0
-            if max_num_batched_tokens < effective_max_model_len:
-                max_num_batched_tokens = effective_max_model_len
             enable_chunked_prefill = _env_flag("MINT_VLLM_ENABLE_CHUNKED_PREFILL", default=True)
             enable_prefix_caching = _env_flag("MINT_VLLM_ENABLE_PREFIX_CACHING", default=True)
             if distributed_executor_backend not in ("ray", "mp"):
@@ -646,14 +649,10 @@ def _create_multinode_vllm_actor(
                     f"Invalid MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND={distributed_executor_backend!r} "
                     f"(expected 'ray' or 'mp')"
                 )
-            # vLLM fused-MoE + LoRA has crashed in Volcano deployments when fully-sharded LoRAs are enabled
-            # (assert in vllm/lora/layers/fused_moe.py:_slice_w13_a during engine init/profile run).
-            # Keep this opt-in so we can toggle it without a code deploy.
             fully_sharded_loras = (
-                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False)
+                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True)
                 and self.enable_lora
                 and self.max_lora_rank is not None
-                and self.tensor_parallel_size >= 32
                 and self.max_lora_rank % self.tensor_parallel_size == 0
             )
             if fully_sharded_loras:
@@ -804,7 +803,13 @@ def _create_multinode_vllm_actor(
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
 
-        async def add_lora(self, lora_int_id: int, lora_path: str, lora_name: str) -> None:
+        async def add_lora(
+            self,
+            lora_int_id: int,
+            lora_path: str,
+            lora_name: str,
+            traceparent: str | None = None,
+        ) -> None:
             """Add LoRA adapter from shared filesystem path.
 
             For multi-node: all workers must have access to the same path.
@@ -815,6 +820,7 @@ def _create_multinode_vllm_actor(
                 lora_path: Path to PEFT adapter directory (must be on shared FS).
                 lora_name: Human-readable name for the adapter.
             """
+            self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
 
             lora_request = LoRARequest(
@@ -878,8 +884,9 @@ def _create_multinode_vllm_actor(
                 )
             logger.info(f"Added LoRA {lora_name} (id={lora_int_id}) from {lora_path}")
 
-        async def remove_lora(self, lora_int_id: int) -> None:
+        async def remove_lora(self, lora_int_id: int, traceparent: str | None = None) -> None:
             """Remove a LoRA adapter."""
+            self._bind_traceparent(traceparent)
             t0 = time.perf_counter()
             async with self._exclusive_engine_op():
                 async with self._lock_write():
@@ -943,8 +950,9 @@ def _create_multinode_vllm_actor(
                 "sys_path_first_8": sys.path[:8],
             }
 
-        async def abort_request(self, request_id: str) -> None:
+        async def abort_request(self, request_id: str, traceparent: str | None = None) -> None:
             """Abort an in-flight request in vLLM."""
+            self._bind_traceparent(traceparent)
             try:
                 async with self._outer_to_subreq_lock:
                     sub_ids = list(self._outer_to_subreq_ids.get(request_id, ()))
@@ -974,6 +982,7 @@ def _create_multinode_vllm_actor(
             top_p: float = 1.0,
             logprobs: bool = True,
             n: int = 1,
+            traceparent: str | None = None,
         ) -> dict | list[dict]:
             """Generate tokens with optional LoRA adapter.
 
@@ -992,6 +1001,7 @@ def _create_multinode_vllm_actor(
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            self._bind_traceparent(traceparent)
             import math
 
             from vllm import SamplingParams
@@ -1002,6 +1012,13 @@ def _create_multinode_vllm_actor(
             outer_request_id = str(outer_request_id or request_id)
             n_req = max(1, int(n))
             if n_req > 1 and self._multisample_mode in ("sequential_n1", "concurrent_n1"):
+                logger.info(
+                    "multinode_vllm_multisample_mode request_id=%s outer_request_id=%s mode=%s n=%s",
+                    request_id,
+                    outer_request_id,
+                    self._multisample_mode,
+                    n_req,
+                )
                 sub_ids = {f"{request_id}_s{i}" for i in range(n_req)}
                 try:
                     async with self._outer_to_subreq_lock:
@@ -1025,6 +1042,7 @@ def _create_multinode_vllm_actor(
                                 top_p=top_p,
                                 logprobs=logprobs,
                                 n=1,
+                                traceparent=traceparent,
                             )
                             assert isinstance(out, dict)
                             outs.append(out)
@@ -1048,6 +1066,7 @@ def _create_multinode_vllm_actor(
                                     top_p=top_p,
                                     logprobs=logprobs,
                                     n=1,
+                                    traceparent=traceparent,
                                 )
                             )
                         )
@@ -1061,6 +1080,14 @@ def _create_multinode_vllm_actor(
                     async with self._outer_to_subreq_lock:
                         self._outer_to_subreq_ids.pop(request_id, None)
                     await self._clear_progress(outer_request_id)
+            if n_req > 1:
+                logger.info(
+                    "multinode_vllm_multisample_mode request_id=%s outer_request_id=%s mode=%s n=%s",
+                    request_id,
+                    outer_request_id,
+                    self._multisample_mode,
+                    n_req,
+                )
 
             effective_max_tokens = int(max_tokens)
             if self.max_model_len is not None:
@@ -1452,6 +1479,7 @@ def _create_multinode_vllm_actor(
             request_id: str,
             lora_int_id: int | None,
             lora_path: str | None,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs for prompt tokens.
 
@@ -1459,6 +1487,7 @@ def _create_multinode_vllm_actor(
             - logprobs[0] is None (first token has no conditioning context)
             - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1486,46 +1515,47 @@ def _create_multinode_vllm_actor(
                 )
 
             t0 = time.perf_counter()
-            async with self._maybe_prompt_logprobs_lock():
-                async with self._lock_read():
-                    t1 = time.perf_counter()
-                    try:
-                        collector = await self.engine.add_request(
-                            request_id=request_id,
-                            prompt=prompt,
-                            params=sampling_params,
-                            lora_request=lora_request,
-                        )
-                    except Exception:
-                        _raise_serializable_vllm_error(
-                            request_id=request_id,
-                            where="vllm_prompt_logprobs_add_request_failed",
-                            extra={
-                                "prompt_len": len(prompt_ids),
-                                "model_path": self.model_path,
-                                "tp": self.tensor_parallel_size,
-                                "pp": self.pipeline_parallel_size,
-                            },
-                        )
-                    final_res = None
-                    try:
-                        while True:
-                            out = await collector.get()
-                            final_res = out
-                            if out.finished:
-                                break
-                    except Exception:
-                        _raise_serializable_vllm_engine_error(
-                            request_id=request_id,
-                            where="vllm_prompt_logprobs_collect_failed",
-                            extra={
-                                "prompt_len": len(prompt_ids),
-                                "model_path": self.model_path,
-                                "tp": self.tensor_parallel_size,
-                                "pp": self.pipeline_parallel_size,
-                            },
-                        )
-                    assert final_res is not None
+            async with self._exclusive_engine_op():
+                async with self._maybe_prompt_logprobs_lock():
+                    async with self._lock_read():
+                        t1 = time.perf_counter()
+                        try:
+                            collector = await self.engine.add_request(
+                                request_id=request_id,
+                                prompt=prompt,
+                                params=sampling_params,
+                                lora_request=lora_request,
+                            )
+                        except Exception:
+                            _raise_serializable_vllm_error(
+                                request_id=request_id,
+                                where="vllm_prompt_logprobs_add_request_failed",
+                                extra={
+                                    "prompt_len": len(prompt_ids),
+                                    "model_path": self.model_path,
+                                    "tp": self.tensor_parallel_size,
+                                    "pp": self.pipeline_parallel_size,
+                                },
+                            )
+                        final_res = None
+                        try:
+                            while True:
+                                out = await collector.get()
+                                final_res = out
+                                if out.finished:
+                                    break
+                        except Exception:
+                            _raise_serializable_vllm_engine_error(
+                                request_id=request_id,
+                                where="vllm_prompt_logprobs_collect_failed",
+                                extra={
+                                    "prompt_len": len(prompt_ids),
+                                    "model_path": self.model_path,
+                                    "tp": self.tensor_parallel_size,
+                                    "pp": self.pipeline_parallel_size,
+                                },
+                            )
+                        assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -1558,6 +1588,7 @@ def _create_multinode_vllm_actor(
             lora_int_id: int | None,
             lora_path: str | None,
             k: int,
+            traceparent: str | None = None,
         ) -> list[list[tuple[int, float]] | None]:
             """Compute top-K prompt logprobs.
 
@@ -1565,6 +1596,7 @@ def _create_multinode_vllm_actor(
             - topk[0] is None (first token has no conditioning context)
             - topk[i] is a list of (token_id, logprob) pairs for i >= 1
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -2091,6 +2123,12 @@ class MultiNodeInferenceEngine:
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "OMP_NUM_THREADS": os.environ.get("MINT_VLLM_OMP_NUM_THREADS", "1"),
+                "MKL_NUM_THREADS": os.environ.get("MINT_VLLM_MKL_NUM_THREADS", "1"),
+                "OPENBLAS_NUM_THREADS": os.environ.get("MINT_VLLM_OPENBLAS_NUM_THREADS", "1"),
+                "NUMEXPR_NUM_THREADS": os.environ.get("MINT_VLLM_NUMEXPR_NUM_THREADS", "1"),
+                "VECLIB_MAXIMUM_THREADS": os.environ.get("MINT_VLLM_VECLIB_MAXIMUM_THREADS", "1"),
+                "BLIS_NUM_THREADS": os.environ.get("MINT_VLLM_BLIS_NUM_THREADS", "1"),
                 # Some environments import tvm_ffi during vLLM init and try to JIT-build a
                 # torch c-dlpack addon on every Ray worker process, which can spawn dozens
                 # of concurrent compilers and stall engine startup. Disable the optional
@@ -2106,8 +2144,10 @@ class MultiNodeInferenceEngine:
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
-            if total_required_gpus >= 16:
-                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
+            if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
+                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
+                    "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"
+                ]
             if "VLLM_USE_V1" in os.environ:
                 env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
             else:
@@ -2134,6 +2174,7 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
+                "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
                 "MINT_VLLM_SERIALIZE_GENERATE",
                 "MINT_VLLM_SERIALIZE_MULTISAMPLE",
                 "MINT_VLLM_MULTISAMPLE_MODE",
@@ -2191,13 +2232,9 @@ class MultiNodeInferenceEngine:
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
 
-            # Keep fully-sharded LoRAs opt-in.
-            #
-            # We have observed vLLM fused-MoE + LoRA crashes in Volcano deployments when
-            # fully-sharded LoRAs are enabled (assert in vllm/lora/layers/fused_moe.py
-            # during engine init/profile run). Operators can still enable this via:
-            #   export MINT_VLLM_FULLY_SHARDED_LORAS=1
-            # but we should not force-enable it in code.
+            # Fully sharded LoRAs are the default for multinode MoE actors when
+            # max_lora_rank is divisible by TP. Operators can still turn this off via:
+            #   export MINT_VLLM_FULLY_SHARDED_LORAS=0
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
@@ -2351,6 +2388,7 @@ class MultiNodeInferenceEngine:
 
         # Allocate lora_int_id
         lora_id = await self.registry.allocate(sampling_session_id, adapter_dir)
+        traceparent = get_current_traceparent()
 
         # Add to engine (all workers load from shared path)
         start_time = time.time()
@@ -2359,6 +2397,7 @@ class MultiNodeInferenceEngine:
                 lora_int_id=lora_id,
                 lora_path=adapter_dir,
                 lora_name=sampling_session_id,
+                traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
@@ -2406,6 +2445,7 @@ class MultiNodeInferenceEngine:
             lora_path,
             lora_id,
         )
+        traceparent = get_current_traceparent()
 
         start_time = time.time()
         try:
@@ -2413,6 +2453,7 @@ class MultiNodeInferenceEngine:
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
+                traceparent=traceparent,
             )
             logger.info(
                 "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_add_lora_remote",
@@ -2462,9 +2503,10 @@ class MultiNodeInferenceEngine:
         if not self._initialized:
             return
         import ray
+        traceparent = get_current_traceparent()
 
         try:
-            ref = self.engine.abort_request.remote(request_id)
+            ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
             await asyncio.to_thread(ray.get, ref, timeout=10)
         except Exception as e:
             logger.warning(f"MultiNodeInferenceEngine.abort_request failed: {type(e).__name__}: {e}")
@@ -2494,6 +2536,7 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
@@ -2507,6 +2550,7 @@ class MultiNodeInferenceEngine:
             top_k=top_k,
             top_p=top_p,
             logprobs=logprobs,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
@@ -2515,7 +2559,7 @@ class MultiNodeInferenceEngine:
             # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
             # Try aborting just this request, then fail loud to the client.
             try:
-                abort_ref = self.engine.abort_request.remote(request_id)
+                abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
                 await asyncio.to_thread(ray.get, abort_ref, timeout=10)
             except Exception:
                 pass
@@ -2580,6 +2624,7 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
@@ -2594,13 +2639,14 @@ class MultiNodeInferenceEngine:
             top_p=top_p,
             logprobs=logprobs,
             n=num_samples,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
             raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             try:
-                abort_ref = self.engine.abort_request.remote(request_id)
+                abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
                 await asyncio.to_thread(ray.get, abort_ref, timeout=10)
             except Exception:
                 pass
@@ -2664,12 +2710,14 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
             lora_int_id=lora_id,
             lora_path=lora_path,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
@@ -2735,6 +2783,7 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.compute_prompt_topk.remote(
             prompt_ids=prompt_ids,
@@ -2742,6 +2791,7 @@ class MultiNodeInferenceEngine:
             lora_int_id=lora_id,
             lora_path=lora_path,
             k=kk,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
@@ -2784,8 +2834,9 @@ class MultiNodeInferenceEngine:
         if removed_lora_id is None:
             return False
         if should_unload:
+            traceparent = get_current_traceparent()
             try:
-                ref = self.engine.remove_lora.remote(removed_lora_id)
+                ref = self.engine.remove_lora.remote(removed_lora_id, traceparent=traceparent)
                 await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 logger.warning(f"Failed to remove LoRA {removed_lora_id} from engine: {e}")

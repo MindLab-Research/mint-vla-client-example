@@ -47,6 +47,57 @@ def _mint_present_expert_ids_from_adapter_dir(adapter_dir: str) -> set[int]:
         return _mint_present_expert_ids_from_keys(list(f.keys()))
 
 
+def _mint_expected_num_experts_from_base_model(base_model_name_or_path: object) -> int | None:
+    if not isinstance(base_model_name_or_path, str) or not base_model_name_or_path:
+        return None
+    try:
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            base_model_name_or_path,
+            trust_remote_code=True,
+        )
+    except Exception:
+        return None
+    value = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
+    try:
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _mint_expected_num_experts_from_adapter_dir(adapter_dir: str) -> int | None:
+    import json
+
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    return _mint_expected_num_experts_from_base_model(cfg.get("base_model_name_or_path"))
+
+
+def _mint_sparse_expert_ids_need_patch(
+    present_expert_ids: set[int],
+    *,
+    expected_num_experts: int | None,
+) -> bool:
+    if not present_expert_ids:
+        return False
+    if expected_num_experts is None or expected_num_experts <= 0:
+        # Fail-open only for the legacy shared-expert export that we can identify
+        # without model metadata. Avoid patching full per-expert adapters
+        # unnecessarily in hardened environments.
+        return present_expert_ids == {0}
+    expected = set(range(expected_num_experts))
+    return present_expert_ids != expected
+
+
 # vLLM MoE LoRA support: tolerate shared-expert sparse adapters.
 #
 # vLLM's PackedLoRALayerWeights.pack_moe currently asserts that every expert has
@@ -307,7 +358,11 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
-from tinker_server.logging_context import init_actor_observability
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+)
 from tinker_server.ray_utils import init_ray
 
 # Import model registry
@@ -382,6 +437,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             allow_insecure = os.environ.get("MINT_VLLM_ALLOW_INSECURE_SERIALIZATION", "1").strip().lower()
             if allow_insecure not in {"0", "false", "no", "off"}:
                 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+            rollout_mode = kwargs.get("rollout_mode")
+            if isinstance(rollout_mode, str):
+                from verl.workers.rollout.replica import RolloutMode
+
+                kwargs["rollout_mode"] = RolloutMode(rollout_mode)
             pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
@@ -418,6 +478,29 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             else:
                 print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
             call_kwargs = dict(kwargs)
+            rollout_cfg = call_kwargs.get("config")
+            if rollout_cfg is not None:
+                from dataclasses import asdict, is_dataclass
+                from verl.utils.config import omega_conf_to_dataclass
+                from verl.workers.config import RolloutConfig as VerlRolloutConfig
+
+                if isinstance(rollout_cfg, dict):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        rollout_cfg, dataclass_type=VerlRolloutConfig
+                    )
+                elif is_dataclass(rollout_cfg):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        asdict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                    )
+                elif not isinstance(rollout_cfg, VerlRolloutConfig):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        dict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                    )
+                print(
+                    f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
+                    flush=True,
+                )
+                call_kwargs["config"] = rollout_cfg
             if sig is not None:
                 accepts_var_kw = any(
                     p.kind == inspect.Parameter.VAR_KEYWORD
@@ -462,6 +545,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "max_tokens": int(max_tokens),
                 "last_progress_at": time.time(),
             }
+
+        def _bind_traceparent(self, traceparent: str | None) -> None:
+            if isinstance(traceparent, str) and traceparent:
+                restore_trace_id_from_traceparent(traceparent)
 
         async def _update_progress(
             self,
@@ -547,12 +634,25 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if not isinstance(adapter_dir, str) or not adapter_dir:
                 raise RuntimeError(f"vLLM LoRARequest missing lora_path: {adapter_dir!r}")
             present = _mint_present_expert_ids_from_adapter_dir(adapter_dir)
-            if present == {0}:
+            expected_num_experts = _mint_expected_num_experts_from_adapter_dir(adapter_dir)
+            if _mint_sparse_expert_ids_need_patch(
+                present,
+                expected_num_experts=expected_num_experts,
+            ):
                 await self._ensure_pack_moe_patched()
 
-        async def _maybe_ensure_pack_moe_patched_for_state_dict(self, state_dict: dict) -> None:
+        async def _maybe_ensure_pack_moe_patched_for_state_dict(
+            self,
+            state_dict: dict,
+            *,
+            base_model_name_or_path: object = None,
+        ) -> None:
             present = _mint_present_expert_ids_from_keys([str(k) for k in state_dict.keys()])
-            if present == {0}:
+            expected_num_experts = _mint_expected_num_experts_from_base_model(base_model_name_or_path)
+            if _mint_sparse_expert_ids_need_patch(
+                present,
+                expected_num_experts=expected_num_experts,
+            ):
                 await self._ensure_pack_moe_patched()
 
         def _patch_lora_args(self, args):
@@ -604,6 +704,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             state_dict: dict,
             peft_config: dict,
+            traceparent: str | None = None,
         ) -> str:
             """Add LoRA from tensors by saving to temp dir on worker node.
 
@@ -618,6 +719,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Path where adapter was saved on worker node.
             """
+            self._bind_traceparent(traceparent)
             import json
             import os
             import tempfile
@@ -654,7 +756,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
-            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                state_dict,
+                base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+            )
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -677,6 +782,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             lora_int_id: int,
             state_dict: dict,
             peft_config: dict,
+            traceparent: str | None = None,
         ) -> str:
             """Add LoRA from tensors with specific lora_int_id.
 
@@ -691,6 +797,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Path where adapter was saved on worker node.
             """
+            self._bind_traceparent(traceparent)
             import json
             import os
             import tempfile
@@ -742,7 +849,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Add to engine (no need to remove - this is a new unique ID)
-            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                state_dict,
+                base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+            )
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -751,6 +861,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             lora_int_id: int,
             lora_path: str,
             lora_name: str,
+            traceparent: str | None = None,
         ) -> None:
             """Add LoRA from filesystem path with specific lora_int_id.
 
@@ -763,6 +874,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 lora_path: Path to PEFT adapter directory.
                 lora_name: Human-readable name for the adapter.
             """
+            self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
 
             debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
@@ -797,6 +909,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_p: float = 1.0,
             logprobs: bool = True,
             n: int = 1,
+            traceparent: str | None = None,
         ) -> dict | list[dict]:
             """Generate with a specific LoRA adapter.
 
@@ -816,6 +929,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1059,6 +1173,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             top_p: float = 1.0,
             logprobs: bool = True,
             n: int = 1,
+            traceparent: str | None = None,
         ) -> dict | list[dict]:
             """Generate using base model without any LoRA adapter.
 
@@ -1077,6 +1192,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from .vllm_stop import vllm_stop_kwargs
@@ -1303,12 +1419,14 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             sampling_params: dict,
             request_id: str,
             image_data: list | None = None,
+            traceparent: str | None = None,
         ):
             """Generate with user's max_tokens respected.
 
             Override of verl's generate() which ignores user's max_tokens.
             Uses min(user_max_tokens, max_model_len - prompt_len).
             """
+            self._bind_traceparent(traceparent)
             from typing import Optional
 
             from vllm import SamplingParams
@@ -1398,6 +1516,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             prompt_ids: list[int],
             request_id: str,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs for each token in the prompt.
 
@@ -1412,6 +1531,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of logprobs, length = len(prompt_ids).
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1570,6 +1690,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             lora_int_id: int,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs with specific LoRA adapter.
 
@@ -1583,6 +1704,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of logprobs, length = len(prompt_ids).
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1649,6 +1771,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             request_id: str,
             lora_int_id: int,
             k: int = 10,
+            traceparent: str | None = None,
         ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens with specific LoRA adapter.
 
@@ -1665,6 +1788,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of per-position top-k lists.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1727,6 +1851,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self,
             prompt_ids: list[int],
             request_id: str,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs using base model without any LoRA adapter.
 
@@ -1739,6 +1864,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of logprobs, length = len(prompt_ids).
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
 
@@ -1790,6 +1916,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             prompt_ids: list[int],
             request_id: str,
             k: int = 10,
+            traceparent: str | None = None,
         ) -> list[list[tuple[int, float]] | None]:
             """Get top-K tokens using base model without any LoRA adapter.
 
@@ -1803,6 +1930,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Returns:
                 List of per-position top-k lists.
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
 
@@ -2160,6 +2288,12 @@ class VerlInferenceEngine:
             f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
         )
 
+        from dataclasses import asdict
+
+        rollout_payload = asdict(rollout_config)
+        if not rollout_payload.get("_target_"):
+            rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
+
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
@@ -2176,7 +2310,7 @@ class VerlInferenceEngine:
                 }
             },
         ).remote(
-            config=rollout_config,
+            config=rollout_payload,
             model_config=model_config,
             rollout_mode=RolloutMode.STANDALONE,
             workers=[],  # No external workers for standalone
@@ -2232,12 +2366,14 @@ class VerlInferenceEngine:
             "logprobs": logprobs,
         }
         sampling_params.update(vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]))
+        traceparent = get_current_traceparent()
 
         # Call the Ray actor's generate method
         result = await self.server.generate.remote(
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             request_id=request_id,
+            traceparent=traceparent,
         )
 
         return GenerateResult(
@@ -2270,10 +2406,12 @@ class VerlInferenceEngine:
         """
         if not self._initialized:
             await self.initialize()
+        traceparent = get_current_traceparent()
 
         result = await self.server.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
+            traceparent=traceparent,
         )
         return list(result)
 
@@ -2303,10 +2441,15 @@ class VerlInferenceEngine:
         state_dict = load_file(weights_path)
         with open(config_path, "r") as f:
             peft_config = json.load(f)
+        traceparent = get_current_traceparent()
 
         # Pass tensors via Ray to inference worker, which saves locally and loads
         # This handles distributed deployments where nodes have different filesystems
-        worker_path = await self.server.add_lora_from_tensors.remote(state_dict, peft_config)
+        worker_path = await self.server.add_lora_from_tensors.remote(
+            state_dict,
+            peft_config,
+            traceparent=traceparent,
+        )
 
         logger.info(f"Hot-loaded LoRA adapter (API: {adapter_path} -> Worker: {worker_path})")
 

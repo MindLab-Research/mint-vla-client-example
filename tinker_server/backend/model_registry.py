@@ -125,28 +125,37 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-0.6B": ModelConfig(
         num_parameters=0.6,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
-        max_model_len=40960,  # 40K context
+        max_model_len=32768,  # 32K context
         max_num_seqs=64,  # Leave headroom for long-context prompt_logprobs
+        max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.92,
+        max_loras=12,
+        max_cpu_loras=1200,
+        max_lora_rank=64,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B": ModelConfig(
         num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
-        max_model_len=40960,  # 40K context
+        max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-4B-Instruct-2507": ModelConfig(
         num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
-        max_model_len=40960,  # 40K context (reduced from 256K for faster vLLM init)
-        max_num_seqs=32,  # Leave headroom for long-context prompt_logprobs
+        max_model_len=32768,  # 32K context
+        max_num_seqs=32,  # Leave headroom for 32K prompt_logprobs
         max_num_batched_tokens=2048,  # Cap prompt_logprobs peak allocations at long context
+        gpu_memory_utilization=0.90,
+        max_loras=8,
+        max_cpu_loras=800,
+        max_lora_rank=64,
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
     "Qwen/Qwen3-8B": ModelConfig(
         num_parameters=8.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
-        max_model_len=40960,  # 40K context
+        max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
     ),
     # MoE models - Qwen3 30B variants (40K context per model config)
@@ -155,7 +164,7 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelConfig(
         num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=40960,  # 40K context - full model capability
+        max_model_len=32768,  # 32K context
         # NOTE: vLLM's `max_num_seqs` caps the total number of *active sequences*,
         # not the number of HTTP requests. When sampling uses `SamplingParams(n=8)`,
         # a single prompt consumes up to 8 sequence slots. With `max_num_seqs=8`,
@@ -163,10 +172,11 @@ MODEL_CONFIGS = {
         # With 32K prompts and SamplingParams(n=8), c=2 uses 16 active sequences.
         # Keep headroom above that to avoid scheduler edge cases at the cap.
         max_num_seqs=24,
-        max_num_batched_tokens=1024,  # Avoid multi-GB logits buffers during prompt_logprobs
-        gpu_memory_utilization=0.90,  # Increase KV cache headroom for long-context concurrency
-        max_loras=8,
-        max_cpu_loras=16,
+        max_num_batched_tokens=512,  # Keep prompt_logprobs under the current stable chunk size
+        gpu_memory_utilization=0.85,  # Leave prompt_logprobs/runtime headroom above KV cache
+        max_loras=6,
+        max_cpu_loras=600,
+        max_lora_rank=64,
         gradient_checkpointing=True,
         vllm_engine="async",
         vllm_distributed_executor_backend="mp",
@@ -174,59 +184,62 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-30B-A3B": ModelConfig(
         num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=40960,
+        max_model_len=32768,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Base": ModelConfig(
         num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=40960,
+        max_model_len=32768,
         gradient_checkpointing=True,
     ),
     "Qwen/Qwen3-30B-A3B-Thinking-2507": ModelConfig(
         num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
-        max_model_len=40960,
+        max_model_len=32768,
         gradient_checkpointing=True,
     ),
     # Qwen3 235B MoE variants (235B total, 22B active)
-    # Default profile is kept for the H-card single-node vLLM deployment shape:
-    # - Inference: TP=8 on one 8-GPU node via backend="mp"
-    # - Training: TP=4, PP=2, EP=2 (16 GPUs)
-    # For Volcano A800, use MINT_MODEL_CONFIG_OVERRIDES_JSON with:
-    # `./.claude/skills/volcano-cluster/configs/volcano_a800_235b_overrides.json`
-    # to switch to the documented multi-node A800 shape:
+    # Default profile is the current Volcano A800 shape:
     # - Inference: TP=16 via backend="ray" (16 GPUs)
     # - Training: TP=4, PP=1, EP=8 (32 GPUs)
     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
         num_parameters=235.0,
         is_moe=True,
-        inference_tp=8,
+        inference_tp=16,
         inference_dp=1,
         train_tp=4,
-        train_pp=2,
-        train_ep=2,
-        max_lora_rank=16,  # Match cookbook lora_rank=16; avoid MoE LoRA buffer blowup at rank=64
+        train_pp=1,
+        train_ep=8,
+        gpu_memory_utilization=0.75,
+        max_loras=2,
+        max_cpu_loras=200,
+        max_lora_rank=64,
         max_model_len=32768,  # 32K context
         max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
-        max_num_batched_tokens=512,  # prompt_logprobs memory spike at 32K
+        max_num_batched_tokens=256,
         gradient_checkpointing=True,
         vllm_engine="async",
-        vllm_distributed_executor_backend="mp",
+        vllm_distributed_executor_backend="ray",
     ),
     "Qwen/Qwen3-235B-A22B-Thinking-2507": ModelConfig(
         num_parameters=235.0,
         is_moe=True,
-        inference_tp=8,
+        inference_tp=16,
         inference_dp=1,
         train_tp=4,
-        train_pp=2,
-        train_ep=2,
-        max_lora_rank=16,
+        train_pp=1,
+        train_ep=8,
+        gpu_memory_utilization=0.75,
+        max_loras=2,
+        max_cpu_loras=200,
+        max_lora_rank=64,
         max_model_len=32768,  # 32K context
+        max_num_seqs=4,
+        max_num_batched_tokens=256,
         gradient_checkpointing=True,
         vllm_engine="async",
-        vllm_distributed_executor_backend="mp",
+        vllm_distributed_executor_backend="ray",
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
@@ -260,7 +273,7 @@ MODEL_CONFIGS = {
         max_lora_rank=64,
         # Leave a small generation headroom above a 32k prompt without materially increasing KV cache size.
         # This avoids hard failures when prompt_target_tokens=32000 (effective_max_tokens would be 0).
-        max_model_len=32256,
+        max_model_len=32768,
         max_num_seqs=8,  # Must be >= default SamplingParams(n=8)
         max_num_batched_tokens=1024,  # Cap logits/prefill peak allocations at long context
         is_mla=True,  # DeepSeek V3 MLA architecture
@@ -284,7 +297,7 @@ MODEL_CONFIGS = {
         gpu_memory_utilization=0.87,
         max_loras=1,
         max_lora_rank=64,
-        max_model_len=32256,
+        max_model_len=32768,
         max_num_seqs=8,
         max_num_batched_tokens=1024,
         is_mla=True,
@@ -334,7 +347,7 @@ MODEL_CONFIGS = {
         quantization=None,  # BF16, no quantization needed
         max_loras=1,
         max_lora_rank=32,
-        max_model_len=8192,  # 8K context
+        max_model_len=32768,  # 32K context
         is_mla=True,  # DeepSeek V3 MLA architecture
         gradient_checkpointing=True,
         vllm_engine="async",

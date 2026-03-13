@@ -45,10 +45,25 @@ def compute_multinode_engine_resources(
                 f"preferred_node_ips too short: need {nodes_needed} nodes for worker_gpus={worker_gpus}, got {len(node_ips)}"
             )
 
-        pg_bundles: list[dict[str, int | float]] = []
-        for i in range(total_required_gpus):
-            ip = node_ips[i // int(gpus_per_node)]
-            pg_bundles.append({"GPU": 1, "CPU": 1, f"node:{ip}": 0.001})
+        # Spread evenly across the provided nodes instead of truncating to the
+        # first ceil(worker_gpus / gpus_per_node) nodes. This preserves the
+        # caller's affinity intent and can reduce per-node CPU pressure during
+        # large model load / NCCL init.
+        capacity = int(gpus_per_node)
+        counts = {ip: 0 for ip in node_ips}
+        assign_order: list[str] = []
+        for _ in range(total_required_gpus):
+            candidates = [ip for ip in node_ips if counts[ip] < capacity]
+            if not candidates:
+                raise ValueError(
+                    f"preferred_node_ips exhausted capacity for worker_gpus={worker_gpus}, "
+                    f"gpus_per_node={gpus_per_node}, node_ips={node_ips}"
+                )
+            ip = min(candidates, key=lambda cur: (counts[cur], node_ips.index(cur)))
+            counts[ip] += 1
+            assign_order.append(ip)
+
+        pg_bundles = [{"GPU": 1, "CPU": 1, f"node:{ip}": 0.001} for ip in assign_order]
         pg_bundles.append({"CPU": controller_cpus})
     else:
         pg_bundles = [{"GPU": 1, "CPU": 1}] * total_required_gpus + [{"CPU": controller_cpus}]

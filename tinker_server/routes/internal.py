@@ -18,30 +18,47 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+from ..auth_identity import get_user_data as _request_user_data
+from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request
 from ..checkpoints import get_persistent_search_roots
-from ..usage_logger import get_usage_logger
+from ..config import config as server_config
+from ..usage_store import get_usage_store
+
+# Checkpoint directory (shared filesystem)
+CHECKPOINTS_DIR = server_config.checkpoint_dir
 
 router = APIRouter()
 
 
-def _get_user_id(request: Request) -> str | None:
-    """Extract user_id from request state (set by auth middleware)."""
-    user_data = getattr(request.state, "user_data", None)
+def _get_account_id(request: Request) -> str | None:
+    """Extract account_id from request state (set by gateway auth middleware)."""
+    user_data = _request_user_data(request)
     if user_data:
-        return user_data.get("user_id")
+        account_id = user_data.get("account_id")
+        if account_id:
+            return account_id
+        user_id = user_data.get("user_id")
+        if user_id and str(user_id) != "admin":
+            return str(user_id)
     return None
+
+
+def _get_user_id(request: Request) -> str | None:
+    return _request_user_id(request)
 
 
 class UsageLogEntry(BaseModel):
     """Single usage log entry."""
 
-    user_id: str
-    operation_type: str
-    model_name: str
-    token_count: int
-    session_id: str
+    source_index: int
+    event_time: str
+    account_id: str
+    apikey_id: str
+    charge_item: str
+    quantity: int
     request_id: str
-    timestamp: str
+    label: str
 
 
 class UsageLogsResponse(BaseModel):
@@ -56,8 +73,8 @@ class UsageLogsResponse(BaseModel):
 class UsageSummaryResponse(BaseModel):
     """Response for usage summary."""
 
-    total_tokens: int
-    operation_counts: dict[str, int]  # token totals by operation type
+    total_quantity: int
+    charge_item_totals: dict[str, int]
 
 
 class HealthResponse(BaseModel):
@@ -84,8 +101,10 @@ async def get_usage_logs(
         limit: Maximum number of logs to return (1-1000)
         offset: Number of logs to skip for pagination
     """
-    # Get user_id from authenticated token
-    user_id = _get_user_id(request)
+    # Get account_id from gateway forwarded auth headers
+    account_id = _get_account_id(request)
+    if account_id is None and not is_admin_request(request):
+        raise HTTPException(status_code=403, detail="Access denied")
 
     # Parse 'since' timestamp if provided
     since_dt = None
@@ -95,10 +114,10 @@ async def get_usage_logs(
         except ValueError:
             since_dt = None
 
-    logger = get_usage_logger()
-    logs, total_count, has_more = logger.query_logs(
+    usage_store = await get_usage_store()
+    logs, total_count, has_more = await usage_store.query_logs(
         since=since_dt,
-        user_id=user_id,  # Filter by authenticated user
+        account_id=account_id,
         limit=limit,
         offset=offset,
     )
@@ -111,28 +130,33 @@ async def get_usage_logs(
     )
 
 
-@router.get("/usage_summary/{user_id}", response_model=UsageSummaryResponse)
-async def get_usage_summary(user_id: str):
-    """Get usage summary for a specific user.
+@router.get("/usage_summary/{account_id}", response_model=UsageSummaryResponse)
+async def get_usage_summary(account_id: str, request: Request):
+    """Get usage summary for a specific account.
 
     Args:
-        user_id: The user ID to get summary for
+        account_id: The account ID to get summary for
     """
-    logger = get_usage_logger()
-    summary = logger.get_user_summary(user_id)
+    request_account_id = _get_account_id(request)
+    if not is_admin_request(request) and request_account_id is None:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not is_admin_request(request) and account_id != request_account_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    usage_store = await get_usage_store()
+    summary = await usage_store.get_account_summary(account_id)
 
     return UsageSummaryResponse(
-        total_tokens=summary["total_tokens"],
-        operation_counts=summary["operation_counts"],
+        total_quantity=summary["total_quantity"],
+        charge_item_totals=summary["charge_item_totals"],
     )
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint for internal monitoring."""
-    # Check if usage log directory is accessible
-    logger = get_usage_logger()
-    db_status = "ok" if logger.log_dir.exists() else "error"
+    usage_store = await get_usage_store()
+    db_status = "ok" if await usage_store.health_check() else "error"
 
     return HealthResponse(
         status="ok",
@@ -486,7 +510,7 @@ def _get_dir_size(path: str) -> int:
     return total
 
 
-def _scan_checkpoints(user_id: str | None) -> list[CheckpointInfo]:
+def _scan_checkpoints(user_id: str | None, *, is_admin: bool = False) -> list[CheckpointInfo]:
     """Scan checkpoint directories and return those owned by user.
 
     Storage schema: /checkpoints/{user_id}/{checkpoint_id}/
@@ -496,7 +520,7 @@ def _scan_checkpoints(user_id: str | None) -> list[CheckpointInfo]:
     checkpoints = []
 
     # Determine which directories to scan
-    if user_id == "admin":
+    if is_admin:
         # Admin sees all - scan all top-level directories
         top_level_dirs: list[tuple[str, str]] = []
         for root in get_persistent_search_roots():
@@ -629,7 +653,7 @@ async def list_checkpoints(request: Request):
     if user_id is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    checkpoints = _scan_checkpoints(user_id)
+    checkpoints = _scan_checkpoints(user_id, is_admin=is_admin_request(request))
     return CheckpointsListResponse(checkpoints=checkpoints)
 
 
@@ -650,7 +674,7 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Checkpoint not found")
 
     # Check ownership via metadata.json (admin can access all, others only their own)
-    if user_id != "admin":
+    if not is_admin_request(request):
         metadata_path = os.path.join(ckpt_path, "metadata.json")
         if os.path.exists(metadata_path):
             try:

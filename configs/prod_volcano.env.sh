@@ -31,7 +31,7 @@ export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwe
 export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
 export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"]}'
 
-export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-235B-A22B-Thinking-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-30B-A3B-Instruct-2507":{"gpu_memory_utilization":0.87,"max_lora_rank":16,"max_loras":1,"max_cpu_loras":2},"Qwen/Qwen3-0.6B":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"},"Qwen/Qwen3-4B-Instruct-2507":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"}}'
+export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-0.6B":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"},"Qwen/Qwen3-4B-Instruct-2507":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"}}'
 
 export TINKER_ENABLE_MULTI_LORA=1
 export MINT_ROUTER_REPLAY_MODE=disabled

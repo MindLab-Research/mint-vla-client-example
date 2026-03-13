@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from ..auth_identity import is_admin_request
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
@@ -146,8 +147,7 @@ def _is_privileged(request: Request) -> bool:
     from ..config import config as server_config
     if not server_config.auth_enabled:
         return True
-    user_data = getattr(request.state, "user_data", None)
-    return user_data is not None and user_data.get("user_id") == "admin"
+    return is_admin_request(request)
 
 
 @router.post("/retrieve_future")
