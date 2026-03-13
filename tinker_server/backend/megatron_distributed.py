@@ -6655,9 +6655,10 @@ def get_or_create_megatron_worker_group(
                 if v is not None:
                     runtime_env["env_vars"][k] = v
             explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
+            megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
             if explicit_node_ips_csv:
                 runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
-            else:
+            elif not megatron_node_pin_json:
                 volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
                 if volc_rq:
                     from .volc_placement import list_node_ips_for_resource_queue
@@ -6675,7 +6676,6 @@ def get_or_create_megatron_worker_group(
             node_pin_json = os.environ.get("MINT_MODEL_NODE_IPS_JSON")
             if node_pin_json:
                 runtime_env["env_vars"]["MINT_MODEL_NODE_IPS_JSON"] = node_pin_json
-            megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
             if megatron_node_pin_json:
                 runtime_env["env_vars"]["MINT_MEGATRON_MODEL_NODE_IPS_JSON"] = megatron_node_pin_json
 
