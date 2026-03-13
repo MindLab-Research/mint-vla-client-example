@@ -1021,11 +1021,6 @@ class ApiWorkQueueClient:
             try:
                 await _claim_active_job_id()
             except Exception:
-                try:
-                    actor = self._get_ray_actor()
-                    ray.kill(actor, no_restart=True)
-                except Exception:
-                    pass
                 self._ray_actor = None
                 await _claim_active_job_id()
         except Exception as e:

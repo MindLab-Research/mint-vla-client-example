@@ -801,7 +801,7 @@ async def create_model_from_state(
         is_admin=is_admin_request(http_request),
     )
     if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
-        raise FileNotFoundError(f"Checkpoint not found: {request.state_path}")
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")
     request = request.model_copy(update={"state_path": resolved_state_path})
 
     request_json = request.model_dump_json().encode("utf-8")
