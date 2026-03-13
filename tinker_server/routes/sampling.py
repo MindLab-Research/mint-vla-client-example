@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
+from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import classify_failure_reason, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -30,7 +31,7 @@ from ..models.types import (
     UntypedAPIFuture,
 )
 from ..sampling_utils import normalize_prompt_logprobs_for_tinker, sampled_sequence_from_result
-from ..usage_logger import get_usage_logger
+from ..usage_store import UsageEvent, get_usage_store
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -67,6 +68,16 @@ async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
             lock = asyncio.Lock()
             _lora_load_locks[session_id] = lock
         return lock
+
+
+def _resolve_billing_model(session_id: str) -> str:
+    if session_manager is None:
+        return session_id
+    return session_manager.get_session_base_model(session_id) or session_id
+
+
+def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> str:
+    return f"model={model},route={route},dimension={dimension}"
 
 
 async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
@@ -437,6 +448,11 @@ def _get_user_id(request: Request) -> str | None:
     return None
 
 
+async def _persist_usage_events(*, auth_ctx: GatewayAuthContext, events: list[UsageEvent]) -> None:
+    usage_store = await get_usage_store()
+    await usage_store.write_events(events)
+
+
 @router.post("/asample")
 async def asample(
     request: SampleRequest,
@@ -541,6 +557,7 @@ async def asample(
         request_id = _deterministic_request_id(session_id, request.seq_id)
     else:
         request_id = uuid.uuid4().hex
+    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
     created_pending = False
 
     # Set request_id in context for logging
@@ -620,6 +637,7 @@ async def asample(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -635,9 +653,7 @@ async def asample(
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_sample(
-    request_id: str, request: SampleRequest, user_id: str | None
-) -> None:
+async def _do_sample(request_id: str, request: SampleRequest, user_id: str | None, gateway_auth: dict | None = None) -> None:
     """Background task to perform sampling."""
     # Restore request_id context for logging
     set_request_id(request_id)
@@ -860,34 +876,46 @@ async def _do_sample(
                     request.topk_prompt_logprobs,
                 )
 
+            usage_events: list[UsageEvent] = []
+            if gateway_auth:
+                auth_ctx = GatewayAuthContext(**gateway_auth)
+                prefill_tokens = len(token_ids)
+                sampling_tokens = sum(len(seq.tokens) for seq in sequences)
+                label_model = _resolve_billing_model(session_id)
+                usage_events.extend(
+                    [
+                        UsageEvent(
+                            account_id=auth_ctx.account_id,
+                            apikey_id=auth_ctx.apikey_id,
+                            charge_item="sampling",
+                            quantity=prefill_tokens,
+                            request_id=auth_ctx.request_id,
+                            label=_build_sampling_usage_label(
+                                model=label_model,
+                                route="sampling.asample",
+                                dimension="prefill",
+                            ),
+                        ),
+                        UsageEvent(
+                            account_id=auth_ctx.account_id,
+                            apikey_id=auth_ctx.apikey_id,
+                            charge_item="sampling",
+                            quantity=sampling_tokens,
+                            request_id=auth_ctx.request_id,
+                            label=_build_sampling_usage_label(
+                                model=label_model,
+                                route="sampling.asample",
+                                dimension="sample",
+                            ),
+                        ),
+                    ]
+                )
+            if usage_events:
+                await _persist_usage_events(auth_ctx=auth_ctx, events=usage_events)
+
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
             future_store.resolve(request_id, response.model_dump(exclude={"type"}))
             logger.info(f"Sampling completed: {len(sequences)} sequences generated")
-
-            # Log usage - separate prefill and sampling tokens
-            if user_id:
-                prefill_tokens = len(token_ids)
-                sampling_tokens = sum(len(seq.tokens) for seq in sequences)
-
-                # Log prefill (input prompt) tokens
-                get_usage_logger().log(
-                    user_id=user_id,
-                    operation_type="sample_prefill",
-                    model_name=session_id,  # Use session_id as model identifier
-                    token_count=prefill_tokens,
-                    session_id=session_id,
-                    request_id=request_id,
-                )
-
-                # Log sampling (generated) tokens
-                get_usage_logger().log(
-                    user_id=user_id,
-                    operation_type="sample_generation",
-                    model_name=session_id,
-                    token_count=sampling_tokens,
-                    session_id=session_id,
-                    request_id=request_id,
-                )
 
         except asyncio.CancelledError:
             await _abort_engine_request(engine, request_id)
@@ -1003,6 +1031,7 @@ async def compute_logprobs(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1025,6 +1054,7 @@ async def compute_logprobs(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1036,7 +1066,10 @@ async def compute_logprobs(
 
 
 async def _do_compute_logprobs(
-    request_id: str, request: ComputeLogprobsRequest, user_id: str | None
+    request_id: str,
+    request: ComputeLogprobsRequest,
+    user_id: str | None,
+    gateway_auth: dict | None = None,
 ) -> None:
     """Background task to compute logprobs."""
     session_id: str | None = None
@@ -1070,6 +1103,7 @@ async def _do_compute_logprobs(
             multi_lora_engine = await session_manager.get_engine_for_session(session_id)
             if multi_lora_engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
+            await _ensure_session_lora_loaded(multi_lora_engine, session_id)
 
             logprobs = await multi_lora_engine.compute_logprobs(
                 sampling_session_id=session_id,
@@ -1089,11 +1123,28 @@ async def _do_compute_logprobs(
 
         logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)
+        if gateway_auth:
+            auth_ctx = GatewayAuthContext(**gateway_auth)
+            await _persist_usage_events(
+                auth_ctx=auth_ctx,
+                events=[
+                    UsageEvent(
+                        account_id=auth_ctx.account_id,
+                        apikey_id=auth_ctx.apikey_id,
+                        charge_item="sampling",
+                        quantity=len(token_ids),
+                        request_id=auth_ctx.request_id,
+                        label=_build_sampling_usage_label(
+                            model=_resolve_billing_model(session_id),
+                            route="sampling.compute_logprobs",
+                            dimension="prefill",
+                        ),
+                    )
+                ],
+            )
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
         future_store.resolve(request_id, response.model_dump(exclude={"type"}))
-        logger.debug(
-            f"Request {request_id} computed {len(logprobs)} logprobs"
-        )
+        logger.debug(f"Request {request_id} computed {len(logprobs)} logprobs")
 
     except Exception as e:
         logger.exception(

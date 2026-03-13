@@ -27,6 +27,10 @@ class ApiWorkQueueUnavailableError(RuntimeError):
     pass
 
 
+class StaleConsumerError(RuntimeError):
+    pass
+
+
 def _ray_namespace() -> str:
     v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
     if v:
@@ -502,6 +506,13 @@ def _get_or_create_ray_actor():
         def set_active_job_id(self, job_id: str) -> None:
             self._active_job_id = None if not job_id else str(job_id)
 
+        def clear_active_job_id_if_matches(self, job_id: str) -> bool:
+            expected = None if not job_id else str(job_id)
+            if self._active_job_id != expected:
+                return False
+            self._active_job_id = None
+            return True
+
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
                 parts = f.read().strip().split()
@@ -575,10 +586,18 @@ def _get_or_create_ray_actor():
             async with self._cv:
                 while True:
                     if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
-                        self._cv.notify(1)
-                        raise RuntimeError(
-                            f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
-                        )
+                        return {
+                            "request_id": "",
+                            "op": "__stale_consumer__",
+                            "request_json": b"",
+                            "user_id": None,
+                            "webhook_url": None,
+                            "extra": {
+                                "consumer_job_id": str(consumer_job_id),
+                                "active_job_id": self._active_job_id,
+                            },
+                            "created_at": time.time(),
+                        }
 
                     has_legacy = bool(self._items)
                     now = time.time()
@@ -872,6 +891,12 @@ class ApiWorkQueueClient:
         if not ray.is_initialized():
             raise ApiWorkQueueUnavailableError("Ray not initialized")
 
+        if self._ray_actor is not None:
+            try:
+                ray.get(self._ray_actor.stats.remote(), timeout=1.0)
+            except Exception:
+                self._ray_actor = None
+
         if self._ray_actor is None:
             try:
                 self._ray_actor = _get_or_create_ray_actor()
@@ -935,7 +960,11 @@ class ApiWorkQueueClient:
             # while capacity stays reserved.
             ref = actor.enqueue.remote(item, producer_job_id)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
+            enqueue_timeout_s = max(
+                10.0,
+                float(os.environ.get("MINT_API_WORK_QUEUE_ENQUEUE_TIMEOUT_S", "60.0")),
+            )
+            await loop.run_in_executor(None, lambda: ray.get(ref, timeout=enqueue_timeout_s))
 
         if tracer is None:
             await _do_enqueue()
@@ -981,6 +1010,11 @@ class ApiWorkQueueClient:
         item = await loop.run_in_executor(self._dequeue_executor, ray.get, ref)
         if not isinstance(item, dict):
             raise TypeError(f"ApiWorkQueue.dequeue returned non-dict: {type(item)}")
+        if str(item.get("op")) == "__stale_consumer__":
+            extra = dict(item.get("extra") or {})
+            raise StaleConsumerError(
+                f"stale consumer job_id={extra.get('consumer_job_id')!r} active_job_id={extra.get('active_job_id')!r}"
+            )
         return WorkItem(
             request_id=str(item["request_id"]),
             op=str(item["op"]),
@@ -1026,23 +1060,26 @@ class ApiWorkQueueClient:
 
     async def start_workers(self, *, num_workers: int) -> None:
         import asyncio
+        import ray
 
         if self._running:
             return
         self._running = True
 
-        actor = self._get_ray_actor()
         try:
-            import ray
-
             job_id = str(ray.get_runtime_context().get_job_id())
             self._consumer_job_id = job_id
             loop = asyncio.get_running_loop()
+            start_timeout_s = max(
+                10.0,
+                float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
+            )
             last_error: Exception | None = None
             for attempt in range(1, 4):
                 try:
+                    actor = self._get_ray_actor()
                     ref = actor.set_active_job_id.remote(job_id)
-                    await loop.run_in_executor(None, lambda: ray.get(ref, timeout=10.0))
+                    await loop.run_in_executor(None, lambda: ray.get(ref, timeout=start_timeout_s))
                     last_error = None
                     break
                 except Exception as e:
@@ -1054,7 +1091,6 @@ class ApiWorkQueueClient:
                         e,
                     )
                     self._ray_actor = None
-                    actor = self._get_ray_actor()
             if last_error is not None:
                 raise last_error
         except Exception as e:
@@ -1073,6 +1109,7 @@ class ApiWorkQueueClient:
 
     async def shutdown(self) -> None:
         import asyncio
+        import ray
 
         self._running = False
         for t in self._worker_tasks:
@@ -1080,6 +1117,20 @@ class ApiWorkQueueClient:
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks = []
+        actor = None
+        consumer_job_id = self._consumer_job_id
+        if consumer_job_id is not None:
+            try:
+                actor = self._get_ray_actor()
+            except Exception:
+                actor = None
+        if actor is not None and consumer_job_id is not None:
+            try:
+                ref = actor.clear_active_job_id_if_matches.remote(consumer_job_id)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+            except Exception:
+                pass
         if self._dequeue_executor is not None:
             self._dequeue_executor.shutdown(wait=False, cancel_futures=True)
             self._dequeue_executor = None
@@ -1094,6 +1145,13 @@ class ApiWorkQueueClient:
         while self._running:
             try:
                 item = await self._dequeue()
+            except StaleConsumerError as e:
+                logger.info(
+                    "[api_work_queue] stale consumer exiting (worker_idx=%s): %s",
+                    int(worker_idx),
+                    e,
+                )
+                break
             except Exception as e:
                 # Never let a dequeue failure permanently kill the background workers.
                 # If the detached Ray queue actor dies (or Ray connectivity blips),

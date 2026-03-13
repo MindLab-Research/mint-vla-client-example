@@ -431,15 +431,16 @@ def _create_multinode_vllm_actor(
             # Serialize add_request() while still allowing concurrent in-flight requests.
             self._serialize_add_request = _env_flag("MINT_VLLM_SERIALIZE_ADD_REQUEST", default=True)
             self._add_request_lock = asyncio.Lock() if self._serialize_add_request else None
-            # For multinode, vLLM's `SamplingParams(n>1)` path has shown hangs even at low
-            # concurrency. Optionally implement multi-sample by issuing N independent n=1
-            # requests; rely on vLLM prefix caching to reuse the long prompt KV across calls.
+            # Multinode multi-sample can run either through vLLM's native `n>1` path or
+            # by expanding into repeated `n=1` requests. Default to the native path here so
+            # experiments measure real `SamplingParams(n>1)` behavior unless explicitly
+            # overridden by environment.
             #
             # Modes:
             # - "vllm_n": use `SamplingParams(n=N)` (default vLLM multisample)
             # - "sequential_n1": run N sequential `SamplingParams(n=1)` requests
             # - "concurrent_n1": run N concurrent `SamplingParams(n=1)` requests
-            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "concurrent_n1").strip().lower()
+            self._multisample_mode = os.environ.get("MINT_VLLM_MULTISAMPLE_MODE", "vllm_n").strip().lower()
             default_serialize_multisample = self._multisample_mode == "vllm_n"
             self._serialize_multisample = _env_flag(
                 "MINT_VLLM_SERIALIZE_MULTISAMPLE",
@@ -637,12 +638,6 @@ def _create_multinode_vllm_actor(
             if max_num_batched_tokens is None:
                 max_num_batched_tokens = 4096 if (self.max_model_len or 0) >= 32768 else 8192
             max_num_batched_tokens = int(os.environ.get("MINT_VLLM_MAX_NUM_BATCHED_TOKENS", str(max_num_batched_tokens)))
-            # vLLM v1 SchedulerConfig requires max_num_batched_tokens >= max_model_len.
-            # With enable_chunked_prefill=True (default), vLLM still chunks prefill internally,
-            # so memory behavior is preserved — this floor only prevents the hard validation rejection.
-            effective_max_model_len = self.max_model_len or 0
-            if max_num_batched_tokens < effective_max_model_len:
-                max_num_batched_tokens = effective_max_model_len
             enable_chunked_prefill = _env_flag("MINT_VLLM_ENABLE_CHUNKED_PREFILL", default=True)
             enable_prefix_caching = _env_flag("MINT_VLLM_ENABLE_PREFIX_CACHING", default=True)
             if distributed_executor_backend not in ("ray", "mp"):
@@ -650,14 +645,10 @@ def _create_multinode_vllm_actor(
                     f"Invalid MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND={distributed_executor_backend!r} "
                     f"(expected 'ray' or 'mp')"
                 )
-            # vLLM fused-MoE + LoRA has crashed in Volcano deployments when fully-sharded LoRAs are enabled
-            # (assert in vllm/lora/layers/fused_moe.py:_slice_w13_a during engine init/profile run).
-            # Keep this opt-in so we can toggle it without a code deploy.
             fully_sharded_loras = (
-                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False)
+                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True)
                 and self.enable_lora
                 and self.max_lora_rank is not None
-                and self.tensor_parallel_size >= 32
                 and self.max_lora_rank % self.tensor_parallel_size == 0
             )
             if fully_sharded_loras:
@@ -1017,6 +1008,13 @@ def _create_multinode_vllm_actor(
             outer_request_id = str(outer_request_id or request_id)
             n_req = max(1, int(n))
             if n_req > 1 and self._multisample_mode in ("sequential_n1", "concurrent_n1"):
+                logger.info(
+                    "multinode_vllm_multisample_mode request_id=%s outer_request_id=%s mode=%s n=%s",
+                    request_id,
+                    outer_request_id,
+                    self._multisample_mode,
+                    n_req,
+                )
                 sub_ids = {f"{request_id}_s{i}" for i in range(n_req)}
                 try:
                     async with self._outer_to_subreq_lock:
@@ -1078,6 +1076,14 @@ def _create_multinode_vllm_actor(
                     async with self._outer_to_subreq_lock:
                         self._outer_to_subreq_ids.pop(request_id, None)
                     await self._clear_progress(outer_request_id)
+            if n_req > 1:
+                logger.info(
+                    "multinode_vllm_multisample_mode request_id=%s outer_request_id=%s mode=%s n=%s",
+                    request_id,
+                    outer_request_id,
+                    self._multisample_mode,
+                    n_req,
+                )
 
             effective_max_tokens = int(max_tokens)
             if self.max_model_len is not None:
@@ -1505,46 +1511,47 @@ def _create_multinode_vllm_actor(
                 )
 
             t0 = time.perf_counter()
-            async with self._maybe_prompt_logprobs_lock():
-                async with self._lock_read():
-                    t1 = time.perf_counter()
-                    try:
-                        collector = await self.engine.add_request(
-                            request_id=request_id,
-                            prompt=prompt,
-                            params=sampling_params,
-                            lora_request=lora_request,
-                        )
-                    except Exception:
-                        _raise_serializable_vllm_error(
-                            request_id=request_id,
-                            where="vllm_prompt_logprobs_add_request_failed",
-                            extra={
-                                "prompt_len": len(prompt_ids),
-                                "model_path": self.model_path,
-                                "tp": self.tensor_parallel_size,
-                                "pp": self.pipeline_parallel_size,
-                            },
-                        )
-                    final_res = None
-                    try:
-                        while True:
-                            out = await collector.get()
-                            final_res = out
-                            if out.finished:
-                                break
-                    except Exception:
-                        _raise_serializable_vllm_engine_error(
-                            request_id=request_id,
-                            where="vllm_prompt_logprobs_collect_failed",
-                            extra={
-                                "prompt_len": len(prompt_ids),
-                                "model_path": self.model_path,
-                                "tp": self.tensor_parallel_size,
-                                "pp": self.pipeline_parallel_size,
-                            },
-                        )
-                    assert final_res is not None
+            async with self._exclusive_engine_op():
+                async with self._maybe_prompt_logprobs_lock():
+                    async with self._lock_read():
+                        t1 = time.perf_counter()
+                        try:
+                            collector = await self.engine.add_request(
+                                request_id=request_id,
+                                prompt=prompt,
+                                params=sampling_params,
+                                lora_request=lora_request,
+                            )
+                        except Exception:
+                            _raise_serializable_vllm_error(
+                                request_id=request_id,
+                                where="vllm_prompt_logprobs_add_request_failed",
+                                extra={
+                                    "prompt_len": len(prompt_ids),
+                                    "model_path": self.model_path,
+                                    "tp": self.tensor_parallel_size,
+                                    "pp": self.pipeline_parallel_size,
+                                },
+                            )
+                        final_res = None
+                        try:
+                            while True:
+                                out = await collector.get()
+                                final_res = out
+                                if out.finished:
+                                    break
+                        except Exception:
+                            _raise_serializable_vllm_engine_error(
+                                request_id=request_id,
+                                where="vllm_prompt_logprobs_collect_failed",
+                                extra={
+                                    "prompt_len": len(prompt_ids),
+                                    "model_path": self.model_path,
+                                    "tp": self.tensor_parallel_size,
+                                    "pp": self.pipeline_parallel_size,
+                                },
+                            )
+                        assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
                 print(
@@ -2112,6 +2119,12 @@ class MultiNodeInferenceEngine:
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "OMP_NUM_THREADS": os.environ.get("MINT_VLLM_OMP_NUM_THREADS", "1"),
+                "MKL_NUM_THREADS": os.environ.get("MINT_VLLM_MKL_NUM_THREADS", "1"),
+                "OPENBLAS_NUM_THREADS": os.environ.get("MINT_VLLM_OPENBLAS_NUM_THREADS", "1"),
+                "NUMEXPR_NUM_THREADS": os.environ.get("MINT_VLLM_NUMEXPR_NUM_THREADS", "1"),
+                "VECLIB_MAXIMUM_THREADS": os.environ.get("MINT_VLLM_VECLIB_MAXIMUM_THREADS", "1"),
+                "BLIS_NUM_THREADS": os.environ.get("MINT_VLLM_BLIS_NUM_THREADS", "1"),
                 # Some environments import tvm_ffi during vLLM init and try to JIT-build a
                 # torch c-dlpack addon on every Ray worker process, which can spawn dozens
                 # of concurrent compilers and stall engine startup. Disable the optional
@@ -2127,8 +2140,10 @@ class MultiNodeInferenceEngine:
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
-            if total_required_gpus >= 16:
-                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
+            if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
+                env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
+                    "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"
+                ]
             if "VLLM_USE_V1" in os.environ:
                 env_vars["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
             else:
@@ -2155,6 +2170,7 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
+                "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
                 "MINT_VLLM_SERIALIZE_GENERATE",
                 "MINT_VLLM_SERIALIZE_MULTISAMPLE",
                 "MINT_VLLM_MULTISAMPLE_MODE",
@@ -2212,13 +2228,9 @@ class MultiNodeInferenceEngine:
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
 
-            # Keep fully-sharded LoRAs opt-in.
-            #
-            # We have observed vLLM fused-MoE + LoRA crashes in Volcano deployments when
-            # fully-sharded LoRAs are enabled (assert in vllm/lora/layers/fused_moe.py
-            # during engine init/profile run). Operators can still enable this via:
-            #   export MINT_VLLM_FULLY_SHARDED_LORAS=1
-            # but we should not force-enable it in code.
+            # Fully sharded LoRAs are the default for multinode MoE actors when
+            # max_lora_rank is divisible by TP. Operators can still turn this off via:
+            #   export MINT_VLLM_FULLY_SHARDED_LORAS=0
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,

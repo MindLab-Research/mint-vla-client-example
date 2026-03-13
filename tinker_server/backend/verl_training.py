@@ -1016,17 +1016,26 @@ class TrainingWorker:
             "base_model_name_or_path": self._base_model,
         }
 
-    def save_lora_weights(self, save_path: str, traceparent: str | None = None) -> str:
+    def save_lora_weights(
+        self,
+        save_path: str,
+        traceparent: str | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> str:
         """Save LoRA adapter to directory.
 
         Args:
             save_path: Directory path to save adapter files.
+            session_id: Optional session to materialize before export.
 
         Returns:
             Absolute path where weights were saved.
         """
         self._bind_traceparent(traceparent)
         self._touch()
+        if session_id is not None:
+            self._ensure_session_loaded(session_id)
         import json
         import os
 
@@ -1047,17 +1056,26 @@ class TrainingWorker:
         logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
         return abs_path
 
-    def save_checkpoint(self, save_path: str, traceparent: str | None = None) -> dict:
+    def save_checkpoint(
+        self,
+        save_path: str,
+        traceparent: str | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> dict:
         """Save full checkpoint: LoRA weights + optimizer state + training metadata.
 
         Args:
             save_path: Directory path to save checkpoint files.
+            session_id: Optional session to materialize before export.
 
         Returns:
             Dict with training metadata, state_dict, and peft_config for registration.
         """
         self._bind_traceparent(traceparent)
         self._touch()
+        if session_id is not None:
+            self._ensure_session_loaded(session_id)
         import json
         import os
 
@@ -1100,12 +1118,15 @@ class TrainingWorker:
         load_path: str,
         load_optimizer: bool = True,
         traceparent: str | None = None,
+        *,
+        session_id: str | None = None,
     ) -> dict:
         """Load checkpoint, optionally restoring optimizer state.
 
         Args:
             load_path: Directory path to load checkpoint from.
             load_optimizer: Whether to restore optimizer state.
+            session_id: Optional session to materialize before loading.
 
         Returns:
             Dict with training metadata.
@@ -1120,33 +1141,79 @@ class TrainingWorker:
 
         # 1. Load LoRA weights
         adapter_path = os.path.join(load_path, "adapter_model.safetensors")
-        if os.path.exists(adapter_path):
-            state_dict = load_file(adapter_path, device=str(self.device))
-            # Load into PEFT model
-            from peft.utils.save_and_load import set_peft_model_state_dict
-            set_peft_model_state_dict(self.model, state_dict)
-            logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
-        else:
+        if not os.path.exists(adapter_path):
             raise FileNotFoundError(f"Adapter not found: {adapter_path}")
 
         # 2. Optionally load optimizer state
+        optimizer_path = os.path.join(load_path, "optimizer.pt")
         if load_optimizer:
-            optimizer_path = os.path.join(load_path, "optimizer.pt")
             if not os.path.exists(optimizer_path):
                 raise FileNotFoundError(
                     f"Optimizer restore requested, but optimizer state not found: {optimizer_path}"
                 )
-            self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-            logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
+
+        if session_id is not None:
+            self._ensure_session_loaded(session_id)
+
+        state_dict = load_file(adapter_path, device=str(self.device))
+        # Load into PEFT model
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        set_peft_model_state_dict(self.model, state_dict)
+        logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
 
         # 3. Load and return metadata
-        meta = {}
+        meta: dict[str, object] = {}
         meta_path = os.path.join(load_path, "training_meta.json")
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
-                meta = json.load(f)
-            self._step_count = meta.get("current_step", 0)
-            logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+                loaded_meta = json.load(f)
+            if isinstance(loaded_meta, dict):
+                meta = loaded_meta
+            else:
+                logger.warning(
+                    "[TrainingWorker] Invalid checkpoint metadata type %s in %s; "
+                    "preserving existing step/lr state",
+                    type(loaded_meta).__name__,
+                    meta_path,
+                )
+
+        if "current_step" in meta:
+            meta_step = meta["current_step"]
+            if isinstance(meta_step, int) and not isinstance(meta_step, bool):
+                self._step_count = meta_step
+                logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+            else:
+                logger.warning(
+                    "[TrainingWorker] Invalid current_step type=%s value=%r in %s; "
+                    "preserving existing step=%s",
+                    type(meta_step).__name__,
+                    meta_step,
+                    meta_path,
+                    self._step_count,
+                )
+
+        checkpoint_lr = meta.get("learning_rate")
+        try:
+            checkpoint_lr = float(checkpoint_lr) if checkpoint_lr is not None else None
+        except Exception:
+            logger.warning(
+                "[TrainingWorker] Invalid learning_rate value=%r in %s; preserving optimizer lr",
+                checkpoint_lr,
+                meta_path,
+            )
+            checkpoint_lr = None
+
+        if load_optimizer:
+            self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+            logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
+        else:
+            # Non-resume loads must drop any session-local momentum/gradients that
+            # _ensure_session_loaded() may have materialized from a previous session incarnation.
+            self.reset_optimizer(checkpoint_lr)
+            logger.info(
+                "[TrainingWorker] Reset optimizer state after non-resume checkpoint load "
+                f"(lr={checkpoint_lr})"
+            )
 
         return meta
 
@@ -1523,12 +1590,18 @@ class VerlTrainingEngine:
         )
         return dense.actor
 
-    async def _get_live_worker(self, session: "TrainingSession", *, op: str) -> ray.actor.ActorHandle:
+    async def _get_live_worker(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        allow_recover: bool = False,
+    ) -> ray.actor.ActorHandle:
         """Return a live worker handle, rebinding dense trainers when evicted."""
         model_id = session.model_id
         worker = self._workers.get(model_id)
         if worker is None:
-            if session.backend == "peft":
+            if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
 
@@ -1545,6 +1618,12 @@ class VerlTrainingEngine:
             self._touch_actor(session)
             return worker
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+            if not allow_recover:
+                raise RuntimeError(
+                    f"[{model_id}] dense worker became unavailable before op={op}; "
+                    "refusing automatic recovery because in-memory session state may be lost. "
+                    "Reload from a checkpoint before retrying."
+                ) from e
             logger.warning(
                 "[%s] dense worker unhealthy before op=%s: %s: %s; attempting rebind",
                 model_id,
@@ -1555,6 +1634,119 @@ class VerlTrainingEngine:
             return await self._recover_dense_worker(
                 session,
                 reason=f"{op}:{type(e).__name__}",
+            )
+
+    def _strict_megatron_save_meta_enabled(self) -> bool:
+        """Whether invalid save metadata should fail the request for megatron."""
+        raw = os.environ.get("MINT_MEGATRON_STRICT_SAVE_META", "1").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _update_session_step_monotonic(
+        self,
+        session: "TrainingSession",
+        meta: Any,
+        *,
+        op: str,
+        strict: bool = False,
+    ) -> None:
+        """Monotonic, type-safe current_step update from worker metadata."""
+        model_id = session.model_id
+        if not isinstance(meta, dict):
+            msg = (
+                f"[{model_id}] {op}: invalid meta type {type(meta).__name__}; "
+                f"current_step={session.current_step}"
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+            return
+
+        if "current_step" not in meta:
+            msg = (
+                f"[{model_id}] {op}: meta missing current_step; "
+                f"current_step={session.current_step}"
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+            return
+
+        meta_step = meta.get("current_step")
+        if not isinstance(meta_step, int) or isinstance(meta_step, bool):
+            msg = (
+                f"[{model_id}] {op}: invalid current_step type={type(meta_step).__name__} "
+                f"value={meta_step!r}; current_step={session.current_step}"
+            )
+            if strict:
+                raise ValueError(msg)
+            logger.warning(msg)
+            return
+
+        prev_step = session.current_step
+        next_step = max(prev_step, meta_step)
+        if meta_step < prev_step:
+            logger.warning(
+                "[%s] %s: stale current_step=%s < existing=%s; keep monotonic value=%s",
+                model_id,
+                op,
+                meta_step,
+                prev_step,
+                next_step,
+            )
+        session.current_step = next_step
+
+    def _update_session_from_load_meta(
+        self,
+        session: "TrainingSession",
+        meta: Any,
+        *,
+        op: str,
+    ) -> None:
+        """Best-effort load metadata application without polluting session state."""
+        model_id = session.model_id
+        if not isinstance(meta, dict):
+            logger.warning(
+                "[%s] %s: invalid meta type %s; preserving current_step=%s lr=%s",
+                model_id,
+                op,
+                type(meta).__name__,
+                session.current_step,
+                session.learning_rate,
+            )
+            return
+
+        meta_step = meta.get("current_step")
+        if isinstance(meta_step, int) and not isinstance(meta_step, bool):
+            session.current_step = meta_step
+        elif "current_step" in meta:
+            logger.warning(
+                "[%s] %s: invalid current_step type=%s value=%r; preserving current_step=%s",
+                model_id,
+                op,
+                type(meta_step).__name__,
+                meta_step,
+                session.current_step,
+            )
+        else:
+            logger.warning(
+                "[%s] %s: meta missing current_step; preserving current_step=%s",
+                model_id,
+                op,
+                session.current_step,
+            )
+
+        if "learning_rate" not in meta:
+            return
+        try:
+            session.learning_rate = float(meta["learning_rate"])
+        except Exception:
+            logger.warning(
+                "[%s] %s: invalid learning_rate type=%s value=%r; preserving learning_rate=%s",
+                model_id,
+                op,
+                type(meta["learning_rate"]).__name__,
+                meta["learning_rate"],
+                session.learning_rate,
             )
 
     async def _await_with_keepalive(
@@ -2290,10 +2482,7 @@ class VerlTrainingEngine:
 
         This intentionally excludes optimizer/resume artifacts.
         """
-        import asyncio
         import os
-
-        import ray
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_dense_lora_weights_for_sampler")
@@ -2316,10 +2505,18 @@ class VerlTrainingEngine:
             default_timeout_s = 300
         timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
 
-        loop = asyncio.get_running_loop()
         traceparent = get_current_traceparent()
-        ref = worker.save_lora_weights.remote(abs_path, traceparent=traceparent)
-        _ = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=timeout_s))
+        ref = worker.save_lora_weights.remote(
+            abs_path,
+            traceparent=traceparent,
+            session_id=session.model_id,
+        )
+        _ = await self._await_with_keepalive(
+            ref,
+            session,
+            interval_s=30.0,
+            timeout_s=timeout_s,
+        )
 
         logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
         return abs_path
@@ -2331,10 +2528,7 @@ class VerlTrainingEngine:
         use_per_expert_lora: bool = False,
     ) -> str:
         """Save minimal PEFT LoRA artifacts for sampling (no optimizer/resume artifacts)."""
-        import asyncio
         import os
-
-        import ray
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_lora_weights_for_sampler")
@@ -2357,7 +2551,6 @@ class VerlTrainingEngine:
             default_timeout_s = 300
         timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
 
-        loop = asyncio.get_running_loop()
         lora_cfg = getattr(session, "lora_config", None)
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
@@ -2372,8 +2565,19 @@ class VerlTrainingEngine:
             train_mlp=train_mlp,
             train_unembed=train_unembed,
         )
-        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
-        session.current_step = meta.get("current_step", session.current_step)
+        meta = await self._await_with_keepalive(
+            meta_ref,
+            session,
+            interval_s=30.0,
+            timeout_s=timeout_s,
+        )
+        strict_meta = self._strict_megatron_save_meta_enabled()
+        self._update_session_step_monotonic(
+            session,
+            meta,
+            op="save_lora_weights_for_sampler",
+            strict=strict_meta,
+        )
 
         logger.info(f"[{model_id}] save_lora_weights_for_sampler: {abs_path}")
         return abs_path
@@ -2398,10 +2602,7 @@ class VerlTrainingEngine:
         Returns:
             Absolute path to saved checkpoint directory.
         """
-        import asyncio
         import os
-
-        import ray
 
         from .model_registry import get_model_config
 
@@ -2426,21 +2627,43 @@ class VerlTrainingEngine:
             default_timeout_s = 300
         timeout_s = int(os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
-        loop = asyncio.get_running_loop()
         if session.backend == "megatron":
             traceparent = get_current_traceparent()
+            lora_cfg = getattr(session, "lora_config", None)
+            train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+            train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+            train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
             meta_ref = worker.save_checkpoint.remote(
                 abs_path,
                 use_per_expert_lora=use_per_expert_lora,
                 traceparent=traceparent,
+                session_id=session.model_id,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
         else:
             traceparent = get_current_traceparent()
-            meta_ref = worker.save_checkpoint.remote(abs_path, traceparent=traceparent)
-        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=timeout_s))
+            meta_ref = worker.save_checkpoint.remote(
+                abs_path,
+                traceparent=traceparent,
+                session_id=session.model_id,
+            )
+        meta = await self._await_with_keepalive(
+            meta_ref,
+            session,
+            interval_s=30.0,
+            timeout_s=timeout_s,
+        )
 
         # Update session state
-        session.current_step = meta.get("current_step", session.current_step)
+        strict_meta = bool(session.backend == "megatron" and self._strict_megatron_save_meta_enabled())
+        self._update_session_step_monotonic(
+            session,
+            meta,
+            op="save_weights",
+            strict=strict_meta,
+        )
 
         logger.info(f"[{model_id}] save_weights: {abs_path}")
         return abs_path
@@ -2458,30 +2681,68 @@ class VerlTrainingEngine:
             load_path: Directory path to load from.
             load_optimizer: Whether to restore optimizer state.
         """
-        import asyncio
-
-        import ray
-
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="load_weights")
+        worker = await self._get_live_worker(
+            session,
+            op="load_weights",
+            allow_recover=(session.backend == "peft"),
+        )
 
-        # Remote call to load checkpoint
-        # Must use ray.get() in executor since await on ObjectRef doesn't await completion
-        loop = asyncio.get_running_loop()
         if session.backend == "megatron":
-            traceparent = get_current_traceparent()
-            meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer, traceparent=traceparent)
-        else:
-            traceparent = get_current_traceparent()
-            meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer, traceparent=traceparent)
-        meta = await loop.run_in_executor(None, lambda: ray.get(meta_ref, timeout=120))
+            ready_timeout_s = (
+                float(server_config.training_actor_ready_timeout_s)
+                if server_config.training_actor_ready_timeout_s is not None
+                else 1800.0
+            )
+            await self._await_with_keepalive(
+                worker.__ray_ready__.remote(),
+                session,
+                interval_s=30.0,
+                timeout_s=ready_timeout_s,
+            )
 
-        # Update session state from loaded metadata
-        session.current_step = meta.get("current_step", 0)
-        try:
-            session.learning_rate = float(meta.get("learning_rate", session.learning_rate))
-        except Exception:
-            pass
+        default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
+        load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+
+        # Remote call to load checkpoint while keeping the pooled actor marked active.
+        traceparent = get_current_traceparent()
+        kwargs: dict[str, object] = {
+            "traceparent": traceparent,
+            "session_id": session.model_id,
+        }
+        if session.backend == "megatron":
+            lora_cfg = getattr(session, "lora_config", None)
+            kwargs["train_attn"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+            kwargs["train_mlp"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+            kwargs["train_unembed"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        meta_ref = worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
+        meta = await self._await_with_keepalive(
+            meta_ref,
+            session,
+            interval_s=30.0,
+            timeout_s=load_timeout_s,
+        )
+
+        # Update session state from loaded metadata without polluting existing
+        # client-side state when old/corrupt checkpoints omit metadata.
+        self._update_session_from_load_meta(
+            session,
+            meta,
+            op="load_weights",
+        )
+
+        if session.backend == "megatron":
+            actual_rank = meta.get("actual_rank")
+            await asyncio.to_thread(
+                ray.get,
+                worker.mark_session_loaded.remote(
+                    session.model_id,
+                    step_count=session.current_step,
+                    learning_rate=session.learning_rate,
+                    actual_rank=actual_rank,
+                ),
+                timeout=30,
+            )
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 

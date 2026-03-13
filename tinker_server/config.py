@@ -197,9 +197,21 @@ class ServerConfig:
     # Authentication
     api_key: str = ""  # Hardcoded API key (legacy). If set, accepts this key directly.
     token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
+    internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
-    # Usage logging
-    usage_log_dir: str = "/tmp/tinker_usage"  # Directory to store usage logs
+    # Usage billing (Postgres only)
+    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated, kept for compatibility
+    usage_backend: str = "postgres"  # postgres
+    usage_pg_dsn: str = ""  # Full PostgreSQL DSN (preferred)
+    usage_pg_host: str = ""
+    usage_pg_port: int = 5432
+    usage_pg_database: str = "mint_billing"
+    usage_pg_user: str = "mint_user"
+    usage_pg_password: str = ""
+    usage_pg_pool_min: int = 10
+    usage_pg_pool_max: int = 30
+    usage_write_timeout_ms: int = 2000
+    usage_pg_table: str = "billing.usage_event"
     skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
 
     # Model settings (no default model - clients specify per-request)
@@ -326,8 +338,84 @@ class ServerConfig:
             port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
             token_secret_key=token_secret_key,
+            internal_api_token=_pick_str(
+                "INTERNAL_API_TOKEN",
+                file_server.internal_api_token if file_server is not None else None,
+                "",
+            ),
+            usage_backend=_pick_str(
+                "TINKER_USAGE_BACKEND",
+                file_server.usage_backend if file_server is not None else None,
+                "postgres",
+            ).lower(),
             usage_log_dir=_pick_str(
-                "TINKER_USAGE_LOG_DIR", file_server.usage_log_dir if file_server is not None else None, "/tmp/tinker_usage"
+                "TINKER_USAGE_LOG_DIR",
+                file_server.usage_log_dir if file_server is not None else None,
+                "/tmp/tinker_usage",
+            ),
+            usage_pg_dsn=(
+                _pick_str(
+                    "TINKER_USAGE_PG_DSN",
+                    file_server.usage_pg_dsn if file_server is not None else None,
+                    "",
+                )
+                or (
+                    (
+                        "postgresql://"
+                        f"{_pick_str('TINKER_USAGE_PG_USER', file_server.usage_pg_user if file_server is not None else None, 'mint_user')}:"
+                        f"{_pick_str('TINKER_USAGE_PG_PASSWORD', file_server.usage_pg_password if file_server is not None else None, '')}@"
+                        f"{_pick_str('TINKER_USAGE_PG_HOST', file_server.usage_pg_host if file_server is not None else None, '')}:"
+                        f"{_pick_int('TINKER_USAGE_PG_PORT', file_server.usage_pg_port if file_server is not None else None, 5432)}/"
+                        f"{_pick_str('TINKER_USAGE_PG_DATABASE', file_server.usage_pg_database if file_server is not None else None, 'mint_billing')}"
+                    )
+                    if _pick_str("TINKER_USAGE_PG_HOST", file_server.usage_pg_host if file_server is not None else None, "")
+                    else ""
+                )
+            ),
+            usage_pg_host=_pick_str(
+                "TINKER_USAGE_PG_HOST",
+                file_server.usage_pg_host if file_server is not None else None,
+                "",
+            ),
+            usage_pg_port=_pick_int(
+                "TINKER_USAGE_PG_PORT",
+                file_server.usage_pg_port if file_server is not None else None,
+                5432,
+            ),
+            usage_pg_database=_pick_str(
+                "TINKER_USAGE_PG_DATABASE",
+                file_server.usage_pg_database if file_server is not None else None,
+                "mint_billing",
+            ),
+            usage_pg_user=_pick_str(
+                "TINKER_USAGE_PG_USER",
+                file_server.usage_pg_user if file_server is not None else None,
+                "mint_user",
+            ),
+            usage_pg_password=_pick_str(
+                "TINKER_USAGE_PG_PASSWORD",
+                file_server.usage_pg_password if file_server is not None else None,
+                "",
+            ),
+            usage_pg_pool_min=_pick_int(
+                "TINKER_USAGE_PG_POOL_MIN",
+                file_server.usage_pg_pool_min if file_server is not None else None,
+                10,
+            ),
+            usage_pg_pool_max=_pick_int(
+                "TINKER_USAGE_PG_POOL_MAX",
+                file_server.usage_pg_pool_max if file_server is not None else None,
+                30,
+            ),
+            usage_write_timeout_ms=_pick_int(
+                "TINKER_USAGE_WRITE_TIMEOUT_MS",
+                file_server.usage_write_timeout_ms if file_server is not None else None,
+                2000,
+            ),
+            usage_pg_table=_pick_str(
+                "TINKER_USAGE_PG_TABLE",
+                file_server.usage_pg_table if file_server is not None else None,
+                "billing.usage_event",
             ),
             skip_actor_cleanup=_pick_bool(
                 "MINT_SKIP_ACTOR_CLEANUP", file_server.skip_actor_cleanup if file_server is not None else None, False

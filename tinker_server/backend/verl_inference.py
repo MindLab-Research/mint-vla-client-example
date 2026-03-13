@@ -47,6 +47,57 @@ def _mint_present_expert_ids_from_adapter_dir(adapter_dir: str) -> set[int]:
         return _mint_present_expert_ids_from_keys(list(f.keys()))
 
 
+def _mint_expected_num_experts_from_base_model(base_model_name_or_path: object) -> int | None:
+    if not isinstance(base_model_name_or_path, str) or not base_model_name_or_path:
+        return None
+    try:
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            base_model_name_or_path,
+            trust_remote_code=True,
+        )
+    except Exception:
+        return None
+    value = getattr(hf_config, "num_experts", None) or getattr(hf_config, "n_routed_experts", None)
+    try:
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _mint_expected_num_experts_from_adapter_dir(adapter_dir: str) -> int | None:
+    import json
+
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    return _mint_expected_num_experts_from_base_model(cfg.get("base_model_name_or_path"))
+
+
+def _mint_sparse_expert_ids_need_patch(
+    present_expert_ids: set[int],
+    *,
+    expected_num_experts: int | None,
+) -> bool:
+    if not present_expert_ids:
+        return False
+    if expected_num_experts is None or expected_num_experts <= 0:
+        # Fail-open only for the legacy shared-expert export that we can identify
+        # without model metadata. Avoid patching full per-expert adapters
+        # unnecessarily in hardened environments.
+        return present_expert_ids == {0}
+    expected = set(range(expected_num_experts))
+    return present_expert_ids != expected
+
+
 # vLLM MoE LoRA support: tolerate shared-expert sparse adapters.
 #
 # vLLM's PackedLoRALayerWeights.pack_moe currently asserts that every expert has
@@ -386,6 +437,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             allow_insecure = os.environ.get("MINT_VLLM_ALLOW_INSECURE_SERIALIZATION", "1").strip().lower()
             if allow_insecure not in {"0", "false", "no", "off"}:
                 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+            rollout_mode = kwargs.get("rollout_mode")
+            if isinstance(rollout_mode, str):
+                from verl.workers.rollout.replica import RolloutMode
+
+                kwargs["rollout_mode"] = RolloutMode(rollout_mode)
             pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):
@@ -422,6 +478,29 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             else:
                 print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
             call_kwargs = dict(kwargs)
+            rollout_cfg = call_kwargs.get("config")
+            if rollout_cfg is not None:
+                from dataclasses import asdict, is_dataclass
+                from verl.utils.config import omega_conf_to_dataclass
+                from verl.workers.config import RolloutConfig as VerlRolloutConfig
+
+                if isinstance(rollout_cfg, dict):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        rollout_cfg, dataclass_type=VerlRolloutConfig
+                    )
+                elif is_dataclass(rollout_cfg):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        asdict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                    )
+                elif not isinstance(rollout_cfg, VerlRolloutConfig):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        dict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                    )
+                print(
+                    f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
+                    flush=True,
+                )
+                call_kwargs["config"] = rollout_cfg
             if sig is not None:
                 accepts_var_kw = any(
                     p.kind == inspect.Parameter.VAR_KEYWORD
@@ -555,12 +634,25 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if not isinstance(adapter_dir, str) or not adapter_dir:
                 raise RuntimeError(f"vLLM LoRARequest missing lora_path: {adapter_dir!r}")
             present = _mint_present_expert_ids_from_adapter_dir(adapter_dir)
-            if present == {0}:
+            expected_num_experts = _mint_expected_num_experts_from_adapter_dir(adapter_dir)
+            if _mint_sparse_expert_ids_need_patch(
+                present,
+                expected_num_experts=expected_num_experts,
+            ):
                 await self._ensure_pack_moe_patched()
 
-        async def _maybe_ensure_pack_moe_patched_for_state_dict(self, state_dict: dict) -> None:
+        async def _maybe_ensure_pack_moe_patched_for_state_dict(
+            self,
+            state_dict: dict,
+            *,
+            base_model_name_or_path: object = None,
+        ) -> None:
             present = _mint_present_expert_ids_from_keys([str(k) for k in state_dict.keys()])
-            if present == {0}:
+            expected_num_experts = _mint_expected_num_experts_from_base_model(base_model_name_or_path)
+            if _mint_sparse_expert_ids_need_patch(
+                present,
+                expected_num_experts=expected_num_experts,
+            ):
                 await self._ensure_pack_moe_patched()
 
         def _patch_lora_args(self, args):
@@ -664,7 +756,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             except Exception:
                 pass
 
-            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                state_dict,
+                base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+            )
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -754,7 +849,10 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             )
 
             # Add to engine (no need to remove - this is a new unique ID)
-            await self._maybe_ensure_pack_moe_patched_for_state_dict(state_dict)
+            await self._maybe_ensure_pack_moe_patched_for_state_dict(
+                state_dict,
+                base_model_name_or_path=peft_config.get("base_model_name_or_path"),
+            )
             await self.engine.add_lora(lora_request)
             return adapter_path
 
@@ -2190,6 +2288,12 @@ class VerlInferenceEngine:
             f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
         )
 
+        from dataclasses import asdict
+
+        rollout_payload = asdict(rollout_config)
+        if not rollout_payload.get("_target_"):
+            rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
+
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
@@ -2206,7 +2310,7 @@ class VerlInferenceEngine:
                 }
             },
         ).remote(
-            config=rollout_config,
+            config=rollout_payload,
             model_config=model_config,
             rollout_mode=RolloutMode.STANDALONE,
             workers=[],  # No external workers for standalone
