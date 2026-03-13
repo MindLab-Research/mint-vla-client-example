@@ -601,8 +601,12 @@ _TIMING_SUMMARY_JSON_PATH = EXPERIMENT_DIR / "timing_summary.json"
 _TIMING_SUMMARY_MD_PATH = EXPERIMENT_DIR / "timing_summary.md"
 atexit.register(_write_timing_reports)
 
-# Create the service client
-service_client = _time_call(mint.ServiceClient, stage_name="create_service_client")
+# Use the scenario timeout for HTTP requests too; 30B/235B optim/sampling can
+# legitimately exceed the library default.
+service_client = _time_call(
+    lambda: mint.ServiceClient(timeout=DEFAULT_TIMEOUT_S),
+    stage_name="create_service_client",
+)
 _dbg(f"client_session_id={getattr(getattr(service_client, 'holder', None), '_session_id', None)!r}")
 
 # List available models
