@@ -6698,6 +6698,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                 actor_name=actor_name,
                 namespace=PERSISTENT_NAMESPACE,
                 no_restart=True,
+                verify_absent=True,
                 base_model=base_model,
             )
             logger.info(f"Killed Megatron actor: {actor_name}")
@@ -6730,6 +6731,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
                     actor_name=entry.actor_name,
                     namespace=PERSISTENT_NAMESPACE,
                     no_restart=True,
+                    verify_absent=True,
                     base_model=entry.base_model,
                 )
                 logger.info(f"Killed Megatron actor: {entry.actor_name}")
