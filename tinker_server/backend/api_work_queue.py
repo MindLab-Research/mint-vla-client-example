@@ -13,6 +13,7 @@ from ..logging_context import (
     classify_failure_reason,
     ensure_trace_id,
     extract_trace_id_from_traceparent,
+    get_trace_id,
     get_otel_tracer,
     init_actor_observability,
     log_with_bound_context,
