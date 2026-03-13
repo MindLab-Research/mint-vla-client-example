@@ -637,14 +637,10 @@ def _create_multinode_vllm_actor(
                     f"Invalid MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND={distributed_executor_backend!r} "
                     f"(expected 'ray' or 'mp')"
                 )
-            # vLLM fused-MoE + LoRA has crashed in Volcano deployments when fully-sharded LoRAs are enabled
-            # (assert in vllm/lora/layers/fused_moe.py:_slice_w13_a during engine init/profile run).
-            # Keep this opt-in so we can toggle it without a code deploy.
             fully_sharded_loras = (
-                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False)
+                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True)
                 and self.enable_lora
                 and self.max_lora_rank is not None
-                and self.tensor_parallel_size >= 32
                 and self.max_lora_rank % self.tensor_parallel_size == 0
             )
             if fully_sharded_loras:
@@ -2207,13 +2203,9 @@ class MultiNodeInferenceEngine:
             if "MINT_VLLM_GENERATE_TIMEOUT_S" not in env_vars:
                 env_vars["MINT_VLLM_GENERATE_TIMEOUT_S"] = "3600"
 
-            # Keep fully-sharded LoRAs opt-in.
-            #
-            # We have observed vLLM fused-MoE + LoRA crashes in Volcano deployments when
-            # fully-sharded LoRAs are enabled (assert in vllm/lora/layers/fused_moe.py
-            # during engine init/profile run). Operators can still enable this via:
-            #   export MINT_VLLM_FULLY_SHARDED_LORAS=1
-            # but we should not force-enable it in code.
+            # Fully sharded LoRAs are the default for multinode MoE actors when
+            # max_lora_rank is divisible by TP. Operators can still turn this off via:
+            #   export MINT_VLLM_FULLY_SHARDED_LORAS=0
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,

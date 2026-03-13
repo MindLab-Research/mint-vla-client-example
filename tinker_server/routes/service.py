@@ -371,7 +371,9 @@ async def create_sampling_session(
     base_model = request.base_model
     if not base_model and request.model_path:
         # Try to infer base_model from adapter_config.json
-        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
+        adapter_path = _resolve_model_path(
+            request.model_path, user_id=user_id, http_request=http_request
+        )
         base_model = _infer_base_model_from_adapter(adapter_path)
 
     if not base_model:
@@ -431,7 +433,9 @@ async def create_sampling_session(
     if request.model_path:
         # Resolve adapter directory (file://, mint://, absolute path).
         if adapter_path is None:
-            adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
+            adapter_path = _resolve_model_path(
+                request.model_path, user_id=user_id, http_request=http_request
+            )
 
         # Fast validation: ensure weights exist; loading happens on first /asample.
         weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
@@ -687,7 +691,9 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
     raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
 
 
-def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
+def _resolve_model_path(
+    model_path: str, *, user_id: str | None, http_request: Request
+) -> str:
     """Resolve model_path URI to filesystem path.
 
     Args:

@@ -98,6 +98,42 @@ Reason:
 Do not pip-install packages until you have first verified that the API-host
 `PYTHONPATH` matches the intended PFS environment.
 
+## Placement Group Hygiene Is Mandatory
+
+Before any new actor placement attempt on mint-dev:
+
+1. List all non-REMOVED placement groups cluster-wide.
+2. If any owned stale or pending PG can reserve the target GPUs, remove it first.
+3. Only after that, check physical GPU occupancy on the target nodes.
+4. Only after both checks pass, start the server or actor.
+
+Hard rule:
+- Do not treat physically idle GPUs as sufficient evidence.
+- A stale PG is a real blocker even when every GPU shows `2 MiB`.
+- Do not retry placement until the stale PG is gone.
+
+Exact check pattern:
+
+```bash
+ssh mint-dev '/root/venv_k2_py31213/bin/python - <<'\''PY'\'''
+import ray, json
+from ray.util.placement_group import placement_group_table
+ray.init(address="192.168.37.134:6379", ignore_reinit_error=True)
+rows = []
+for pgid, info in placement_group_table().items():
+    if info.get("state") != "REMOVED":
+        rows.append({
+            "id": pgid,
+            "name": info.get("name"),
+            "state": info.get("state"),
+            "stats": info.get("stats"),
+        })
+print(json.dumps(rows, indent=2))
+PY'
+```
+
+If a stale PG is yours, remove it before any retry.
+
 ---
 
 **Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. Set it explicitly before submitting any new dev worker tasks.
@@ -548,6 +584,7 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 - If exact nodes are physically idle but `healthz` reports pending placement groups, inspect the global placement-group table before any retry.
 - Remove only placement groups you own, by exact actor-name namespace match.
 - Do not treat idle GPUs as proof that Ray has no logical reservations.
+- If you have not listed non-REMOVED PGs yet, you are not ready to start a new actor.
 
 **Safe connectivity check (no local raylet):**
 ```bash

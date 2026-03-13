@@ -474,6 +474,29 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             else:
                 print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
             call_kwargs = dict(kwargs)
+            rollout_cfg = call_kwargs.get("config")
+            if rollout_cfg is not None:
+                from dataclasses import asdict, is_dataclass
+                from verl.utils.config import omega_conf_to_dataclass
+                from verl.workers.config import RolloutConfig as VerlRolloutConfig
+
+                if isinstance(rollout_cfg, dict):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        rollout_cfg, dataclass_type=VerlRolloutConfig
+                    )
+                elif is_dataclass(rollout_cfg):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        asdict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                    )
+                elif not isinstance(rollout_cfg, VerlRolloutConfig):
+                    rollout_cfg = omega_conf_to_dataclass(
+                        dict(rollout_cfg), dataclass_type=VerlRolloutConfig
+                    )
+                print(
+                    f"[ExtendedVLLMHttpServer] rollout config normalized type={type(rollout_cfg).__name__} _target_={getattr(rollout_cfg, '_target_', None)!r}",
+                    flush=True,
+                )
+                call_kwargs["config"] = rollout_cfg
             if sig is not None:
                 accepts_var_kw = any(
                     p.kind == inspect.Parameter.VAR_KEYWORD
@@ -2235,6 +2258,12 @@ class VerlInferenceEngine:
             f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
         )
 
+        from dataclasses import asdict
+
+        rollout_payload = asdict(rollout_config)
+        if not rollout_payload.get("_target_"):
+            rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
+
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
@@ -2251,7 +2280,7 @@ class VerlInferenceEngine:
                 }
             },
         ).remote(
-            config=rollout_config,
+            config=rollout_payload,
             model_config=model_config,
             rollout_mode=RolloutMode.STANDALONE,
             workers=[],  # No external workers for standalone
