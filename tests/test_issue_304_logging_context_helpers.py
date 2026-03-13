@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import tinker_server.logging_context as logging_context
+
+
+def test_issue_304_bind_request_trace_context_restores_previous_values():
+    prev_request_id = logging_context.get_request_id()
+    prev_trace_id = logging_context.get_trace_id()
+    try:
+        logging_context.set_request_id("req-old")
+        logging_context.set_trace_id("a" * 32)
+        with logging_context.bind_request_trace_context(
+            request_id="req-new",
+            trace_id="b" * 32,
+        ):
+            assert logging_context.get_request_id() == "req-new"
+            assert logging_context.get_trace_id() == "b" * 32
+        assert logging_context.get_request_id() == "req-old"
+        assert logging_context.get_trace_id() == "a" * 32
+    finally:
+        logging_context.set_request_id(prev_request_id)
+        logging_context.set_trace_id(prev_trace_id)
+
+
+def test_issue_304_log_with_bound_context_does_not_leak_context():
+    prev_request_id = logging_context.get_request_id()
+    prev_trace_id = logging_context.get_trace_id()
+    try:
+        logging_context.set_request_id("req-parent")
+        logging_context.set_trace_id("c" * 32)
+        logger = logging.getLogger("tests.test_issue_304")
+        logger.addHandler(logging.NullHandler())
+
+        logging_context.log_with_bound_context(
+            logger,
+            "msg",
+            request_id="req-child",
+            trace_id="d" * 32,
+        )
+
+        assert logging_context.get_request_id() == "req-parent"
+        assert logging_context.get_trace_id() == "c" * 32
+    finally:
+        logging_context.set_request_id(prev_request_id)
+        logging_context.set_trace_id(prev_trace_id)
+
+
+def test_issue_304_run_async_with_otel_span_without_tracer_executes_action(monkeypatch):
+    saved_tracer = logging_context._TRACER
+    try:
+        monkeypatch.setattr(logging_context, "_TRACER", None)
+
+        async def _run() -> int:
+            return 7
+
+        out = asyncio.run(
+            logging_context.run_async_with_otel_span(
+                "test.span",
+                _run,
+                component="test",
+                request_id="rid",
+            )
+        )
+        assert out == 7
+    finally:
+        logging_context._TRACER = saved_tracer

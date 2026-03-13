@@ -17,7 +17,7 @@ import uuid
 from enum import Enum
 from typing import Any
 
-from ..config import config as server_config
+from ..config import config as server_config, otel_env_vars
 
 
 class FutureStoreUnavailableError(RuntimeError):
@@ -527,11 +527,18 @@ def _get_or_create_ray_actor():
             # release any external reservations.
             return self._prune()
 
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": namespace,
+        "lifetime": "detached",
+    }
+    actor_otel_env = otel_env_vars()
+    if actor_otel_env:
+        options["runtime_env"] = {"env_vars": actor_otel_env}
+
     try:
         return _RayFutureStoreActor.options(
-            name=actor_name,
-            namespace=namespace,
-            lifetime="detached",
+            **options
         ).remote(ttl_s, queue_ttl_s, done_ttl_s, tombstone_ttl_s)
     except Exception:
         # Race: another process may have created the actor between get_actor and create.

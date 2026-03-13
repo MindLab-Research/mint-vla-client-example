@@ -8,14 +8,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from ..config import config as server_config
+from ..config import config as server_config, otel_env_vars
 from ..logging_context import (
     classify_failure_reason,
     ensure_trace_id,
     extract_trace_id_from_traceparent,
     get_otel_tracer,
-    get_trace_id,
     init_actor_observability,
+    log_with_bound_context,
     set_request_id,
     set_trace_id,
 )
@@ -63,11 +63,44 @@ def _get_or_create_ray_actor():
     import ray
 
     actor_name = _ray_api_work_queue_actor_name()
+    probe_timeout_s = float(os.environ.get("MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S", "1.0"))
+    fail_fast_on_probe_timeout = (
+        os.environ.get("MINT_API_WORK_QUEUE_FAIL_FAST_ON_PROBE_TIMEOUT", "").strip().lower()
+        in ("1", "true", "yes", "y", "on")
+    )
     try:
         actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+        # Quick liveness probe: if the actor is mid-restart, stats() will hang
+        # until Ray finishes re-initializing it. Use a short timeout so the
+        # request path fails fast with 503 instead of blocking.
+        ray.get(actor.stats.remote(), timeout=probe_timeout_s)
         return actor
     except ValueError:
         logger.info("[api_work_queue] actor %s not found; creating", actor_name)
+    except ray.exceptions.GetTimeoutError:
+        if fail_fast_on_probe_timeout:
+            logger.warning(
+                "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
+                actor_name,
+                probe_timeout_s,
+            )
+            raise ApiWorkQueueUnavailableError(
+                f"queue actor {actor_name} unresponsive (restarting?)"
+            )
+        logger.warning(
+            "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); killing stale actor and recreating",
+            actor_name,
+            probe_timeout_s,
+        )
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception as kill_e:
+            logger.warning(
+                "[api_work_queue] failed to kill stale actor %s after probe timeout (%s: %s); will try recreate",
+                actor_name,
+                type(kill_e).__name__,
+                kill_e,
+            )
     except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
         logger.warning(
             "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
@@ -150,6 +183,22 @@ def _get_or_create_ray_actor():
                 return float(item.get("created_at", fallback))
             except Exception:
                 return fallback
+
+        def _item_log_context(self, item: dict[str, Any]) -> tuple[str, str]:
+            request_id = str(item.get("request_id") or "-")
+            trace_id: str | None = None
+            extra = item.get("extra")
+            if isinstance(extra, dict):
+                raw_trace_id = extra.get("_trace_id")
+                if isinstance(raw_trace_id, str) and raw_trace_id.strip():
+                    trace_id = raw_trace_id.strip()
+                if trace_id is None:
+                    raw_traceparent = extra.get("_traceparent")
+                    if isinstance(raw_traceparent, str) and raw_traceparent.strip():
+                        trace_id = extract_trace_id_from_traceparent(raw_traceparent)
+            if not isinstance(trace_id, str) or not trace_id:
+                trace_id = "-"
+            return request_id, trace_id
 
         def _scheduler_item_info(self, item: dict[str, Any]) -> tuple[bool, str, str]:
             extra = item.get("extra")
@@ -476,12 +525,17 @@ def _get_or_create_ray_actor():
         async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> None:
             async with self._cv:
                 packed = dict(item)
-                request_id = packed.get("request_id")
+                request_id, trace_id = self._item_log_context(packed)
 
                 # Log enqueue with request_id context
-                logger.info(
-                    f"[Queue] enqueue: request_id={request_id}, op={packed.get('op')}, "
-                    f"user_id={packed.get('user_id')}"
+                log_with_bound_context(
+                    logger,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    message=(
+                        f"[Queue] enqueue: request_id={request_id}, op={packed.get('op')}, "
+                        f"user_id={packed.get('user_id')}"
+                    ),
                 )
 
                 is_sched, domain, session_id = self._scheduler_item_info(packed)
@@ -646,11 +700,16 @@ def _get_or_create_ray_actor():
                 self._dequeued += 1
 
                 # Log dequeue with request_id context
-                request_id = item.get("request_id")
-                logger.info(
-                    f"[Queue] dequeue: request_id={request_id}, op={item.get('op')}, "
-                    f"reason={dequeue_reason}, scheduler_domain={scheduler_domain}, "
-                    f"scheduler_session_id={scheduler_session_id}"
+                request_id, trace_id = self._item_log_context(item)
+                log_with_bound_context(
+                    logger,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    message=(
+                        f"[Queue] dequeue: request_id={request_id}, op={item.get('op')}, "
+                        f"reason={dequeue_reason}, scheduler_domain={scheduler_domain}, "
+                        f"scheduler_session_id={scheduler_session_id}"
+                    ),
                 )
 
                 try:
@@ -790,6 +849,9 @@ def _get_or_create_ray_actor():
         "max_restarts": -1,
         "max_task_retries": -1,
     }
+    actor_otel_env = otel_env_vars()
+    if actor_otel_env:
+        options["runtime_env"] = {"env_vars": actor_otel_env}
     if resources is not None:
         options["resources"] = resources
 
@@ -1006,23 +1068,31 @@ class ApiWorkQueueClient:
 
         try:
             job_id = str(ray.get_runtime_context().get_job_id())
+            self._consumer_job_id = job_id
+            loop = asyncio.get_running_loop()
             start_timeout_s = max(
                 10.0,
                 float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
             )
-
-            async def _claim_active_job_id() -> None:
-                actor = self._get_ray_actor()
-                self._consumer_job_id = job_id
-                ref = actor.set_active_job_id.remote(job_id)
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, lambda: ray.get(ref, timeout=start_timeout_s))
-
-            try:
-                await _claim_active_job_id()
-            except Exception:
-                self._ray_actor = None
-                await _claim_active_job_id()
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    actor = self._get_ray_actor()
+                    ref = actor.set_active_job_id.remote(job_id)
+                    await loop.run_in_executor(None, lambda: ray.get(ref, timeout=start_timeout_s))
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "[api_work_queue] set_active_job_id attempt=%s failed (%s: %s); recreating actor",
+                        attempt,
+                        type(e).__name__,
+                        e,
+                    )
+                    self._ray_actor = None
+            if last_error is not None:
+                raise last_error
         except Exception as e:
             self._running = False
             self._consumer_job_id = None

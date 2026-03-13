@@ -42,7 +42,11 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
-from tinker_server.logging_context import init_actor_observability
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+)
 from tinker_server.ray_utils import init_ray
 from .multinode_resources import compute_multinode_engine_resources
 
@@ -475,6 +479,10 @@ def _create_multinode_vllm_actor(
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
 
+        def _bind_traceparent(self, traceparent: str | None) -> None:
+            if isinstance(traceparent, str) and traceparent:
+                restore_trace_id_from_traceparent(traceparent)
+
         @asynccontextmanager
         async def _reserve_seq_slots(self, n_req: int):
             if (not self._admission_control) or (self.max_num_seqs is None):
@@ -791,7 +799,13 @@ def _create_multinode_vllm_actor(
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
 
-        async def add_lora(self, lora_int_id: int, lora_path: str, lora_name: str) -> None:
+        async def add_lora(
+            self,
+            lora_int_id: int,
+            lora_path: str,
+            lora_name: str,
+            traceparent: str | None = None,
+        ) -> None:
             """Add LoRA adapter from shared filesystem path.
 
             For multi-node: all workers must have access to the same path.
@@ -802,6 +816,7 @@ def _create_multinode_vllm_actor(
                 lora_path: Path to PEFT adapter directory (must be on shared FS).
                 lora_name: Human-readable name for the adapter.
             """
+            self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
 
             lora_request = LoRARequest(
@@ -865,8 +880,9 @@ def _create_multinode_vllm_actor(
                 )
             logger.info(f"Added LoRA {lora_name} (id={lora_int_id}) from {lora_path}")
 
-        async def remove_lora(self, lora_int_id: int) -> None:
+        async def remove_lora(self, lora_int_id: int, traceparent: str | None = None) -> None:
             """Remove a LoRA adapter."""
+            self._bind_traceparent(traceparent)
             t0 = time.perf_counter()
             async with self._exclusive_engine_op():
                 async with self._lock_write():
@@ -930,8 +946,9 @@ def _create_multinode_vllm_actor(
                 "sys_path_first_8": sys.path[:8],
             }
 
-        async def abort_request(self, request_id: str) -> None:
+        async def abort_request(self, request_id: str, traceparent: str | None = None) -> None:
             """Abort an in-flight request in vLLM."""
+            self._bind_traceparent(traceparent)
             try:
                 async with self._outer_to_subreq_lock:
                     sub_ids = list(self._outer_to_subreq_ids.get(request_id, ()))
@@ -961,6 +978,7 @@ def _create_multinode_vllm_actor(
             top_p: float = 1.0,
             logprobs: bool = True,
             n: int = 1,
+            traceparent: str | None = None,
         ) -> dict | list[dict]:
             """Generate tokens with optional LoRA adapter.
 
@@ -979,6 +997,7 @@ def _create_multinode_vllm_actor(
             Returns:
                 Dict with token_ids, logprobs, stop_reason.
             """
+            self._bind_traceparent(traceparent)
             import math
 
             from vllm import SamplingParams
@@ -1019,6 +1038,7 @@ def _create_multinode_vllm_actor(
                                 top_p=top_p,
                                 logprobs=logprobs,
                                 n=1,
+                                traceparent=traceparent,
                             )
                             assert isinstance(out, dict)
                             outs.append(out)
@@ -1042,6 +1062,7 @@ def _create_multinode_vllm_actor(
                                     top_p=top_p,
                                     logprobs=logprobs,
                                     n=1,
+                                    traceparent=traceparent,
                                 )
                             )
                         )
@@ -1454,6 +1475,7 @@ def _create_multinode_vllm_actor(
             request_id: str,
             lora_int_id: int | None,
             lora_path: str | None,
+            traceparent: str | None = None,
         ) -> list[float | None]:
             """Compute logprobs for prompt tokens.
 
@@ -1461,6 +1483,7 @@ def _create_multinode_vllm_actor(
             - logprobs[0] is None (first token has no conditioning context)
             - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -1561,6 +1584,7 @@ def _create_multinode_vllm_actor(
             lora_int_id: int | None,
             lora_path: str | None,
             k: int,
+            traceparent: str | None = None,
         ) -> list[list[tuple[int, float]] | None]:
             """Compute top-K prompt logprobs.
 
@@ -1568,6 +1592,7 @@ def _create_multinode_vllm_actor(
             - topk[0] is None (first token has no conditioning context)
             - topk[i] is a list of (token_id, logprob) pairs for i >= 1
             """
+            self._bind_traceparent(traceparent)
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
             from vllm.lora.request import LoRARequest
@@ -2359,6 +2384,7 @@ class MultiNodeInferenceEngine:
 
         # Allocate lora_int_id
         lora_id = await self.registry.allocate(sampling_session_id, adapter_dir)
+        traceparent = get_current_traceparent()
 
         # Add to engine (all workers load from shared path)
         start_time = time.time()
@@ -2367,6 +2393,7 @@ class MultiNodeInferenceEngine:
                 lora_int_id=lora_id,
                 lora_path=adapter_dir,
                 lora_name=sampling_session_id,
+                traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
@@ -2414,6 +2441,7 @@ class MultiNodeInferenceEngine:
             lora_path,
             lora_id,
         )
+        traceparent = get_current_traceparent()
 
         start_time = time.time()
         try:
@@ -2421,6 +2449,7 @@ class MultiNodeInferenceEngine:
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
+                traceparent=traceparent,
             )
             logger.info(
                 "add_lora_for_session_from_path start sampling_session_id=%s path=%s lora_int_id=%s stage=after_add_lora_remote",
@@ -2470,9 +2499,10 @@ class MultiNodeInferenceEngine:
         if not self._initialized:
             return
         import ray
+        traceparent = get_current_traceparent()
 
         try:
-            ref = self.engine.abort_request.remote(request_id)
+            ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
             await asyncio.to_thread(ray.get, ref, timeout=10)
         except Exception as e:
             logger.warning(f"MultiNodeInferenceEngine.abort_request failed: {type(e).__name__}: {e}")
@@ -2502,6 +2532,7 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
@@ -2515,6 +2546,7 @@ class MultiNodeInferenceEngine:
             top_k=top_k,
             top_p=top_p,
             logprobs=logprobs,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
@@ -2523,7 +2555,7 @@ class MultiNodeInferenceEngine:
             # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
             # Try aborting just this request, then fail loud to the client.
             try:
-                abort_ref = self.engine.abort_request.remote(request_id)
+                abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
                 await asyncio.to_thread(ray.get, abort_ref, timeout=10)
             except Exception:
                 pass
@@ -2588,6 +2620,7 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
@@ -2602,13 +2635,14 @@ class MultiNodeInferenceEngine:
             top_p=top_p,
             logprobs=logprobs,
             n=num_samples,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
             raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             try:
-                abort_ref = self.engine.abort_request.remote(request_id)
+                abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
                 await asyncio.to_thread(ray.get, abort_ref, timeout=10)
             except Exception:
                 pass
@@ -2672,12 +2706,14 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
             lora_int_id=lora_id,
             lora_path=lora_path,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
@@ -2743,6 +2779,7 @@ class MultiNodeInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
             if lora_id is not None:
                 lora_path = await self.registry.get_adapter_path(lora_id)
+        traceparent = get_current_traceparent()
 
         ref = self.engine.compute_prompt_topk.remote(
             prompt_ids=prompt_ids,
@@ -2750,6 +2787,7 @@ class MultiNodeInferenceEngine:
             lora_int_id=lora_id,
             lora_path=lora_path,
             k=kk,
+            traceparent=traceparent,
         )
         try:
             timeout_s = ray_get_timeout_s if ray_get_timeout_s > 0 else None
@@ -2792,8 +2830,9 @@ class MultiNodeInferenceEngine:
         if removed_lora_id is None:
             return False
         if should_unload:
+            traceparent = get_current_traceparent()
             try:
-                ref = self.engine.remove_lora.remote(removed_lora_id)
+                ref = self.engine.remove_lora.remote(removed_lora_id, traceparent=traceparent)
                 await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 logger.warning(f"Failed to remove LoRA {removed_lora_id} from engine: {e}")

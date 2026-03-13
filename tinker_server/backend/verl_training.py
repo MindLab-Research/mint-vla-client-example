@@ -21,7 +21,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 from . import ray_kill
-from ..logging_context import get_request_id, init_actor_observability
+from ..logging_context import (
+    get_current_traceparent,
+    get_request_id,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+)
 
 # Default idle timeout for TrainingWorker (seconds)
 # Set to 0 to disable self-termination (ResourcePool LRU eviction handles lifecycle)
@@ -497,6 +502,10 @@ class TrainingWorker:
             "time_until_timeout": max(0, self._idle_timeout - (time.time() - self._last_activity)),
         }
 
+    def _bind_traceparent(self, traceparent: str | None) -> None:
+        if isinstance(traceparent, str) and traceparent:
+            restore_trace_id_from_traceparent(traceparent)
+
     def get_rss_bytes(self) -> int:
         with open("/proc/self/statm", encoding="utf-8") as f:
             parts = f.read().strip().split()
@@ -512,6 +521,7 @@ class TrainingWorker:
         loss_fn: str = "cross_entropy",
         loss_fn_config: dict | None = None,
         session_id: str | None = None,
+        traceparent: str | None = None,
     ) -> dict:
         """Forward + backward pass using tinker Datum format.
 
@@ -532,6 +542,7 @@ class TrainingWorker:
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        self._bind_traceparent(traceparent)
         torch = _get_torch()
         self._touch()
 
@@ -766,7 +777,12 @@ class TrainingWorker:
             "metrics": metrics,
         }
 
-    def forward(self, data_items: list[dict], session_id: str | None = None) -> dict:
+    def forward(
+        self,
+        data_items: list[dict],
+        session_id: str | None = None,
+        traceparent: str | None = None,
+    ) -> dict:
         """Forward pass only (no backward). Returns logprobs.
 
         Same input format as forward_backward but skips gradient computation.
@@ -783,6 +799,7 @@ class TrainingWorker:
         Returns:
             Dict with loss_fn_outputs (including logprobs) and metrics.
         """
+        self._bind_traceparent(traceparent)
         torch = _get_torch()
         self._touch()
 
@@ -918,7 +935,12 @@ class TrainingWorker:
             "unk_token_id": self.tokenizer.unk_token_id,
         }
 
-    def optim_step(self, learning_rate: float | None, session_id: str | None = None) -> dict:
+    def optim_step(
+        self,
+        learning_rate: float | None,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+    ) -> dict:
         """Optimizer update step.
 
         Args:
@@ -929,6 +951,7 @@ class TrainingWorker:
         Returns:
             Dict with metrics.
         """
+        self._bind_traceparent(traceparent)
         torch = _get_torch()
         self._touch()
 
@@ -993,7 +1016,13 @@ class TrainingWorker:
             "base_model_name_or_path": self._base_model,
         }
 
-    def save_lora_weights(self, save_path: str, session_id: str | None = None) -> str:
+    def save_lora_weights(
+        self,
+        save_path: str,
+        traceparent: str | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> str:
         """Save LoRA adapter to directory.
 
         Args:
@@ -1003,6 +1032,7 @@ class TrainingWorker:
         Returns:
             Absolute path where weights were saved.
         """
+        self._bind_traceparent(traceparent)
         self._touch()
         if session_id is not None:
             self._ensure_session_loaded(session_id)
@@ -1026,7 +1056,13 @@ class TrainingWorker:
         logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
         return abs_path
 
-    def save_checkpoint(self, save_path: str, session_id: str | None = None) -> dict:
+    def save_checkpoint(
+        self,
+        save_path: str,
+        traceparent: str | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> dict:
         """Save full checkpoint: LoRA weights + optimizer state + training metadata.
 
         Args:
@@ -1036,6 +1072,7 @@ class TrainingWorker:
         Returns:
             Dict with training metadata, state_dict, and peft_config for registration.
         """
+        self._bind_traceparent(traceparent)
         self._touch()
         if session_id is not None:
             self._ensure_session_loaded(session_id)
@@ -1080,6 +1117,8 @@ class TrainingWorker:
         self,
         load_path: str,
         load_optimizer: bool = True,
+        traceparent: str | None = None,
+        *,
         session_id: str | None = None,
     ) -> dict:
         """Load checkpoint, optionally restoring optimizer state.
@@ -1092,6 +1131,7 @@ class TrainingWorker:
         Returns:
             Dict with training metadata.
         """
+        self._bind_traceparent(traceparent)
         self._touch()
         import json
         import os
@@ -1294,7 +1334,11 @@ class TrainingWorker:
 
         return {"status": "ok", "learning_rate": learning_rate}
 
-    def reinit_lora_weights(self, learning_rate: float | None = None) -> dict:
+    def reinit_lora_weights(
+        self,
+        learning_rate: float | None = None,
+        traceparent: str | None = None,
+    ) -> dict:
         """Reinitialize LoRA weights AND optimizer state for fresh session.
 
         Uses standard initialization:
@@ -1310,6 +1354,7 @@ class TrainingWorker:
         Returns:
             dict with reinit_count, opt_state_reset, lr_updated.
         """
+        self._bind_traceparent(traceparent)
         import torch.nn.init as init
 
         reinit_count = 0
@@ -1933,9 +1978,10 @@ class VerlTrainingEngine:
                 f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={effective_reinit_timeout_s}",
                 flush=True,
             )
+            traceparent = get_current_traceparent()
             try:
                 result = await self._await_with_keepalive(
-                    worker.reinit_lora_weights.remote(session.learning_rate),
+                    worker.reinit_lora_weights.remote(session.learning_rate, traceparent=traceparent),
                     session,
                     interval_s=30.0,
                     timeout_s=effective_reinit_timeout_s,
@@ -2064,6 +2110,7 @@ class VerlTrainingEngine:
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
         if session.backend == "megatron":
@@ -2073,12 +2120,19 @@ class VerlTrainingEngine:
                 loss_fn_config,
                 rollout_correction_config,
                 session.model_id,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
         else:
-            pending = worker.forward_backward.remote(data_items, loss_fn, loss_fn_config, session.model_id)
+            pending = worker.forward_backward.remote(
+                data_items,
+                loss_fn,
+                loss_fn_config,
+                session.model_id,
+                traceparent=traceparent,
+            )
         result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
@@ -2115,18 +2169,20 @@ class VerlTrainingEngine:
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
         if session.backend == "megatron":
             pending = worker.forward.remote(
                 data_items,
                 session.model_id,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
         else:
-            pending = worker.forward.remote(data_items, session.model_id)
+            pending = worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
         result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         logger.info(f"[{model_id}] forward completed")
@@ -2180,18 +2236,20 @@ class VerlTrainingEngine:
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
         if session.backend == "megatron":
             pending = worker.optim_step.remote(
                 lr,
                 session.model_id,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
         else:
-            pending = worker.optim_step.remote(lr, session.model_id)
+            pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
         result = await self._await_with_keepalive(pending, session, interval_s=30.0)
 
         # Update session state
@@ -2256,6 +2314,7 @@ class VerlTrainingEngine:
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        traceparent = get_current_traceparent()
 
         # Only MoE models use the combined MegatronWorkerGroup.train_step path.
         # Avoid importing megatron_training on CPU-only API hosts (Aliyun gateway).
@@ -2275,6 +2334,7 @@ class VerlTrainingEngine:
                 rollout_correction_config,
                 lr,
                 session.model_id,
+                traceparent=traceparent,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -2290,23 +2350,31 @@ class VerlTrainingEngine:
                     loss_fn_config,
                     rollout_correction_config,
                     session.model_id,
+                    traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
                     train_unembed=train_unembed,
                 )
             else:
-                fb_pending = worker.forward_backward.remote(data_items, loss_fn, loss_fn_config, session.model_id)
+                fb_pending = worker.forward_backward.remote(
+                    data_items,
+                    loss_fn,
+                    loss_fn_config,
+                    session.model_id,
+                    traceparent=traceparent,
+                )
             fb_result = await self._await_with_keepalive(fb_pending, session, interval_s=30.0)
             if session.backend == "megatron":
                 opt_pending = worker.optim_step.remote(
                     lr,
                     session.model_id,
+                    traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
                     train_unembed=train_unembed,
                 )
             else:
-                opt_pending = worker.optim_step.remote(lr, session.model_id)
+                opt_pending = worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
             opt_result = await self._await_with_keepalive(opt_pending, session, interval_s=30.0)
 
             # Merge results
@@ -2364,7 +2432,8 @@ class VerlTrainingEngine:
 
         loop = asyncio.get_running_loop()
         try:
-            result_ref = worker.reset_expert_bias.remote()
+            traceparent = get_current_traceparent()
+            result_ref = worker.reset_expert_bias.remote(traceparent=traceparent)
             result = await loop.run_in_executor(None, ray.get, result_ref)
             # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
             modules_reset = result.get("reset_count", result.get("modules_reset", 0))
@@ -2436,7 +2505,12 @@ class VerlTrainingEngine:
             default_timeout_s = 300
         timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
 
-        ref = worker.save_lora_weights.remote(abs_path, session_id=session.model_id)
+        traceparent = get_current_traceparent()
+        ref = worker.save_lora_weights.remote(
+            abs_path,
+            traceparent=traceparent,
+            session_id=session.model_id,
+        )
         _ = await self._await_with_keepalive(
             ref,
             session,
@@ -2481,10 +2555,12 @@ class VerlTrainingEngine:
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
         train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        traceparent = get_current_traceparent()
         meta_ref = worker.save_lora_weights.remote(
             abs_path,
             use_per_expert_lora=use_per_expert_lora,
             session_id=session.model_id,
+            traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
@@ -2552,6 +2628,7 @@ class VerlTrainingEngine:
         timeout_s = int(os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
         if session.backend == "megatron":
+            traceparent = get_current_traceparent()
             lora_cfg = getattr(session, "lora_config", None)
             train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
             train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
@@ -2559,14 +2636,17 @@ class VerlTrainingEngine:
             meta_ref = worker.save_checkpoint.remote(
                 abs_path,
                 use_per_expert_lora=use_per_expert_lora,
+                traceparent=traceparent,
                 session_id=session.model_id,
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
         else:
+            traceparent = get_current_traceparent()
             meta_ref = worker.save_checkpoint.remote(
                 abs_path,
+                traceparent=traceparent,
                 session_id=session.model_id,
             )
         meta = await self._await_with_keepalive(
@@ -2625,7 +2705,11 @@ class VerlTrainingEngine:
         load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
 
         # Remote call to load checkpoint while keeping the pooled actor marked active.
-        kwargs: dict[str, object] = {"session_id": session.model_id}
+        traceparent = get_current_traceparent()
+        kwargs: dict[str, object] = {
+            "traceparent": traceparent,
+            "session_id": session.model_id,
+        }
         if session.backend == "megatron":
             lora_cfg = getattr(session, "lora_config", None)
             kwargs["train_attn"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))

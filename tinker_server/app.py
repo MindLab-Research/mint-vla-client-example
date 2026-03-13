@@ -30,6 +30,7 @@ from .logging_context import (
     get_trace_id,
     get_otel_tracer,
     record_http_server_metrics,
+    run_async_with_otel_span,
     set_trace_id,
 )
 from .ray_utils import init_ray
@@ -765,85 +766,240 @@ async def lifespan(app: FastAPI):
     )
 
     async def _exec_sampling_asample(item):
-        logger.info(
-            "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
-            str(item.request_id),
+        async def _run():
+            logger.info(
+                "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
+                str(item.request_id),
+            )
+            req = SampleRequest.model_validate_json(item.request_json)
+            logger.info(
+                "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
+                str(item.request_id),
+            )
+            await sampling._do_sample(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.sampling.asample",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.sampling.asample"},
         )
-        req = SampleRequest.model_validate_json(item.request_json)
-        logger.info(
-            "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
-            str(item.request_id),
-        )
-        await sampling._do_sample(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
 
     async def _exec_sampling_compute_logprobs(item):
-        req = ComputeLogprobsRequest.model_validate_json(item.request_json)
-        await sampling._do_compute_logprobs(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
+        async def _run():
+            req = ComputeLogprobsRequest.model_validate_json(item.request_json)
+            await sampling._do_compute_logprobs(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.sampling.compute_logprobs",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.sampling.compute_logprobs"},
+        )
 
     async def _exec_training_create_model(item):
-        req = CreateModelRequest.model_validate_json(item.request_json)
-        await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+        async def _run():
+            req = CreateModelRequest.model_validate_json(item.request_json)
+            await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.create_model",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.create_model"},
+        )
 
     async def _exec_training_create_model_from_state(item):
-        req = CreateModelFromStateRequest.model_validate_json(item.request_json)
-        await training._do_create_model_from_state(item.request_id, req, item.user_id)
+        async def _run():
+            req = CreateModelFromStateRequest.model_validate_json(item.request_json)
+            await training._do_create_model_from_state(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.create_model_from_state",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.create_model_from_state"},
+        )
 
     async def _exec_training_train_step(item):
-        req = TrainStepRequest.model_validate_json(item.request_json)
-        await training._do_train_step(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
+        async def _run():
+            req = TrainStepRequest.model_validate_json(item.request_json)
+            await training._do_train_step(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.train_step",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.train_step"},
+        )
 
     async def _exec_training_forward(item):
-        req = ForwardRequest.model_validate_json(item.request_json)
-        await training._do_forward(item.request_id, req, (item.extra or {}).get("gateway_auth"))
+        async def _run():
+            req = ForwardRequest.model_validate_json(item.request_json)
+            await training._do_forward(
+                item.request_id,
+                req,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.forward",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.forward"},
+        )
 
     async def _exec_training_forward_backward(item):
-        req = ForwardBackwardRequest.model_validate_json(item.request_json)
-        await training._do_forward_backward(item.request_id, req, item.user_id, (item.extra or {}).get("gateway_auth"))
+        async def _run():
+            req = ForwardBackwardRequest.model_validate_json(item.request_json)
+            await training._do_forward_backward(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.forward_backward",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.forward_backward"},
+        )
 
     async def _exec_training_save_weights_for_sampler(item):
-        req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
-        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        is_admin = bool((item.extra or {}).get("is_admin"))
-        await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker, is_admin)
+        async def _run():
+            req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
+            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+            is_admin = bool((item.extra or {}).get("is_admin"))
+            await training._do_save_weights_for_sampler(
+                item.request_id,
+                req,
+                item.user_id,
+                prefer_tinker,
+                is_admin,
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.save_weights_for_sampler",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.save_weights_for_sampler"},
+        )
 
     async def _exec_training_optim_step(item):
-        req = OptimStepRequest.model_validate_json(item.request_json)
-        await training._do_optim_step(item.request_id, req, item.user_id)
+        async def _run():
+            req = OptimStepRequest.model_validate_json(item.request_json)
+            await training._do_optim_step(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.optim_step",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.optim_step"},
+        )
 
     async def _exec_weights_save_weights(item):
-        req = SaveStateRequest.model_validate_json(item.request_json)
-        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
-        # This must produce a training checkpoint (weights + optimizer state).
-        await weights._do_save_state(
-            item.request_id,
-            req,
-            user_id=item.user_id,
-            webhook_url=item.webhook_url,
-            prefer_tinker=prefer_tinker,
+        async def _run():
+            req = SaveStateRequest.model_validate_json(item.request_json)
+            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+            # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
+            # This must produce a training checkpoint (weights + optimizer state).
+            await weights._do_save_state(
+                item.request_id,
+                req,
+                user_id=item.user_id,
+                webhook_url=item.webhook_url,
+                prefer_tinker=prefer_tinker,
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.weights.save_weights",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.weights.save_weights"},
         )
 
     async def _exec_weights_save_state(item):
-        req = SaveStateRequest.model_validate_json(item.request_json)
-        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        await weights._do_save_state(
-            item.request_id,
-            req,
-            user_id=item.user_id,
-            webhook_url=item.webhook_url,
-            prefer_tinker=prefer_tinker,
+        async def _run():
+            req = SaveStateRequest.model_validate_json(item.request_json)
+            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+            await weights._do_save_state(
+                item.request_id,
+                req,
+                user_id=item.user_id,
+                webhook_url=item.webhook_url,
+                prefer_tinker=prefer_tinker,
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.weights.save_state",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.weights.save_state"},
         )
 
     async def _exec_weights_load_state(item):
-        req = LoadStateRequest.model_validate_json(item.request_json)
-        await weights._do_load_state(item.request_id, req, item.user_id)
+        async def _run():
+            req = LoadStateRequest.model_validate_json(item.request_json)
+            await weights._do_load_state(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.weights.load_state",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.weights.load_state"},
+        )
 
     async def _exec_internal_noop(item):
-        from .backend.future_store import future_store
+        async def _run():
+            from .backend.future_store import future_store
 
-        future_store.resolve(
-            str(item.request_id),
-            {"ok": True, "op": "internal.noop", "ts": time.time()},
+            future_store.resolve(
+                str(item.request_id),
+                {"ok": True, "op": "internal.noop", "ts": time.time()},
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.internal.noop",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.internal.noop"},
         )
 
     api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)

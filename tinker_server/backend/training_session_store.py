@@ -12,6 +12,8 @@ import logging
 import os
 from typing import Any
 
+from ..config import otel_env_vars
+
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +70,18 @@ def _get_or_create_actor():
         def list(self) -> list[dict[str, Any]]:
             return list(self._sessions.values())
 
+    options: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "lifetime": "detached",
+    }
+    actor_otel_env = otel_env_vars()
+    if actor_otel_env:
+        options["runtime_env"] = {"env_vars": actor_otel_env}
+
     try:
         return _TrainingSessionStoreActor.options(
-            name=name,
-            namespace=namespace,
-            lifetime="detached",
+            **options
         ).remote()
     except Exception:
         return ray.get_actor(name, namespace=namespace)

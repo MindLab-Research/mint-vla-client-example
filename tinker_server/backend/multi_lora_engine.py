@@ -59,6 +59,7 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 # Import centralized PFS paths from config
 from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
+from tinker_server.logging_context import get_current_traceparent
 from tinker_server.ray_utils import init_ray
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
@@ -595,6 +596,7 @@ class MultiLoRAInferenceEngine:
         # Worker creates file-based LoRARequest for GPU/CPU swap support.
         # Auto-restart vLLM if actor died (e.g. killed for GPU allocation).
         start_time = time.time()
+        traceparent = get_current_traceparent()
         print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
             print(f"[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
@@ -602,6 +604,7 @@ class MultiLoRAInferenceEngine:
                 lora_int_id=lora_id,
                 state_dict=state_dict,
                 peft_config=peft_config,
+                traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             print(f"[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
@@ -616,6 +619,7 @@ class MultiLoRAInferenceEngine:
                 lora_int_id=lora_id,
                 state_dict=state_dict,
                 peft_config=peft_config,
+                traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
@@ -678,12 +682,14 @@ class MultiLoRAInferenceEngine:
         # Load directly from shared filesystem path
         # Much faster than Ray tensor transfer for large MoE models
         start_time = time.time()
+        traceparent = get_current_traceparent()
         print(f"[DEBUG add_lora_for_session_from_path] Loading from path: {lora_path}", flush=True)
         try:
             ref = self.server.add_lora_from_path.remote(
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
+                traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             print(f"[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
@@ -698,6 +704,7 @@ class MultiLoRAInferenceEngine:
                 lora_int_id=lora_id,
                 lora_path=lora_path,
                 lora_name=sampling_session_id,
+                traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
@@ -765,6 +772,7 @@ class MultiLoRAInferenceEngine:
         lora_id = None
         if sampling_session_id is not None:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
+        traceparent = get_current_traceparent()
 
         if lora_id is not None:
             # Generate with session-specific LoRA
@@ -782,6 +790,7 @@ class MultiLoRAInferenceEngine:
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=logprobs,
+                traceparent=traceparent,
             )
         else:
             # Generate with base model (no LoRA)
@@ -798,6 +807,7 @@ class MultiLoRAInferenceEngine:
                 top_k=top_k,
                 top_p=top_p,
                 logprobs=logprobs,
+                traceparent=traceparent,
             )
 
         t0_ray = time.time()
@@ -860,6 +870,7 @@ class MultiLoRAInferenceEngine:
         lora_id = None
         if sampling_session_id is not None:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
+        traceparent = get_current_traceparent()
 
         if lora_id is not None:
             ref = self.server.generate_with_lora.remote(
@@ -873,6 +884,7 @@ class MultiLoRAInferenceEngine:
                 top_p=top_p,
                 logprobs=logprobs,
                 n=num_samples,
+                traceparent=traceparent,
             )
         else:
             ref = self.server.generate_base.remote(
@@ -885,6 +897,7 @@ class MultiLoRAInferenceEngine:
                 top_p=top_p,
                 logprobs=logprobs,
                 n=num_samples,
+                traceparent=traceparent,
             )
 
         raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
@@ -955,6 +968,7 @@ class MultiLoRAInferenceEngine:
         lora_id = None
         if sampling_session_id is not None:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
+        traceparent = get_current_traceparent()
 
         if lora_id is not None:
             # Compute logprobs with session-specific LoRA
@@ -963,6 +977,7 @@ class MultiLoRAInferenceEngine:
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                     lora_int_id=lora_id,
+                    traceparent=traceparent,
                 )
                 result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
@@ -991,6 +1006,7 @@ class MultiLoRAInferenceEngine:
                 ref = self.server.compute_prompt_logprobs_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
+                    traceparent=traceparent,
                 )
                 result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
@@ -1053,6 +1069,7 @@ class MultiLoRAInferenceEngine:
         lora_id = None
         if sampling_session_id is not None:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
+        traceparent = get_current_traceparent()
 
         if lora_id is not None:
             # Compute top-K with session-specific LoRA
@@ -1061,6 +1078,7 @@ class MultiLoRAInferenceEngine:
                 request_id=request_id,
                 lora_int_id=lora_id,
                 k=k,
+                traceparent=traceparent,
             )
         else:
             # Compute top-K with base model (no LoRA)
@@ -1068,6 +1086,7 @@ class MultiLoRAInferenceEngine:
                 prompt_ids=prompt_ids,
                 request_id=request_id,
                 k=k,
+                traceparent=traceparent,
             )
 
         result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
