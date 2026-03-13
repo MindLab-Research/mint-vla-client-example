@@ -428,6 +428,7 @@ async def save_weights(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1029,11 +1030,12 @@ async def load_state(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     user_id = _get_user_id(http_request)
+    load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+    request = request.model_copy(update={"path": load_path})
     if request.optimizer:
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
             validate_checkpoint_load_contract(load_path, load_optimizer=True)
         except ValueError as e:
             raise HTTPException(
@@ -1096,8 +1098,7 @@ async def _do_load_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        # Resolve path
-        load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+        load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 

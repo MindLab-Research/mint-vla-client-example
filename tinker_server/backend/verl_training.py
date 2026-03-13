@@ -2608,6 +2608,22 @@ class VerlTrainingEngine:
             allow_recover=(session.backend == "peft"),
         )
 
+        if session.backend == "megatron":
+            ready_timeout_s = (
+                float(server_config.training_actor_ready_timeout_s)
+                if server_config.training_actor_ready_timeout_s is not None
+                else 1800.0
+            )
+            await self._await_with_keepalive(
+                worker.__ray_ready__.remote(),
+                session,
+                interval_s=30.0,
+                timeout_s=ready_timeout_s,
+            )
+
+        default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
+        load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+
         # Remote call to load checkpoint while keeping the pooled actor marked active.
         kwargs: dict[str, object] = {"session_id": session.model_id}
         if session.backend == "megatron":
@@ -2620,7 +2636,7 @@ class VerlTrainingEngine:
             meta_ref,
             session,
             interval_s=30.0,
-            timeout_s=120,
+            timeout_s=load_timeout_s,
         )
 
         # Update session state from loaded metadata without polluting existing
@@ -2630,6 +2646,19 @@ class VerlTrainingEngine:
             meta,
             op="load_weights",
         )
+
+        if session.backend == "megatron":
+            actual_rank = meta.get("actual_rank")
+            await asyncio.to_thread(
+                ray.get,
+                worker.mark_session_loaded.remote(
+                    session.model_id,
+                    step_count=session.current_step,
+                    learning_rate=session.learning_rate,
+                    actual_rank=actual_rank,
+                ),
+                timeout=30,
+            )
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 

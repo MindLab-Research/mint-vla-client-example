@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytest.importorskip("ray")
+
 from tinker_server.backend.megatron_distributed import (
     DistributedConfig,
     MegatronRankWorker,

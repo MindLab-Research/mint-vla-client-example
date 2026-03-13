@@ -793,14 +793,23 @@ async def create_model_from_state(
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    resolved_state_path = _resolve_state_path(
+        request.state_path,
+        user_id=user_id,
+        is_admin=is_admin_request(http_request),
+    )
+    if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")
+    request = request.model_copy(update={"state_path": resolved_state_path})
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
-        object_store_bytes=estimate_forward_backward_result_bytes(request),
+        object_store_bytes=estimate_small_result_bytes(),
     )
     if not bool(reserve.get("ok")):
         raise HTTPException(
@@ -842,10 +851,8 @@ async def _do_create_model_from_state(
 
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
-        # Resolve state path (before creating a session/actor)
-        load_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=is_admin_request(http_request))
-        if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(load_path):
-            raise FileNotFoundError(f"Checkpoint not found: {request.state_path}")
+        # Queue-time validation hands the background worker a concrete local path.
+        load_path = request.state_path
 
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)

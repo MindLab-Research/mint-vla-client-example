@@ -108,7 +108,7 @@ class _FakePool:
         self.closed = True
 
 
-def test_postgres_usage_store_retry_regenerates_source_index(monkeypatch):
+def test_postgres_usage_store_retry_regenerates_source_index(monkeypatch, tmp_path):
     state = {
         "rows": [],
         "source_indexes": [],
@@ -135,6 +135,7 @@ def test_postgres_usage_store_retry_regenerates_source_index(monkeypatch):
         pool_min=1,
         pool_max=2,
         write_timeout_ms=2000,
+        outbox_path=str(tmp_path / "usage_outbox.sqlite3"),
     )
 
     event = UsageEvent(
