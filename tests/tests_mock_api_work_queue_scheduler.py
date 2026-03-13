@@ -166,7 +166,7 @@ def test_mock_scheduler_accepts_new_and_legacy_session_key_fields(monkeypatch):
     assert sessions == {"new-key-A", "legacy-key-B"}
 
 
-def test_stale_dequeue_times_out_without_enqueue_wakeup(monkeypatch):
+def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):
     monkeypatch.setenv("MINT_API_WORK_QUEUE_DEQUEUE_POLL_S", "0.05")
 
     api_work_queue = _load_api_work_queue_module(monkeypatch)
@@ -174,7 +174,10 @@ def test_stale_dequeue_times_out_without_enqueue_wakeup(monkeypatch):
     actor.set_active_job_id("consumer-job-new")
 
     async def _run() -> None:
-        with pytest.raises(RuntimeError, match="stale dequeue"):
-            await actor.dequeue("consumer-job-old")
+        item = await actor.dequeue("consumer-job-old")
+        assert item["op"] == "__stale_consumer__"
+        extra = item.get("extra") or {}
+        assert extra["consumer_job_id"] == "consumer-job-old"
+        assert extra["active_job_id"] == "consumer-job-new"
 
     asyncio.run(_run())
