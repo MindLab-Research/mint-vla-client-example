@@ -9,6 +9,7 @@ export MINT_MOE_LORA_SPARSE_EXPERT_EXPORT=1
 export TINKER_HOST=0.0.0.0
 export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
+export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
 
 export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
