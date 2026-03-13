@@ -10,6 +10,7 @@
 | `aliyun-cluster` | Aliyun DLC cluster lifecycle (create/stop/list jobs, logs) |
 | `merge-gate` | Pre-merge testing |
 | `vllm-knob-calculation` | Back-of-envelope sizing for vLLM serving knobs |
+| `megatron-memory-estimation` | Back-of-envelope Megatron memory sizing and admission |
 
 **Use `mint-prod` for production operations. Use `mint-dev` for development.**
 
