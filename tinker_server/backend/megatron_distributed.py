@@ -703,6 +703,11 @@ class MegatronRankWorker:
             del self._session_optimizer_states[session_id]
         logger.debug(f"[Rank {self.rank}] Cleared state for session {session_id}")
 
+    def mark_session_loaded(self, session_id: str) -> None:
+        """Record that a checkpoint-loaded session is now active on this rank."""
+        self._current_session_id = session_id
+        logger.info(f"[Rank {self.rank}] Marked loaded session active: {session_id}")
+
     def initialize(self):
         """Initialize distributed backend and Megatron engine.
         
@@ -5452,6 +5457,32 @@ class MegatronWorkerGroup:
             "new_session": new_session_id,
             "actual_rank": self._actual_rank,
         }
+
+    def mark_session_loaded(
+        self,
+        session_id: str,
+        *,
+        step_count: int,
+        learning_rate: float,
+        actual_rank: int | None = None,
+    ) -> dict:
+        """Record that a checkpoint-loaded session is the current active session."""
+        ray.get([w.mark_session_loaded.remote(session_id) for w in self.workers])
+        self._current_session = session_id
+        self._step_count = int(step_count)
+        self.learning_rate = float(learning_rate)
+        self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
+        self._session_manager.save_metadata(
+            session_id,
+            self._step_count,
+            self.learning_rate,
+            self._actual_rank,
+        )
+        logger.info(
+            f"[MegatronWorkerGroup] Marked loaded session active: {session_id} "
+            f"(step={self._step_count}, actual_rank={self._actual_rank})"
+        )
+        return {"status": "ok", "session_id": session_id}
 
     def get_session_info(self) -> dict:
         """Get current session info.

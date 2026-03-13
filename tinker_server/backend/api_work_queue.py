@@ -533,10 +533,11 @@ def _get_or_create_ray_actor():
             async with self._cv:
                 while True:
                     if self._active_job_id is not None and str(consumer_job_id) != self._active_job_id:
-                        self._cv.notify(1)
-                        raise RuntimeError(
-                            f"stale dequeue from consumer_job_id={str(consumer_job_id)!r} (active_job_id={self._active_job_id!r})"
-                        )
+                        try:
+                            await asyncio.wait_for(self._cv.wait(), timeout=dequeue_poll_s)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
 
                     has_legacy = bool(self._items)
                     now = time.time()

@@ -428,6 +428,7 @@ async def save_weights(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1096,8 +1097,8 @@ async def _do_load_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        # Resolve path
-        load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+        # Queue-time validation hands the background worker a concrete local path.
+        load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
