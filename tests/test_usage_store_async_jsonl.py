@@ -203,6 +203,7 @@ async def test_jsonl_usage_store_does_not_mutate_memory_when_append_fails(tmp_pa
 
 def test_build_usage_store_falls_back_to_jsonl_when_asyncpg_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "postgresql://fake")
     monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
     missing = ModuleNotFoundError("No module named 'asyncpg'")
     missing.name = "asyncpg"
@@ -216,6 +217,7 @@ def test_build_usage_store_falls_back_to_jsonl_when_asyncpg_missing(monkeypatch,
 
 def test_build_usage_store_does_not_mask_non_missing_asyncpg_errors(monkeypatch):
     monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "postgresql://fake")
     monkeypatch.setattr(
         usage_store_module,
         "_import_asyncpg",
@@ -224,3 +226,19 @@ def test_build_usage_store_does_not_mask_non_missing_asyncpg_errors(monkeypatch)
 
     with pytest.raises(RuntimeError, match="broken asyncpg import"):
         usage_store_module._build_usage_store()
+
+
+def test_build_usage_store_falls_back_to_jsonl_when_pg_dsn_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(usage_store_module.config, "usage_backend", "postgres")
+    monkeypatch.setattr(usage_store_module.config, "usage_pg_dsn", "")
+    monkeypatch.setattr(usage_store_module.config, "usage_log_dir", str(tmp_path))
+    monkeypatch.setattr(
+        usage_store_module,
+        "_import_asyncpg",
+        lambda: (_ for _ in ()).throw(AssertionError("asyncpg import should not run without PG DSN")),
+    )
+
+    store = usage_store_module._build_usage_store()
+
+    assert isinstance(store, usage_store_module.JsonlUsageStore)
+    assert store._path == tmp_path / "usage_event.jsonl"

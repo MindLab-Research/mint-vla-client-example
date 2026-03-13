@@ -40,6 +40,10 @@ def _is_missing_asyncpg(exc: ModuleNotFoundError) -> bool:
     return str(getattr(exc, "name", "") or "").strip() == "asyncpg"
 
 
+def _usage_pg_dsn() -> str:
+    return str(config.usage_pg_dsn or "").strip()
+
+
 @dataclass(frozen=True)
 class UsageEvent:
     account_id: str
@@ -750,6 +754,13 @@ _usage_store_guard = asyncio.Lock()
 def _build_usage_store() -> UsageStore:
     if str(config.usage_backend or "postgres").strip().lower() != "postgres":
         raise ValueError("Unsupported usage backend. Only postgres is supported")
+    if not _usage_pg_dsn():
+        path = _default_jsonl_usage_path()
+        logger.warning(
+            "usage postgres backend has no PG DSN configured; falling back to JSONL usage_event store at %s",
+            path,
+        )
+        return JsonlUsageStore(path=path)
     try:
         _import_asyncpg()
     except ModuleNotFoundError as e:
@@ -763,7 +774,7 @@ def _build_usage_store() -> UsageStore:
         )
         return JsonlUsageStore(path=path)
     return PostgresUsageStore(
-        dsn=config.usage_pg_dsn,
+        dsn=_usage_pg_dsn(),
         pool_min=config.usage_pg_pool_min,
         pool_max=config.usage_pg_pool_max,
         write_timeout_ms=config.usage_write_timeout_ms,
