@@ -1103,6 +1103,7 @@ async def _do_compute_logprobs(
             multi_lora_engine = await session_manager.get_engine_for_session(session_id)
             if multi_lora_engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
+            await _ensure_session_lora_loaded(multi_lora_engine, session_id)
 
             logprobs = await multi_lora_engine.compute_logprobs(
                 sampling_session_id=session_id,

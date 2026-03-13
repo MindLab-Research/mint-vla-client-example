@@ -382,6 +382,11 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             allow_insecure = os.environ.get("MINT_VLLM_ALLOW_INSECURE_SERIALIZATION", "1").strip().lower()
             if allow_insecure not in {"0", "false", "no", "off"}:
                 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+            rollout_mode = kwargs.get("rollout_mode")
+            if isinstance(rollout_mode, str):
+                from verl.workers.rollout.replica import RolloutMode
+
+                kwargs["rollout_mode"] = RolloutMode(rollout_mode)
             pfs_pythonpath = PFS_PYTHONPATH
             os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
             for p in reversed(pfs_pythonpath.split(":")):

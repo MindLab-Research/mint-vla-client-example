@@ -520,6 +520,7 @@ def sync_checkpoint_tree(src_dir: str, dst_dir: str) -> str:
             if os.path.isdir(dst_dir):
                 os.rename(dst_dir, old_dir)
             os.rename(temp_dir, dst_dir)
+            os.utime(dst_dir, None)
             if os.path.isdir(old_dir):
                 shutil.rmtree(old_dir, ignore_errors=True)
             return dst_dir
