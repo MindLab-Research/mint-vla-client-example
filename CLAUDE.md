@@ -9,6 +9,7 @@
 | `volcano-cluster` | Ray cluster lifecycle (create/teardown worker tasks) |
 | `aliyun-cluster` | Aliyun DLC cluster lifecycle (create/stop/list jobs, logs) |
 | `merge-gate` | Pre-merge testing |
+| `vllm-knob-calculation` | Back-of-envelope sizing for vLLM serving knobs |
 
 **Use `mint-prod` for production operations. Use `mint-dev` for development.**
 
