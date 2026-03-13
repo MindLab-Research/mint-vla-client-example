@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import threading
 import logging
+import json
 from dataclasses import dataclass
 
 import ray
@@ -69,14 +70,54 @@ def _pg_name(actor_name: str) -> str:
     return f"{actor_name}_pg"
 
 
-def _get_or_create_pg(actor_name: str) -> ray.util.placement_group.PlacementGroup:
+def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) -> str | None:
+    raw = os.environ.get("MINT_DENSE_MODEL_NODE_IPS_JSON", "").strip()
+    source = "MINT_DENSE_MODEL_NODE_IPS_JSON"
+    if not raw:
+        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+        source = "MINT_MODEL_NODE_IPS_JSON"
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.warning("%s is not valid JSON; ignoring", source)
+        return None
+    if not isinstance(data, dict):
+        logger.warning("%s must be a JSON object; ignoring", source)
+        return None
+
+    candidates = None
+    lookup_keys = []
+    for key in (model_key, base_model):
+        if not key:
+            continue
+        lookup_keys.extend((key, str(key).lower()))
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            candidates = value
+            break
+    if not isinstance(candidates, list) or not candidates:
+        return None
+
+    ip = str(candidates[0]).strip()
+    return ip or None
+
+
+def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> ray.util.placement_group.PlacementGroup:
     """Ensure a detached 1-GPU placement group exists for this actor."""
     pg_name = _pg_name(actor_name)
     try:
         pg = ray.util.get_placement_group(pg_name)
     except Exception:
+        bundle = {"GPU": 1, "CPU": 1}
+        preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
+        if preferred_ip:
+            bundle[f"node:{preferred_ip}"] = 0.001
+            logger.info("Dense trainer pin model=%s node_ip=%s", model_key or base_model, preferred_ip)
         pg = ray.util.placement_group(
-            [{"GPU": 1, "CPU": 1}],
+            [bundle],
             strategy="PACK",
             name=pg_name,
             lifetime="detached",
@@ -193,7 +234,7 @@ def get_or_create_dense_trainer(
                         **otel_env_vars(),
                     }
                 }
-                pg = _get_or_create_pg(actor_name)
+                pg = _get_or_create_pg(actor_name, model_key=name_key, base_model=base_model)
                 actor = training_worker_cls.options(
                     name=actor_name,
                     namespace=PERSISTENT_DENSE_NAMESPACE,

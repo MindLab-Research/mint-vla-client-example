@@ -72,16 +72,20 @@ def _model_key_from_base_model(base_model: str) -> str:
 
 
 def _preferred_worker_node_ips_for_model(base_model: str) -> list[str]:
-    raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+    raw = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "").strip()
+    source = "MINT_MEGATRON_MODEL_NODE_IPS_JSON"
+    if not raw:
+        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+        source = "MINT_MODEL_NODE_IPS_JSON"
     if not raw:
         return []
     try:
         data = json.loads(raw)
     except Exception:
-        logger.warning("MINT_MODEL_NODE_IPS_JSON is not valid JSON; ignoring")
+        logger.warning("%s is not valid JSON; ignoring", source)
         return []
     if not isinstance(data, dict):
-        logger.warning("MINT_MODEL_NODE_IPS_JSON must be a JSON object; ignoring")
+        logger.warning("%s must be a JSON object; ignoring", source)
         return []
 
     model_key = _model_key_from_base_model(base_model)
@@ -5685,6 +5689,9 @@ def get_or_create_megatron_worker_group(
             node_pin_json = os.environ.get("MINT_MODEL_NODE_IPS_JSON")
             if node_pin_json:
                 runtime_env["env_vars"]["MINT_MODEL_NODE_IPS_JSON"] = node_pin_json
+            megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
+            if megatron_node_pin_json:
+                runtime_env["env_vars"]["MINT_MEGATRON_MODEL_NODE_IPS_JSON"] = megatron_node_pin_json
 
             # Create detached Ray actor with per-model name
             try:

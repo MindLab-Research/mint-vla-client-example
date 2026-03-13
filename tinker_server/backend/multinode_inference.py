@@ -143,17 +143,21 @@ def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str
 def _preferred_worker_node_ips_for_model(model_name: str | None) -> list[str]:
     if not model_name:
         return []
-    raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+    raw = os.environ.get("MINT_VLLM_MODEL_NODE_IPS_JSON", "").strip()
+    source = "MINT_VLLM_MODEL_NODE_IPS_JSON"
+    if not raw:
+        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+        source = "MINT_MODEL_NODE_IPS_JSON"
     if not raw:
         return []
 
     try:
         data = json.loads(raw)
     except Exception:
-        logger.warning("MINT_MODEL_NODE_IPS_JSON is not valid JSON; ignoring")
+        logger.warning("%s is not valid JSON; ignoring", source)
         return []
     if not isinstance(data, dict):
-        logger.warning("MINT_MODEL_NODE_IPS_JSON must be a JSON object; ignoring")
+        logger.warning("%s must be a JSON object; ignoring", source)
         return []
 
     candidates = []

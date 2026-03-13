@@ -11,7 +11,7 @@ export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
 
 export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
-export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507"
+export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_PREWARM_INFERENCE=1
 export MINT_PERSISTENT_PREWARM_TRAINING=1
 export MINT_PERSISTENT_TRAIN_LORA_RANK=16
@@ -22,15 +22,23 @@ export TINKER_GATEWAY_CONFIG_JSON=""
 export MINT_SAVE_LORA_TIMEOUT_S=1800
 export MINT_SCHEDULER_ENABLE=1
 
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.37.90","Qwen/Qwen3-4B-Instruct-2507":"192.168.37.90","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.88"}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.90"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.90"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.88"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.92","192.168.37.93","192.168.37.94","192.168.37.95"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.92","192.168.37.93","192.168.37.94","192.168.37.95"]}'
+# Current worker topology after 2026-03-12 rebuild:
+# worker1=192.168.37.159 worker2=192.168.37.160 worker3=192.168.37.161 worker4=192.168.37.162
+# worker5=192.168.37.163 worker6=192.168.37.156 worker7=192.168.37.157 worker8=192.168.37.158
+export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.37.159","Qwen/Qwen3-4B-Instruct-2507":"192.168.37.159","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.160"}'
+export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"]}'
+export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"]}'
+export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
+export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON='{"Qwen/Qwen3-235B-A22B-Instruct-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-235B-A22B-Thinking-2507":{"inference_tp":16,"train_pp":1,"train_ep":8,"max_num_batched_tokens":32768,"vllm_distributed_executor_backend":"ray"},"Qwen/Qwen3-30B-A3B-Instruct-2507":{"gpu_memory_utilization":0.87,"max_lora_rank":16,"max_loras":1,"max_cpu_loras":2},"Qwen/Qwen3-0.6B":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"},"Qwen/Qwen3-4B-Instruct-2507":{"vllm_engine":"async","vllm_distributed_executor_backend":"mp"}}'
 
 export TINKER_ENABLE_MULTI_LORA=1
+export MINT_ROUTER_REPLAY_MODE=disabled
 export MINT_VLLM_ENABLE_CHUNKED_PREFILL=1
 export MINT_VLLM_ENABLE_PREFIX_CACHING=1
 export MINT_VLLM_FULLY_SHARDED_LORAS=1
+export MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE=0
 export MINT_VLLM_ADMISSION_CONTROL=1
 
 export MINT_LOG_FILE=/tmp/tinker_server_auth.log
@@ -54,7 +62,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 export MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
 export MINT_VLLM_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
-export RAY_ADDRESS=192.168.37.87:6379
+export RAY_ADDRESS=192.168.37.147:6379
 
 export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
