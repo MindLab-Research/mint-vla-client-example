@@ -134,6 +134,10 @@ def checkpoint_has_lora_weights(path: str) -> bool:
     )
 
 
+def checkpoint_has_sampling_adapter_weights(path: str) -> bool:
+    return os.path.exists(os.path.join(path, "adapter_model.safetensors"))
+
+
 def checkpoint_has_optimizer_state(path: str) -> bool:
     return os.path.exists(os.path.join(path, "optimizer.pt")) or bool(
         glob.glob(os.path.join(path, "*_optimizer.pt"))
@@ -298,6 +302,13 @@ def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None
     else:
         if not has_optimizer:
             raise ValueError("Missing optimizer state in extracted checkpoint")
+
+
+def validate_sampler_checkpoint_for_sampling(path: str) -> None:
+    if not checkpoint_has_sampling_adapter_weights(path):
+        raise ValueError("Missing adapter_model.safetensors for sampling")
+    if checkpoint_has_optimizer_state(path):
+        raise ValueError("Sampler checkpoint must not include optimizer state")
 
 
 def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:

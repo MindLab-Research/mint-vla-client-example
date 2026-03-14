@@ -42,6 +42,7 @@ from ..checkpoints import (
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
     validate_checkpoint_dir,
+    validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
 )
 from ..models.types import (
@@ -1366,7 +1367,10 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             if checkpoint_type not in ("training", "sampler"):
                 continue
             try:
-                validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
             except ValueError:
                 continue
 
@@ -1450,7 +1454,10 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             if checkpoint_type not in ("training", "sampler"):
                 continue
             try:
-                validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
             except ValueError:
                 continue
 

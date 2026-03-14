@@ -189,3 +189,46 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
 
     assert checkpoint_ids == ["weights/training-good"]
     assert "sampler_weights/sampler-bad" not in checkpoint_ids
+
+
+def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server.checkpoints import write_checkpoint_metadata
+    from tinker_server.routes import weights as wt
+
+    root = tmp_path / "checkpoints"
+    model_id = "run-319-mismatch"
+    owner_dir = root / "anonymous" / model_id
+
+    shard_only = owner_dir / "sampler-sharded-only"
+    _touch(shard_only / "mp_rank_00_adapter.pt", b"lora-shard")
+    write_checkpoint_metadata(
+        str(shard_only),
+        {
+            "checkpoint_id": "sampler-sharded-only",
+            "owner_id": None,
+            "model_id": model_id,
+            "model_name": "Qwen/Qwen3-0.6B",
+            "created_at": "2026-03-14T00:00:00Z",
+            "step": 8,
+            "checkpoint_type": "sampler",
+            "optimizer_present": False,
+            "backend": "megatron",
+            "type": "sampler",
+        },
+    )
+
+    async def _no_remote(**_kwargs):
+        return None
+
+    monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
+    monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
+
+    app = FastAPI()
+    app.include_router(wt.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    resp = client.get(f"/api/v1/training_runs/{model_id}/checkpoints")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["checkpoints"] == []

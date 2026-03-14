@@ -45,7 +45,7 @@ from ..checkpoints import (
     materialize_persistent_checkpoint,
     mirror_checkpoint_to_persistent_store,
     resolve_checkpoint_path,
-    validate_checkpoint_dir,
+    validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
 )
 from ..config import RAY_NAMESPACE
@@ -1968,7 +1968,7 @@ async def _do_save_weights_for_sampler(
                 f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
             )
         try:
-            validate_checkpoint_dir(save_path, checkpoint_type="sampler")
+            validate_sampler_checkpoint_for_sampling(save_path)
         except ValueError as e:
             raise RuntimeError(
                 f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
@@ -2004,7 +2004,7 @@ async def _do_save_weights_for_sampler(
                 checkpoint_name=checkpoint_name,
             )
             try:
-                validate_checkpoint_dir(persistent_path, checkpoint_type="sampler")
+                validate_sampler_checkpoint_for_sampling(persistent_path)
             except ValueError as e:
                 raise RuntimeError(
                     f"save_weights_for_sampler mirrored an invalid sampler checkpoint at {persistent_path}: {e}"
