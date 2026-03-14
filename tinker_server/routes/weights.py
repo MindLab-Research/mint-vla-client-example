@@ -42,6 +42,7 @@ from ..checkpoints import (
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
     validate_checkpoint_dir,
+    validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
 )
 from ..models.types import (
@@ -623,6 +624,12 @@ async def _do_save_state(
             raise RuntimeError(
                 f"save_state must produce optimizer artifacts, but none found under: {save_path}"
             )
+        try:
+            validate_checkpoint_dir(save_path, checkpoint_type="training")
+        except ValueError as e:
+            raise RuntimeError(
+                f"save_state produced an invalid training checkpoint at {save_path}: {e}"
+            ) from e
 
         metadata = {
             "checkpoint_id": checkpoint_name,
@@ -646,6 +653,12 @@ async def _do_save_state(
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
         )
+        try:
+            validate_checkpoint_dir(persistent_path, checkpoint_type="training")
+        except ValueError as e:
+            raise RuntimeError(
+                f"save_state mirrored an invalid training checkpoint at {persistent_path}: {e}"
+            ) from e
         write_checkpoint_metadata(
             persistent_path,
             {
@@ -1353,6 +1366,13 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoint_type = metadata.get("checkpoint_type")
             if checkpoint_type not in ("training", "sampler"):
                 continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
+                continue
 
             created_at = metadata.get("created_at") or created_at
             try:
@@ -1432,6 +1452,13 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
             checkpoint_type = metadata.get("checkpoint_type")
             if checkpoint_type not in ("training", "sampler"):
+                continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
                 continue
 
             created_at = metadata.get("created_at") or created_at
