@@ -776,7 +776,12 @@ async def lifespan(app: FastAPI):
                 "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
                 str(item.request_id),
             )
-            await sampling._do_sample(item.request_id, req, item.user_id)
+            await sampling._do_sample(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
 
         await run_async_with_otel_span(
             "queue.stage.sampling.asample",
