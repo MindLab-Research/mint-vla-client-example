@@ -13,13 +13,18 @@ def _install_stub(name: str, module: types.ModuleType) -> None:
 
 def _ensure_ray_stubbed() -> None:
     try:
-        import ray  # noqa: F401
-        return
+        import ray  # type: ignore
+        if all(
+            hasattr(ray, attr)
+            for attr in ("remote", "kill", "get", "get_actor", "is_initialized", "actor")
+        ) and hasattr(ray, "util"):
+            return
     except ModuleNotFoundError:
-        pass
+        ray = None
 
-    ray = types.ModuleType("ray")
-    ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
+    if ray is None:
+        ray = types.ModuleType("ray")
+        ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
 
     def remote(**_kwargs):
         def deco(obj):
@@ -27,16 +32,18 @@ def _ensure_ray_stubbed() -> None:
 
         return deco
 
-    ray.remote = remote  # type: ignore[attr-defined]
-    ray.kill = lambda *_a, **_k: None  # type: ignore[attr-defined]
-    ray.get = lambda *_a, **_k: None  # type: ignore[attr-defined]
-    ray.get_actor = lambda *_a, **_k: None  # type: ignore[attr-defined]
-    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
-    ray.actor = types.SimpleNamespace(ActorHandle=object)
+    ray.remote = getattr(ray, "remote", remote)  # type: ignore[attr-defined]
+    ray.kill = getattr(ray, "kill", lambda *_a, **_k: None)  # type: ignore[attr-defined]
+    ray.get = getattr(ray, "get", lambda *_a, **_k: None)  # type: ignore[attr-defined]
+    ray.get_actor = getattr(ray, "get_actor", lambda *_a, **_k: None)  # type: ignore[attr-defined]
+    ray.is_initialized = getattr(ray, "is_initialized", lambda: True)  # type: ignore[attr-defined]
+    ray.actor = getattr(ray, "actor", types.SimpleNamespace(ActorHandle=object))  # type: ignore[attr-defined]
 
-    ray_util = types.ModuleType("ray.util")
-    ray_util.__spec__ = importlib.machinery.ModuleSpec("ray.util", loader=None)
-    ray.util = ray_util  # type: ignore[attr-defined]
+    ray_util = getattr(ray, "util", None)
+    if ray_util is None:
+        ray_util = types.ModuleType("ray.util")
+        ray_util.__spec__ = importlib.machinery.ModuleSpec("ray.util", loader=None)
+        ray.util = ray_util  # type: ignore[attr-defined]
 
     _install_stub("ray", ray)
     _install_stub("ray.util", ray_util)
