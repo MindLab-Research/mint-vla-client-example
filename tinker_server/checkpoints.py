@@ -309,6 +309,17 @@ def validate_sampler_checkpoint_for_sampling(path: str) -> None:
         raise ValueError("Missing adapter_model.safetensors for sampling")
     if checkpoint_has_optimizer_state(path):
         raise ValueError("Sampler checkpoint must not include optimizer state")
+    try:
+        from safetensors import safe_open
+
+        with safe_open(
+            os.path.join(path, "adapter_model.safetensors"),
+            framework="np",
+            device="cpu",
+        ) as f:
+            list(f.keys())
+    except Exception as e:
+        raise ValueError(f"Unreadable adapter_model.safetensors for sampling: {e}") from e
 
 
 def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:

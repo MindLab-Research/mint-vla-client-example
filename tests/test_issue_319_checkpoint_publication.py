@@ -76,6 +76,64 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
 
 
 @pytest.mark.anyio
+async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from tinker_server.models.types import SaveWeightsForSamplerRequest
+    from tinker_server.routes import training as tr
+
+    ckpt_dir = tmp_path / "sampler_corrupt_lora"
+    _touch(ckpt_dir / "adapter_model.safetensors", b"")
+
+    failed: dict[str, str] = {}
+
+    async def _fake_save_weights_for_sampler(**_kwargs):
+        return str(ckpt_dir)
+
+    def _fail(request_id: str, error: str) -> None:
+        failed["request_id"] = request_id
+        failed["error"] = error
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: SimpleNamespace(
+                model_id="run-319",
+                base_model="Qwen/Qwen3-0.6B",
+                current_step=5,
+                backend="dense",
+                lora_config=SimpleNamespace(rank=8, train_mlp=False),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        tr,
+        "training_engine",
+        SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
+    )
+    monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr,
+        "mirror_checkpoint_to_persistent_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("mirror should not run")),
+    )
+
+    request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
+    await tr._do_save_weights_for_sampler(
+        request_id="req-319-sampler-corrupt",
+        request=request,
+        user_id="owner-a",
+        prefer_tinker=True,
+    )
+
+    assert failed["request_id"] == "req-319-sampler-corrupt"
+    assert "Unreadable adapter_model.safetensors" in failed["error"]
+    assert not (ckpt_dir / "metadata.json").exists()
+
+
+@pytest.mark.anyio
 async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path: Path) -> None:
     from tinker_server.models.types import SaveStateRequest
     from tinker_server.routes import weights as wt
@@ -213,6 +271,49 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
             "checkpoint_type": "sampler",
             "optimizer_present": False,
             "backend": "megatron",
+            "type": "sampler",
+        },
+    )
+
+    async def _no_remote(**_kwargs):
+        return None
+
+    monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
+    monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
+
+    app = FastAPI()
+    app.include_router(wt.router, prefix="/api/v1")
+    client = TestClient(app)
+
+    resp = client.get(f"/api/v1/training_runs/{model_id}/checkpoints")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["checkpoints"] == []
+
+
+def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server.checkpoints import write_checkpoint_metadata
+    from tinker_server.routes import weights as wt
+
+    root = tmp_path / "checkpoints"
+    model_id = "run-319-corrupt"
+    owner_dir = root / "anonymous" / model_id
+
+    corrupt = owner_dir / "sampler-corrupt"
+    _touch(corrupt / "adapter_model.safetensors", b"")
+    write_checkpoint_metadata(
+        str(corrupt),
+        {
+            "checkpoint_id": "sampler-corrupt",
+            "owner_id": None,
+            "model_id": model_id,
+            "model_name": "Qwen/Qwen3-0.6B",
+            "created_at": "2026-03-14T00:00:00Z",
+            "step": 9,
+            "checkpoint_type": "sampler",
+            "optimizer_present": False,
+            "backend": "dense",
             "type": "sampler",
         },
     )
