@@ -80,6 +80,12 @@ Placement:
 - Main volcano: 30B vllm + 30B megatron on node 1; 0.6B vllm + 0.6B peft + 4B vllm + 4B peft on node 2.
 - Main aliyun: 235B vllm on node 1; 235B megatron on node 2+3.
 
+API host Ray driver precondition:
+- One-time setup only: if `mint-prod-volcano` has not yet joined the Ray cluster as a local 0-GPU node, `tinker-server-auth` startup can fail in `ray.init()`.
+- If already joined, do not repeat this step during normal deploy/restart.
+- One-time command:
+  `ssh mint-prod-volcano '/root/tinker_project/tinker-server-auth/.venv31213/bin/ray start --address=192.168.37.147:6379 --node-ip-address=192.168.47.239 --num-cpus=0 --num-gpus=0 --disable-usage-stats'`
+
 ## Queue Placement SOP (C1/C2)
 
 K2 is not in production service yet. Skip this section unless the task is explicitly K2 placement or K2 bringup.

@@ -41,7 +41,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://apmplus-cn-beijing.ivolces.com:4317
 export OTEL_EXPORTER_OTLP_HEADERS=
 export OTEL_METRIC_EXPORT_INTERVAL_MS=10000
 export OTEL_LOG_LEVEL=DEBUG
-export MINT_HEALTHZ_RAY_TIMEOUT_S=10.0
+export MINT_HEALTHZ_RAY_TIMEOUT_S=30.0
 export MINT_VLLM_REQUEST_TIMING=1
 export MINT_TIMING_DIAG=1
 export MINT_VERL_DIAGNOSTICS=1
@@ -54,7 +54,11 @@ export PYTHONDONTWRITEBYTECODE=1
 
 export MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
 export MINT_VLLM_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
-export RAY_ADDRESS=192.168.37.87:6379
+if [ -f /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt ]; then
+  export RAY_ADDRESS="$(cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt):6379"
+else
+  export RAY_ADDRESS=192.168.37.147:6379
+fi
 
 export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
@@ -66,5 +70,6 @@ export PFS_MEGATRON_BRIDGE_PATH=/vePFS-Mindverse/share/code/megatron-bridge/src
 export PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH=/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src
 export PFS_VLLM_PATH=
 export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
+export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
 
 export LD_LIBRARY_PATH=/root/tinker_project/tinker-server-auth/.venv31213/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
