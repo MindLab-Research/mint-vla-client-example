@@ -411,6 +411,7 @@ class MultiLoRAInferenceEngine:
                 "HF_HUB_OFFLINE": "1",
                 **otel_env_vars(),
             }
+            env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
 
@@ -672,9 +673,19 @@ class MultiLoRAInferenceEngine:
             )
             return existing_lora_id
 
-        # Allocate unique ID for this session
-        lora_id = await self.registry.allocate(sampling_session_id)
-        allocated = True
+        # Allocate or reuse a shared LoRA ID for this adapter path
+        lora_id, is_new_load = await self.registry.allocate_for_path(
+            sampling_session_id, lora_path
+        )
+        allocated = is_new_load
+        if not is_new_load:
+            logger.info(
+                "Reused LoRA for session %s from path (lora_int_id=%s path=%s)",
+                sampling_session_id,
+                lora_id,
+                lora_path,
+            )
+            return lora_id
 
         # Check if we need to evict from GPU
         current_count = await self.registry.count()
@@ -718,11 +729,11 @@ class MultiLoRAInferenceEngine:
             traceback.print_exc()
             if allocated:
                 try:
-                    await self.registry.remove(lora_id)
+                    await self.registry.remove_session(sampling_session_id)
                 except Exception as cleanup_e:
                     logger.warning(
-                        "Failed to roll back lora_int_id=%s after add_lora failure: %s: %s",
-                        lora_id,
+                        "Failed to roll back session=%s after add_lora failure: %s: %s",
+                        sampling_session_id,
                         type(cleanup_e).__name__,
                         cleanup_e,
                     )
@@ -1111,16 +1122,23 @@ class MultiLoRAInferenceEngine:
         if lora_id is None:
             return False
 
-        # Remove from vLLM engine
-        try:
-            ref = self.server.remove_lora.remote(lora_id)
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-        except Exception as e:
-            logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
+        lora_id, should_unload = await self.registry.remove_session(sampling_session_id)
+        if lora_id is None:
+            return False
 
-        # Remove from registry
-        await self.registry.remove(lora_id)
-        logger.info(f"Removed session {sampling_session_id} (lora_int_id={lora_id})")
+        if should_unload:
+            try:
+                ref = self.server.remove_lora.remote(lora_id)
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+            except Exception as e:
+                logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
+
+        logger.info(
+            "Removed session %s (lora_int_id=%s should_unload=%s)",
+            sampling_session_id,
+            lora_id,
+            should_unload,
+        )
         return True
 
     async def shutdown(self, kill_actor: bool = False) -> None:
@@ -1343,7 +1361,11 @@ class MultiModelInferenceManager:
                 env_var_name="MINT_MODEL_NODE_IPS_JSON",
                 context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
             )
-            if pinned_node_ip is None and configured_node_ips:
+            if (
+                config.vllm_engine != "async"
+                and pinned_node_ip is None
+                and configured_node_ips
+            ):
                 pinned_node_ip = configured_node_ips[0]
             logger.info(
                 "single_node_vllm_pin_lookup model=%r actor=%r pinned_json_present=%s pinned_node_ip=%s lookup_keys=%s raw_pinned_json=%r raw_model_node_ips=%r configured_node_ips=%s",

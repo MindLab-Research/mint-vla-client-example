@@ -227,12 +227,13 @@ class ServerConfig:
     max_loras: int = 64  # GPU slots for concurrent LoRA adapters (~2.5GB for 64 rank-32 Qwen-7B)
     max_cpu_loras: int = 1024  # CPU cache for evicted adapters
     max_lora_rank: int = 64  # Maximum supported LoRA rank
+    vllm_attention_backend: str = "DUAL_CHUNK_FLASH_ATTN"
 
     # Sampling settings (routes/sampling.py)
     sampling_max_inflight_sample_tasks: int = 64
     sampling_max_concurrent_samples_per_request: int = 8
     sampling_sample_coalesce: bool = True
-    sampling_sample_coalesce_window_ms: float = 2.0
+    sampling_sample_coalesce_window_ms: float = 50.0
     sampling_sample_coalesce_max_batch: int = 32
     sampling_sample_coalesce_max_samples: int = 16
     sampling_require_seq_id: bool = False
@@ -453,11 +454,6 @@ class ServerConfig:
                 "TINKER_SAMPLE_COALESCE",
                 file_sampling.sample_coalesce if file_sampling is not None else None,
                 True,
-            ),
-            sampling_sample_coalesce_window_ms=_pick_float(
-                "TINKER_SAMPLE_COALESCE_WINDOW_MS",
-                file_sampling.sample_coalesce_window_ms if file_sampling is not None else None,
-                2.0,
             ),
             sampling_sample_coalesce_max_batch=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_BATCH",

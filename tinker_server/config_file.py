@@ -52,7 +52,6 @@ class _SamplingSection(BaseModel):
     max_concurrent_samples_per_request: int | None = None
 
     sample_coalesce: bool | None = None
-    sample_coalesce_window_ms: float | None = None
     sample_coalesce_max_batch: int | None = None
     sample_coalesce_max_samples: int | None = None
     require_seq_id: bool | None = None

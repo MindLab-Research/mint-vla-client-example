@@ -9,9 +9,9 @@ Purpose:
 - Provides GPU runtime dependencies (CUDA, torch+cu*, vLLM, DeepEP, Megatron-LM, Megatron-Bridge, verl).
 
 Image series and arch variants:
-- Start at version 15:
-  - `mint:15-sm80` for Volcano A-cards (A800, SM80)
-  - `mint:15-sm90` for Aliyun H-cards (H, SM90)
+- Start at version 16:
+  - `mint:16-sm80` for Volcano A-cards (A800, SM80)
+  - `mint:16-sm90` for Aliyun H-cards (H, SM90)
 
 Rule:
 - Use the Mint Docker image for GPU workers. Do not depend on host venv state for worker runtime.

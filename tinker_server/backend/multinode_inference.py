@@ -2183,6 +2183,7 @@ class MultiNodeInferenceEngine:
                 v = os.environ.get(k)
                 if v is not None:
                     env_vars[k] = v
+            env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
 
             if (
                 distributed_executor_backend == "ray"
@@ -2202,7 +2203,6 @@ class MultiNodeInferenceEngine:
             for k in (
                 "VLLM_LOGGING_LEVEL",
                 "VLLM_LOG_LEVEL",
-                "VLLM_ATTENTION_BACKEND",
                 "VLLM_USE_FLASHINFER_SAMPLER",
                 "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING",
                 "VLLM_FUSED_MOE_CHUNK_SIZE",

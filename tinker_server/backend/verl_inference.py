@@ -2306,6 +2306,7 @@ class VerlInferenceEngine:
                     "PYTHONPATH": PFS_PYTHONPATH,
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
+                    "VLLM_ATTENTION_BACKEND": server_config.vllm_attention_backend,
                     **otel_env_vars(),
                 }
             },

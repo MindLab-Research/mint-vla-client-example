@@ -28,6 +28,14 @@ def init_ray(**kwargs: Any) -> Any:
         if current is None or current == "" or current == "auto":
             kwargs["address"] = addr
 
+    node_ip = os.environ.get("MINT_RAY_NODE_IP_ADDRESS", "").strip()
+    if node_ip and "_node_ip_address" not in kwargs:
+        kwargs["_node_ip_address"] = node_ip
+
+    temp_dir = os.environ.get("MINT_RAY_TEMP_DIR", "").strip()
+    if temp_dir and "_temp_dir" not in kwargs:
+        kwargs["_temp_dir"] = temp_dir
+
     for k, v in ray_log_to_driver_kwargs().items():
         kwargs.setdefault(k, v)
 

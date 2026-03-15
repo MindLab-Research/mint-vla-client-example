@@ -1393,7 +1393,6 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
         set_lora_3d._tinker_sparse_shards = True  # type: ignore[attr-defined]
         cls3d.set_lora = set_lora_3d  # type: ignore[method-assign]
 
-
 def _patch_vllm_lora_optimize_overlap_safe() -> None:
     """Avoid in-place LoRA optimize on overlapping tensors.
 

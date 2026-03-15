@@ -243,8 +243,20 @@ async def _coalesced_generate(
 ):
     if num_samples < 1:
         raise ValueError(f"num_samples must be >= 1 (got {num_samples})")
+    coalesce_identity: str = sampling_session_id
+    try:
+        registry = getattr(engine, "registry", None)
+        if registry is not None:
+            lora_id = await registry.get_lora_id(sampling_session_id)
+            if lora_id is not None:
+                coalesce_identity = f"lora:{lora_id}"
+            elif sampling_session_id == "__base__":
+                coalesce_identity = "__base__"
+    except Exception:
+        coalesce_identity = sampling_session_id
+
     key = (
-        sampling_session_id,
+        coalesce_identity,
         _prompt_fingerprint(prompt_ids),
         int(max_tokens),
         _stop_key(stop),
@@ -314,7 +326,7 @@ async def _coalesced_generate(
             delay_s = 0.0 if do_flush_now else max(0.0, _SAMPLE_COALESCE_WINDOW_MS / 1000.0)
             g["flush_task"] = asyncio.create_task(_flush_coalesced_group(key, delay_s))
         logger.info(
-            f"[coalesce queue] request_id={request_id} sampling_session_id={sampling_session_id} "
+            f"[coalesce queue] request_id={request_id} sampling_session_id={sampling_session_id} coalesce_identity={coalesce_identity} "
             f"waiters={len(g['waiters'])} total_samples={int(g['total_samples'])} "
             f"do_flush_now={do_flush_now} delay_s={delay_s if delay_s is not None else -1.0:.3f}"
         )
