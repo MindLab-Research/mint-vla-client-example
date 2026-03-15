@@ -577,10 +577,14 @@ async def ensure_sampling_session(
     parent_session_id: str | None = None,
 ) -> tuple[str, str]:
     """Ensure a sampling session exists for an OpenAI-compatible request."""
-    sampling_request = CreateSamplingSessionRequest(
-        session_id=parent_session_id or str(uuid.uuid4()),
-        model_path=model_path,
-    )
+    request_kwargs: dict[str, str] = {
+        "session_id": parent_session_id or str(uuid.uuid4()),
+    }
+    if model_path.startswith(("tinker://", "mint://", "ckpt_", "file://", "/")):
+        request_kwargs["model_path"] = model_path
+    else:
+        request_kwargs["base_model"] = model_path
+    sampling_request = CreateSamplingSessionRequest(**request_kwargs)
     response = await create_sampling_session(sampling_request, http_request)
     sampling_session_id = response.sampling_session_id
     base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)

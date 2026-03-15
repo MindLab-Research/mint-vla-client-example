@@ -766,22 +766,37 @@ async def sample_once(
             )
 
         sequence = sampled_sequence_from_result(result)
-        if user_id:
-            get_usage_logger().log(
-                user_id=user_id,
-                operation_type="sample_prefill",
-                model_name=session_id,
-                token_count=len(token_ids),
-                session_id=session_id,
-                request_id=request_id,
-            )
-            get_usage_logger().log(
-                user_id=user_id,
-                operation_type="sample_generation",
-                model_name=session_id,
-                token_count=len(sequence.tokens),
-                session_id=session_id,
-                request_id=request_id,
+        billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+        if billing_auth is not None:
+            label_model = _resolve_billing_model(session_id)
+            await _persist_usage_events(
+                auth_ctx=billing_auth,
+                events=[
+                    UsageEvent(
+                        account_id=billing_auth.account_id,
+                        apikey_id=billing_auth.apikey_id,
+                        charge_item="sampling",
+                        quantity=len(token_ids),
+                        request_id=billing_auth.request_id,
+                        label=_build_sampling_usage_label(
+                            model=label_model,
+                            route="sampling.sample_once",
+                            dimension="prefill",
+                        ),
+                    ),
+                    UsageEvent(
+                        account_id=billing_auth.account_id,
+                        apikey_id=billing_auth.apikey_id,
+                        charge_item="sampling",
+                        quantity=len(sequence.tokens),
+                        request_id=billing_auth.request_id,
+                        label=_build_sampling_usage_label(
+                            model=label_model,
+                            route="sampling.sample_once",
+                            dimension="sample",
+                        ),
+                    ),
+                ],
             )
         return sequence
     except HTTPException:

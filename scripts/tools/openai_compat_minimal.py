@@ -2,15 +2,20 @@
 """Minimal OpenAI-compatible example for tinker-server.
 
 Usage:
-  TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=your-real-api-key \
+  TINKER_BASE_URL=http://localhost:8000 \
     python scripts/tools/openai_compat_minimal.py completions \
       --model tinker:///vePFS-Mindverse/share/tinker_runtime_checkpoints/persistent_cache/anonymous/stress-qwen3-30b_0/sampler \
       --prompt "The capital of France is"
 
-  TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=your-real-api-key \
+  TINKER_BASE_URL=http://localhost:8000 \
     python scripts/tools/openai_compat_minimal.py chat \
-      --model tinker:///vePFS-Mindverse/share/tinker_runtime_checkpoints/persistent_cache/anonymous/stress-qwen3-30b_0/sampler \
+      --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
       --user-message "What is 2+2?"
+
+  TINKER_BASE_URL=http://localhost:8000 \
+    python scripts/tools/openai_compat_minimal.py tool \
+      --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+      --user-message "北京天气如何"
 """
 
 from __future__ import annotations
@@ -89,15 +94,20 @@ def _print_error(*, base_url: str, api_key: str, endpoint: str, payload: dict, e
 
 def _parse_args() -> argparse.Namespace:
     examples = """Examples:
-  TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=your-real-api-key \\
+  TINKER_BASE_URL=http://localhost:8000 \\
     python scripts/tools/openai_compat_minimal.py completions \\
-      --model tinker:///vePFS-Mindverse/share/tinker_runtime_checkpoints/persistent_cache/anonymous/stress-qwen3-30b_0/sampler \\
+      --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\
       --prompt "The capital of France is"
 
-  TINKER_BASE_URL=http://localhost:8000 TINKER_API_KEY=your-real-api-key \\
+  TINKER_BASE_URL=http://localhost:8000 \\
     python scripts/tools/openai_compat_minimal.py chat \\
-      --model tinker:///vePFS-Mindverse/share/tinker_runtime_checkpoints/persistent_cache/anonymous/stress-qwen3-30b_0/sampler \\
+      --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\
       --user-message "What is 2+2?"
+
+  TINKER_BASE_URL=http://localhost:8000 \\
+    python scripts/tools/openai_compat_minimal.py tool \\
+      --model Qwen/Qwen3-30B-A3B-Instruct-2507 \\
+      --user-message "北京天气如何"
 
 Environment:
   TINKER_BASE_URL / MINT_BASE_URL  Base server URL without /oai/api/v1 suffix
@@ -129,6 +139,22 @@ Environment:
     chat.add_argument("--temperature", type=float, default=0.2)
     chat.add_argument("--top-p", type=float, default=0.9)
     chat.add_argument("--stop", default=None, help="Optional stop string")
+
+    tool = sub.add_parser("tool", help="Minimal tool-calling example")
+    tool.add_argument("--model", default=DEFAULT_MODEL, help="Model name or sampler checkpoint URI")
+    tool.add_argument("--system", "--system-message", dest="system", default=None)
+    tool.add_argument("--user", "--user-message", dest="user_message", default="北京天气如何")
+    tool.add_argument("--tool-name", default="get_weather")
+    tool.add_argument("--tool-description", default="Get current weather for a city")
+    tool.add_argument("--tool-choice", default="auto", help='OpenAI tool_choice value, e.g. "auto" or "required"')
+    tool.add_argument("--max-tokens", type=int, default=128)
+    tool.add_argument("--temperature", type=float, default=0.1)
+    tool.add_argument("--top-p", type=float, default=0.9)
+    tool.add_argument(
+        "--allow-no-tool-call",
+        action="store_true",
+        help="Exit successfully even if the model returns plain text instead of tool_calls",
+    )
 
     args = p.parse_args()
     if not args.model:
@@ -204,14 +230,92 @@ def _run_chat(client: OpenAI, args: argparse.Namespace) -> None:
             response=response,
         )
 
+
+def _run_tool_call(client: OpenAI, args: argparse.Namespace) -> None:
+    messages = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+    messages.append({"role": "user", "content": args.user_message})
+
+    payload = {
+        "model": args.model,
+        "messages": messages,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": args.tool_name,
+                    "description": args.tool_description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "City or area to get weather for",
+                            }
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ],
+        "tool_choice": args.tool_choice,
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+    }
+    try:
+        response = client.chat.completions.create(**payload)
+    except Exception as exc:
+        _print_error(
+            base_url=args.oai_base_url,
+            api_key=args.resolved_api_key,
+            endpoint="/chat/completions",
+            payload=payload,
+            exc=exc,
+        )
+        raise
+    else:
+        _print_io(
+            base_url=args.oai_base_url,
+            api_key=args.resolved_api_key,
+            endpoint="/chat/completions",
+            payload=payload,
+            response=response,
+        )
+
+    tool_calls = response.choices[0].message.tool_calls or []
+    if tool_calls:
+        print("=== tool_call_summary ===")
+        for i, tool_call in enumerate(tool_calls, 1):
+            print(
+                json.dumps(
+                    {
+                        "index": i,
+                        "id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        return
+
+    if not args.allow_no_tool_call:
+        raise SystemExit("No tool_calls returned by the model")
+
+
 def main() -> int:
     args = _parse_args()
     client = OpenAI(base_url=args.oai_base_url, api_key=args.resolved_api_key)
 
     if args.cmd == "completions":
         _run_completions(client, args)
-    else:
+    elif args.cmd == "chat":
         _run_chat(client, args)
+    else:
+        _run_tool_call(client, args)
     return 0
 
 
