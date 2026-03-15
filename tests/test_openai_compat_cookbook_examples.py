@@ -4,7 +4,7 @@
 
 import anyio
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from openai import AsyncOpenAI
 
@@ -895,6 +895,48 @@ def test_sampling_exception_returns_oai_error_json(monkeypatch):
     error = resp.json()["error"]
     assert "vLLM actor died" in error["message"]
     assert "type" in error
+
+
+def test_gateway_http_exception_invalidates_cached_session_and_recreates(monkeypatch):
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    ensure_calls: list[str] = []
+    session_ids = ["stale-gateway-session", "fresh-gateway-session"]
+    sample_calls: list[str] = []
+
+    async def _fake_ensure(*, model_path: str, http_request, **_kw):
+        ensure_calls.append(model_path)
+        idx = min(len(ensure_calls) - 1, len(session_ids) - 1)
+        return session_ids[idx], "Qwen/Qwen3-235B-A22B-Instruct-2507"
+
+    async def _fake_get_tok(_bm):
+        return tokenizer
+
+    async def _fake_sample(**kwargs):
+        sample_calls.append(kwargs["session_id"])
+        if kwargs["session_id"] == "stale-gateway-session":
+            raise HTTPException(status_code=404, detail="Unknown request_id for stale upstream session")
+        return SampledSequence(tokens=[7, 8], logprobs=None, stop_reason="eos")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tok)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample)
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/completions",
+        json={"model": "Qwen/Qwen3-235B-A22B-Instruct-2507", "prompt": "hi", "max_tokens": 4},
+        headers={"x-user-id": "alice"},
+    )
+
+    assert resp.status_code == 200
+    assert ensure_calls == [
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    ]
+    assert sample_calls == ["stale-gateway-session", "fresh-gateway-session"]
+    cached = openai_compat._session_cache[("alice", "Qwen/Qwen3-235B-A22B-Instruct-2507")]
+    assert cached.session_id == "fresh-gateway-session"
 
 
 def test_session_creation_http_exception_returns_oai_error_json(monkeypatch):

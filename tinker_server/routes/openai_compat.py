@@ -174,6 +174,31 @@ async def _get_or_create_cached_session(*, model_path: str, http_request: Reques
         return session_id, base_model
 
 
+def _invalidate_cached_session(*, user_id: str | None, model_path: str) -> None:
+    _session_cache.pop((user_id, model_path), None)
+
+
+def _should_retry_with_fresh_session(exc: Exception) -> bool:
+    if isinstance(exc, RuntimeError):
+        return True
+    if not isinstance(exc, HTTPException):
+        return False
+    if exc.status_code == 404:
+        return True
+    if exc.status_code < 500:
+        return False
+    detail = str(exc.detail).lower()
+    return (
+        "sampling session" in detail
+        or "session " in detail
+        or "request_id" in detail
+        or "no engine found" in detail
+        or "unknown request_id" in detail
+        or "retrieve_future" in detail
+        or "asample" in detail
+    )
+
+
 def _finish_reason(stop_reason: str) -> str:
     if stop_reason in ("stop", "eos"):
         return "stop"
@@ -581,7 +606,6 @@ async def completions(request: OAICompletionRequest, http_request: Request):
         if request.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported")
         user_id = _get_user_id(http_request)
-        cache_key = (user_id, request.model)
         sequence = None
         for attempt in range(2):
             sampling_session_id, base_model = await _get_or_create_cached_session(
@@ -603,8 +627,10 @@ async def completions(request: OAICompletionRequest, http_request: Request):
                     user_id=user_id,
                 )
                 break
-            except RuntimeError:
-                _session_cache.pop(cache_key, None)
+            except Exception as exc:
+                if not _should_retry_with_fresh_session(exc):
+                    raise
+                _invalidate_cached_session(user_id=user_id, model_path=request.model)
                 if attempt == 1:
                     raise
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
@@ -638,7 +664,6 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
         if request.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported")
         user_id = _get_user_id(http_request)
-        cache_key = (user_id, request.model)
         for prompt_attempt in range(2):
             force_tool_prompt = prompt_attempt == 1
             sequence = None
@@ -672,8 +697,10 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                         user_id=user_id,
                     )
                     break
-                except RuntimeError:
-                    _session_cache.pop(cache_key, None)
+                except Exception as exc:
+                    if not _should_retry_with_fresh_session(exc):
+                        raise
+                    _invalidate_cached_session(user_id=user_id, model_path=request.model)
                     if attempt == 1:
                         raise
 
