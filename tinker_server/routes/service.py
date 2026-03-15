@@ -364,16 +364,13 @@ async def _create_sampling_session_impl(
 
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
-    adapter_path: str | None = None
-
-    # Determine base_model from request or infer from model_path
-    base_model = request.base_model
-    if not base_model and request.model_path:
-        # Try to infer base_model from adapter_config.json
-        adapter_path = _resolve_model_path(
-            request.model_path, user_id=user_id, http_request=http_request
-        )
-        base_model = _infer_base_model_from_adapter(adapter_path)
+    # Determine base_model from request or infer from model_path.
+    base_model, adapter_path = _resolve_base_model_for_sampling_request(
+        base_model=request.base_model,
+        model_path=request.model_path,
+        user_id=user_id,
+        http_request=http_request,
+    )
 
     if not base_model:
         raise HTTPException(
@@ -577,6 +574,8 @@ async def ensure_sampling_session(
     parent_session_id: str | None = None,
 ) -> tuple[str, str]:
     """Ensure a sampling session exists for an OpenAI-compatible request."""
+    from ..gateway import remote_sampling_session
+
     request_kwargs: dict[str, str] = {
         "session_id": parent_session_id or str(uuid.uuid4()),
     }
@@ -584,18 +583,15 @@ async def ensure_sampling_session(
         request_kwargs["model_path"] = model_path
     else:
         request_kwargs["base_model"] = model_path
+
     sampling_request = CreateSamplingSessionRequest(**request_kwargs)
     response = await create_sampling_session(sampling_request, http_request)
     sampling_session_id = response.sampling_session_id
     base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
-
-    from ..gateway import remote_sampling_session
-
-    if remote_sampling_session(sampling_session_id) is not None:
-        raise HTTPException(
-            status_code=501,
-            detail="This model is routed via gateway. OAI-compatible API does not support gateway models in MVP.",
-        )
+    if base_model is None:
+        remote = remote_sampling_session(sampling_session_id)
+        if remote is not None:
+            _, base_model = remote
 
     if not base_model:
         raise HTTPException(
@@ -762,6 +758,25 @@ def _resolve_model_path(
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
+
+
+def _resolve_base_model_for_sampling_request(
+    *,
+    base_model: str | None,
+    model_path: str | None,
+    user_id: str | None,
+    http_request: Request,
+) -> tuple[str | None, str | None]:
+    """Return the effective base_model and resolved adapter path for a sampling request."""
+    adapter_path: str | None = None
+    if not base_model and model_path:
+        adapter_path = _resolve_model_path(
+            model_path,
+            user_id=user_id,
+            http_request=http_request,
+        )
+        base_model = _infer_base_model_from_adapter(adapter_path)
+    return base_model, adapter_path
 
 
 def _infer_base_model_from_adapter(adapter_path: str) -> str | None:

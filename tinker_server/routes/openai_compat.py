@@ -7,8 +7,6 @@ import json
 import logging
 import os
 import re
-import sys
-import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -63,11 +61,6 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 # Secondary: ```json {...} ``` / ```json [...] ``` code blocks for tool payloads.
 # Handles models whose native chat templates emit JSON code blocks instead of <tool_call> XML.
 _CODE_BLOCK_TOOL_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
-# Serialises the sys.modules["torch"] = None window so concurrent tokenizer
-# loads in different OS threads cannot corrupt each other's _prev_torch state.
-_torch_block_lock = threading.Lock()
-
-
 def _get_user_id(request: Request) -> str | None:
     user_data = getattr(request.state, "user_data", None)
     if user_data:
@@ -88,14 +81,10 @@ def _error_response(*, message: str, status_code: int, error_type: str = "invali
     )
 
 
-def _list_supported_models_safe() -> list[str]:
-    try:
-        from ..backend.model_registry import list_supported_models
+def _list_supported_models() -> list[str]:
+    from ..backend.model_registry import list_supported_models
 
-        return list_supported_models()
-    except Exception:
-        logger.exception("list_supported_models() failed; returning empty model list")
-        return []
+    return list_supported_models()
 
 
 def _oai_model_payload(model_id: str, *, created: int) -> dict[str, Any]:
@@ -108,30 +97,14 @@ def _oai_model_payload(model_id: str, *, created: int) -> dict[str, Any]:
 
 
 def _load_tokenizer_cpu(base_model: str):
-    """Load tokenizer without importing torch.
+    """Load tokenizer on the API host.
 
-    The API server runs on CPU and must not load GPU/NVSHMEM libraries.
-    transformers supports tokenizer-only mode when torch is unavailable,
-    which is all we need here (encode + apply_chat_template).
-
-    sys.modules["torch"] = None is process-global state, so we hold
-    _torch_block_lock for the entire operation to prevent concurrent calls
-    from seeing each other's poisoned entry and corrupting _prev_torch.
+    This uses transformers' normal optional-backend detection instead of
+    mutating ``sys.modules["torch"]`` process-wide.
     """
-    _sentinel = object()
-    with _torch_block_lock:
-        _prev_torch = sys.modules.get("torch", _sentinel)
-        # Block torch import so transformers falls back to tokenizer-only mode.
-        sys.modules["torch"] = None  # type: ignore[assignment]
-        try:
-            from transformers import AutoTokenizer
+    from transformers import AutoTokenizer
 
-            return AutoTokenizer.from_pretrained(base_model, local_files_only=True)
-        finally:
-            if _prev_torch is _sentinel:
-                sys.modules.pop("torch", None)
-            else:
-                sys.modules["torch"] = _prev_torch
+    return AutoTokenizer.from_pretrained(base_model, local_files_only=True)
 
 
 async def _get_tokenizer(base_model: str):
@@ -570,23 +543,34 @@ async def list_models():
     """Return supported models in OpenAI /v1/models format.
 
     Reads from MINT_SUPPORTED_MODELS (or the built-in default list).
-    Falls back to an empty list if the registry is unavailable.
     """
-    models = _list_supported_models_safe()
-    now = int(time.time())
-    return {
-        "object": "list",
-        "data": [_oai_model_payload(m, created=now) for m in models],
-    }
+    try:
+        models = _list_supported_models()
+        now = int(time.time())
+        return {
+            "object": "list",
+            "data": [_oai_model_payload(m, created=now) for m in models],
+        }
+    except HTTPException as exc:
+        return _error_response(message=str(exc.detail), status_code=exc.status_code)
+    except Exception as exc:
+        logger.exception("list_supported_models() failed for /models")
+        return _error_response(message=f"{type(exc).__name__}: {exc}", status_code=500)
 
 
 @router.get("/models/{model_id:path}")
 async def retrieve_model(model_id: str):
     """Return a single supported model in OpenAI /v1/models/{id} format."""
-    models = _list_supported_models_safe()
-    if model_id not in models:
-        raise HTTPException(status_code=404, detail="Model not found")
-    return _oai_model_payload(model_id, created=int(time.time()))
+    try:
+        models = _list_supported_models()
+        if model_id not in models:
+            raise HTTPException(status_code=404, detail="Model not found")
+        return _oai_model_payload(model_id, created=int(time.time()))
+    except HTTPException as exc:
+        return _error_response(message=str(exc.detail), status_code=exc.status_code)
+    except Exception as exc:
+        logger.exception("list_supported_models() failed for /models/%s", model_id)
+        return _error_response(message=f"{type(exc).__name__}: {exc}", status_code=500)
 
 
 @router.post("/completions", response_model=OAICompletionResponse)

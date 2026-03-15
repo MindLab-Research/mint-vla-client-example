@@ -10,6 +10,8 @@ from openai import AsyncOpenAI
 
 from tinker_server.models.types import SampledSequence
 from tinker_server.routes import openai_compat
+from tinker_server.routes import sampling as sampling_route
+from tinker_server.routes import service as service_route
 
 
 class _DummyTokenizer:
@@ -105,6 +107,97 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
     assert seen["sample_kwargs"]["max_tokens"] == 50
     assert seen["sample_kwargs"]["temperature"] == 0.2
     assert seen["sample_kwargs"]["top_p"] == 0.9
+
+
+def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    seen: dict[str, object] = {"polls": 0}
+
+    async def _fake_create_sampling_session(request, _http_request):
+        seen["base_model"] = request.base_model
+        return service_route.CreateSamplingSessionResponse(sampling_session_id="remote-sample-235b")
+
+    async def _fake_get_tokenizer(base_model: str):
+        seen["tokenizer_base_model"] = base_model
+        return tokenizer
+
+    async def _fake_forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s):
+        seen.setdefault("forward_calls", []).append(
+            {
+                "alias": upstream.alias,
+                "method": method,
+                "path": path,
+                "json_body": json_body,
+                "timeout_s": timeout_s,
+            }
+        )
+        if path == "/api/v1/asample":
+            return httpx.Response(200, json={"request_id": "upstream-rid-1"})
+        if path == "/api/v1/retrieve_future":
+            polls = int(seen["polls"])
+            seen["polls"] = polls + 1
+            if polls == 0:
+                return httpx.Response(408, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "type": "sample",
+                    "sequences": [
+                        {
+                            "tokens": [31, 32],
+                            "logprobs": None,
+                            "routed_experts": None,
+                            "stop_reason": "eos",
+                        }
+                    ],
+                    "prompt_logprobs": None,
+                    "topk_prompt_logprobs": None,
+                },
+            )
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", service_route.ensure_sampling_session)
+    monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
+    monkeypatch.setattr(service_route, "session_manager", None)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
+    monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
+    monkeypatch.setattr(sampling_route, "session_manager", None)
+
+    import tinker_server.gateway as gw
+
+    monkeypatch.setattr(
+        gw,
+        "remote_sampling_session",
+        lambda _sid: ("mint-prod-aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507"),
+    )
+    monkeypatch.setattr(
+        gw,
+        "upstream_for_alias",
+        lambda alias: type("Upstream", (), {"alias": alias})(),
+    )
+    monkeypatch.setattr(gw, "forward_json", _fake_forward_json)
+
+    client = TestClient(_build_app())
+    response = client.post(
+        "/oai/api/v1/completions",
+        json={
+            "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "prompt": "Say hi",
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    assert body["choices"][0]["text"] == "31|32"
+    assert seen["base_model"] == "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    assert seen["tokenizer_base_model"] == "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    assert seen["forward_calls"][0]["path"] == "/api/v1/asample"
+    assert seen["forward_calls"][0]["json_body"]["sampling_session_id"] == "remote-sample-235b"
+    assert seen["forward_calls"][1]["path"] == "/api/v1/retrieve_future"
+    assert seen["polls"] == 2
 
 
 def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
@@ -1264,6 +1357,39 @@ def test_retrieve_model_returns_oai_format(monkeypatch):
     assert body["object"] == "model"
     assert isinstance(body["created"], int)
     assert body["owned_by"] == "mint"
+
+
+def test_retrieve_model_not_found_returns_oai_error_json(monkeypatch):
+    monkeypatch.setattr(
+        "tinker_server.backend.model_registry.list_supported_models",
+        lambda: ["Qwen/Qwen3-4B-Instruct-2507"],
+        raising=False,
+    )
+    client = TestClient(_build_app())
+    resp = client.get("/oai/api/v1/models/Qwen/Qwen3-235B-A22B-Instruct-2507")
+    assert resp.status_code == 404
+    body = resp.json()
+    assert "detail" not in body
+    assert body["error"]["message"] == "Model not found"
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_list_models_registry_error_returns_oai_error_json(monkeypatch):
+    def _boom():
+        raise ValueError("bad config")
+
+    monkeypatch.setattr(
+        "tinker_server.backend.model_registry.list_supported_models",
+        _boom,
+        raising=False,
+    )
+    client = TestClient(_build_app())
+    resp = client.get("/oai/api/v1/models")
+    assert resp.status_code == 500
+    body = resp.json()
+    assert "detail" not in body
+    assert body["error"]["message"] == "ValueError: bad config"
+    assert body["error"]["type"] == "invalid_request_error"
 
 
 # ---------------------------------------------------------------------------
