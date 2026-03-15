@@ -508,6 +508,9 @@ class CheckpointInfo(BaseModel):
     size_bytes: int | None = None
     public: bool = False
     expires_at: datetime | None = None
+    storage_tier: str | None = None
+    mirror_status: str | None = None
+    mirror_error: str | None = None
 
 
 class CheckpointsListResponse(BaseModel):

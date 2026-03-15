@@ -661,7 +661,12 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
-    from .checkpoints import get_checkpoint_reap_interval_s, reap_runtime_checkpoints
+    from .checkpoints import (
+        get_checkpoint_mirror_poll_s,
+        get_checkpoint_reap_interval_s,
+        process_pending_checkpoint_mirrors,
+        reap_runtime_checkpoints,
+    )
 
     future_store.ensure_ready()
 
@@ -1053,6 +1058,22 @@ async def lifespan(app: FastAPI):
 
     checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
 
+    async def _checkpoint_mirror_loop() -> None:
+        while True:
+            try:
+                mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
+                if mirrored["mirrored"] or mirrored["failed"]:
+                    logger.info(
+                        "checkpoint mirror processed mirrored=%s failed=%s",
+                        len(mirrored["mirrored"]),
+                        len(mirrored["failed"]),
+                    )
+            except Exception:
+                logger.exception("checkpoint mirror loop failed")
+            await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+
+    checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
+
     # ==========================================================================
     # Persistent actors: pre-create and protect at startup
     # ==========================================================================
@@ -1065,7 +1086,13 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     future_reaper_task.cancel()
     checkpoint_reaper_task.cancel()
-    await asyncio.gather(future_reaper_task, checkpoint_reaper_task, return_exceptions=True)
+    checkpoint_mirror_task.cancel()
+    await asyncio.gather(
+        future_reaper_task,
+        checkpoint_reaper_task,
+        checkpoint_mirror_task,
+        return_exceptions=True,
+    )
     await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 
