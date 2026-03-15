@@ -433,7 +433,7 @@ class OAICompletionRequest(BaseModel):
 
     model: str
     prompt: str
-    max_tokens: int = 16
+    max_tokens: int = 512
     temperature: float = 1.0
     top_p: float = 1.0
     stop: str | list[str] | None = None
@@ -447,6 +447,7 @@ class OAIFunctionDefinition(BaseModel):
     name: str
     description: str | None = None
     parameters: dict[str, Any] | None = None
+    strict: bool | None = None
 
 
 class OAIToolDefinition(BaseModel):
@@ -495,6 +496,10 @@ class OAIMessage(BaseModel):
         if self.role == "assistant":
             if self.content is None and not self.tool_calls:
                 raise ValueError("assistant messages require content or tool_calls")
+            if self.tool_calls:
+                missing_ids = [i for i, tc in enumerate(self.tool_calls) if tc.id is None]
+                if missing_ids:
+                    raise ValueError(f"tool_calls[{missing_ids[0]}].id is required")
             return self
 
         if self.tool_calls is not None:
@@ -566,6 +571,7 @@ class OAICompletionChoice(BaseModel):
     text: str
     index: int
     finish_reason: Literal["stop", "length"]
+    logprobs: None = None
 
 
 class OAIChatMessageResponse(BaseModel):
@@ -578,6 +584,7 @@ class OAIChatCompletionChoice(BaseModel):
     index: int
     message: OAIChatMessageResponse
     finish_reason: Literal["stop", "length", "tool_calls"]
+    logprobs: None = None
 
 
 class OAICompletionResponse(BaseModel):

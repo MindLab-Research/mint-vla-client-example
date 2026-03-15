@@ -50,7 +50,8 @@ def _build_app() -> FastAPI:
 
 
 def _reset_openai_compat_state(monkeypatch):
-    monkeypatch.setattr(openai_compat, "_session_cache", {})
+    from collections import OrderedDict
+    monkeypatch.setattr(openai_compat, "_session_cache", OrderedDict())
     monkeypatch.setattr(openai_compat, "_tokenizer_cache", {})
 
 
@@ -842,3 +843,477 @@ def test_prompt_as_list_is_rejected_with_422(monkeypatch):
         json={"model": "tinker://x/sampler_weights/1", "prompt": ["a", "b"]},
     )
     assert resp.status_code == 422
+
+
+
+# ---------------------------------------------------------------------------
+# New tests for bug fixes
+# ---------------------------------------------------------------------------
+
+
+def _tool_monkeypatch(monkeypatch, *, decode_texts: list[str]):
+    """Wire up fake session/tokenizer/sampler returning decode_texts in order."""
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    call_count = {"n": 0}
+
+    async def _fake_ensure(*, model_path, http_request, parent_session_id=None):
+        return "sess-x", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_tok(_bm):
+        return tokenizer
+
+    async def _fake_sample(**_kw):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        tokenizer.decode_text = decode_texts[idx % len(decode_texts)]
+        return SampledSequence(tokens=[idx], logprobs=None, stop_reason="stop")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_tok)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample)
+    return tokenizer, call_count
+
+
+def test_extract_tool_calls_skips_bad_json_keeps_valid(monkeypatch):
+    """A malformed JSON block is skipped; valid blocks in the same output are returned."""
+    tokenizer, _ = _tool_monkeypatch(
+        monkeypatch,
+        decode_texts=[
+            '<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>\n'
+            '<tool_call>NOT VALID JSON</tool_call>\n'
+            '<tool_call>{"name":"search","arguments":{"query":"test"}}</tool_call>',
+        ],
+    )
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "tinker://x/sampler_weights/1",
+            "messages": [{"role": "user", "content": "test"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+            ],
+            "max_tokens": 32,
+        },
+    )
+
+    assert resp.status_code == 200
+    tool_calls = resp.json()["choices"][0]["message"]["tool_calls"]
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert tool_calls[1]["function"]["name"] == "search"
+
+
+def test_system_message_merged_not_duplicated_native_path(monkeypatch):
+    """When user supplies a system message and tools are present (native path),
+    only one system message is sent to apply_chat_template."""
+    tokenizer, _ = _tool_monkeypatch(
+        monkeypatch,
+        decode_texts=['<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>'],
+    )
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "北京天气如何"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+            ],
+            "max_tokens": 32,
+        },
+    )
+
+    assert resp.status_code == 200
+    sent_msgs = tokenizer.chat_calls[0]
+    system_msgs = [m for m in sent_msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    assert system_msgs[0]["content"] == "You are a helpful assistant."
+
+
+def test_system_message_merged_in_fallback_path(monkeypatch):
+    """In the fallback path the tool prompt is merged into the existing system message."""
+    _reset_openai_compat_state(monkeypatch)
+
+    class _RaisingTokenizer(_DummyTokenizer):
+        def apply_chat_template(self, messages, tools=None, **kw):
+            if tools is not None:
+                raise TypeError("tools not supported")
+            self.chat_calls.append(list(messages))
+            self.chat_tools.append(tools)
+            return [900, 901]
+
+    tokenizer = _RaisingTokenizer()
+    tokenizer.decode_text = '<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>'
+
+    async def _fake_ensure(*, model_path, http_request, parent_session_id=None):
+        return "sess-y", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_tok(_bm):
+        return tokenizer
+
+    async def _fake_sample(**_kw):
+        return SampledSequence(tokens=[1], logprobs=None, stop_reason="stop")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_tok)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample)
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "北京天气如何"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+            ],
+            "max_tokens": 32,
+        },
+    )
+
+    assert resp.status_code == 200
+    sent_msgs = tokenizer.chat_calls[0]
+    system_msgs = [m for m in sent_msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    assert "You are a helpful assistant." in system_msgs[0]["content"]
+    assert "get_weather" in system_msgs[0]["content"]
+
+
+def test_multi_turn_tool_history_serialised_in_fallback(monkeypatch):
+    """In fallback mode, assistant tool_calls are folded into <tool_call> XML in content
+    and tool-role messages are converted to user messages with <tool_result>."""
+    _reset_openai_compat_state(monkeypatch)
+
+    class _RaisingTokenizer(_DummyTokenizer):
+        def apply_chat_template(self, messages, tools=None, **kw):
+            if tools is not None:
+                raise TypeError("tools not supported")
+            self.chat_calls.append(list(messages))
+            self.chat_tools.append(tools)
+            return [900, 901]
+
+    tokenizer = _RaisingTokenizer()
+    tokenizer.decode_text = "北京今天晴，10度。"
+
+    async def _fake_ensure(*, model_path, http_request, parent_session_id=None):
+        return "sess-z", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_tok(_bm):
+        return tokenizer
+
+    async def _fake_sample(**_kw):
+        return SampledSequence(tokens=[1], logprobs=None, stop_reason="stop")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_tok)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample)
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "messages": [
+                {"role": "user", "content": "北京天气如何"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"location":"北京"}'},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_abc", "content": '{"temp":10}'},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+            ],
+            "max_tokens": 32,
+        },
+    )
+
+    assert resp.status_code == 200
+    sent_msgs = tokenizer.chat_calls[0]
+    asst_msg = next(m for m in sent_msgs if m["role"] == "assistant")
+    assert "tool_calls" not in asst_msg
+    assert "<tool_call>" in asst_msg["content"]
+    tool_result_msgs = [
+        m for m in sent_msgs
+        if m.get("role") == "user" and "<tool_result>" in (m.get("content") or "")
+    ]
+    assert len(tool_result_msgs) == 1
+
+
+def test_required_tool_choice_retries_before_rejecting(monkeypatch):
+    """With tool_choice='required', plain-text response triggers retry; 400 only after both fail."""
+    tokenizer, call_count = _tool_monkeypatch(
+        monkeypatch,
+        decode_texts=["plain text, no tool call"],
+    )
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "tinker://x/1",
+            "messages": [{"role": "user", "content": "call a tool"}],
+            "tools": [{"type": "function", "function": {"name": "fn", "parameters": {"type": "object"}}}],
+            "tool_choice": "required",
+            "max_tokens": 16,
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "required tool call" in resp.json()["error"]["message"]
+    assert call_count["n"] == 2  # first attempt + retry
+
+
+def test_function_choice_wrong_tool_retries_then_rejects(monkeypatch):
+    """tool_choice={function:X} returning wrong tool triggers retry; 400 after both fail."""
+    tokenizer, call_count = _tool_monkeypatch(
+        monkeypatch,
+        decode_texts=['<tool_call>{"name":"search","arguments":{}}</tool_call>'],
+    )
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "tinker://x/1",
+            "messages": [{"role": "user", "content": "use get_weather"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            "max_tokens": 16,
+        },
+    )
+
+    assert resp.status_code == 400
+    assert call_count["n"] == 2
+
+
+def test_function_definition_accepts_strict_field(monkeypatch):
+    """OAIFunctionDefinition accepts strict=true without 422."""
+    tokenizer, _ = _tool_monkeypatch(
+        monkeypatch,
+        decode_texts=['<tool_call>{"name":"fn","arguments":{}}</tool_call>'],
+    )
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "tinker://x/1",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "fn",
+                    "parameters": {"type": "object"},
+                    "strict": True,
+                },
+            }],
+            "max_tokens": 16,
+        },
+    )
+
+    assert resp.status_code == 200
+
+
+def test_response_choice_has_logprobs_field(monkeypatch):
+    """OAIChatCompletionChoice and OAICompletionChoice always include logprobs=null."""
+    tokenizer, _ = _tool_monkeypatch(monkeypatch, decode_texts=["hello"])
+
+    client = TestClient(_build_app())
+    chat_resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "tinker://x/1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+        },
+    )
+    assert chat_resp.status_code == 200
+    assert "logprobs" in chat_resp.json()["choices"][0]
+    assert chat_resp.json()["choices"][0]["logprobs"] is None
+
+    compl_resp = client.post(
+        "/oai/api/v1/completions",
+        json={"model": "tinker://x/1", "prompt": "hi", "max_tokens": 4},
+    )
+    assert compl_resp.status_code == 200
+    assert "logprobs" in compl_resp.json()["choices"][0]
+    assert compl_resp.json()["choices"][0]["logprobs"] is None
+
+
+def test_assistant_tool_call_without_id_is_rejected(monkeypatch):
+    """assistant message with tool_calls missing id must be rejected with 422."""
+    _reset_openai_compat_state(monkeypatch)
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "tinker://x/1",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    # id intentionally omitted → should be rejected
+                    "tool_calls": [{"type": "function", "function": {"name": "fn", "arguments": "{}"}}],
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "fn", "parameters": {"type": "object"}}}],
+            "max_tokens": 8,
+        },
+    )
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Session cache is bounded (eviction on overflow)
+# ---------------------------------------------------------------------------
+
+
+def test_session_cache_evicts_oldest_when_full(monkeypatch):
+    """超过 _MAX_SESSION_CACHE_SIZE 时，最早插入的 entry 被驱逐。"""
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    ensure_calls: list[str] = []
+
+    async def _fake_ensure(*, model_path, http_request, **_kw):
+        ensure_calls.append(model_path)
+        return f"sess-{len(ensure_calls)}", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_tok(_bm):
+        return tokenizer
+
+    async def _fake_sample(**_kw):
+        return SampledSequence(tokens=[1], logprobs=None, stop_reason="stop")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_tok)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample)
+    monkeypatch.setattr(openai_compat, "_MAX_SESSION_CACHE_SIZE", 2)
+
+    client = TestClient(_build_app())
+    for i in range(3):
+        client.post(
+            "/oai/api/v1/completions",
+            json={"model": f"tinker://m{i}/sampler_weights/1", "prompt": "hi", "max_tokens": 1},
+            headers={"x-user-id": "alice"},
+        )
+
+    assert len(ensure_calls) == 3
+    assert len(openai_compat._session_cache) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: /v1/models endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_list_models_returns_oai_format(monkeypatch):
+    """/models 端点返回 OpenAI 格式的 model 列表。"""
+    monkeypatch.setattr(
+        "tinker_server.backend.model_registry.list_supported_models",
+        lambda: ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-30B-A3B-Instruct-2507"],
+        raising=False,
+    )
+    client = TestClient(_build_app())
+    resp = client.get("/oai/api/v1/models")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    ids = [m["id"] for m in body["data"]]
+    assert "Qwen/Qwen3-4B-Instruct-2507" in ids
+    assert "Qwen/Qwen3-30B-A3B-Instruct-2507" in ids
+    for m in body["data"]:
+        assert m["object"] == "model"
+        assert isinstance(m["created"], int)
+        assert m["owned_by"] == "mint"
+
+
+def test_retrieve_model_returns_oai_format(monkeypatch):
+    """/models/{id} 端点返回单个 OpenAI model 对象。"""
+    monkeypatch.setattr(
+        "tinker_server.backend.model_registry.list_supported_models",
+        lambda: ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-30B-A3B-Instruct-2507"],
+        raising=False,
+    )
+    client = TestClient(_build_app())
+    resp = client.get("/oai/api/v1/models/Qwen/Qwen3-30B-A3B-Instruct-2507")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert body["object"] == "model"
+    assert isinstance(body["created"], int)
+    assert body["owned_by"] == "mint"
+
+
+# ---------------------------------------------------------------------------
+# Fix 11: JSON code-block tool call extraction (secondary parser)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_tool_calls_parses_json_code_block(monkeypatch):
+    """当模型以 ```json {...} ``` 格式输出 tool call 时也能正确解析。"""
+    _reset_openai_compat_state(monkeypatch)
+    tokenizer = _DummyTokenizer()
+    tokenizer.decode_text = '```json\n{"name": "get_weather", "arguments": {"location": "Shanghai"}}\n```'
+
+    async def _fake_ensure(*, model_path, http_request, **_kw):
+        return "sess-cb", "Qwen/Qwen3-4B-Instruct-2507"
+
+    async def _fake_tok(_bm):
+        return tokenizer
+
+    async def _fake_sample(**_kw):
+        return SampledSequence(tokens=[99], logprobs=None, stop_reason="stop")
+
+    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
+    monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_tok)
+    monkeypatch.setattr(openai_compat, "sample_once", _fake_sample)
+
+    client = TestClient(_build_app())
+    resp = client.post(
+        "/oai/api/v1/chat/completions",
+        json={
+            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "messages": [{"role": "user", "content": "上海天气如何？"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {"location": {"type": "string"}}},
+                    },
+                }
+            ],
+            "max_tokens": 64,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    tc = body["choices"][0]["message"]["tool_calls"][0]
+    assert tc["function"]["name"] == "get_weather"
+    import json as _json
+    assert _json.loads(tc["function"]["arguments"]) == {"location": "Shanghai"}

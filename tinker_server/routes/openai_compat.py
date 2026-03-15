@@ -5,9 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import sys
+import threading
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -31,11 +36,36 @@ from .service import ensure_sampling_session
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-_session_cache: dict[tuple[str | None, str], tuple[str, str]] = {}
+
+@dataclass
+class _SessionCacheEntry:
+    session_id: str
+    base_model: str
+    created_at: float
+    last_used: float
+
+
+_MAX_SESSION_CACHE_SIZE = int(
+    os.environ.get("TINKER_OAI_SESSION_CACHE_MAX_SIZE")
+    or os.environ.get("MINT_OAI_SESSION_CACHE_MAX_SIZE")
+    or 1024
+)
+_SESSION_CACHE_TTL_S = int(
+    os.environ.get("TINKER_OAI_SESSION_CACHE_TTL_S")
+    or os.environ.get("MINT_OAI_SESSION_CACHE_TTL_S")
+    or 3600
+)
+_session_cache: OrderedDict[tuple[str | None, str], _SessionCacheEntry] = OrderedDict()
 _session_lock = asyncio.Lock()
 _tokenizer_cache: dict[str, Any] = {}
 _tokenizer_lock = asyncio.Lock()
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# Secondary: ```json {...} ``` / ```json [...] ``` code blocks for tool payloads.
+# Handles models whose native chat templates emit JSON code blocks instead of <tool_call> XML.
+_CODE_BLOCK_TOOL_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+# Serialises the sys.modules["torch"] = None window so concurrent tokenizer
+# loads in different OS threads cannot corrupt each other's _prev_torch state.
+_torch_block_lock = threading.Lock()
 
 
 def _get_user_id(request: Request) -> str | None:
@@ -58,28 +88,50 @@ def _error_response(*, message: str, status_code: int, error_type: str = "invali
     )
 
 
+def _list_supported_models_safe() -> list[str]:
+    try:
+        from ..backend.model_registry import list_supported_models
+
+        return list_supported_models()
+    except Exception:
+        logger.exception("list_supported_models() failed; returning empty model list")
+        return []
+
+
+def _oai_model_payload(model_id: str, *, created: int) -> dict[str, Any]:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "mint",
+    }
+
+
 def _load_tokenizer_cpu(base_model: str):
     """Load tokenizer without importing torch.
 
     The API server runs on CPU and must not load GPU/NVSHMEM libraries.
     transformers supports tokenizer-only mode when torch is unavailable,
     which is all we need here (encode + apply_chat_template).
+
+    sys.modules["torch"] = None is process-global state, so we hold
+    _torch_block_lock for the entire operation to prevent concurrent calls
+    from seeing each other's poisoned entry and corrupting _prev_torch.
     """
-    import sys
-
     _sentinel = object()
-    _prev_torch = sys.modules.get("torch", _sentinel)
-    # Block torch import so transformers falls back to tokenizer-only mode.
-    sys.modules["torch"] = None  # type: ignore[assignment]
-    try:
-        from transformers import AutoTokenizer
+    with _torch_block_lock:
+        _prev_torch = sys.modules.get("torch", _sentinel)
+        # Block torch import so transformers falls back to tokenizer-only mode.
+        sys.modules["torch"] = None  # type: ignore[assignment]
+        try:
+            from transformers import AutoTokenizer
 
-        return AutoTokenizer.from_pretrained(base_model, local_files_only=True)
-    finally:
-        if _prev_torch is _sentinel:
-            sys.modules.pop("torch", None)
-        else:
-            sys.modules["torch"] = _prev_torch
+            return AutoTokenizer.from_pretrained(base_model, local_files_only=True)
+        finally:
+            if _prev_torch is _sentinel:
+                sys.modules.pop("torch", None)
+            else:
+                sys.modules["torch"] = _prev_torch
 
 
 async def _get_tokenizer(base_model: str):
@@ -94,20 +146,58 @@ async def _get_tokenizer(base_model: str):
         return tokenizer
 
 
+def _is_session_cache_expired(entry: _SessionCacheEntry, now: float) -> bool:
+    if _SESSION_CACHE_TTL_S <= 0:
+        return False
+    return now - entry.last_used > _SESSION_CACHE_TTL_S
+
+
+def _prune_session_cache(now: float) -> None:
+    if not _session_cache:
+        return
+    if _SESSION_CACHE_TTL_S > 0:
+        expired = [key for key, entry in _session_cache.items() if _is_session_cache_expired(entry, now)]
+        for key in expired:
+            _session_cache.pop(key, None)
+    if _MAX_SESSION_CACHE_SIZE > 0:
+        while len(_session_cache) > _MAX_SESSION_CACHE_SIZE:
+            _session_cache.popitem(last=False)
+
+
 async def _get_or_create_cached_session(*, model_path: str, http_request: Request) -> tuple[str, str]:
     user_id = _get_user_id(http_request)
     cache_key = (user_id, model_path)
+    now = time.time()
 
     cached = _session_cache.get(cache_key)
     if cached is not None:
-        return cached
+        if _is_session_cache_expired(cached, now):
+            _session_cache.pop(cache_key, None)
+        else:
+            cached.last_used = now
+            _session_cache.move_to_end(cache_key)
+            return cached.session_id, cached.base_model
 
     async with _session_lock:
+        _prune_session_cache(now)
         cached = _session_cache.get(cache_key)
         if cached is not None:
-            return cached
+            if _is_session_cache_expired(cached, now):
+                _session_cache.pop(cache_key, None)
+            else:
+                cached.last_used = now
+                _session_cache.move_to_end(cache_key)
+                return cached.session_id, cached.base_model
         session_id, base_model = await ensure_sampling_session(model_path=model_path, http_request=http_request)
-        _session_cache[cache_key] = (session_id, base_model)
+        _session_cache[cache_key] = _SessionCacheEntry(
+            session_id=session_id,
+            base_model=base_model,
+            created_at=now,
+            last_used=now,
+        )
+        _session_cache.move_to_end(cache_key)
+        # Evict the oldest entry when the cache exceeds the size limit.
+        _prune_session_cache(now)
         return session_id, base_model
 
 
@@ -166,9 +256,37 @@ def _tool_prompt_text(request: OAIChatCompletionRequest) -> str:
         lines.append("You must call at least one tool before giving a final answer.")
     elif mode == "function" and function_name is not None:
         lines.append(f"You must call the function `{function_name}` before giving a final answer.")
-    elif mode == "none":
-        lines.append("Do not call any tools.")
     return "\n".join(lines)
+
+
+def _message_to_fallback_dict(message) -> dict[str, Any]:
+    """Serialize a message to a plain-text dict for templates without native tool support.
+
+    - assistant with tool_calls: fold calls into content as <tool_call> XML
+    - tool role: convert to user message with <tool_result> wrapper
+    - everything else: pass through (drop structured tool fields)
+    """
+    if message.role == "assistant" and message.tool_calls:
+        tc_parts = []
+        for tc in message.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, ValueError):
+                args = tc.function.arguments
+            payload = {"name": tc.function.name, "arguments": args}
+            tc_parts.append(f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>")
+        tc_text = "\n".join(tc_parts)
+        prefix = message.content or ""
+        combined = (prefix + "\n" + tc_text).strip() if prefix else tc_text
+        return {"role": "assistant", "content": combined}
+
+    if message.role == "tool":
+        return {"role": "user", "content": f"<tool_result>{message.content}</tool_result>"}
+
+    item: dict[str, Any] = {"role": message.role}
+    if message.content is not None:
+        item["content"] = message.content
+    return item
 
 
 def _build_chat_template_messages(
@@ -177,22 +295,30 @@ def _build_chat_template_messages(
     include_tool_prompt: bool = False,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
-    mode, function_name = _tool_choice_mode(request)
 
+    # Text to inject as (or prepend to) the system message.
+    # Only inject in the fallback (text-prompt) path; native path lets the chat template handle it.
+    extra_system: str | None = None
     if include_tool_prompt and request.tools:
-        messages.append({"role": "system", "content": _tool_prompt_text(request)})
-    elif mode == "required":
-        messages.append({
-            "role": "system",
-            "content": "You must call at least one tool before giving a final answer.",
-        })
-    elif mode == "function" and function_name is not None:
-        messages.append({
-            "role": "system",
-            "content": f"You must call the function `{function_name}` before giving a final answer.",
-        })
+        extra_system = _tool_prompt_text(request)
 
-    for message in request.messages:
+    # If user already has a system message we merge into it to avoid duplicate system blocks.
+    first_is_system = bool(request.messages and request.messages[0].role == "system")
+    if extra_system and not first_is_system:
+        messages.append({"role": "system", "content": extra_system})
+
+    for i, message in enumerate(request.messages):
+        # Merge extra_system prefix into the user-supplied system message.
+        if i == 0 and message.role == "system" and extra_system:
+            merged = extra_system + "\n\n" + (message.content or "")
+            messages.append({"role": "system", "content": merged})
+            continue
+
+        if include_tool_prompt:
+            messages.append(_message_to_fallback_dict(message))
+            continue
+
+        # Native path: pass structured tool data; the chat template handles formatting.
         item: dict[str, Any] = {"role": message.role}
         if message.content is not None:
             item["content"] = message.content
@@ -219,41 +345,109 @@ def _build_chat_template_messages(
     return messages
 
 
-def _extract_tool_calls(text: str) -> tuple[str | None, list[OAIToolCall]]:
-    matches = list(_TOOL_CALL_RE.finditer(text))
-    if not matches:
-        stripped = text.strip()
-        return stripped or None, []
+def _parse_tool_call_payload(payload: str) -> OAIToolCall | None:
+    """Parse a raw JSON string as a tool call. Returns None if invalid or missing required keys."""
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        logger.warning("Skipping malformed tool_call JSON: %r", payload[:200])
+        return None
 
+    name = parsed.get("name")
+    arguments = parsed.get("arguments", {})
+    if not isinstance(name, str) or not name:
+        logger.warning("Skipping tool_call with missing/invalid name: %r", parsed)
+        return None
+
+    arguments_json = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    return OAIToolCall(
+        id=f"call_{uuid.uuid4().hex}",
+        function=OAIFunctionCall(name=name, arguments=arguments_json),
+    )
+
+
+def _coerce_tool_calls(items: list[dict[str, Any]]) -> list[OAIToolCall]:
     tool_calls: list[OAIToolCall] = []
-    for match in matches:
-        payload = match.group(1).strip()
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            stripped = text.strip()
-            return stripped or None, []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") if isinstance(item.get("function"), dict) else None
+        name = None
+        arguments = None
+        if function is not None:
+            name = function.get("name")
+            arguments = function.get("arguments")
+        else:
+            name = item.get("name")
+            arguments = item.get("arguments")
 
-        name = parsed.get("name")
-        arguments = parsed.get("arguments", {})
         if not isinstance(name, str) or not name:
-            stripped = text.strip()
-            return stripped or None, []
+            continue
 
         if isinstance(arguments, str):
             arguments_json = arguments
         else:
-            arguments_json = json.dumps(arguments, ensure_ascii=False)
+            arguments_json = json.dumps(arguments or {}, ensure_ascii=False)
 
         tool_calls.append(
             OAIToolCall(
-                id=f"call_{uuid.uuid4().hex}",
+                id=item.get("id") or f"call_{uuid.uuid4().hex}",
                 function=OAIFunctionCall(name=name, arguments=arguments_json),
             )
         )
+    return tool_calls
 
-    remaining = _TOOL_CALL_RE.sub("", text).strip()
-    return remaining or None, tool_calls
+
+def _tool_calls_from_json_blob(blob: str) -> list[OAIToolCall]:
+    try:
+        parsed = json.loads(blob)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("tool_calls"), list):
+            return _coerce_tool_calls(parsed["tool_calls"])
+        if "name" in parsed:
+            return _coerce_tool_calls([parsed])
+        if isinstance(parsed.get("function_call"), dict):
+            fn = parsed["function_call"]
+            return _coerce_tool_calls(
+                [{"name": fn.get("name"), "arguments": fn.get("arguments")}]
+            )
+    elif isinstance(parsed, list):
+        return _coerce_tool_calls(parsed)
+    return []
+
+
+def _extract_tool_calls(text: str) -> tuple[str | None, list[OAIToolCall]]:
+    # Primary: <tool_call>...</tool_call> XML (Qwen3, DeepSeek, and our fallback prompt path).
+    matches = list(_TOOL_CALL_RE.finditer(text))
+    if matches:
+        tool_calls = [tc for m in matches if (tc := _parse_tool_call_payload(m.group(1).strip())) is not None]
+        if not tool_calls:
+            # All blocks were malformed – treat entire output as plain text.
+            return text.strip() or None, []
+        remaining = _TOOL_CALL_RE.sub("", text).strip()
+        return remaining or None, tool_calls
+
+    # Secondary: ```json {...} ``` or ```json [...] ``` code blocks.
+    # Some model templates emit tool calls as JSON code blocks rather than <tool_call> XML.
+    code_matches = list(_CODE_BLOCK_TOOL_RE.finditer(text))
+    if code_matches:
+        tool_calls: list[OAIToolCall] = []
+        for match in code_matches:
+            tool_calls.extend(_tool_calls_from_json_blob(match.group(1).strip()))
+        if tool_calls:
+            remaining = _CODE_BLOCK_TOOL_RE.sub("", text).strip()
+            return remaining or None, tool_calls
+
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        tool_calls = _tool_calls_from_json_blob(stripped)
+        if tool_calls:
+            return None, tool_calls
+
+    return stripped or None, []
 
 
 def _invalid_tool_call_names(
@@ -269,12 +463,8 @@ def _validate_tool_calls(
     *,
     tool_calls: list[OAIToolCall],
 ) -> None:
+    # tool_choice="none" means extraction is skipped upstream (tool_calls is always []) so no check needed.
     mode, function_name = _tool_choice_mode(request)
-    if mode == "none":
-        if tool_calls:
-            raise HTTPException(status_code=400, detail="tool_choice='none' forbids tool calls")
-        return
-
     if not request.tools:
         return
 
@@ -311,6 +501,15 @@ def _validate_tool_calls(
             )
 
 
+def _is_template_tools_error(exc: BaseException) -> bool:
+    """Return True if exc is a known error from apply_chat_template rejecting the tools= kwarg."""
+    if isinstance(exc, (TypeError, ValueError)):
+        return True
+    # jinja2.TemplateError — check by module to avoid a hard import dependency.
+    tp = type(exc)
+    return tp.__module__ is not None and tp.__module__.startswith("jinja2")
+
+
 def _render_chat_prompt_token_ids(
     *,
     tokenizer,
@@ -338,9 +537,17 @@ def _render_chat_prompt_token_ids(
             tokenize=True,
             add_generation_prompt=True,
         )
-    except TypeError as exc:
-        if effective_tools is None:
+    except Exception as exc:
+        if effective_tools is None or not _is_template_tools_error(exc):
             raise
+        # Template doesn't support tools= (TypeError, ValueError, jinja2 TemplateError, …).
+        # Fall back to injecting tool descriptions as a system message in plain text.
+        logger.warning(
+            "apply_chat_template with tools= failed for %s (%s: %s); falling back to text prompt injection",
+            base_model,
+            type(exc).__name__,
+            exc,
+        )
         try:
             fallback_messages = _build_chat_template_messages(request, include_tool_prompt=True)
             return tokenizer.apply_chat_template(
@@ -356,16 +563,30 @@ def _render_chat_prompt_token_ids(
                     f"{base_model}: {type(fallback_exc).__name__}: {fallback_exc}"
                 ),
             ) from fallback_exc
-    except Exception as exc:
-        if effective_tools is not None:
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    f"Tool calling is not supported by tokenizer chat template for base_model "
-                    f"{base_model}: {type(exc).__name__}: {exc}"
-                ),
-            ) from exc
-        raise
+
+
+@router.get("/models")
+async def list_models():
+    """Return supported models in OpenAI /v1/models format.
+
+    Reads from MINT_SUPPORTED_MODELS (or the built-in default list).
+    Falls back to an empty list if the registry is unavailable.
+    """
+    models = _list_supported_models_safe()
+    now = int(time.time())
+    return {
+        "object": "list",
+        "data": [_oai_model_payload(m, created=now) for m in models],
+    }
+
+
+@router.get("/models/{model_id:path}")
+async def retrieve_model(model_id: str):
+    """Return a single supported model in OpenAI /v1/models/{id} format."""
+    models = _list_supported_models_safe()
+    if model_id not in models:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return _oai_model_payload(model_id, created=int(time.time()))
 
 
 @router.post("/completions", response_model=OAICompletionResponse)
@@ -475,15 +696,43 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
             text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
             if request.tools and request.tool_choice != "none":
                 content, tool_calls = _extract_tool_calls(text)
+                if not tool_calls and not force_tool_prompt and text.strip():
+                    # Native template path: model output was non-empty but contained no
+                    # recognisable tool call blocks. Could mean the model legitimately chose
+                    # not to call any tool (auto mode), or that it uses an unrecognised format.
+                    logger.debug(
+                        "Native template path yielded no tool_calls for %s "
+                        "(tool_choice=%r). Model may use an unrecognised output format. "
+                        "Output[:300]: %r",
+                        request.model, request.tool_choice, text[:300],
+                    )
             else:
                 content, tool_calls = text, []
 
             invalid_names = _invalid_tool_call_names(request, tool_calls)
-            if invalid_names and request.tools and request.tool_choice != "none" and not force_tool_prompt:
+            mode, function_name = _tool_choice_mode(request)
+            wrong_function = (
+                mode == "function"
+                and function_name is not None
+                and tool_calls
+                and any(tc.function.name != function_name for tc in tool_calls)
+            )
+            should_retry = (
+                not force_tool_prompt
+                and request.tools
+                and request.tool_choice != "none"
+                and (
+                    bool(invalid_names)
+                    or (mode == "required" and not tool_calls)
+                    or (mode == "function" and function_name is not None and not tool_calls)
+                    or wrong_function
+                )
+            )
+            if should_retry:
                 logger.warning(
-                    "Model returned undeclared tool calls %s for model %s; retrying with explicit tool prompt",
-                    invalid_names,
-                    request.model,
+                    "Tool constraint not satisfied for model %s (mode=%s, invalid_names=%s, "
+                    "tool_calls=%d, wrong_function=%s); retrying with explicit tool prompt",
+                    request.model, mode, invalid_names, len(tool_calls), wrong_function,
                 )
                 continue
 
@@ -506,7 +755,6 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                 ),
             )
 
-        raise HTTPException(status_code=500, detail="tool calling retry exhausted unexpectedly")
     except HTTPException as exc:
         return _error_response(message=str(exc.detail), status_code=exc.status_code)
     except Exception as exc:
