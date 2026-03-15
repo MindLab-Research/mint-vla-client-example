@@ -132,6 +132,44 @@ def test_issue_317_reaper_keeps_pending_cache(monkeypatch, tmp_path: Path) -> No
     assert cache_dir.exists()
 
 
+def test_issue_317_failed_mirror_status_is_stable(monkeypatch, tmp_path: Path) -> None:
+    from tinker_server import checkpoints
+
+    runtime_root = tmp_path / "runtime"
+    persistent_root = tmp_path / "tos"
+    cache_dir = runtime_root / "persistent_cache" / "owner-a" / "run-317" / "ckpt-a"
+    _touch(cache_dir / "adapter_model.safetensors")
+    _touch(cache_dir / "optimizer.pt")
+    checkpoints.write_checkpoint_metadata(
+        str(cache_dir),
+        {
+            "checkpoint_id": "ckpt-a",
+            "owner_id": "owner-a",
+            "model_id": "run-317",
+            "checkpoint_type": "training",
+            "optimizer_present": True,
+            "storage_tier": "persistent_cache",
+            "mirror_status": checkpoints.MIRROR_STATUS_FAILED,
+            "mirror_error": "RuntimeError: previous failure",
+            "type": "training",
+        },
+    )
+
+    monkeypatch.setattr(checkpoints, "RUNTIME_CHECKPOINTS_DIR", str(runtime_root))
+    monkeypatch.setattr(checkpoints, "PERSISTENT_CHECKPOINTS_DIR", str(persistent_root))
+    monkeypatch.setattr(
+        checkpoints,
+        "_process_pending_checkpoint_mirror",
+        lambda _path: (_ for _ in ()).throw(AssertionError("failed mirrors must stay observable")),
+    )
+
+    result = checkpoints.process_pending_checkpoint_mirrors()
+    assert result == {"mirrored": [], "failed": []}
+    meta = checkpoints.read_checkpoint_metadata(str(cache_dir))
+    assert meta["mirror_status"] == checkpoints.MIRROR_STATUS_FAILED
+    assert meta["mirror_error"] == "RuntimeError: previous failure"
+
+
 def test_issue_317_list_checkpoints_includes_pending_cache_status(monkeypatch, tmp_path: Path) -> None:
     from tinker_server import checkpoints
     from tinker_server.routes import weights as wt

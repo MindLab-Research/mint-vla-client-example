@@ -724,7 +724,7 @@ def process_pending_checkpoint_mirrors(*, max_items: int | None = None) -> dict[
             if metadata.get("storage_tier") != "persistent_cache":
                 continue
             status = metadata.get("mirror_status")
-            if status == MIRROR_STATUS_COMPLETE:
+            if status in (MIRROR_STATUS_COMPLETE, MIRROR_STATUS_FAILED):
                 continue
             try:
                 _, mirrored_path = _process_pending_checkpoint_mirror(checkpoint_path)
