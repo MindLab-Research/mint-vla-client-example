@@ -34,7 +34,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import futures, internal, sampling, service, training, weights
+from .routes import futures, internal, openai_compat, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -1447,6 +1447,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
 @app.get("/")

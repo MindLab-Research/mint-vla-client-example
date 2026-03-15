@@ -26,8 +26,11 @@ from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
+    ModelInput,
     SampleRequest,
+    SampledSequence,
     SampleResponse,
+    SamplingParams,
     UntypedAPIFuture,
 )
 from ..sampling_utils import normalize_prompt_logprobs_for_tinker, sampled_sequence_from_result
@@ -663,6 +666,245 @@ async def asample(
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
+
+
+async def sample_once(
+    *,
+    session_id: str,
+    token_ids: list[int],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: str | list[str] | list[int] | None,
+    request_id: str,
+    http_request: Request,
+    user_id: str | None,
+) -> SampledSequence:
+    """Synchronously execute one sampling request using the multi-LoRA path."""
+    from ..gateway import forward_json, remote_sampling_session, upstream_for_alias
+
+    if _should_backpressure(http_request):
+        raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
+
+    is_local = False
+    if session_manager is not None:
+        is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
+    remote = None if is_local else remote_sampling_session(session_id)
+    if remote is not None:
+        upstream_alias, base_model = remote
+        upstream = upstream_for_alias(upstream_alias)
+        if upstream is None:
+            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+        user_data = getattr(http_request.state, "user_data", None)
+        if not can_access_model(base_model, user_data):
+            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+
+        sample_request = SampleRequest(
+            sampling_session_id=session_id,
+            num_samples=1,
+            prompt=ModelInput.from_ints(token_ids),
+            sampling_params=SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+            ),
+        )
+        resp = await forward_json(
+            upstream=upstream,
+            method="POST",
+            path="/api/v1/asample",
+            incoming_headers=dict(http_request.headers),
+            json_body=sample_request.model_dump(),
+            timeout_s=300.0,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        payload = resp.json()
+        upstream_request_id = payload.get("request_id")
+        if not isinstance(upstream_request_id, str) or not upstream_request_id:
+            raise HTTPException(status_code=502, detail="Upstream asample returned invalid request_id")
+
+        poll_timeout_s = float(os.environ.get("TINKER_POLL_TIMEOUT_S", "1800"))
+        poll_sleep_s = float(os.environ.get("TINKER_POLL_SLEEP_S", "0.2"))
+        deadline = time.time() + poll_timeout_s
+        while True:
+            poll_resp = await forward_json(
+                upstream=upstream,
+                method="POST",
+                path="/api/v1/retrieve_future",
+                incoming_headers=dict(http_request.headers),
+                json_body={"request_id": upstream_request_id},
+                timeout_s=30.0,
+            )
+            if poll_resp.status_code == 408:
+                if time.time() > deadline:
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            f"Upstream {upstream_alias!r} retrieve_future timed out after "
+                            f"{poll_timeout_s:.1f}s for request_id={upstream_request_id!r}"
+                        ),
+                    )
+                await asyncio.sleep(poll_sleep_s)
+                continue
+            if poll_resp.status_code >= 400:
+                raise HTTPException(status_code=poll_resp.status_code, detail=poll_resp.text)
+            try:
+                poll_payload = poll_resp.json()
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Upstream {upstream_alias!r} returned non-JSON retrieve_future payload",
+                ) from e
+            if isinstance(poll_payload, dict) and "error" in poll_payload:
+                raise HTTPException(status_code=500, detail=poll_payload["error"])
+            try:
+                sample_response = SampleResponse.model_validate(poll_payload)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Upstream {upstream_alias!r} returned invalid sample payload: {type(e).__name__}: {e}",
+                ) from e
+            if len(sample_response.sequences) != 1:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Upstream {upstream_alias!r} returned {len(sample_response.sequences)} sequences "
+                        "for sample_once(num_samples=1)"
+                    ),
+                )
+            return sample_response.sequences[0]
+
+    if session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+
+    engine = None
+    resource_pool = None
+    resource_pool_actor_name: str | None = None
+    session_manager.mark_session_inflight(session_id, +1)
+    try:
+        if session_manager.is_multi_lora_session(session_id):
+            base_model = session_manager.get_session_base_model(session_id)
+            if not base_model:
+                raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
+
+            from ..backend.model_registry import get_model_config
+
+            try:
+                max_model_len = int(get_model_config(base_model).max_model_len)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Cannot determine max_model_len for base_model {base_model!r}: "
+                        f"{type(e).__name__}: {e}"
+                    ),
+                ) from e
+
+            total_len = len(token_ids) + int(max_tokens)
+            if total_len > max_model_len:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    ),
+                )
+
+            engine = await session_manager.get_engine_for_session(session_id)
+            if engine is None:
+                raise RuntimeError(f"No engine found for session {session_id}")
+
+            from ..backend.resource_pool import get_resource_pool
+
+            resource_pool = get_resource_pool()
+            resource_pool_actor_name = getattr(engine, "actor_name", None)
+            if not isinstance(resource_pool_actor_name, str) or not resource_pool_actor_name:
+                raise RuntimeError(
+                    f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
+                )
+            resource_pool.mark_inflight(resource_pool_actor_name, +1)
+            await _ensure_session_lora_loaded(engine, session_id)
+            result = await _await_with_external_fail_abort(
+                engine=engine,
+                request_id=request_id,
+                awaitable=engine.generate(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=-1,
+                    top_p=top_p,
+                    logprobs=False,
+                ),
+            )
+        else:
+            engine = session_manager.get_engine(session_id)
+            if engine is None:
+                raise RuntimeError(f"No engine found for session {session_id}")
+            result = await _await_with_external_fail_abort(
+                engine=engine,
+                request_id=request_id,
+                awaitable=engine.generate(
+                    prompt_ids=token_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=-1,
+                    top_p=top_p,
+                    logprobs=False,
+                ),
+            )
+
+        sequence = sampled_sequence_from_result(result)
+        billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+        if billing_auth is not None:
+            label_model = _resolve_billing_model(session_id)
+            await _persist_usage_events(
+                auth_ctx=billing_auth,
+                events=[
+                    UsageEvent(
+                        account_id=billing_auth.account_id,
+                        apikey_id=billing_auth.apikey_id,
+                        charge_item="sampling",
+                        quantity=len(token_ids),
+                        request_id=billing_auth.request_id,
+                        label=_build_sampling_usage_label(
+                            model=label_model,
+                            route="sampling.sample_once",
+                            dimension="prefill",
+                        ),
+                    ),
+                    UsageEvent(
+                        account_id=billing_auth.account_id,
+                        apikey_id=billing_auth.apikey_id,
+                        charge_item="sampling",
+                        quantity=len(sequence.tokens),
+                        request_id=billing_auth.request_id,
+                        label=_build_sampling_usage_label(
+                            model=label_model,
+                            route="sampling.sample_once",
+                            dimension="sample",
+                        ),
+                    ),
+                ],
+            )
+        return sequence
+    except HTTPException:
+        await _abort_engine_request(engine, request_id)
+        raise
+    except Exception:
+        await _abort_engine_request(engine, request_id)
+        raise
+    finally:
+        if resource_pool is not None and resource_pool_actor_name is not None:
+            resource_pool.mark_inflight(resource_pool_actor_name, -1)
+        session_manager.mark_session_inflight(session_id, -1)
 
 
 async def _do_sample(request_id: str, request: SampleRequest, user_id: str | None, gateway_auth: dict | None = None) -> None:
