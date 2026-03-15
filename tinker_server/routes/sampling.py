@@ -27,6 +27,7 @@ from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
     SampleRequest,
+    SampledSequence,
     SampleResponse,
     UntypedAPIFuture,
 )
@@ -663,6 +664,136 @@ async def asample(
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
+
+
+async def sample_once(
+    *,
+    session_id: str,
+    token_ids: list[int],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: str | list[str] | list[int] | None,
+    request_id: str,
+    http_request: Request,
+    user_id: str | None,
+) -> SampledSequence:
+    """Synchronously execute one sampling request using the multi-LoRA path."""
+    if _should_backpressure(http_request):
+        raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
+    if session_manager is None:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+
+    engine = None
+    resource_pool = None
+    resource_pool_actor_name: str | None = None
+    session_manager.mark_session_inflight(session_id, +1)
+    try:
+        if session_manager.is_multi_lora_session(session_id):
+            base_model = session_manager.get_session_base_model(session_id)
+            if not base_model:
+                raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
+
+            from ..backend.model_registry import get_model_config
+
+            try:
+                max_model_len = int(get_model_config(base_model).max_model_len)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Cannot determine max_model_len for base_model {base_model!r}: "
+                        f"{type(e).__name__}: {e}"
+                    ),
+                ) from e
+
+            total_len = len(token_ids) + int(max_tokens)
+            if total_len > max_model_len:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    ),
+                )
+
+            engine = await session_manager.get_engine_for_session(session_id)
+            if engine is None:
+                raise RuntimeError(f"No engine found for session {session_id}")
+
+            from ..backend.resource_pool import get_resource_pool
+
+            resource_pool = get_resource_pool()
+            resource_pool_actor_name = getattr(engine, "actor_name", None)
+            if not isinstance(resource_pool_actor_name, str) or not resource_pool_actor_name:
+                raise RuntimeError(
+                    f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
+                )
+            resource_pool.mark_inflight(resource_pool_actor_name, +1)
+            await _ensure_session_lora_loaded(engine, session_id)
+            result = await _await_with_external_fail_abort(
+                engine=engine,
+                request_id=request_id,
+                awaitable=engine.generate(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=-1,
+                    top_p=top_p,
+                    logprobs=False,
+                ),
+            )
+        else:
+            engine = session_manager.get_engine(session_id)
+            if engine is None:
+                raise RuntimeError(f"No engine found for session {session_id}")
+            result = await _await_with_external_fail_abort(
+                engine=engine,
+                request_id=request_id,
+                awaitable=engine.generate(
+                    prompt_ids=token_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=-1,
+                    top_p=top_p,
+                    logprobs=False,
+                ),
+            )
+
+        sequence = sampled_sequence_from_result(result)
+        if user_id:
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="sample_prefill",
+                model_name=session_id,
+                token_count=len(token_ids),
+                session_id=session_id,
+                request_id=request_id,
+            )
+            get_usage_logger().log(
+                user_id=user_id,
+                operation_type="sample_generation",
+                model_name=session_id,
+                token_count=len(sequence.tokens),
+                session_id=session_id,
+                request_id=request_id,
+            )
+        return sequence
+    except HTTPException:
+        await _abort_engine_request(engine, request_id)
+        raise
+    except Exception:
+        await _abort_engine_request(engine, request_id)
+        raise
+    finally:
+        if resource_pool is not None and resource_pool_actor_name is not None:
+            resource_pool.mark_inflight(resource_pool_actor_name, -1)
+        session_manager.mark_session_inflight(session_id, -1)
 
 
 async def _do_sample(request_id: str, request: SampleRequest, user_id: str | None, gateway_auth: dict | None = None) -> None:

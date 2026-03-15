@@ -424,6 +424,85 @@ class SessionHeartbeatResponse(BaseModel):
 
 
 # =============================================================================
+# OpenAI-Compatible API Types
+# =============================================================================
+
+
+class OAICompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    prompt: str
+    max_tokens: int = 16
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stop: str | list[str] | None = None
+    stream: bool = False
+    n: int = 1
+
+
+class OAIMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class OAIChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    messages: list[OAIMessage]
+    max_tokens: int = 16
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stop: str | list[str] | None = None
+    stream: bool = False
+    n: int = 1
+
+
+class OAIUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class OAICompletionChoice(BaseModel):
+    text: str
+    index: int
+    finish_reason: Literal["stop", "length"]
+
+
+class OAIChatMessageResponse(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+
+
+class OAIChatCompletionChoice(BaseModel):
+    index: int
+    message: OAIChatMessageResponse
+    finish_reason: Literal["stop", "length"]
+
+
+class OAICompletionResponse(BaseModel):
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int
+    model: str
+    choices: list[OAICompletionChoice]
+    usage: OAIUsage
+
+
+class OAIChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[OAIChatCompletionChoice]
+    usage: OAIUsage
+
+
+# =============================================================================
 # Weight Sync Types
 # =============================================================================
 

@@ -346,8 +346,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     return CreateSessionResponse(session_id=session_id)
 
 
-@router.post("/create_sampling_session")
-async def create_sampling_session(
+async def _create_sampling_session_impl(
     request: CreateSamplingSessionRequest,
     http_request: Request,
 ) -> CreateSamplingSessionResponse:
@@ -561,6 +560,45 @@ async def create_sampling_session(
     _write_sampler_index(sampling_session_id)
 
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+
+
+@router.post("/create_sampling_session")
+async def create_sampling_session(
+    request: CreateSamplingSessionRequest,
+    http_request: Request,
+) -> CreateSamplingSessionResponse:
+    return await _create_sampling_session_impl(request, http_request)
+
+
+async def ensure_sampling_session(
+    *,
+    model_path: str,
+    http_request: Request,
+    parent_session_id: str | None = None,
+) -> tuple[str, str]:
+    """Ensure a sampling session exists for an OpenAI-compatible request."""
+    sampling_request = CreateSamplingSessionRequest(
+        session_id=parent_session_id or str(uuid.uuid4()),
+        model_path=model_path,
+    )
+    response = await create_sampling_session(sampling_request, http_request)
+    sampling_session_id = response.sampling_session_id
+    base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
+
+    from ..gateway import remote_sampling_session
+
+    if remote_sampling_session(sampling_session_id) is not None:
+        raise HTTPException(
+            status_code=501,
+            detail="This model is routed via gateway. OAI-compatible API does not support gateway models in MVP.",
+        )
+
+    if not base_model:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Sampling session {sampling_session_id!r} missing base_model after creation",
+        )
+    return sampling_session_id, base_model
 
 
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
