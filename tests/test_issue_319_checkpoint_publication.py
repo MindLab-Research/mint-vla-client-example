@@ -56,12 +56,6 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
     )
     monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
-    monkeypatch.setattr(
-        tr,
-        "mirror_checkpoint_to_persistent_store",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("mirror should not run")),
-    )
-
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-bad")
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler",
@@ -114,12 +108,6 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     )
     monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
-    monkeypatch.setattr(
-        tr,
-        "mirror_checkpoint_to_persistent_store",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("mirror should not run")),
-    )
-
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler-corrupt",
@@ -164,12 +152,6 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
     monkeypatch.setattr(wt, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
-    monkeypatch.setattr(
-        wt,
-        "mirror_checkpoint_to_persistent_store",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("mirror should not run")),
-    )
-
     request = SaveStateRequest(model_id="run-319", path="training-bad")
     await wt._do_save_state(
         request_id="req-319-training",

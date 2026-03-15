@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import tarfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ DEFAULT_LEGACY_CODE_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/code/tinker-server
 DEFAULT_EPHEMERAL_TTL_S = 24 * 60 * 60
 DEFAULT_PERSISTENT_CACHE_TTL_S = 24 * 60 * 60
 DEFAULT_REAP_INTERVAL_S = 10 * 60
+DEFAULT_MIRROR_POLL_S = 5
 
 # Backward-compatible module globals. Existing tests patch CHECKPOINTS_DIR directly.
 CHECKPOINTS_DIR = os.environ.get("TINKER_CHECKPOINT_DIR", DEFAULT_PERSISTENT_CHECKPOINTS_DIR)
@@ -28,6 +30,14 @@ PERSISTENT_CHECKPOINTS_DIR = os.environ.get("TINKER_PERSISTENT_CHECKPOINT_DIR", 
 RUNTIME_CHECKPOINTS_DIR = os.environ.get("TINKER_RUNTIME_CHECKPOINT_DIR", DEFAULT_RUNTIME_CHECKPOINTS_DIR)
 
 CheckpointType = Literal["training", "sampler"]
+MIRROR_STATUS_PENDING = "pending"
+MIRROR_STATUS_IN_PROGRESS = "in_progress"
+MIRROR_STATUS_COMPLETE = "complete"
+MIRROR_STATUS_FAILED = "failed"
+
+_mirror_process_lock = threading.Lock()
+_mirror_thread_lock = threading.Lock()
+_mirror_thread: threading.Thread | None = None
 
 
 def _dedupe_paths(paths: list[str]) -> list[str]:
@@ -80,6 +90,10 @@ def get_ephemeral_checkpoint_ttl_s() -> int:
 
 def get_checkpoint_reap_interval_s() -> int:
     return int(os.environ.get("MINT_CHECKPOINT_REAP_INTERVAL_S", str(DEFAULT_REAP_INTERVAL_S)))
+
+
+def get_checkpoint_mirror_poll_s() -> float:
+    return float(os.environ.get("MINT_CHECKPOINT_MIRROR_POLL_S", str(DEFAULT_MIRROR_POLL_S)))
 
 
 def get_legacy_checkpoint_dirs() -> list[str]:
@@ -203,6 +217,17 @@ def write_checkpoint_metadata(path: str, metadata: dict) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
+def update_checkpoint_metadata(path: str, updates: dict) -> dict:
+    current = {}
+    try:
+        current = read_checkpoint_metadata(path)
+    except Exception:
+        current = {}
+    current.update(dict(updates))
+    write_checkpoint_metadata(path, current)
+    return current
+
+
 def validate_checkpoint_load_contract(
     path: str, *, load_optimizer: bool
 ) -> tuple[CheckpointType, bool]:
@@ -320,6 +345,13 @@ def validate_sampler_checkpoint_for_sampling(path: str) -> None:
             list(f.keys())
     except Exception as e:
         raise ValueError(f"Unreadable adapter_model.safetensors for sampling: {e}") from e
+
+
+def _validate_checkpoint_for_publication(path: str, checkpoint_type: CheckpointType) -> None:
+    if checkpoint_type == "sampler":
+        validate_sampler_checkpoint_for_sampling(path)
+    else:
+        validate_checkpoint_dir(path, checkpoint_type=checkpoint_type)
 
 
 def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:
@@ -565,6 +597,153 @@ def mirror_checkpoint_to_persistent_store(
     return sync_checkpoint_tree(src_dir, dst_dir)
 
 
+def _mirror_target_path(metadata: dict) -> str:
+    configured = metadata.get("persistent_mirror_path")
+    if isinstance(configured, str) and configured:
+        return configured
+    checkpoint_name = metadata.get("checkpoint_id")
+    model_id = metadata.get("model_id")
+    if not isinstance(checkpoint_name, str) or not checkpoint_name:
+        raise ValueError("mirror metadata missing checkpoint_id")
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("mirror metadata missing model_id")
+    return build_persistent_checkpoint_dir(
+        user_id=metadata.get("owner_id"),
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+    )
+
+
+def _kickoff_pending_checkpoint_mirrors() -> None:
+    global _mirror_thread
+
+    def _runner() -> None:
+        global _mirror_thread
+        try:
+            process_pending_checkpoint_mirrors()
+        finally:
+            with _mirror_thread_lock:
+                _mirror_thread = None
+
+    with _mirror_thread_lock:
+        if _mirror_thread is not None and _mirror_thread.is_alive():
+            return
+        _mirror_thread = threading.Thread(
+            target=_runner,
+            name="checkpoint-mirror-worker",
+            daemon=True,
+        )
+        _mirror_thread.start()
+
+
+def begin_async_checkpoint_mirror(
+    src_dir: str,
+    *,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_name: str,
+) -> str:
+    dst_dir = build_persistent_checkpoint_dir(
+        user_id=user_id,
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+    )
+    update_checkpoint_metadata(
+        src_dir,
+        {
+            "mirror_status": MIRROR_STATUS_PENDING,
+            "mirror_error": None,
+            "persistent_mirror_path": dst_dir,
+            "last_mirror_enqueued_at": _isoformat_utc(time.time()),
+        },
+    )
+    _kickoff_pending_checkpoint_mirrors()
+    return dst_dir
+
+
+def _process_pending_checkpoint_mirror(checkpoint_path: str) -> tuple[str, str]:
+    metadata = read_checkpoint_metadata(checkpoint_path)
+    checkpoint_type = metadata.get("checkpoint_type") or metadata.get("type")
+    if checkpoint_type not in ("training", "sampler"):
+        raise ValueError(f"invalid checkpoint_type for mirror: {checkpoint_type!r}")
+    dst_dir = _mirror_target_path(metadata)
+    attempt = int(metadata.get("mirror_attempts") or 0) + 1
+    update_checkpoint_metadata(
+        checkpoint_path,
+        {
+            "mirror_status": MIRROR_STATUS_IN_PROGRESS,
+            "mirror_error": None,
+            "mirror_attempts": attempt,
+            "last_mirror_attempt_at": _isoformat_utc(time.time()),
+            "persistent_mirror_path": dst_dir,
+        },
+    )
+    delay_s = float(os.environ.get("MINT_CHECKPOINT_MIRROR_DELAY_S", "0") or 0.0)
+    if delay_s > 0:
+        time.sleep(delay_s)
+    mirrored_path = sync_checkpoint_tree(checkpoint_path, dst_dir)
+    _validate_checkpoint_for_publication(mirrored_path, checkpoint_type)
+    mirrored_at = _isoformat_utc(time.time())
+    cache_meta = read_checkpoint_metadata(checkpoint_path)
+    persistent_meta = dict(cache_meta)
+    persistent_meta.update(
+        {
+            "storage_tier": "persistent_tos",
+            "mirror_status": MIRROR_STATUS_COMPLETE,
+            "mirror_error": None,
+            "persistent_mirror_path": mirrored_path,
+            "mirror_completed_at": mirrored_at,
+        }
+    )
+    write_checkpoint_metadata(mirrored_path, persistent_meta)
+    update_checkpoint_metadata(
+        checkpoint_path,
+        {
+            "mirror_status": MIRROR_STATUS_COMPLETE,
+            "mirror_error": None,
+            "persistent_mirror_path": mirrored_path,
+            "mirror_completed_at": mirrored_at,
+        },
+    )
+    return checkpoint_path, mirrored_path
+
+
+def process_pending_checkpoint_mirrors(*, max_items: int | None = None) -> dict[str, list[str]]:
+    if not _mirror_process_lock.acquire(blocking=False):
+        return {"mirrored": [], "failed": []}
+    try:
+        results = {"mirrored": [], "failed": []}
+        cache_dirs = sorted(_iter_runtime_checkpoint_dirs(get_persistent_cache_dir()))
+        for checkpoint_path in cache_dirs:
+            if max_items is not None and len(results["mirrored"]) + len(results["failed"]) >= max_items:
+                break
+            try:
+                metadata = read_checkpoint_metadata(checkpoint_path)
+            except Exception:
+                continue
+            if metadata.get("storage_tier") != "persistent_cache":
+                continue
+            status = metadata.get("mirror_status")
+            if status in (MIRROR_STATUS_COMPLETE, MIRROR_STATUS_FAILED):
+                continue
+            try:
+                _, mirrored_path = _process_pending_checkpoint_mirror(checkpoint_path)
+                results["mirrored"].append(mirrored_path)
+            except Exception as e:
+                update_checkpoint_metadata(
+                    checkpoint_path,
+                    {
+                        "mirror_status": MIRROR_STATUS_FAILED,
+                        "mirror_error": f"{type(e).__name__}: {e}",
+                        "last_mirror_failure_at": _isoformat_utc(time.time()),
+                    },
+                )
+                results["failed"].append(checkpoint_path)
+        return results
+    finally:
+        _mirror_process_lock.release()
+
+
 def materialize_persistent_checkpoint(path: str) -> str:
     if not os.path.isdir(path):
         return path
@@ -632,6 +811,13 @@ def reap_runtime_checkpoints(*, now: float | None = None) -> dict[str, list[str]
     cache_root = get_persistent_cache_dir()
     cache_ttl_s = get_persistent_cache_ttl_s()
     for checkpoint_path in _iter_runtime_checkpoint_dirs(cache_root):
+        meta = {}
+        try:
+            meta = read_checkpoint_metadata(checkpoint_path)
+        except Exception:
+            meta = {}
+        if meta.get("storage_tier") == "persistent_cache" and meta.get("mirror_status") != MIRROR_STATUS_COMPLETE:
+            continue
         age_s = current - os.path.getmtime(checkpoint_path)
         if age_s < cache_ttl_s:
             continue

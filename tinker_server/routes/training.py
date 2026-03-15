@@ -37,13 +37,14 @@ from ..logging_context import classify_failure_reason, set_request_id
 
 from ..backend.future_store import future_store
 from ..checkpoints import (
+    MIRROR_STATUS_PENDING,
+    begin_async_checkpoint_mirror,
     build_ephemeral_checkpoint_dir,
     build_persistent_cache_dir,
     checkpoint_has_optimizer_state,
     create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
     materialize_persistent_checkpoint,
-    mirror_checkpoint_to_persistent_store,
     resolve_checkpoint_path,
     validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
@@ -1997,34 +1998,11 @@ async def _do_save_weights_for_sampler(
 
         persistent_path = None
         if request.path is not None:
-            persistent_path = mirror_checkpoint_to_persistent_store(
+            persistent_path = begin_async_checkpoint_mirror(
                 save_path,
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
                 checkpoint_name=checkpoint_name,
-            )
-            try:
-                validate_sampler_checkpoint_for_sampling(persistent_path)
-            except ValueError as e:
-                raise RuntimeError(
-                    f"save_weights_for_sampler mirrored an invalid sampler checkpoint at {persistent_path}: {e}"
-                ) from e
-            write_checkpoint_metadata(
-                persistent_path,
-                {
-                    "checkpoint_id": checkpoint_name,
-                    "owner_id": user_id,
-                    "model_id": session.model_id,
-                    "model_name": session.base_model,
-                    "created_at": datetime.utcnow().isoformat() + "Z",
-                    "step": session.current_step,
-                    "checkpoint_type": "sampler",
-                    "optimizer_present": False,
-                    "backend": session.backend,
-                    "type": "sampler",
-                    "storage_tier": "persistent_tos",
-                    "ttl_seconds": request.ttl_seconds,
-                },
             )
 
         from ..client_compat import checkpoint_uri
@@ -2048,6 +2026,13 @@ async def _do_save_weights_for_sampler(
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
+            ).model_dump()
+            response.update(
+                filesystem_path=save_path,
+                persistent_filesystem_path=persistent_path,
+                mirror_status=MIRROR_STATUS_PENDING,
+                storage_tier="persistent_cache",
+                mirror_error=None,
             )
         else:
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
@@ -2176,9 +2161,9 @@ async def _do_save_weights_for_sampler(
             response = SaveWeightsForSamplerResponse(
                 path=None,  # Ephemeral - no path returned
                 sampling_session_id=sampling_session_id,
-            )
+            ).model_dump()
 
-        future_store.resolve(request_id, response.model_dump())
+        future_store.resolve(request_id, response)
 
     except Exception as e:
         logger.exception(
