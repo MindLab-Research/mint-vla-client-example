@@ -2328,14 +2328,18 @@ class MegatronRankWorker:
             )
             try:
 
-                # DEBUG: Check optimizer state size BEFORE step
+                # Optional diagnostics only. Missing Megatron optimizer modules must not
+                # change optim_step semantics.
                 if self.rank == 0:
-                    from megatron.core.optimizer import ChainedOptimizer
+                    try:
+                        from megatron.core.optimizer import ChainedOptimizer
+                    except ModuleNotFoundError:
+                        ChainedOptimizer = None
 
                     optimizer = self.engine.optimizer
                     if optimizer is not None:
                         def iter_optimizers(opt):
-                            if isinstance(opt, ChainedOptimizer):
+                            if ChainedOptimizer is not None and isinstance(opt, ChainedOptimizer):
                                 return opt.chained_optimizers
                             return [opt]
 

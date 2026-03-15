@@ -1215,8 +1215,8 @@ def test_issue_193_missing_optimizer_shard_does_not_switch_session(monkeypatch, 
             self.result = result
             self.calls = []
 
-        def remote(self, load_path):
-            self.calls.append(load_path)
+        def remote(self, load_path, **kwargs):
+            self.calls.append((load_path, kwargs))
             return self.result
 
     class _FakeWorker:
@@ -1240,8 +1240,8 @@ def test_issue_193_missing_optimizer_shard_does_not_switch_session(monkeypatch, 
             session_id="target_session",
         )
 
-    assert worker_0.check_optimizer_state_exists.calls == [str(ckpt_dir)]
-    assert worker_1.check_optimizer_state_exists.calls == [str(ckpt_dir)]
+    assert worker_0.check_optimizer_state_exists.calls == [(str(ckpt_dir), {"traceparent": None})]
+    assert worker_1.check_optimizer_state_exists.calls == [(str(ckpt_dir), {"traceparent": None})]
     assert ensure_calls == []
     assert load_adapter_calls == []
     assert group._current_session == "current_session"
@@ -1264,14 +1264,16 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs))
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
-    group.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {"status": "ok"}
+    group.reset_optimizer = (
+        lambda learning_rate=None, traceparent=None: reset_calls.append((learning_rate, traceparent)) or {"status": "ok"}
+    )
 
     class _FakeClearRemoteMethod:
         def __init__(self):
             self.calls = []
 
-        def remote(self, session_id):
-            self.calls.append(session_id)
+        def remote(self, session_id, **kwargs):
+            self.calls.append((session_id, kwargs))
             return {"status": "ok", "session_id": session_id}
 
     class _FakeWorker:
@@ -1303,18 +1305,24 @@ def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_re
     assert ensure_calls == [
         (
             "target_session",
-            {"train_attn": False, "train_mlp": True, "train_unembed": False},
+            {"traceparent": None, "train_attn": False, "train_mlp": True, "train_unembed": False},
         )
     ]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
-            {"actual_rank": 8, "train_attn": False, "train_mlp": True, "train_unembed": False},
+            {
+                "actual_rank": 8,
+                "traceparent": None,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
+            },
         )
     ]
-    assert worker_0.clear_session_state.calls == ["target_session"]
-    assert worker_1.clear_session_state.calls == ["target_session"]
-    assert reset_calls == [pytest.approx(7e-4)]
+    assert worker_0.clear_session_state.calls == [("target_session", {"traceparent": None})]
+    assert worker_1.clear_session_state.calls == [("target_session", {"traceparent": None})]
+    assert reset_calls == [(pytest.approx(7e-4), None)]
     assert result["optimizer_restored"] is False
     assert result["optimizer_reset"] is True
     assert group._step_count == 42
@@ -1338,14 +1346,16 @@ def test_issue_193_load_checkpoint_invalid_meta_preserves_step_and_lr(tmp_path, 
     group._resolve_required_session_id = lambda session_id, op: session_id
     group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append((session_id, kwargs))
     group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {"status": "ok"}
-    group.reset_optimizer = lambda learning_rate=None: reset_calls.append(learning_rate) or {"status": "ok"}
+    group.reset_optimizer = (
+        lambda learning_rate=None, traceparent=None: reset_calls.append((learning_rate, traceparent)) or {"status": "ok"}
+    )
 
     class _FakeClearRemoteMethod:
         def __init__(self):
             self.calls = []
 
-        def remote(self, session_id):
-            self.calls.append(session_id)
+        def remote(self, session_id, **kwargs):
+            self.calls.append((session_id, kwargs))
             return {"status": "ok", "session_id": session_id}
 
     class _FakeWorker:
@@ -1372,16 +1382,22 @@ def test_issue_193_load_checkpoint_invalid_meta_preserves_step_and_lr(tmp_path, 
             session_id="target_session",
         )
 
-    assert ensure_calls == [("target_session", {"train_attn": None, "train_mlp": None, "train_unembed": None})]
+    assert ensure_calls == [("target_session", {"traceparent": None, "train_attn": None, "train_mlp": None, "train_unembed": None})]
     assert load_adapter_calls == [
         (
             str(ckpt_dir),
-            {"actual_rank": 8, "train_attn": None, "train_mlp": None, "train_unembed": None},
+            {
+                "actual_rank": 8,
+                "traceparent": None,
+                "train_attn": None,
+                "train_mlp": None,
+                "train_unembed": None,
+            },
         )
     ]
-    assert worker_0.clear_session_state.calls == ["target_session"]
-    assert worker_1.clear_session_state.calls == ["target_session"]
-    assert reset_calls == [pytest.approx(1e-4)]
+    assert worker_0.clear_session_state.calls == [("target_session", {"traceparent": None})]
+    assert worker_1.clear_session_state.calls == [("target_session", {"traceparent": None})]
+    assert reset_calls == [(pytest.approx(1e-4), None)]
     assert result["current_step"] == "bad"
     assert result["learning_rate"] == "oops"
     assert group._step_count == 99
@@ -1473,8 +1489,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
         def __init__(self):
             self.calls = []
 
-        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora):
-            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora))
+        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora, **kwargs):
+            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora, kwargs))
             return f"future-{len(self.calls)}"
 
     class _FakeWorker:
@@ -1506,6 +1522,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
         (
             "recovered_session",
             {
+                "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -1513,10 +1530,10 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_checkpoint(monkey
         )
     ]
     assert worker_0.save_checkpoint.calls == [
-        ("/tmp/recovery_ckpt", 12, 16, True)
+        ("/tmp/recovery_ckpt", 12, 16, True, {"traceparent": None})
     ]
     assert worker_1.save_checkpoint.calls == [
-        ("/tmp/recovery_ckpt", 12, 16, True)
+        ("/tmp/recovery_ckpt", 12, 16, True, {"traceparent": None})
     ]
 
 
@@ -1542,8 +1559,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_forward(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def remote(self, data_items, reset_bias):
-            self.calls.append((data_items, reset_bias))
+        def remote(self, data_items, reset_bias, **kwargs):
+            self.calls.append((data_items, reset_bias, kwargs))
             return "future-forward"
 
     class _FakeWorker:
@@ -1578,13 +1595,14 @@ def test_issue_193_partial_swap_explicit_session_recovers_forward(monkeypatch):
         (
             "recovered_session",
             {
+                "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
             },
         )
     ]
-    assert worker.forward.calls == [([], None)]
+    assert worker.forward.calls == [([], None, {"traceparent": None})]
     assert result["metrics"]["num_samples:sum"] == 0.0
 
 
@@ -1640,6 +1658,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
         (
             "recovered_session",
             {
+                "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -1654,6 +1673,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
+                "traceparent": None,
             },
         )
     ]
@@ -1685,8 +1705,8 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
         def __init__(self):
             self.calls = []
 
-        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora):
-            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora))
+        def remote(self, save_path, step_count, actual_rank, use_per_expert_lora, **kwargs):
+            self.calls.append((save_path, step_count, actual_rank, use_per_expert_lora, kwargs))
             return "future-save-lora"
 
     class _FakeWorker:
@@ -1717,6 +1737,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
         (
             "recovered_session",
             {
+                "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -1724,7 +1745,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
         )
     ]
     assert worker.save_lora_weights.calls == [
-        ("/tmp/recovery_lora", 9, 8, True)
+        ("/tmp/recovery_lora", 9, 8, True, {"traceparent": None})
     ]
 
 
@@ -1765,16 +1786,16 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
         def __init__(self):
             self.calls = []
 
-        def remote(self, load_path):
-            self.calls.append(load_path)
+        def remote(self, load_path, **kwargs):
+            self.calls.append((load_path, kwargs))
             return f"future-{len(self.calls)}"
 
     class _FakeCheckOptimizerStateExistsRemoteMethod:
         def __init__(self):
             self.calls = []
 
-        def remote(self, load_path):
-            self.calls.append(load_path)
+        def remote(self, load_path, **kwargs):
+            self.calls.append((load_path, kwargs))
             return {"exists": True, "optimizer_file": f"{load_path}/optimizer.pt"}
 
     class _FakeWorker:
@@ -1814,6 +1835,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
         (
             "recovered_session",
             {
+                "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
@@ -1825,16 +1847,17 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
             str(ckpt_dir),
             {
                 "actual_rank": 8,
+                "traceparent": None,
                 "train_attn": False,
                 "train_mlp": True,
                 "train_unembed": False,
             },
         )
     ]
-    assert worker_0.check_optimizer_state_exists.calls == [str(ckpt_dir)]
-    assert worker_1.check_optimizer_state_exists.calls == [str(ckpt_dir)]
-    assert worker_0.load_optimizer_state.calls == [str(ckpt_dir)]
-    assert worker_1.load_optimizer_state.calls == [str(ckpt_dir)]
+    assert worker_0.check_optimizer_state_exists.calls == [(str(ckpt_dir), {"traceparent": None})]
+    assert worker_1.check_optimizer_state_exists.calls == [(str(ckpt_dir), {"traceparent": None})]
+    assert worker_0.load_optimizer_state.calls == [(str(ckpt_dir), {"traceparent": None})]
+    assert worker_1.load_optimizer_state.calls == [(str(ckpt_dir), {"traceparent": None})]
     assert result["current_step"] == 21
     assert result["learning_rate"] == pytest.approx(3e-4)
     assert group._step_count == 21
