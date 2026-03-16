@@ -32,8 +32,6 @@ from ..checkpoints import (
     MIRROR_STATUS_PENDING,
     begin_async_checkpoint_mirror,
     build_persistent_cache_dir,
-    build_persistent_checkpoint_dir,
-    checkpoint_access_roots,
     checkpoint_has_optimizer_state,
     create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
@@ -594,7 +592,6 @@ async def _do_save_state(
     Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
-    import json
     session = None
 
     try:

@@ -8,12 +8,10 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
@@ -39,7 +37,6 @@ from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
     from .backend.multi_lora_engine import MultiModelInferenceManager
-    from .backend.training_session_manager import TrainingSessionManager
     from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
@@ -1138,7 +1135,6 @@ async def lifespan(app: FastAPI):
 
     await close_usage_store()
 
-    from .gateway import close_http_clients
 
     await close_http_clients()
 

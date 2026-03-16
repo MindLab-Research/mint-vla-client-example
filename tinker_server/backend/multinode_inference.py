@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -23,8 +22,24 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+    traced_async_from_traceparent,
+)
+from tinker_server.ray_utils import init_ray
+
 from . import ray_kill
+from .multinode_resources import compute_multinode_engine_resources
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_node_ip_list,
+    parse_model_single_node_ip,
+)
 
 if TYPE_CHECKING:
     pass
@@ -38,22 +53,6 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
         "max_tokens": int(max_tokens),
         "last_progress_at": time.time(),
     }
-
-# Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars, otel_env_vars
-from tinker_server.config import config as server_config
-from tinker_server.logging_context import (
-    get_current_traceparent,
-    init_actor_observability,
-    restore_trace_id_from_traceparent,
-)
-from tinker_server.ray_utils import init_ray
-from .multinode_resources import compute_multinode_engine_resources
-from .volc_placement import (
-    assert_node_ip_capacity,
-    parse_model_node_ip_list,
-    parse_model_single_node_ip,
-)
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
@@ -771,6 +770,16 @@ def _create_multinode_vllm_actor(
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.add_lora",
+            component="multinode_vllm_actor",
+            op="sampling.add_lora_from_path",
+            request_id_arg="lora_name",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "lora_path": a.get("lora_path"),
+            },
+        )
         async def add_lora(
             self,
             lora_int_id: int,
@@ -973,6 +982,18 @@ def _create_multinode_vllm_actor(
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine.abort_request failed: {type(e).__name__}: {e}")
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.generate",
+            component="multinode_vllm_actor",
+            op="sampling.generate",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "max_tokens": a.get("max_tokens"),
+                "num_samples": a.get("n"),
+            },
+        )
         async def generate(
             self,
             prompt_ids: list[int],
@@ -1478,6 +1499,16 @@ def _create_multinode_vllm_actor(
                 await self._clear_progress(outer_request_id)
             return multi_results
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.compute_prompt_logprobs",
+            component="multinode_vllm_actor",
+            op="sampling.compute_prompt_logprobs",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+            },
+        )
         async def compute_prompt_logprobs(
             self,
             prompt_ids: list[int],
@@ -1592,6 +1623,17 @@ def _create_multinode_vllm_actor(
 
             return out
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.compute_prompt_topk",
+            component="multinode_vllm_actor",
+            op="sampling.compute_prompt_topk",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "topk": a.get("k"),
+            },
+        )
         async def compute_prompt_topk(
             self,
             prompt_ids: list[int],
@@ -1970,7 +2012,6 @@ class MultiNodeInferenceEngine:
                     except Exception:
                         pass
                     # Wait for Ray to clean up the actor name
-                    import time
                     for _ in range(10):
                         await asyncio.sleep(1)
                         try:
@@ -2342,7 +2383,7 @@ class MultiNodeInferenceEngine:
                 except Exception:
                     pass
                 self.engine = None
-                raise RuntimeError(f"MultiNodeVLLMEngine init timed out")
+                raise RuntimeError("MultiNodeVLLMEngine init timed out")
             except Exception:
                 try:
                     ray_kill.kill(
@@ -2432,7 +2473,7 @@ class MultiNodeInferenceEngine:
                 traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-        except Exception as e:
+        except Exception:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
             try:

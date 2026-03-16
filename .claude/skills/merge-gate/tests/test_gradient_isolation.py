@@ -14,8 +14,6 @@ Agent analyzes results both quantitatively and visually - no hardcoded threshold
 """
 
 import time
-import uuid
-from pathlib import Path
 
 import pytest
 
@@ -24,12 +22,8 @@ from .framework import (
     GradientIsolationData,
     GradientAccumulationData,
     PlotGenerator,
-    TestReport,
     create_test_report,
     print_report_summary,
-    detect_training_anomalies,
-    detect_isolation_anomalies,
-    RESULTS_DIR,
 )
 from .conftest import (
     DENSE_MODEL,
@@ -362,7 +356,7 @@ class TestGradientIsolationDense:
         print(f"{'='*70}")
         print(f"Report: {report_path}")
         if plots:
-            print(f"Plots:")
+            print("Plots:")
             for p in plots:
                 print(f"  - {p}")
         print(f"\nCorrelation: {data.compute_correlation():.3f}")

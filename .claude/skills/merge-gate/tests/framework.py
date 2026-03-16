@@ -687,7 +687,7 @@ def print_report_summary(report: TestReport):
 
     # Print plots
     if report.plots:
-        print(f"\n  Plots generated:")
+        print("\n  Plots generated:")
         for p in report.plots:
             print(f"    - {p}")
 

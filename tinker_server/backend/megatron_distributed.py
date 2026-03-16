@@ -36,7 +36,7 @@ from ..logging_context import (
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
@@ -4231,7 +4231,6 @@ class MegatronRankWorker:
             Dict with training metadata (rank 0 only, others return empty).
         """
         self._bind_traceparent(traceparent)
-        import json
         import os
         import torch
 
@@ -4329,7 +4328,6 @@ class MegatronRankWorker:
         are not required for sampling and can exceed memory/time budgets on large MoE models.
         """
         self._bind_traceparent(traceparent)
-        import json
         import os
 
         from safetensors.torch import save_file
@@ -5951,7 +5949,6 @@ class MegatronWorkerGroup:
             Dict with load metadata.
         """
         self._bind_traceparent(traceparent)
-        import json
         import os
 
         effective_session_id = self._resolve_required_session_id(

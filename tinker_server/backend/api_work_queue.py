@@ -161,7 +161,6 @@ def _get_or_create_ray_actor():
     @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=max_restarts)
     class _RayApiWorkQueueActor:
         def __init__(self) -> None:
-            import asyncio
             from collections import deque
 
             init_actor_observability()
@@ -710,7 +709,6 @@ def _get_or_create_ray_actor():
                 return {"ok": True}
 
         async def dequeue(self, consumer_job_id: str) -> dict[str, Any]:
-            import asyncio
 
             dequeue_poll_s = max(
                 0.05,
@@ -1067,7 +1065,6 @@ class ApiWorkQueueClient:
         throttle_principal: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        import asyncio
         import ray
 
         actor = self._get_ray_actor()
@@ -1159,7 +1156,6 @@ class ApiWorkQueueClient:
                 raise
 
     async def _dequeue(self) -> WorkItem:
-        import asyncio
         import ray
 
         if self._dequeue_executor is None:
@@ -1193,7 +1189,6 @@ class ApiWorkQueueClient:
         )
 
     async def find_position(self, request_id: str) -> dict[str, Any]:
-        import asyncio
         import ray
 
         actor = self._get_ray_actor()
@@ -1205,7 +1200,6 @@ class ApiWorkQueueClient:
         return result
 
     async def record_execution_time(self, op: str, duration_s: float) -> None:
-        import asyncio
         import ray
 
         actor = self._get_ray_actor()
@@ -1214,7 +1208,6 @@ class ApiWorkQueueClient:
         await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
 
     async def get_eta_state(self, op: str | None) -> dict[str, Any]:
-        import asyncio
         import ray
 
         actor = self._get_ray_actor()
@@ -1226,7 +1219,6 @@ class ApiWorkQueueClient:
         return result
 
     async def start_workers(self, *, num_workers: int) -> None:
-        import asyncio
         import ray
 
         if self._running:
@@ -1275,7 +1267,6 @@ class ApiWorkQueueClient:
         self._worker_tasks = [asyncio.create_task(self._worker_loop(i)) for i in range(n)]
 
     async def shutdown(self) -> None:
-        import asyncio
         import ray
 
         self._running = False
@@ -1304,7 +1295,6 @@ class ApiWorkQueueClient:
         self._consumer_job_id = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
-        import asyncio
 
         from .capacity_manager import capacity_manager
         from .future_store import FutureStatus, future_store

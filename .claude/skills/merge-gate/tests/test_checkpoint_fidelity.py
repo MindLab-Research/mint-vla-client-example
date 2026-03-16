@@ -22,11 +22,9 @@ Agent-analyzed: collects full data and plots for analysis.
 """
 
 import json
-import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -230,12 +228,12 @@ class TestCheckpointFidelity:
         print(f"Report: {report_path}")
 
         if anomalies:
-            print(f"\nANOMALIES:")
+            print("\nANOMALIES:")
             for a in anomalies:
                 print(f"  - {a}")
 
         if not success:
-            pytest.fail(f"Checkpoint fidelity test failed: outputs differ after load")
+            pytest.fail("Checkpoint fidelity test failed: outputs differ after load")
 
     @pytest.mark.skip(reason="load_state not fully implemented - LoRA weights not loaded for training")
     def test_training_resume(self, tokenizer):
@@ -277,7 +275,7 @@ class TestCheckpointFidelity:
 
             # Save checkpoint at iteration 5
             if i == 4:
-                print(f"\n  Saving checkpoint at iteration 5...")
+                print("\n  Saving checkpoint at iteration 5...")
                 ckpt_result = save_state(model_id_a, name="t10_checkpoint")
                 ckpt_path = ckpt_result.get("path")
                 print(f"  Checkpoint: {ckpt_path}\n")
@@ -353,12 +351,12 @@ class TestCheckpointFidelity:
         print(f"Report: {report_path}")
 
         if anomalies:
-            print(f"\nANOMALIES:")
+            print("\nANOMALIES:")
             for a in anomalies:
                 print(f"  - {a}")
 
         if not success:
-            pytest.fail(f"Training resume test failed: trajectories differ significantly")
+            pytest.fail("Training resume test failed: trajectories differ significantly")
 
 
 class TestCheckpointFidelitySmall:

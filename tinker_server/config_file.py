@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -43,6 +42,7 @@ class _ServerSection(BaseModel):
     max_loras: int | None = None
     max_cpu_loras: int | None = None
     max_lora_rank: int | None = None
+    vllm_attention_backend: str | None = None
 
 
 class _SamplingSection(BaseModel):

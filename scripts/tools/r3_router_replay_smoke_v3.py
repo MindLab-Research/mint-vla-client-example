@@ -1118,7 +1118,7 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
     format_reward_coef = float(args.format_reward_coef)
     explicit_stop_token_ids = _default_stop_token_ids_for_model(base_model)
 
-    print(f"=== R3 Router Replay Experiment (v3) ===", flush=True)
+    print("=== R3 Router Replay Experiment (v3) ===", flush=True)
     print(f"Server: {base_url}", flush=True)
     print(f"Router replay mode: {router_replay_mode}", flush=True)
     print(f"Base model: {base_model}", flush=True)
@@ -1568,7 +1568,7 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
                 ppo_kl_v2 = kl_v2_calc
 
         if diff_mean is None:
-            raise RuntimeError(f"missing training/rollout_probs_diff_mean:mean in metrics")
+            raise RuntimeError("missing training/rollout_probs_diff_mean:mean in metrics")
 
         step_elapsed = time.time() - step_start
 
@@ -1611,7 +1611,7 @@ def run_ppo_experiment(args: argparse.Namespace) -> int:
         )
 
     print(flush=True)
-    print(f"=== Experiment Complete ===", flush=True)
+    print("=== Experiment Complete ===", flush=True)
     print(f"CSV: {out_csv}", flush=True)
     print(f"Meta: {meta_path}", flush=True)
 

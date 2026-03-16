@@ -230,7 +230,7 @@ def _apply_external_label_patch():
         from functools import partial
         from tensordict import TensorDict
         from verl.utils.megatron_utils import get_device_id
-        from verl.workers.engine.megatron.transformer_impl import tu, DatasetPadMode, extract_multi_modal_inputs
+        from verl.workers.engine.megatron.transformer_impl import tu, DatasetPadMode
         import verl.utils.torch_functional as verl_F
         from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy
         from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
@@ -736,7 +736,7 @@ def _enable_megatron_determinism(seed: int = 42):
     print(f"[VERL_PATCH]   torch.backends.cudnn.deterministic = {torch.backends.cudnn.deterministic}")
     print(f"[VERL_PATCH]   FLASH_ATTENTION_DETERMINISTIC = {os.environ.get('FLASH_ATTENTION_DETERMINISTIC')}")
     print(f"[VERL_PATCH]   Status written to {status_file}")
-    logger.info(f"Enabled full determinism mode (FLASH_ATTENTION_DETERMINISTIC=1, cudnn.deterministic=True)")
+    logger.info("Enabled full determinism mode (FLASH_ATTENTION_DETERMINISTIC=1, cudnn.deterministic=True)")
 
 
 def apply_verl_patches():
@@ -811,7 +811,7 @@ def apply_verl_patches():
             is_mla = _is_mla_model(self.model_config.hf_config)
             if is_mla:
                 provider.attention_backend = AttnBackend.flash
-                print(f"[VERL_PATCH] MLA model detected, using AttnBackend.flash (with value padding)")
+                print("[VERL_PATCH] MLA model detected, using AttnBackend.flash (with value padding)")
                 print(f"[VERL_PATCH] model_type: {getattr(self.model_config.hf_config, 'model_type', 'unknown')}")
                 print(f"[VERL_PATCH] qk_nope_head_dim: {getattr(self.model_config.hf_config, 'qk_nope_head_dim', 'N/A')}")
                 print(f"[VERL_PATCH] qk_rope_head_dim: {getattr(self.model_config.hf_config, 'qk_rope_head_dim', 'N/A')}")

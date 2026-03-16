@@ -111,7 +111,7 @@ def save_training_curve(
     except ImportError:
         pass
 
-    print(f"\nResults saved:")
+    print("\nResults saved:")
     print(f"  Data: {data_file}")
     if plot_file:
         print(f"  Plot: {plot_file}")
@@ -190,7 +190,7 @@ def print_test_summary(
     print(f"  Anomalies: {len(anomalies)}")
 
     if anomalies:
-        print(f"\n*** ANOMALIES DETECTED - REQUIRE VISUAL INSPECTION ***")
+        print("\n*** ANOMALIES DETECTED - REQUIRE VISUAL INSPECTION ***")
         for a in anomalies:
             print(f"  - {a}")
 
