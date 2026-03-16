@@ -163,6 +163,11 @@ def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path
         "host_python": str(host_python),
         "shared_dependencies": shared_deps,
         "host_dependencies": _host_deps(pyproject),
+        "runtime_env": {
+            "site_packages_dir": runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME),
+            "source_dir": runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME),
+            "host_venv_dir": runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME),
+        },
         "sources": runtime["sources"],
         "image_managed": runtime["image_managed"],
     }

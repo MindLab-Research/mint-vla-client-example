@@ -97,6 +97,7 @@ For API-server startup, prefer a built runtime-env root plus its host interprete
 python scripts/build_runtime_env.py --env-root /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213
 export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
 /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py
 ```
 

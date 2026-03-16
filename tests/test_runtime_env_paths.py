@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import pytest
@@ -147,6 +148,39 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
     layout = runtime_env_layout("/tmp/runtime")
     assert list(layout.host_pythonpath_entries) == expected
+
+
+def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
+    env_root = tmp_path / "runtime"
+    manifest = {
+        "runtime_env": {
+            "site_packages_dir": "site-packages",
+            "source_dir": "src",
+            "host_venv_dir": "host-venv",
+        },
+        "sources": [
+            {
+                "name": "CustomSource",
+                "pythonpath": ["src"],
+            },
+            {
+                "name": "HostOnlySource",
+                "pythonpath": ["."],
+                "host_only": True,
+            },
+        ],
+    }
+    env_root.mkdir(parents=True, exist_ok=True)
+    (env_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    layout = runtime_env_layout(str(env_root))
+    assert list(layout.pythonpath_entries) == [
+        str(env_root / "site-packages"),
+        str(env_root / "src" / "CustomSource" / "src"),
+    ]
+    assert list(layout.host_pythonpath_entries) == [
+        str(env_root / "src" / "HostOnlySource"),
+    ]
 
 
 def test_config_import_does_not_require_runtime_root():

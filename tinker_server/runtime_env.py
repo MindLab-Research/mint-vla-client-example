@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
 from dataclasses import dataclass
@@ -95,8 +96,44 @@ def _runtime_env_settings() -> RuntimeEnvSettings:
     )
 
 
+def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings | None:
+    manifest_path = Path(os.path.abspath(env_root)) / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    runtime = data.get("runtime_env", {})
+    sources = data.get("sources", [])
+    shared_entries: list[tuple[str, tuple[str, ...]]] = []
+    host_entries: list[tuple[str, tuple[str, ...]]] = []
+    for source in sources:
+        name = str(source["name"])
+        bucket = host_entries if bool(source.get("host_only", False)) else shared_entries
+        for rel in source.get("pythonpath", ["."]):
+            rel_str = str(rel).strip()
+            parts = () if rel_str in ("", ".") else tuple(part for part in rel_str.split("/") if part)
+            bucket.append((name, parts))
+
+    def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        deduped: list[tuple[str, tuple[str, ...]]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for entry in entries:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            deduped.append(entry)
+        return tuple(deduped)
+
+    return RuntimeEnvSettings(
+        site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
+        source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
+        host_venv_dir=str(runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)),
+        sources=_dedupe(shared_entries),
+        host_sources=_dedupe(host_entries),
+    )
+
+
 def runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
-    settings = _runtime_env_settings()
+    settings = _runtime_env_settings_from_manifest(env_root) or _runtime_env_settings()
     root = os.path.abspath(env_root)
     source_root = os.path.join(root, settings.source_dir)
     site_packages = os.path.join(root, settings.site_packages_dir)
