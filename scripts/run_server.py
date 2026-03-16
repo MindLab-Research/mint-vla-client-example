@@ -229,9 +229,10 @@ def _seed_runtime_env_from_config(config_path: str) -> None:
 
 if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
-    if args.config_path:
-        os.environ["TINKER_CONFIG_PATH"] = str(args.config_path)
-        _seed_runtime_env_from_config(str(args.config_path))
+    config_path = str(args.config_path) if args.config_path else os.environ.get("TINKER_CONFIG_PATH", "").strip()
+    if config_path:
+        os.environ["TINKER_CONFIG_PATH"] = config_path
+        _seed_runtime_env_from_config(config_path)
 
     _reexec_to_runtime_host_python_if_needed()
 

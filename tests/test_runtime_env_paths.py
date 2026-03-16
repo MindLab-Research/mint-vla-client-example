@@ -341,6 +341,38 @@ def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
     assert "PFS_RUNTIME_ENV_ROOT is required" not in (out.stdout + out.stderr)
 
 
+def test_run_server_honors_env_config_before_runtime_bootstrap(tmp_path):
+    cfg = tmp_path / "tinker.toml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "[paths]",
+                f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
+                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
+                "",
+                "[server]",
+                "port = 9",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [sys.executable, "scripts/run_server.py"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={
+            "TINKER_HOST": "127.0.0.1",
+            "TINKER_CONFIG_PATH": str(cfg),
+        },
+    )
+    assert "PFS_RUNTIME_ENV_ROOT is required" not in (out.stdout + out.stderr)
+
+
 def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch):
     from scripts.run_server import _seed_runtime_env_from_config
 
