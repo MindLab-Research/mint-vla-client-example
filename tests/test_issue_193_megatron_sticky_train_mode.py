@@ -1,3 +1,4 @@
+import inspect
 import logging
 import time
 import sys
@@ -1245,6 +1246,18 @@ def test_issue_193_missing_optimizer_shard_does_not_switch_session(monkeypatch, 
     assert ensure_calls == []
     assert load_adapter_calls == []
     assert group._current_session == "current_session"
+
+
+def test_issue_193_megatron_rank_worker_load_checkpoint_helpers_accept_traceparent():
+    impl_cls = MegatronRankWorker.__ray_metadata__.modified_class
+
+    clear_params = inspect.signature(impl_cls.clear_session_state).parameters
+    check_params = inspect.signature(impl_cls.check_optimizer_state_exists).parameters
+
+    assert "traceparent" in clear_params
+    assert clear_params["traceparent"].default is None
+    assert "traceparent" in check_params
+    assert check_params["traceparent"].default is None
 
 
 def test_issue_193_load_checkpoint_without_optimizer_clears_session_cache_and_resets_optimizer(tmp_path, monkeypatch):

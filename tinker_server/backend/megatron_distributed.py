@@ -1061,12 +1061,13 @@ class MegatronRankWorker:
 
         self._current_session_id = new_session_id
 
-    def clear_session_state(self, session_id: str) -> None:
+    def clear_session_state(self, session_id: str, traceparent: str | None = None) -> None:
         """Clear saved state for a session (call after session completes).
 
         Args:
             session_id: Session ID to clear.
         """
+        self._bind_traceparent(traceparent)
         if session_id in self._session_gradients:
             del self._session_gradients[session_id]
         if session_id in self._session_optimizer_states:
@@ -4410,8 +4411,13 @@ class MegatronRankWorker:
             return {"status": "ok", "optimizer_file": optimizer_file}
         return {}
 
-    def check_optimizer_state_exists(self, checkpoint_path: str) -> dict:
+    def check_optimizer_state_exists(
+        self,
+        checkpoint_path: str,
+        traceparent: str | None = None,
+    ) -> dict:
         """Check whether this rank's optimizer shard exists on shared storage."""
+        self._bind_traceparent(traceparent)
         import os
 
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
