@@ -344,3 +344,44 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     assert "/home/yiwen/tinker_project/mindlab-toolkit/src" not in run_server.sys.path
     assert "/opt/host-venv/lib/python3.12" in run_server.sys.path
     assert "/usr/lib/python3.12" in run_server.sys.path
+
+
+def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    cfg = tmp_path / "tinker.toml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "[paths]",
+                f'pfs_runtime_env_root = "{env_root}"',
+                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from tinker_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "PFS_TINKER_PATH": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "TINKER_CONFIG_PATH": str(cfg),
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["TINKER_CONFIG_PATH"] == str(cfg)

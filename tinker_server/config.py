@@ -142,6 +142,9 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
         "PYTHONPATH": pythonpath,
     }
+    config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
+    if config_path is not None:
+        out["TINKER_CONFIG_PATH"] = config_path
     if extra:
         out.update(extra)
     return out
