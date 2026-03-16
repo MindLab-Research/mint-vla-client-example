@@ -296,7 +296,6 @@ class MultiLoRAInferenceEngine:
             ExtendedVLLMHttpServer = _create_extended_server_class(
                 max_loras=self.max_loras,
                 max_cpu_loras=self.max_cpu_loras,
-                single_gpu_direct=((self.tensor_parallel_size * self.data_parallel_size) == 1),
             )
 
             # Compute total GPUs needed for MoE models
@@ -457,38 +456,17 @@ class MultiLoRAInferenceEngine:
                     self.actor_name,
                 )
 
-            if total_gpus == 1:
-                remote_kwargs = {
-                    "model_path": self.model_path,
-                    "trust_remote_code": True,
-                    "max_model_len": max_model_len,
-                    "gpu_memory_utilization": self.gpu_memory_utilization,
-                    "disable_log_stats": True,
-                    "enable_lora": True,
-                    "max_loras": self.max_loras,
-                    "max_lora_rank": self.max_lora_rank,
-                    "max_cpu_loras": self.max_cpu_loras,
-                    "enable_rollout_routing_replay": enable_rollout_routing_replay,
-                    "rollout_mode": RolloutMode.STANDALONE,
-                    "workers": [],
-                    "replica_rank": 0,
-                    "node_rank": 0,
-                    "gpus_per_node": total_gpus,
-                    "nnodes": 1,
-                    "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
-                }
-            else:
-                remote_kwargs = {
-                    "config": rollout_config,
-                    "model_config": model_config,
-                    "rollout_mode": RolloutMode.STANDALONE,
-                    "workers": [],
-                    "replica_rank": 0,
-                    "node_rank": 0,
-                    "gpus_per_node": total_gpus,
-                    "nnodes": 1,
-                    "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
-                }
+            remote_kwargs = {
+                "config": rollout_config,
+                "model_config": model_config,
+                "rollout_mode": RolloutMode.STANDALONE,
+                "workers": [],
+                "replica_rank": 0,
+                "node_rank": 0,
+                "gpus_per_node": total_gpus,
+                "nnodes": 1,
+                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
+            }
             self.server = ExtendedVLLMHttpServer.options(
                 **actor_options,
             ).remote(**remote_kwargs)

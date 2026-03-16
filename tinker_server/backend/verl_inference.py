@@ -379,8 +379,6 @@ from tinker_server.backend.model_registry import get_model_config
 def _create_extended_server_class(
     max_loras: int = 1,
     max_cpu_loras: int = 0,
-    *,
-    single_gpu_direct: bool = False,
 ):
     """Create extended vLLMHttpServer class with add_lora method.
 
@@ -2254,138 +2252,6 @@ with open(result_file, "w") as f:
             else:
                 return "No logits captured"
 
-    if single_gpu_direct:
-        class SingleGpuDirectVLLMActor:
-            MULTI_LORA_MAX_LORAS = _max_loras
-            MULTI_LORA_MAX_CPU_LORAS = _max_cpu_loras
-
-            def __init__(self, *args, **kwargs):
-                init_actor_observability()
-                from types import SimpleNamespace
-                from verl.utils.device import get_visible_devices_keyword
-
-                os.environ[get_visible_devices_keyword()] = str(kwargs.get("cuda_visible_devices", "0"))
-                self._direct_model_path = kwargs.get("model_path")
-                self._direct_trust_remote_code = bool(kwargs.get("trust_remote_code", False))
-                self._direct_max_model_len = kwargs.get("max_model_len")
-                self._direct_gpu_memory_utilization = kwargs.get("gpu_memory_utilization", 0.9)
-                self._direct_disable_log_stats = bool(kwargs.get("disable_log_stats", False))
-                self._direct_enable_lora = bool(kwargs.get("enable_lora", False))
-                self._direct_max_loras = int(kwargs.get("max_loras", self.MULTI_LORA_MAX_LORAS) or self.MULTI_LORA_MAX_LORAS)
-                self._direct_max_lora_rank = int(kwargs.get("max_lora_rank", 16) or 16)
-                self._direct_max_cpu_loras = kwargs.get("max_cpu_loras", self.MULTI_LORA_MAX_CPU_LORAS or None)
-                self._direct_enable_rollout_routing_replay = bool(kwargs.get("enable_rollout_routing_replay", False))
-                self.rollout_mode = kwargs.get("rollout_mode")
-                self.workers = kwargs.get("workers", [])
-                self.replica_rank = int(kwargs.get("replica_rank", 0) or 0)
-                self.node_rank = int(kwargs.get("node_rank", 0) or 0)
-                self.gpus_per_node = int(kwargs.get("gpus_per_node", 1) or 1)
-                self.nnodes = int(kwargs.get("nnodes", 1) or 1)
-                self._server_address = ray.util.get_node_ip_address().strip("[]")
-                self._server_port = None
-                self._server_task = None
-                self._master_address = self._server_address
-                self._master_port = 0
-                self._dp_rpc_port = 0
-                self._dp_master_port = 0
-                noop_close = lambda: None
-                self._master_sock = SimpleNamespace(close=noop_close)
-                self._dp_rpc_sock = SimpleNamespace(close=noop_close)
-                self._dp_master_sock = SimpleNamespace(close=noop_close)
-                self.profiler_controller = SimpleNamespace(
-                    config=None,
-                    tool_config=None,
-                    check_enable=lambda: False,
-                    check_this_rank=lambda: False,
-                    is_discrete_mode=lambda: False,
-                )
-                self._lora_paths: dict[int, str] = {}
-                self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                    "y",
-                    "on",
-                )
-                self._enable_rollout_routing_replay = self._direct_enable_rollout_routing_replay
-                self._mint_pack_moe_patched = False
-                self._progress_last: dict[str, float] = {}
-
-            async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
-                import inspect
-                from types import SimpleNamespace
-                from vllm.engine.arg_utils import AsyncEngineArgs
-                from vllm.usage.usage_lib import UsageContext
-                from vllm.v1.engine.async_llm import AsyncLLM
-
-                self.model_config = SimpleNamespace(
-                    local_path=self._direct_model_path,
-                    trust_remote_code=self._direct_trust_remote_code,
-                    lora_rank=self._direct_max_lora_rank,
-                )
-                self.config = SimpleNamespace(
-                    max_model_len=self._direct_max_model_len,
-                    gpu_memory_utilization=self._direct_gpu_memory_utilization,
-                    disable_log_stats=self._direct_disable_log_stats,
-                    enable_rollout_routing_replay=self._direct_enable_rollout_routing_replay,
-                    repetition_penalty=1.0,
-                )
-                self.config.get = lambda name, default=None: getattr(self.config, name, default)
-
-                direct_engine_args = AsyncEngineArgs(
-                    model=self._direct_model_path,
-                    trust_remote_code=self._direct_trust_remote_code,
-                    max_model_len=self._direct_max_model_len,
-                    gpu_memory_utilization=self._direct_gpu_memory_utilization,
-                    disable_log_stats=self._direct_disable_log_stats,
-                    tensor_parallel_size=1,
-                    enable_lora=self._direct_enable_lora,
-                    max_loras=self._direct_max_loras,
-                    max_lora_rank=self._direct_max_lora_rank,
-                    max_cpu_loras=self._direct_max_cpu_loras,
-                )
-                usage_context = UsageContext.OPENAI_API_SERVER
-                vllm_config = direct_engine_args.create_engine_config(usage_context=usage_context)
-                fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
-                kwargs = {}
-                if "disable_log_stats" in fn_args:
-                    kwargs["disable_log_stats"] = self._direct_disable_log_stats
-                if "enable_log_requests" in fn_args:
-                    kwargs["enable_log_requests"] = False
-                engine_client = AsyncLLM.from_vllm_config(
-                    vllm_config=vllm_config,
-                    usage_context=usage_context,
-                    **kwargs,
-                )
-                self.engine = engine_client
-                return True
-
-        for name in (
-            "_progress_meta",
-            "_bind_traceparent",
-            "_update_progress",
-            "get_rss_bytes",
-            "is_engine_ready",
-            "is_ready",
-            "_ensure_pack_moe_patched",
-            "_maybe_ensure_pack_moe_patched_for_adapter_dir",
-            "_maybe_ensure_pack_moe_patched_for_state_dict",
-            "add_lora",
-            "add_lora_from_tensors",
-            "list_loras",
-            "remove_lora",
-            "add_lora_with_id",
-            "add_lora_from_path",
-            "generate_with_lora",
-            "generate_base",
-            "compute_prompt_logprobs_with_lora",
-            "compute_prompt_topk_with_lora",
-            "compute_prompt_logprobs_base",
-            "compute_prompt_topk_base",
-        ):
-            setattr(SingleGpuDirectVLLMActor, name, getattr(ExtendedVLLMHttpServer, name))
-        return ray.remote(num_cpus=1)(SingleGpuDirectVLLMActor)
-
     # Apply ray.remote() dynamically, like verl does
     return ray.remote(num_cpus=1)(ExtendedVLLMHttpServer)
 
@@ -2475,7 +2341,6 @@ class VerlInferenceEngine:
         ExtendedVLLMHttpServer = _create_extended_server_class(
             max_loras=max_loras,
             max_cpu_loras=max_cpu_loras,
-            single_gpu_direct=(total_gpus == 1),
         )
         max_model_len = cfg.max_model_len
         max_num_seqs = cfg.max_num_seqs or 256
