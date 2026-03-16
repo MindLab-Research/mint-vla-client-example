@@ -12,12 +12,23 @@ import sys
 from tinker_server.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
+    checkout_runtime_env_layout,
     runtime_env_layout,
 )
 
 
 def _materialize_runtime_env(root: Path) -> None:
-    layout = runtime_env_layout(str(root))
+    layout = checkout_runtime_env_layout(str(root))
+    manifest = {
+        "runtime_env": {
+            "site_packages_dir": "site-packages",
+            "source_dir": "src",
+            "host_venv_dir": "host-venv",
+        },
+        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]["sources"],
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:
         Path(entry).mkdir(parents=True, exist_ok=True)
@@ -61,7 +72,17 @@ def test_build_runtime_pythonpath_fails_on_incomplete_root(tmp_path):
 
 def test_build_runtime_pythonpath_does_not_require_host_python(tmp_path):
     env_root = tmp_path / "runtime"
-    layout = runtime_env_layout(str(env_root))
+    layout = checkout_runtime_env_layout(str(env_root))
+    manifest = {
+        "runtime_env": {
+            "site_packages_dir": "site-packages",
+            "source_dir": "src",
+            "host_venv_dir": "host-venv",
+        },
+        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]["sources"],
+    }
+    env_root.mkdir(parents=True, exist_ok=True)
+    (env_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:
         Path(entry).mkdir(parents=True, exist_ok=True)
@@ -133,7 +154,7 @@ def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
             rel_str = str(rel).strip()
             suffix = "" if rel_str in ("", ".") else f"/{rel_str}"
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
-    layout = runtime_env_layout("/tmp/runtime")
+    layout = checkout_runtime_env_layout("/tmp/runtime")
     assert list(layout.pythonpath_entries[1:]) == expected
 
 
@@ -147,7 +168,7 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
             rel_str = str(rel).strip()
             suffix = "" if rel_str in ("", ".") else f"/{rel_str}"
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
-    layout = runtime_env_layout("/tmp/runtime")
+    layout = checkout_runtime_env_layout("/tmp/runtime")
     assert list(layout.host_pythonpath_entries) == expected
 
 
@@ -182,6 +203,11 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
     assert list(layout.host_pythonpath_entries) == [
         str(env_root / "src" / "HostOnlySource"),
     ]
+
+
+def test_runtime_env_layout_requires_manifest(tmp_path):
+    with pytest.raises(RuntimeError, match="missing manifest.json"):
+        runtime_env_layout(str(tmp_path / "runtime"))
 
 
 def test_config_import_does_not_require_runtime_root():

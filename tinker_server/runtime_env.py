@@ -61,79 +61,62 @@ class RuntimeEnvSettings:
     host_sources: tuple[tuple[str, tuple[str, ...]], ...]
 
 
+def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    deduped: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for entry in entries:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        deduped.append(entry)
+    return tuple(deduped)
+
+
+def _settings_from_runtime_metadata(runtime: Mapping[str, object], sources: Sequence[Mapping[str, object]]) -> RuntimeEnvSettings:
+    shared_entries: list[tuple[str, tuple[str, ...]]] = []
+    host_entries: list[tuple[str, tuple[str, ...]]] = []
+    for source in sources:
+        if "name" not in source:
+            raise RuntimeError(f"runtime source missing name: {source!r}")
+        name = str(source["name"])
+        bucket = host_entries if bool(source.get("host_only", False)) else shared_entries
+        for rel in source.get("pythonpath", ["."]):
+            rel_str = str(rel).strip()
+            parts = () if rel_str in ("", ".") else tuple(part for part in rel_str.split("/") if part)
+            bucket.append((name, parts))
+    return RuntimeEnvSettings(
+        site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
+        source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
+        host_venv_dir=str(runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)),
+        sources=_dedupe(shared_entries),
+        host_sources=_dedupe(host_entries),
+    )
+
+
 @lru_cache(maxsize=1)
-def _runtime_env_settings() -> RuntimeEnvSettings:
+def _checkout_runtime_env_settings() -> RuntimeEnvSettings:
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
     runtime = data["tool"]["tinker"]["runtime_env"]
-    shared_entries: list[tuple[str, tuple[str, ...]]] = []
-    host_entries: list[tuple[str, tuple[str, ...]]] = []
-    for source in runtime["sources"]:
-        name = str(source["name"])
-        bucket = host_entries if bool(source.get("host_only", False)) else shared_entries
-        for rel in source.get("pythonpath", ["."]):
-            rel_str = str(rel).strip()
-            parts = () if rel_str in ("", ".") else tuple(part for part in rel_str.split("/") if part)
-            bucket.append((name, parts))
-
-    def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-        deduped: list[tuple[str, tuple[str, ...]]] = []
-        seen: set[tuple[str, tuple[str, ...]]] = set()
-        for entry in entries:
-            if entry in seen:
-                continue
-            seen.add(entry)
-            deduped.append(entry)
-        return tuple(deduped)
-
-    return RuntimeEnvSettings(
-        site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
-        source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
-        host_venv_dir=str(runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)),
-        sources=_dedupe(shared_entries),
-        host_sources=_dedupe(host_entries),
-    )
+    return _settings_from_runtime_metadata(runtime, runtime["sources"])
 
 
-def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings | None:
+def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings:
     manifest_path = Path(os.path.abspath(env_root)) / "manifest.json"
     if not manifest_path.exists():
-        return None
+        raise RuntimeError(f"PFS runtime env root is missing manifest.json: {manifest_path}")
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    runtime = data.get("runtime_env", {})
-    sources = data.get("sources", [])
-    shared_entries: list[tuple[str, tuple[str, ...]]] = []
-    host_entries: list[tuple[str, tuple[str, ...]]] = []
-    for source in sources:
-        name = str(source["name"])
-        bucket = host_entries if bool(source.get("host_only", False)) else shared_entries
-        for rel in source.get("pythonpath", ["."]):
-            rel_str = str(rel).strip()
-            parts = () if rel_str in ("", ".") else tuple(part for part in rel_str.split("/") if part)
-            bucket.append((name, parts))
-
-    def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-        deduped: list[tuple[str, tuple[str, ...]]] = []
-        seen: set[tuple[str, tuple[str, ...]]] = set()
-        for entry in entries:
-            if entry in seen:
-                continue
-            seen.add(entry)
-            deduped.append(entry)
-        return tuple(deduped)
-
-    return RuntimeEnvSettings(
-        site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
-        source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
-        host_venv_dir=str(runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)),
-        sources=_dedupe(shared_entries),
-        host_sources=_dedupe(host_entries),
-    )
+    runtime = data.get("runtime_env")
+    sources = data.get("sources")
+    if not isinstance(runtime, dict):
+        raise RuntimeError(f"runtime manifest missing runtime_env table: {manifest_path}")
+    if not isinstance(sources, list) or not sources:
+        raise RuntimeError(f"runtime manifest missing sources list: {manifest_path}")
+    return _settings_from_runtime_metadata(runtime, sources)
 
 
-def runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
-    settings = _runtime_env_settings_from_manifest(env_root) or _runtime_env_settings()
+def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings) -> RuntimeEnvLayout:
     root = os.path.abspath(env_root)
     source_root = os.path.join(root, settings.source_dir)
     site_packages = os.path.join(root, settings.site_packages_dir)
@@ -153,6 +136,14 @@ def runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
         host_pythonpath_entries=tuple(host_entries),
         host_python=host_python,
     )
+
+
+def runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
+    return _layout_from_settings(env_root, _runtime_env_settings_from_manifest(env_root))
+
+
+def checkout_runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
+    return _layout_from_settings(env_root, _checkout_runtime_env_settings())
 
 
 def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = True) -> RuntimeEnvLayout:

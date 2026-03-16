@@ -760,7 +760,7 @@ ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv
 # WRONG: Guessing actor name and concluding "DEAD" if not found
 # RIGHT: List first, then check with exact name from list
 
-ssh mint-dev 'python3 -c "
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c "
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
 
@@ -776,16 +776,16 @@ for a in actors:
 
 ```bash
 # Get actor ID from ray list actors output, then:
-ssh mint-dev 'ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
 
 # Example with actual ID:
-ssh mint-dev 'ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
 ```
 
 ### List Dead Actors (for crash investigation)
 
 ```bash
-ssh mint-dev 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --filter "state=DEAD" 2>&1 | head -30'
 ```
 
 ---
