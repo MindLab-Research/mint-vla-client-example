@@ -5,6 +5,10 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config_file import TinkerConfigFile
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -439,6 +443,11 @@ class ServerConfig:
                 "TINKER_MAX_CPU_LORAS", file_server.max_cpu_loras if file_server is not None else None, 1024
             ),
             max_lora_rank=_pick_int("TINKER_MAX_LORA_RANK", file_server.max_lora_rank if file_server is not None else None, 64),
+            vllm_attention_backend=_pick_str(
+                "TINKER_VLLM_ATTENTION_BACKEND",
+                file_server.vllm_attention_backend if file_server is not None else None,
+                "DUAL_CHUNK_FLASH_ATTN",
+            ),
             # Sampling settings
             sampling_max_inflight_sample_tasks=_pick_int(
                 "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
