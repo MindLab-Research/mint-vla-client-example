@@ -1,8 +1,8 @@
 # Ray Head Node - CPU only, persistent
 # Submit with: volc ml_task submit -c ray_head.yaml --output json
 
-TaskName: "ray-head"
-Description: "Ray head node - CPU only, long-running"
+TaskName: "mint-dev-head"
+Description: "mint-dev-head cpu task"
 
 Entrypoint: |
   set -euo pipefail
@@ -27,7 +27,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:15-sm80"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
 ResourceQueueID: "q-20251225183621-m2297"  # CPU queue
 Framework: "Custom"
 

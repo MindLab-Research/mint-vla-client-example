@@ -42,3 +42,16 @@ def test_issue_301_actor_entrypoints_call_observability_init():
         text = (repo_root / rel_path).read_text(encoding="utf-8")
         got = text.count("init_actor_observability()")
         assert got >= min_count, f"{rel_path} should contain >= {min_count} init_actor_observability() calls, got {got}"
+
+
+def test_issue_301_sampling_actor_entrypoints_use_traceparent_span_decorator():
+    repo_root = Path(__file__).resolve().parents[1]
+    required = {
+        "tinker_server/backend/verl_inference.py": 7,
+        "tinker_server/backend/multinode_inference.py": 4,
+    }
+
+    for rel_path, min_count in required.items():
+        text = (repo_root / rel_path).read_text(encoding="utf-8")
+        got = text.count("@traced_async_from_traceparent(")
+        assert got >= min_count, f"{rel_path} should contain >= {min_count} traced actor entrypoints, got {got}"

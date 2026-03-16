@@ -60,7 +60,7 @@ def test_capabilities():
 
             # Check sorting (ascending by num_parameters)
             if prev_params is not None and num_params < prev_params:
-                print(f"FAIL: Models not sorted by num_parameters")
+                print("FAIL: Models not sorted by num_parameters")
                 print(f"  Previous: {prev_params}B, Current: {num_params}B")
                 return False
 

@@ -36,10 +36,11 @@ from ..logging_context import (
 logger = logging.getLogger(__name__)
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, PFS_TINKER_PATH, RAY_NAMESPACE
 from tinker_server.backend.model_registry import get_model_config
 from tinker_server.ray_utils import init_ray
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
+from tinker_server.backend.volc_placement import assert_node_ip_capacity, parse_model_node_ip_list
 
 # Persistent actor configuration
 PERSISTENT_NAMESPACE = RAY_NAMESPACE  # Same namespace as vLLM
@@ -116,49 +117,25 @@ def _model_key_from_base_model(base_model: str) -> str:
 
 
 def _preferred_worker_node_ips_for_model(base_model: str) -> list[str]:
-    raw = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "").strip()
-    source = "MINT_MEGATRON_MODEL_NODE_IPS_JSON"
-    if not raw:
-        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
-        source = "MINT_MODEL_NODE_IPS_JSON"
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-    except Exception:
-        logger.warning("%s is not valid JSON; ignoring", source)
-        return []
-    if not isinstance(data, dict):
-        logger.warning("%s must be a JSON object; ignoring", source)
-        return []
-
     model_key = _model_key_from_base_model(base_model)
-    candidates = None
-    for key in (model_key, model_key.lower(), base_model, base_model.lower()):
-        value = data.get(key)
-        if value is not None:
-            candidates = value
-            break
-    if not isinstance(candidates, list):
+    lookup_keys = [model_key, model_key.lower(), base_model, base_model.lower()]
+    node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON"),
+        lookup_keys=lookup_keys,
+        env_var_name="MINT_MEGATRON_MODEL_NODE_IPS_JSON",
+        context=f"[MegatronWorkerGroup] node pinning model={model_key}",
+    )
+    if not node_ips:
+        node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+        lookup_keys=[model_key, model_key.lower(), base_model, base_model.lower()],
+        env_var_name="MINT_MODEL_NODE_IPS_JSON",
+        context=f"[MegatronWorkerGroup] node pinning model={model_key}",
+        )
+    if not node_ips:
         return []
-
-    cleaned = [str(ip).strip() for ip in candidates if str(ip).strip()]
-    if not cleaned:
-        return []
-
-    try:
-        cluster = ray.cluster_resources() or {}
-    except Exception:
-        cluster = {}
-    usable = [ip for ip in cleaned if f"node:{ip}" in cluster]
-    if not usable:
-        logger.warning(f"[MegatronWorkerGroup] node pinning has no usable node IPs for model={model_key}")
-        return []
-    if len(usable) < len(cleaned):
-        skipped = [ip for ip in cleaned if ip not in usable]
-        logger.warning(f"[MegatronWorkerGroup] node pinning skipped missing nodes for model={model_key}: {skipped}")
-    logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {usable}")
-    return usable
+    logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {node_ips}")
+    return node_ips
 
 
 def _make_megatron_actor_name(base_model: str) -> str:
@@ -1092,12 +1069,13 @@ class MegatronRankWorker:
 
         self._current_session_id = new_session_id
 
-    def clear_session_state(self, session_id: str) -> None:
+    def clear_session_state(self, session_id: str, traceparent: str | None = None) -> None:
         """Clear saved state for a session (call after session completes).
 
         Args:
             session_id: Session ID to clear.
         """
+        self._bind_traceparent(traceparent)
         if session_id in self._session_gradients:
             del self._session_gradients[session_id]
         if session_id in self._session_optimizer_states:
@@ -2359,14 +2337,18 @@ class MegatronRankWorker:
             )
             try:
 
-                # DEBUG: Check optimizer state size BEFORE step
+                # Optional diagnostics only. Missing Megatron optimizer modules must not
+                # change optim_step semantics.
                 if self.rank == 0:
-                    from megatron.core.optimizer import ChainedOptimizer
+                    try:
+                        from megatron.core.optimizer import ChainedOptimizer
+                    except ModuleNotFoundError:
+                        ChainedOptimizer = None
 
                     optimizer = self.engine.optimizer
                     if optimizer is not None:
                         def iter_optimizers(opt):
-                            if isinstance(opt, ChainedOptimizer):
+                            if ChainedOptimizer is not None and isinstance(opt, ChainedOptimizer):
                                 return opt.chained_optimizers
                             return [opt]
 
@@ -4257,7 +4239,6 @@ class MegatronRankWorker:
             Dict with training metadata (rank 0 only, others return empty).
         """
         self._bind_traceparent(traceparent)
-        import json
         import os
         import torch
 
@@ -4355,7 +4336,6 @@ class MegatronRankWorker:
         are not required for sampling and can exceed memory/time budgets on large MoE models.
         """
         self._bind_traceparent(traceparent)
-        import json
         import os
 
         from safetensors.torch import save_file
@@ -4437,8 +4417,13 @@ class MegatronRankWorker:
             return {"status": "ok", "optimizer_file": optimizer_file}
         return {}
 
-    def check_optimizer_state_exists(self, checkpoint_path: str) -> dict:
+    def check_optimizer_state_exists(
+        self,
+        checkpoint_path: str,
+        traceparent: str | None = None,
+    ) -> dict:
         """Check whether this rank's optimizer shard exists on shared storage."""
+        self._bind_traceparent(traceparent)
         import os
 
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
@@ -4902,6 +4887,14 @@ class MegatronWorkerGroup:
                         f"need {nodes_needed} nodes for world_size={world_size}, got {len(preferred_node_ips)}"
                     )
                 node_ips = preferred_node_ips[:nodes_needed]
+                required_by_node_ip: dict[str, int] = {}
+                for i in range(world_size):
+                    node_ip = node_ips[i // int(gpus_per_node)]
+                    required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
+                assert_node_ip_capacity(
+                    required_gpus_by_node_ip=required_by_node_ip,
+                    context=f"[MegatronWorkerGroup] node pinning base_model={self.base_model}",
+                )
                 bundles = build_node_affinity_gpu_bundles(
                     node_ips=node_ips,
                     gpus_per_node=gpus_per_node,
@@ -4938,10 +4931,11 @@ class MegatronWorkerGroup:
             is_mla = False
             disable_nccl_ib = False
 
-        from ..config import otel_env_vars
+        from ..config import actor_runtime_env_vars, otel_env_vars
         runtime_env = {
-            "env_vars": {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -4955,7 +4949,8 @@ class MegatronWorkerGroup:
                 "NVTE_FUSED_ATTN": "0" if is_mla else "1",
                 "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
                 **otel_env_vars(),
-            },
+                },
+            ),
         }
 
         # Forward MoE LoRA export knobs into rank workers.
@@ -5962,7 +5957,6 @@ class MegatronWorkerGroup:
             Dict with load metadata.
         """
         self._bind_traceparent(traceparent)
-        import json
         import os
 
         effective_session_id = self._resolve_required_session_id(
@@ -6510,7 +6504,6 @@ def get_or_create_megatron_worker_group(
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6617,19 +6610,21 @@ def get_or_create_megatron_worker_group(
         resource_pool.reserve_gpus(num_gpus)
 
         try:
-            from ..config import otel_env_vars
+            from ..config import actor_runtime_env_vars, otel_env_vars
 
             # Runtime env for PFS code access
             runtime_env = {
-                "env_vars": {
-                    "PYTHONPATH": PFS_PYTHONPATH,
+                "env_vars": actor_runtime_env_vars(
+                    pythonpath=PFS_PYTHONPATH,
+                    extra={
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     **otel_env_vars(),
-                }
+                    },
+                )
             }
 
             # Forward MoE LoRA export knobs into the detached Megatron actor so the
@@ -6769,7 +6764,6 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6863,7 +6857,6 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
     """
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

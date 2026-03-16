@@ -18,7 +18,7 @@ import ray
 
 from . import ray_kill
 from .resource_pool import ActorType, get_resource_pool
-from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 logger = logging.getLogger(__name__)
 
@@ -222,17 +222,19 @@ def get_or_create_dense_trainer(
 
             if actor is None:
                 pool.ensure_gpus_available(DEFAULT_NUM_GPUS)
-                from ..config import otel_env_vars
+                from ..config import actor_runtime_env_vars, otel_env_vars
                 runtime_env = {
-                    "env_vars": {
-                        "PYTHONPATH": PFS_PYTHONPATH_DENSE,
+                    "env_vars": actor_runtime_env_vars(
+                        pythonpath=PFS_PYTHONPATH_DENSE,
+                        extra={
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
                         "TRANSFORMERS_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                         **otel_env_vars(),
-                    }
+                        },
+                    )
                 }
                 pg = _get_or_create_pg(actor_name, model_key=name_key, base_model=base_model)
                 actor = training_worker_cls.options(

@@ -68,38 +68,10 @@ def _ray_future_tombstone_ttl_s() -> float:
     return float(getattr(server_config, "future_store_tombstone_ttl_s", 300.0))
 
 
-def _infer_ray_address() -> str | None:
-    """Infer Ray GCS address for remote clusters.
+def _require_ray_address() -> str:
+    from ..ray_utils import require_ray_address
 
-    Prefer explicit RAY_ADDRESS. Fall back to ray_head_ip.txt on shared storage
-    (Volcano writes the canonical head IP there).
-    """
-    addr = (os.environ.get("RAY_ADDRESS") or "").strip()
-    if addr:
-        return addr
-
-    candidates: list[str] = []
-    pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
-    if pfs_tinker_path:
-        candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
-    candidates.extend(
-        [
-            # Common prod/dev code roots on PFS
-            "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
-            "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
-            # Local repo fallback (useful for workstation tunnels)
-            os.path.join(os.getcwd(), "ray_head_ip.txt"),
-        ]
-    )
-
-    for p in candidates:
-        try:
-            ip = open(p, "r", encoding="utf-8").read().strip()
-        except OSError:
-            continue
-        if ip:
-            return f"{ip}:6379"
-    return None
+    return require_ray_address()
 
 
 def _get_or_create_ray_actor():
@@ -554,8 +526,13 @@ def _get_or_create_ray_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
 
     try:
         return _RayFutureStoreActor.options(
@@ -600,8 +577,7 @@ class FutureStore:
             try:
                 from ..ray_utils import init_ray
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
 
@@ -628,7 +604,7 @@ class FutureStore:
 
             out["ray_initialized"] = bool(ray.is_initialized())
             if not ray.is_initialized():
-                out["ray_address_inferred"] = _infer_ray_address()
+                out["ray_address"] = _require_ray_address()
                 return out
 
             try:

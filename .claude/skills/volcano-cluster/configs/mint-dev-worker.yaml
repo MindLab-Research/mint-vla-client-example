@@ -8,8 +8,8 @@
 #
 # Submit with: volc ml_task submit -c mint-dev-worker.yaml --output json
 
-TaskName: "ray-worker"
-Description: "Ray GPU worker - A800, joins dev cluster"
+TaskName: "mint-dev-worker"
+Description: "mint-dev-worker 8-gpu worker"
 
 Entrypoint: |
   export HF_HUB_OFFLINE=1
@@ -43,7 +43,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:15-sm80"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
 ResourceQueueID: "<GPU_QUEUE_ID>"  # Set explicitly before submit. If only prod GPU queues are available, get user approval.
 Framework: "Custom"
 

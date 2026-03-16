@@ -8,12 +8,10 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
@@ -34,12 +32,11 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import futures, internal, sampling, service, training, weights
+from .routes import futures, internal, openai_compat, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
     from .backend.multi_lora_engine import MultiModelInferenceManager
-    from .backend.training_session_manager import TrainingSessionManager
     from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
@@ -78,7 +75,6 @@ async def _cleanup_stale_actors() -> None:
 
         if not ray.is_initialized():
             init_ray(
-                address="auto",
                 namespace=PERSISTENT_NAMESPACE,
                 ignore_reinit_error=True,
             )
@@ -162,7 +158,7 @@ async def _cleanup_stale_actors() -> None:
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
-                        num_gpus = 1  # Fallback for unknown models
+                        num_gpus: int | None = None
                         if name.startswith("tinker_vllm_"):
                             model_part = name[len("tinker_vllm_"):]
                         else:
@@ -172,6 +168,11 @@ async def _cleanup_stale_actors() -> None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored vLLM actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -180,13 +181,12 @@ async def _cleanup_stale_actors() -> None:
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
                         base_model = ""
+                        num_gpus: int | None = None
                         model_part = name[len("megatron_"):]
                         model_name, cfg = _lookup_model_config(model_part)
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.train_gpus
-                        else:
-                            num_gpus = 8  # Fallback for unknown models
 
                         # Prefer real world_size when actor is responsive.
                         try:
@@ -196,6 +196,11 @@ async def _cleanup_stale_actors() -> None:
                         except Exception:
                             pass
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
@@ -253,7 +258,7 @@ async def _cleanup_stale_actors() -> None:
 
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
-                            num_gpus = 1
+                            num_gpus: int | None = None
                             base_model = ""
                             if name.startswith("tinker_vllm_"):
                                 model_part = name[len("tinker_vllm_"):]
@@ -264,6 +269,11 @@ async def _cleanup_stale_actors() -> None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored vLLM actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -271,14 +281,18 @@ async def _cleanup_stale_actors() -> None:
                         elif name.startswith("megatron_"):
                             actor_type = ActorType.MEGATRON
                             base_model = ""
+                            num_gpus: int | None = None
                             model_part = name[len("megatron_"):]
                             model_name, cfg = _lookup_model_config(model_part)
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.train_gpus
-                            else:
-                                num_gpus = 8
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored Megatron actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
@@ -344,6 +358,15 @@ async def _prewarm_persistent_models(
 
     and marks them as ResourcePool protected to prevent LRU eviction.
     """
+    failures: list[str] = []
+
+    def _record_failure(stage: str, model_name: str, exc: Exception) -> None:
+        failures.append(f"{stage} failed model={model_name}: {type(exc).__name__}: {exc}")
+
+    def _raise_if_failures() -> None:
+        if failures:
+            raise RuntimeError("persistent prewarm failed:\n" + "\n".join(failures))
+
     models_csv = (config.prewarm_persistent_models_csv or "").strip()
     if not models_csv:
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
@@ -380,6 +403,51 @@ async def _prewarm_persistent_models(
                 pinned_vllm_node_ip = {str(k): str(v) for k, v in parsed.items()}
         except Exception:
             pinned_vllm_node_ip = {}
+
+    def _preferred_pg_node_id(pg_name: str, model_name: str) -> str | None:
+        preferred_ips: list[str] = []
+        for env_name in ("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "MINT_MODEL_NODE_IPS_JSON"):
+            raw = os.environ.get(env_name, "").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            selected = None
+            for key in (model_name, model_name.lower()):
+                selected = data.get(key)
+                if selected is not None:
+                    break
+            if isinstance(selected, list):
+                preferred_ips.extend(str(ip).strip() for ip in selected if str(ip).strip())
+            if preferred_ips:
+                break
+
+        node_ip_by_id = {
+            str(n.get("NodeID") or ""): str(n.get("NodeManagerAddress") or "").strip()
+            for n in ray.nodes()
+            if n.get("Alive")
+        }
+        candidate_node_ids: list[str] = []
+        for info in ray.util.placement_group_table().values():
+            if info.get("state") != "CREATED" or info.get("name") != pg_name:
+                continue
+            bundles_to_node_id = info.get("bundles_to_node_id") or {}
+            for node_id in bundles_to_node_id.values():
+                node_id_str = str(node_id or "").strip()
+                if node_id_str:
+                    candidate_node_ids.append(node_id_str)
+        if not candidate_node_ids:
+            return None
+        if preferred_ips:
+            for node_id in candidate_node_ids:
+                if node_ip_by_id.get(node_id) in preferred_ips:
+                    return node_id
+            return None
+        return candidate_node_ids[0]
 
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
@@ -467,15 +535,7 @@ async def _prewarm_persistent_models(
                             node_id = None
                             deadline = time.monotonic() + 30.0
                             while time.monotonic() < deadline and not node_id:
-                                pg_table = ray.util.placement_group_table()
-                                for info in pg_table.values():
-                                    if info.get("state") != "CREATED":
-                                        continue
-                                    if info.get("name") != pg_name:
-                                        continue
-                                    node_id = (info.get("bundles_to_node_id") or {}).get(0)
-                                    if node_id:
-                                        break
+                                node_id = _preferred_pg_node_id(pg_name, model_name)
                                 if not node_id:
                                     await asyncio.sleep(0.5)
                             if node_id:
@@ -493,37 +553,31 @@ async def _prewarm_persistent_models(
                                 f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
                             )
 
-                    async def _await_ready(
-                        actor=actor,
-                        actor_name=actor_name,
-                        model_name=model_name,
-                    ) -> None:
-                        try:
-                            await asyncio.to_thread(
-                                ray.get,
-                                actor.__ray_ready__.remote(),
-                                timeout=megatron_ready_timeout_s,
-                            )
-                            resource_pool.mark_ready(actor_name)
-                            logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-                        except SystemExit as ready_err:
-                            if getattr(ready_err, "code", None) == 15:
-                                raise
-                            logger.warning(
-                                f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
-                            )
-                        except Exception as ready_err:
-                            logger.warning(
-                                f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
-                            )
-
-                    asyncio.create_task(_await_ready())
+                    try:
+                        await asyncio.to_thread(
+                            ray.get,
+                            actor.__ray_ready__.remote(),
+                            timeout=megatron_ready_timeout_s,
+                        )
+                        resource_pool.mark_ready(actor_name)
+                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                    except SystemExit as ready_err:
+                        if getattr(ready_err, "code", None) == 15:
+                            raise
+                        raise RuntimeError(
+                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
+                        ) from ready_err
+                    except Exception as ready_err:
+                        raise RuntimeError(
+                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
+                        ) from ready_err
                 else:
                     # Defer dense pool creation until after multi-node vLLM inference is initialized,
                     # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
                     deferred_dense_training.append((model_name, base_model))
                     logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
             except Exception as e:
+                _record_failure("training", model_name, e)
                 logger.exception(f"[prewarm] training failed model={model_name}: {e}")
         else:
             logger.info(f"[prewarm] training skipped model={model_name} (MINT_PERSISTENT_PREWARM_TRAINING=0)")
@@ -540,9 +594,11 @@ async def _prewarm_persistent_models(
         # actors (e.g., Qwen3-30B TP=4) can be placed.
 
     if not prewarm_inference:
+        _raise_if_failures()
         return
 
     if multi_model_manager is None:
+        _raise_if_failures()
         return
 
     def _infer_gpus(model_name: str) -> int:
@@ -619,8 +675,10 @@ async def _prewarm_persistent_models(
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
                 raise
+            _record_failure("inference", model_name, e)
             logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
         except Exception as e:
+            _record_failure("inference", model_name, e)
             logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
 
     # -------------------------
@@ -646,7 +704,10 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
+                _record_failure("training", model_name, e)
                 logger.exception(f"[prewarm] training failed model={model_name} backend=peft_trainer: {e}")
+
+    _raise_if_failures()
 
 
 @asynccontextmanager
@@ -661,7 +722,12 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
-    from .checkpoints import get_checkpoint_reap_interval_s, reap_runtime_checkpoints
+    from .checkpoints import (
+        get_checkpoint_mirror_poll_s,
+        get_checkpoint_reap_interval_s,
+        process_pending_checkpoint_mirrors,
+        reap_runtime_checkpoints,
+    )
 
     future_store.ensure_ready()
 
@@ -745,6 +811,11 @@ async def lifespan(app: FastAPI):
     weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
 
     logger.info("Training components initialized")
+
+    # ==========================================================================
+    # Persistent actors: pre-create and protect at startup
+    # ==========================================================================
+    await _prewarm_persistent_models(train_engine, multi_model_manager)
 
     # ==========================================================================
     # Issue #84: Admission control + API work queue workers + future reaper
@@ -1053,10 +1124,21 @@ async def lifespan(app: FastAPI):
 
     checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
 
-    # ==========================================================================
-    # Persistent actors: pre-create and protect at startup
-    # ==========================================================================
-    asyncio.create_task(_prewarm_persistent_models(train_engine, multi_model_manager))
+    async def _checkpoint_mirror_loop() -> None:
+        while True:
+            try:
+                mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
+                if mirrored["mirrored"] or mirrored["failed"]:
+                    logger.info(
+                        "checkpoint mirror processed mirrored=%s failed=%s",
+                        len(mirrored["mirrored"]),
+                        len(mirrored["failed"]),
+                    )
+            except Exception:
+                logger.exception("checkpoint mirror loop failed")
+            await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+
+    checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
 
     yield
 
@@ -1065,7 +1147,13 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     future_reaper_task.cancel()
     checkpoint_reaper_task.cancel()
-    await asyncio.gather(future_reaper_task, checkpoint_reaper_task, return_exceptions=True)
+    checkpoint_mirror_task.cancel()
+    await asyncio.gather(
+        future_reaper_task,
+        checkpoint_reaper_task,
+        checkpoint_mirror_task,
+        return_exceptions=True,
+    )
     await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 
@@ -1084,7 +1172,6 @@ async def lifespan(app: FastAPI):
 
     await close_usage_store()
 
-    from .gateway import close_http_clients
 
     await close_http_clients()
 
@@ -1420,6 +1507,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
 @app.get("/")

@@ -267,7 +267,7 @@ class TestMoELongContext:
         sample_result = sample(model_id, tokens[:100], max_tokens=10, temperature=0.0)
         assert "error" not in sample_result, f"Sampling after long training failed: {sample_result.get('error')}"
 
-        print(f"MoE long context training PASS: trained and sampled successfully")
+        print("MoE long context training PASS: trained and sampled successfully")
 
         anomalies: list[str] = []
         if loss <= 0:

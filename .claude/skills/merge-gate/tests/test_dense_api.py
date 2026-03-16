@@ -13,8 +13,6 @@ Pass criteria: All API operations complete without error.
 import time
 import uuid
 
-import numpy as np
-import pytest
 
 from .conftest import (
     DENSE_MODEL,

@@ -8,7 +8,6 @@ Supports GPU slots with CPU cache for overflow (LRU eviction).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -18,9 +17,20 @@ from typing import TYPE_CHECKING
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from tinker_server.backend.model_registry import get_model_config
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
+from tinker_server.ray_utils import init_ray
+
 from . import ray_kill
-from .lora_registry import LoRARegistry, LoRASlotInfo
+from .lora_registry import LoRARegistry
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_node_ip_list,
+    parse_model_single_node_ip,
+)
 
 if TYPE_CHECKING:
     pass
@@ -56,17 +66,8 @@ def _read_process_env_var(name: str) -> str:
 # Well-known name for persistent vLLM actor
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
-# Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
-from tinker_server.config import config as server_config
-from tinker_server.logging_context import get_current_traceparent
-from tinker_server.ray_utils import init_ray
-
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
-
-# Import model registry
-from tinker_server.backend.model_registry import get_model_config
 
 
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
@@ -146,6 +147,8 @@ class MultiLoRAInferenceEngine:
         self.server = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._path_load_lock = asyncio.Lock()
+        self._path_load_futures: dict[str, asyncio.Future[None]] = {}
 
     async def initialize(self) -> None:
         """Initialize the shared vLLM engine with multi-LoRA support.
@@ -160,7 +163,6 @@ class MultiLoRAInferenceEngine:
             if not ray.is_initialized():
                 # Use fixed namespace so detached actors can be found across process restarts
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -282,7 +284,7 @@ class MultiLoRAInferenceEngine:
                 )
 
             from verl.workers.config.model import HFModelConfig
-            from verl.workers.config.rollout import RolloutConfig
+            from verl.workers.config.rollout import CheckpointEngineConfig, RolloutConfig
             from verl.workers.rollout.replica import RolloutMode
 
             from .verl_inference import _create_extended_server_class
@@ -374,6 +376,7 @@ class MultiLoRAInferenceEngine:
                 data_parallel_size=1,
                 expert_parallel_size=1,
                 engine_kwargs=engine_kwargs,
+                checkpoint_engine=CheckpointEngineConfig(backend="naive"),
                 quantization=self.quantization,
                 enable_rollout_routing_replay=enable_rollout_routing_replay,
             )
@@ -399,13 +402,18 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ..config import otel_env_vars
-            env_vars = {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            env_vars = actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
+                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 **otel_env_vars(),
-            }
+                },
+            )
+            env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
 
@@ -445,19 +453,20 @@ class MultiLoRAInferenceEngine:
                     self.actor_name,
                 )
 
+            remote_kwargs = {
+                "config": rollout_config,
+                "model_config": model_config,
+                "rollout_mode": RolloutMode.STANDALONE,
+                "workers": [],
+                "replica_rank": 0,
+                "node_rank": 0,
+                "gpus_per_node": total_gpus,
+                "nnodes": 1,
+                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
+            }
             self.server = ExtendedVLLMHttpServer.options(
                 **actor_options,
-            ).remote(
-                config=rollout_config,
-                model_config=model_config,
-                rollout_mode=RolloutMode.STANDALONE,
-                workers=[],
-                replica_rank=0,
-                node_rank=0,
-                gpus_per_node=total_gpus,
-                nnodes=1,
-                cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
-            )
+            ).remote(**remote_kwargs)
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
             # This allows the server to remain responsive during vLLM initialization.
@@ -599,7 +608,7 @@ class MultiLoRAInferenceEngine:
         traceparent = get_current_traceparent()
         print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
-            print(f"[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
+            print("[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
             ref = self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
@@ -607,7 +616,7 @@ class MultiLoRAInferenceEngine:
                 traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-            print(f"[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
+            print("[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
             print(f"[DEBUG add_lora_for_session] RayActorError/GetTimeoutError: {e}", flush=True)
@@ -667,9 +676,34 @@ class MultiLoRAInferenceEngine:
             )
             return existing_lora_id
 
-        # Allocate unique ID for this session
-        lora_id = await self.registry.allocate(sampling_session_id)
-        allocated = True
+        # Allocate or reuse a shared LoRA ID for this adapter path. Coordinate
+        # concurrent first-use requests so later sessions do not observe the
+        # shared lora_int_id before the initial add_lora_from_path finishes.
+        async with self._path_load_lock:
+            lora_id, is_new_load = await self.registry.allocate_for_path(
+                sampling_session_id, lora_path
+            )
+            allocated = is_new_load
+            load_future = self._path_load_futures.get(lora_path)
+            if is_new_load:
+                loop = asyncio.get_running_loop()
+                load_future = loop.create_future()
+                self._path_load_futures[lora_path] = load_future
+
+        if not is_new_load:
+            if load_future is not None and not load_future.done():
+                try:
+                    await load_future
+                except Exception:
+                    await self.registry.remove_session(sampling_session_id)
+                    raise
+            logger.info(
+                "Reused LoRA for session %s from path (lora_int_id=%s path=%s)",
+                sampling_session_id,
+                lora_id,
+                lora_path,
+            )
+            return lora_id
 
         # Check if we need to evict from GPU
         current_count = await self.registry.count()
@@ -684,44 +718,66 @@ class MultiLoRAInferenceEngine:
         start_time = time.time()
         traceparent = get_current_traceparent()
         print(f"[DEBUG add_lora_for_session_from_path] Loading from path: {lora_path}", flush=True)
+
+        async def _load_from_actor() -> None:
+            try:
+                ref = self.server.add_lora_from_path.remote(
+                    lora_int_id=lora_id,
+                    lora_path=lora_path,
+                    lora_name=sampling_session_id,
+                    traceparent=traceparent,
+                )
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                print("[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
+            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+                print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
+                self._initialized = False
+                self.server = None
+                await self.initialize()
+                ref = self.server.add_lora_from_path.remote(
+                    lora_int_id=lora_id,
+                    lora_path=lora_path,
+                    lora_name=sampling_session_id,
+                    traceparent=traceparent,
+                )
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+
         try:
-            ref = self.server.add_lora_from_path.remote(
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                lora_name=sampling_session_id,
-                traceparent=traceparent,
+            await run_async_with_otel_span(
+                "sampling.multi_lora.add_lora_from_path",
+                _load_from_actor,
+                component="multi_lora_engine",
+                op="sampling.add_lora_from_path",
+                request_id=sampling_session_id,
+                attributes={
+                    "actor_name": self.actor_name,
+                    "sampling_session_id": sampling_session_id,
+                },
             )
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-            print(f"[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
-        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
-            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
-            print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
-            self._initialized = False
-            self.server = None
-            await self.initialize()
-            # Retry after restart
-            ref = self.server.add_lora_from_path.remote(
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                lora_name=sampling_session_id,
-                traceparent=traceparent,
-            )
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             print(f"[DEBUG add_lora_for_session_from_path] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
             import traceback
             traceback.print_exc()
             if allocated:
                 try:
-                    await self.registry.remove(lora_id)
+                    await self.registry.remove_session(sampling_session_id)
                 except Exception as cleanup_e:
                     logger.warning(
-                        "Failed to roll back lora_int_id=%s after add_lora failure: %s: %s",
-                        lora_id,
+                        "Failed to roll back session=%s after add_lora failure: %s: %s",
+                        sampling_session_id,
                         type(cleanup_e).__name__,
                         cleanup_e,
                     )
+            if load_future is not None and not load_future.done():
+                load_future.set_exception(e)
+            async with self._path_load_lock:
+                self._path_load_futures.pop(lora_path, None)
             raise
+        if load_future is not None and not load_future.done():
+            load_future.set_result(None)
+        async with self._path_load_lock:
+            self._path_load_futures.pop(lora_path, None)
         load_time = time.time() - start_time
 
         logger.info(
@@ -774,50 +830,66 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
         traceparent = get_current_traceparent()
 
-        if lora_id is not None:
-            # Generate with session-specific LoRA
-            logger.info(
-                "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
-                request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
-            )
-            ref = self.server.generate_with_lora.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                traceparent=traceparent,
-            )
-        else:
-            # Generate with base model (no LoRA)
-            logger.info(
-                "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
-                request_id, self.actor_name, len(prompt_ids), max_tokens,
-            )
-            ref = self.server.generate_base.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                traceparent=traceparent,
-            )
+        async def _dispatch_generate() -> dict:
+            if lora_id is not None:
+                logger.info(
+                    "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
+                    request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
+                )
+                ref = self.server.generate_with_lora.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    lora_int_id=lora_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    traceparent=traceparent,
+                )
+            else:
+                logger.info(
+                    "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
+                    request_id, self.actor_name, len(prompt_ids), max_tokens,
+                )
+                ref = self.server.generate_base.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    traceparent=traceparent,
+                )
 
-        t0_ray = time.time()
-        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
-        ray_elapsed = time.time() - t0_ray
-        if ray_elapsed > 30.0:
-            logger.warning(
-                "[generate slow] req=%s actor=%s ray_get_elapsed=%.1fs",
-                request_id, self.actor_name, ray_elapsed,
-            )
+            t0_ray = time.time()
+            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
+            ray_elapsed = time.time() - t0_ray
+            if ray_elapsed > 30.0:
+                logger.warning(
+                    "[generate slow] req=%s actor=%s ray_get_elapsed=%.1fs",
+                    request_id, self.actor_name, ray_elapsed,
+                )
+            return result
+
+        result = await run_async_with_otel_span(
+            "sampling.multi_lora.generate",
+            _dispatch_generate,
+            component="multi_lora_engine",
+            op="sampling.generate",
+            request_id=request_id,
+            attributes={
+                "actor_name": self.actor_name,
+                "sampling_session_id": sampling_session_id,
+                "prompt_tokens": len(prompt_ids),
+                "max_tokens": max_tokens,
+                "num_samples": 1,
+                "lora_id": lora_id,
+            },
+        )
 
         timing_total_s = result.get("_timing_total_s")
         if timing_total_s is not None:
@@ -872,40 +944,68 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
         traceparent = get_current_traceparent()
 
-        if lora_id is not None:
-            ref = self.server.generate_with_lora.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                n=num_samples,
-                traceparent=traceparent,
-            )
-        else:
-            ref = self.server.generate_base.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                n=num_samples,
-                traceparent=traceparent,
-            )
+        async def _dispatch_generate_many():
+            if lora_id is not None:
+                ref = self.server.generate_with_lora.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    lora_int_id=lora_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    n=num_samples,
+                    traceparent=traceparent,
+                )
+            else:
+                ref = self.server.generate_base.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    n=num_samples,
+                    traceparent=traceparent,
+                )
+            return await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
-        raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        raw = await run_async_with_otel_span(
+            "sampling.multi_lora.generate_many",
+            _dispatch_generate_many,
+            component="multi_lora_engine",
+            op="sampling.generate_many",
+            request_id=request_id,
+            attributes={
+                "actor_name": self.actor_name,
+                "sampling_session_id": sampling_session_id,
+                "prompt_tokens": len(prompt_ids),
+                "max_tokens": max_tokens,
+                "num_samples": num_samples,
+                "lora_id": lora_id,
+            },
+        )
+        logger.info(
+            "[generate_many result] req=%s actor=%s type=%s",
+            request_id,
+            self.actor_name,
+            type(raw).__name__,
+        )
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
         else:
             raw_list = list(raw)
+        logger.info(
+            "[generate_many result] req=%s actor=%s result_count=%d",
+            request_id,
+            self.actor_name,
+            len(raw_list),
+        )
 
         if raw_list:
             timing_total_s = raw_list[0].get("_timing_total_s")
@@ -970,45 +1070,43 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
         traceparent = get_current_traceparent()
 
-        if lora_id is not None:
-            # Compute logprobs with session-specific LoRA
-            try:
-                ref = self.server.compute_prompt_logprobs_with_lora.remote(
-                    prompt_ids=prompt_ids,
-                    request_id=request_id,
-                    lora_int_id=lora_id,
-                    traceparent=traceparent,
-                )
-                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-            except Exception as e:
-                msg = f"{type(e).__name__}: {e}"
-                if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
-                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
-                    try:
-                        from tinker_server.backend.resource_pool import get_resource_pool
+        async def _dispatch_compute_logprobs():
+            if lora_id is not None:
+                try:
+                    ref = self.server.compute_prompt_logprobs_with_lora.remote(
+                        prompt_ids=prompt_ids,
+                        request_id=request_id,
+                        lora_int_id=lora_id,
+                        traceparent=traceparent,
+                    )
+                    return await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                except Exception as e:
+                    msg = f"{type(e).__name__}: {e}"
+                    if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
+                        logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                        try:
+                            from tinker_server.backend.resource_pool import get_resource_pool
 
-                        ray_kill.kill(
-                            self.server,
-                            reason="vllm_compute_logprobs_failed",
-                            actor_name=self.actor_name,
-                            namespace=PERSISTENT_NAMESPACE,
-                            no_restart=True,
-                        )
-                        get_resource_pool().unregister(self.actor_name)
-                    except Exception:
-                        pass
-                    self.server = None
-                    self._initialized = False
-                raise
-        else:
-            # Compute logprobs with base model (no LoRA)
+                            ray_kill.kill(
+                                self.server,
+                                reason="vllm_compute_logprobs_failed",
+                                actor_name=self.actor_name,
+                                namespace=PERSISTENT_NAMESPACE,
+                                no_restart=True,
+                            )
+                            get_resource_pool().unregister(self.actor_name)
+                        except Exception:
+                            pass
+                        self.server = None
+                        self._initialized = False
+                    raise
             try:
                 ref = self.server.compute_prompt_logprobs_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                     traceparent=traceparent,
                 )
-                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                return await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
@@ -1029,6 +1127,20 @@ class MultiLoRAInferenceEngine:
                     self.server = None
                     self._initialized = False
                 raise
+
+        result = await run_async_with_otel_span(
+            "sampling.multi_lora.compute_logprobs",
+            _dispatch_compute_logprobs,
+            component="multi_lora_engine",
+            op="sampling.compute_logprobs",
+            request_id=request_id,
+            attributes={
+                "actor_name": self.actor_name,
+                "sampling_session_id": sampling_session_id,
+                "prompt_tokens": len(prompt_ids),
+                "lora_id": lora_id,
+            },
+        )
 
         return list(result)
 
@@ -1106,16 +1218,23 @@ class MultiLoRAInferenceEngine:
         if lora_id is None:
             return False
 
-        # Remove from vLLM engine
-        try:
-            ref = self.server.remove_lora.remote(lora_id)
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-        except Exception as e:
-            logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
+        lora_id, should_unload = await self.registry.remove_session(sampling_session_id)
+        if lora_id is None:
+            return False
 
-        # Remove from registry
-        await self.registry.remove(lora_id)
-        logger.info(f"Removed session {sampling_session_id} (lora_int_id={lora_id})")
+        if should_unload:
+            try:
+                ref = self.server.remove_lora.remote(lora_id)
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+            except Exception as e:
+                logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
+
+        logger.info(
+            "Removed session %s (lora_int_id=%s should_unload=%s)",
+            sampling_session_id,
+            lora_id,
+            should_unload,
+        )
         return True
 
     async def shutdown(self, kill_actor: bool = False) -> None:
@@ -1229,6 +1348,43 @@ class MultiModelInferenceManager:
                 self._locks[model_name] = lock
             return lock
 
+    async def _named_single_node_actor_is_reusable(self, actor_name: str) -> bool:
+        """Return True only when the detached actor is usable for immediate reuse."""
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+        except ValueError:
+            return False
+        except ray.exceptions.RayActorError:
+            return False
+
+        try:
+            await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
+            engine_ready = await asyncio.to_thread(ray.get, actor.is_engine_ready.remote(), timeout=10)
+            return bool(engine_ready)
+        except SystemExit as e:
+            if getattr(e, "code", None) == 15:
+                raise
+            logger.warning(
+                "named actor probe hit SystemExit actor=%s err=%s; treating as non-reusable",
+                actor_name,
+                e,
+            )
+            return False
+        except ray.exceptions.GetTimeoutError:
+            # Busy actors still occupy the pinned node and should be reused rather than
+            # tripping a false capacity failure before initialize() reconnects to them.
+            logger.info(
+                "named actor probe timed out actor=%s; treating existing actor as reusable",
+                actor_name,
+            )
+            return True
+        except ray.exceptions.RayActorError:
+            logger.warning(
+                "named actor probe found stale/dead actor=%s; will run capacity check before recreate",
+                actor_name,
+            )
+            return False
+
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
 
@@ -1259,12 +1415,14 @@ class MultiModelInferenceManager:
                         # sessions before they even reach `after_get_engine`. Use the detached
                         # actor name lookup instead: it is cheap, avoids queuing on the actor,
                         # and still lets us drop dead cached handles before reuse.
-                        from .multinode_inference import PERSISTENT_NAMESPACE
+                        from .multinode_inference import (
+                            PERSISTENT_NAMESPACE as MULTINODE_PERSISTENT_NAMESPACE,
+                        )
 
                         actor_name = getattr(engine, "actor_name", None)
                         if actor_name:
                             try:
-                                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                                ray.get_actor(actor_name, namespace=MULTINODE_PERSISTENT_NAMESPACE)
                             except (ValueError, ray.exceptions.RayActorError):
                                 logger.warning(
                                     "Cached multi-node vLLM engine for %s has no live named actor, recreating",
@@ -1317,67 +1475,84 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            existing_named_actor = False
+            try:
+                if not ray.is_initialized():
+                    init_ray(
+                        address="auto",
+                        namespace=PERSISTENT_NAMESPACE,
+                        ignore_reinit_error=True,
+                    )
+                existing_named_actor = await self._named_single_node_actor_is_reusable(actor_name)
+                if existing_named_actor:
+                    logger.info(
+                        "get_engine model=%s stage=existing_named_actor_found actor=%s namespace=%s",
+                        model_name,
+                        actor_name,
+                        PERSISTENT_NAMESPACE,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "get_engine model=%s stage=existing_named_actor_probe_failed actor=%s err=%s",
+                    model_name,
+                    actor_name,
+                    e,
+                )
+
             pinned_node_ip: str | None = None
             pinned_json = _read_process_env_var("MINT_VLLM_PINNED_NODE_IP_JSON")
-            normalized_keys: list[str] = []
             raw_node_ips = _read_process_env_var("MINT_MODEL_NODE_IPS_JSON")
-            normalized_node_ip_keys: list[str] = []
-            if pinned_json:
-                try:
-                    parsed = json.loads(pinned_json)
-                    if isinstance(parsed, dict):
-                        normalized = {str(k).strip(): v for k, v in parsed.items()}
-                        normalized_keys = list(normalized.keys())
-                        lookup_keys = [
-                            str(model_name).strip(),
-                            str(model_name).strip().lower(),
-                            str(actor_name).strip(),
-                            str(actor_name).strip().lower(),
-                        ]
-                        v = None
-                        for key in lookup_keys:
-                            v = normalized.get(key)
-                            if v is not None:
-                                break
-                        if isinstance(v, str) and v.strip():
-                            pinned_node_ip = v.strip()
-                except Exception:
-                    pinned_node_ip = None
-            if pinned_node_ip is None:
-                if raw_node_ips:
-                    try:
-                        parsed_node_ips = json.loads(raw_node_ips)
-                        if isinstance(parsed_node_ips, dict):
-                            normalized_node_ips = {str(k).strip(): v for k, v in parsed_node_ips.items()}
-                            normalized_node_ip_keys = list(normalized_node_ips.keys())
-                            for key in (
-                                str(model_name).strip(),
-                                str(model_name).strip().lower(),
-                                str(actor_name).strip(),
-                                str(actor_name).strip().lower(),
-                            ):
-                                value = normalized_node_ips.get(key)
-                                if isinstance(value, list) and value:
-                                    first_ip = str(value[0]).strip()
-                                    if first_ip:
-                                        pinned_node_ip = first_ip
-                                        break
-                    except Exception:
-                        pass
+            lookup_keys = [
+                str(model_name).strip(),
+                str(model_name).strip().lower(),
+                str(actor_name).strip(),
+                str(actor_name).strip().lower(),
+            ]
+            pinned_node_ip = parse_model_single_node_ip(
+                raw_json=pinned_json,
+                lookup_keys=lookup_keys,
+                env_var_name="MINT_VLLM_PINNED_NODE_IP_JSON",
+                context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
+            )
+            configured_node_ips = parse_model_node_ip_list(
+                raw_json=raw_node_ips,
+                lookup_keys=lookup_keys,
+                env_var_name="MINT_MODEL_NODE_IPS_JSON",
+                context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
+            )
+            if (
+                config.vllm_engine != "async"
+                and pinned_node_ip is None
+                and configured_node_ips
+            ):
+                pinned_node_ip = configured_node_ips[0]
             logger.info(
-                "single_node_vllm_pin_lookup model=%r actor=%r pinned_json_present=%s pinned_node_ip=%s normalized_keys=%s raw_pinned_json=%r raw_model_node_ips=%r normalized_model_node_ip_keys=%s",
+                "single_node_vllm_pin_lookup model=%r actor=%r pinned_json_present=%s pinned_node_ip=%s lookup_keys=%s raw_pinned_json=%r raw_model_node_ips=%r configured_node_ips=%s",
                 model_name,
                 actor_name,
                 bool(pinned_json),
                 pinned_node_ip,
-                normalized_keys,
+                lookup_keys,
                 pinned_json,
                 raw_node_ips,
-                normalized_node_ip_keys,
+                configured_node_ips,
             )
 
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
+            total_gpus = int(config.inference_tp) * int(config.inference_dp)
+            if pinned_node_ip is not None and existing_named_actor:
+                logger.info(
+                    "get_engine model=%s stage=skip_capacity_check_existing_named_actor actor=%s pinned_node_ip=%s",
+                    model_name,
+                    actor_name,
+                    pinned_node_ip,
+                )
+            elif pinned_node_ip is not None:
+                assert_node_ip_capacity(
+                    required_gpus_by_node_ip={pinned_node_ip: total_gpus},
+                    context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
+                )
 
             # Determine max_loras: per-model override > MoE default (1) > global default
             model_max_loras_override = config.max_loras
@@ -1561,7 +1736,6 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -1653,7 +1827,6 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

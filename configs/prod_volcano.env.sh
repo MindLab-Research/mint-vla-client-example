@@ -50,32 +50,30 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://apmplus-cn-beijing.ivolces.com:4317
 export OTEL_EXPORTER_OTLP_HEADERS=
 export OTEL_METRIC_EXPORT_INTERVAL_MS=10000
 export OTEL_LOG_LEVEL=DEBUG
-export MINT_HEALTHZ_RAY_TIMEOUT_S=10.0
+export MINT_HEALTHZ_RAY_TIMEOUT_S=30.0
 export MINT_VLLM_REQUEST_TIMING=1
 export MINT_TIMING_DIAG=1
 export MINT_VERL_DIAGNOSTICS=1
 export MINT_LOG_KILL_STACK=1
 
-# API server imports from PFS overlays, including the PFS vLLM 0.16.0 package.
-# Ray actors keep using the image-bundled vLLM wheel because PFS_VLLM_PATH stays empty below.
-export PYTHONPATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg:/vePFS-Mindverse/share/code/tinker-server-auth:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/megatron-bridge/src:/vePFS-Mindverse/share/huggingface/modules:/vePFS-Mindverse/share/code/tinker-server-auth/cpu-pydeps
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export HF_HUB_OFFLINE=1
 export PYTHONDONTWRITEBYTECODE=1
 
 export MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
 export MINT_VLLM_VOLC_RESOURCE_QUEUE_ID=q-20251126180002-26lwz
-export RAY_ADDRESS=192.168.37.147:6379
+if [ -f /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt ]; then
+  export RAY_ADDRESS="$(cat /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt):6379"
+else
+  echo "Missing /vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt" >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
-export PFS_EXTRA_PYTHONPATH=/vePFS-Mindverse/share/code/tinker-server-auth/cpu-pydeps
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/tinker-server-auth/tinker-runtime-py31213
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server-auth
-export PFS_VERL_PATH=/vePFS-Mindverse/share/code/verl
-export PFS_MEGATRON_BRIDGE_PATH=/vePFS-Mindverse/share/code/megatron-bridge/src
-export PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH=/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src
-export PFS_VLLM_PATH=
 export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
 
-export LD_LIBRARY_PATH=/root/tinker_project/tinker-server-auth/.venv31213/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/tinker-server-auth/tinker-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64

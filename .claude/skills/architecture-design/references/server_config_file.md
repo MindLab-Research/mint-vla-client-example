@@ -42,6 +42,7 @@ Secrets stay in environment variables (`TINKER_API_KEY`, `TINKER_TOKEN_SECRET_KE
 - `sample_coalesce_window_ms` (float) [env: `TINKER_SAMPLE_COALESCE_WINDOW_MS`]
 - `sample_coalesce_max_batch` (int) [env: `TINKER_SAMPLE_COALESCE_MAX_BATCH`]
 - `sample_coalesce_max_samples` (int) [env: `TINKER_SAMPLE_COALESCE_MAX_SAMPLES`]
+- `require_seq_id` (bool) [env: `TINKER_SAMPLE_REQUIRE_SEQ_ID`]
 
 ### `[ray]`
 
@@ -49,17 +50,15 @@ Secrets stay in environment variables (`TINKER_API_KEY`, `TINKER_TOKEN_SECRET_KE
 
 ### `[paths]`
 
+- `pfs_runtime_env_root` (str) [env: `PFS_RUNTIME_ENV_ROOT`]
 - `pfs_tinker_path` (str) [env: `PFS_TINKER_PATH`]
-- `pfs_verl_path` (str) [env: `PFS_VERL_PATH`]
-- `pfs_vllm_path` (str) [env: `PFS_VLLM_PATH`]
-- `pfs_megatron_bridge_path` (str) [env: `PFS_MEGATRON_BRIDGE_PATH`]
-- `pfs_megatron_bridge_hollowman_path` (str) [env: `PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH`]
 - `pfs_hf_modules_path` (str) [env: `PFS_HF_MODULES_PATH`]
-- `pfs_extra_pythonpath` (str) [env: `PFS_EXTRA_PYTHONPATH`]
+
+`pfs_runtime_env_root` is the canonical dependency root and is required for
+actor/runtime dependency assembly.
 
 ### `[megatron_bridge]`
 
-- `use_hollowman_mbridge` (bool) [env: `USE_HOLLOWMAN_MBRIDGE`]
 - `use_mbridge_lora_export` (bool) [env: `USE_MBRIDGE_LORA_EXPORT`]
 
 ### `[resource_pool]`
@@ -71,7 +70,9 @@ Secrets stay in environment variables (`TINKER_API_KEY`, `TINKER_TOKEN_SECRET_KE
 
 - `actor_name` (str) [env: `MINT_FUTURE_STORE_ACTOR_NAME`]
 - `ttl_s` (float) [env: `MINT_FUTURE_TTL_S`]
+- `queue_ttl_s` (float) [env: `MINT_FUTURE_QUEUE_TTL_S`]
 - `done_ttl_s` (float) [env: `MINT_FUTURE_DONE_TTL_S`]
+- `tombstone_ttl_s` (float) [env: `MINT_FUTURE_TOMBSTONE_TTL_S`]
 
 ### `[training]`
 

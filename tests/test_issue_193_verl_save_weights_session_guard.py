@@ -46,7 +46,9 @@ class _FakeSamplerWorker(_HeartbeatWorkerMixin):
 class _FakeLoadWorker(_HeartbeatWorkerMixin):
     def __init__(self, ref: str = "fake-load-checkpoint-ref"):
         super().__init__()
+        self.__ray_ready__ = _RecordingRemoteMethod("fake-load-ready-ref")
         self.load_checkpoint = _RecordingRemoteMethod(ref)
+        self.mark_session_loaded = _RecordingRemoteMethod("fake-mark-session-loaded-ref")
 
 
 def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_state(monkeypatch, tmp_path):
@@ -647,7 +649,7 @@ def test_issue_193_dense_load_weights_rebinds_after_worker_death(monkeypatch):
 
     assert keepalive_calls == [("recovered-load-ref", model_id, 30.0, 120)]
     assert recovered_worker.load_checkpoint.calls == [
-        (("/tmp/issue_193_dense_load_recover", True), {"session_id": model_id})
+        (("/tmp/issue_193_dense_load_recover", True), {"traceparent": None, "session_id": model_id})
     ]
     assert session.current_step == 11
     assert session.learning_rate == pytest.approx(3e-4)
@@ -680,6 +682,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
         return {"current_step": 5, "learning_rate": 3e-4}
 
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
 
     async def _run():
         await engine.load_weights(
@@ -690,13 +693,27 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
 
     asyncio.run(_run())
 
-    assert keepalive_calls == [("megatron-load-ref", model_id, 30.0, 120)]
+    assert keepalive_calls == [
+        ("fake-load-ready-ref", model_id, 30.0, 1800.0),
+        ("megatron-load-ref", model_id, 30.0, 1800.0),
+    ]
     args, kwargs = worker.load_checkpoint.calls[0]
     assert args == ("/tmp/issue_193_megatron_load", False)
+    assert kwargs["traceparent"] is None
     assert kwargs["session_id"] == model_id
     assert kwargs["train_attn"] is False
     assert kwargs["train_mlp"] is True
     assert kwargs["train_unembed"] is False
+    assert worker.mark_session_loaded.calls == [
+        (
+            (model_id,),
+            {
+                "step_count": 5,
+                "learning_rate": pytest.approx(3e-4),
+                "actual_rank": None,
+            },
+        )
+    ]
     assert session.current_step == 5
     assert session.learning_rate == pytest.approx(3e-4)
 

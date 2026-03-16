@@ -6,7 +6,7 @@ These types match the tinker client API for compatibility.
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class EncodedTextChunk(BaseModel):
@@ -424,6 +424,188 @@ class SessionHeartbeatResponse(BaseModel):
 
 
 # =============================================================================
+# OpenAI-Compatible API Types
+# =============================================================================
+
+
+class OAICompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    prompt: str
+    max_tokens: int = 512
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stop: str | list[str] | None = None
+    stream: bool = False
+    n: int = 1
+
+
+class OAIFunctionDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+    strict: bool | None = None
+
+
+class OAIToolDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["function"] = "function"
+    function: OAIFunctionDefinition
+
+
+class OAIFunctionCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    arguments: str
+
+
+class OAIToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    type: Literal["function"] = "function"
+    function: OAIFunctionCall
+
+
+class OAIMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | None = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[OAIToolCall] | None = None
+
+    @model_validator(mode="after")
+    def validate_role_specific_fields(self) -> "OAIMessage":
+        if self.role == "tool":
+            if self.tool_call_id is None:
+                raise ValueError("tool messages require tool_call_id")
+            if self.content is None:
+                raise ValueError("tool messages require content")
+            return self
+
+        if self.tool_call_id is not None:
+            raise ValueError("tool_call_id is only valid for tool messages")
+
+        if self.role == "assistant":
+            if self.content is None and not self.tool_calls:
+                raise ValueError("assistant messages require content or tool_calls")
+            if self.tool_calls:
+                missing_ids = [i for i, tc in enumerate(self.tool_calls) if tc.id is None]
+                if missing_ids:
+                    raise ValueError(f"tool_calls[{missing_ids[0]}].id is required")
+            return self
+
+        if self.tool_calls is not None:
+            raise ValueError("tool_calls are only valid for assistant messages")
+        if self.content is None:
+            raise ValueError(f"{self.role} messages require content")
+        return self
+
+
+class OAIChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    messages: list[OAIMessage]
+    max_tokens: int = 16
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stop: str | list[str] | None = None
+    stream: bool = False
+    n: int = 1
+    tools: list[OAIToolDefinition] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_tool_calling_fields(self) -> "OAIChatCompletionRequest":
+        tool_names = [tool.function.name for tool in self.tools or []]
+        if len(tool_names) != len(set(tool_names)):
+            raise ValueError("tools must have unique function names")
+
+        if isinstance(self.tool_choice, str):
+            if self.tool_choice not in {"none", "auto", "required"}:
+                raise ValueError("tool_choice must be one of: none, auto, required")
+            if self.tool_choice == "required" and not self.tools:
+                raise ValueError("tool_choice='required' requires tools")
+            return self
+
+        if self.tool_choice is None:
+            return self
+
+        if not isinstance(self.tool_choice, dict):
+            raise ValueError("tool_choice must be a string or a function selection object")
+
+        if self.tool_choice.get("type") != "function":
+            raise ValueError("tool_choice object must have type='function'")
+
+        function = self.tool_choice.get("function")
+        if not isinstance(function, dict):
+            raise ValueError("tool_choice.function must be an object")
+
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.function.name must be a non-empty string")
+
+        if not self.tools:
+            raise ValueError("tool_choice function selection requires tools")
+        if name not in set(tool_names):
+            raise ValueError(f"tool_choice function {name!r} must be declared in tools")
+        return self
+
+
+class OAIUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class OAICompletionChoice(BaseModel):
+    text: str
+    index: int
+    finish_reason: Literal["stop", "length"]
+    logprobs: None = None
+
+
+class OAIChatMessageResponse(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str | None = None
+    tool_calls: list[OAIToolCall] | None = None
+
+
+class OAIChatCompletionChoice(BaseModel):
+    index: int
+    message: OAIChatMessageResponse
+    finish_reason: Literal["stop", "length", "tool_calls"]
+    logprobs: None = None
+
+
+class OAICompletionResponse(BaseModel):
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int
+    model: str
+    choices: list[OAICompletionChoice]
+    usage: OAIUsage
+
+
+class OAIChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[OAIChatCompletionChoice]
+    usage: OAIUsage
+
+
+# =============================================================================
 # Weight Sync Types
 # =============================================================================
 
@@ -508,6 +690,9 @@ class CheckpointInfo(BaseModel):
     size_bytes: int | None = None
     public: bool = False
     expires_at: datetime | None = None
+    storage_tier: str | None = None
+    mirror_status: str | None = None
+    mirror_error: str | None = None
 
 
 class CheckpointsListResponse(BaseModel):

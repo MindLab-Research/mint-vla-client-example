@@ -29,19 +29,20 @@ from ..auth_identity import is_admin_request
 from ..backend.future_store import future_store
 from ..checkpoints import (
     CHECKPOINTS_DIR,
+    MIRROR_STATUS_PENDING,
+    begin_async_checkpoint_mirror,
     build_persistent_cache_dir,
-    build_persistent_checkpoint_dir,
-    checkpoint_access_roots,
     checkpoint_has_optimizer_state,
     create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
+    get_persistent_cache_dir,
     get_persistent_checkpoints_dir,
     get_persistent_search_roots,
     materialize_persistent_checkpoint,
-    mirror_checkpoint_to_persistent_store,
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
     validate_checkpoint_dir,
+    validate_sampler_checkpoint_for_sampling,
     write_checkpoint_metadata,
 )
 from ..models.types import (
@@ -109,6 +110,14 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = F
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     """Convert to mint://{model_id}/ URI (legacy format)."""
     return f"mint://{model_id}/{checkpoint_name}"
+
+
+def _checkpoint_rank(storage_tier: str | None) -> int:
+    if storage_tier == "persistent_tos":
+        return 2
+    if storage_tier == "persistent_cache":
+        return 1
+    return 0
 
 
 def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None, is_admin: bool = False) -> None:
@@ -583,7 +592,6 @@ async def _do_save_state(
     Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
-    import json
     session = None
 
     try:
@@ -623,6 +631,12 @@ async def _do_save_state(
             raise RuntimeError(
                 f"save_state must produce optimizer artifacts, but none found under: {save_path}"
             )
+        try:
+            validate_checkpoint_dir(save_path, checkpoint_type="training")
+        except ValueError as e:
+            raise RuntimeError(
+                f"save_state produced an invalid training checkpoint at {save_path}: {e}"
+            ) from e
 
         metadata = {
             "checkpoint_id": checkpoint_name,
@@ -640,47 +654,16 @@ async def _do_save_state(
         }
         write_checkpoint_metadata(save_path, metadata)
 
-        persistent_path = mirror_checkpoint_to_persistent_store(
+        persistent_path = begin_async_checkpoint_mirror(
             save_path,
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
         )
-        write_checkpoint_metadata(
-            persistent_path,
-            {
-                **metadata,
-                "storage_tier": "persistent_tos",
-            },
-        )
 
-        # Register for sampling via path-based loading (avoids tensor transfer OOM)
+        # Sampling engines load checkpoints on demand via checkpoint_uri/create_sampling_session.
+        # Do not block save_state completion on vLLM engine creation or LoRA hot-load.
         sampling_registered = False
-        base_model = session.base_model
-        if inference_manager is not None and base_model is not None:
-            try:
-                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-
-                # Remove existing registration if any
-                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                if existing_lora_id is not None:
-                    await multi_lora_engine.remove_session(session.model_id)
-
-                # Path-based loading - vLLM loads directly from shared filesystem
-                await multi_lora_engine.add_lora_for_session_from_path(
-                    sampling_session_id=session.model_id,
-                    lora_path=abs_path,
-                )
-                try:
-                    inference_manager.register_multi_lora_session(
-                        session.model_id, base_model=base_model
-                    )
-                except ValueError:
-                    pass  # Already registered
-                sampling_registered = True
-                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
-            except Exception as reg_err:
-                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
         from ..client_compat import checkpoint_uri
 
@@ -707,7 +690,11 @@ async def _do_save_state(
             "path": selected_path,
             "mint_path": mint_path,
             "tinker_path": tinker_path,
-            "filesystem_path": persistent_path,
+            "filesystem_path": save_path,
+            "persistent_filesystem_path": persistent_path,
+            "mirror_status": MIRROR_STATUS_PENDING,
+            "storage_tier": "persistent_cache",
+            "mirror_error": None,
             "type": "save_weights",
             "sampling_registered": sampling_registered,
             "checkpoint_type": "training",
@@ -820,44 +807,16 @@ async def _do_save_weights(
         }
         write_checkpoint_metadata(save_path, metadata)
 
-        persistent_path = mirror_checkpoint_to_persistent_store(
+        persistent_path = begin_async_checkpoint_mirror(
             save_path,
             user_id=user_id,
             model_id=session.model_id,
             checkpoint_name=checkpoint_name,
         )
-        write_checkpoint_metadata(
-            persistent_path,
-            {
-                **metadata,
-                "storage_tier": "persistent_tos",
-            },
-        )
 
+        # Keep save_weights completion scoped to checkpoint export + metadata publication.
+        # Sampler clients can load the returned checkpoint path on demand.
         sampling_registered = False
-        base_model = session.base_model
-        if inference_manager is not None and base_model is not None:
-            try:
-                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-
-                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                if existing_lora_id is not None:
-                    await multi_lora_engine.remove_session(session.model_id)
-
-                await multi_lora_engine.add_lora_for_session_from_path(
-                    sampling_session_id=session.model_id,
-                    lora_path=abs_path,
-                )
-                try:
-                    inference_manager.register_multi_lora_session(
-                        session.model_id, base_model=base_model
-                    )
-                except ValueError:
-                    pass
-                sampling_registered = True
-                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
-            except Exception as reg_err:
-                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
         from ..client_compat import checkpoint_uri
 
@@ -882,7 +841,11 @@ async def _do_save_weights(
                 "path": selected_path,
                 "mint_path": mint_path,
                 "tinker_path": tinker_path,
-                "filesystem_path": persistent_path,
+                "filesystem_path": save_path,
+                "persistent_filesystem_path": persistent_path,
+                "mirror_status": MIRROR_STATUS_PENDING,
+                "storage_tier": "persistent_cache",
+                "mirror_error": None,
                 "type": "save_weights",
                 "sampling_registered": sampling_registered,
                 "checkpoint_type": "sampler",
@@ -1291,8 +1254,11 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
     prefer_tinker = prefer_tinker_uri(request)
 
+    persistent_roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
+    cache_root = get_persistent_cache_dir()
+
     candidate_paths: list[str] = []
-    for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
+    for root in [*persistent_roots, cache_root]:
         candidate_paths.extend(
             [
                 os.path.join(root, owner_dir, model_id),
@@ -1311,7 +1277,14 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             status_code=404, detail=f"No checkpoints found for model '{model_id}'"
         )
 
-    checkpoints = []
+    checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
+
+    def _store_checkpoint(info: CheckpointInfo) -> None:
+        rank = _checkpoint_rank(info.storage_tier)
+        current = checkpoints_by_id.get(info.checkpoint_id)
+        if current is None or rank >= current[0]:
+            checkpoints_by_id[info.checkpoint_id] = (rank, info)
+
     seen: set[str] = set()
     for checkpoints_path in candidate_paths:
         if not os.path.isdir(checkpoints_path):
@@ -1353,6 +1326,16 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoint_type = metadata.get("checkpoint_type")
             if checkpoint_type not in ("training", "sampler"):
                 continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
+                continue
+            storage_tier = metadata.get("storage_tier")
+            mirror_status = metadata.get("mirror_status")
+            mirror_error = metadata.get("mirror_error")
 
             created_at = metadata.get("created_at") or created_at
             try:
@@ -1376,7 +1359,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 checkpoint_type=checkpoint_type,
             )
 
-            checkpoints.append(
+            _store_checkpoint(
                 CheckpointInfo(
                     checkpoint_id=checkpoint_id,
                     checkpoint_type=checkpoint_type,
@@ -1385,6 +1368,9 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                     path=path_uri,
                     step=step,
                     created_at=created_at,
+                    storage_tier=storage_tier,
+                    mirror_status=mirror_status,
+                    mirror_error=mirror_error,
                 )
             )
 
@@ -1393,7 +1379,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     if is_admin_request(request):
         try:
             owner_roots = []
-            for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
+            for root in [*persistent_roots, cache_root]:
                 if not os.path.isdir(root):
                     continue
                 owner_roots.extend(
@@ -1404,7 +1390,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
         except OSError:
             owner_roots = []
     else:
-        owner_roots = [os.path.join(root, owner_dir) for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)]
+        owner_roots = [os.path.join(root, owner_dir) for root in [*persistent_roots, cache_root]]
 
     for root in owner_roots:
         if not os.path.isdir(root):
@@ -1433,6 +1419,16 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoint_type = metadata.get("checkpoint_type")
             if checkpoint_type not in ("training", "sampler"):
                 continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
+                continue
+            storage_tier = metadata.get("storage_tier")
+            mirror_status = metadata.get("mirror_status")
+            mirror_error = metadata.get("mirror_error")
 
             created_at = metadata.get("created_at") or created_at
             try:
@@ -1455,7 +1451,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 prefer_tinker=prefer_tinker,
                 checkpoint_type=checkpoint_type,
             )
-            checkpoints.append(
+            _store_checkpoint(
                 CheckpointInfo(
                     checkpoint_id=checkpoint_id,
                     checkpoint_type=checkpoint_type,
@@ -1464,10 +1460,14 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                     path=path_uri,
                     step=None,
                     created_at=created_at,
+                    storage_tier=storage_tier,
+                    mirror_status=mirror_status,
+                    mirror_error=mirror_error,
                 )
             )
 
     # Sort by step (descending)
+    checkpoints = [item for _, item in checkpoints_by_id.values()]
     checkpoints.sort(key=lambda x: x.step or 0, reverse=True)
 
     return CheckpointsListResponse(

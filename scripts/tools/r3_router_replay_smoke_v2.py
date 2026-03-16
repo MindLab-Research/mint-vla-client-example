@@ -937,7 +937,6 @@ def _auto_compare_latest(base_model: str) -> None:
             no_r3_vals = _read_vals(latest_no_r3)
 
             if r3_vals and no_r3_vals:
-                import math
                 r3_mean = sum(r3_vals) / len(r3_vals)
                 no_r3_mean = sum(no_r3_vals) / len(no_r3_vals)
                 improvement_pct = ((no_r3_mean - r3_mean) / no_r3_mean * 100) if no_r3_mean != 0 else 0

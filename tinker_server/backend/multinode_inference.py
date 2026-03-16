@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -23,8 +22,24 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+    traced_async_from_traceparent,
+)
+from tinker_server.ray_utils import init_ray
+
 from . import ray_kill
+from .multinode_resources import compute_multinode_engine_resources
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_node_ip_list,
+    parse_model_single_node_ip,
+)
 
 if TYPE_CHECKING:
     pass
@@ -38,17 +53,6 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
         "max_tokens": int(max_tokens),
         "last_progress_at": time.time(),
     }
-
-# Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
-from tinker_server.config import config as server_config
-from tinker_server.logging_context import (
-    get_current_traceparent,
-    init_actor_observability,
-    restore_trace_id_from_traceparent,
-)
-from tinker_server.ray_utils import init_ray
-from .multinode_resources import compute_multinode_engine_resources
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
@@ -109,7 +113,11 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
         _patch_cls(cls)
 
 
-def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str, Any]:
+def _node_affinity_scheduling_opts_for_model(
+    model_name: str | None,
+    *,
+    required_gpus: int,
+) -> dict[str, Any]:
     """Optional single-node pinning for vLLM actors (mp backend).
 
     Use-case: pack MoE inference+training on the same 8-GPU node during prewarm.
@@ -118,28 +126,20 @@ def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str
     """
     if not model_name:
         return {}
-    mapping_json = os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON")
-    if not mapping_json:
+    pinned_ip = parse_model_single_node_ip(
+        raw_json=os.environ.get("MINT_VLLM_PINNED_NODE_IP_JSON"),
+        lookup_keys=[model_name, model_name.lower()],
+        env_var_name="MINT_VLLM_PINNED_NODE_IP_JSON",
+        context=f"multinode_vllm_pin model={model_name}",
+    )
+    if pinned_ip is None:
         return {}
-
-    try:
-        mapping = json.loads(mapping_json)
-    except Exception:
-        return {}
-    if not isinstance(mapping, dict):
-        return {}
-    pinned_ip = mapping.get(model_name)
-    if not isinstance(pinned_ip, str) or not pinned_ip.strip():
-        return {}
-    pinned_ip = pinned_ip.strip()
+    assert_node_ip_capacity(
+        required_gpus_by_node_ip={pinned_ip: int(required_gpus)},
+        context=f"multinode_vllm_pin model={model_name}",
+    )
 
     node_res = f"node:{pinned_ip}"
-    try:
-        if node_res not in (ray.cluster_resources() or {}):
-            return {}
-    except Exception:
-        return {}
-
     logger.info(f"multinode_vllm_pin model={model_name} resources={node_res!r}")
     return {"resources": {node_res: 0.001}}
 
@@ -147,49 +147,23 @@ def _node_affinity_scheduling_opts_for_model(model_name: str | None) -> dict[str
 def _preferred_worker_node_ips_for_model(model_name: str | None) -> list[str]:
     if not model_name:
         return []
-    raw = os.environ.get("MINT_VLLM_MODEL_NODE_IPS_JSON", "").strip()
-    source = "MINT_VLLM_MODEL_NODE_IPS_JSON"
-    if not raw:
-        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
-        source = "MINT_MODEL_NODE_IPS_JSON"
-    if not raw:
+    node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_VLLM_MODEL_NODE_IPS_JSON"),
+        lookup_keys=[model_name, model_name.lower()],
+        env_var_name="MINT_VLLM_MODEL_NODE_IPS_JSON",
+        context=f"multinode_vllm_node_pin model={model_name}",
+    )
+    if not node_ips:
+        node_ips = parse_model_node_ip_list(
+            raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+            lookup_keys=[model_name, model_name.lower()],
+            env_var_name="MINT_MODEL_NODE_IPS_JSON",
+            context=f"multinode_vllm_node_pin model={model_name}",
+        )
+    if not node_ips:
         return []
-
-    try:
-        data = json.loads(raw)
-    except Exception:
-        logger.warning("%s is not valid JSON; ignoring", source)
-        return []
-    if not isinstance(data, dict):
-        logger.warning("%s must be a JSON object; ignoring", source)
-        return []
-
-    candidates = []
-    for key in (model_name, model_name.lower()):
-        value = data.get(key)
-        if value is not None:
-            candidates = value
-            break
-    if not isinstance(candidates, list):
-        return []
-
-    cleaned = [str(ip).strip() for ip in candidates if str(ip).strip()]
-    if not cleaned:
-        return []
-
-    try:
-        cluster = ray.cluster_resources() or {}
-    except Exception:
-        cluster = {}
-    usable = [ip for ip in cleaned if f"node:{ip}" in cluster]
-    if not usable:
-        logger.warning(f"multinode_vllm_node_pin model={model_name} has no usable node IPs")
-        return []
-    if len(usable) < len(cleaned):
-        skipped = [ip for ip in cleaned if ip not in usable]
-        logger.warning(f"multinode_vllm_node_pin model={model_name} skipped_missing_nodes={skipped}")
-    logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={usable}")
-    return usable
+    logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={node_ips}")
+    return node_ips
 
 
 def _raise_serializable_vllm_error(*, where: str, request_id: str, extra: dict[str, Any]) -> None:
@@ -803,6 +777,16 @@ def _create_multinode_vllm_actor(
                 logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
                 return False
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.add_lora",
+            component="multinode_vllm_actor",
+            op="sampling.add_lora_from_path",
+            request_id_arg="lora_name",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "lora_path": a.get("lora_path"),
+            },
+        )
         async def add_lora(
             self,
             lora_int_id: int,
@@ -937,7 +921,6 @@ def _create_multinode_vllm_actor(
 
             return {
                 "pythonpath": os.environ.get("PYTHONPATH", ""),
-                "pfs_vllm_path": os.environ.get("PFS_VLLM_PATH", ""),
                 "mint_enable_vllm_import_patches": os.environ.get(
                     "MINT_ENABLE_VLLM_IMPORT_PATCHES"
                 ),
@@ -948,6 +931,44 @@ def _create_multinode_vllm_actor(
                 "vllm_lora_opt_overlap_safe": lora_opt_safe,
                 "vllm_lora_packed_opt_overlap_safe": packed_opt_safe,
                 "sys_path_first_8": sys.path[:8],
+            }
+
+        async def get_kv_debug_info(self) -> dict:
+            def _collect_kv_info(worker_wrapper):
+                worker = getattr(worker_wrapper, "worker", None)
+                target = worker if worker is not None else worker_wrapper
+                model_runner = getattr(target, "model_runner", None)
+                kv_cfg = getattr(model_runner, "kv_cache_config", None)
+                return {
+                    "available_kv_cache_memory_bytes": int(
+                        getattr(target, "available_kv_cache_memory_bytes", 0) or 0
+                    ),
+                    "requested_memory_bytes": int(
+                        getattr(target, "requested_memory", 0) or 0
+                    ),
+                    "non_torch_memory_bytes": int(
+                        getattr(target, "non_torch_memory", 0) or 0
+                    ),
+                    "peak_activation_memory_bytes": int(
+                        getattr(target, "peak_activation_memory", 0) or 0
+                    ),
+                    "kv_cache_num_blocks": int(
+                        getattr(kv_cfg, "num_blocks", 0) or 0
+                    ) if kv_cfg is not None else 0,
+                    "kv_cache_groups": len(
+                        getattr(kv_cfg, "kv_cache_groups", []) or []
+                    ) if kv_cfg is not None else 0,
+                }
+
+            infos = await self.engine.collective_rpc(_collect_kv_info)
+            return {
+                "per_worker": infos,
+                "min_available_kv_cache_memory_bytes": min(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
+                "max_available_kv_cache_memory_bytes": max(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
             }
 
         async def abort_request(self, request_id: str, traceparent: str | None = None) -> None:
@@ -968,6 +989,18 @@ def _create_multinode_vllm_actor(
             except Exception as e:
                 logger.warning(f"MultiNodeVLLMEngine.abort_request failed: {type(e).__name__}: {e}")
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.generate",
+            component="multinode_vllm_actor",
+            op="sampling.generate",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "max_tokens": a.get("max_tokens"),
+                "num_samples": a.get("n"),
+            },
+        )
         async def generate(
             self,
             prompt_ids: list[int],
@@ -1473,6 +1506,16 @@ def _create_multinode_vllm_actor(
                 await self._clear_progress(outer_request_id)
             return multi_results
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.compute_prompt_logprobs",
+            component="multinode_vllm_actor",
+            op="sampling.compute_prompt_logprobs",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+            },
+        )
         async def compute_prompt_logprobs(
             self,
             prompt_ids: list[int],
@@ -1519,6 +1562,12 @@ def _create_multinode_vllm_actor(
                 async with self._maybe_prompt_logprobs_lock():
                     async with self._lock_read():
                         t1 = time.perf_counter()
+                        # Prompt-logprobs requests explicitly skip prefix-cache reads in vLLM.
+                        # After a long sample finishes, its prompt KV blocks can remain cached and
+                        # occupy the KV pool while being unusable for the follow-on prompt-logprobs
+                        # request. Clearing prefix cache here frees those cached blocks without
+                        # changing prompt-logprobs semantics for this request.
+                        await self.engine.reset_prefix_cache()
                         try:
                             collector = await self.engine.add_request(
                                 request_id=request_id,
@@ -1581,6 +1630,17 @@ def _create_multinode_vllm_actor(
 
             return out
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.compute_prompt_topk",
+            component="multinode_vllm_actor",
+            op="sampling.compute_prompt_topk",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "topk": a.get("k"),
+            },
+        )
         async def compute_prompt_topk(
             self,
             prompt_ids: list[int],
@@ -1792,7 +1852,6 @@ class MultiNodeInferenceEngine:
 
             if not ray.is_initialized():
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -1960,7 +2019,6 @@ class MultiNodeInferenceEngine:
                     except Exception:
                         pass
                     # Wait for Ray to clean up the actor name
-                    import time
                     for _ in range(10):
                         await asyncio.sleep(1)
                         try:
@@ -1977,6 +2035,22 @@ class MultiNodeInferenceEngine:
             # when C2 is unavailable). If provided, it takes precedence over queue-based selection.
             preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
             if preferred_node_ips and distributed_executor_backend != "mp":
+                required_by_node_ip: dict[str, int] = {}
+                for bundle in resources.pg_bundles:
+                    if float(bundle.get("GPU", 0) or 0) <= 0:
+                        continue
+                    for key, value in bundle.items():
+                        if not isinstance(key, str) or not key.startswith("node:"):
+                            continue
+                        if float(value or 0) <= 0:
+                            continue
+                        node_ip = key.split("node:", 1)[1]
+                        required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
+                if required_by_node_ip:
+                    assert_node_ip_capacity(
+                        required_gpus_by_node_ip=required_by_node_ip,
+                        context=f"multinode_vllm_node_pin model={self.model_name}",
+                    )
                 nodes_needed = (int(worker_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
                 if len(preferred_node_ips) < nodes_needed:
                     raise RuntimeError(
@@ -2115,11 +2189,17 @@ class MultiNodeInferenceEngine:
                 if mp_pinned_node_ip:
                     scheduling_opts = {"resources": {f"node:{mp_pinned_node_ip}": 0.001}}
                 else:
-                    scheduling_opts = _node_affinity_scheduling_opts_for_model(self.model_name)
+                    scheduling_opts = _node_affinity_scheduling_opts_for_model(
+                        self.model_name,
+                        required_gpus=int(worker_gpus),
+                    )
 
-            from ..config import otel_env_vars
-            env_vars = {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            env_vars = actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
+                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -2140,10 +2220,12 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
                 "VLLM_DISABLE_PYNCCL": "1",
                 **otel_env_vars(),
-            }
+                },
+            )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+            env_vars.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
                     "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"
@@ -2196,26 +2278,24 @@ class MultiNodeInferenceEngine:
                 v = os.environ.get(k)
                 if v is not None:
                     env_vars[k] = v
+            env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
 
-            if (
-                distributed_executor_backend == "ray"
-                and total_required_gpus >= 16
-                and "VLLM_DISABLE_RAY_COMPILED_DAG" not in env_vars
-            ):
-                # On Volcano 235B we have observed the opposite failure mode from startup OOM/crash:
-                # generate() completes inside vLLM (worker timing line emitted) but ray.get() on the
-                # driver side never receives the result and the request stays pending indefinitely.
-                # That points at Ray compiled DAG transport rather than model execution.
+            if distributed_executor_backend == "ray":
+                # Keep Ray compiled DAG disabled for all multinode-ray vLLM actors.
+                # This vLLM build does not honor VLLM_DISABLE_RAY_COMPILED_DAG in
+                # ray_executor.py, so the real no-compiled-DAG path is the
+                # sitecustomize monkey patch gated by
+                # MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE.
+                env_vars["MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE"] = "1"
                 env_vars["VLLM_DISABLE_RAY_COMPILED_DAG"] = "1"
 
-            # Performance defaults: do not disable prefix caching, grouped-topk, or
-            # Ray compiled DAG in code. If stability requires toggling, do it via env.
+            # Performance defaults: do not disable prefix caching or grouped-topk in code.
+            # If stability requires toggling other vLLM knobs, do it via env.
 
             # Expose selected vLLM debug/perf knobs via API host env without code deploys.
             for k in (
                 "VLLM_LOGGING_LEVEL",
                 "VLLM_LOG_LEVEL",
-                "VLLM_ATTENTION_BACKEND",
                 "VLLM_USE_FLASHINFER_SAMPLER",
                 "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING",
                 "VLLM_FUSED_MOE_CHUNK_SIZE",
@@ -2310,7 +2390,7 @@ class MultiNodeInferenceEngine:
                 except Exception:
                     pass
                 self.engine = None
-                raise RuntimeError(f"MultiNodeVLLMEngine init timed out")
+                raise RuntimeError("MultiNodeVLLMEngine init timed out")
             except Exception:
                 try:
                     ray_kill.kill(
@@ -2400,7 +2480,7 @@ class MultiNodeInferenceEngine:
                 traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-        except Exception as e:
+        except Exception:
             # Roll back registry on load failure so retries don't trip
             # "already has lora_int_id" for the same session.
             try:

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +15,7 @@ import requests
 class Env:
     base_url: str
     api_key: str
+    ray_address: str
     ray_namespace: str
     ssh_host: str
     server_root: str
@@ -43,6 +43,7 @@ def _env() -> Env:
     port = int(os.environ.get("TINKER_PORT", "10238"))
     base_url = os.environ.get("TINKER_BASE_URL", f"http://localhost:{port}")
     api_key = _coalesce(os.environ.get("TINKER_API_KEY"), os.environ.get("MINT_API_KEY"), "dummy") or "dummy"
+    ray_address = _require_env("RAY_ADDRESS")
     ray_namespace = _coalesce(os.environ.get("TINKER_RAY_NAMESPACE"), os.environ.get("MINT_RAY_NAMESPACE"))
     if not ray_namespace:
         raise SystemExit("error: missing env TINKER_RAY_NAMESPACE or MINT_RAY_NAMESPACE")
@@ -55,6 +56,7 @@ def _env() -> Env:
     return Env(
         base_url=str(base_url).rstrip("/"),
         api_key=str(api_key),
+        ray_address=str(ray_address),
         ray_namespace=str(ray_namespace),
         ssh_host=str(ssh_host),
         server_root=str(server_root),
@@ -127,14 +129,16 @@ def _wait_ready(env: Env, *, timeout_s: float) -> None:
 def _kill_namespace_actors(env: Env) -> None:
     out = _ssh(
         env,
-        "TINKER_RAY_NAMESPACE="
+        "RAY_ADDRESS="
+        + json.dumps(env.ray_address)
+        + " TINKER_RAY_NAMESPACE="
         + json.dumps(env.ray_namespace)
         + " MINT_RAY_NAMESPACE="
         + json.dumps(env.ray_namespace)
         + " python - <<'PY'\n"
         "import os\n"
         "import ray\n"
-        "ray.init(address='auto', ignore_reinit_error=True)\n"
+        "ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)\n"
         "ns = os.environ['TINKER_RAY_NAMESPACE']\n"
         "actors = ray.util.list_named_actors(all_namespaces=True)\n"
         "killed = 0\n"
@@ -159,9 +163,12 @@ def _kill_namespace_actors(env: Env) -> None:
 def _get_server_job_id(env: Env, pid: int) -> str:
     out = _ssh(
         env,
-        "python - <<'PY'\n"
+        "RAY_ADDRESS="
+        + json.dumps(env.ray_address)
+        + " python - <<'PY'\n"
+        "import os\n"
         "import ray\n"
-        "ray.init(address='auto', ignore_reinit_error=True)\n"
+        "ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)\n"
         "from ray._private.state import jobs\n"
         f"pid = int({int(pid)})\n"
         "for j in jobs():\n"

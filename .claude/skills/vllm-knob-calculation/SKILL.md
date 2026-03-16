@@ -32,9 +32,16 @@ The workflow is:
 - Keep the math separate from empirical safety margins.
 
 3. Estimate steady-state non-KV memory per GPU.
-- Base weights on that rank.
-- Steady-state LoRA runtime slot cost for `max_loras` and `max_lora_rank`.
-- Other profiled non-KV executor memory.
+- Use vLLM's original accounting:
+  - `weights_memory`
+  - `peak_activation_memory`
+  - `non_torch_increase`
+- Remember that persistent LoRA slot tensors are part of `weights_memory`.
+- If the full profiled term is not derivable exactly from architecture alone,
+  introduce an explicit conservative upper bound `U_profile` for the remainder.
+- Empirical calibration is allowed only inside `U_profile`.
+- If runtime falsifies the slot cost itself, re-derive the active tensor basis
+  before changing any knob.
 
 4. Solve the steady-state budget.
 - `total_gpu_mem * gpu_memory_utilization >= profiled_non_kv + long_seq_kv_budget`
@@ -47,8 +54,9 @@ The workflow is:
   `gpu_memory_utilization`.
 
 6. Choose `max_loras`.
-- Under MinT-style diverse active LoRAs, choose it close to but below the
-  conservative long-sequence concurrency target.
+- Under MinT-style diverse active LoRAs, choose:
+  - `max_loras = N_long - 1`
+  where `N_long` is the conservative guaranteed full-context concurrency target.
 
 7. Choose `max_num_seqs`.
 - Treat it as an admission cap for realistic mixed traffic, not as the same
@@ -65,3 +73,8 @@ Hard rules:
 - Do not confuse KV reservation with total runtime memory pressure.
 - Do not use "try a smaller setting" as the first move.
 - Separate observation from inference when discussing empirical safety margins.
+- If local patches bypass native vLLM startup profiling, state that the
+  upstream sizing model is invalid until that behavior is removed.
+- For `FusedMoEWithLoRA`, count all four persistent expert slot tensors
+  (`w13_a`, `w13_b`, `w2_a`, `w2_b`); do not replace them with a shorthand
+  "experts term" unless you have proved the tensor equivalence.

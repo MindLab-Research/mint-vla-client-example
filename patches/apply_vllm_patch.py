@@ -6,7 +6,6 @@ Supports:
 - vLLM source checkout (override via env var)
 """
 
-import re
 import sys
 import os
 from pathlib import Path

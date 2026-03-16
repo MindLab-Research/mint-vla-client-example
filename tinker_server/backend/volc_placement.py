@@ -124,6 +124,294 @@ def list_node_ips_for_resource_queue(*, resource_queue_id: str) -> list[str]:
     return sorted({n.node_ip for n in nodes if n.node_ip})
 
 
+def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
+    if not ray.is_initialized():
+        raise RuntimeError("ray is not initialized (expected to be connected already)")
+
+    from ray._private import state as ray_state
+
+    avail = ray_state.available_resources_per_node()
+    nodes: list[VolcGpuNode] = []
+    for n in ray.nodes():
+        if not n.get("Alive"):
+            continue
+        res = n.get("Resources") or {}
+        if float(res.get("GPU", 0) or 0) <= 0:
+            continue
+
+        node_id = str(n.get("NodeID") or "")
+        node_ip = str(n.get("NodeManagerAddress") or "")
+        hostname = str(n.get("NodeManagerHostname") or "")
+        total_gpus = int(float(res.get("GPU", 0) or 0))
+        node_avail = avail.get(node_id) or {}
+        available_gpus = int(float(node_avail.get("GPU", 0) or 0))
+        nodes.append(
+            VolcGpuNode(
+                node_id=node_id,
+                node_ip=node_ip,
+                hostname=hostname,
+                total_gpus=total_gpus,
+                available_gpus=available_gpus,
+                volc_job_id=_parse_volc_job_id_from_hostname(hostname),
+                volc_resource_queue_id=None,
+            )
+        )
+    return nodes
+
+
+def _gpu_placement_groups() -> list[dict[str, object]]:
+    try:
+        table = ray.util.placement_group_table()
+    except Exception:
+        return []
+
+    groups: list[dict[str, object]] = []
+    for info in table.values():
+        if not isinstance(info, dict):
+            continue
+        state = str(info.get("state") or "")
+        if state == "REMOVED":
+            continue
+
+        bundles = info.get("bundles") or {}
+        total_gpu = 0.0
+        pinned_ips: set[str] = set()
+        if isinstance(bundles, dict):
+            bundle_values = bundles.values()
+        elif isinstance(bundles, list):
+            bundle_values = bundles
+        else:
+            bundle_values = ()
+        for bundle in bundle_values:
+            if not isinstance(bundle, dict):
+                continue
+            total_gpu += float(bundle.get("GPU", 0) or 0)
+            for key, value in bundle.items():
+                if not isinstance(key, str) or not key.startswith("node:"):
+                    continue
+                if float(value or 0) > 0:
+                    pinned_ips.add(key.split("node:", 1)[1])
+        if total_gpu <= 0:
+            continue
+
+        bundles_to_node_id = info.get("bundles_to_node_id") or {}
+        node_ids = sorted(
+            {
+                str(node_id)
+                for node_id in (
+                    bundles_to_node_id.values()
+                    if isinstance(bundles_to_node_id, dict)
+                    else ()
+                )
+                if node_id
+            }
+        )
+        groups.append(
+            {
+                "name": str(info.get("name") or "<unnamed>"),
+                "state": state or "<unknown>",
+                "pinned_ips": sorted(pinned_ips),
+                "node_ids": node_ids,
+            }
+        )
+    return groups
+
+
+def parse_model_node_ip_list(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> list[str]:
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"{context}: {env_var_name} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context}: {env_var_name} must be a JSON object")
+
+    value = None
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            break
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(
+            f"{context}: {env_var_name}[{key!r}] must be a JSON list of node IPs, got {type(value).__name__}"
+        )
+
+    cleaned = [str(ip).strip() for ip in value if str(ip).strip()]
+    if not cleaned:
+        raise RuntimeError(f"{context}: {env_var_name}[{key!r}] resolved to an empty node list")
+    return list(dict.fromkeys(cleaned))
+
+
+def parse_model_single_node_ip(
+    *,
+    raw_json: str | None,
+    lookup_keys: list[str],
+    env_var_name: str,
+    context: str,
+) -> str | None:
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"{context}: {env_var_name} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context}: {env_var_name} must be a JSON object")
+
+    value = None
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            break
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(
+            f"{context}: {env_var_name}[{key!r}] must be a non-empty node IP string"
+        )
+    return value.strip()
+
+
+def assert_node_ip_capacity(
+    *,
+    required_gpus_by_node_ip: dict[str, int],
+    context: str,
+) -> None:
+    requested = {
+        str(node_ip).strip(): int(gpus)
+        for node_ip, gpus in required_gpus_by_node_ip.items()
+        if str(node_ip).strip()
+    }
+    if not requested:
+        raise ValueError("required_gpus_by_node_ip is empty")
+    if any(gpus <= 0 for gpus in requested.values()):
+        raise ValueError(f"required_gpus_by_node_ip must be positive, got {requested!r}")
+
+    nodes = _list_alive_gpu_nodes()
+    nodes_by_ip = {node.node_ip: node for node in nodes if node.node_ip}
+    missing = sorted(ip for ip in requested if ip not in nodes_by_ip)
+    if missing:
+        raise RuntimeError(
+            f"{context}: requested pinned node(s) are not alive Ray GPU nodes: "
+            f"missing_nodes={missing} alive_gpu_nodes={sorted(nodes_by_ip)}"
+        )
+
+    placement_groups = _gpu_placement_groups()
+    blockers: list[dict[str, object]] = []
+    for node_ip, need_gpus in requested.items():
+        node = nodes_by_ip[node_ip]
+        if node.available_gpus >= need_gpus:
+            continue
+        matching_pgs = [
+            f"{pg['name']}:{pg['state']}"
+            for pg in placement_groups
+            if node_ip in pg["pinned_ips"] or node.node_id in pg["node_ids"]
+        ]
+        blockers.append(
+            {
+                "node_ip": node_ip,
+                "hostname": node.hostname,
+                "need_gpus": need_gpus,
+                "available_gpus": node.available_gpus,
+                "total_gpus": node.total_gpus,
+                "used_or_reserved_gpus": node.total_gpus - node.available_gpus,
+                "placement_groups": matching_pgs[:8],
+            }
+        )
+    if blockers:
+        # Check for cross-namespace actor conflicts to provide better error messages
+        conflict_info = _check_cross_namespace_conflicts(requested)
+        error_msg = f"{context}: pinned node capacity check failed: required_by_node={requested} blockers={blockers}"
+        if conflict_info:
+            error_msg += f"\n\nPossible cross-namespace conflicts detected:\n{conflict_info}\n\nSuggestion: Coordinate with other developers or use a different node."
+        raise RuntimeError(error_msg)
+
+
+def _check_cross_namespace_conflicts(requested_node_ips: dict[str, int]) -> str:
+    """Check if other namespaces have actors on the requested nodes.
+
+    Returns a formatted string describing conflicts, or empty string if none found.
+    """
+    try:
+        if not ray.is_initialized():
+            return ""
+
+        current_namespace = os.environ.get("MINT_RAY_NAMESPACE") or os.environ.get("TINKER_RAY_NAMESPACE")
+        all_actors = ray.util.list_named_actors(all_namespaces=True)
+
+        # Group actors by namespace and node
+        conflicts_by_namespace: dict[str, list[str]] = {}
+
+        for actor_info in all_actors:
+            actor_ns = actor_info.get("namespace")
+            actor_name = actor_info.get("name", "")
+
+            # Skip actors in current namespace
+            if actor_ns == current_namespace:
+                continue
+
+            # Only check vLLM and Megatron actors (the ones that use pinned nodes)
+            if not (actor_name.startswith("tinker_vllm_") or
+                    actor_name.startswith("multinode_vllm_") or
+                    actor_name.startswith("megatron_")):
+                continue
+
+            # Try to get actor's node location
+            try:
+                # Verify actor exists (we don't need the handle, just check it's alive)
+                _ = ray.get_actor(actor_name, namespace=actor_ns)
+                # Get placement group to find node
+                pg_name = f"{actor_name}_pg"
+                try:
+                    pg = ray.util.get_placement_group(pg_name)
+                    pg_info = ray.util.placement_group_table(pg)
+                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
+
+                    # Check if any bundle is on requested nodes
+                    for node_id in bundles_to_node.values():
+                        for n in ray.nodes():
+                            if n.get("NodeID") == node_id:
+                                node_ip = n.get("NodeManagerAddress")
+                                if node_ip in requested_node_ips:
+                                    key = f"{actor_ns} (node: {node_ip})"
+                                    if key not in conflicts_by_namespace:
+                                        conflicts_by_namespace[key] = []
+                                    conflicts_by_namespace[key].append(actor_name)
+                                break
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+        if not conflicts_by_namespace:
+            return ""
+
+        lines = []
+        for ns_info, actors in sorted(conflicts_by_namespace.items()):
+            lines.append(f"  - {ns_info}:")
+            for actor in actors[:5]:  # Limit to 5 actors per namespace
+                lines.append(f"    * {actor}")
+            if len(actors) > 5:
+                lines.append(f"    * ... and {len(actors) - 5} more")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.debug(f"Failed to check cross-namespace conflicts: {e}")
+        return ""
+
+
+
 def select_free_nodes_from_allowed_ips(
     *,
     allowed_node_ips: list[str],

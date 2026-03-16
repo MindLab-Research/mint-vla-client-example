@@ -115,14 +115,13 @@ def _ssh_create_named_actor(actor: _NamedActor, *, block_s: int | None = None) -
     block_s_expr = "None" if block_s is None else str(int(block_s))
     code = f"""
 import os
-from pathlib import Path
 import time
 import ray
 
 ns = os.environ["TINKER_RAY_NAMESPACE"]
-repo_root = Path({json.dumps(REMOTE_SERVER_ROOT)})
-head_ip = repo_root.joinpath("ray_head_ip.txt").read_text().strip()
-addr = head_ip if ":" in head_ip else f"{{head_ip}}:6379"
+addr = os.environ.get("RAY_ADDRESS", "").strip()
+if not addr:
+    raise RuntimeError("RAY_ADDRESS is required")
 ray.init(address=addr, namespace=ns, ignore_reinit_error=True)
 
 @ray.remote
@@ -161,13 +160,12 @@ print(f"created name={{name}} namespace={{ns}} kind={{kind}} block_s={{block_s}}
 def _ssh_kill_named_actor(name: str) -> None:
     code = f"""
 import os
-from pathlib import Path
 import ray
 
 ns = os.environ["TINKER_RAY_NAMESPACE"]
-repo_root = Path({json.dumps(REMOTE_SERVER_ROOT)})
-head_ip = repo_root.joinpath("ray_head_ip.txt").read_text().strip()
-addr = head_ip if ":" in head_ip else f"{{head_ip}}:6379"
+addr = os.environ.get("RAY_ADDRESS", "").strip()
+if not addr:
+    raise RuntimeError("RAY_ADDRESS is required")
 ray.init(address=addr, namespace=ns, ignore_reinit_error=True)
 
 name = {json.dumps(name)}
