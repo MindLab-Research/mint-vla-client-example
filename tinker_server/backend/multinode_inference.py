@@ -2174,8 +2174,6 @@ class MultiNodeInferenceEngine:
                 **otel_env_vars(),
                 },
             )
-            if "LD_LIBRARY_PATH" in os.environ:
-                env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")

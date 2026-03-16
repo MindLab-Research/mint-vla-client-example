@@ -417,8 +417,6 @@ class MultiLoRAInferenceEngine:
                 **otel_env_vars(),
                 },
             )
-            if "LD_LIBRARY_PATH" in os.environ:
-                env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
