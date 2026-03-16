@@ -2173,11 +2173,11 @@ class VerlInferenceEngine:
             return
 
         if not ray.is_initialized():
-            # Use 'auto' to connect to existing cluster if available
-            # If no cluster, this falls back to starting a local Ray instance
-            # Use fixed namespace for persistent vLLM actor support
+            address = os.environ.get("RAY_ADDRESS", "").strip()
+            if not address:
+                raise RuntimeError("RAY_ADDRESS must be set before initializing VerlInferenceEngine")
             init_ray(
-                address="auto",
+                address=address,
                 namespace=RAY_NAMESPACE,
                 ignore_reinit_error=True,
             )

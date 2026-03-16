@@ -645,7 +645,7 @@ Before starting any MoE test, run:
 # Quick status command (MANDATORY before any work)
 ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python << "PYEOF"
 import ray
-ray.init(address="auto", ignore_reinit_error=True)
+ray.init(address="<RAY_HEAD_IP>:6379", ignore_reinit_error=True)
 r = ray.available_resources()
 t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
@@ -660,7 +660,7 @@ for a in actors:
 PYEOF'
 
 # Check pending placement groups (MUST be empty)
-ssh mint-dev "ray status 2>/dev/null | grep -A5 'Pending Demands'"
+ssh mint-dev "/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379' 2>/dev/null | grep -A5 'Pending Demands'"
 ```
 
 **Required for Qwen3-30B-A3B tests:** At least 8 available GPUs and no pending placement groups.
@@ -686,7 +686,7 @@ If placement groups are pending (blocking GPUs):
 # Kill vLLM actor (see "Kill Actors" section above for commands)
 
 # Verify resources freed
-ssh mint-dev "ray status 2>/dev/null | head -20"
+ssh mint-dev "/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379' 2>/dev/null | head -20"
 ```
 
 ---
@@ -800,7 +800,7 @@ ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv
 | Can't connect | Check SSH tunnel, Ray cluster connection |
 | vLLM OOM | Kill vLLM actor, restart server |
 | Pending placement groups | Not enough GPUs. Kill stale actors (see section 6) |
-| MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
+| MoE test hangs on startup | Check GPU availability first. Need 8 GPUs for 30B MoE |
 | Tokenizer download fails | Run test script locally, not on server (server has no internet) |
 | Actor lookup fails | **LIST actors first** (`ray list actors`), don't assume dead |
 
