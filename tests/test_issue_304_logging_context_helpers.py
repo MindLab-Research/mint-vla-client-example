@@ -67,3 +67,43 @@ def test_issue_304_run_async_with_otel_span_without_tracer_executes_action(monke
         assert out == 7
     finally:
         logging_context._TRACER = saved_tracer
+
+
+def test_issue_304_extract_otel_context_from_traceparent_accepts_valid_header():
+    traceparent = "00-" + ("a" * 32) + "-" + ("1" * 16) + "-01"
+    ctx = logging_context.extract_otel_context_from_traceparent(traceparent)
+    assert ctx is not None
+
+
+def test_issue_304_extract_otel_context_from_traceparent_rejects_blank():
+    assert logging_context.extract_otel_context_from_traceparent("") is None
+
+
+def test_issue_304_traced_async_from_traceparent_binds_context(monkeypatch):
+    saved_tracer = logging_context._TRACER
+    prev_request_id = logging_context.get_request_id()
+    prev_trace_id = logging_context.get_trace_id()
+    try:
+        monkeypatch.setattr(logging_context, "_TRACER", None)
+
+        @logging_context.traced_async_from_traceparent(
+            "test.decorated",
+            component="test",
+            op="test.decorated",
+            request_id_arg="request_id",
+        )
+        async def _decorated(*, request_id: str, traceparent: str | None = None):
+            return logging_context.get_request_id(), logging_context.get_trace_id()
+
+        request_id, trace_id = asyncio.run(
+            _decorated(
+                request_id="req-123",
+                traceparent="00-" + ("a" * 32) + "-" + ("1" * 16) + "-01",
+            )
+        )
+        assert request_id == "req-123"
+        assert trace_id == "a" * 32
+    finally:
+        logging_context._TRACER = saved_tracer
+        logging_context.set_request_id(prev_request_id)
+        logging_context.set_trace_id(prev_trace_id)

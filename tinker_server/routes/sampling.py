@@ -21,7 +21,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import classify_failure_reason, set_request_id
+from ..logging_context import classify_failure_reason, run_async_with_otel_span, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
@@ -956,7 +956,14 @@ async def _do_sample(request_id: str, request: SampleRequest, user_id: str | Non
                 logger.info(
                     f"[sample path] request_id={request_id} session_id={session_id} stage=before_get_engine"
                 )
-                engine = await session_manager.get_engine_for_session(session_id)
+                engine = await run_async_with_otel_span(
+                    "sampling.get_engine_for_session",
+                    lambda: session_manager.get_engine_for_session(session_id),
+                    component="sampling",
+                    op="sampling.get_engine_for_session",
+                    request_id=request_id,
+                    attributes={"sampling_session_id": session_id},
+                )
                 logger.info(
                     f"[sample path] request_id={request_id} session_id={session_id} stage=after_get_engine"
                 )
@@ -976,7 +983,14 @@ async def _do_sample(request_id: str, request: SampleRequest, user_id: str | Non
                     f"[sample path] session_id={session_id} "
                     f"prompt_tokens={len(token_ids)} num_samples={request.num_samples} stage=before_lora_load"
                 )
-                await _ensure_session_lora_loaded(engine, session_id)
+                await run_async_with_otel_span(
+                    "sampling.ensure_lora_loaded",
+                    lambda: _ensure_session_lora_loaded(engine, session_id),
+                    component="sampling",
+                    op="sampling.ensure_lora_loaded",
+                    request_id=request_id,
+                    attributes={"sampling_session_id": session_id},
+                )
                 logger.info(f"[sample path] session_id={session_id} stage=after_lora_load")
 
                 gen_many = getattr(engine, "generate_many", None)
@@ -996,59 +1010,80 @@ async def _do_sample(request_id: str, request: SampleRequest, user_id: str | Non
                 )
                 if can_coalesce:
                     logger.info("[sample path] branch=coalesced_generate")
-                    results = await _await_with_external_fail_abort(
-                        engine=engine,
-                        request_id=request_id,
-                        awaitable=_coalesced_generate(
+                    results = await run_async_with_otel_span(
+                        "sampling.generate",
+                        lambda: _await_with_external_fail_abort(
                             engine=engine,
-                            sampling_session_id=session_id,
-                            prompt_ids=token_ids,
                             request_id=request_id,
-                            num_samples=request.num_samples,
-                            max_tokens=request.sampling_params.max_tokens,
-                            stop=request.sampling_params.stop,
-                            temperature=request.sampling_params.temperature,
-                            top_k=request.sampling_params.top_k,
-                            top_p=request.sampling_params.top_p,
+                            awaitable=_coalesced_generate(
+                                engine=engine,
+                                sampling_session_id=session_id,
+                                prompt_ids=token_ids,
+                                request_id=request_id,
+                                num_samples=request.num_samples,
+                                max_tokens=request.sampling_params.max_tokens,
+                                stop=request.sampling_params.stop,
+                                temperature=request.sampling_params.temperature,
+                                top_k=request.sampling_params.top_k,
+                                top_p=request.sampling_params.top_p,
+                            ),
                         ),
+                        component="sampling",
+                        op="sampling.generate",
+                        request_id=request_id,
+                        attributes={"sampling_session_id": session_id, "num_samples": request.num_samples},
                     )
                 elif request.num_samples == 1:
                     logger.info("[sample path] branch=generate_single")
-                    one_result = await _await_with_external_fail_abort(
-                        engine=engine,
-                        request_id=request_id,
-                        awaitable=engine.generate(
-                            sampling_session_id=session_id,
-                            prompt_ids=token_ids,
+                    one_result = await run_async_with_otel_span(
+                        "sampling.generate",
+                        lambda: _await_with_external_fail_abort(
+                            engine=engine,
                             request_id=request_id,
-                            max_tokens=request.sampling_params.max_tokens,
-                            stop=request.sampling_params.stop,
-                            temperature=request.sampling_params.temperature,
-                            top_k=request.sampling_params.top_k,
-                            top_p=request.sampling_params.top_p,
-                            logprobs=True,
-                        )
+                            awaitable=engine.generate(
+                                sampling_session_id=session_id,
+                                prompt_ids=token_ids,
+                                request_id=request_id,
+                                max_tokens=request.sampling_params.max_tokens,
+                                stop=request.sampling_params.stop,
+                                temperature=request.sampling_params.temperature,
+                                top_k=request.sampling_params.top_k,
+                                top_p=request.sampling_params.top_p,
+                                logprobs=True,
+                            ),
+                        ),
+                        component="sampling",
+                        op="sampling.generate",
+                        request_id=request_id,
+                        attributes={"sampling_session_id": session_id, "num_samples": 1},
                     )
                     results = [one_result]
                 else:
                     if gen_many is None:
                         raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
                     logger.info("[sample path] branch=generate_many")
-                    results = await _await_with_external_fail_abort(
-                        engine=engine,
-                        request_id=request_id,
-                        awaitable=gen_many(
-                            sampling_session_id=session_id,
-                            prompt_ids=token_ids,
+                    results = await run_async_with_otel_span(
+                        "sampling.generate",
+                        lambda: _await_with_external_fail_abort(
+                            engine=engine,
                             request_id=request_id,
-                            num_samples=request.num_samples,
-                            max_tokens=request.sampling_params.max_tokens,
-                            stop=request.sampling_params.stop,
-                            temperature=request.sampling_params.temperature,
-                            top_k=request.sampling_params.top_k,
-                            top_p=request.sampling_params.top_p,
-                            logprobs=True,
+                            awaitable=gen_many(
+                                sampling_session_id=session_id,
+                                prompt_ids=token_ids,
+                                request_id=request_id,
+                                num_samples=request.num_samples,
+                                max_tokens=request.sampling_params.max_tokens,
+                                stop=request.sampling_params.stop,
+                                temperature=request.sampling_params.temperature,
+                                top_k=request.sampling_params.top_k,
+                                top_p=request.sampling_params.top_p,
+                                logprobs=True,
+                            ),
                         ),
+                        component="sampling",
+                        op="sampling.generate_many",
+                        request_id=request_id,
+                        attributes={"sampling_session_id": session_id, "num_samples": request.num_samples},
                     )
             else:
                 # Legacy mode: per-session engine
@@ -1090,13 +1125,27 @@ async def _do_sample(request_id: str, request: SampleRequest, user_id: str | Non
             if want_prompt_logprobs:
                 if is_multi_lora:
                     # Get engine for session (already fetched above, but refetch to ensure exists)
-                    engine_for_logprobs = await session_manager.get_engine_for_session(session_id)
+                    engine_for_logprobs = await run_async_with_otel_span(
+                        "sampling.get_engine_for_prompt_logprobs",
+                        lambda: session_manager.get_engine_for_session(session_id),
+                        component="sampling",
+                        op="sampling.get_engine_for_prompt_logprobs",
+                        request_id=request_id,
+                        attributes={"sampling_session_id": session_id},
+                    )
                     if engine_for_logprobs is None:
                         raise RuntimeError(f"No engine found for session {session_id}")
-                    computed_logprobs = await engine_for_logprobs.compute_logprobs(
-                        sampling_session_id=session_id,
-                        prompt_ids=token_ids,
-                        request_id=f"{request_id}_prompt_logprobs",
+                    computed_logprobs = await run_async_with_otel_span(
+                        "sampling.compute_prompt_logprobs",
+                        lambda: engine_for_logprobs.compute_logprobs(
+                            sampling_session_id=session_id,
+                            prompt_ids=token_ids,
+                            request_id=f"{request_id}_prompt_logprobs",
+                        ),
+                        component="sampling",
+                        op="sampling.compute_prompt_logprobs",
+                        request_id=request_id,
+                        attributes={"sampling_session_id": session_id, "prompt_tokens": len(token_ids)},
                     )
                 else:
                     computed_logprobs = await engine.compute_logprobs(
@@ -1110,14 +1159,32 @@ async def _do_sample(request_id: str, request: SampleRequest, user_id: str | Non
             # Handle top-K prompt logprobs if requested
             if request.topk_prompt_logprobs > 0:
                 if is_multi_lora:
-                    engine_for_topk = await session_manager.get_engine_for_session(session_id)
+                    engine_for_topk = await run_async_with_otel_span(
+                        "sampling.get_engine_for_prompt_topk",
+                        lambda: session_manager.get_engine_for_session(session_id),
+                        component="sampling",
+                        op="sampling.get_engine_for_prompt_topk",
+                        request_id=request_id,
+                        attributes={"sampling_session_id": session_id},
+                    )
                     if engine_for_topk is None:
                         raise RuntimeError(f"No engine found for session {session_id}")
-                    computed_topk = await engine_for_topk.compute_topk(
-                        sampling_session_id=session_id,
-                        prompt_ids=token_ids,
-                        request_id=f"{request_id}_topk",
-                        k=request.topk_prompt_logprobs,
+                    computed_topk = await run_async_with_otel_span(
+                        "sampling.compute_prompt_topk",
+                        lambda: engine_for_topk.compute_topk(
+                            sampling_session_id=session_id,
+                            prompt_ids=token_ids,
+                            request_id=f"{request_id}_topk",
+                            k=request.topk_prompt_logprobs,
+                        ),
+                        component="sampling",
+                        op="sampling.compute_prompt_topk",
+                        request_id=request_id,
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "prompt_tokens": len(token_ids),
+                            "topk": request.topk_prompt_logprobs,
+                        },
                     )
                 else:
                     computed_topk = await engine.server.compute_prompt_topk.remote(

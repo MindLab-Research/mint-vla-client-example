@@ -17,6 +17,8 @@ Environment Variables:
 from __future__ import annotations
 
 import contextvars
+import functools
+import inspect
 import logging
 import logging.handlers
 import os
@@ -193,6 +195,110 @@ def restore_trace_id_from_traceparent(traceparent: str | None) -> str | None:
     trace_id = extract_trace_id_from_traceparent(traceparent)
     set_trace_id(trace_id)
     return trace_id
+
+
+def extract_otel_context_from_traceparent(traceparent: str | None) -> Any | None:
+    """Best-effort extract of an OTel parent context from W3C traceparent."""
+    if not isinstance(traceparent, str) or not traceparent.strip():
+        return None
+    try:
+        from opentelemetry.propagate import extract
+
+        return extract({"traceparent": traceparent.strip()})
+    except Exception:
+        return None
+
+
+@contextmanager
+def start_as_current_span_from_traceparent(
+    span_name: str,
+    *,
+    traceparent: str | None = None,
+    component: str | None = None,
+    op: str | None = None,
+    request_id: str | None = None,
+    attributes: dict[str, Any] | None = None,
+    kind: Any | None = None,
+) -> Iterator[Any | None]:
+    """Start an OTel span from a propagated traceparent and bind request/trace IDs for logs."""
+    trace_id = restore_trace_id_from_traceparent(traceparent)
+    context = extract_otel_context_from_traceparent(traceparent)
+    with bind_request_trace_context(request_id=request_id, trace_id=trace_id):
+        tracer = get_otel_tracer()
+        if tracer is None:
+            yield None
+            return
+
+        try:
+            from opentelemetry.trace import SpanKind, Status, StatusCode
+        except Exception:
+            yield None
+            return
+
+        span_kind = SpanKind.INTERNAL if kind is None else kind
+        with tracer.start_as_current_span(str(span_name), kind=span_kind, context=context) as span:
+            if component:
+                span.set_attribute("component", str(component))
+            if op:
+                span.set_attribute("op", str(op))
+            if request_id:
+                span.set_attribute("request_id", str(request_id))
+            if attributes:
+                for key, value in attributes.items():
+                    if value is None:
+                        continue
+                    try:
+                        span.set_attribute(str(key), value)
+                    except Exception:
+                        span.set_attribute(str(key), str(value))
+            try:
+                yield span
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                raise
+
+
+def traced_async_from_traceparent(
+    span_name: str,
+    *,
+    component: str | None = None,
+    op: str | None = None,
+    request_id_arg: str | None = None,
+    traceparent_arg: str = "traceparent",
+    attributes_builder: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+) -> Callable[[Callable[..., Awaitable[_T]]], Callable[..., Awaitable[_T]]]:
+    """Decorator for async actor methods that receive a propagated traceparent."""
+
+    def _decorator(fn: Callable[..., Awaitable[_T]]) -> Callable[..., Awaitable[_T]]:
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def _wrapped(*args: Any, **kwargs: Any) -> _T:
+            bound = signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            arguments = dict(bound.arguments)
+            traceparent = arguments.get(traceparent_arg)
+            request_id = arguments.get(request_id_arg) if request_id_arg else None
+            attributes: dict[str, Any] | None = None
+            if attributes_builder is not None:
+                try:
+                    attributes = attributes_builder(arguments)
+                except Exception:
+                    attributes = None
+            with start_as_current_span_from_traceparent(
+                span_name,
+                traceparent=traceparent if isinstance(traceparent, str) else None,
+                component=component,
+                op=op,
+                request_id=str(request_id) if request_id is not None else None,
+                attributes=attributes,
+            ):
+                return await fn(*args, **kwargs)
+
+        return _wrapped
+
+    return _decorator
 
 
 def ensure_trace_id(preferred_trace_id: str | None = None) -> str:

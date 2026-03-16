@@ -8,7 +8,6 @@ Supports GPU slots with CPU cache for overflow (LRU eviction).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -19,7 +18,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from . import ray_kill
-from .lora_registry import LoRARegistry, LoRASlotInfo
+from .lora_registry import LoRARegistry
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
 from .volc_placement import (
     assert_node_ip_capacity,
@@ -62,9 +61,9 @@ def _read_process_env_var(name: str) -> str:
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
-from tinker_server.logging_context import get_current_traceparent
+from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
 from tinker_server.ray_utils import init_ray
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
@@ -605,7 +604,7 @@ class MultiLoRAInferenceEngine:
         traceparent = get_current_traceparent()
         print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
-            print(f"[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
+            print("[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
             ref = self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
@@ -613,7 +612,7 @@ class MultiLoRAInferenceEngine:
                 traceparent=traceparent,
             )
             await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-            print(f"[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
+            print("[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
             logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
             print(f"[DEBUG add_lora_for_session] RayActorError/GetTimeoutError: {e}", flush=True)
@@ -700,29 +699,43 @@ class MultiLoRAInferenceEngine:
         start_time = time.time()
         traceparent = get_current_traceparent()
         print(f"[DEBUG add_lora_for_session_from_path] Loading from path: {lora_path}", flush=True)
+
+        async def _load_from_actor() -> None:
+            try:
+                ref = self.server.add_lora_from_path.remote(
+                    lora_int_id=lora_id,
+                    lora_path=lora_path,
+                    lora_name=sampling_session_id,
+                    traceparent=traceparent,
+                )
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                print("[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
+            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+                print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
+                self._initialized = False
+                self.server = None
+                await self.initialize()
+                ref = self.server.add_lora_from_path.remote(
+                    lora_int_id=lora_id,
+                    lora_path=lora_path,
+                    lora_name=sampling_session_id,
+                    traceparent=traceparent,
+                )
+                await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+
         try:
-            ref = self.server.add_lora_from_path.remote(
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                lora_name=sampling_session_id,
-                traceparent=traceparent,
+            await run_async_with_otel_span(
+                "sampling.multi_lora.add_lora_from_path",
+                _load_from_actor,
+                component="multi_lora_engine",
+                op="sampling.add_lora_from_path",
+                request_id=sampling_session_id,
+                attributes={
+                    "actor_name": self.actor_name,
+                    "sampling_session_id": sampling_session_id,
+                },
             )
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-            print(f"[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
-        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
-            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
-            print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
-            self._initialized = False
-            self.server = None
-            await self.initialize()
-            # Retry after restart
-            ref = self.server.add_lora_from_path.remote(
-                lora_int_id=lora_id,
-                lora_path=lora_path,
-                lora_name=sampling_session_id,
-                traceparent=traceparent,
-            )
-            await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
         except Exception as e:
             print(f"[DEBUG add_lora_for_session_from_path] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}", flush=True)
             import traceback
@@ -790,50 +803,66 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
         traceparent = get_current_traceparent()
 
-        if lora_id is not None:
-            # Generate with session-specific LoRA
-            logger.info(
-                "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
-                request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
-            )
-            ref = self.server.generate_with_lora.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                traceparent=traceparent,
-            )
-        else:
-            # Generate with base model (no LoRA)
-            logger.info(
-                "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
-                request_id, self.actor_name, len(prompt_ids), max_tokens,
-            )
-            ref = self.server.generate_base.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                traceparent=traceparent,
-            )
+        async def _dispatch_generate() -> dict:
+            if lora_id is not None:
+                logger.info(
+                    "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
+                    request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
+                )
+                ref = self.server.generate_with_lora.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    lora_int_id=lora_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    traceparent=traceparent,
+                )
+            else:
+                logger.info(
+                    "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
+                    request_id, self.actor_name, len(prompt_ids), max_tokens,
+                )
+                ref = self.server.generate_base.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    traceparent=traceparent,
+                )
 
-        t0_ray = time.time()
-        result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
-        ray_elapsed = time.time() - t0_ray
-        if ray_elapsed > 30.0:
-            logger.warning(
-                "[generate slow] req=%s actor=%s ray_get_elapsed=%.1fs",
-                request_id, self.actor_name, ray_elapsed,
-            )
+            t0_ray = time.time()
+            result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name, request_id=request_id)
+            ray_elapsed = time.time() - t0_ray
+            if ray_elapsed > 30.0:
+                logger.warning(
+                    "[generate slow] req=%s actor=%s ray_get_elapsed=%.1fs",
+                    request_id, self.actor_name, ray_elapsed,
+                )
+            return result
+
+        result = await run_async_with_otel_span(
+            "sampling.multi_lora.generate",
+            _dispatch_generate,
+            component="multi_lora_engine",
+            op="sampling.generate",
+            request_id=request_id,
+            attributes={
+                "actor_name": self.actor_name,
+                "sampling_session_id": sampling_session_id,
+                "prompt_tokens": len(prompt_ids),
+                "max_tokens": max_tokens,
+                "num_samples": 1,
+                "lora_id": lora_id,
+            },
+        )
 
         timing_total_s = result.get("_timing_total_s")
         if timing_total_s is not None:
@@ -888,35 +917,51 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
         traceparent = get_current_traceparent()
 
-        if lora_id is not None:
-            ref = self.server.generate_with_lora.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                lora_int_id=lora_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                n=num_samples,
-                traceparent=traceparent,
-            )
-        else:
-            ref = self.server.generate_base.remote(
-                prompt_ids=prompt_ids,
-                request_id=request_id,
-                max_tokens=max_tokens,
-                stop=stop,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                n=num_samples,
-                traceparent=traceparent,
-            )
+        async def _dispatch_generate_many():
+            if lora_id is not None:
+                ref = self.server.generate_with_lora.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    lora_int_id=lora_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    n=num_samples,
+                    traceparent=traceparent,
+                )
+            else:
+                ref = self.server.generate_base.remote(
+                    prompt_ids=prompt_ids,
+                    request_id=request_id,
+                    max_tokens=max_tokens,
+                    stop=stop,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    logprobs=logprobs,
+                    n=num_samples,
+                    traceparent=traceparent,
+                )
+            return await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
 
-        raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        raw = await run_async_with_otel_span(
+            "sampling.multi_lora.generate_many",
+            _dispatch_generate_many,
+            component="multi_lora_engine",
+            op="sampling.generate_many",
+            request_id=request_id,
+            attributes={
+                "actor_name": self.actor_name,
+                "sampling_session_id": sampling_session_id,
+                "prompt_tokens": len(prompt_ids),
+                "max_tokens": max_tokens,
+                "num_samples": num_samples,
+                "lora_id": lora_id,
+            },
+        )
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
@@ -986,45 +1031,43 @@ class MultiLoRAInferenceEngine:
             lora_id = await self.registry.get_lora_id(sampling_session_id)
         traceparent = get_current_traceparent()
 
-        if lora_id is not None:
-            # Compute logprobs with session-specific LoRA
-            try:
-                ref = self.server.compute_prompt_logprobs_with_lora.remote(
-                    prompt_ids=prompt_ids,
-                    request_id=request_id,
-                    lora_int_id=lora_id,
-                    traceparent=traceparent,
-                )
-                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
-            except Exception as e:
-                msg = f"{type(e).__name__}: {e}"
-                if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
-                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
-                    try:
-                        from tinker_server.backend.resource_pool import get_resource_pool
+        async def _dispatch_compute_logprobs():
+            if lora_id is not None:
+                try:
+                    ref = self.server.compute_prompt_logprobs_with_lora.remote(
+                        prompt_ids=prompt_ids,
+                        request_id=request_id,
+                        lora_int_id=lora_id,
+                        traceparent=traceparent,
+                    )
+                    return await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                except Exception as e:
+                    msg = f"{type(e).__name__}: {e}"
+                    if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
+                        logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                        try:
+                            from tinker_server.backend.resource_pool import get_resource_pool
 
-                        ray_kill.kill(
-                            self.server,
-                            reason="vllm_compute_logprobs_failed",
-                            actor_name=self.actor_name,
-                            namespace=PERSISTENT_NAMESPACE,
-                            no_restart=True,
-                        )
-                        get_resource_pool().unregister(self.actor_name)
-                    except Exception:
-                        pass
-                    self.server = None
-                    self._initialized = False
-                raise
-        else:
-            # Compute logprobs with base model (no LoRA)
+                            ray_kill.kill(
+                                self.server,
+                                reason="vllm_compute_logprobs_failed",
+                                actor_name=self.actor_name,
+                                namespace=PERSISTENT_NAMESPACE,
+                                no_restart=True,
+                            )
+                            get_resource_pool().unregister(self.actor_name)
+                        except Exception:
+                            pass
+                        self.server = None
+                        self._initialized = False
+                    raise
             try:
                 ref = self.server.compute_prompt_logprobs_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
                     traceparent=traceparent,
                 )
-                result = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+                return await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
@@ -1045,6 +1088,20 @@ class MultiLoRAInferenceEngine:
                     self.server = None
                     self._initialized = False
                 raise
+
+        result = await run_async_with_otel_span(
+            "sampling.multi_lora.compute_logprobs",
+            _dispatch_compute_logprobs,
+            component="multi_lora_engine",
+            op="sampling.compute_logprobs",
+            request_id=request_id,
+            attributes={
+                "actor_name": self.actor_name,
+                "sampling_session_id": sampling_session_id,
+                "prompt_tokens": len(prompt_ids),
+                "lora_id": lora_id,
+            },
+        )
 
         return list(result)
 

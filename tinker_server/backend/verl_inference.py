@@ -356,12 +356,13 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
     init_actor_observability,
     restore_trace_id_from_traceparent,
+    traced_async_from_traceparent,
 )
 from tinker_server.ray_utils import init_ray
 
@@ -476,7 +477,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if 'cuda_visible_devices' in kwargs:
                 print(f"[ExtendedVLLMHttpServer] cuda_visible_devices={kwargs['cuda_visible_devices']}", flush=True)
             else:
-                print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
+                print("[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
             call_kwargs = dict(kwargs)
             rollout_cfg = call_kwargs.get("config")
             if rollout_cfg is not None:
@@ -856,6 +857,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             await self.engine.add_lora(lora_request)
             return adapter_path
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.add_lora_from_path",
+            component="vllm_actor",
+            op="sampling.add_lora_from_path",
+            request_id_arg="lora_name",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "lora_path": a.get("lora_path"),
+            },
+        )
         async def add_lora_from_path(
             self,
             lora_int_id: int,
@@ -897,6 +908,18 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             if debug:
                 print(f"[DEBUG add_lora_from_path] Stored path for lora_int_id={lora_int_id}", flush=True)
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.generate_with_lora",
+            component="vllm_actor",
+            op="sampling.generate_with_lora",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "max_tokens": a.get("max_tokens"),
+                "num_samples": a.get("n"),
+            },
+        )
         async def generate_with_lora(
             self,
             prompt_ids: list[int],
@@ -1162,6 +1185,17 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             self._progress_last.pop(request_id, None)
             return outs
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.generate_base",
+            component="vllm_actor",
+            op="sampling.generate_base",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "max_tokens": a.get("max_tokens"),
+                "num_samples": a.get("n"),
+            },
+        )
         async def generate_base(
             self,
             prompt_ids: list[int],
@@ -1427,7 +1461,6 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             Uses min(user_max_tokens, max_model_len - prompt_len).
             """
             self._bind_traceparent(traceparent)
-            from typing import Optional
 
             from vllm import SamplingParams
             from vllm.inputs import TokensPrompt
@@ -1623,8 +1656,6 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
             from vllm.lora.request import LoRARequest
 
             from verl.workers.rollout.vllm_rollout.utils import (
-                VLLM_LORA_INT_ID,
-                VLLM_LORA_NAME,
                 VLLM_LORA_PATH,
             )
 
@@ -1685,6 +1716,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return result
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.compute_prompt_logprobs_with_lora",
+            component="vllm_actor",
+            op="sampling.compute_prompt_logprobs_with_lora",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+            },
+        )
         async def compute_prompt_logprobs_with_lora(
             self,
             prompt_ids: list[int],
@@ -1847,6 +1888,15 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return result
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.compute_prompt_logprobs_base",
+            component="vllm_actor",
+            op="sampling.compute_prompt_logprobs_base",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+            },
+        )
         async def compute_prompt_logprobs_base(
             self,
             prompt_ids: list[int],
@@ -1992,7 +2042,6 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
         async def test_mp_spawn_from_actor(self) -> dict:
             """Test multiprocessing spawn from within actor to debug PYTHONPATH."""
-            import os
             import subprocess
             
             # Run the test script
@@ -2055,7 +2104,6 @@ with open(result_file, "w") as f:
         async def test_actual_worker_spawn(self) -> dict:
             """Test spawning with module-level function (like vLLM does)."""
             import os
-            import sys
             from vllm.utils.system_utils import get_mp_context
             from tinker_server.spawn_worker_test import spawn_worker_check, RESULT_FILE
             

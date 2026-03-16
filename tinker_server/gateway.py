@@ -10,6 +10,8 @@ from typing import Any
 
 import httpx
 
+from .logging_context import get_current_traceparent, get_trace_id
+
 logger = logging.getLogger(__name__)
 
 _GATEWAY_REQUEST_ID_PREFIX = "gw:"
@@ -134,6 +136,25 @@ def _pick_auth_headers(*, incoming_headers: dict[str, str], upstream: Upstream) 
     )
 
 
+def _pick_trace_headers(*, incoming_headers: dict[str, str]) -> dict[str, str]:
+    incoming_lower = {k.lower(): v for k, v in incoming_headers.items()}
+    forwarded: dict[str, str] = {}
+
+    traceparent = (incoming_headers.get("traceparent") or incoming_lower.get("traceparent") or "").strip()
+    if not traceparent:
+        traceparent = str(get_current_traceparent() or "").strip()
+    if traceparent:
+        forwarded["traceparent"] = traceparent
+
+    trace_id = (incoming_headers.get("X-Trace-Id") or incoming_lower.get("x-trace-id") or "").strip()
+    if not trace_id:
+        trace_id = str(get_trace_id() or "").strip()
+    if trace_id:
+        forwarded["X-Trace-Id"] = trace_id
+
+    return forwarded
+
+
 async def forward_json(
     *,
     upstream: Upstream,
@@ -143,7 +164,10 @@ async def forward_json(
     json_body: dict[str, Any] | None,
     timeout_s: float = 30.0,
 ) -> httpx.Response:
-    headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    headers = {
+        **_pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream),
+        **_pick_trace_headers(incoming_headers=incoming_headers),
+    }
     key = upstream.base_url
     async with _http_clients_lock:
         client = _http_clients.get(key)
@@ -163,7 +187,10 @@ async def forward_request(
     timeout_s: float = 30.0,
     stream: bool = False,
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
-    headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    headers = {
+        **_pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream),
+        **_pick_trace_headers(incoming_headers=incoming_headers),
+    }
     client = httpx.AsyncClient(base_url=upstream.base_url, timeout=timeout_s)
     request = client.build_request(method, path, headers=headers, params=params)
     response = await client.send(request, stream=stream, follow_redirects=False)
@@ -189,7 +216,10 @@ async def forward_file(
     timeout_s: float = 600.0,
 ) -> httpx.Response:
     url = f"{upstream.base_url}{path}"
-    headers = _pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream)
+    headers = {
+        **_pick_auth_headers(incoming_headers=incoming_headers, upstream=upstream),
+        **_pick_trace_headers(incoming_headers=incoming_headers),
+    }
     filename = os.path.basename(file_path)
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         with open(file_path, "rb") as f:
@@ -253,7 +283,7 @@ def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias
             upstream_alias=upstream_alias,
             base_model=base_model,
         )
-    except Exception as e:
+    except Exception:
         _remote_sampling_sessions.pop(sampling_session_id, None)
         logger.exception("gateway_session_store.upsert_sampling_session failed")
         raise HTTPException(
@@ -278,7 +308,7 @@ def remote_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
         if info is not None:
             _remote_sampling_sessions[sampling_session_id] = info
         return info
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=503,
             detail="Gateway session store unavailable",
@@ -296,7 +326,7 @@ def unregister_remote_sampling_session(sampling_session_id: str) -> None:
         from .backend import gateway_session_store
 
         gateway_session_store.delete_sampling_session(sampling_session_id)
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=503,
             detail="Gateway session store unavailable",
@@ -330,7 +360,7 @@ def register_remote_training_model(
             base_model=base_model,
             owner_id=owner_id,
         )
-    except Exception as e:
+    except Exception:
         _remote_training_models.pop(model_id, None)
         logger.exception("gateway_session_store.upsert_training_model failed")
         raise HTTPException(
@@ -356,7 +386,7 @@ def remote_training_model_info(model_id: str) -> dict[str, str | None] | None:
             _remote_training_models[model_id] = dict(info)
             return dict(info)
         return None
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=503,
             detail="Gateway session store unavailable",
@@ -387,7 +417,7 @@ def unregister_remote_training_model(model_id: str) -> None:
         from .backend import gateway_session_store
 
         gateway_session_store.delete_training_model(model_id)
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=503,
             detail="Gateway session store unavailable",
