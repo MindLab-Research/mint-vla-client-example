@@ -27,6 +27,13 @@ Responsibility split:
 - Bugfixer subagent: all reproduction, troubleshooting, debugging, code edits, and dev-server operations needed to make reproduction pass.
 - Reviewer subagent: independent review and a PR comment; no code changes.
 
+GitHub accountability requirement:
+- The PR is the accountability surface for auto-bugfix. The orchestrator MUST explicitly post GitHub comments/recommendations before merge.
+- Minimum required GitHub artifacts on every auto-bugfix PR:
+  - A PR comment from the orchestrator summarizing the problem, root cause, fix, exact runtime evidence, remaining risks, and merge recommendation.
+  - A reviewer PR comment/review that states findings or explicitly says no findings and gives a merge recommendation.
+- Do not treat the PR description alone as sufficient. The recommendation must be posted as an explicit GitHub comment/review on the PR before merge.
+
 SOP step ownership (remove ambiguity):
 - Orchestrator runs: 3a-3c, 3h-3k.
 - Bugfixer runs: 3d-3g.
@@ -86,6 +93,9 @@ Hard rules:
   - Unit tests: `pytest -q` run on the PR branch (in addition to integrated checks; unit tests do not replace integrated checks).
   - Evidence recording: record the exact commands AND the observed PASS/FAIL output in the PR (description or comment). "I inspected the code" is invalid evidence.
 - If you cannot run the reproduction or tests, do not close the issue and do not merge the PR. Post a blocking note explaining why it cannot be executed.
+- Before merge, explicitly post the final recommendation to the PR:
+  - `recommend merge` if the issue-specific evidence is complete and any remaining failures are proven pre-existing or unrelated.
+  - `do not merge` if issue-specific evidence is incomplete or a remaining failure may be introduced by the branch.
 - Retroactive enforcement: if a closed `assign-to-bot` issue was closed based on static-only or partial evidence (no integrated runtime repro), reopen it and requeue it for a real integrated repro + smoke + pytest.
 
 Files:

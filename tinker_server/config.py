@@ -231,6 +231,7 @@ class ServerConfig:
 
     # Sampling settings (routes/sampling.py)
     sampling_max_inflight_sample_tasks: int = 64
+    sampling_max_pending_asample_per_apikey: int = 64
     sampling_max_concurrent_samples_per_request: int = 8
     sampling_sample_coalesce: bool = True
     sampling_sample_coalesce_window_ms: float = 50.0
@@ -443,6 +444,11 @@ class ServerConfig:
             sampling_max_inflight_sample_tasks=_pick_int(
                 "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
                 file_sampling.max_inflight_sample_tasks if file_sampling is not None else None,
+                64,
+            ),
+            sampling_max_pending_asample_per_apikey=_pick_int(
+                "TINKER_MAX_PENDING_ASAMPLE_PER_APIKEY",
+                getattr(file_sampling, "max_pending_asample_per_apikey", None) if file_sampling is not None else None,
                 64,
             ),
             sampling_max_concurrent_samples_per_request=_pick_int(

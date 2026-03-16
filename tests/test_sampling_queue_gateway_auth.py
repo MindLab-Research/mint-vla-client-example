@@ -1,5 +1,7 @@
 import asyncio
 import importlib
+import sys
+import types
 from types import SimpleNamespace
 
 from tinker_server import app as app_module
@@ -72,10 +74,12 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
-    verl_training_module = importlib.import_module("tinker_server.backend.verl_training")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
+    verl_training_module = types.ModuleType("tinker_server.backend.verl_training")
+    verl_training_module.VerlTrainingEngine = _StubTrainingEngine
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.verl_training", verl_training_module)
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
@@ -97,6 +101,8 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
         op="sampling.asample",
         request_json=request.model_dump_json().encode("utf-8"),
         user_id="user-test",
+        apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+        throttle_principal="apikey:bbbbbbbbbbbbbbbbbbbbbbbb",
         webhook_url=None,
         extra={
             "gateway_auth": {
