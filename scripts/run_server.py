@@ -27,10 +27,40 @@ import pathlib
 import sys
 import tomllib
 import traceback
+from types import ModuleType
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _load_local_runtime_env_module() -> ModuleType:
+    module_name = "_tinker_runtime_env_bootstrap"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        _REPO_ROOT / "tinker_server" / "runtime_env.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load local tinker_server.runtime_env bootstrap module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _is_local_checkout_path(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        candidate = pathlib.Path(path).resolve()
+    except OSError:
+        return False
+    try:
+        candidate.relative_to(_REPO_ROOT)
+        return True
+    except ValueError:
+        return False
 
 def _normalize_pythonpath(entries: str) -> str:
     return ":".join(part for part in entries.split(":") if part)
@@ -42,7 +72,11 @@ def _set_exact_pythonpath(entries: str) -> str:
         return ""
     parts = normalized.split(":")
     os.environ["PYTHONPATH"] = normalized
-    existing = [part for part in sys.path if part not in parts]
+    existing = [
+        part
+        for part in sys.path
+        if part not in parts and not _is_local_checkout_path(part)
+    ]
     sys.path[:] = [*parts, *existing]
     return normalized
 
@@ -98,9 +132,8 @@ def _reexec_to_runtime_host_python_if_needed() -> None:
     env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
     if not env_root:
         return
-    from tinker_server.runtime_env import validate_runtime_env_layout
-
-    layout = validate_runtime_env_layout(env_root, require_host_python=True)
+    runtime_env = _load_local_runtime_env_module()
+    layout = runtime_env.validate_runtime_env_layout(env_root, require_host_python=True)
     target_python = pathlib.Path(layout.host_python).resolve()
     current_python = pathlib.Path(sys.executable).resolve()
     if current_python == target_python:
@@ -169,10 +202,10 @@ if __name__ == "__main__":
 
     _reexec_to_runtime_host_python_if_needed()
 
-    from tinker_server.runtime_env import bootstrap_runtime_pythonpath
+    runtime_env = _load_local_runtime_env_module()
 
     pythonpath = _set_exact_pythonpath(
-        bootstrap_runtime_pythonpath(
+        runtime_env.bootstrap_runtime_pythonpath(
             os.environ,
             repo_root=str(_REPO_ROOT),
         )

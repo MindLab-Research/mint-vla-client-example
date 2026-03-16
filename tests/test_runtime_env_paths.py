@@ -224,3 +224,28 @@ def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch)
     assert os.environ["PFS_RUNTIME_ENV_ROOT"] == str(tmp_path / "runtime")
     assert os.environ["PFS_TINKER_PATH"] == str(tmp_path / "repo")
     assert os.environ["PFS_HF_MODULES_PATH"] == str(tmp_path / "hf")
+
+
+def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
+    import scripts.run_server as run_server
+
+    monkeypatch.setattr(
+        run_server,
+        "sys",
+        type(
+            "FakeSys",
+            (),
+            {
+                "path": [
+                    str(Path.cwd()),
+                    str(Path.cwd() / "scripts"),
+                    "/usr/lib/python3.12",
+                ]
+            },
+        )(),
+    )
+    out = run_server._set_exact_pythonpath("/canonical/repo:/canonical/hf")
+    assert out == "/canonical/repo:/canonical/hf"
+    assert run_server.sys.path[:2] == ["/canonical/repo", "/canonical/hf"]
+    assert str(Path.cwd()) not in run_server.sys.path
+    assert str(Path.cwd() / "scripts") not in run_server.sys.path
