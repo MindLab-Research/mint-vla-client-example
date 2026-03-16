@@ -226,6 +226,35 @@ def test_config_import_does_not_require_runtime_root():
     assert out.stdout.strip() == "True"
 
 
+def test_gateway_session_store_namespace_respects_config_file(tmp_path):
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["TINKER_CONFIG_PATH"] = str(cfg)
+    env.pop("TINKER_RAY_NAMESPACE", None)
+    env.pop("MINT_RAY_NAMESPACE", None)
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import tinker_server.config as c; "
+                "import tinker_server.backend.gateway_session_store as g; "
+                "print(c.RAY_NAMESPACE); "
+                "print(g._ray_namespace())"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns"]
+
+
 def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
     cfg = tmp_path / "tinker.toml"
     cfg.write_text(

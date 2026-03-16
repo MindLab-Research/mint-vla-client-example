@@ -465,10 +465,10 @@ for a in actors:
 \""
 
 # Kill all dense trainer pool actors in current namespace (prefix match)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/\$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address='auto', ignore_reinit_error=True)
+ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 ns = os.environ['TINKER_RAY_NAMESPACE']
 actors = ray.util.list_named_actors(all_namespaces=True)
 killed = 0
@@ -487,10 +487,10 @@ print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
 \""
 
 # Kill detached store actors in current namespace (name match)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/\$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address='auto', ignore_reinit_error=True)
+ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 ns = os.environ['TINKER_RAY_NAMESPACE']
 names = ['tinker_future_store', 'tinker_training_session_store', 'tinker_gateway_session_store']
 killed = 0
@@ -746,10 +746,10 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbo
 
 ```bash
 # List all actors - this shows actual names and states
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --address "$RAY_ADDRESS" 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
 
 # Or list with full details
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --filter "state=ALIVE" 2>&1 | head -30'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --address "$RAY_ADDRESS" --filter "state=ALIVE" 2>&1 | head -30'
 ```
 
 ### Check Specific Actor Status
@@ -775,16 +775,16 @@ for a in actors:
 
 ```bash
 # Get actor ID from ray list actors output, then:
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray logs actor --address "$RAY_ADDRESS" --id <ACTOR_ID> --tail 100 2>&1'
 
 # Example with actual ID:
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray logs actor --address "$RAY_ADDRESS" --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
 ```
 
 ### List Dead Actors (for crash investigation)
 
 ```bash
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --filter "state=DEAD" 2>&1 | head -30'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --address "$RAY_ADDRESS" --filter "state=DEAD" 2>&1 | head -30'
 ```
 
 ---
