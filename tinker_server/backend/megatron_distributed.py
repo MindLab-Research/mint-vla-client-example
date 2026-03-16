@@ -1061,12 +1061,13 @@ class MegatronRankWorker:
 
         self._current_session_id = new_session_id
 
-    def clear_session_state(self, session_id: str) -> None:
+    def clear_session_state(self, session_id: str, traceparent: str | None = None) -> None:
         """Clear saved state for a session (call after session completes).
 
         Args:
             session_id: Session ID to clear.
         """
+        self._bind_traceparent(traceparent)
         if session_id in self._session_gradients:
             del self._session_gradients[session_id]
         if session_id in self._session_optimizer_states:
@@ -2328,14 +2329,18 @@ class MegatronRankWorker:
             )
             try:
 
-                # DEBUG: Check optimizer state size BEFORE step
+                # Optional diagnostics only. Missing Megatron optimizer modules must not
+                # change optim_step semantics.
                 if self.rank == 0:
-                    from megatron.core.optimizer import ChainedOptimizer
+                    try:
+                        from megatron.core.optimizer import ChainedOptimizer
+                    except ModuleNotFoundError:
+                        ChainedOptimizer = None
 
                     optimizer = self.engine.optimizer
                     if optimizer is not None:
                         def iter_optimizers(opt):
-                            if isinstance(opt, ChainedOptimizer):
+                            if ChainedOptimizer is not None and isinstance(opt, ChainedOptimizer):
                                 return opt.chained_optimizers
                             return [opt]
 
@@ -4406,8 +4411,13 @@ class MegatronRankWorker:
             return {"status": "ok", "optimizer_file": optimizer_file}
         return {}
 
-    def check_optimizer_state_exists(self, checkpoint_path: str) -> dict:
+    def check_optimizer_state_exists(
+        self,
+        checkpoint_path: str,
+        traceparent: str | None = None,
+    ) -> dict:
         """Check whether this rank's optimizer shard exists on shared storage."""
+        self._bind_traceparent(traceparent)
         import os
 
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
@@ -4915,10 +4925,11 @@ class MegatronWorkerGroup:
             is_mla = False
             disable_nccl_ib = False
 
-        from ..config import otel_env_vars
+        from ..config import actor_runtime_env_vars, otel_env_vars
         runtime_env = {
-            "env_vars": {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -4932,7 +4943,8 @@ class MegatronWorkerGroup:
                 "NVTE_FUSED_ATTN": "0" if is_mla else "1",
                 "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
                 **otel_env_vars(),
-            },
+                },
+            ),
         }
 
         # Forward MoE LoRA export knobs into rank workers.
@@ -6487,7 +6499,6 @@ def get_or_create_megatron_worker_group(
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6594,19 +6605,21 @@ def get_or_create_megatron_worker_group(
         resource_pool.reserve_gpus(num_gpus)
 
         try:
-            from ..config import otel_env_vars
+            from ..config import actor_runtime_env_vars, otel_env_vars
 
             # Runtime env for PFS code access
             runtime_env = {
-                "env_vars": {
-                    "PYTHONPATH": PFS_PYTHONPATH,
+                "env_vars": actor_runtime_env_vars(
+                    pythonpath=PFS_PYTHONPATH,
+                    extra={
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     **otel_env_vars(),
-                }
+                    },
+                )
             }
 
             # Forward MoE LoRA export knobs into the detached Megatron actor so the
@@ -6743,7 +6756,6 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6837,7 +6849,6 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
     """
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

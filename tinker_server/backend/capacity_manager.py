@@ -192,8 +192,13 @@ def _get_or_create_ray_actor():
         "get_if_exists": True,
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
     return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
         **options
     ).remote(queue_bytes_budget=queue_bytes_budget)
@@ -212,10 +217,8 @@ class CapacityManager:
         if not ray.is_initialized():
             try:
                 from ..ray_utils import init_ray
-                from .future_store import _infer_ray_address  # type: ignore
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
 

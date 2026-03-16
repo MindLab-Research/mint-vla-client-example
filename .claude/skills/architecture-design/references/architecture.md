@@ -15,5 +15,6 @@ This reference is split by topic for faster lookup. Start here, then open the re
 - Weights and checkpoints: `weights-checkpoints.md`
 - Auto eviction and GPU allocation: `eviction.md`
 - Authentication and model access: `auth-access.md`
+- Dependency architecture (runtime env root, image boundary, host bootstrap): `dependency-architecture.md`
 - Usage billing storage (JSONL -> async PostgreSQL): `usage-billing-storage.md`
 - Design constraints and change checklist: `constraints-checklist.md`

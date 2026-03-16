@@ -122,7 +122,7 @@ async def healthz() -> dict:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         def _pending_gpu_pg_names_in_namespace() -> list[str]:
             tbl = ray.util.placement_group_table()
@@ -346,8 +346,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     return CreateSessionResponse(session_id=session_id)
 
 
-@router.post("/create_sampling_session")
-async def create_sampling_session(
+async def _create_sampling_session_impl(
     request: CreateSamplingSessionRequest,
     http_request: Request,
 ) -> CreateSamplingSessionResponse:
@@ -365,16 +364,13 @@ async def create_sampling_session(
 
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
-    adapter_path: str | None = None
-
-    # Determine base_model from request or infer from model_path
-    base_model = request.base_model
-    if not base_model and request.model_path:
-        # Try to infer base_model from adapter_config.json
-        adapter_path = _resolve_model_path(
-            request.model_path, user_id=user_id, http_request=http_request
-        )
-        base_model = _infer_base_model_from_adapter(adapter_path)
+    # Determine base_model from request or infer from model_path.
+    base_model, adapter_path = _resolve_base_model_for_sampling_request(
+        base_model=request.base_model,
+        model_path=request.model_path,
+        user_id=user_id,
+        http_request=http_request,
+    )
 
     if not base_model:
         raise HTTPException(
@@ -563,6 +559,48 @@ async def create_sampling_session(
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
 
+@router.post("/create_sampling_session")
+async def create_sampling_session(
+    request: CreateSamplingSessionRequest,
+    http_request: Request,
+) -> CreateSamplingSessionResponse:
+    return await _create_sampling_session_impl(request, http_request)
+
+
+async def ensure_sampling_session(
+    *,
+    model_path: str,
+    http_request: Request,
+    parent_session_id: str | None = None,
+) -> tuple[str, str]:
+    """Ensure a sampling session exists for an OpenAI-compatible request."""
+    from ..gateway import remote_sampling_session
+
+    request_kwargs: dict[str, str] = {
+        "session_id": parent_session_id or str(uuid.uuid4()),
+    }
+    if model_path.startswith(("tinker://", "mint://", "ckpt_", "file://", "/")):
+        request_kwargs["model_path"] = model_path
+    else:
+        request_kwargs["base_model"] = model_path
+
+    sampling_request = CreateSamplingSessionRequest(**request_kwargs)
+    response = await create_sampling_session(sampling_request, http_request)
+    sampling_session_id = response.sampling_session_id
+    base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
+    if base_model is None:
+        remote = remote_sampling_session(sampling_session_id)
+        if remote is not None:
+            _, base_model = remote
+
+    if not base_model:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Sampling session {sampling_session_id!r} missing base_model after creation",
+        )
+    return sampling_session_id, base_model
+
+
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
 async def get_session(session_id: str, http_request: Request) -> GetSessionResponse:
     request_user_data = _get_user_data(http_request)
@@ -722,6 +760,25 @@ def _resolve_model_path(
     return materialize_persistent_checkpoint(resolved)
 
 
+def _resolve_base_model_for_sampling_request(
+    *,
+    base_model: str | None,
+    model_path: str | None,
+    user_id: str | None,
+    http_request: Request,
+) -> tuple[str | None, str | None]:
+    """Return the effective base_model and resolved adapter path for a sampling request."""
+    adapter_path: str | None = None
+    if not base_model and model_path:
+        adapter_path = _resolve_model_path(
+            model_path,
+            user_id=user_id,
+            http_request=http_request,
+        )
+        base_model = _infer_base_model_from_adapter(adapter_path)
+    return base_model, adapter_path
+
+
 def _infer_base_model_from_adapter(adapter_path: str) -> str | None:
     """Infer base_model from adapter_config.json if present.
 
@@ -837,7 +894,7 @@ def _augment_with_placement_groups(actors: list[dict]) -> None:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         for a in actors:
             name = a.get("actor_name")
@@ -914,7 +971,7 @@ def _kill_dense_actors(base_model: str | None) -> int:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         for e in targets:
             try:

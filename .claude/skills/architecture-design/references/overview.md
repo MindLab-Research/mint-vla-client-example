@@ -2,6 +2,10 @@
 
 Mint (tinker-server) is a FastAPI service that implements the Tinker REST contract and brokers training and inference to Ray GPU actors. The server is a control plane plus request validation, not a compute engine. The design is shaped by two goals: keep compatibility with the Tinker API contract, and multiplex GPU resources across many LoRA sessions for both inference and training.
 
+Dependency management follows the same control-plane versus compute-engine split:
+- the worker image owns ABI-bound GPU packages
+- a PFS runtime-env root owns the shared Python dependency graph and pinned source overlays for the API host and Ray actors
+
 ## Tinker API contract as the boundary
 
 The API surface follows the Tinker SDK expectations: create sessions and models, submit work, poll for completion, and manage weights. The server owns HTTP, auth, and request validation. The GPU actors own model weights and do the compute. That split is the primary boundary.

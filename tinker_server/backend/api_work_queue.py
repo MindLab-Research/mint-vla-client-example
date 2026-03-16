@@ -32,6 +32,39 @@ class StaleConsumerError(RuntimeError):
     pass
 
 
+class ApiWorkQueueThrottleError(RuntimeError):
+    def __init__(self, *, scope: str, limit: int, pending: int):
+        self.detail = {
+            "code": "sampling_principal_backpressure",
+            "scope": str(scope),
+            "limit": int(limit),
+            "pending": int(pending),
+            "message": "Sampling backpressure: principal budget exhausted",
+        }
+        super().__init__(self.detail["message"])
+
+    @classmethod
+    def from_detail(cls, detail: dict[str, Any]) -> "ApiWorkQueueThrottleError":
+        return cls(
+            scope=str(detail.get("scope") or "api_key"),
+            limit=int(detail.get("limit") or 0),
+            pending=int(detail.get("pending") or 0),
+        )
+
+
+def _unwrap_queue_throttle_error(exc: Exception) -> ApiWorkQueueThrottleError | None:
+    candidate: Exception | None = exc
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            candidate = as_instanceof_cause()
+        except Exception:
+            candidate = exc
+    if isinstance(candidate, ApiWorkQueueThrottleError):
+        return candidate
+    return None
+
+
 def _ray_namespace() -> str:
     v = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
     if v:
@@ -54,6 +87,8 @@ class WorkItem:
     op: str
     request_json: bytes
     user_id: str | None
+    apikey_id: str | None
+    throttle_principal: str | None
     webhook_url: str | None
     extra: dict[str, Any]
     created_at: float
@@ -143,6 +178,12 @@ def _get_or_create_ray_actor():
             self._active_job_id: str | None = None
             self._ema_exec_s_by_op: dict[str, float] = {}
             self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
+            self._max_pending_asample_per_apikey = int(
+                getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
+            )
+            self._queued_asample_by_principal: dict[str, int] = {}
+            self._queued_asample_by_apikey: dict[str, int] = {}
+            self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
             self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
             self._scheduler_max_consecutive = max(
                 1,
@@ -168,6 +209,82 @@ def _get_or_create_ray_actor():
                 "wait_s_sum": 0.0,
                 "switch_reasons": {},
             }
+
+        def _asample_throttle_identity(self, item: dict[str, Any]) -> tuple[str | None, str | None]:
+            if str(item.get("op")) != "sampling.asample":
+                return None, None
+            principal = item.get("throttle_principal")
+            apikey_id = item.get("apikey_id")
+            principal_str = None if principal is None else str(principal).strip()
+            apikey_str = None if apikey_id is None else str(apikey_id).strip()
+            if principal_str == "":
+                principal_str = None
+            if apikey_str == "":
+                apikey_str = None
+            return principal_str, apikey_str
+
+        def _reserve_asample_slot(self, item: dict[str, Any]) -> None:
+            principal, apikey_id = self._asample_throttle_identity(item)
+            if principal is None:
+                return
+            request_id = str(item.get("request_id"))
+            if request_id in self._queued_asample_request_state:
+                return
+            pending = int(self._queued_asample_by_principal.get(principal, 0))
+            if pending >= self._max_pending_asample_per_apikey:
+                raise ApiWorkQueueThrottleError(
+                    scope="api_key" if apikey_id is not None else "user",
+                    limit=self._max_pending_asample_per_apikey,
+                    pending=pending,
+                )
+            self._queued_asample_by_principal[principal] = pending + 1
+            if apikey_id is not None:
+                self._queued_asample_by_apikey[apikey_id] = int(self._queued_asample_by_apikey.get(apikey_id, 0)) + 1
+            self._queued_asample_request_state[request_id] = (principal, apikey_id, None)
+
+        def _release_asample_slot(self, request_id: str) -> None:
+            principal, apikey_id, _consumer_job_id = self._queued_asample_request_state.pop(
+                str(request_id), (None, None, None)
+            )
+            if principal is not None:
+                pending = int(self._queued_asample_by_principal.get(principal, 0)) - 1
+                if pending > 0:
+                    self._queued_asample_by_principal[principal] = pending
+                else:
+                    self._queued_asample_by_principal.pop(principal, None)
+            if apikey_id is not None:
+                pending = int(self._queued_asample_by_apikey.get(apikey_id, 0)) - 1
+                if pending > 0:
+                    self._queued_asample_by_apikey[apikey_id] = pending
+                else:
+                    self._queued_asample_by_apikey.pop(apikey_id, None)
+
+        def finalize_request(self, request_id: str) -> None:
+            self._release_asample_slot(str(request_id))
+
+        def _mark_asample_leased_to_consumer(self, request_id: str, consumer_job_id: str | None) -> None:
+            request_id = str(request_id)
+            state = self._queued_asample_request_state.get(request_id)
+            if state is None:
+                return
+            principal, apikey_id, _previous_consumer = state
+            self._queued_asample_request_state[request_id] = (
+                principal,
+                apikey_id,
+                None if consumer_job_id is None else str(consumer_job_id),
+            )
+
+        def _release_slots_for_consumer(self, consumer_job_id: str | None) -> int:
+            if consumer_job_id is None:
+                return 0
+            doomed = [
+                request_id
+                for request_id, (_principal, _apikey_id, leased_consumer) in self._queued_asample_request_state.items()
+                if leased_consumer == str(consumer_job_id)
+            ]
+            for request_id in doomed:
+                self._release_asample_slot(request_id)
+            return len(doomed)
         def _to_bool(self, v: Any) -> bool:
             if isinstance(v, bool):
                 return v
@@ -505,12 +622,17 @@ def _get_or_create_ray_actor():
             }
 
         def set_active_job_id(self, job_id: str) -> None:
-            self._active_job_id = None if not job_id else str(job_id)
+            next_job_id = None if not job_id else str(job_id)
+            previous_job_id = self._active_job_id
+            if previous_job_id is not None and previous_job_id != next_job_id:
+                self._release_slots_for_consumer(previous_job_id)
+            self._active_job_id = next_job_id
 
         def clear_active_job_id_if_matches(self, job_id: str) -> bool:
             expected = None if not job_id else str(job_id)
             if self._active_job_id != expected:
                 return False
+            self._release_slots_for_consumer(expected)
             self._active_job_id = None
             return True
 
@@ -523,9 +645,13 @@ def _get_or_create_ray_actor():
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             return rss_pages * page_size
 
-        async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> None:
+        async def enqueue(self, item: dict[str, Any], producer_job_id: str | None = None) -> dict[str, Any]:
             async with self._cv:
                 packed = dict(item)
+                try:
+                    self._reserve_asample_slot(packed)
+                except ApiWorkQueueThrottleError as e:
+                    return {"ok": False, "detail": dict(e.detail)}
                 request_id, trace_id = self._item_log_context(packed)
 
                 # Log enqueue with request_id context
@@ -535,7 +661,7 @@ def _get_or_create_ray_actor():
                     trace_id=trace_id,
                     message=(
                         f"[Queue] enqueue: request_id={request_id}, op={packed.get('op')}, "
-                        f"user_id={packed.get('user_id')}"
+                        f"user_id={packed.get('user_id')} apikey_id={packed.get('apikey_id')}"
                     ),
                 )
 
@@ -566,6 +692,12 @@ def _get_or_create_ray_actor():
                             "task_id": str(ctx.get_task_id()),
                             "request_id": str(packed.get("request_id")),
                             "op": str(packed.get("op")),
+                            "apikey_id": None if packed.get("apikey_id") is None else str(packed.get("apikey_id")),
+                            "throttle_principal": (
+                                None
+                                if packed.get("throttle_principal") is None
+                                else str(packed.get("throttle_principal"))
+                            ),
                             "scheduler_domain": None if scheduler_domain is None else str(scheduler_domain),
                             "scheduler_session_id": None if scheduler_session_id is None else str(scheduler_session_id),
                             "scheduler_enabled": scheduler_enabled,
@@ -575,6 +707,7 @@ def _get_or_create_ray_actor():
                 except Exception:
                     pass
                 self._cv.notify(1)
+                return {"ok": True}
 
         async def dequeue(self, consumer_job_id: str) -> dict[str, Any]:
             import asyncio
@@ -592,6 +725,8 @@ def _get_or_create_ray_actor():
                             "op": "__stale_consumer__",
                             "request_json": b"",
                             "user_id": None,
+                            "apikey_id": None,
+                            "throttle_principal": None,
                             "webhook_url": None,
                             "extra": {
                                 "consumer_job_id": str(consumer_job_id),
@@ -696,6 +831,7 @@ def _get_or_create_ray_actor():
                         dequeue_reason = str(sched_reason)
                         scheduler_domain = str(sched_domain)
                         scheduler_session_id = str(sched_session_id)
+                    self._mark_asample_leased_to_consumer(item.get("request_id", ""), consumer_job_id)
                     break
 
                 self._dequeued += 1
@@ -708,7 +844,7 @@ def _get_or_create_ray_actor():
                     trace_id=trace_id,
                     message=(
                         f"[Queue] dequeue: request_id={request_id}, op={item.get('op')}, "
-                        f"reason={dequeue_reason}, scheduler_domain={scheduler_domain}, "
+                        f"apikey_id={item.get('apikey_id')} reason={dequeue_reason}, scheduler_domain={scheduler_domain}, "
                         f"scheduler_session_id={scheduler_session_id}"
                     ),
                 )
@@ -724,6 +860,12 @@ def _get_or_create_ray_actor():
                             "task_id": str(ctx.get_task_id()),
                             "request_id": str(item.get("request_id")),
                             "op": str(item.get("op")),
+                            "apikey_id": None if item.get("apikey_id") is None else str(item.get("apikey_id")),
+                            "throttle_principal": (
+                                None
+                                if item.get("throttle_principal") is None
+                                else str(item.get("throttle_principal"))
+                            ),
                             "dequeue_reason": str(dequeue_reason),
                             "scheduler_domain": None if scheduler_domain is None else str(scheduler_domain),
                             "scheduler_session_id": None if scheduler_session_id is None else str(scheduler_session_id),
@@ -782,6 +924,8 @@ def _get_or_create_ray_actor():
                 "enqueued": int(self._enqueued),
                 "dequeued": int(self._dequeued),
                 "by_executor": by_executor,
+                "by_apikey_id": dict(self._queued_asample_by_apikey),
+                "by_throttle_principal": dict(self._queued_asample_by_principal),
                 "age_stats": self._queued_age_stats(),
                 "scheduler_enabled": bool(self._scheduler_enabled),
                 "scheduler_picks_total": int(self._sched_stats.get("picks_total", 0)),
@@ -851,8 +995,13 @@ def _get_or_create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
     if resources is not None:
         options["resources"] = resources
 
@@ -882,10 +1031,8 @@ class ApiWorkQueueClient:
         if not ray.is_initialized():
             try:
                 from ..ray_utils import init_ray
-                from .future_store import _infer_ray_address  # type: ignore
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
 
@@ -916,6 +1063,8 @@ class ApiWorkQueueClient:
         request_json: bytes,
         user_id: str | None,
         webhook_url: str | None,
+        apikey_id: str | None = None,
+        throttle_principal: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
         import asyncio
@@ -934,6 +1083,8 @@ class ApiWorkQueueClient:
             "op": str(op),
             "request_json": bytes(request_json),
             "user_id": None if user_id is None else str(user_id),
+            "apikey_id": None if apikey_id is None else str(apikey_id),
+            "throttle_principal": None if throttle_principal is None else str(throttle_principal),
             "webhook_url": None if webhook_url is None else str(webhook_url),
             "extra": {},
             "created_at": time.time(),
@@ -965,7 +1116,18 @@ class ApiWorkQueueClient:
                 10.0,
                 float(os.environ.get("MINT_API_WORK_QUEUE_ENQUEUE_TIMEOUT_S", "60.0")),
             )
-            await loop.run_in_executor(None, lambda: ray.get(ref, timeout=enqueue_timeout_s))
+            try:
+                result = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=enqueue_timeout_s))
+            except Exception as e:
+                throttle_error = _unwrap_queue_throttle_error(e)
+                if throttle_error is not None:
+                    raise throttle_error
+                raise
+            if isinstance(result, dict) and not bool(result.get("ok")):
+                detail = result.get("detail")
+                if isinstance(detail, dict):
+                    raise ApiWorkQueueThrottleError.from_detail(detail)
+                raise RuntimeError(f"ApiWorkQueue.enqueue rejected item without detail: {result!r}")
 
         if tracer is None:
             await _do_enqueue()
@@ -1021,6 +1183,10 @@ class ApiWorkQueueClient:
             op=str(item["op"]),
             request_json=bytes(item["request_json"]),
             user_id=None if item.get("user_id") is None else str(item["user_id"]),
+            apikey_id=None if item.get("apikey_id") is None else str(item["apikey_id"]),
+            throttle_principal=(
+                None if item.get("throttle_principal") is None else str(item["throttle_principal"])
+            ),
             webhook_url=None if item.get("webhook_url") is None else str(item["webhook_url"]),
             extra=dict(item.get("extra") or {}),
             created_at=float(item.get("created_at", 0.0)),
@@ -1143,6 +1309,18 @@ class ApiWorkQueueClient:
         from .capacity_manager import capacity_manager
         from .future_store import FutureStatus, future_store
 
+        async def _finalize_request_slot(request_id: str) -> None:
+            try:
+                await self.finalize_request(request_id)
+            except Exception as e:
+                logger.error(
+                    "[api_work_queue] finalize_request failed (worker_idx=%s, request_id=%s): %s: %s",
+                    int(worker_idx),
+                    str(request_id),
+                    type(e).__name__,
+                    e,
+                )
+
         while self._running:
             try:
                 item = await self._dequeue()
@@ -1221,6 +1399,7 @@ class ApiWorkQueueClient:
             try:
                 status = future_store.get_status(item.request_id)
             except KeyError:
+                await _finalize_request_slot(item.request_id)
                 try:
                     capacity_manager.release_all(item.request_id)
                 except Exception as e:
@@ -1264,6 +1443,7 @@ class ApiWorkQueueClient:
                         type(e2).__name__,
                         e2,
                     )
+                await _finalize_request_slot(item.request_id)
                 continue
 
             if status is not None and status != FutureStatus.PENDING:
@@ -1287,6 +1467,7 @@ class ApiWorkQueueClient:
                         type(e).__name__,
                         e,
                     )
+                await _finalize_request_slot(item.request_id)
                 continue
 
             try:
@@ -1337,6 +1518,7 @@ class ApiWorkQueueClient:
                         type(e2).__name__,
                         e2,
                     )
+                await _finalize_request_slot(item.request_id)
                 continue
             if str(item.op) == "training.create_model":
                 logger.info(
@@ -1376,6 +1558,7 @@ class ApiWorkQueueClient:
                         type(e).__name__,
                         e,
                     )
+                await _finalize_request_slot(item.request_id)
                 continue
 
             try:
@@ -1447,6 +1630,7 @@ class ApiWorkQueueClient:
                         str(item.op),
                         int(worker_idx),
                     )
+                await _finalize_request_slot(item.request_id)
             except Exception as e:
                 logger.error(
                     "[api_work_queue] executor failed (worker_idx=%s, request_id=%s, op=%s): %s: %s failure_reason=%s next_action=%s",
@@ -1481,6 +1665,7 @@ class ApiWorkQueueClient:
                         type(e2).__name__,
                         e2,
                     )
+                await _finalize_request_slot(item.request_id)
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         import ray
@@ -1496,6 +1681,13 @@ class ApiWorkQueueClient:
         ref = actor.get_rss_bytes.remote()
         v = ray.get(ref, timeout=float(timeout_s))
         return int(v)
+
+    async def finalize_request(self, request_id: str, *, timeout_s: float = 10.0) -> None:
+        import ray
+
+        actor = self._get_ray_actor()
+        ref = actor.finalize_request.remote(str(request_id))
+        ray.get(ref, timeout=float(timeout_s))
 
     async def debug_state(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         import ray

@@ -70,4 +70,12 @@ Implications:
   - Supported model allowlist and per-model parallelism/memory knobs (inference and training are specified separately).
 
 - `tinker_server/config.py`
-  - Server config + Ray runtime `PYTHONPATH` for actors (PFS package paths).
+  - Server config + Ray runtime `PYTHONPATH` for actors.
+  - Canonical mode assembles `PFS_PYTHONPATH` from `PFS_RUNTIME_ENV_ROOT`.
+  - Legacy mode assembles it from per-package overlay paths.
+
+- `tinker_server/runtime_env.py`
+  - Pure-stdlib runtime-env layout and bootstrap helpers shared by config and startup code.
+
+- `scripts/build_runtime_env.py`
+  - Materializes the PFS runtime-env root from `pyproject.toml`.

@@ -34,7 +34,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import futures, internal, sampling, service, training, weights
+from .routes import futures, internal, openai_compat, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -78,7 +78,6 @@ async def _cleanup_stale_actors() -> None:
 
         if not ray.is_initialized():
             init_ray(
-                address="auto",
                 namespace=PERSISTENT_NAMESPACE,
                 ignore_reinit_error=True,
             )
@@ -162,7 +161,7 @@ async def _cleanup_stale_actors() -> None:
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
-                        num_gpus = 1  # Fallback for unknown models
+                        num_gpus: int | None = None
                         if name.startswith("tinker_vllm_"):
                             model_part = name[len("tinker_vllm_"):]
                         else:
@@ -172,6 +171,11 @@ async def _cleanup_stale_actors() -> None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored vLLM actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -180,13 +184,12 @@ async def _cleanup_stale_actors() -> None:
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
                         base_model = ""
+                        num_gpus: int | None = None
                         model_part = name[len("megatron_"):]
                         model_name, cfg = _lookup_model_config(model_part)
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.train_gpus
-                        else:
-                            num_gpus = 8  # Fallback for unknown models
 
                         # Prefer real world_size when actor is responsive.
                         try:
@@ -196,6 +199,11 @@ async def _cleanup_stale_actors() -> None:
                         except Exception:
                             pass
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
@@ -253,7 +261,7 @@ async def _cleanup_stale_actors() -> None:
 
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
-                            num_gpus = 1
+                            num_gpus: int | None = None
                             base_model = ""
                             if name.startswith("tinker_vllm_"):
                                 model_part = name[len("tinker_vllm_"):]
@@ -264,6 +272,11 @@ async def _cleanup_stale_actors() -> None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored vLLM actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -271,14 +284,18 @@ async def _cleanup_stale_actors() -> None:
                         elif name.startswith("megatron_"):
                             actor_type = ActorType.MEGATRON
                             base_model = ""
+                            num_gpus: int | None = None
                             model_part = name[len("megatron_"):]
                             model_name, cfg = _lookup_model_config(model_part)
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.train_gpus
-                            else:
-                                num_gpus = 8
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored Megatron actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
@@ -661,7 +678,12 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
-    from .checkpoints import get_checkpoint_reap_interval_s, reap_runtime_checkpoints
+    from .checkpoints import (
+        get_checkpoint_mirror_poll_s,
+        get_checkpoint_reap_interval_s,
+        process_pending_checkpoint_mirrors,
+        reap_runtime_checkpoints,
+    )
 
     future_store.ensure_ready()
 
@@ -1053,6 +1075,22 @@ async def lifespan(app: FastAPI):
 
     checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
 
+    async def _checkpoint_mirror_loop() -> None:
+        while True:
+            try:
+                mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
+                if mirrored["mirrored"] or mirrored["failed"]:
+                    logger.info(
+                        "checkpoint mirror processed mirrored=%s failed=%s",
+                        len(mirrored["mirrored"]),
+                        len(mirrored["failed"]),
+                    )
+            except Exception:
+                logger.exception("checkpoint mirror loop failed")
+            await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+
+    checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
+
     # ==========================================================================
     # Persistent actors: pre-create and protect at startup
     # ==========================================================================
@@ -1065,7 +1103,13 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     future_reaper_task.cancel()
     checkpoint_reaper_task.cancel()
-    await asyncio.gather(future_reaper_task, checkpoint_reaper_task, return_exceptions=True)
+    checkpoint_mirror_task.cancel()
+    await asyncio.gather(
+        future_reaper_task,
+        checkpoint_reaper_task,
+        checkpoint_mirror_task,
+        return_exceptions=True,
+    )
     await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 
@@ -1420,6 +1464,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
 @app.get("/")
