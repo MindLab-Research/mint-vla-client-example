@@ -255,6 +255,58 @@ def test_gateway_session_store_namespace_respects_config_file(tmp_path):
     assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns"]
 
 
+def test_detached_store_namespaces_respect_config_file(tmp_path):
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["TINKER_CONFIG_PATH"] = str(cfg)
+    env.pop("TINKER_RAY_NAMESPACE", None)
+    env.pop("MINT_RAY_NAMESPACE", None)
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import tinker_server.config as c; "
+                "import tinker_server.backend.gateway_session_store as g; "
+                "import tinker_server.backend.session_index_store as s; "
+                "import tinker_server.backend.training_session_store as t; "
+                "print(c.RAY_NAMESPACE); "
+                "print(g._ray_namespace()); "
+                "print(s._ray_namespace()); "
+                "print(t._ray_namespace())"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
+
+
+def test_config_import_fails_on_namespace_mismatch(tmp_path):
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text("[ray]\nnamespace = 'cfg_ns'\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["TINKER_CONFIG_PATH"] = str(cfg)
+    env["TINKER_RAY_NAMESPACE"] = "env_ns"
+
+    out = subprocess.run(
+        [sys.executable, "-c", "import tinker_server.config"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert out.returncode != 0
+    assert "Ray namespace mismatch" in (out.stdout + out.stderr)
+
+
 def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
     cfg = tmp_path / "tinker.toml"
     cfg.write_text(
@@ -386,6 +438,9 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
                 f'pfs_runtime_env_root = "{env_root}"',
                 f'pfs_tinker_path = "{tmp_path / "repo"}"',
                 f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
+                "",
+                "[ray]",
+                "namespace = 'cfg_ns'",
             ]
         )
         + "\n",
@@ -414,3 +469,4 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     )
     data = json.loads(out.stdout)
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
+    assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"

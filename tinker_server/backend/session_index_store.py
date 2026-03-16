@@ -16,7 +16,15 @@ logger = logging.getLogger(__name__)
 
 
 def _ray_namespace() -> str:
-    return os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "tinker"
+    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    if env_ns:
+        return env_ns
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "tinker"
 
 
 def _actor_name() -> str:

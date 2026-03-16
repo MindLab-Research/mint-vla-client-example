@@ -44,6 +44,11 @@ _CONFIG_PATH, _CONFIG_FILE = _load_config_file_for_process(os.environ)
 # `TINKER_RAY_NAMESPACE` but accept the alias as a fallback.
 _env_ray_ns = _env_nonempty(os.environ, "TINKER_RAY_NAMESPACE") or _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
 _file_ray_ns = _CONFIG_FILE.ray.namespace if _CONFIG_FILE is not None else None
+if _env_ray_ns and _file_ray_ns and _env_ray_ns != _file_ray_ns:
+    raise RuntimeError(
+        "Ray namespace mismatch between environment and config file: "
+        f"env={_env_ray_ns!r} config={_file_ray_ns!r}"
+    )
 RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 
 # PFS paths for Ray worker runtime_env
@@ -140,6 +145,7 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "PFS_TINKER_PATH": PFS_TINKER_PATH,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
+        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
     }
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
