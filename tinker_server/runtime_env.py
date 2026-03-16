@@ -47,6 +47,7 @@ class RuntimeEnvLayout:
     site_packages: str
     source_root: str
     pythonpath_entries: tuple[str, ...]
+    host_pythonpath_entries: tuple[str, ...]
     host_python: str
 
 
@@ -56,6 +57,7 @@ class RuntimeEnvSettings:
     source_dir: str
     host_venv_dir: str
     sources: tuple[tuple[str, tuple[str, ...]], ...]
+    host_sources: tuple[tuple[str, tuple[str, ...]], ...]
 
 
 @lru_cache(maxsize=1)
@@ -64,25 +66,32 @@ def _runtime_env_settings() -> RuntimeEnvSettings:
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
     runtime = data["tool"]["tinker"]["runtime_env"]
-    entries: list[tuple[str, tuple[str, ...]]] = []
+    shared_entries: list[tuple[str, tuple[str, ...]]] = []
+    host_entries: list[tuple[str, tuple[str, ...]]] = []
     for source in runtime["sources"]:
         name = str(source["name"])
+        bucket = host_entries if bool(source.get("host_only", False)) else shared_entries
         for rel in source.get("pythonpath", ["."]):
             rel_str = str(rel).strip()
             parts = () if rel_str in ("", ".") else tuple(part for part in rel_str.split("/") if part)
-            entries.append((name, parts))
-    deduped: list[tuple[str, tuple[str, ...]]] = []
-    seen: set[tuple[str, tuple[str, ...]]] = set()
-    for entry in entries:
-        if entry in seen:
-            continue
-        seen.add(entry)
-        deduped.append(entry)
+            bucket.append((name, parts))
+
+    def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        deduped: list[tuple[str, tuple[str, ...]]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for entry in entries:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            deduped.append(entry)
+        return tuple(deduped)
+
     return RuntimeEnvSettings(
         site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
         source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
         host_venv_dir=str(runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)),
-        sources=tuple(deduped),
+        sources=_dedupe(shared_entries),
+        host_sources=_dedupe(host_entries),
     )
 
 
@@ -94,12 +103,17 @@ def runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
     entries = [site_packages]
     for repo_name, rel_parts in settings.sources:
         entries.append(os.path.join(source_root, repo_name, *rel_parts))
+    host_entries = [
+        os.path.join(source_root, repo_name, *rel_parts)
+        for repo_name, rel_parts in settings.host_sources
+    ]
     host_python = os.path.join(root, settings.host_venv_dir, "bin", "python")
     return RuntimeEnvLayout(
         root=root,
         site_packages=site_packages,
         source_root=source_root,
         pythonpath_entries=tuple(entries),
+        host_pythonpath_entries=tuple(host_entries),
         host_python=host_python,
     )
 
@@ -108,7 +122,7 @@ def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = Tr
     layout = runtime_env_layout(env_root)
     required = [layout.site_packages, *layout.pythonpath_entries[1:]]
     if require_host_python:
-        required.append(layout.host_python)
+        required.extend([layout.host_python, *layout.host_pythonpath_entries])
     missing = [path for path in required if not Path(path).exists()]
     if missing:
         raise RuntimeError(

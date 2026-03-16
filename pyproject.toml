@@ -116,6 +116,15 @@ repo = "https://github.com/verl-project/verl.git"
 commit = "9433f8a8f2771256ea4f8f94e4401bcfe9703228"
 pythonpath = ["."]
 
+[[tool.tinker.runtime_env.sources]]
+name = "vllm"
+repo = "https://github.com/vllm-project/vllm.git"
+commit = "89a77b10846fd96273cce78d86d2556ea582d26e"
+pythonpath = ["."]
+host_only = true
+package_name = "vllm"
+version = "0.16.0"
+
 [tool.tinker.runtime_env.image_managed]
 torch = "2.9.1+cu129 from mint:16 base image"
 vllm = "0.16.x from mint:16 base image"

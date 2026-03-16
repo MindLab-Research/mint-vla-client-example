@@ -470,11 +470,6 @@ def _create_extended_server_class(
             else:
                 print(f"[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
             call_kwargs = dict(kwargs)
-            single_gpu_standalone = (
-                int(call_kwargs.get("gpus_per_node", 1) or 1) == 1
-                and int(call_kwargs.get("nnodes", 1) or 1) == 1
-                and int(call_kwargs.get("node_rank", 0) or 0) == 0
-            )
             rollout_cfg = call_kwargs.get("config")
             if rollout_cfg is not None:
                 from dataclasses import asdict, is_dataclass
@@ -498,76 +493,30 @@ def _create_extended_server_class(
                     flush=True,
                 )
                 call_kwargs["config"] = rollout_cfg
-            if single_gpu_standalone:
-                from types import SimpleNamespace
-                from verl.utils.config import omega_conf_to_dataclass
-                from verl.utils.device import get_visible_devices_keyword
-                from verl.workers.config import HFModelConfig as VerlHFModelConfig
-                from verl.workers.config import RolloutConfig as VerlRolloutConfig
-                from verl.workers.rollout.replica import RolloutMode as VerlRolloutMode
-                from verl.workers.rollout.utils import get_max_position_embeddings
 
-                os.environ[get_visible_devices_keyword()] = str(call_kwargs.get("cuda_visible_devices", "0"))
-                self.config = omega_conf_to_dataclass(call_kwargs["config"], dataclass_type=VerlRolloutConfig)
-                self.model_config = omega_conf_to_dataclass(
-                    call_kwargs["model_config"], dataclass_type=VerlHFModelConfig
+            if sig is not None:
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
                 )
-                max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
-                if self.config.max_model_len is None:
-                    self.config.max_model_len = max_position_embeddings
-                elif self.config.max_model_len > max_position_embeddings:
-                    raise ValueError(
-                        f"max_model_len ({self.config.max_model_len}) should be less than or equal to "
-                        f"max_position_embeddings ({max_position_embeddings})"
-                    )
-                self.rollout_mode = call_kwargs.get("rollout_mode", VerlRolloutMode.STANDALONE)
-                self.workers = call_kwargs.get("workers", [])
-                self.replica_rank = int(call_kwargs.get("replica_rank", 0) or 0)
-                self.node_rank = int(call_kwargs.get("node_rank", 0) or 0)
-                self.gpus_per_node = int(call_kwargs.get("gpus_per_node", 1) or 1)
-                self.nnodes = int(call_kwargs.get("nnodes", 1) or 1)
-                self._server_address = ray.util.get_node_ip_address().strip("[]")
-                self._server_port = None
-                self._server_task = None
-                self._master_address = self._server_address
-                self._master_port = 0
-                self._dp_rpc_port = 0
-                self._dp_master_port = 0
-                noop_close = lambda: None
-                self._master_sock = SimpleNamespace(close=noop_close)
-                self._dp_rpc_sock = SimpleNamespace(close=noop_close)
-                self._dp_master_sock = SimpleNamespace(close=noop_close)
-                self.profiler_controller = SimpleNamespace(
-                    config=None,
-                    tool_config=None,
-                    check_enable=lambda: False,
-                    check_this_rank=lambda: False,
-                    is_discrete_mode=lambda: False,
-                )
-            else:
-                if sig is not None:
-                    accepts_var_kw = any(
-                        p.kind == inspect.Parameter.VAR_KEYWORD
-                        for p in sig.parameters.values()
-                    )
-                    if not accepts_var_kw:
-                        accepted = {
-                            name for name, p in sig.parameters.items()
-                            if name != "self"
-                            and p.kind in (
-                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                                inspect.Parameter.KEYWORD_ONLY,
-                            )
-                        }
-                        dropped = [k for k in list(call_kwargs.keys()) if k not in accepted]
-                        for k in dropped:
-                            call_kwargs.pop(k, None)
-                        if dropped:
-                            logger.warning(
-                                "[ExtendedVLLMHttpServer] dropping unsupported kwargs for base __init__: %s",
-                                dropped,
-                            )
-                super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
+                if not accepts_var_kw:
+                    accepted = {
+                        name for name, p in sig.parameters.items()
+                        if name != "self"
+                        and p.kind in (
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.KEYWORD_ONLY,
+                        )
+                    }
+                    dropped = [k for k in list(call_kwargs.keys()) if k not in accepted]
+                    for k in dropped:
+                        call_kwargs.pop(k, None)
+                    if dropped:
+                        logger.warning(
+                            "[ExtendedVLLMHttpServer] dropping unsupported kwargs for base __init__: %s",
+                            dropped,
+                        )
+            super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
             # Track local paths for multi-LoRA (needed for GPU/CPU swap)
             self._lora_paths: dict[int, str] = {}
             self._timing = os.environ.get("MINT_VLLM_REQUEST_TIMING", "").strip().lower() in (
@@ -716,83 +665,9 @@ def _create_extended_server_class(
                 args.max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
                 _logger.info(f"Multi-LoRA: overriding max_cpu_loras={args.max_cpu_loras}")
 
-            # verl's async server forces mp + worker_extension even for the 1-GPU
-            # standalone case. With vLLM 0.16 this path is less stable than the
-            # default uniprocess backend, while our direct worker probes show the
-            # uniprocess engine works. Collapse the 1-GPU standalone case back to
-            # vLLM's default backend.
-            if (
-                getattr(args, "tensor_parallel_size", 1) == 1
-                and getattr(args, "pipeline_parallel_size", 1) == 1
-                and getattr(self, "nnodes", 1) == 1
-                and getattr(self, "gpus_per_node", 1) == 1
-            ):
-                args.distributed_executor_backend = "uni"
-                args.worker_extension_cls = ""
-                _logger.info("Single-GPU standalone vLLM: forcing distributed_executor_backend=uni")
-
         async def run_server(self, args):
             """Override to inject multi-LoRA config (rank-0 node)."""
             self._patch_lora_args(args)
-            if (
-                getattr(args, "tensor_parallel_size", 1) == 1
-                and getattr(args, "pipeline_parallel_size", 1) == 1
-                and getattr(self, "nnodes", 1) == 1
-                and getattr(self, "gpus_per_node", 1) == 1
-            ):
-                import inspect
-                from vllm.engine.arg_utils import AsyncEngineArgs
-                from vllm.entrypoints.openai.api_server import build_app, init_app_state
-                from vllm.usage.usage_lib import UsageContext
-                from vllm.v1.engine.async_llm import AsyncLLM
-
-                direct_engine_args = AsyncEngineArgs(
-                    model=self.model_config.local_path,
-                    trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
-                    max_model_len=getattr(args, "max_model_len", None),
-                    gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.9),
-                    disable_log_stats=bool(getattr(args, "disable_log_stats", False)),
-                    tensor_parallel_size=int(getattr(args, "tensor_parallel_size", 1)),
-                    enable_lora=bool(getattr(args, "enable_lora", False)),
-                    max_loras=int(getattr(args, "max_loras", 1)),
-                    max_lora_rank=int(getattr(args, "max_lora_rank", 16)),
-                    max_cpu_loras=getattr(args, "max_cpu_loras", None),
-                )
-                usage_context = UsageContext.OPENAI_API_SERVER
-                vllm_config = direct_engine_args.create_engine_config(usage_context=usage_context)
-                fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
-                kwargs = {}
-                if "enable_log_requests" in fn_args:
-                    kwargs["enable_log_requests"] = getattr(args, "enable_log_requests", False)
-                if "disable_log_stats" in fn_args:
-                    kwargs["disable_log_stats"] = bool(getattr(args, "disable_log_stats", False))
-                engine_client = AsyncLLM.from_vllm_config(
-                    vllm_config=vllm_config,
-                    usage_context=usage_context,
-                    **kwargs,
-                )
-                await engine_client.reset_mm_cache()
-                await engine_client.collective_rpc(
-                    method="monkey_patch_model",
-                    kwargs={"vocab_size": len(self.model_config.tokenizer)},
-                )
-                build_app_sig = inspect.signature(build_app)
-                supported_tasks: tuple[Any, ...] = ()
-                if "supported_tasks" in build_app_sig.parameters:
-                    supported_tasks = await engine_client.get_supported_tasks()
-                    app = build_app(args, supported_tasks)
-                else:
-                    app = build_app(args)
-                init_app_sig = inspect.signature(init_app_state)
-                if "vllm_config" in init_app_sig.parameters:
-                    await init_app_state(engine_client, vllm_config, app.state, args)
-                elif "supported_tasks" in init_app_sig.parameters:
-                    await init_app_state(engine_client, app.state, args, supported_tasks)
-                else:
-                    await init_app_state(engine_client, app.state, args)
-                self.engine = engine_client
-                self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
-                return
             return await super().run_server(args)
 
         async def run_headless(self, args):
@@ -2297,10 +2172,6 @@ class VerlInferenceEngine:
         if self._initialized:
             return
 
-        # Import verl components
-        from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
-        from verl.workers.rollout.replica import RolloutMode
-
         if not ray.is_initialized():
             # Use 'auto' to connect to existing cluster if available
             # If no cluster, this falls back to starting a local Ray instance
@@ -2364,10 +2235,25 @@ class VerlInferenceEngine:
         response_length = max_model_len - prompt_length
         logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
 
+        enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
+        logger.info(
+            f"Launching vLLMHttpServer for {self.model_path} "
+            f"(TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
+            f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
+        )
+
+        # Create ExtendedVLLMHttpServer as Ray actor
+        # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
+        # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+        from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+        from dataclasses import asdict
+
+        from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
+        from verl.workers.rollout.replica import RolloutMode
+
         # Create rollout config using dataclass
         # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
         # Expert parallelism is enabled via engine_kwargs instead
-        enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
         rollout_config = RolloutConfig(
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
@@ -2386,70 +2272,32 @@ class VerlInferenceEngine:
             temperature=1.0,
             top_k=-1,
             top_p=1.0,
-            data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
-            expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+            data_parallel_size=1,
+            expert_parallel_size=1,
             engine_kwargs=engine_kwargs,
             checkpoint_engine=CheckpointEngineConfig(backend="naive"),
             enable_rollout_routing_replay=enable_rollout_routing_replay,
         )
-
-        # Create model config using dataclass
         model_config = HFModelConfig(
             path=self.model_path,
             trust_remote_code=True,
             lora_rank=self.lora_rank,
             lora_adapter_path=self.lora_adapter_path,
         )
-
-        logger.info(
-            f"Launching vLLMHttpServer for {self.model_path} "
-            f"(TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
-            f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
-        )
-
-        from dataclasses import asdict
-
         rollout_payload = asdict(rollout_config)
         if not rollout_payload.get("_target_"):
             rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
-
-        # Create ExtendedVLLMHttpServer as Ray actor
-        # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
-        # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-        from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
-        remote_kwargs: dict[str, object]
-        if total_gpus == 1:
-            remote_kwargs = {
-                "model_path": self.model_path,
-                "trust_remote_code": True,
-                "max_model_len": max_model_len,
-                "gpu_memory_utilization": gpu_util,
-                "disable_log_stats": True,
-                "enable_lora": bool(self.lora_rank > 0),
-                "max_loras": max_loras,
-                "max_lora_rank": self.lora_rank if self.lora_rank > 0 else 16,
-                "max_cpu_loras": max_cpu_loras,
-                "enable_rollout_routing_replay": enable_rollout_routing_replay,
-                "rollout_mode": RolloutMode.STANDALONE,
-                "workers": [],
-                "replica_rank": 0,
-                "node_rank": 0,
-                "gpus_per_node": total_gpus,
-                "nnodes": 1,
-                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
-            }
-        else:
-            remote_kwargs = {
-                "config": rollout_payload,
-                "model_config": model_config,
-                "rollout_mode": RolloutMode.STANDALONE,
-                "workers": [],
-                "replica_rank": 0,
-                "node_rank": 0,
-                "gpus_per_node": total_gpus,
-                "nnodes": 1,
-                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
-            }
+        remote_kwargs: dict[str, object] = {
+            "config": rollout_payload,
+            "model_config": model_config,
+            "rollout_mode": RolloutMode.STANDALONE,
+            "workers": [],
+            "replica_rank": 0,
+            "node_rank": 0,
+            "gpus_per_node": total_gpus,
+            "nnodes": 1,
+            "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
+        }
         self.server = ExtendedVLLMHttpServer.options(
             num_gpus=total_gpus,
             max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),

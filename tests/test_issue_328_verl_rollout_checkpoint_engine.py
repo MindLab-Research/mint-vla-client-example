@@ -35,8 +35,9 @@ def test_issue_328_vllm_actors_force_spawn_mode() -> None:
         assert needle in text, f"{rel_path} must force spawn mode for vLLM worker subprocesses"
 
 
-def test_issue_328_single_gpu_standalone_forces_uni_backend() -> None:
+def test_issue_328_single_gpu_standalone_has_no_bespoke_backend_path() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     text = (repo_root / "tinker_server/backend/verl_inference.py").read_text(encoding="utf-8")
-    assert 'args.distributed_executor_backend = "uni"' in text
-    assert 'args.worker_extension_cls = ""' in text
+    assert 'args.distributed_executor_backend = "uni"' not in text
+    assert 'args.worker_extension_cls = ""' not in text
+    assert "single_gpu_standalone" not in text

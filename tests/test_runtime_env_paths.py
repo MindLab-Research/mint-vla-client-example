@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ def _materialize_runtime_env(root: Path) -> None:
     layout = runtime_env_layout(str(root))
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:
+        Path(entry).mkdir(parents=True, exist_ok=True)
+    for entry in layout.host_pythonpath_entries:
         Path(entry).mkdir(parents=True, exist_ok=True)
     Path(layout.host_python).parent.mkdir(parents=True, exist_ok=True)
     Path(layout.host_python).write_text("#!/bin/sh\n", encoding="utf-8")
@@ -95,12 +98,28 @@ def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     expected = []
     for source in data["tool"]["tinker"]["runtime_env"]["sources"]:
+        if source.get("host_only", False):
+            continue
         for rel in source.get("pythonpath", ["."]):
             rel_str = str(rel).strip()
             suffix = "" if rel_str in ("", ".") else f"/{rel_str}"
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
     layout = runtime_env_layout("/tmp/runtime")
     assert list(layout.pythonpath_entries[1:]) == expected
+
+
+def test_runtime_env_layout_tracks_host_only_pythonpaths():
+    data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    expected = []
+    for source in data["tool"]["tinker"]["runtime_env"]["sources"]:
+        if not source.get("host_only", False):
+            continue
+        for rel in source.get("pythonpath", ["."]):
+            rel_str = str(rel).strip()
+            suffix = "" if rel_str in ("", ".") else f"/{rel_str}"
+            expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
+    layout = runtime_env_layout("/tmp/runtime")
+    assert list(layout.host_pythonpath_entries) == expected
 
 
 def test_config_import_does_not_require_runtime_root():
@@ -149,3 +168,30 @@ def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
         env={**dict(), "TINKER_HOST": "127.0.0.1"},
     )
     assert "PFS_RUNTIME_ENV_ROOT is required" not in (out.stdout + out.stderr)
+
+
+def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch):
+    from scripts.run_server import _seed_runtime_env_from_config
+
+    cfg = tmp_path / "tinker.toml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "[paths]",
+                f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
+                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/stale/runtime")
+    monkeypatch.setenv("PFS_TINKER_PATH", "/stale/repo")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/stale/hf")
+
+    _seed_runtime_env_from_config(str(cfg))
+
+    assert os.environ["PFS_RUNTIME_ENV_ROOT"] == str(tmp_path / "runtime")
+    assert os.environ["PFS_TINKER_PATH"] == str(tmp_path / "repo")
+    assert os.environ["PFS_HF_MODULES_PATH"] == str(tmp_path / "hf")

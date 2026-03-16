@@ -22,6 +22,7 @@ Parallelism is auto-detected from the model registry when engines are created.
 import logging
 import pathlib
 import argparse
+import importlib.util
 import os
 import sys
 import traceback
@@ -30,35 +31,66 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-def _prepend_pythonpath(entries: str) -> None:
-    if not entries:
-        return
-    parts = [part for part in entries.split(":") if part]
-    for part in reversed(parts):
-        if part not in sys.path:
-            sys.path.insert(0, part)
-    existing = os.environ.get("PYTHONPATH", "")
-    os.environ["PYTHONPATH"] = entries if not existing else f"{entries}:{existing}"
+def _normalize_pythonpath(entries: str) -> str:
+    return ":".join(part for part in entries.split(":") if part)
 
 
-def _sanitize_torch_ld_library_path() -> None:
-    venv_root = pathlib.Path(sys.executable).resolve().parents[1]
-    torch_lib = (
-        venv_root
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-        / "torch"
-        / "lib"
+def _set_exact_pythonpath(entries: str) -> str:
+    normalized = _normalize_pythonpath(entries)
+    if not normalized:
+        return ""
+    parts = normalized.split(":")
+    os.environ["PYTHONPATH"] = normalized
+    existing = [part for part in sys.path if part not in parts]
+    sys.path[:] = [*parts, *existing]
+    return normalized
+
+
+def _exact_torch_ld_library_path() -> str:
+    torch_spec = importlib.util.find_spec("torch")
+    if torch_spec is None or torch_spec.origin is None:
+        raise RuntimeError("torch is not importable from the configured host runtime")
+    torch_lib = pathlib.Path(torch_spec.origin).resolve().parent / "lib"
+    if not torch_lib.is_dir():
+        raise RuntimeError(
+            f"Host torch lib directory missing for interpreter {sys.executable}: {torch_lib}"
+        )
+    return ":".join(
+        [
+            str(torch_lib),
+            "/usr/local/cuda/compat/lib",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64",
+            "/usr/local/cuda/lib64",
+        ]
     )
-    existing = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]
-    cleaned = [part for part in existing if "dist-packages/torch/lib" not in part]
-    if torch_lib.is_dir():
-        cleaned = [str(torch_lib), *cleaned]
-    if cleaned:
-        os.environ["LD_LIBRARY_PATH"] = ":".join(cleaned)
-    else:
-        os.environ.pop("LD_LIBRARY_PATH", None)
+
+
+def _set_exact_torch_ld_library_path() -> str:
+    value = _exact_torch_ld_library_path()
+    os.environ["LD_LIBRARY_PATH"] = value
+    return value
+
+
+def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
+    desired = {
+        "PYTHONPATH": pythonpath,
+        "LD_LIBRARY_PATH": ld_library_path,
+        "TINKER_SERVER_EXACT_ENV": "1",
+    }
+    current_matches = all(
+        os.environ.get(k) == v for k, v in desired.items() if k != "TINKER_SERVER_EXACT_ENV"
+    )
+    if current_matches:
+        return
+    if os.environ.get("TINKER_SERVER_EXACT_ENV") == "1":
+        raise RuntimeError(
+            "TINKER_SERVER_EXACT_ENV=1 but runtime environment is still incorrect: "
+            f"PYTHONPATH={os.environ.get('PYTHONPATH')!r} LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH')!r}"
+        )
+    new_env = dict(os.environ)
+    new_env.update(desired)
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], new_env)
 
 def crash_handler(exc_type, exc_value, exc_tb):
     """Log uncaught exceptions before crash."""
@@ -101,11 +133,11 @@ def _seed_runtime_env_from_config(config_path: str) -> None:
     from tinker_server.config_file import load_tinker_config_file
 
     cfg = load_tinker_config_file(config_path)
-    if cfg.paths.pfs_runtime_env_root and "PFS_RUNTIME_ENV_ROOT" not in os.environ:
+    if cfg.paths.pfs_runtime_env_root:
         os.environ["PFS_RUNTIME_ENV_ROOT"] = str(cfg.paths.pfs_runtime_env_root)
-    if cfg.paths.pfs_tinker_path and "PFS_TINKER_PATH" not in os.environ:
+    if cfg.paths.pfs_tinker_path:
         os.environ["PFS_TINKER_PATH"] = str(cfg.paths.pfs_tinker_path)
-    if cfg.paths.pfs_hf_modules_path and "PFS_HF_MODULES_PATH" not in os.environ:
+    if cfg.paths.pfs_hf_modules_path:
         os.environ["PFS_HF_MODULES_PATH"] = str(cfg.paths.pfs_hf_modules_path)
 
 
@@ -117,13 +149,17 @@ if __name__ == "__main__":
 
     from tinker_server.runtime_env import bootstrap_runtime_pythonpath
 
-    _prepend_pythonpath(
+    pythonpath = _set_exact_pythonpath(
         bootstrap_runtime_pythonpath(
             os.environ,
             repo_root=str(_REPO_ROOT),
         )
     )
-    _sanitize_torch_ld_library_path()
+    ld_library_path = _set_exact_torch_ld_library_path()
+    _reexec_if_env_mismatch(
+        pythonpath=pythonpath,
+        ld_library_path=ld_library_path,
+    )
 
     # Configure structured logging early with request_id support
     from tinker_server.logging_context import configure_logging
