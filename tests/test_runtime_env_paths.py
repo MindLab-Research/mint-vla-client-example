@@ -307,6 +307,38 @@ def test_config_import_fails_on_namespace_mismatch(tmp_path):
     assert "Ray namespace mismatch" in (out.stdout + out.stderr)
 
 
+def test_config_import_fails_on_runtime_path_mismatch(tmp_path):
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "[paths]",
+                'pfs_runtime_env_root = "/cfg/runtime"',
+                'pfs_tinker_path = "/cfg/repo"',
+                'pfs_hf_modules_path = "/cfg/hf"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["TINKER_CONFIG_PATH"] = str(cfg)
+    env["PFS_RUNTIME_ENV_ROOT"] = "/env/runtime"
+    env["PFS_TINKER_PATH"] = "/env/repo"
+    env["PFS_HF_MODULES_PATH"] = "/env/hf"
+
+    out = subprocess.run(
+        [sys.executable, "-c", "import tinker_server.config"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert out.returncode != 0
+    assert "mismatch between environment and config file" in (out.stdout + out.stderr)
+
+
 def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
     cfg = tmp_path / "tinker.toml"
     cfg.write_text(

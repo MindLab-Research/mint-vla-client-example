@@ -17,6 +17,14 @@ def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
     return _runtime_env_nonempty(environ, name)
 
 
+def _resolve_env_or_config(name: str, env_value: str | None, file_value: str | None) -> str:
+    if env_value and file_value and env_value != file_value:
+        raise RuntimeError(
+            f"{name} mismatch between environment and config file: env={env_value!r} config={file_value!r}"
+        )
+    return env_value or file_value or ""
+
+
 def _parse_bool(s: str) -> bool:
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
 
@@ -63,15 +71,21 @@ RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 # non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
 # to a non-existent code directory.
 _file_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
-PFS_TINKER_PATH = _env_nonempty(os.environ, "PFS_TINKER_PATH") or _file_pfs_tinker_path or ""
+PFS_TINKER_PATH = _resolve_env_or_config(
+    "PFS_TINKER_PATH",
+    _env_nonempty(os.environ, "PFS_TINKER_PATH"),
+    _file_pfs_tinker_path,
+)
 
 # Canonical runtime env root. This contains:
 # - `site-packages/` for shared pure-Python runtime deps
 # - `src/Megatron-Bridge`, `src/verl`, `src/Megatron-LM` pinned source trees
 # - `host-venv/bin/python` as the thin host interpreter for API-server startup
 _file_pfs_runtime_env_root = _CONFIG_FILE.paths.pfs_runtime_env_root if _CONFIG_FILE is not None else None
-PFS_RUNTIME_ENV_ROOT = (
-    _env_nonempty(os.environ, "PFS_RUNTIME_ENV_ROOT") or _file_pfs_runtime_env_root or ""
+PFS_RUNTIME_ENV_ROOT = _resolve_env_or_config(
+    "PFS_RUNTIME_ENV_ROOT",
+    _env_nonempty(os.environ, "PFS_RUNTIME_ENV_ROOT"),
+    _file_pfs_runtime_env_root,
 )
 
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
@@ -86,8 +100,10 @@ USE_MBRIDGE_LORA_EXPORT = (
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
 _file_pfs_hf_modules_path = _CONFIG_FILE.paths.pfs_hf_modules_path if _CONFIG_FILE is not None else None
-PFS_HF_MODULES_PATH = (
-    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or ""
+PFS_HF_MODULES_PATH = _resolve_env_or_config(
+    "PFS_HF_MODULES_PATH",
+    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH"),
+    _file_pfs_hf_modules_path,
 )
 
 def ensure_runtime_env_configured() -> str:

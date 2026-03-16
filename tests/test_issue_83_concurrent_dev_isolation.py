@@ -61,3 +61,10 @@ def test_training_session_metadata_namespace_is_ray_namespace():
     repo_root = Path(__file__).resolve().parents[1]
     txt = (repo_root / "tinker_server/routes/training.py").read_text(encoding="utf-8")
     assert "MINT_RAY_NAMESPACE" not in txt
+
+
+def test_startup_reconciliation_does_not_guess_gpu_counts():
+    repo_root = Path(__file__).resolve().parents[1]
+    txt = (repo_root / "tinker_server/app.py").read_text(encoding="utf-8")
+    assert "Fallback for unknown models" not in txt
+    assert "num_gpus = 8  # Fallback for unknown models" not in txt

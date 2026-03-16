@@ -161,7 +161,7 @@ async def _cleanup_stale_actors() -> None:
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
-                        num_gpus = 1  # Fallback for unknown models
+                        num_gpus: int | None = None
                         if name.startswith("tinker_vllm_"):
                             model_part = name[len("tinker_vllm_"):]
                         else:
@@ -171,6 +171,11 @@ async def _cleanup_stale_actors() -> None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored vLLM actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -179,13 +184,12 @@ async def _cleanup_stale_actors() -> None:
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
                         base_model = ""
+                        num_gpus: int | None = None
                         model_part = name[len("megatron_"):]
                         model_name, cfg = _lookup_model_config(model_part)
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.train_gpus
-                        else:
-                            num_gpus = 8  # Fallback for unknown models
 
                         # Prefer real world_size when actor is responsive.
                         try:
@@ -195,6 +199,11 @@ async def _cleanup_stale_actors() -> None:
                         except Exception:
                             pass
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
