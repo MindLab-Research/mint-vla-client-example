@@ -1282,12 +1282,14 @@ class MultiModelInferenceManager:
                         # sessions before they even reach `after_get_engine`. Use the detached
                         # actor name lookup instead: it is cheap, avoids queuing on the actor,
                         # and still lets us drop dead cached handles before reuse.
-                        from .multinode_inference import PERSISTENT_NAMESPACE
+                        from .multinode_inference import (
+                            PERSISTENT_NAMESPACE as MULTINODE_PERSISTENT_NAMESPACE,
+                        )
 
                         actor_name = getattr(engine, "actor_name", None)
                         if actor_name:
                             try:
-                                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                                ray.get_actor(actor_name, namespace=MULTINODE_PERSISTENT_NAMESPACE)
                             except (ValueError, ray.exceptions.RayActorError):
                                 logger.warning(
                                     "Cached multi-node vLLM engine for %s has no live named actor, recreating",
@@ -1340,6 +1342,34 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            existing_named_actor = False
+            try:
+                if not ray.is_initialized():
+                    init_ray(
+                        address="auto",
+                        namespace=PERSISTENT_NAMESPACE,
+                        ignore_reinit_error=True,
+                    )
+                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                existing_named_actor = True
+                logger.info(
+                    "get_engine model=%s stage=existing_named_actor_found actor=%s namespace=%s",
+                    model_name,
+                    actor_name,
+                    PERSISTENT_NAMESPACE,
+                )
+            except ValueError:
+                existing_named_actor = False
+            except ray.exceptions.RayActorError:
+                existing_named_actor = False
+            except Exception as e:
+                logger.debug(
+                    "get_engine model=%s stage=existing_named_actor_probe_failed actor=%s err=%s",
+                    model_name,
+                    actor_name,
+                    e,
+                )
+
             pinned_node_ip: str | None = None
             pinned_json = _read_process_env_var("MINT_VLLM_PINNED_NODE_IP_JSON")
             raw_node_ips = _read_process_env_var("MINT_MODEL_NODE_IPS_JSON")
@@ -1382,7 +1412,14 @@ class MultiModelInferenceManager:
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
             total_gpus = int(config.inference_tp) * int(config.inference_dp)
-            if pinned_node_ip is not None:
+            if pinned_node_ip is not None and existing_named_actor:
+                logger.info(
+                    "get_engine model=%s stage=skip_capacity_check_existing_named_actor actor=%s pinned_node_ip=%s",
+                    model_name,
+                    actor_name,
+                    pinned_node_ip,
+                )
+            elif pinned_node_ip is not None:
                 assert_node_ip_capacity(
                     required_gpus_by_node_ip={pinned_node_ip: total_gpus},
                     context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",

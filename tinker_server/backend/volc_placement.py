@@ -330,9 +330,86 @@ def assert_node_ip_capacity(
             }
         )
     if blockers:
-        raise RuntimeError(
-            f"{context}: pinned node capacity check failed: required_by_node={requested} blockers={blockers}"
-        )
+        # Check for cross-namespace actor conflicts to provide better error messages
+        conflict_info = _check_cross_namespace_conflicts(requested)
+        error_msg = f"{context}: pinned node capacity check failed: required_by_node={requested} blockers={blockers}"
+        if conflict_info:
+            error_msg += f"\n\nPossible cross-namespace conflicts detected:\n{conflict_info}\n\nSuggestion: Coordinate with other developers or use a different node."
+        raise RuntimeError(error_msg)
+
+
+def _check_cross_namespace_conflicts(requested_node_ips: dict[str, int]) -> str:
+    """Check if other namespaces have actors on the requested nodes.
+
+    Returns a formatted string describing conflicts, or empty string if none found.
+    """
+    try:
+        if not ray.is_initialized():
+            return ""
+
+        current_namespace = os.environ.get("MINT_RAY_NAMESPACE") or os.environ.get("TINKER_RAY_NAMESPACE")
+        all_actors = ray.util.list_named_actors(all_namespaces=True)
+
+        # Group actors by namespace and node
+        conflicts_by_namespace: dict[str, list[str]] = {}
+
+        for actor_info in all_actors:
+            actor_ns = actor_info.get("namespace")
+            actor_name = actor_info.get("name", "")
+
+            # Skip actors in current namespace
+            if actor_ns == current_namespace:
+                continue
+
+            # Only check vLLM and Megatron actors (the ones that use pinned nodes)
+            if not (actor_name.startswith("tinker_vllm_") or
+                    actor_name.startswith("multinode_vllm_") or
+                    actor_name.startswith("megatron_")):
+                continue
+
+            # Try to get actor's node location
+            try:
+                # Verify actor exists (we don't need the handle, just check it's alive)
+                _ = ray.get_actor(actor_name, namespace=actor_ns)
+                # Get placement group to find node
+                pg_name = f"{actor_name}_pg"
+                try:
+                    pg = ray.util.get_placement_group(pg_name)
+                    pg_info = ray.util.placement_group_table(pg)
+                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
+
+                    # Check if any bundle is on requested nodes
+                    for node_id in bundles_to_node.values():
+                        for n in ray.nodes():
+                            if n.get("NodeID") == node_id:
+                                node_ip = n.get("NodeManagerAddress")
+                                if node_ip in requested_node_ips:
+                                    key = f"{actor_ns} (node: {node_ip})"
+                                    if key not in conflicts_by_namespace:
+                                        conflicts_by_namespace[key] = []
+                                    conflicts_by_namespace[key].append(actor_name)
+                                break
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+        if not conflicts_by_namespace:
+            return ""
+
+        lines = []
+        for ns_info, actors in sorted(conflicts_by_namespace.items()):
+            lines.append(f"  - {ns_info}:")
+            for actor in actors[:5]:  # Limit to 5 actors per namespace
+                lines.append(f"    * {actor}")
+            if len(actors) > 5:
+                lines.append(f"    * ... and {len(actors) - 5} more")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.debug(f"Failed to check cross-namespace conflicts: {e}")
+        return ""
+
 
 
 def select_free_nodes_from_allowed_ips(
