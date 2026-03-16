@@ -18,6 +18,17 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from tinker_server.backend.model_registry import get_model_config
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+    traced_async_from_traceparent,
+)
+from tinker_server.ray_utils import init_ray
+
 from . import ray_kill
 
 if TYPE_CHECKING:
@@ -142,7 +153,7 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
         )
 
     def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
-        if loras and all(l is not None for l in loras):
+        if loras and all(lora_item is not None for lora_item in loras):
             return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
         if not loras or (len(loras) % 3) != 0:
@@ -152,7 +163,7 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
 
         n_experts = len(loras) // 3
 
-        base_any = next((l for l in loras if l is not None), None)
+        base_any = next((lora_item for lora_item in loras if lora_item is not None), None)
         if base_any is None:
             raise RuntimeError(
                 f"MoE LoRA pack_moe got all-None loras for module={module_name!r}"
@@ -354,20 +365,6 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
     return "ok:patched"
 
-
-# Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
-from tinker_server.config import config as server_config
-from tinker_server.logging_context import (
-    get_current_traceparent,
-    init_actor_observability,
-    restore_trace_id_from_traceparent,
-    traced_async_from_traceparent,
-)
-from tinker_server.ray_utils import init_ray
-
-# Import model registry
-from tinker_server.backend.model_registry import get_model_config
 
 # Apply verl's hijack for TensorLoRARequest support
 # NOTE: Do not apply VLLM hijacks at module import time.

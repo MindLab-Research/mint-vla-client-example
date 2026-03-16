@@ -17,6 +17,12 @@ from typing import TYPE_CHECKING
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from tinker_server.backend.model_registry import get_model_config
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
+from tinker_server.ray_utils import init_ray
+
 from . import ray_kill
 from .lora_registry import LoRARegistry
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
@@ -60,17 +66,8 @@ def _read_process_env_var(name: str) -> str:
 # Well-known name for persistent vLLM actor
 PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 
-# Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
-from tinker_server.config import config as server_config
-from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
-from tinker_server.ray_utils import init_ray
-
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
-
-# Import model registry
-from tinker_server.backend.model_registry import get_model_config
 
 
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:

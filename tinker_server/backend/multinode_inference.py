@@ -22,8 +22,24 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import config as server_config
+from tinker_server.logging_context import (
+    get_current_traceparent,
+    init_actor_observability,
+    restore_trace_id_from_traceparent,
+    traced_async_from_traceparent,
+)
+from tinker_server.ray_utils import init_ray
+
 from . import ray_kill
+from .multinode_resources import compute_multinode_engine_resources
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
+from .volc_placement import (
+    assert_node_ip_capacity,
+    parse_model_node_ip_list,
+    parse_model_single_node_ip,
+)
 
 if TYPE_CHECKING:
     pass
@@ -37,23 +53,6 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
         "max_tokens": int(max_tokens),
         "last_progress_at": time.time(),
     }
-
-# Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
-from tinker_server.config import config as server_config
-from tinker_server.logging_context import (
-    get_current_traceparent,
-    init_actor_observability,
-    restore_trace_id_from_traceparent,
-    traced_async_from_traceparent,
-)
-from tinker_server.ray_utils import init_ray
-from .multinode_resources import compute_multinode_engine_resources
-from .volc_placement import (
-    assert_node_ip_capacity,
-    parse_model_node_ip_list,
-    parse_model_single_node_ip,
-)
 
 # Namespace for actors
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
