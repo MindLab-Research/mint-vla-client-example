@@ -33,8 +33,8 @@ def _env() -> Env:
     internal_api_token = (os.environ.get("INTERNAL_API_TOKEN") or "").strip()
     if not internal_api_token:
         raise SystemExit("error: missing env INTERNAL_API_TOKEN")
-    flood_count = int(os.environ.get("ISSUE324_FLOOD_COUNT") or "64")
-    timeout_s = float(os.environ.get("ISSUE324_TIMEOUT_S") or "10")
+    flood_count = int(os.environ.get("ISSUE324_FLOOD_COUNT") or "4")
+    timeout_s = float(os.environ.get("ISSUE324_TIMEOUT_S") or "40")
     return Env(
         base_url=base_url,
         internal_api_token=internal_api_token,

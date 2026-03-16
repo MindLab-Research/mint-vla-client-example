@@ -183,7 +183,7 @@ def _get_or_create_ray_actor():
             )
             self._queued_asample_by_principal: dict[str, int] = {}
             self._queued_asample_by_apikey: dict[str, int] = {}
-            self._queued_asample_request_state: dict[str, tuple[str | None, str | None]] = {}
+            self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
             self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
             self._scheduler_max_consecutive = max(
                 1,
@@ -240,10 +240,12 @@ def _get_or_create_ray_actor():
             self._queued_asample_by_principal[principal] = pending + 1
             if apikey_id is not None:
                 self._queued_asample_by_apikey[apikey_id] = int(self._queued_asample_by_apikey.get(apikey_id, 0)) + 1
-            self._queued_asample_request_state[request_id] = (principal, apikey_id)
+            self._queued_asample_request_state[request_id] = (principal, apikey_id, None)
 
         def _release_asample_slot(self, request_id: str) -> None:
-            principal, apikey_id = self._queued_asample_request_state.pop(str(request_id), (None, None))
+            principal, apikey_id, _consumer_job_id = self._queued_asample_request_state.pop(
+                str(request_id), (None, None, None)
+            )
             if principal is not None:
                 pending = int(self._queued_asample_by_principal.get(principal, 0)) - 1
                 if pending > 0:
@@ -259,6 +261,30 @@ def _get_or_create_ray_actor():
 
         def finalize_request(self, request_id: str) -> None:
             self._release_asample_slot(str(request_id))
+
+        def _mark_asample_leased_to_consumer(self, request_id: str, consumer_job_id: str | None) -> None:
+            request_id = str(request_id)
+            state = self._queued_asample_request_state.get(request_id)
+            if state is None:
+                return
+            principal, apikey_id, _previous_consumer = state
+            self._queued_asample_request_state[request_id] = (
+                principal,
+                apikey_id,
+                None if consumer_job_id is None else str(consumer_job_id),
+            )
+
+        def _release_slots_for_consumer(self, consumer_job_id: str | None) -> int:
+            if consumer_job_id is None:
+                return 0
+            doomed = [
+                request_id
+                for request_id, (_principal, _apikey_id, leased_consumer) in self._queued_asample_request_state.items()
+                if leased_consumer == str(consumer_job_id)
+            ]
+            for request_id in doomed:
+                self._release_asample_slot(request_id)
+            return len(doomed)
         def _to_bool(self, v: Any) -> bool:
             if isinstance(v, bool):
                 return v
@@ -596,12 +622,17 @@ def _get_or_create_ray_actor():
             }
 
         def set_active_job_id(self, job_id: str) -> None:
-            self._active_job_id = None if not job_id else str(job_id)
+            next_job_id = None if not job_id else str(job_id)
+            previous_job_id = self._active_job_id
+            if previous_job_id is not None and previous_job_id != next_job_id:
+                self._release_slots_for_consumer(previous_job_id)
+            self._active_job_id = next_job_id
 
         def clear_active_job_id_if_matches(self, job_id: str) -> bool:
             expected = None if not job_id else str(job_id)
             if self._active_job_id != expected:
                 return False
+            self._release_slots_for_consumer(expected)
             self._active_job_id = None
             return True
 
@@ -800,6 +831,7 @@ def _get_or_create_ray_actor():
                         dequeue_reason = str(sched_reason)
                         scheduler_domain = str(sched_domain)
                         scheduler_session_id = str(sched_session_id)
+                    self._mark_asample_leased_to_consumer(item.get("request_id", ""), consumer_job_id)
                     break
 
                 self._dequeued += 1

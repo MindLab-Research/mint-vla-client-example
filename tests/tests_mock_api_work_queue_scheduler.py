@@ -260,3 +260,26 @@ def test_issue_324_finalize_request_releases_running_slot(monkeypatch):
     assert actor.stats()["by_apikey_id"] == {"bbbbbbbbbbbbbbbbbbbbbbbb": 1}
     actor.finalize_request("r1")
     assert actor.stats()["by_apikey_id"] == {}
+
+
+def test_issue_324_consumer_handoff_releases_leased_slots(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    monkeypatch.setattr(api_work_queue.server_config, "sampling_max_pending_asample_per_apikey", 1)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    item = _item("r1", domain="d", session_key="A", created_at=1.0)
+    item["op"] = "sampling.asample"
+    item["user_id"] = "aaaaaaaaaaaaaaaaaaaaaaaa"
+    item["apikey_id"] = "bbbbbbbbbbbbbbbbbbbbbbbb"
+    item["throttle_principal"] = "apikey:bbbbbbbbbbbbbbbbbbbbbbbb"
+
+    actor.set_active_job_id("consumer-old")
+    asyncio.run(actor.enqueue(item))
+    asyncio.run(actor.dequeue("consumer-old"))
+    assert actor.stats()["by_apikey_id"] == {"bbbbbbbbbbbbbbbbbbbbbbbb": 1}
+
+    actor.set_active_job_id("consumer-new")
+    assert actor.stats()["by_apikey_id"] == {}
+
+    accepted = asyncio.run(actor.enqueue(dict(item, request_id="r2")))
+    assert accepted == {"ok": True}
