@@ -30,9 +30,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tinker_server.runtime_env import bootstrap_runtime_pythonpath
-
-
 def _prepend_pythonpath(entries: str) -> None:
     if not entries:
         return
@@ -62,16 +59,6 @@ def _sanitize_torch_ld_library_path() -> None:
         os.environ["LD_LIBRARY_PATH"] = ":".join(cleaned)
     else:
         os.environ.pop("LD_LIBRARY_PATH", None)
-
-
-_prepend_pythonpath(
-    bootstrap_runtime_pythonpath(
-        os.environ,
-        repo_root=str(_REPO_ROOT),
-    )
-)
-_sanitize_torch_ld_library_path()
-
 
 def crash_handler(exc_type, exc_value, exc_tb):
     """Log uncaught exceptions before crash."""
@@ -110,10 +97,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _seed_runtime_env_from_config(config_path: str) -> None:
+    from tinker_server.config_file import load_tinker_config_file
+
+    cfg = load_tinker_config_file(config_path)
+    if cfg.paths.pfs_runtime_env_root and "PFS_RUNTIME_ENV_ROOT" not in os.environ:
+        os.environ["PFS_RUNTIME_ENV_ROOT"] = str(cfg.paths.pfs_runtime_env_root)
+    if cfg.paths.pfs_tinker_path and "PFS_TINKER_PATH" not in os.environ:
+        os.environ["PFS_TINKER_PATH"] = str(cfg.paths.pfs_tinker_path)
+    if cfg.paths.pfs_hf_modules_path and "PFS_HF_MODULES_PATH" not in os.environ:
+        os.environ["PFS_HF_MODULES_PATH"] = str(cfg.paths.pfs_hf_modules_path)
+
+
 if __name__ == "__main__":
     args = _parse_args(sys.argv[1:])
     if args.config_path:
         os.environ["TINKER_CONFIG_PATH"] = str(args.config_path)
+        _seed_runtime_env_from_config(str(args.config_path))
+
+    from tinker_server.runtime_env import bootstrap_runtime_pythonpath
+
+    _prepend_pythonpath(
+        bootstrap_runtime_pythonpath(
+            os.environ,
+            repo_root=str(_REPO_ROOT),
+        )
+    )
+    _sanitize_torch_ld_library_path()
 
     # Configure structured logging early with request_id support
     from tinker_server.logging_context import configure_logging

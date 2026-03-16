@@ -86,13 +86,20 @@ PFS_HF_MODULES_PATH = (
     _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or DEFAULT_HF_MODULES_PATH
 )
 
-if not PFS_RUNTIME_ENV_ROOT:
-    raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
+def ensure_runtime_env_configured() -> str:
+    if not PFS_RUNTIME_ENV_ROOT:
+        raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
+    return PFS_RUNTIME_ENV_ROOT
 
-PFS_PYTHONPATH = build_runtime_pythonpath(
-    env_root=PFS_RUNTIME_ENV_ROOT,
-    pfs_tinker_path=PFS_TINKER_PATH,
-    pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+
+PFS_PYTHONPATH = (
+    build_runtime_pythonpath(
+        env_root=PFS_RUNTIME_ENV_ROOT,
+        pfs_tinker_path=PFS_TINKER_PATH,
+        pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+    )
+    if PFS_RUNTIME_ENV_ROOT
+    else ""
 )
 
 # OTEL env vars forwarded into Ray actors so actor-side logging/tracing
@@ -125,6 +132,7 @@ def otel_env_vars() -> dict[str, str]:
 
 
 def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    ensure_runtime_env_configured()
     out = {
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "PFS_TINKER_PATH": PFS_TINKER_PATH,

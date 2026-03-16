@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 import tomllib
+import subprocess
+import sys
 
 from tinker_server.runtime_env import (
     DEFAULT_HF_MODULES_PATH,
@@ -99,3 +101,51 @@ def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
             expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
     layout = runtime_env_layout("/tmp/runtime")
     assert list(layout.pythonpath_entries[1:]) == expected
+
+
+def test_config_import_does_not_require_runtime_root():
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import tinker_server.config as c; print(c.PFS_RUNTIME_ENV_ROOT == '')",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={},
+    )
+    assert out.stdout.strip() == "True"
+
+
+def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
+    cfg = tmp_path / "tinker.toml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "[paths]",
+                f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
+                "",
+                "[server]",
+                "port = 9",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_server.py",
+            "--config",
+            str(cfg),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={**dict(), "TINKER_HOST": "127.0.0.1"},
+    )
+    assert "PFS_RUNTIME_ENV_ROOT is required" not in (out.stdout + out.stderr)
