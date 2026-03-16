@@ -126,14 +126,12 @@ Hard rule:
 Exact check pattern:
 
 ```bash
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
 import json
 import os
-from pathlib import Path
 import ray
 from ray.util.placement_group import placement_group_table
-head_ip = Path(f"/vePFS-Mindverse/share/code/{os.environ['USER']}/tinker-server/ray_head_ip.txt").read_text().strip()
-ray.init(address=f"{head_ip}:6379", ignore_reinit_error=True)
+ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
 rows = []
 for pgid, info in placement_group_table().items():
     if info.get("state") != "REMOVED":
@@ -427,10 +425,10 @@ If none of the above changed: restart server only.
 
 ```bash
 # Kill vLLM actor for K2
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/\$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 try:
     ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
     actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=ns)
@@ -441,10 +439,10 @@ except ValueError as e:
 \""
 
 # Kill Megatron actor for K2
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/\$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 try:
     ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
     actor = ray.get_actor(\"megatron_kimi_k2_thinking\", namespace=ns)
@@ -455,10 +453,10 @@ except ValueError as e:
 \""
 
 # List all actors in current namespace (to find actor names)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/\$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
 actors = ray.util.list_named_actors(all_namespaces=True)
 for a in actors:
@@ -760,9 +758,10 @@ ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv
 # WRONG: Guessing actor name and concluding "DEAD" if not found
 # RIGHT: List first, then check with exact name from list
 
-ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c "
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c "
+import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 
 # List actors first to get exact names
 actors = ray.util.list_named_actors(all_namespaces=True)

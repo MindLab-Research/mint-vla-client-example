@@ -106,22 +106,7 @@ def _ensure_ray_initialized() -> None:
     try:
         from tinker_server.ray_utils import init_ray
 
-        addr = (os.environ.get("RAY_ADDRESS") or "").strip()
-        if not addr:
-            candidates: list[str] = []
-            pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
-            if pfs_tinker_path:
-                candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
-            for p in candidates:
-                try:
-                    ip = open(p, "r", encoding="utf-8").read().strip()
-                except OSError:
-                    continue
-                if ip:
-                    addr = f"{ip}:6379"
-                    break
-
-        init_ray(address=addr or "auto")
+        init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Ray for gateway session store: {type(e).__name__}: {e}") from e
     if not ray.is_initialized():

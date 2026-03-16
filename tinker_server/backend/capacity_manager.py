@@ -217,10 +217,8 @@ class CapacityManager:
         if not ray.is_initialized():
             try:
                 from ..ray_utils import init_ray
-                from .future_store import _infer_ray_address  # type: ignore
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
 

@@ -1759,7 +1759,6 @@ class MultiNodeInferenceEngine:
 
             if not ray.is_initialized():
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )

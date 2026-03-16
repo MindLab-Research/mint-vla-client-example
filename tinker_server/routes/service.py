@@ -122,7 +122,7 @@ async def healthz() -> dict:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         def _pending_gpu_pg_names_in_namespace() -> list[str]:
             tbl = ray.util.placement_group_table()
@@ -837,7 +837,7 @@ def _augment_with_placement_groups(actors: list[dict]) -> None:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         for a in actors:
             name = a.get("actor_name")
@@ -914,7 +914,7 @@ def _kill_dense_actors(base_model: str | None) -> int:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         for e in targets:
             try:

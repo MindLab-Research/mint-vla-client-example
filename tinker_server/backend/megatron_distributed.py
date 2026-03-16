@@ -6489,7 +6489,6 @@ def get_or_create_megatron_worker_group(
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6747,7 +6746,6 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6841,7 +6839,6 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
     """
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

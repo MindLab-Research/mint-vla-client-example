@@ -36,13 +36,16 @@ def _get_json(url: str, *, timeout_s: float) -> tuple[int, dict[str, Any] | None
 def main() -> int:
     if not RAY_NAMESPACE:
         return _fail("TINKER_RAY_NAMESPACE is required (run on mint-dev with the server namespace)")
+    ray_address = os.environ.get("RAY_ADDRESS", "").strip()
+    if not ray_address:
+        return _fail("RAY_ADDRESS is required and must be the validated GCS address")
 
     try:
         import ray
     except Exception as e:
         return _fail(f"ray import failed (run this repro on mint-dev): {type(e).__name__}: {e}")
 
-    ray.init(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    ray.init(address=ray_address, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
     pg = None
     pg_name = f"repro_206_pg_{uuid.uuid4().hex[:8]}"

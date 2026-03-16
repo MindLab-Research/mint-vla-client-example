@@ -165,7 +165,6 @@ class MultiLoRAInferenceEngine:
             if not ray.is_initialized():
                 # Use fixed namespace so detached actors can be found across process restarts
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -1588,7 +1587,6 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -1680,7 +1678,6 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
