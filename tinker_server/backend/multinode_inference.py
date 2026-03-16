@@ -2194,7 +2194,7 @@ class MultiNodeInferenceEngine:
                         required_gpus=int(worker_gpus),
                     )
 
-            from ..config import actor_ld_library_path, otel_env_vars
+            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
             env_vars = actor_runtime_env_vars(
                 pythonpath=PFS_PYTHONPATH,
                 extra={

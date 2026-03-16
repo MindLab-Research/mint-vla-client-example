@@ -404,6 +404,51 @@ async def _prewarm_persistent_models(
         except Exception:
             pinned_vllm_node_ip = {}
 
+    def _preferred_pg_node_id(pg_name: str, model_name: str) -> str | None:
+        preferred_ips: list[str] = []
+        for env_name in ("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "MINT_MODEL_NODE_IPS_JSON"):
+            raw = os.environ.get(env_name, "").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            selected = None
+            for key in (model_name, model_name.lower()):
+                selected = data.get(key)
+                if selected is not None:
+                    break
+            if isinstance(selected, list):
+                preferred_ips.extend(str(ip).strip() for ip in selected if str(ip).strip())
+            if preferred_ips:
+                break
+
+        node_ip_by_id = {
+            str(n.get("NodeID") or ""): str(n.get("NodeManagerAddress") or "").strip()
+            for n in ray.nodes()
+            if n.get("Alive")
+        }
+        candidate_node_ids: list[str] = []
+        for info in ray.util.placement_group_table().values():
+            if info.get("state") != "CREATED" or info.get("name") != pg_name:
+                continue
+            bundles_to_node_id = info.get("bundles_to_node_id") or {}
+            for node_id in bundles_to_node_id.values():
+                node_id_str = str(node_id or "").strip()
+                if node_id_str:
+                    candidate_node_ids.append(node_id_str)
+        if not candidate_node_ids:
+            return None
+        if preferred_ips:
+            for node_id in candidate_node_ids:
+                if node_ip_by_id.get(node_id) in preferred_ips:
+                    return node_id
+            return None
+        return candidate_node_ids[0]
+
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
         f"megatron_ready_timeout_s={megatron_ready_timeout_s} "
@@ -490,15 +535,7 @@ async def _prewarm_persistent_models(
                             node_id = None
                             deadline = time.monotonic() + 30.0
                             while time.monotonic() < deadline and not node_id:
-                                pg_table = ray.util.placement_group_table()
-                                for info in pg_table.values():
-                                    if info.get("state") != "CREATED":
-                                        continue
-                                    if info.get("name") != pg_name:
-                                        continue
-                                    node_id = (info.get("bundles_to_node_id") or {}).get(0)
-                                    if node_id:
-                                        break
+                                node_id = _preferred_pg_node_id(pg_name, model_name)
                                 if not node_id:
                                     await asyncio.sleep(0.5)
                             if node_id:

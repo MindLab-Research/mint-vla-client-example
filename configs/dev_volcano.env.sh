@@ -10,18 +10,16 @@
 #   python scripts/run_server.py
 
 # ── Python / venv ──────────────────────────────────────────────────────────────
-export PYTHON_BIN=/root/tinker_project/tinker-server/.venv31213/bin/python
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
+export PYTHON_BIN=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
 export PYTHONDONTWRITEBYTECODE=1
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 export HF_HOME=/vePFS-Mindverse/share/huggingface
 export HF_HUB_OFFLINE=1
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/leixiang/tinker-server
-export PFS_VLLM_PATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg
-export PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH=/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src
-export PFS_VERL_PATH=/vePFS-Mindverse/share/code/verl
 export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
-export LD_LIBRARY_PATH=/root/tinker_project/tinker-server/.venv31213/lib/python3.12/site-packages/torch/lib
+export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
 
 # ── Ray ────────────────────────────────────────────────────────────────────────
 export RAY_ADDRESS=192.168.37.185:6379
