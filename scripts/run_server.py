@@ -186,12 +186,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def _seed_runtime_env_from_config(config_path: str) -> None:
     data = tomllib.loads(pathlib.Path(config_path).read_text(encoding="utf-8"))
     paths = data.get("paths", {})
-    if "pfs_runtime_env_root" in paths:
-        os.environ["PFS_RUNTIME_ENV_ROOT"] = str(paths["pfs_runtime_env_root"])
-    if "pfs_tinker_path" in paths:
-        os.environ["PFS_TINKER_PATH"] = str(paths["pfs_tinker_path"])
-    if "pfs_hf_modules_path" in paths:
-        os.environ["PFS_HF_MODULES_PATH"] = str(paths["pfs_hf_modules_path"])
+    required = (
+        "pfs_runtime_env_root",
+        "pfs_tinker_path",
+        "pfs_hf_modules_path",
+    )
+    missing = [key for key in required if key not in paths]
+    if missing:
+        raise RuntimeError(
+            f"{config_path} must define [paths] {required}; missing={missing}"
+        )
+    os.environ["PFS_RUNTIME_ENV_ROOT"] = str(paths["pfs_runtime_env_root"])
+    os.environ["PFS_TINKER_PATH"] = str(paths["pfs_tinker_path"])
+    os.environ["PFS_HF_MODULES_PATH"] = str(paths["pfs_hf_modules_path"])
 
 
 if __name__ == "__main__":

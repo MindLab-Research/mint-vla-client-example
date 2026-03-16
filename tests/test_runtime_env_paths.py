@@ -226,6 +226,29 @@ def test_seed_runtime_env_from_config_overrides_stale_env(tmp_path, monkeypatch)
     assert os.environ["PFS_HF_MODULES_PATH"] == str(tmp_path / "hf")
 
 
+def test_seed_runtime_env_from_config_requires_all_paths(tmp_path, monkeypatch):
+    from scripts.run_server import _seed_runtime_env_from_config
+
+    cfg = tmp_path / "bad.toml"
+    cfg.write_text(
+        "\n".join(
+            [
+                "[paths]",
+                f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
+                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/stale/runtime")
+    monkeypatch.setenv("PFS_TINKER_PATH", "/stale/repo")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/stale/hf")
+
+    with pytest.raises(RuntimeError, match="missing=.*pfs_hf_modules_path"):
+        _seed_runtime_env_from_config(str(cfg))
+
+
 def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     import scripts.run_server as run_server
 
