@@ -118,12 +118,20 @@ def _model_key_from_base_model(base_model: str) -> str:
 
 def _preferred_worker_node_ips_for_model(base_model: str) -> list[str]:
     model_key = _model_key_from_base_model(base_model)
+    lookup_keys = [model_key, model_key.lower(), base_model, base_model.lower()]
     node_ips = parse_model_node_ip_list(
+        raw_json=os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON"),
+        lookup_keys=lookup_keys,
+        env_var_name="MINT_MEGATRON_MODEL_NODE_IPS_JSON",
+        context=f"[MegatronWorkerGroup] node pinning model={model_key}",
+    )
+    if not node_ips:
+        node_ips = parse_model_node_ip_list(
         raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
         lookup_keys=[model_key, model_key.lower(), base_model, base_model.lower()],
         env_var_name="MINT_MODEL_NODE_IPS_JSON",
         context=f"[MegatronWorkerGroup] node pinning model={model_key}",
-    )
+        )
     if not node_ips:
         return []
     logger.info(f"[MegatronWorkerGroup] node pinning for model={model_key}: {node_ips}")
@@ -6642,9 +6650,10 @@ def get_or_create_megatron_worker_group(
                 if v is not None:
                     runtime_env["env_vars"][k] = v
             explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
+            megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
             if explicit_node_ips_csv:
                 runtime_env["env_vars"]["MINT_MEGATRON_NODE_IPS_CSV"] = explicit_node_ips_csv
-            else:
+            elif not megatron_node_pin_json:
                 volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
                 if volc_rq:
                     from .volc_placement import list_node_ips_for_resource_queue
@@ -6662,6 +6671,8 @@ def get_or_create_megatron_worker_group(
             node_pin_json = os.environ.get("MINT_MODEL_NODE_IPS_JSON")
             if node_pin_json:
                 runtime_env["env_vars"]["MINT_MODEL_NODE_IPS_JSON"] = node_pin_json
+            if megatron_node_pin_json:
+                runtime_env["env_vars"]["MINT_MEGATRON_MODEL_NODE_IPS_JSON"] = megatron_node_pin_json
 
             # Create detached Ray actor with per-model name
             try:

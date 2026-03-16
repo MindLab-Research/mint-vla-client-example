@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Watchdog for prod tinker-server-auth (server/ops side).
 
-If /api/v1/healthz is unresponsive or non-200 for N consecutive checks,
-restart the supervisord program `tinker-server-auth`.
+Probe the Ray-aware health endpoint first, but treat a successful root-path
+liveness response as a healthy server when `/api/v1/healthz` is slow or
+temporarily degraded under Ray congestion. In that case, restarting the API
+server is counterproductive because the process is alive and only the heavier
+health path is struggling.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 
@@ -17,13 +21,16 @@ def _ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _check(url: str, timeout_s: float) -> bool:
+def _probe(url: str, timeout_s: float) -> tuple[bool, str]:
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= int(resp.status) < 300
-    except Exception:
-        return False
+            status = int(resp.status)
+            return 200 <= status < 300, f"http_{status}"
+    except urllib.error.HTTPError as e:
+        return False, f"http_{int(e.code)}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _restart(program: str) -> int:
@@ -42,8 +49,9 @@ def _restart(program: str) -> int:
 
 def main() -> int:
     url = os.environ.get("TINKER_WATCHDOG_URL", "http://localhost:18000/api/v1/healthz")
-    timeout_s = float(os.environ.get("TINKER_WATCHDOG_TIMEOUT_S", "10"))
-    interval_s = float(os.environ.get("TINKER_WATCHDOG_INTERVAL_S", "10"))
+    alive_url = os.environ.get("TINKER_WATCHDOG_ALIVE_URL", "http://localhost:18000/")
+    timeout_s = float(os.environ.get("TINKER_WATCHDOG_TIMEOUT_S", "30"))
+    interval_s = float(os.environ.get("TINKER_WATCHDOG_INTERVAL_S", "60"))
     fails_to_restart = int(os.environ.get("TINKER_WATCHDOG_FAILS_TO_RESTART", "6"))
     restart_cooldown_s = float(os.environ.get("TINKER_WATCHDOG_RESTART_COOLDOWN_S", "60"))
     program = os.environ.get("TINKER_WATCHDOG_PROGRAM", "tinker-server-auth")
@@ -53,25 +61,45 @@ def main() -> int:
     # Give server time to boot after container start / deploy.
     boot_grace_s = float(os.environ.get("TINKER_WATCHDOG_BOOT_GRACE_S", "30"))
     print(
-        f"{_ts()} watchdog: starting url={url} timeout_s={timeout_s} interval_s={interval_s} "
+        f"{_ts()} watchdog: starting url={url} alive_url={alive_url} "
+        f"timeout_s={timeout_s} interval_s={interval_s} "
         f"fails_to_restart={fails_to_restart} restart_cooldown_s={restart_cooldown_s} boot_grace_s={boot_grace_s}",
         flush=True,
     )
     time.sleep(boot_grace_s)
 
     while True:
-        ok = _check(url, timeout_s)
+        ok, reason = _probe(url, timeout_s)
         if ok:
             fails = 0
             time.sleep(interval_s)
             continue
 
+        alive_ok, alive_reason = _probe(alive_url, timeout_s)
+        if alive_ok:
+            print(
+                f"{_ts()} watchdog: treating probe as success because server is alive "
+                f"(healthz={reason}, alive={alive_reason})",
+                flush=True,
+            )
+            fails = 0
+            time.sleep(interval_s)
+            continue
+
         fails += 1
+        print(
+            f"{_ts()} watchdog: failed probe {fails}/{fails_to_restart} "
+            f"(healthz={reason}, alive={alive_reason})",
+            flush=True,
+        )
         if fails < fails_to_restart:
             time.sleep(interval_s)
             continue
 
-        print(f"{_ts()} watchdog: health check failed {fails} times; restarting {program}", flush=True)
+        print(
+            f"{_ts()} watchdog: health check failed {fails} times; restarting {program}",
+            flush=True,
+        )
         _restart(program)
         fails = 0
         time.sleep(restart_cooldown_s)

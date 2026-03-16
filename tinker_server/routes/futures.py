@@ -491,6 +491,20 @@ async def retrieve_future(
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             return _apply_cached_response(cached, response)
+        result = future_store.get_result(body.request_id)
+        if result is not None:
+            _recent_put(body.request_id, result)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=result", body.request_id)
+            return result
+        error = future_store.get_error(body.request_id)
+        if error is not None:
+            if _is_privileged(http_request):
+                payload = {"error": error, "category": "system"}
+            else:
+                payload = {"error": _public_error(error), "category": "system"}
+            _recent_put(body.request_id, payload)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=error_payload", body.request_id)
+            return payload
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:

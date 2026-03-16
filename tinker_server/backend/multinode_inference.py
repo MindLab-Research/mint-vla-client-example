@@ -148,11 +148,18 @@ def _preferred_worker_node_ips_for_model(model_name: str | None) -> list[str]:
     if not model_name:
         return []
     node_ips = parse_model_node_ip_list(
-        raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+        raw_json=os.environ.get("MINT_VLLM_MODEL_NODE_IPS_JSON"),
         lookup_keys=[model_name, model_name.lower()],
-        env_var_name="MINT_MODEL_NODE_IPS_JSON",
+        env_var_name="MINT_VLLM_MODEL_NODE_IPS_JSON",
         context=f"multinode_vllm_node_pin model={model_name}",
     )
+    if not node_ips:
+        node_ips = parse_model_node_ip_list(
+            raw_json=os.environ.get("MINT_MODEL_NODE_IPS_JSON"),
+            lookup_keys=[model_name, model_name.lower()],
+            env_var_name="MINT_MODEL_NODE_IPS_JSON",
+            context=f"multinode_vllm_node_pin model={model_name}",
+        )
     if not node_ips:
         return []
     logger.info(f"multinode_vllm_node_pin model={model_name} node_ips={node_ips}")

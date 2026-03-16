@@ -1553,6 +1553,7 @@ async def optim_step(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform optimizer step to update weights."""
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1564,7 +1565,14 @@ async def optim_step(
     if training_manager is not None:
         session = training_manager.get_session(request.model_id)
         if session is None:
+            restore_start_s = time.perf_counter()
             session = _restore_training_session(request.model_id)
+            logger.info(
+                "[optim_step route] model_id=%s stage=restore_session elapsed_ms=%.3f restored=%s",
+                str(request.model_id),
+                (time.perf_counter() - restore_start_s) * 1000.0,
+                bool(session is not None),
+            )
 
     if session is None:
         remote = remote_training_model(request.model_id)
@@ -1617,10 +1625,18 @@ async def optim_step(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    reserve_start_s = time.perf_counter()
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
+    )
+    logger.info(
+        "[optim_step route] request_id=%s model_id=%s stage=capacity_reserve elapsed_ms=%.3f ok=%s",
+        str(request_id),
+        str(request.model_id),
+        (time.perf_counter() - reserve_start_s) * 1000.0,
+        bool(reserve.get("ok")),
     )
     if not bool(reserve.get("ok")):
         raise HTTPException(
@@ -1636,9 +1652,17 @@ async def optim_step(
             training_op="optim_step",
             seq_id=request.seq_id,
         )
+        future_create_start_s = time.perf_counter()
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
+        logger.info(
+            "[optim_step route] request_id=%s model_id=%s stage=future_store_ready elapsed_ms=%.3f",
+            str(request_id),
+            str(request.model_id),
+            (time.perf_counter() - future_create_start_s) * 1000.0,
+        )
+        enqueue_start_s = time.perf_counter()
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.optim_step",
@@ -1646,6 +1670,13 @@ async def optim_step(
             user_id=user_id,
             webhook_url=None,
             extra=scheduler_extra,
+        )
+        logger.info(
+            "[optim_step route] request_id=%s model_id=%s stage=enqueue_done elapsed_ms=%.3f route_elapsed_ms=%.3f",
+            str(request_id),
+            str(request.model_id),
+            (time.perf_counter() - enqueue_start_s) * 1000.0,
+            (time.perf_counter() - route_start_s) * 1000.0,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
