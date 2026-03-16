@@ -4925,10 +4925,11 @@ class MegatronWorkerGroup:
             is_mla = False
             disable_nccl_ib = False
 
-        from ..config import otel_env_vars
+        from ..config import actor_runtime_env_vars, otel_env_vars
         runtime_env = {
-            "env_vars": {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -4942,7 +4943,8 @@ class MegatronWorkerGroup:
                 "NVTE_FUSED_ATTN": "0" if is_mla else "1",
                 "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
                 **otel_env_vars(),
-            },
+                },
+            ),
         }
 
         # Forward MoE LoRA export knobs into rank workers.
@@ -6497,7 +6499,6 @@ def get_or_create_megatron_worker_group(
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6604,19 +6605,21 @@ def get_or_create_megatron_worker_group(
         resource_pool.reserve_gpus(num_gpus)
 
         try:
-            from ..config import otel_env_vars
+            from ..config import actor_runtime_env_vars, otel_env_vars
 
             # Runtime env for PFS code access
             runtime_env = {
-                "env_vars": {
-                    "PYTHONPATH": PFS_PYTHONPATH,
+                "env_vars": actor_runtime_env_vars(
+                    pythonpath=PFS_PYTHONPATH,
+                    extra={
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     **otel_env_vars(),
-                }
+                    },
+                )
             }
 
             # Forward MoE LoRA export knobs into the detached Megatron actor so the
@@ -6753,7 +6756,6 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -6847,7 +6849,6 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
     """
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

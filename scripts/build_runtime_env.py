@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tinker_server.runtime_env import (
+    DEFAULT_HOST_VENV_DIRNAME,
+    DEFAULT_SITE_PACKAGES_DIRNAME,
+    DEFAULT_SOURCE_DIRNAME,
+    checkout_runtime_env_layout,
+)
+
+
+def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+
+
+def _resolve_uv() -> str:
+    uv = shutil.which("uv")
+    if uv:
+        return uv
+    candidate = Path.home() / ".local" / "bin" / "uv"
+    if candidate.exists():
+        return str(candidate)
+    raise RuntimeError("uv executable not found; install uv or add it to PATH")
+
+
+def _load_pyproject() -> dict[str, Any]:
+    with PYPROJECT.open("rb") as f:
+        return tomllib.load(f)
+
+
+def _runtime_table(pyproject: dict[str, Any]) -> dict[str, Any]:
+    return pyproject["tool"]["tinker"]["runtime_env"]
+
+
+def _shared_deps(pyproject: dict[str, Any]) -> list[str]:
+    return list(pyproject["project"]["dependencies"])
+
+
+def _host_deps(pyproject: dict[str, Any]) -> list[str]:
+    groups = pyproject.get("dependency-groups", {})
+    return list(groups.get("host-runtime", []))
+
+def _clone_checkout(target: Path, *, repo: str, commit: str) -> None:
+    if target.exists():
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _run(["git", "init", str(target)])
+    _run(["git", "-C", str(target), "remote", "add", "origin", repo])
+    _run(["git", "-C", str(target), "fetch", "--depth=1", "origin", commit])
+    _run(["git", "-C", str(target), "checkout", "--detach", "FETCH_HEAD"])
+
+
+def _export_shared_requirements(pyproject: dict[str, Any], output: Path) -> None:
+    runtime = _runtime_table(pyproject)
+    prune_args: list[str] = []
+    for name in runtime.get("image_managed", {}).keys():
+        prune_args.extend(["--prune", name])
+    _run(
+        [
+            _resolve_uv(),
+            "export",
+            "--frozen",
+            "--no-hashes",
+            "--no-emit-project",
+            "--no-dev",
+            "--no-default-groups",
+            "--output-file",
+            str(output),
+            *prune_args,
+        ],
+        cwd=REPO_ROOT,
+    )
+
+
+def _export_host_requirements(output: Path) -> None:
+    _run(
+        [
+            _resolve_uv(),
+            "export",
+            "--frozen",
+            "--no-hashes",
+            "--no-emit-project",
+            "--no-dev",
+            "--only-group",
+            "host-runtime",
+            "--output-file",
+            str(output),
+        ],
+        cwd=REPO_ROOT,
+    )
+
+
+def _install_target(python: Path, target: Path, requirements_file: Path) -> None:
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+    _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    _run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(target),
+            "-r",
+            str(requirements_file),
+        ]
+    )
+
+
+def _create_host_venv(
+    uv_python: str,
+    host_venv: Path,
+    host_requirements: Path,
+) -> Path:
+    if host_venv.exists():
+        shutil.rmtree(host_venv)
+    _run([_resolve_uv(), "venv", "--seed", "--python", uv_python, str(host_venv)])
+    python = host_venv / "bin" / "python"
+    _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    _run([str(python), "-m", "pip", "install", "-r", str(host_requirements)])
+    return python
+
+
+def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str]) -> None:
+    runtime = _runtime_table(pyproject)
+    manifest = {
+        "python_version": runtime["python_version"],
+        "env_root": str(env_root),
+        "host_python": str(host_python),
+        "shared_dependencies": shared_deps,
+        "host_dependencies": _host_deps(pyproject),
+        "runtime_env": {
+            "site_packages_dir": runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME),
+            "source_dir": runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME),
+            "host_venv_dir": runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME),
+        },
+        "sources": runtime["sources"],
+        "image_managed": runtime["image_managed"],
+    }
+    (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_activation(env_root: Path) -> None:
+    layout = checkout_runtime_env_layout(str(env_root))
+    text = "\n".join(
+        [
+            "# Generated by scripts/build_runtime_env.py",
+            f"export PFS_RUNTIME_ENV_ROOT={layout.root}",
+            f"export TINKER_HOST_PYTHON={layout.host_python}",
+            "",
+        ]
+    )
+    (env_root / "activate_runtime_env.sh").write_text(text, encoding="utf-8")
+
+
+def _write_host_pth(env_root: Path, host_python: Path) -> None:
+    layout = checkout_runtime_env_layout(str(env_root))
+    purelib = subprocess.check_output(
+        [str(host_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        text=True,
+    ).strip()
+    pth = Path(purelib) / "tinker_runtime_env.pth"
+    lines = [layout.site_packages, *layout.pythonpath_entries[1:], *layout.host_pythonpath_entries]
+    pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_host_source_dist_info(pyproject: dict[str, Any], host_python: Path) -> None:
+    runtime = _runtime_table(pyproject)
+    purelib = Path(
+        subprocess.check_output(
+            [str(host_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True,
+        ).strip()
+    )
+    for source in runtime.get("sources", []):
+        if not source.get("host_only", False):
+            continue
+        package_name = str(source.get("package_name") or source["name"]).strip()
+        package_version = str(source.get("version") or "").strip()
+        if not package_name or not package_version:
+            raise RuntimeError(
+                f"host_only runtime source must declare package_name and version: {source!r}"
+            )
+        dist = purelib / f"{package_name.replace('-', '_')}-{package_version}.dist-info"
+        if dist.exists():
+            shutil.rmtree(dist)
+        dist.mkdir(parents=True, exist_ok=True)
+        (dist / "METADATA").write_text(
+            "\n".join(
+                [
+                    "Metadata-Version: 2.1",
+                    f"Name: {package_name}",
+                    f"Version: {package_version}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (dist / "WHEEL").write_text(
+            "\n".join(
+                [
+                    "Wheel-Version: 1.0",
+                    "Generator: scripts/build_runtime_env.py",
+                    "Root-Is-Purelib: true",
+                    "Tag: py3-none-any",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (dist / "top_level.txt").write_text(f"{package_name.split('-', 1)[0]}\n", encoding="utf-8")
+        (dist / "INSTALLER").write_text("scripts/build_runtime_env.py\n", encoding="utf-8")
+
+
+def _write_host_source_version_files(pyproject: dict[str, Any], env_root: Path) -> None:
+    runtime = _runtime_table(pyproject)
+    source_root = env_root / runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)
+    for source in runtime.get("sources", []):
+        if not source.get("host_only", False):
+            continue
+        package_name = str(source.get("package_name") or source["name"]).strip()
+        package_version = str(source.get("version") or "").strip()
+        if not package_name or not package_version:
+            raise RuntimeError(
+                f"host_only runtime source must declare package_name and version: {source!r}"
+            )
+        package_root = source_root / source["name"] / package_name.replace("-", "_")
+        if package_name == "vllm":
+            version_file = package_root / "_version.py"
+            version_tuple = package_version.split(".")
+            if len(version_tuple) < 3:
+                raise RuntimeError(f"vllm host version must be x.y.z: {package_version!r}")
+            major, minor, patch = (int(part) for part in version_tuple[:3])
+            version_file.write_text(
+                "\n".join(
+                    [
+                        "# Generated by scripts/build_runtime_env.py",
+                        f'__version__ = "{package_version}"',
+                        f"__version_tuple__ = ({major}, {minor}, {patch})",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+
+def _write_host_wrappers(env_root: Path, host_python: Path) -> None:
+    bindir = host_python.parent
+    wrappers = {
+        "ray": "ray.scripts.scripts",
+    }
+    for name, module in wrappers.items():
+        script = bindir / name
+        script.write_text(
+            "\n".join(
+                [
+                    "#!/bin/sh",
+                    f'exec "{host_python}" -m {module} "$@"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+
+
+def build_runtime_env(env_root: Path) -> None:
+    pyproject = _load_pyproject()
+    runtime = _runtime_table(pyproject)
+    shared_deps = _shared_deps(pyproject)
+    env_root.mkdir(parents=True, exist_ok=True)
+    shared_site_packages = env_root / runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)
+    host_venv = env_root / runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)
+    source_root = env_root / runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)
+    shared_requirements = env_root / "shared-requirements.txt"
+    host_requirements = env_root / "host-requirements.txt"
+
+    _export_host_requirements(host_requirements)
+    host_python = _create_host_venv(runtime["python_version"], host_venv, host_requirements)
+    _export_shared_requirements(pyproject, shared_requirements)
+    _install_target(host_python, shared_site_packages, shared_requirements)
+
+    for source in runtime["sources"]:
+        _clone_checkout(
+            source_root / source["name"],
+            repo=source["repo"],
+            commit=source["commit"],
+        )
+
+    _write_host_source_version_files(pyproject, env_root)
+    _write_host_pth(env_root, host_python)
+    _write_host_source_dist_info(pyproject, host_python)
+    _write_host_wrappers(env_root, host_python)
+    _write_manifest(env_root, pyproject, host_python, shared_deps)
+    _write_activation(env_root)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--env-root", required=True, help="Destination PFS runtime env root")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = _parse_args(argv)
+    build_runtime_env(Path(args.env_root).resolve())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

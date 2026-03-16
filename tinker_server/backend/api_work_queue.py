@@ -995,8 +995,13 @@ def _get_or_create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
     if resources is not None:
         options["resources"] = resources
 
@@ -1026,10 +1031,8 @@ class ApiWorkQueueClient:
         if not ray.is_initialized():
             try:
                 from ..ray_utils import init_ray
-                from .future_store import _infer_ray_address  # type: ignore
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
 

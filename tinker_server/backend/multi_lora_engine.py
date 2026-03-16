@@ -165,7 +165,6 @@ class MultiLoRAInferenceEngine:
             if not ray.is_initialized():
                 # Use fixed namespace so detached actors can be found across process restarts
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -287,7 +286,7 @@ class MultiLoRAInferenceEngine:
                 )
 
             from verl.workers.config.model import HFModelConfig
-            from verl.workers.config.rollout import RolloutConfig
+            from verl.workers.config.rollout import CheckpointEngineConfig, RolloutConfig
             from verl.workers.rollout.replica import RolloutMode
 
             from .verl_inference import _create_extended_server_class
@@ -379,6 +378,7 @@ class MultiLoRAInferenceEngine:
                 data_parallel_size=1,
                 expert_parallel_size=1,
                 engine_kwargs=engine_kwargs,
+                checkpoint_engine=CheckpointEngineConfig(backend="naive"),
                 quantization=self.quantization,
                 enable_rollout_routing_replay=enable_rollout_routing_replay,
             )
@@ -404,13 +404,17 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ..config import otel_env_vars
-            env_vars = {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            env_vars = actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
+                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 **otel_env_vars(),
-            }
+                },
+            )
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
@@ -451,19 +455,20 @@ class MultiLoRAInferenceEngine:
                     self.actor_name,
                 )
 
+            remote_kwargs = {
+                "config": rollout_config,
+                "model_config": model_config,
+                "rollout_mode": RolloutMode.STANDALONE,
+                "workers": [],
+                "replica_rank": 0,
+                "node_rank": 0,
+                "gpus_per_node": total_gpus,
+                "nnodes": 1,
+                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
+            }
             self.server = ExtendedVLLMHttpServer.options(
                 **actor_options,
-            ).remote(
-                config=rollout_config,
-                model_config=model_config,
-                rollout_mode=RolloutMode.STANDALONE,
-                workers=[],
-                replica_rank=0,
-                node_rank=0,
-                gpus_per_node=total_gpus,
-                nnodes=1,
-                cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
-            )
+            ).remote(**remote_kwargs)
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
             # This allows the server to remain responsive during vLLM initialization.
@@ -917,11 +922,23 @@ class MultiLoRAInferenceEngine:
             )
 
         raw = await ray_get_with_resource_pool_keepalive(ref, actor_name=self.actor_name)
+        logger.info(
+            "[generate_many result] req=%s actor=%s type=%s",
+            request_id,
+            self.actor_name,
+            type(raw).__name__,
+        )
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
         else:
             raw_list = list(raw)
+        logger.info(
+            "[generate_many result] req=%s actor=%s result_count=%d",
+            request_id,
+            self.actor_name,
+            len(raw_list),
+        )
 
         if raw_list:
             timing_total_s = raw_list[0].get("_timing_total_s")
@@ -1570,7 +1587,6 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -1662,7 +1678,6 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

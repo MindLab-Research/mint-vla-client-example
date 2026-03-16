@@ -35,17 +35,18 @@ def main() -> int:
 
     calls = _install_ray_stub()
 
+    os.environ["RAY_ADDRESS"] = "192.168.37.185:6379"
     os.environ.pop("MINT_RAY_LOG_TO_DRIVER", None)
-    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+    init_ray(namespace="ns", ignore_reinit_error=True)
     if calls[-1].get("log_to_driver") is not False:
         return _fail(f"log_to_driver expected False when disabled: {calls[-1]!r}")
 
     os.environ["MINT_RAY_LOG_TO_DRIVER"] = "1"
-    init_ray(address="auto", namespace="ns", ignore_reinit_error=True)
+    init_ray(namespace="ns", ignore_reinit_error=True)
     if calls[-1].get("log_to_driver") is not True:
         return _fail(f"log_to_driver not forwarded when enabled: {calls[-1]!r}")
 
-    init_ray(address="auto", namespace="ns", ignore_reinit_error=True, log_to_driver=False)
+    init_ray(address="127.0.0.1:6379", namespace="ns", ignore_reinit_error=True, log_to_driver=False)
     if calls[-1].get("log_to_driver") is not False:
         return _fail(f"explicit log_to_driver override not respected: {calls[-1]!r}")
 

@@ -6,13 +6,23 @@ import os
 import secrets
 from dataclasses import dataclass
 
+from .runtime_env import (
+    DEFAULT_HF_MODULES_PATH,
+    build_runtime_pythonpath,
+    env_nonempty as _runtime_env_nonempty,
+)
+
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
-    v = environ.get(name)
-    if v is None:
-        return None
-    v = str(v).strip()
-    return v or None
+    return _runtime_env_nonempty(environ, name)
+
+
+def _resolve_env_or_config(name: str, env_value: str | None, file_value: str | None) -> str:
+    if env_value and file_value and env_value != file_value:
+        raise RuntimeError(
+            f"{name} mismatch between environment and config file: env={env_value!r} config={file_value!r}"
+        )
+    return env_value or file_value or ""
 
 
 def _parse_bool(s: str) -> bool:
@@ -42,6 +52,11 @@ _CONFIG_PATH, _CONFIG_FILE = _load_config_file_for_process(os.environ)
 # `TINKER_RAY_NAMESPACE` but accept the alias as a fallback.
 _env_ray_ns = _env_nonempty(os.environ, "TINKER_RAY_NAMESPACE") or _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
 _file_ray_ns = _CONFIG_FILE.ray.namespace if _CONFIG_FILE is not None else None
+if _env_ray_ns and _file_ray_ns and _env_ray_ns != _file_ray_ns:
+    raise RuntimeError(
+        "Ray namespace mismatch between environment and config file: "
+        f"env={_env_ray_ns!r} config={_file_ray_ns!r}"
+    )
 RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 
 # PFS paths for Ray worker runtime_env
@@ -55,59 +70,22 @@ RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 # Historical default hard-coded `/vePFS-Mindverse/share/code/tinker-server-auth`, which breaks
 # non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
 # to a non-existent code directory.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _file_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
-PFS_TINKER_PATH = _env_nonempty(os.environ, "PFS_TINKER_PATH") or _file_pfs_tinker_path or _REPO_ROOT
-
-# PFS verl path with _mutable_fields patch for LoRA config assignment
-_file_pfs_verl_path = _CONFIG_FILE.paths.pfs_verl_path if _CONFIG_FILE is not None else None
-PFS_VERL_PATH = _env_nonempty(os.environ, "PFS_VERL_PATH") or _file_pfs_verl_path or "/vePFS-Mindverse/share/code/verl"
-
-# PFS vLLM 0.13.0 with raw logits dump instrumentation
-_file_pfs_vllm_path = _CONFIG_FILE.paths.pfs_vllm_path if _CONFIG_FILE is not None else None
-PFS_VLLM_PATH = (
-    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or ""
+PFS_TINKER_PATH = _resolve_env_or_config(
+    "PFS_TINKER_PATH",
+    _env_nonempty(os.environ, "PFS_TINKER_PATH"),
+    _file_pfs_tinker_path,
 )
 
-# Some deployments rely on the in-image vLLM wheel (with compiled `vllm._C`).
-# Avoid shadowing it with an incomplete CPFS checkout that lacks the extension module.
-def _pfs_vllm_path_is_usable(path: str) -> bool:
-    if not path or not os.path.isdir(path):
-        return False
-    import glob
-
-    return bool(glob.glob(os.path.join(path, "vllm", "_C*.so")))
-
-PFS_VLLM_PATH_EFFECTIVE = PFS_VLLM_PATH if _pfs_vllm_path_is_usable(PFS_VLLM_PATH) else ""
-
-# PFS megatron-bridge path for MoE LoRA ETP fix (PR #1380)
-# Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-_file_pfs_megatron_bridge_path = _CONFIG_FILE.paths.pfs_megatron_bridge_path if _CONFIG_FILE is not None else None
-PFS_MEGATRON_BRIDGE_PATH = (
-    _env_nonempty(os.environ, "PFS_MEGATRON_BRIDGE_PATH")
-    or _file_pfs_megatron_bridge_path
-    or "/vePFS-Mindverse/share/code/megatron-bridge/src"
-)
-
-# HollowMan fork with export_adapter_weights API for LoRA export
-# Clone from: https://github.com/HollowMan6/Megatron-Bridge.git branch merged
-_file_pfs_megatron_bridge_hollowman_path = (
-    _CONFIG_FILE.paths.pfs_megatron_bridge_hollowman_path if _CONFIG_FILE is not None else None
-)
-PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = (
-    _env_nonempty(os.environ, "PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH")
-    or _file_pfs_megatron_bridge_hollowman_path
-    or "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
-)
-
-# Toggle to use HollowMan fork of Megatron-Bridge (affects training forward pass)
-# Default: true - HollowMan fork fixes train-inference KL divergence (verified 2026-01-07)
-_file_use_hollowman = _CONFIG_FILE.megatron_bridge.use_hollowman_mbridge if _CONFIG_FILE is not None else None
-_env_use_hollowman = _env_nonempty(os.environ, "USE_HOLLOWMAN_MBRIDGE")
-USE_HOLLOWMAN_MBRIDGE = (
-    _parse_bool(_env_use_hollowman)
-    if _env_use_hollowman is not None
-    else (bool(_file_use_hollowman) if _file_use_hollowman is not None else True)
+# Canonical runtime env root. This contains:
+# - `site-packages/` for shared pure-Python runtime deps
+# - `src/Megatron-Bridge`, `src/verl`, `src/Megatron-LM` pinned source trees
+# - `host-venv/bin/python` as the thin host interpreter for API-server startup
+_file_pfs_runtime_env_root = _CONFIG_FILE.paths.pfs_runtime_env_root if _CONFIG_FILE is not None else None
+PFS_RUNTIME_ENV_ROOT = _resolve_env_or_config(
+    "PFS_RUNTIME_ENV_ROOT",
+    _env_nonempty(os.environ, "PFS_RUNTIME_ENV_ROOT"),
+    _file_pfs_runtime_env_root,
 )
 
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
@@ -122,37 +100,31 @@ USE_MBRIDGE_LORA_EXPORT = (
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
 _file_pfs_hf_modules_path = _CONFIG_FILE.paths.pfs_hf_modules_path if _CONFIG_FILE is not None else None
-PFS_HF_MODULES_PATH = (
-    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or "/vePFS-Mindverse/share/huggingface/modules"
+PFS_HF_MODULES_PATH = _resolve_env_or_config(
+    "PFS_HF_MODULES_PATH",
+    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH"),
+    _file_pfs_hf_modules_path,
 )
 
-# PYTHONPATH for Ray actors - vLLM first (for instrumentation), then megatron-bridge, verl, tinker-server, HF modules
-# USE_HOLLOWMAN_MBRIDGE controls which megatron-bridge version is used
-def _join_pythonpath(*paths: str) -> str:
-    return ":".join([p for p in paths if p])
+def ensure_runtime_env_configured() -> str:
+    if not PFS_RUNTIME_ENV_ROOT:
+        raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
+    if not PFS_TINKER_PATH:
+        raise RuntimeError("PFS_TINKER_PATH must be set")
+    if not PFS_HF_MODULES_PATH:
+        raise RuntimeError("PFS_HF_MODULES_PATH must be set")
+    return PFS_RUNTIME_ENV_ROOT
 
-PFS_EXTRA_PYTHONPATH = os.environ.get("PFS_EXTRA_PYTHONPATH", "").strip()
-if not PFS_EXTRA_PYTHONPATH and _CONFIG_FILE is not None and _CONFIG_FILE.paths.pfs_extra_pythonpath:
-    PFS_EXTRA_PYTHONPATH = str(_CONFIG_FILE.paths.pfs_extra_pythonpath).strip()
 
-if USE_HOLLOWMAN_MBRIDGE:
-    PFS_PYTHONPATH = _join_pythonpath(
-        PFS_EXTRA_PYTHONPATH,
-        PFS_VLLM_PATH_EFFECTIVE,
-        PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH,
-        PFS_VERL_PATH,
-        PFS_TINKER_PATH,
-        PFS_HF_MODULES_PATH,
+PFS_PYTHONPATH = (
+    build_runtime_pythonpath(
+        env_root=PFS_RUNTIME_ENV_ROOT,
+        pfs_tinker_path=PFS_TINKER_PATH,
+        pfs_hf_modules_path=PFS_HF_MODULES_PATH,
     )
-else:
-    PFS_PYTHONPATH = _join_pythonpath(
-        PFS_EXTRA_PYTHONPATH,
-        PFS_VLLM_PATH_EFFECTIVE,
-        PFS_MEGATRON_BRIDGE_PATH,
-        PFS_VERL_PATH,
-        PFS_TINKER_PATH,
-        PFS_HF_MODULES_PATH,
-    )
+    if PFS_RUNTIME_ENV_ROOT and PFS_TINKER_PATH and PFS_HF_MODULES_PATH
+    else ""
+)
 
 # OTEL env vars forwarded into Ray actors so actor-side logging/tracing
 # can use the same collector/auth as the API server process.
@@ -181,6 +153,43 @@ def otel_env_vars() -> dict[str, str]:
     if app_key is not None:
         out["MINT_APMPLUS_APP_KEY"] = app_key
     return out
+
+
+def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    ensure_runtime_env_configured()
+    out = {
+        "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
+        "PFS_TINKER_PATH": PFS_TINKER_PATH,
+        "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
+        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
+        "PYTHONPATH": pythonpath,
+    }
+    config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
+    if config_path is not None:
+        out["TINKER_CONFIG_PATH"] = config_path
+    if extra:
+        out.update(extra)
+    return out
+
+
+def actor_ld_library_path() -> str:
+    """Return the library path Ray actors should use on GPU workers.
+
+    Do not inherit the API host's LD_LIBRARY_PATH by default. The host may be a
+    CPU-only bootstrap environment with incompatible torch libs.
+    """
+    override = _env_nonempty(os.environ, "TINKER_ACTOR_LD_LIBRARY_PATH")
+    if override is not None:
+        return override
+    return ":".join(
+        [
+            "/usr/local/lib/python3.12/dist-packages/torch/lib",
+            "/usr/local/cuda/compat/lib",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64",
+            "/usr/local/cuda/lib64",
+        ]
+    )
 
 # When false (default), reject requests for base_model not in list_supported_models().
 ALLOW_UNSUPPORTED_MODELS = _parse_bool(_env_nonempty(os.environ, "ALLOW_UNSUPPORTED_MODELS") or "false")
@@ -460,6 +469,11 @@ class ServerConfig:
                 "TINKER_SAMPLE_COALESCE",
                 file_sampling.sample_coalesce if file_sampling is not None else None,
                 True,
+            ),
+            sampling_sample_coalesce_window_ms=_pick_float(
+                "TINKER_SAMPLE_COALESCE_WINDOW_MS",
+                file_sampling.sample_coalesce_window_ms if file_sampling is not None else None,
+                50.0,
             ),
             sampling_sample_coalesce_max_batch=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_BATCH",

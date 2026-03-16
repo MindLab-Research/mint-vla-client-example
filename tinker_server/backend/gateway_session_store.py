@@ -14,11 +14,15 @@ from ..config import otel_env_vars
 
 
 def _ray_namespace() -> str:
-    return (
-        os.environ.get("TINKER_RAY_NAMESPACE")
-        or os.environ.get("MINT_RAY_NAMESPACE")
-        or "tinker"
-    )
+    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    if env_ns:
+        return env_ns
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "tinker"
 
 
 def _actor_name() -> str:
@@ -74,8 +78,13 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
 
     try:
         return _GatewaySessionStoreActor.options(
@@ -101,29 +110,7 @@ def _ensure_ray_initialized() -> None:
     try:
         from tinker_server.ray_utils import init_ray
 
-        addr = (os.environ.get("RAY_ADDRESS") or "").strip()
-        if not addr:
-            # Volcano head writes the canonical GCS IP to PFS.
-            candidates: list[str] = []
-            pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
-            if pfs_tinker_path:
-                candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
-            candidates.extend(
-                [
-                    "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
-                    "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
-                ]
-            )
-            for p in candidates:
-                try:
-                    ip = open(p, "r", encoding="utf-8").read().strip()
-                except OSError:
-                    continue
-                if ip:
-                    addr = f"{ip}:6379"
-                    break
-
-        init_ray(address=addr or "auto")
+        init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Ray for gateway session store: {type(e).__name__}: {e}") from e
     if not ray.is_initialized():

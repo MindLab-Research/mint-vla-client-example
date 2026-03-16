@@ -1528,7 +1528,6 @@ class VerlTrainingEngine:
         if not ray.is_initialized():
             # Use fixed namespace for persistent vLLM actor support
             init_ray(
-                address="auto",
                 namespace=RAY_NAMESPACE,
                 ignore_reinit_error=True,
             )

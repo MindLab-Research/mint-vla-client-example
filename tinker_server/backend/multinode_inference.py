@@ -40,7 +40,7 @@ def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
     }
 
 # Import centralized PFS paths from config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -905,7 +905,6 @@ def _create_multinode_vllm_actor(
 
             return {
                 "pythonpath": os.environ.get("PYTHONPATH", ""),
-                "pfs_vllm_path": os.environ.get("PFS_VLLM_PATH", ""),
                 "mint_enable_vllm_import_patches": os.environ.get(
                     "MINT_ENABLE_VLLM_IMPORT_PATCHES"
                 ),
@@ -1760,7 +1759,6 @@ class MultiNodeInferenceEngine:
 
             if not ray.is_initialized():
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -2104,9 +2102,12 @@ class MultiNodeInferenceEngine:
                         required_gpus=int(worker_gpus),
                     )
 
-            from ..config import otel_env_vars
-            env_vars = {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            from ..config import actor_ld_library_path, otel_env_vars
+            env_vars = actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
+                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -2127,7 +2128,8 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
                 "VLLM_DISABLE_PYNCCL": "1",
                 **otel_env_vars(),
-            }
+                },
+            )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
