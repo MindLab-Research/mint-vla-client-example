@@ -1296,6 +1296,43 @@ class MultiModelInferenceManager:
                 self._locks[model_name] = lock
             return lock
 
+    async def _named_single_node_actor_is_reusable(self, actor_name: str) -> bool:
+        """Return True only when the detached actor is usable for immediate reuse."""
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+        except ValueError:
+            return False
+        except ray.exceptions.RayActorError:
+            return False
+
+        try:
+            await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
+            engine_ready = await asyncio.to_thread(ray.get, actor.is_engine_ready.remote(), timeout=10)
+            return bool(engine_ready)
+        except SystemExit as e:
+            if getattr(e, "code", None) == 15:
+                raise
+            logger.warning(
+                "named actor probe hit SystemExit actor=%s err=%s; treating as non-reusable",
+                actor_name,
+                e,
+            )
+            return False
+        except ray.exceptions.GetTimeoutError:
+            # Busy actors still occupy the pinned node and should be reused rather than
+            # tripping a false capacity failure before initialize() reconnects to them.
+            logger.info(
+                "named actor probe timed out actor=%s; treating existing actor as reusable",
+                actor_name,
+            )
+            return True
+        except ray.exceptions.RayActorError:
+            logger.warning(
+                "named actor probe found stale/dead actor=%s; will run capacity check before recreate",
+                actor_name,
+            )
+            return False
+
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
 
@@ -1326,12 +1363,14 @@ class MultiModelInferenceManager:
                         # sessions before they even reach `after_get_engine`. Use the detached
                         # actor name lookup instead: it is cheap, avoids queuing on the actor,
                         # and still lets us drop dead cached handles before reuse.
-                        from .multinode_inference import PERSISTENT_NAMESPACE
+                        from .multinode_inference import (
+                            PERSISTENT_NAMESPACE as MULTINODE_PERSISTENT_NAMESPACE,
+                        )
 
                         actor_name = getattr(engine, "actor_name", None)
                         if actor_name:
                             try:
-                                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                                ray.get_actor(actor_name, namespace=MULTINODE_PERSISTENT_NAMESPACE)
                             except (ValueError, ray.exceptions.RayActorError):
                                 logger.warning(
                                     "Cached multi-node vLLM engine for %s has no live named actor, recreating",
@@ -1384,6 +1423,30 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            existing_named_actor = False
+            try:
+                if not ray.is_initialized():
+                    init_ray(
+                        address="auto",
+                        namespace=PERSISTENT_NAMESPACE,
+                        ignore_reinit_error=True,
+                    )
+                existing_named_actor = await self._named_single_node_actor_is_reusable(actor_name)
+                if existing_named_actor:
+                    logger.info(
+                        "get_engine model=%s stage=existing_named_actor_found actor=%s namespace=%s",
+                        model_name,
+                        actor_name,
+                        PERSISTENT_NAMESPACE,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "get_engine model=%s stage=existing_named_actor_probe_failed actor=%s err=%s",
+                    model_name,
+                    actor_name,
+                    e,
+                )
+
             pinned_node_ip: str | None = None
             pinned_json = _read_process_env_var("MINT_VLLM_PINNED_NODE_IP_JSON")
             raw_node_ips = _read_process_env_var("MINT_MODEL_NODE_IPS_JSON")
@@ -1426,7 +1489,14 @@ class MultiModelInferenceManager:
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
             total_gpus = int(config.inference_tp) * int(config.inference_dp)
-            if pinned_node_ip is not None:
+            if pinned_node_ip is not None and existing_named_actor:
+                logger.info(
+                    "get_engine model=%s stage=skip_capacity_check_existing_named_actor actor=%s pinned_node_ip=%s",
+                    model_name,
+                    actor_name,
+                    pinned_node_ip,
+                )
+            elif pinned_node_ip is not None:
                 assert_node_ip_capacity(
                     required_gpus_by_node_ip={pinned_node_ip: total_gpus},
                     context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
