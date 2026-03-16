@@ -192,8 +192,13 @@ def _get_or_create_ray_actor():
         "get_if_exists": True,
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
     return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
         **options
     ).remote(queue_bytes_budget=queue_bytes_budget)

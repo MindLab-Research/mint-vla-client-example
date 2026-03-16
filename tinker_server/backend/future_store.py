@@ -71,8 +71,8 @@ def _ray_future_tombstone_ttl_s() -> float:
 def _infer_ray_address() -> str | None:
     """Infer Ray GCS address for remote clusters.
 
-    Prefer explicit RAY_ADDRESS. Fall back to ray_head_ip.txt on shared storage
-    (Volcano writes the canonical head IP there).
+    Prefer explicit RAY_ADDRESS. Otherwise only trust the `ray_head_ip.txt`
+    colocated with `PFS_TINKER_PATH`.
     """
     addr = (os.environ.get("RAY_ADDRESS") or "").strip()
     if addr:
@@ -82,15 +82,6 @@ def _infer_ray_address() -> str | None:
     pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
     if pfs_tinker_path:
         candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
-    candidates.extend(
-        [
-            # Common prod/dev code roots on PFS
-            "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
-            "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
-            # Local repo fallback (useful for workstation tunnels)
-            os.path.join(os.getcwd(), "ray_head_ip.txt"),
-        ]
-    )
 
     for p in candidates:
         try:
@@ -533,8 +524,13 @@ def _get_or_create_ray_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
 
     try:
         return _RayFutureStoreActor.options(

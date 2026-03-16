@@ -74,29 +74,39 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 
 ## Python And PYTHONPATH Invariants
 
-For mint-dev API-host work, use the Python 3.12 venv:
+For mint-dev operator work, use the canonical runtime-env host interpreter:
 
 ```bash
-/root/venv_k2_py31213/bin/python
+/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python
+```
+
+The canonical runtime root also provides a matching Ray CLI wrapper:
+
+```bash
+/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray --version
 ```
 
 Do not use system Python for Ray inspection, actor probes, or server startup.
-The dev Ray cluster is running Python 3.12, and host-side `ray.init(...)` with
-Python 3.10 will fail with version mismatch and waste time on fake errors.
+The dev Ray cluster is running Python 3.12.13, and host-side `ray.init(...)`
+with the wrong interpreter will fail with version mismatch or import-path
+errors.
 
-For API-server startup, use the full PFS Python path on the host:
+For API-server startup, prefer a built runtime-env root plus its host interpreter:
 
 ```bash
-export PYTHONPATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/$USER/tinker-server:/vePFS-Mindverse/share/huggingface/modules:/root/tinker_project/tinker-server
+python scripts/build_runtime_env.py --env-root /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213
+export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py
 ```
 
 Reason:
-- actor `runtime_env` already gets full PFS `PYTHONPATH`
-- `verl_http` imports also happen on the API host before actor launch
-- repo-root-only `PYTHONPATH` creates fake import failures
+- actor `runtime_env` and API-host bootstrap now share the same canonical dependency root
+- `scripts/run_server.py` bootstraps `PYTHONPATH` from `PFS_RUNTIME_ENV_ROOT`
+- repo-root-only startup still creates fake import failures
 
 Do not pip-install packages until you have first verified that the API-host
-`PYTHONPATH` matches the intended PFS environment.
+runtime env root matches the intended PFS environment.
 
 ## Placement Group Hygiene Is Mandatory
 
@@ -115,10 +125,14 @@ Hard rule:
 Exact check pattern:
 
 ```bash
-ssh mint-dev '/root/venv_k2_py31213/bin/python - <<'\''PY'\'''
-import ray, json
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
+import json
+import os
+from pathlib import Path
+import ray
 from ray.util.placement_group import placement_group_table
-ray.init(address="192.168.37.134:6379", ignore_reinit_error=True)
+head_ip = Path(f"/vePFS-Mindverse/share/code/{os.environ['USER']}/tinker-server/ray_head_ip.txt").read_text().strip()
+ray.init(address=f"{head_ip}:6379", ignore_reinit_error=True)
 rows = []
 for pgid, info in placement_group_table().items():
     if info.get("state") != "REMOVED":
@@ -296,13 +310,13 @@ export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 
 ```bash
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/vePFS-Mindverse/share/code/vllm-0.16.0-pkg:/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src:/vePFS-Mindverse/share/code/verl:/vePFS-Mindverse/share/code/$USER/tinker-server:/vePFS-Mindverse/share/huggingface/modules:/root/tinker_project/tinker-server \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213 \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   /root/venv_k2_py31213/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Stop Server

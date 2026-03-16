@@ -1,12 +1,14 @@
-# Frozen package set for the mint-dev driver venv:
+# Frozen package set for the legacy mint-dev operator venv:
 # - Host: mint-dev
 # - Venv: /root/venv_k2_py31213
 # - Python: 3.12.13
 #
 # Captured: 2026-03-04
 #
-# This file is meant to be a reproducible reference and for audit/debugging.
-# If you want a short list of top-level deps, use:
+# This file is an audit/debugging artifact for the legacy operator venv.
+# The canonical shared runtime env now comes from `pyproject.toml` plus
+# `scripts/build_runtime_env.py`.
+# If you want a short list of top-level deps for the operator venv, use:
 #   requirements/api_server_driver_py31213.requirements.in
 
 accelerate==1.12.0

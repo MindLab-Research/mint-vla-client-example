@@ -122,31 +122,9 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: --no-deps "omegacon
 RUN python -m pip install --no-cache-dir --no-build-isolation "antlr4-python3-runtime==4.9.3"
 RUN python -c "import antlr4; print('antlr4:', antlr4.__file__); import omegaconf; print('omegaconf:', omegaconf.__version__)"
 
-# Megatron-LM + Megatron-Bridge + verl: clone from pinned commits (no local modifications).
-ARG MEGATRON_LM_REPO=https://github.com/NVIDIA/Megatron-LM.git
-ARG MEGATRON_LM_COMMIT=0810e6390280672f9c87c388ce4f559571d54365
-ARG MEGATRON_BRIDGE_REPO=https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-ARG MEGATRON_BRIDGE_COMMIT=0034ddaad7fae7c658c3df7e12d13522a4935770
-ARG VERL_REPO=https://github.com/verl-project/verl.git
-# Sync to the same git commit as `/vePFS-Mindverse/share/code/leixiang/verl` on Volcano.
-ARG VERL_COMMIT=9433f8a8f2771256ea4f8f94e4401bcfe9703228
-RUN set -euo pipefail \
-  && mkdir -p /workspace \
-  && git init /workspace/Megatron-LM \
-  && git -C /workspace/Megatron-LM remote add origin "${MEGATRON_LM_REPO}" \
-  && git -C /workspace/Megatron-LM fetch --depth=1 origin "${MEGATRON_LM_COMMIT}" \
-  && git -C /workspace/Megatron-LM checkout --detach FETCH_HEAD \
-  && git init /workspace/Megatron-Bridge \
-  && git -C /workspace/Megatron-Bridge remote add origin "${MEGATRON_BRIDGE_REPO}" \
-  && git -C /workspace/Megatron-Bridge fetch --depth=1 origin "${MEGATRON_BRIDGE_COMMIT}" \
-  && git -C /workspace/Megatron-Bridge checkout --detach FETCH_HEAD \
-  && git init /workspace/verl \
-  && git -C /workspace/verl remote add origin "${VERL_REPO}" \
-  && git -C /workspace/verl fetch --depth=1 origin "${VERL_COMMIT}" \
-  && git -C /workspace/verl checkout --detach FETCH_HEAD
-
-ENV PYTHONPATH="/workspace/Megatron-LM:/workspace/Megatron-Bridge/src:/workspace/Megatron-Bridge:/workspace/verl:${PYTHONPATH}"
-RUN python -c "import verl; print('verl:', verl.__file__)"
+# Do not bake mutable source trees into the image. The supported runtime contract
+# is: image owns ABI-bound packages, while `PFS_RUNTIME_ENV_ROOT` owns pinned
+# source trees (`Megatron-LM`, `Megatron-Bridge`, `verl`) plus shared Python deps.
 
 # Default command is intentionally minimal; Ray task YAMLs and server ops override this.
 RUN python -c "import onnxscript, modelopt; print('onnxscript', getattr(onnxscript, '__version__', 'unknown')); print('modelopt', getattr(modelopt, '__version__', 'unknown'))"

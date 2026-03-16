@@ -74,8 +74,13 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
 
     try:
         return _GatewaySessionStoreActor.options(
@@ -103,17 +108,10 @@ def _ensure_ray_initialized() -> None:
 
         addr = (os.environ.get("RAY_ADDRESS") or "").strip()
         if not addr:
-            # Volcano head writes the canonical GCS IP to PFS.
             candidates: list[str] = []
             pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
             if pfs_tinker_path:
                 candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
-            candidates.extend(
-                [
-                    "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
-                    "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
-                ]
-            )
             for p in candidates:
                 try:
                     ip = open(p, "r", encoding="utf-8").read().strip()

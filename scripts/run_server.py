@@ -30,6 +30,48 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from tinker_server.runtime_env import bootstrap_runtime_pythonpath
+
+
+def _prepend_pythonpath(entries: str) -> None:
+    if not entries:
+        return
+    parts = [part for part in entries.split(":") if part]
+    for part in reversed(parts):
+        if part not in sys.path:
+            sys.path.insert(0, part)
+    existing = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = entries if not existing else f"{entries}:{existing}"
+
+
+def _sanitize_torch_ld_library_path() -> None:
+    venv_root = pathlib.Path(sys.executable).resolve().parents[1]
+    torch_lib = (
+        venv_root
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / "torch"
+        / "lib"
+    )
+    existing = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]
+    cleaned = [part for part in existing if "dist-packages/torch/lib" not in part]
+    if torch_lib.is_dir():
+        cleaned = [str(torch_lib), *cleaned]
+    if cleaned:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(cleaned)
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+
+
+_prepend_pythonpath(
+    bootstrap_runtime_pythonpath(
+        os.environ,
+        repo_root=str(_REPO_ROOT),
+    )
+)
+_sanitize_torch_ld_library_path()
+
 
 def crash_handler(exc_type, exc_value, exc_tb):
     """Log uncaught exceptions before crash."""

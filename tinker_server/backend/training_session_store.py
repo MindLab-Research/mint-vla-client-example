@@ -76,8 +76,13 @@ def _get_or_create_actor():
         "lifetime": "detached",
     }
     actor_otel_env = otel_env_vars()
-    if actor_otel_env:
-        options["runtime_env"] = {"env_vars": actor_otel_env}
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
 
     try:
         return _TrainingSessionStoreActor.options(
