@@ -256,6 +256,41 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
     cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
 
 
+def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
+    """Prevent vLLM Ray executor from silently starting a local Ray head.
+
+    In our server, multinode vLLM actors already run inside a managed Ray
+    cluster. If vLLM initializes its Ray executor with no address, Ray starts a
+    standalone local head inside EngineCore, which hides the real failure behind
+    a nested cluster. Fail closed unless `RAY_ADDRESS` is explicitly available.
+    """
+
+    import vllm.v1.executor.ray_executor as ray_exec_mod
+    import vllm.v1.executor.ray_utils as ray_utils_mod
+
+    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
+    if original is None:
+        raise RuntimeError("vLLM missing initialize_ray_cluster")
+    if getattr(original, "_tinker_patched_explicit_cluster_address", False):
+        return
+
+    def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
+        addr = ray_address
+        if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
+            env_addr = os.environ.get("RAY_ADDRESS", "").strip()
+            if not env_addr:
+                raise RuntimeError(
+                    "vLLM RayDistributedExecutor requires explicit RAY_ADDRESS; "
+                    "refusing to start nested local Ray inside EngineCore"
+                )
+            addr = env_addr
+        return original(parallel_config, ray_address=addr)
+
+    initialize_ray_cluster._tinker_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
+    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    ray_exec_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+
+
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
     """Avoid expensive dummy-LoRA warmup during profiling runs.
 
@@ -1680,6 +1715,7 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_worker_lora_load_to_device()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
+    _patch_vllm_ray_executor_use_explicit_cluster_address()
     _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
     _patch_vllm_gpu_worker_kv_debug_info()
     # Keep worker/runtime LoRA fixes, but do not alter vLLM's native startup

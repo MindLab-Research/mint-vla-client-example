@@ -175,6 +175,22 @@ def _raise_serializable_vllm_engine_error(
     _raise_serializable_vllm_error(where=where, request_id=request_id, extra=extra)
 
 
+def _is_request_validation_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in (
+            "vllm_prompt_logprobs_add_request_failed",
+            "vllm_generate_add_request_failed",
+            "Prompt+max_tokens length",
+            "exceeds max_model_len",
+            "maximum model length",
+            "Prompt length (",
+            "model context limit",
+        )
+    )
+
+
 @dataclass
 class MultiNodeLoRASlot:
     """Metadata for a loaded LoRA adapter in multi-node engine."""
@@ -2598,7 +2614,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed generate actor=%s request_id=%s sampling_session_id=%s prompt_len=%s max_tokens=%s",
                 self.actor_name,
@@ -2685,7 +2703,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed generate_many actor=%s request_id=%s sampling_session_id=%s prompt_len=%s num_samples=%s max_tokens=%s",
                 self.actor_name,
@@ -2758,7 +2778,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed compute_logprobs actor=%s request_id=%s sampling_session_id=%s prompt_len=%s",
                 self.actor_name,
