@@ -1252,6 +1252,43 @@ class MultiModelInferenceManager:
                 self._locks[model_name] = lock
             return lock
 
+    async def _named_single_node_actor_is_reusable(self, actor_name: str) -> bool:
+        """Return True only when the detached actor is usable for immediate reuse."""
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+        except ValueError:
+            return False
+        except ray.exceptions.RayActorError:
+            return False
+
+        try:
+            await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
+            engine_ready = await asyncio.to_thread(ray.get, actor.is_engine_ready.remote(), timeout=10)
+            return bool(engine_ready)
+        except SystemExit as e:
+            if getattr(e, "code", None) == 15:
+                raise
+            logger.warning(
+                "named actor probe hit SystemExit actor=%s err=%s; treating as non-reusable",
+                actor_name,
+                e,
+            )
+            return False
+        except ray.exceptions.GetTimeoutError:
+            # Busy actors still occupy the pinned node and should be reused rather than
+            # tripping a false capacity failure before initialize() reconnects to them.
+            logger.info(
+                "named actor probe timed out actor=%s; treating existing actor as reusable",
+                actor_name,
+            )
+            return True
+        except ray.exceptions.RayActorError:
+            logger.warning(
+                "named actor probe found stale/dead actor=%s; will run capacity check before recreate",
+                actor_name,
+            )
+            return False
+
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
 
@@ -1350,18 +1387,14 @@ class MultiModelInferenceManager:
                         namespace=PERSISTENT_NAMESPACE,
                         ignore_reinit_error=True,
                     )
-                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-                existing_named_actor = True
-                logger.info(
-                    "get_engine model=%s stage=existing_named_actor_found actor=%s namespace=%s",
-                    model_name,
-                    actor_name,
-                    PERSISTENT_NAMESPACE,
-                )
-            except ValueError:
-                existing_named_actor = False
-            except ray.exceptions.RayActorError:
-                existing_named_actor = False
+                existing_named_actor = await self._named_single_node_actor_is_reusable(actor_name)
+                if existing_named_actor:
+                    logger.info(
+                        "get_engine model=%s stage=existing_named_actor_found actor=%s namespace=%s",
+                        model_name,
+                        actor_name,
+                        PERSISTENT_NAMESPACE,
+                    )
             except Exception as e:
                 logger.debug(
                     "get_engine model=%s stage=existing_named_actor_probe_failed actor=%s err=%s",

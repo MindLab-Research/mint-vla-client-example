@@ -203,10 +203,18 @@ async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypat
     _install_fake_ray(monkeypatch)
     from tinker_server.backend import multi_lora_engine as mle
 
-    actor_handle = object()
+    actor_handle = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+        is_engine_ready=SimpleNamespace(remote=lambda: "engine-ready-ref"),
+    )
 
     monkeypatch.setattr(mle.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle)
+    monkeypatch.setattr(
+        mle.ray,
+        "get",
+        lambda ref, *args, **kwargs: True if ref == "engine-ready-ref" else None,
+    )
     monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4")
     monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"])
 
@@ -225,3 +233,34 @@ async def test_get_engine_skips_capacity_check_when_named_actor_exists(monkeypat
     engine = await manager.get_engine("Qwen/Qwen3-0.6B")
 
     assert engine.server is actor_handle
+
+
+@pytest.mark.anyio
+async def test_get_engine_checks_capacity_when_named_actor_probe_fails(monkeypatch) -> None:
+    _install_fake_ray(monkeypatch)
+    from tinker_server.backend import multi_lora_engine as mle
+
+    actor_handle = SimpleNamespace(
+        __ray_ready__=SimpleNamespace(remote=lambda: "ready-ref"),
+        is_engine_ready=SimpleNamespace(remote=lambda: "engine-ready-ref"),
+    )
+
+    monkeypatch.setattr(mle.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(mle.ray, "get_actor", lambda *args, **kwargs: actor_handle)
+
+    def _stale_actor_get(ref, *args, **kwargs):
+        raise mle.ray.exceptions.RayActorError(f"stale actor during probe: {ref}")
+
+    monkeypatch.setattr(mle.ray, "get", _stale_actor_get)
+    monkeypatch.setattr(mle, "parse_model_single_node_ip", lambda **_kwargs: "192.168.38.4")
+    monkeypatch.setattr(mle, "parse_model_node_ip_list", lambda **_kwargs: ["192.168.38.4"])
+
+    def _capacity_check(**_kwargs):
+        raise RuntimeError("capacity check ran")
+
+    monkeypatch.setattr(mle, "assert_node_ip_capacity", _capacity_check)
+
+    manager = mle.MultiModelInferenceManager()
+
+    with pytest.raises(RuntimeError, match="capacity check ran"):
+        await manager.get_engine("Qwen/Qwen3-0.6B")

@@ -75,37 +75,32 @@ def get_actor_placements() -> dict[str, list[dict]]:
 
         # Try to find which node this actor is on
         try:
-            actor_handle = ray.get_actor(actor_name, namespace=actor_ns)
+            ray.get_actor(actor_name, namespace=actor_ns)
             pg_name = f"{actor_name}_pg"
 
             try:
                 pg = ray.util.get_placement_group(pg_name)
                 pg_info = ray.util.placement_group_table(pg)
-                bundles_to_node = pg_info.get("bundles_to_node_id", {})
                 state = pg_info.get("state", "UNKNOWN")
+                gpus_by_node_ip = _gpus_by_node_ip(pg_info)
 
-                # Get GPU count from bundles
-                bundles = pg_info.get("bundles", {})
-                total_gpus = sum(
-                    int(b.get("GPU", 0) or 0) for b in bundles.values() if isinstance(b, dict)
-                )
+                if not gpus_by_node_ip:
+                    placements["unknown"].append(
+                        {
+                            "actor_name": actor_name,
+                            "namespace": actor_ns,
+                            "gpus": _total_pg_gpus(pg_info) or 1,
+                            "pg_state": state,
+                        }
+                    )
+                    continue
 
-                # Find node IPs for all bundles
-                node_ips = set()
-                for node_id in bundles_to_node.values():
-                    for n in ray.nodes():
-                        if n.get("NodeID") == node_id:
-                            node_ip = n.get("NodeManagerAddress")
-                            if node_ip:
-                                node_ips.add(node_ip)
-                            break
-
-                for node_ip in node_ips:
+                for node_ip, node_gpus in gpus_by_node_ip.items():
                     placements[node_ip].append(
                         {
                             "actor_name": actor_name,
                             "namespace": actor_ns,
-                            "gpus": total_gpus,
+                            "gpus": node_gpus,
                             "pg_state": state,
                         }
                     )
@@ -123,6 +118,55 @@ def get_actor_placements() -> dict[str, list[dict]]:
             continue
 
     return placements
+
+
+def _gpus_by_node_ip(pg_info: dict) -> dict[str, int]:
+    bundles = pg_info.get("bundles", {})
+    bundles_to_node = pg_info.get("bundles_to_node_id", {})
+
+    if isinstance(bundles, dict):
+        bundle_items = bundles.items()
+    elif isinstance(bundles, list):
+        bundle_items = enumerate(bundles)
+    else:
+        bundle_items = ()
+
+    gpu_by_bundle_key = {
+        str(bundle_key): int(bundle.get("GPU", 0) or 0)
+        for bundle_key, bundle in bundle_items
+        if isinstance(bundle, dict) and int(bundle.get("GPU", 0) or 0) > 0
+    }
+
+    node_ip_by_id = {
+        str(n.get("NodeID") or ""): str(n.get("NodeManagerAddress") or "")
+        for n in ray.nodes()
+        if n.get("NodeID") and n.get("NodeManagerAddress")
+    }
+
+    node_gpu_counts: dict[str, int] = defaultdict(int)
+    if isinstance(bundles_to_node, dict):
+        bundle_assignments = bundles_to_node.items()
+    else:
+        bundle_assignments = ()
+
+    for bundle_key, node_id in bundle_assignments:
+        node_ip = node_ip_by_id.get(str(node_id or ""))
+        bundle_gpus = gpu_by_bundle_key.get(str(bundle_key), 0)
+        if node_ip and bundle_gpus > 0:
+            node_gpu_counts[node_ip] += bundle_gpus
+
+    return dict(node_gpu_counts)
+
+
+def _total_pg_gpus(pg_info: dict) -> int:
+    bundles = pg_info.get("bundles", {})
+    if isinstance(bundles, dict):
+        bundle_values = bundles.values()
+    elif isinstance(bundles, list):
+        bundle_values = bundles
+    else:
+        bundle_values = ()
+    return sum(int(bundle.get("GPU", 0) or 0) for bundle in bundle_values if isinstance(bundle, dict))
 
 
 def print_node_usage(nodes_by_ip: dict, placements: dict, filter_node_ip: str | None = None):
