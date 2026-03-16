@@ -201,6 +201,7 @@ def bootstrap_runtime_pythonpath(
     layout = runtime_env_layout(env_root)
     return join_pythonpath(
         layout.pythonpath_entries,
+        layout.host_pythonpath_entries,
         pfs_tinker_path,
         pfs_hf_modules_path,
     )

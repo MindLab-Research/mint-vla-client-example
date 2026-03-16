@@ -87,6 +87,7 @@ def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
     out = bootstrap_runtime_pythonpath(environ, repo_root="/repo")
 
     assert str(env_root / "site-packages") in out.split(":")
+    assert str(env_root / "src" / "vllm") in out.split(":")
     assert "/pfs/code/tinker-server" in out.split(":")
     assert "/pfs/hf/modules" in out.split(":")
 
