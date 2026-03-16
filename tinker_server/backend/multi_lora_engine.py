@@ -25,6 +25,7 @@ from tinker_server.ray_utils import init_ray
 
 from . import ray_kill
 from .lora_registry import LoRARegistry
+from .ray_placement_groups import remove_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
 from .volc_placement import (
     assert_node_ip_capacity,
@@ -1256,8 +1257,7 @@ class MultiLoRAInferenceEngine:
             except Exception as e:
                 logger.warning(f"Error killing server actor: {e}")
             try:
-                pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
-                ray.util.remove_placement_group(pg)
+                remove_named_placement_group(f"{self.actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
                 pass
         self.server = None
@@ -1756,16 +1756,14 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             logger.info(f"Killed vLLM actor: {actor_name}")
             resource_pool.unregister(actor_name)
             try:
-                pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                ray.util.remove_placement_group(pg)
+                remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
                 pass
             return True
         except ValueError:
             logger.info(f"No vLLM actor found: {actor_name}")
             try:
-                pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                ray.util.remove_placement_group(pg)
+                remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
                 pass
             return False
@@ -1785,8 +1783,10 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     try:
-                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
-                        ray.util.remove_placement_group(pg)
+                        remove_named_placement_group(
+                            f"{entry.actor_name}_pg",
+                            namespace=entry.namespace,
+                        )
                     except Exception:
                         pass
                     killed_any = True
@@ -1794,8 +1794,10 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     try:
-                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
-                        ray.util.remove_placement_group(pg)
+                        remove_named_placement_group(
+                            f"{entry.actor_name}_pg",
+                            namespace=entry.namespace,
+                        )
                     except Exception:
                         pass
                 except Exception as e:
