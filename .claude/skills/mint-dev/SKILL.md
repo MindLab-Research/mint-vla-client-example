@@ -290,9 +290,11 @@ ssh mint-dev "rm -rf /root/tinker_project/tinker-server && \
 ```bash
 export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
+export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213
+export TINKER_HOST_PYTHON=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python
 # For concurrent dev runs, set this to a unique value (example: tinker_$USER).
 # export TINKER_RAY_NAMESPACE=tinker
 # Also set this to the same value (used by detached metadata stores):
@@ -312,6 +314,7 @@ export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 ```bash
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
   \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
@@ -512,13 +515,14 @@ Use this after server-only code changes. If you killed any actors, restart the s
 ```bash
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Restart after killing vLLM
@@ -529,13 +533,14 @@ Use this after vLLM actor code changes, OOM, or switching base model.
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 ```
 
@@ -547,13 +552,14 @@ Use this after Megatron actor code changes, OOM, or switching base model.
 curl -X POST http://localhost:8000/api/v1/kill_megatron
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 curl -s http://localhost:8000/api/v1/healthz
 ```
 
@@ -567,13 +573,14 @@ Note: `/api/v1/kill_all_actors` kills ResourcePool-tracked GPU actors (vLLM, Meg
 curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 ```
 
@@ -603,8 +610,8 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 
 **Safe connectivity check (no local raylet):**
 ```bash
-ssh mint-dev "ray status --address='<RAY_HEAD_IP>:6379'"
-ssh mint-dev "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
+ssh mint-dev "/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
+ssh mint-dev "/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
 ```
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
