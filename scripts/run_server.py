@@ -19,12 +19,13 @@ Note: No default model is configured. Clients specify models per-request.
 Parallelism is auto-detected from the model registry when engines are created.
 """
 
-import logging
-import pathlib
 import argparse
 import importlib.util
+import logging
 import os
+import pathlib
 import sys
+import tomllib
 import traceback
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -92,6 +93,26 @@ def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
     new_env.update(desired)
     os.execvpe(sys.executable, [sys.executable, *sys.argv], new_env)
 
+
+def _reexec_to_runtime_host_python_if_needed() -> None:
+    env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
+    if not env_root:
+        return
+    from tinker_server.runtime_env import validate_runtime_env_layout
+
+    layout = validate_runtime_env_layout(env_root, require_host_python=True)
+    target_python = pathlib.Path(layout.host_python).resolve()
+    current_python = pathlib.Path(sys.executable).resolve()
+    if current_python == target_python:
+        return
+    if os.environ.get("TINKER_SERVER_HOST_PYTHON") == "1":
+        raise RuntimeError(
+            f"TINKER_SERVER_HOST_PYTHON=1 but sys.executable={current_python} != {target_python}"
+        )
+    new_env = dict(os.environ)
+    new_env["TINKER_SERVER_HOST_PYTHON"] = "1"
+    os.execvpe(str(target_python), [str(target_python), *sys.argv], new_env)
+
 def crash_handler(exc_type, exc_value, exc_tb):
     """Log uncaught exceptions before crash."""
     print(f"\n{'='*60}", flush=True)
@@ -130,15 +151,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _seed_runtime_env_from_config(config_path: str) -> None:
-    from tinker_server.config_file import load_tinker_config_file
-
-    cfg = load_tinker_config_file(config_path)
-    if cfg.paths.pfs_runtime_env_root:
-        os.environ["PFS_RUNTIME_ENV_ROOT"] = str(cfg.paths.pfs_runtime_env_root)
-    if cfg.paths.pfs_tinker_path:
-        os.environ["PFS_TINKER_PATH"] = str(cfg.paths.pfs_tinker_path)
-    if cfg.paths.pfs_hf_modules_path:
-        os.environ["PFS_HF_MODULES_PATH"] = str(cfg.paths.pfs_hf_modules_path)
+    data = tomllib.loads(pathlib.Path(config_path).read_text(encoding="utf-8"))
+    paths = data.get("paths", {})
+    if "pfs_runtime_env_root" in paths:
+        os.environ["PFS_RUNTIME_ENV_ROOT"] = str(paths["pfs_runtime_env_root"])
+    if "pfs_tinker_path" in paths:
+        os.environ["PFS_TINKER_PATH"] = str(paths["pfs_tinker_path"])
+    if "pfs_hf_modules_path" in paths:
+        os.environ["PFS_HF_MODULES_PATH"] = str(paths["pfs_hf_modules_path"])
 
 
 if __name__ == "__main__":
@@ -146,6 +166,8 @@ if __name__ == "__main__":
     if args.config_path:
         os.environ["TINKER_CONFIG_PATH"] = str(args.config_path)
         _seed_runtime_env_from_config(str(args.config_path))
+
+    _reexec_to_runtime_host_python_if_needed()
 
     from tinker_server.runtime_env import bootstrap_runtime_pythonpath
 

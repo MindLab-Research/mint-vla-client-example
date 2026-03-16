@@ -9,7 +9,6 @@ import subprocess
 import sys
 
 from tinker_server.runtime_env import (
-    DEFAULT_HF_MODULES_PATH,
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
     runtime_env_layout,
@@ -25,6 +24,7 @@ def _materialize_runtime_env(root: Path) -> None:
         Path(entry).mkdir(parents=True, exist_ok=True)
     Path(layout.host_python).parent.mkdir(parents=True, exist_ok=True)
     Path(layout.host_python).write_text("#!/bin/sh\n", encoding="utf-8")
+    Path(layout.host_python).chmod(0o755)
 
 
 def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
@@ -80,18 +80,45 @@ def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
     environ = {
         "PFS_RUNTIME_ENV_ROOT": str(env_root),
         "PFS_TINKER_PATH": "/pfs/code/tinker-server",
+        "PFS_HF_MODULES_PATH": "/pfs/hf/modules",
     }
 
     out = bootstrap_runtime_pythonpath(environ, repo_root="/repo")
 
     assert str(env_root / "site-packages") in out.split(":")
     assert "/pfs/code/tinker-server" in out.split(":")
-    assert DEFAULT_HF_MODULES_PATH in out.split(":")
+    assert "/pfs/hf/modules" in out.split(":")
 
 
 def test_bootstrap_runtime_pythonpath_requires_runtime_root():
     with pytest.raises(RuntimeError, match="PFS_RUNTIME_ENV_ROOT is required"):
         bootstrap_runtime_pythonpath({}, repo_root="/repo")
+
+
+def test_bootstrap_runtime_pythonpath_requires_tinker_path(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    with pytest.raises(RuntimeError, match="PFS_TINKER_PATH is required"):
+        bootstrap_runtime_pythonpath(
+            {
+                "PFS_RUNTIME_ENV_ROOT": str(env_root),
+                "PFS_HF_MODULES_PATH": "/hf",
+            },
+            repo_root="/repo",
+        )
+
+
+def test_bootstrap_runtime_pythonpath_requires_hf_modules_path(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    with pytest.raises(RuntimeError, match="PFS_HF_MODULES_PATH is required"):
+        bootstrap_runtime_pythonpath(
+            {
+                "PFS_RUNTIME_ENV_ROOT": str(env_root),
+                "PFS_TINKER_PATH": "/repo",
+            },
+            repo_root="/repo",
+        )
 
 
 def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
@@ -145,6 +172,8 @@ def test_run_server_parses_config_before_runtime_bootstrap(tmp_path):
             [
                 "[paths]",
                 f'pfs_runtime_env_root = "{tmp_path / "runtime"}"',
+                f'pfs_tinker_path = "{tmp_path / "repo"}"',
+                f'pfs_hf_modules_path = "{tmp_path / "hf"}"',
                 "",
                 "[server]",
                 "port = 9",

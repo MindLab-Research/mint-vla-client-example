@@ -155,8 +155,12 @@ def bootstrap_runtime_pythonpath(
     env_root = env_nonempty(environ, "PFS_RUNTIME_ENV_ROOT")
     if not env_root:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
-    pfs_tinker_path = env_nonempty(environ, "PFS_TINKER_PATH") or repo_root
-    pfs_hf_modules_path = env_nonempty(environ, "PFS_HF_MODULES_PATH") or default_hf_modules_path
+    pfs_tinker_path = env_nonempty(environ, "PFS_TINKER_PATH")
+    if not pfs_tinker_path:
+        raise RuntimeError("PFS_TINKER_PATH is required")
+    pfs_hf_modules_path = env_nonempty(environ, "PFS_HF_MODULES_PATH")
+    if not pfs_hf_modules_path:
+        raise RuntimeError("PFS_HF_MODULES_PATH is required")
     layout = runtime_env_layout(env_root)
     return join_pythonpath(
         layout.pythonpath_entries,

@@ -57,9 +57,8 @@ RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 # Historical default hard-coded `/vePFS-Mindverse/share/code/tinker-server-auth`, which breaks
 # non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
 # to a non-existent code directory.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _file_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
-PFS_TINKER_PATH = _env_nonempty(os.environ, "PFS_TINKER_PATH") or _file_pfs_tinker_path or _REPO_ROOT
+PFS_TINKER_PATH = _env_nonempty(os.environ, "PFS_TINKER_PATH") or _file_pfs_tinker_path or ""
 
 # Canonical runtime env root. This contains:
 # - `site-packages/` for shared pure-Python runtime deps
@@ -83,12 +82,16 @@ USE_MBRIDGE_LORA_EXPORT = (
 # Custom model code is cached here when models are first loaded
 _file_pfs_hf_modules_path = _CONFIG_FILE.paths.pfs_hf_modules_path if _CONFIG_FILE is not None else None
 PFS_HF_MODULES_PATH = (
-    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or DEFAULT_HF_MODULES_PATH
+    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or ""
 )
 
 def ensure_runtime_env_configured() -> str:
     if not PFS_RUNTIME_ENV_ROOT:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
+    if not PFS_TINKER_PATH:
+        raise RuntimeError("PFS_TINKER_PATH must be set")
+    if not PFS_HF_MODULES_PATH:
+        raise RuntimeError("PFS_HF_MODULES_PATH must be set")
     return PFS_RUNTIME_ENV_ROOT
 
 
@@ -98,7 +101,7 @@ PFS_PYTHONPATH = (
         pfs_tinker_path=PFS_TINKER_PATH,
         pfs_hf_modules_path=PFS_HF_MODULES_PATH,
     )
-    if PFS_RUNTIME_ENV_ROOT
+    if PFS_RUNTIME_ENV_ROOT and PFS_TINKER_PATH and PFS_HF_MODULES_PATH
     else ""
 )
 
