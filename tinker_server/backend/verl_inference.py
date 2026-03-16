@@ -1982,6 +1982,44 @@ def _create_extended_server_class(
                 "sys_path_first_5": sys.path[:5],
             }
 
+        async def get_kv_debug_info(self) -> dict:
+            def _collect_kv_info(worker_wrapper):
+                worker = getattr(worker_wrapper, "worker", None)
+                target = worker if worker is not None else worker_wrapper
+                model_runner = getattr(target, "model_runner", None)
+                kv_cfg = getattr(model_runner, "kv_cache_config", None)
+                return {
+                    "available_kv_cache_memory_bytes": int(
+                        getattr(target, "available_kv_cache_memory_bytes", 0) or 0
+                    ),
+                    "requested_memory_bytes": int(
+                        getattr(target, "requested_memory", 0) or 0
+                    ),
+                    "non_torch_memory_bytes": int(
+                        getattr(target, "non_torch_memory", 0) or 0
+                    ),
+                    "peak_activation_memory_bytes": int(
+                        getattr(target, "peak_activation_memory", 0) or 0
+                    ),
+                    "kv_cache_num_blocks": int(
+                        getattr(kv_cfg, "num_blocks", 0) or 0
+                    ) if kv_cfg is not None else 0,
+                    "kv_cache_groups": len(
+                        getattr(kv_cfg, "kv_cache_groups", []) or []
+                    ) if kv_cfg is not None else 0,
+                }
+
+            infos = await self.engine.collective_rpc(_collect_kv_info)
+            return {
+                "per_worker": infos,
+                "min_available_kv_cache_memory_bytes": min(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
+                "max_available_kv_cache_memory_bytes": max(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
+            }
+
 
         async def test_mp_spawn_from_actor(self) -> dict:
             """Test multiprocessing spawn from within actor to debug PYTHONPATH."""

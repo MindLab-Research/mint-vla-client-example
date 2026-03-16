@@ -151,6 +151,8 @@ class MultiLoRAInferenceEngine:
         self.server = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._path_load_lock = asyncio.Lock()
+        self._path_load_futures: dict[str, asyncio.Future[None]] = {}
 
     async def initialize(self) -> None:
         """Initialize the shared vLLM engine with multi-LoRA support.
@@ -415,6 +417,8 @@ class MultiLoRAInferenceEngine:
                 **otel_env_vars(),
                 },
             )
+            if "LD_LIBRARY_PATH" in os.environ:
+                env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
@@ -678,12 +682,27 @@ class MultiLoRAInferenceEngine:
             )
             return existing_lora_id
 
-        # Allocate or reuse a shared LoRA ID for this adapter path
-        lora_id, is_new_load = await self.registry.allocate_for_path(
-            sampling_session_id, lora_path
-        )
-        allocated = is_new_load
+        # Allocate or reuse a shared LoRA ID for this adapter path. Coordinate
+        # concurrent first-use requests so later sessions do not observe the
+        # shared lora_int_id before the initial add_lora_from_path finishes.
+        async with self._path_load_lock:
+            lora_id, is_new_load = await self.registry.allocate_for_path(
+                sampling_session_id, lora_path
+            )
+            allocated = is_new_load
+            load_future = self._path_load_futures.get(lora_path)
+            if is_new_load:
+                loop = asyncio.get_running_loop()
+                load_future = loop.create_future()
+                self._path_load_futures[lora_path] = load_future
+
         if not is_new_load:
+            if load_future is not None and not load_future.done():
+                try:
+                    await load_future
+                except Exception:
+                    await self.registry.remove_session(sampling_session_id)
+                    raise
             logger.info(
                 "Reused LoRA for session %s from path (lora_int_id=%s path=%s)",
                 sampling_session_id,
@@ -742,7 +761,15 @@ class MultiLoRAInferenceEngine:
                         type(cleanup_e).__name__,
                         cleanup_e,
                     )
+            if load_future is not None and not load_future.done():
+                load_future.set_exception(e)
+            async with self._path_load_lock:
+                self._path_load_futures.pop(lora_path, None)
             raise
+        if load_future is not None and not load_future.done():
+            load_future.set_result(None)
+        async with self._path_load_lock:
+            self._path_load_futures.pop(lora_path, None)
         load_time = time.time() - start_time
 
         logger.info(

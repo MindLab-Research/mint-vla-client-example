@@ -1038,6 +1038,11 @@ async def _do_sample(
                     and gen_many is not None
                     and request.num_samples <= _SAMPLE_COALESCE_MAX_SAMPLES
                 )
+                if engine.__class__.__name__ == "MultiNodeInferenceEngine":
+                    # Multi-node vLLM has shown severe hangs on the coalesced
+                    # generate_many path even for a single waiter. Keep the
+                    # native per-request generate path for these engines.
+                    can_coalesce = False
                 logger.info(
                     f"[sample path] session_id={session_id} "
                     f"can_coalesce={can_coalesce} sample_coalesce={_SAMPLE_COALESCE} "

@@ -126,11 +126,11 @@ MODEL_CONFIGS = {
         num_parameters=0.6,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
-        max_num_seqs=64,  # Leave headroom for long-context prompt_logprobs
-        max_num_batched_tokens=2048,
-        gpu_memory_utilization=0.92,
-        max_loras=12,
-        max_cpu_loras=1200,
+        max_num_seqs=608,  # 32 * N_long (N_long=19) for short-request headroom
+        max_num_batched_tokens=1024,  # Prompt-logprob path chunks internally at 1024
+        gpu_memory_utilization=0.90,
+        max_loras=18,
+        max_cpu_loras=180,
         max_lora_rank=64,
         gradient_checkpointing=True,
     ),
@@ -144,11 +144,11 @@ MODEL_CONFIGS = {
         num_parameters=4.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
-        max_num_seqs=32,  # Leave headroom for 32K prompt_logprobs
-        max_num_batched_tokens=2048,  # Cap prompt_logprobs peak allocations at long context
+        max_num_seqs=416,  # 32 * N_long (N_long=13) for short-request headroom
+        max_num_batched_tokens=1024,  # Prompt-logprob path chunks internally at 1024
         gpu_memory_utilization=0.90,
-        max_loras=8,
-        max_cpu_loras=800,
+        max_loras=12,
+        max_cpu_loras=120,
         max_lora_rank=64,
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
@@ -165,17 +165,13 @@ MODEL_CONFIGS = {
         num_parameters=30.0,
         is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=1,
         max_model_len=32768,  # 32K context
-        # NOTE: vLLM's `max_num_seqs` caps the total number of *active sequences*,
-        # not the number of HTTP requests. When sampling uses `SamplingParams(n=8)`,
-        # a single prompt consumes up to 8 sequence slots. With `max_num_seqs=8`,
-        # the engine effectively runs prompts sequentially (no cross-prompt batching).
-        # With 32K prompts and SamplingParams(n=8), c=2 uses 16 active sequences.
-        # Keep headroom above that to avoid scheduler edge cases at the cap.
-        max_num_seqs=24,
-        max_num_batched_tokens=512,  # Keep prompt_logprobs under the current stable chunk size
+        # 32 * N_long (N_long=22) for short-request headroom. Keep
+        # max_num_batched_tokens >= max_num_seqs for scheduler validity.
+        max_num_seqs=704,
+        max_num_batched_tokens=1024,
         gpu_memory_utilization=0.85,  # Leave prompt_logprobs/runtime headroom above KV cache
-        max_loras=6,
-        max_cpu_loras=600,
+        max_loras=21,
+        max_cpu_loras=210,
         max_lora_rank=64,
         gradient_checkpointing=True,
         vllm_engine="async",
@@ -212,12 +208,12 @@ MODEL_CONFIGS = {
         train_pp=1,
         train_ep=8,
         gpu_memory_utilization=0.75,
-        max_loras=2,
-        max_cpu_loras=200,
+        max_loras=8,
+        max_cpu_loras=80,
         max_lora_rank=64,
         max_model_len=32768,  # 32K context
-        max_num_seqs=4,  # Constrain KV cache; prompt_logprobs needs extra headroom
-        max_num_batched_tokens=256,
+        max_num_seqs=288,  # 32 * N_long (N_long=9) for short-request headroom
+        max_num_batched_tokens=1024,  # Prompt-logprob path chunks internally at 1024
         gradient_checkpointing=True,
         vllm_engine="async",
         vllm_distributed_executor_backend="ray",
@@ -231,12 +227,12 @@ MODEL_CONFIGS = {
         train_pp=1,
         train_ep=8,
         gpu_memory_utilization=0.75,
-        max_loras=2,
-        max_cpu_loras=200,
+        max_loras=8,
+        max_cpu_loras=80,
         max_lora_rank=64,
         max_model_len=32768,  # 32K context
-        max_num_seqs=4,
-        max_num_batched_tokens=256,
+        max_num_seqs=288,  # 32 * N_long (N_long=9) for short-request headroom
+        max_num_batched_tokens=1024,  # Prompt-logprob path chunks internally at 1024
         gradient_checkpointing=True,
         vllm_engine="async",
         vllm_distributed_executor_backend="ray",
