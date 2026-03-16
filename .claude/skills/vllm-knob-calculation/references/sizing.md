@@ -28,9 +28,17 @@ So the planning-time inequality is:
 
 where:
 
-- `profiled_non_kv` includes base weights, steady-state LoRA slot/runtime
-  capacity, and other profiled executor buffers
+- `profiled_non_kv` is vLLM's original startup-profile term:
+  - `weights_memory`
+  - `peak_activation_memory`
+  - `non_torch_increase`
+- `weights_memory` already includes persistent LoRA slot tensors allocated
+  during model load when LoRA is enabled
 - `kv_budget` is the intended KV reservation
+
+Do not replace `profiled_non_kv` with `weights_memory`.
+If local patches bypass `Worker.determine_available_memory()` or mutate
+`DeviceMemoryProfiler`, the sizing math in this reference no longer applies.
 
 ## 3. KV geometry
 
@@ -60,13 +68,64 @@ What matters is steady-state slot capacity on each GPU:
 
 - `lora_runtime_per_gpu = max_loras * slot_cost_per_gpu(max_lora_rank, architecture)`
 
-Useful approximations:
+Hard rule:
 
-- slot cost scales roughly linearly with `max_lora_rank`
-- slot cost scales roughly linearly with `max_loras`
+- derive `slot_cost_per_gpu` from the active vLLM replacement class and tensor
+  shapes, not from a generic MoE shorthand
 
-So moving from rank `16` to rank `64` is approximately a `4x` increase in the
-LoRA slot term.
+For MoE this especially means checking all of:
+
+- whether the active class is `FusedMoEWithLoRA` or `FusedMoE3DWithLoRA`
+- whether `fully_sharded_loras` is actually enabled
+- whether expert parallel is enabled, because that determines
+  `local_num_experts`
+
+Do not assume `local_num_experts = global_num_experts / tp`.
+If expert parallel is disabled, `local_num_experts` can still equal the full
+expert count even when tensor parallel is greater than 1.
+
+For `FusedMoEWithLoRA`, do not collapse the expert slot cost to a single
+"experts term". The persistent slot tensors are:
+
+- `w13_lora_a_stacked`
+- `w13_lora_b_stacked`
+- `w2_lora_a_stacked`
+- `w2_lora_b_stacked`
+
+Even when `fully_sharded_loras=True`, only part of that state is TP-divided.
+On the current path:
+
+- `w13_lora_a` is rank-sharded
+- `w2_lora_b` is hidden-sharded
+- `w13_lora_b` is still intermediate-sharded only
+- `w2_lora_a` is still intermediate-sharded only
+
+So for `FusedMoEWithLoRA` with expert parallel disabled, the per-layer slot
+bytes are:
+
+- `2 * E * (R / TP) * H * bytes`
+- `2 * E * (I / TP) * R * bytes`
+- `E * R * (I / TP) * bytes`
+- `E * (H / TP) * R * bytes`
+
+where:
+
+- `E = local_num_experts`
+- `R = max_lora_rank`
+- `H = hidden_size`
+- `I = moe_intermediate_size`
+- `bytes = lora_dtype_size`
+
+Only after the active tensor shapes are identified should you apply the usual
+linear scaling observations:
+
+- slot cost scales linearly with `max_lora_rank`
+- slot cost scales linearly with `max_loras`
+
+Under a MinT-style rule where active LoRAs should sit slightly below guaranteed
+full-context concurrency, choose:
+
+- `max_loras = N_long - 1`
 
 ## 5. Prompt-logprob headroom
 
@@ -80,6 +139,11 @@ For the path we inspected, the dominant lower-bound term is:
 This is why `max_num_batched_tokens` matters for long prompt logprob requests:
 
 - smaller scheduled chunks reduce the `[tokens, vocab]` scratch term
+
+On the current vLLM prompt-logprob path, there is also an internal chunk cap of
+`1024` prompt tokens. For this path:
+
+- `effective_chunk_tokens = min(max_num_batched_tokens, 1024)`
 
 So the runtime peak is better modeled as:
 
@@ -152,8 +216,26 @@ runtime headroom for long prompt logprobs.
 - LoRA slot/runtime capacity
 - Other profiled executor overhead
 
+If you cannot derive the full profiled term exactly from architecture alone,
+introduce an explicit conservative upper bound `U_profile` for the remainder:
+
+- `(weights_memory - theoretical_weight_shard)`
+- `peak_activation_memory`
+- `non_torch_increase`
+
+Hard epistemic boundary:
+
+- empirical calibration is allowed only inside `U_profile`
+- do not use empirical data to modify KV geometry or slot geometry directly
+- if runtime falsifies the current slot geometry, re-derive the tensor basis
+  first and only then update `U_profile`
+
 4. Solve the steady-state inequality.
 - `requested_memory >= profiled_non_kv + N_long * kv_bytes_per_full_context_seq_per_gpu`
+
+Equivalently, with explicit architecture terms:
+
+- `requested_memory >= theoretical_weight_shard + lora_slot_cost + U_profile + N_long * kv_per_seq`
 
 5. Add runtime scratch headroom.
 - Especially prompt-logprob scratch

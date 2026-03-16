@@ -61,3 +61,12 @@ def test_training_session_metadata_namespace_is_ray_namespace():
     repo_root = Path(__file__).resolve().parents[1]
     txt = (repo_root / "tinker_server/routes/training.py").read_text(encoding="utf-8")
     assert "MINT_RAY_NAMESPACE" not in txt
+
+
+def test_startup_reconciliation_does_not_guess_gpu_counts():
+    repo_root = Path(__file__).resolve().parents[1]
+    txt = (repo_root / "tinker_server/app.py").read_text(encoding="utf-8")
+    assert "num_gpus = 8" not in txt
+    assert 'actor_type = ActorType.VLLM\n                            num_gpus = 1' not in txt
+    assert "Skipping busy restored vLLM actor with unknown GPU count" in txt
+    assert "Skipping busy restored Megatron actor with unknown GPU count" in txt

@@ -914,7 +914,6 @@ def _create_multinode_vllm_actor(
 
             return {
                 "pythonpath": os.environ.get("PYTHONPATH", ""),
-                "pfs_vllm_path": os.environ.get("PFS_VLLM_PATH", ""),
                 "mint_enable_vllm_import_patches": os.environ.get(
                     "MINT_ENABLE_VLLM_IMPORT_PATCHES"
                 ),
@@ -925,6 +924,44 @@ def _create_multinode_vllm_actor(
                 "vllm_lora_opt_overlap_safe": lora_opt_safe,
                 "vllm_lora_packed_opt_overlap_safe": packed_opt_safe,
                 "sys_path_first_8": sys.path[:8],
+            }
+
+        async def get_kv_debug_info(self) -> dict:
+            def _collect_kv_info(worker_wrapper):
+                worker = getattr(worker_wrapper, "worker", None)
+                target = worker if worker is not None else worker_wrapper
+                model_runner = getattr(target, "model_runner", None)
+                kv_cfg = getattr(model_runner, "kv_cache_config", None)
+                return {
+                    "available_kv_cache_memory_bytes": int(
+                        getattr(target, "available_kv_cache_memory_bytes", 0) or 0
+                    ),
+                    "requested_memory_bytes": int(
+                        getattr(target, "requested_memory", 0) or 0
+                    ),
+                    "non_torch_memory_bytes": int(
+                        getattr(target, "non_torch_memory", 0) or 0
+                    ),
+                    "peak_activation_memory_bytes": int(
+                        getattr(target, "peak_activation_memory", 0) or 0
+                    ),
+                    "kv_cache_num_blocks": int(
+                        getattr(kv_cfg, "num_blocks", 0) or 0
+                    ) if kv_cfg is not None else 0,
+                    "kv_cache_groups": len(
+                        getattr(kv_cfg, "kv_cache_groups", []) or []
+                    ) if kv_cfg is not None else 0,
+                }
+
+            infos = await self.engine.collective_rpc(_collect_kv_info)
+            return {
+                "per_worker": infos,
+                "min_available_kv_cache_memory_bytes": min(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
+                "max_available_kv_cache_memory_bytes": max(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
             }
 
         async def abort_request(self, request_id: str, traceparent: str | None = None) -> None:
@@ -1518,6 +1555,12 @@ def _create_multinode_vllm_actor(
                 async with self._maybe_prompt_logprobs_lock():
                     async with self._lock_read():
                         t1 = time.perf_counter()
+                        # Prompt-logprobs requests explicitly skip prefix-cache reads in vLLM.
+                        # After a long sample finishes, its prompt KV blocks can remain cached and
+                        # occupy the KV pool while being unusable for the follow-on prompt-logprobs
+                        # request. Clearing prefix cache here frees those cached blocks without
+                        # changing prompt-logprobs semantics for this request.
+                        await self.engine.reset_prefix_cache()
                         try:
                             collector = await self.engine.add_request(
                                 request_id=request_id,
@@ -1802,7 +1845,6 @@ class MultiNodeInferenceEngine:
 
             if not ray.is_initialized():
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -2145,9 +2187,12 @@ class MultiNodeInferenceEngine:
                         required_gpus=int(worker_gpus),
                     )
 
-            from ..config import otel_env_vars
-            env_vars = {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            from ..config import actor_ld_library_path, otel_env_vars
+            env_vars = actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
+                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -2168,10 +2213,12 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": distributed_executor_backend,
                 "VLLM_DISABLE_PYNCCL": "1",
                 **otel_env_vars(),
-            }
+                },
+            )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]
             env_vars.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+            env_vars.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             if "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE" in os.environ:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = os.environ[
                     "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"
@@ -2226,19 +2273,17 @@ class MultiNodeInferenceEngine:
                     env_vars[k] = v
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
 
-            if (
-                distributed_executor_backend == "ray"
-                and total_required_gpus >= 16
-                and "VLLM_DISABLE_RAY_COMPILED_DAG" not in env_vars
-            ):
-                # On Volcano 235B we have observed the opposite failure mode from startup OOM/crash:
-                # generate() completes inside vLLM (worker timing line emitted) but ray.get() on the
-                # driver side never receives the result and the request stays pending indefinitely.
-                # That points at Ray compiled DAG transport rather than model execution.
+            if distributed_executor_backend == "ray":
+                # Keep Ray compiled DAG disabled for all multinode-ray vLLM actors.
+                # This vLLM build does not honor VLLM_DISABLE_RAY_COMPILED_DAG in
+                # ray_executor.py, so the real no-compiled-DAG path is the
+                # sitecustomize monkey patch gated by
+                # MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE.
+                env_vars["MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE"] = "1"
                 env_vars["VLLM_DISABLE_RAY_COMPILED_DAG"] = "1"
 
-            # Performance defaults: do not disable prefix caching, grouped-topk, or
-            # Ray compiled DAG in code. If stability requires toggling, do it via env.
+            # Performance defaults: do not disable prefix caching or grouped-topk in code.
+            # If stability requires toggling other vLLM knobs, do it via env.
 
             # Expose selected vLLM debug/perf knobs via API host env without code deploys.
             for k in (

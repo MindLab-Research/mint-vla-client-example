@@ -1716,6 +1716,35 @@ def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
     setattr(op, "_tinker_patched_fused_moe_lora_torch_dist_tp", True)
 
 
+def _patch_vllm_gpu_worker_kv_debug_info() -> None:
+    try:
+        import vllm.v1.worker.gpu_worker as gpu_worker_mod
+    except Exception:
+        return
+
+    cls = getattr(gpu_worker_mod, "Worker", None) or getattr(gpu_worker_mod, "GPUWorker", None)
+    if cls is None:
+        return
+
+    original = getattr(cls, "get_kv_debug_info", None)
+    if callable(original) and getattr(original, "_tinker_kv_debug_info", False):
+        return
+
+    def get_kv_debug_info(self):  # type: ignore[no-untyped-def]
+        kv_cfg = getattr(getattr(self, "model_runner", None), "kv_cache_config", None)
+        return {
+            "available_kv_cache_memory_bytes": int(getattr(self, "available_kv_cache_memory_bytes", 0) or 0),
+            "requested_memory_bytes": int(getattr(self, "requested_memory", 0) or 0),
+            "non_torch_memory_bytes": int(getattr(self, "non_torch_memory", 0) or 0),
+            "peak_activation_memory_bytes": int(getattr(self, "peak_activation_memory", 0) or 0),
+            "kv_cache_num_blocks": int(getattr(kv_cfg, "num_blocks", 0) or 0) if kv_cfg is not None else 0,
+            "kv_cache_groups": len(getattr(kv_cfg, "kv_cache_groups", []) or []) if kv_cfg is not None else 0,
+        }
+
+    get_kv_debug_info._tinker_kv_debug_info = True  # type: ignore[attr-defined]
+    cls.get_kv_debug_info = get_kv_debug_info  # type: ignore[method-assign]
+
+
 def _apply_vllm_worker_patches() -> None:
     if not _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False):
         return
@@ -1737,20 +1766,10 @@ def _apply_vllm_worker_patches() -> None:
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
     _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
-    # These startup-profile patches are not specific to fully-sharded LoRAs.
-    # Qwen3-235B on Volcano crashes in vLLM's dummy fused-MoE LoRA profile path
-    # during determine_available_memory() before any real adapter is loaded.
-    # Keep the actual fully-sharded slicing patch opt-in, but always apply the
-    # startup-only safeguards when worker import patches are enabled.
-    _patch_vllm_skip_dummy_lora_setup_when_inactive()
-    _patch_vllm_profile_run_disable_dummy_active_loras()
-    _patch_vllm_fused_moe_lora_profile_noop()
-    _patch_vllm_profile_run_scope_bypass_fused_moe_lora()
-    if not _patch_vllm_invoke_fused_moe_kernel_startup_noop():
-        _patch_vllm_fused_moe_forward_startup_fake()
-    _patch_vllm_device_memory_profiler_skip_exit_measure()
-    _patch_vllm_skip_startup_memory_profile()
-    _patch_vllm_dummy_lora_weights_use_empty()
+    _patch_vllm_gpu_worker_kv_debug_info()
+    # Keep worker/runtime LoRA fixes, but do not alter vLLM's native startup
+    # profiling path. Knob sizing depends on upstream accounting:
+    # `weights_memory + peak_activation_memory + non_torch_increase`.
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
         _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
         _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()

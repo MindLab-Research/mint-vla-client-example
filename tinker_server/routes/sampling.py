@@ -463,6 +463,35 @@ def _get_user_id(request: Request) -> str | None:
     return None
 
 
+def _get_apikey_id(
+    request: Request,
+    *,
+    billing_auth: GatewayAuthContext | None = None,
+) -> str | None:
+    if billing_auth is not None and billing_auth.apikey_id:
+        return str(billing_auth.apikey_id)
+    user_data = getattr(request.state, "user_data", None)
+    if isinstance(user_data, dict):
+        apikey_id = str(user_data.get("apikey_id") or user_data.get("key_id") or "").strip()
+        if apikey_id:
+            return apikey_id
+    return None
+
+
+def _get_asample_throttle_identity(
+    request: Request,
+    *,
+    billing_auth: GatewayAuthContext | None = None,
+) -> tuple[str | None, str | None, str]:
+    apikey_id = _get_apikey_id(request, billing_auth=billing_auth)
+    if apikey_id:
+        return f"apikey:{apikey_id}", apikey_id, "api_key"
+    user_id = _get_user_id(request)
+    if user_id:
+        return f"user:{user_id}", None, "user"
+    return None, None, "anonymous"
+
+
 async def _persist_usage_events(*, auth_ctx: GatewayAuthContext, events: list[UsageEvent]) -> None:
     usage_store = await get_usage_store()
     await usage_store.write_events(events)
@@ -562,7 +591,7 @@ async def asample(
     if _should_backpressure(http_request):
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import api_work_queue
+    from ..backend.api_work_queue import ApiWorkQueueThrottleError, api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_sampling_result_bytes
 
@@ -573,6 +602,10 @@ async def asample(
     else:
         request_id = uuid.uuid4().hex
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    throttle_principal, apikey_id, throttle_scope = _get_asample_throttle_identity(
+        http_request,
+        billing_auth=billing_auth,
+    )
     created_pending = False
 
     # Set request_id in context for logging
@@ -651,9 +684,21 @@ async def asample(
             op="sampling.asample",
             request_json=request_json,
             user_id=user_id,
+            apikey_id=apikey_id,
+            throttle_principal=throttle_principal,
             webhook_url=None,
             extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
         )
+    except ApiWorkQueueThrottleError as e:
+        capacity_manager.release_all(request_id)
+        if created_pending:
+            try:
+                future_store.forget(request_id)
+            except FutureStoreUnavailableError:
+                raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+        elif created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=429, detail=e.detail) from e
     except Exception as e:
         capacity_manager.release_all(request_id)
         if created_pending:
@@ -907,7 +952,12 @@ async def sample_once(
         session_manager.mark_session_inflight(session_id, -1)
 
 
-async def _do_sample(request_id: str, request: SampleRequest, user_id: str | None, gateway_auth: dict | None = None) -> None:
+async def _do_sample(
+    request_id: str,
+    request: SampleRequest,
+    user_id: str | None,
+    gateway_auth: dict | None = None,
+) -> None:
     """Background task to perform sampling."""
     # Restore request_id context for logging
     set_request_id(request_id)
@@ -1002,6 +1052,11 @@ async def _do_sample(request_id: str, request: SampleRequest, user_id: str | Non
                     and gen_many is not None
                     and request.num_samples <= _SAMPLE_COALESCE_MAX_SAMPLES
                 )
+                if engine.__class__.__name__ == "MultiNodeInferenceEngine":
+                    # Multi-node vLLM has shown severe hangs on the coalesced
+                    # generate_many path even for a single waiter. Keep the
+                    # native per-request generate path for these engines.
+                    can_coalesce = False
                 logger.info(
                     f"[sample path] session_id={session_id} "
                     f"can_coalesce={can_coalesce} sample_coalesce={_SAMPLE_COALESCE} "

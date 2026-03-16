@@ -366,16 +366,18 @@ def _mint_vllm_patch_pack_moe_sparse_ok(_worker: Any) -> str:
     return "ok:patched"
 
 
-# Apply verl's hijack for TensorLoRARequest support
-# NOTE: Do not apply VLLM hijacks at module import time.
-# The API server can be CPU-only (no vLLM/verl installed), while Ray actors on GPU
-# nodes run inside `mint:8` and have the runtime available. We apply hijacks inside
-# the Ray actor process before engine initialization (see ExtendedVLLMHttpServer.__init__).
+# Do not apply TensorLoRARequest hijacks at module import time.
+# The API server can be CPU-only while Ray actors run on GPU nodes with the full
+# runtime, and this codepath already loads LoRAs from on-node adapter paths.
+# The older hijack path also breaks newer vLLM engine-core startup.
 
 
 # Extended vLLMHttpServer with add_lora support
-# Must be defined after hijack is applied
-def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
+# Defined lazily so actor-local runtime setup happens inside the Ray process.
+def _create_extended_server_class(
+    max_loras: int = 1,
+    max_cpu_loras: int = 0,
+):
     """Create extended vLLMHttpServer class with add_lora method.
 
     Args:
@@ -388,7 +390,6 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
     """
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
     from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
-
     def _unwrap_ray_actor_class(cls):
         """Return the underlying Python class if `cls` is a Ray ActorClass."""
         try:
@@ -447,15 +448,6 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     sys.path.insert(0, p)
             print(f"[ExtendedVLLMHttpServer] Set PYTHONPATH, vLLM path: {sys.path[0]}", flush=True)
 
-            # Apply hijack BEFORE engine creation (in parent __init__)
-            # This runs inside the Ray actor process on GPU node
-            try:
-                from verl.utils.vllm import VLLMHijack, is_version_ge
-                if is_version_ge(pkg="vllm", minver="0.7.3"):
-                    VLLMHijack.hijack()
-            except Exception:
-                pass
-
             # Always initialize through current MRO parent. Calling __init__ on a
             # separately re-imported class can break class identity and trigger:
             # "super(type, obj): obj must be an instance or subtype of type".
@@ -499,6 +491,7 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                     flush=True,
                 )
                 call_kwargs["config"] = rollout_cfg
+
             if sig is not None:
                 accepts_var_kw = any(
                     p.kind == inspect.Parameter.VAR_KEYWORD
@@ -2057,6 +2050,44 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
                 "sys_path_first_5": sys.path[:5],
             }
 
+        async def get_kv_debug_info(self) -> dict:
+            def _collect_kv_info(worker_wrapper):
+                worker = getattr(worker_wrapper, "worker", None)
+                target = worker if worker is not None else worker_wrapper
+                model_runner = getattr(target, "model_runner", None)
+                kv_cfg = getattr(model_runner, "kv_cache_config", None)
+                return {
+                    "available_kv_cache_memory_bytes": int(
+                        getattr(target, "available_kv_cache_memory_bytes", 0) or 0
+                    ),
+                    "requested_memory_bytes": int(
+                        getattr(target, "requested_memory", 0) or 0
+                    ),
+                    "non_torch_memory_bytes": int(
+                        getattr(target, "non_torch_memory", 0) or 0
+                    ),
+                    "peak_activation_memory_bytes": int(
+                        getattr(target, "peak_activation_memory", 0) or 0
+                    ),
+                    "kv_cache_num_blocks": int(
+                        getattr(kv_cfg, "num_blocks", 0) or 0
+                    ) if kv_cfg is not None else 0,
+                    "kv_cache_groups": len(
+                        getattr(kv_cfg, "kv_cache_groups", []) or []
+                    ) if kv_cfg is not None else 0,
+                }
+
+            infos = await self.engine.collective_rpc(_collect_kv_info)
+            return {
+                "per_worker": infos,
+                "min_available_kv_cache_memory_bytes": min(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
+                "max_available_kv_cache_memory_bytes": max(
+                    int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
+                ) if infos else 0,
+            }
+
 
         async def test_mp_spawn_from_actor(self) -> dict:
             """Test multiprocessing spawn from within actor to debug PYTHONPATH."""
@@ -2245,16 +2276,12 @@ class VerlInferenceEngine:
         if self._initialized:
             return
 
-        # Import verl components
-        from verl.workers.config import HFModelConfig, RolloutConfig
-        from verl.workers.rollout.replica import RolloutMode
-
         if not ray.is_initialized():
-            # Use 'auto' to connect to existing cluster if available
-            # If no cluster, this falls back to starting a local Ray instance
-            # Use fixed namespace for persistent vLLM actor support
+            address = os.environ.get("RAY_ADDRESS", "").strip()
+            if not address:
+                raise RuntimeError("RAY_ADDRESS must be set before initializing VerlInferenceEngine")
             init_ray(
-                address="auto",
+                address=address,
                 namespace=RAY_NAMESPACE,
                 ignore_reinit_error=True,
             )
@@ -2312,10 +2339,25 @@ class VerlInferenceEngine:
         response_length = max_model_len - prompt_length
         logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
 
+        enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
+        logger.info(
+            f"Launching vLLMHttpServer for {self.model_path} "
+            f"(TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
+            f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
+        )
+
+        # Create ExtendedVLLMHttpServer as Ray actor
+        # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
+        # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
+        from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+        from dataclasses import asdict
+
+        from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
+        from verl.workers.rollout.replica import RolloutMode
+
         # Create rollout config using dataclass
         # NOTE: Keep expert_parallel_size=1 to avoid verl's worker-based EP assertion
         # Expert parallelism is enabled via engine_kwargs instead
-        enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
         rollout_config = RolloutConfig(
             name="vllm",
             tensor_model_parallel_size=self.tensor_parallel_size,
@@ -2334,59 +2376,49 @@ class VerlInferenceEngine:
             temperature=1.0,
             top_k=-1,
             top_p=1.0,
-            data_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
-            expert_parallel_size=1,  # Keep at 1 to avoid verl's worker assertion
+            data_parallel_size=1,
+            expert_parallel_size=1,
             engine_kwargs=engine_kwargs,
+            checkpoint_engine=CheckpointEngineConfig(backend="naive"),
             enable_rollout_routing_replay=enable_rollout_routing_replay,
         )
-
-        # Create model config using dataclass
         model_config = HFModelConfig(
             path=self.model_path,
             trust_remote_code=True,
             lora_rank=self.lora_rank,
             lora_adapter_path=self.lora_adapter_path,
         )
-
-        logger.info(
-            f"Launching vLLMHttpServer for {self.model_path} "
-            f"(TP={self.tensor_parallel_size}, DP={self.data_parallel_size}, total_gpus={total_gpus}, "
-            f"lora_rank={self.lora_rank}, adapter_path={self.lora_adapter_path})"
-        )
-
-        from dataclasses import asdict
-
         rollout_payload = asdict(rollout_config)
         if not rollout_payload.get("_target_"):
             rollout_payload["_target_"] = "verl.workers.config.RolloutConfig"
-
-        # Create ExtendedVLLMHttpServer as Ray actor
-        # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
-        # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-        from ..config import otel_env_vars
+        remote_kwargs: dict[str, object] = {
+            "config": rollout_payload,
+            "model_config": model_config,
+            "rollout_mode": RolloutMode.STANDALONE,
+            "workers": [],
+            "replica_rank": 0,
+            "node_rank": 0,
+            "gpus_per_node": total_gpus,
+            "nnodes": 1,
+            "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
+        }
         self.server = ExtendedVLLMHttpServer.options(
             num_gpus=total_gpus,
             max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
             runtime_env={
-                "env_vars": {
-                    "PYTHONPATH": PFS_PYTHONPATH,
+                "env_vars": actor_runtime_env_vars(
+                    pythonpath=PFS_PYTHONPATH,
+                    extra={
+                    "LD_LIBRARY_PATH": actor_ld_library_path(),
+                    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "VLLM_ATTENTION_BACKEND": server_config.vllm_attention_backend,
                     **otel_env_vars(),
-                }
+                    },
+                )
             },
-        ).remote(
-            config=rollout_payload,
-            model_config=model_config,
-            rollout_mode=RolloutMode.STANDALONE,
-            workers=[],  # No external workers for standalone
-            replica_rank=0,
-            node_rank=0,
-            gpus_per_node=total_gpus,
-            nnodes=1,
-            cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
-        )
+        ).remote(**remote_kwargs)
 
         # Launch the server
         await self.server.launch_server.remote()

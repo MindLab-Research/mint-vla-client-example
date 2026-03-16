@@ -147,6 +147,8 @@ class MultiLoRAInferenceEngine:
         self.server = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._path_load_lock = asyncio.Lock()
+        self._path_load_futures: dict[str, asyncio.Future[None]] = {}
 
     async def initialize(self) -> None:
         """Initialize the shared vLLM engine with multi-LoRA support.
@@ -161,7 +163,6 @@ class MultiLoRAInferenceEngine:
             if not ray.is_initialized():
                 # Use fixed namespace so detached actors can be found across process restarts
                 init_ray(
-                    address="auto",
                     namespace=PERSISTENT_NAMESPACE,
                     ignore_reinit_error=True,
                 )
@@ -283,7 +284,7 @@ class MultiLoRAInferenceEngine:
                 )
 
             from verl.workers.config.model import HFModelConfig
-            from verl.workers.config.rollout import RolloutConfig
+            from verl.workers.config.rollout import CheckpointEngineConfig, RolloutConfig
             from verl.workers.rollout.replica import RolloutMode
 
             from .verl_inference import _create_extended_server_class
@@ -375,6 +376,7 @@ class MultiLoRAInferenceEngine:
                 data_parallel_size=1,
                 expert_parallel_size=1,
                 engine_kwargs=engine_kwargs,
+                checkpoint_engine=CheckpointEngineConfig(backend="naive"),
                 quantization=self.quantization,
                 enable_rollout_routing_replay=enable_rollout_routing_replay,
             )
@@ -400,13 +402,17 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ..config import otel_env_vars
-            env_vars = {
-                "PYTHONPATH": PFS_PYTHONPATH,
+            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            env_vars = actor_runtime_env_vars(
+                pythonpath=PFS_PYTHONPATH,
+                extra={
+                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 **otel_env_vars(),
-            }
+                },
+            )
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
@@ -447,19 +453,20 @@ class MultiLoRAInferenceEngine:
                     self.actor_name,
                 )
 
+            remote_kwargs = {
+                "config": rollout_config,
+                "model_config": model_config,
+                "rollout_mode": RolloutMode.STANDALONE,
+                "workers": [],
+                "replica_rank": 0,
+                "node_rank": 0,
+                "gpus_per_node": total_gpus,
+                "nnodes": 1,
+                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
+            }
             self.server = ExtendedVLLMHttpServer.options(
                 **actor_options,
-            ).remote(
-                config=rollout_config,
-                model_config=model_config,
-                rollout_mode=RolloutMode.STANDALONE,
-                workers=[],
-                replica_rank=0,
-                node_rank=0,
-                gpus_per_node=total_gpus,
-                nnodes=1,
-                cuda_visible_devices=",".join(str(i) for i in range(total_gpus)),
-            )
+            ).remote(**remote_kwargs)
 
             # Run blocking ray.get() in thread executor to avoid blocking the event loop.
             # This allows the server to remain responsive during vLLM initialization.
@@ -669,12 +676,27 @@ class MultiLoRAInferenceEngine:
             )
             return existing_lora_id
 
-        # Allocate or reuse a shared LoRA ID for this adapter path
-        lora_id, is_new_load = await self.registry.allocate_for_path(
-            sampling_session_id, lora_path
-        )
-        allocated = is_new_load
+        # Allocate or reuse a shared LoRA ID for this adapter path. Coordinate
+        # concurrent first-use requests so later sessions do not observe the
+        # shared lora_int_id before the initial add_lora_from_path finishes.
+        async with self._path_load_lock:
+            lora_id, is_new_load = await self.registry.allocate_for_path(
+                sampling_session_id, lora_path
+            )
+            allocated = is_new_load
+            load_future = self._path_load_futures.get(lora_path)
+            if is_new_load:
+                loop = asyncio.get_running_loop()
+                load_future = loop.create_future()
+                self._path_load_futures[lora_path] = load_future
+
         if not is_new_load:
+            if load_future is not None and not load_future.done():
+                try:
+                    await load_future
+                except Exception:
+                    await self.registry.remove_session(sampling_session_id)
+                    raise
             logger.info(
                 "Reused LoRA for session %s from path (lora_int_id=%s path=%s)",
                 sampling_session_id,
@@ -747,7 +769,15 @@ class MultiLoRAInferenceEngine:
                         type(cleanup_e).__name__,
                         cleanup_e,
                     )
+            if load_future is not None and not load_future.done():
+                load_future.set_exception(e)
+            async with self._path_load_lock:
+                self._path_load_futures.pop(lora_path, None)
             raise
+        if load_future is not None and not load_future.done():
+            load_future.set_result(None)
+        async with self._path_load_lock:
+            self._path_load_futures.pop(lora_path, None)
         load_time = time.time() - start_time
 
         logger.info(
@@ -959,11 +989,23 @@ class MultiLoRAInferenceEngine:
                 "lora_id": lora_id,
             },
         )
+        logger.info(
+            "[generate_many result] req=%s actor=%s type=%s",
+            request_id,
+            self.actor_name,
+            type(raw).__name__,
+        )
 
         if isinstance(raw, dict):
             raw_list: list[dict] = [raw]
         else:
             raw_list = list(raw)
+        logger.info(
+            "[generate_many result] req=%s actor=%s result_count=%d",
+            request_id,
+            self.actor_name,
+            len(raw_list),
+        )
 
         if raw_list:
             timing_total_s = raw_list[0].get("_timing_total_s")
@@ -1306,6 +1348,43 @@ class MultiModelInferenceManager:
                 self._locks[model_name] = lock
             return lock
 
+    async def _named_single_node_actor_is_reusable(self, actor_name: str) -> bool:
+        """Return True only when the detached actor is usable for immediate reuse."""
+        try:
+            actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+        except ValueError:
+            return False
+        except ray.exceptions.RayActorError:
+            return False
+
+        try:
+            await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
+            engine_ready = await asyncio.to_thread(ray.get, actor.is_engine_ready.remote(), timeout=10)
+            return bool(engine_ready)
+        except SystemExit as e:
+            if getattr(e, "code", None) == 15:
+                raise
+            logger.warning(
+                "named actor probe hit SystemExit actor=%s err=%s; treating as non-reusable",
+                actor_name,
+                e,
+            )
+            return False
+        except ray.exceptions.GetTimeoutError:
+            # Busy actors still occupy the pinned node and should be reused rather than
+            # tripping a false capacity failure before initialize() reconnects to them.
+            logger.info(
+                "named actor probe timed out actor=%s; treating existing actor as reusable",
+                actor_name,
+            )
+            return True
+        except ray.exceptions.RayActorError:
+            logger.warning(
+                "named actor probe found stale/dead actor=%s; will run capacity check before recreate",
+                actor_name,
+            )
+            return False
+
     async def get_engine(self, model_name: str) -> MultiLoRAInferenceEngine:
         """Get or create engine for a model.
 
@@ -1336,12 +1415,14 @@ class MultiModelInferenceManager:
                         # sessions before they even reach `after_get_engine`. Use the detached
                         # actor name lookup instead: it is cheap, avoids queuing on the actor,
                         # and still lets us drop dead cached handles before reuse.
-                        from .multinode_inference import PERSISTENT_NAMESPACE
+                        from .multinode_inference import (
+                            PERSISTENT_NAMESPACE as MULTINODE_PERSISTENT_NAMESPACE,
+                        )
 
                         actor_name = getattr(engine, "actor_name", None)
                         if actor_name:
                             try:
-                                ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
+                                ray.get_actor(actor_name, namespace=MULTINODE_PERSISTENT_NAMESPACE)
                             except (ValueError, ray.exceptions.RayActorError):
                                 logger.warning(
                                     "Cached multi-node vLLM engine for %s has no live named actor, recreating",
@@ -1394,6 +1475,30 @@ class MultiModelInferenceManager:
             actor_name = _model_to_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
+            existing_named_actor = False
+            try:
+                if not ray.is_initialized():
+                    init_ray(
+                        address="auto",
+                        namespace=PERSISTENT_NAMESPACE,
+                        ignore_reinit_error=True,
+                    )
+                existing_named_actor = await self._named_single_node_actor_is_reusable(actor_name)
+                if existing_named_actor:
+                    logger.info(
+                        "get_engine model=%s stage=existing_named_actor_found actor=%s namespace=%s",
+                        model_name,
+                        actor_name,
+                        PERSISTENT_NAMESPACE,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "get_engine model=%s stage=existing_named_actor_probe_failed actor=%s err=%s",
+                    model_name,
+                    actor_name,
+                    e,
+                )
+
             pinned_node_ip: str | None = None
             pinned_json = _read_process_env_var("MINT_VLLM_PINNED_NODE_IP_JSON")
             raw_node_ips = _read_process_env_var("MINT_MODEL_NODE_IPS_JSON")
@@ -1436,7 +1541,14 @@ class MultiModelInferenceManager:
             # Determine quantization from model config (None = vLLM auto-detect from config.json)
             quantization = config.quantization
             total_gpus = int(config.inference_tp) * int(config.inference_dp)
-            if pinned_node_ip is not None:
+            if pinned_node_ip is not None and existing_named_actor:
+                logger.info(
+                    "get_engine model=%s stage=skip_capacity_check_existing_named_actor actor=%s pinned_node_ip=%s",
+                    model_name,
+                    actor_name,
+                    pinned_node_ip,
+                )
+            elif pinned_node_ip is not None:
                 assert_node_ip_capacity(
                     required_gpus_by_node_ip={pinned_node_ip: total_gpus},
                     context=f"single_node_vllm_pin model={model_name!r} actor={actor_name!r}",
@@ -1624,7 +1736,6 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )
@@ -1716,7 +1827,6 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if not ray.is_initialized():
         init_ray(
-            address="auto",
             namespace=PERSISTENT_NAMESPACE,
             ignore_reinit_error=True,
         )

@@ -52,6 +52,7 @@ class _SamplingSection(BaseModel):
     max_concurrent_samples_per_request: int | None = None
 
     sample_coalesce: bool | None = None
+    sample_coalesce_window_ms: float | None = None
     sample_coalesce_max_batch: int | None = None
     sample_coalesce_max_samples: int | None = None
     require_seq_id: bool | None = None
@@ -66,21 +67,14 @@ class _RaySection(BaseModel):
 class _PathsSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    pfs_runtime_env_root: str | None = None
     pfs_tinker_path: str | None = None
-    pfs_verl_path: str | None = None
-    pfs_vllm_path: str | None = None
-
-    pfs_megatron_bridge_path: str | None = None
-    pfs_megatron_bridge_hollowman_path: str | None = None
     pfs_hf_modules_path: str | None = None
-
-    pfs_extra_pythonpath: str | None = None
 
 
 class _MegatronBridgeSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    use_hollowman_mbridge: bool | None = None
     use_mbridge_lora_export: bool | None = None
 
 

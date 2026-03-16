@@ -75,7 +75,6 @@ async def _cleanup_stale_actors() -> None:
 
         if not ray.is_initialized():
             init_ray(
-                address="auto",
                 namespace=PERSISTENT_NAMESPACE,
                 ignore_reinit_error=True,
             )
@@ -159,7 +158,7 @@ async def _cleanup_stale_actors() -> None:
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
-                        num_gpus = 1  # Fallback for unknown models
+                        num_gpus: int | None = None
                         if name.startswith("tinker_vllm_"):
                             model_part = name[len("tinker_vllm_"):]
                         else:
@@ -169,6 +168,11 @@ async def _cleanup_stale_actors() -> None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored vLLM actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -177,13 +181,12 @@ async def _cleanup_stale_actors() -> None:
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
                         base_model = ""
+                        num_gpus: int | None = None
                         model_part = name[len("megatron_"):]
                         model_name, cfg = _lookup_model_config(model_part)
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.train_gpus
-                        else:
-                            num_gpus = 8  # Fallback for unknown models
 
                         # Prefer real world_size when actor is responsive.
                         try:
@@ -193,6 +196,11 @@ async def _cleanup_stale_actors() -> None:
                         except Exception:
                             pass
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
@@ -250,7 +258,7 @@ async def _cleanup_stale_actors() -> None:
 
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
-                            num_gpus = 1
+                            num_gpus: int | None = None
                             base_model = ""
                             if name.startswith("tinker_vllm_"):
                                 model_part = name[len("tinker_vllm_"):]
@@ -261,6 +269,11 @@ async def _cleanup_stale_actors() -> None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored vLLM actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -268,14 +281,18 @@ async def _cleanup_stale_actors() -> None:
                         elif name.startswith("megatron_"):
                             actor_type = ActorType.MEGATRON
                             base_model = ""
+                            num_gpus: int | None = None
                             model_part = name[len("megatron_"):]
                             model_name, cfg = _lookup_model_config(model_part)
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.train_gpus
-                            else:
-                                num_gpus = 8
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored Megatron actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
@@ -341,6 +358,15 @@ async def _prewarm_persistent_models(
 
     and marks them as ResourcePool protected to prevent LRU eviction.
     """
+    failures: list[str] = []
+
+    def _record_failure(stage: str, model_name: str, exc: Exception) -> None:
+        failures.append(f"{stage} failed model={model_name}: {type(exc).__name__}: {exc}")
+
+    def _raise_if_failures() -> None:
+        if failures:
+            raise RuntimeError("persistent prewarm failed:\n" + "\n".join(failures))
+
     models_csv = (config.prewarm_persistent_models_csv or "").strip()
     if not models_csv:
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
@@ -490,37 +516,31 @@ async def _prewarm_persistent_models(
                                 f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
                             )
 
-                    async def _await_ready(
-                        actor=actor,
-                        actor_name=actor_name,
-                        model_name=model_name,
-                    ) -> None:
-                        try:
-                            await asyncio.to_thread(
-                                ray.get,
-                                actor.__ray_ready__.remote(),
-                                timeout=megatron_ready_timeout_s,
-                            )
-                            resource_pool.mark_ready(actor_name)
-                            logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-                        except SystemExit as ready_err:
-                            if getattr(ready_err, "code", None) == 15:
-                                raise
-                            logger.warning(
-                                f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
-                            )
-                        except Exception as ready_err:
-                            logger.warning(
-                                f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
-                            )
-
-                    asyncio.create_task(_await_ready())
+                    try:
+                        await asyncio.to_thread(
+                            ray.get,
+                            actor.__ray_ready__.remote(),
+                            timeout=megatron_ready_timeout_s,
+                        )
+                        resource_pool.mark_ready(actor_name)
+                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                    except SystemExit as ready_err:
+                        if getattr(ready_err, "code", None) == 15:
+                            raise
+                        raise RuntimeError(
+                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
+                        ) from ready_err
+                    except Exception as ready_err:
+                        raise RuntimeError(
+                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
+                        ) from ready_err
                 else:
                     # Defer dense pool creation until after multi-node vLLM inference is initialized,
                     # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
                     deferred_dense_training.append((model_name, base_model))
                     logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
             except Exception as e:
+                _record_failure("training", model_name, e)
                 logger.exception(f"[prewarm] training failed model={model_name}: {e}")
         else:
             logger.info(f"[prewarm] training skipped model={model_name} (MINT_PERSISTENT_PREWARM_TRAINING=0)")
@@ -537,9 +557,11 @@ async def _prewarm_persistent_models(
         # actors (e.g., Qwen3-30B TP=4) can be placed.
 
     if not prewarm_inference:
+        _raise_if_failures()
         return
 
     if multi_model_manager is None:
+        _raise_if_failures()
         return
 
     def _infer_gpus(model_name: str) -> int:
@@ -616,8 +638,10 @@ async def _prewarm_persistent_models(
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
                 raise
+            _record_failure("inference", model_name, e)
             logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
         except Exception as e:
+            _record_failure("inference", model_name, e)
             logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
 
     # -------------------------
@@ -643,7 +667,10 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
+                _record_failure("training", model_name, e)
                 logger.exception(f"[prewarm] training failed model={model_name} backend=peft_trainer: {e}")
+
+    _raise_if_failures()
 
 
 @asynccontextmanager
@@ -747,6 +774,11 @@ async def lifespan(app: FastAPI):
     weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
 
     logger.info("Training components initialized")
+
+    # ==========================================================================
+    # Persistent actors: pre-create and protect at startup
+    # ==========================================================================
+    await _prewarm_persistent_models(train_engine, multi_model_manager)
 
     # ==========================================================================
     # Issue #84: Admission control + API work queue workers + future reaper
@@ -1070,11 +1102,6 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
 
     checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
-
-    # ==========================================================================
-    # Persistent actors: pre-create and protect at startup
-    # ==========================================================================
-    asyncio.create_task(_prewarm_persistent_models(train_engine, multi_model_manager))
 
     yield
 
