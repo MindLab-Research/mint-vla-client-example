@@ -427,7 +427,7 @@ If none of the above changed: restart server only.
 
 ```bash
 # Kill vLLM actor for K2
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -643,7 +643,7 @@ Before starting any MoE test, run:
 
 ```bash
 # Quick status command (MANDATORY before any work)
-ssh mint-dev 'python3 << "PYEOF"
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python << "PYEOF"
 import ray
 ray.init(address="auto", ignore_reinit_error=True)
 r = ray.available_resources()
@@ -748,10 +748,10 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbo
 
 ```bash
 # List all actors - this shows actual names and states
-ssh mint-dev 'ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
 
 # Or list with full details
-ssh mint-dev 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
+ssh mint-dev '/vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/ray list actors --filter "state=ALIVE" 2>&1 | head -30'
 ```
 
 ### Check Specific Actor Status
