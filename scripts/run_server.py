@@ -66,6 +66,30 @@ def _normalize_pythonpath(entries: str) -> str:
     return ":".join(part for part in entries.split(":") if part)
 
 
+def _is_interpreter_managed_path(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        candidate = pathlib.Path(path).resolve()
+    except OSError:
+        return False
+    prefixes = {
+        pathlib.Path(getattr(sys, "prefix", "")).resolve(),
+        pathlib.Path(getattr(sys, "exec_prefix", "")).resolve(),
+        pathlib.Path(getattr(sys, "base_prefix", "")).resolve(),
+        pathlib.Path(getattr(sys, "base_exec_prefix", "")).resolve(),
+    }
+    for prefix in prefixes:
+        if not str(prefix):
+            continue
+        try:
+            candidate.relative_to(prefix)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _set_exact_pythonpath(entries: str) -> str:
     normalized = _normalize_pythonpath(entries)
     if not normalized:
@@ -75,7 +99,9 @@ def _set_exact_pythonpath(entries: str) -> str:
     existing = [
         part
         for part in sys.path
-        if part not in parts and not _is_local_checkout_path(part)
+        if part not in parts
+        and not _is_local_checkout_path(part)
+        and _is_interpreter_managed_path(part)
     ]
     sys.path[:] = [*parts, *existing]
     return normalized

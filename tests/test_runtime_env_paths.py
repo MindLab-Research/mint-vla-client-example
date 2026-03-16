@@ -296,8 +296,15 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
                 "path": [
                     str(Path.cwd()),
                     str(Path.cwd() / "scripts"),
+                    "/home/yiwen/.local/lib/python3.14/site-packages",
+                    "/home/yiwen/tinker_project/mindlab-toolkit/src",
+                    "/opt/host-venv/lib/python3.12",
                     "/usr/lib/python3.12",
-                ]
+                ],
+                "prefix": "/opt/host-venv",
+                "exec_prefix": "/opt/host-venv",
+                "base_prefix": "/usr",
+                "base_exec_prefix": "/usr",
             },
         )(),
     )
@@ -306,3 +313,7 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     assert run_server.sys.path[:2] == ["/canonical/repo", "/canonical/hf"]
     assert str(Path.cwd()) not in run_server.sys.path
     assert str(Path.cwd() / "scripts") not in run_server.sys.path
+    assert "/home/yiwen/.local/lib/python3.14/site-packages" not in run_server.sys.path
+    assert "/home/yiwen/tinker_project/mindlab-toolkit/src" not in run_server.sys.path
+    assert "/opt/host-venv/lib/python3.12" in run_server.sys.path
+    assert "/usr/lib/python3.12" in run_server.sys.path
