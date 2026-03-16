@@ -441,7 +441,7 @@ except ValueError as e:
 \""
 
 # Kill Megatron actor for K2
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -455,7 +455,7 @@ except ValueError as e:
 \""
 
 # List all actors in current namespace (to find actor names)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
 ray.init(address=\"auto\", ignore_reinit_error=True)
@@ -467,7 +467,7 @@ for a in actors:
 \""
 
 # Kill all dense trainer pool actors in current namespace (prefix match)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
 ray.init(address='auto', ignore_reinit_error=True)
@@ -489,7 +489,7 @@ print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
 \""
 
 # Kill detached store actors in current namespace (name match)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/$USER/tinker-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
 ray.init(address='auto', ignore_reinit_error=True)

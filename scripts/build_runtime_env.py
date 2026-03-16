@@ -59,34 +59,6 @@ def _host_deps(pyproject: dict[str, Any]) -> list[str]:
     groups = pyproject.get("dependency-groups", {})
     return list(groups.get("host-runtime", []))
 
-
-def _host_pip_index_args(pyproject: dict[str, Any]) -> list[str]:
-    uv_cfg = pyproject.get("tool", {}).get("uv", {})
-    sources = uv_cfg.get("sources", {})
-    index_rows = uv_cfg.get("index", [])
-    index_urls = {
-        row["name"]: row["url"]
-        for row in index_rows
-        if isinstance(row, dict) and row.get("name") and row.get("url")
-    }
-    args: list[str] = []
-    seen: set[str] = set()
-    for dep in _host_deps(pyproject):
-        name = dep.split(";", 1)[0].split("[", 1)[0].split("==", 1)[0].strip()
-        source = sources.get(name)
-        if not isinstance(source, dict):
-            continue
-        index_name = source.get("index")
-        if not index_name:
-            continue
-        index_url = index_urls.get(index_name)
-        if not index_url or index_url in seen:
-            continue
-        seen.add(index_url)
-        args.extend(["--extra-index-url", index_url])
-    return args
-
-
 def _clone_checkout(target: Path, *, repo: str, commit: str) -> None:
     if target.exists():
         shutil.rmtree(target)
@@ -119,6 +91,24 @@ def _export_shared_requirements(pyproject: dict[str, Any], output: Path) -> None
     )
 
 
+def _export_host_requirements(output: Path) -> None:
+    _run(
+        [
+            _resolve_uv(),
+            "export",
+            "--frozen",
+            "--no-hashes",
+            "--no-emit-project",
+            "--no-dev",
+            "--only-group",
+            "host-runtime",
+            "--output-file",
+            str(output),
+        ],
+        cwd=REPO_ROOT,
+    )
+
+
 def _install_target(python: Path, target: Path, requirements_file: Path) -> None:
     if target.exists():
         shutil.rmtree(target)
@@ -142,16 +132,14 @@ def _install_target(python: Path, target: Path, requirements_file: Path) -> None
 def _create_host_venv(
     uv_python: str,
     host_venv: Path,
-    host_deps: list[str],
-    pip_index_args: list[str],
+    host_requirements: Path,
 ) -> Path:
     if host_venv.exists():
         shutil.rmtree(host_venv)
     _run([_resolve_uv(), "venv", "--seed", "--python", uv_python, str(host_venv)])
     python = host_venv / "bin" / "python"
-    if host_deps:
-        _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-        _run([str(python), "-m", "pip", "install", *pip_index_args, *host_deps])
+    _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    _run([str(python), "-m", "pip", "install", "-r", str(host_requirements)])
     return python
 
 
@@ -302,20 +290,15 @@ def build_runtime_env(env_root: Path) -> None:
     pyproject = _load_pyproject()
     runtime = _runtime_table(pyproject)
     shared_deps = _shared_deps(pyproject)
-    host_deps = _host_deps(pyproject)
-    host_pip_index_args = _host_pip_index_args(pyproject)
     env_root.mkdir(parents=True, exist_ok=True)
     shared_site_packages = env_root / runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)
     host_venv = env_root / runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)
     source_root = env_root / runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)
     shared_requirements = env_root / "shared-requirements.txt"
+    host_requirements = env_root / "host-requirements.txt"
 
-    host_python = _create_host_venv(
-        runtime["python_version"],
-        host_venv,
-        host_deps,
-        host_pip_index_args,
-    )
+    _export_host_requirements(host_requirements)
+    host_python = _create_host_venv(runtime["python_version"], host_venv, host_requirements)
     _export_shared_requirements(pyproject, shared_requirements)
     _install_target(host_python, shared_site_packages, shared_requirements)
 
