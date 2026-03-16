@@ -8,7 +8,6 @@ import types
 from types import SimpleNamespace
 
 import anyio
-from fastapi import HTTPException
 
 from tinker_server.models.types import CreateSamplingSessionResponse
 from tinker_server.routes import openai_compat

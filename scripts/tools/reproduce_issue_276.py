@@ -5,7 +5,6 @@ import subprocess
 import sys
 import tarfile
 import uuid
-from typing import Any
 
 import requests
 

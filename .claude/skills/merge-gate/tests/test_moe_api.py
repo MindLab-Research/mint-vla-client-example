@@ -15,8 +15,6 @@ Note: MoE tests can allocate both trainer (4 GPUs) and vLLM (4 GPUs) under an 8-
 import time
 import uuid
 
-import numpy as np
-import pytest
 
 from .conftest import (
     MOE_MODEL,

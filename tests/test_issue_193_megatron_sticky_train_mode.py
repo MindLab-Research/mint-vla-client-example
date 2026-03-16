@@ -2,7 +2,6 @@ import inspect
 import logging
 import time
 import sys
-from unittest.mock import patch
 
 import pytest
 

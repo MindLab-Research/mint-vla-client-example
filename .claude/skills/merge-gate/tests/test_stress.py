@@ -18,10 +18,7 @@ import concurrent.futures
 import os
 import threading
 import time
-from typing import Any
 
-import numpy as np
-import pytest
 from transformers import AutoTokenizer
 
 from .conftest import (
@@ -311,7 +308,7 @@ class TestStress:
 
         # Print summary
         print(f"\n{'='*60}")
-        print(f"STRESS TEST RESULTS: Dense Clients")
+        print("STRESS TEST RESULTS: Dense Clients")
         print(f"{'='*60}")
         print(f"Total time: {elapsed:.2f}s")
         print(f"Clients: {len(results)}")

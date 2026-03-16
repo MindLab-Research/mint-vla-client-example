@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, Callable
 import ray
 import torch
 import torch.distributed
-from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 
@@ -28,7 +27,6 @@ from verl.utils import tensordict_utils as tu
 if TYPE_CHECKING:
     pass
 
-from tinker_server.backend.model_registry import get_model_config
 from tinker_server.config import config as server_config
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
@@ -665,7 +663,7 @@ def create_ppo_loss_fn(
                     seq_idx = max_idx % diff.shape[1]
                     position = (batch_idx.item(), seq_idx.item())
 
-                    print(f"[PPO_LOSS DEBUG] Large logprob diff detected:")
+                    print("[PPO_LOSS DEBUG] Large logprob diff detected:")
                     print(f"  Position (batch, seq): {position}")
                     print(f"  Rollout logprob: {old_log_probs[batch_idx, seq_idx].item():.4f}")
                     print(f"  Training logprob: {response_log_probs[batch_idx, seq_idx].item():.4f}")
@@ -674,7 +672,7 @@ def create_ppo_loss_fn(
                     # 1D tensor: use position directly
                     position = max_idx.item() if hasattr(max_idx, 'item') else int(max_idx)
 
-                    print(f"[PPO_LOSS DEBUG] Large logprob diff detected:")
+                    print("[PPO_LOSS DEBUG] Large logprob diff detected:")
                     print(f"  Position in sequence: {position}")
                     print(f"  Rollout logprob: {old_log_probs[position].item():.4f}")
                     print(f"  Training logprob: {response_log_probs[position].item():.4f}")
@@ -829,7 +827,6 @@ class MegatronTrainingWorker:
         from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
-        from verl.utils.torch_dtypes import PrecisionType
 
         # Initialize distributed if not already done
         # For Ray actor running single-process multi-GPU, we set up minimal distributed env

@@ -17,7 +17,7 @@ import ray
 
 from . import ray_kill
 from .resource_pool import ActorType, get_resource_pool
-from ..config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
+from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
 logger = logging.getLogger(__name__)
 
