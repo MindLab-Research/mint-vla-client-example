@@ -202,9 +202,9 @@ def extract_otel_context_from_traceparent(traceparent: str | None) -> Any | None
     if not isinstance(traceparent, str) or not traceparent.strip():
         return None
     try:
-        from opentelemetry.propagate import extract
+        from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-        return extract({"traceparent": traceparent.strip()})
+        return TraceContextTextMapPropagator().extract({"traceparent": traceparent.strip()})
     except Exception:
         return None
 
@@ -221,7 +221,7 @@ def start_as_current_span_from_traceparent(
     kind: Any | None = None,
 ) -> Iterator[Any | None]:
     """Start an OTel span from a propagated traceparent and bind request/trace IDs for logs."""
-    trace_id = restore_trace_id_from_traceparent(traceparent)
+    trace_id = extract_trace_id_from_traceparent(traceparent)
     context = extract_otel_context_from_traceparent(traceparent)
     with bind_request_trace_context(request_id=request_id, trace_id=trace_id):
         tracer = get_otel_tracer()

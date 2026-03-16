@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+import types
 
 import tinker_server.logging_context as logging_context
 
@@ -69,14 +71,51 @@ def test_issue_304_run_async_with_otel_span_without_tracer_executes_action(monke
         logging_context._TRACER = saved_tracer
 
 
-def test_issue_304_extract_otel_context_from_traceparent_accepts_valid_header():
+def test_issue_304_extract_otel_context_from_traceparent_accepts_valid_header(monkeypatch):
     traceparent = "00-" + ("a" * 32) + "-" + ("1" * 16) + "-01"
+
+    class _DummyPropagator:
+        def extract(self, carrier):
+            assert carrier == {"traceparent": traceparent}
+            return {"ctx": "ok"}
+
+    otel_mod = types.ModuleType("opentelemetry")
+    otel_mod.__path__ = []
+    trace_mod = types.ModuleType("opentelemetry.trace")
+    trace_mod.__path__ = []
+    propagation_mod = types.ModuleType("opentelemetry.trace.propagation")
+    propagation_mod.__path__ = []
+    tracecontext_mod = types.ModuleType("opentelemetry.trace.propagation.tracecontext")
+    tracecontext_mod.TraceContextTextMapPropagator = _DummyPropagator
+
+    monkeypatch.setitem(sys.modules, "opentelemetry", otel_mod)
+    monkeypatch.setitem(sys.modules, "opentelemetry.trace", trace_mod)
+    monkeypatch.setitem(sys.modules, "opentelemetry.trace.propagation", propagation_mod)
+    monkeypatch.setitem(sys.modules, "opentelemetry.trace.propagation.tracecontext", tracecontext_mod)
+
     ctx = logging_context.extract_otel_context_from_traceparent(traceparent)
     assert ctx is not None
 
 
 def test_issue_304_extract_otel_context_from_traceparent_rejects_blank():
     assert logging_context.extract_otel_context_from_traceparent("") is None
+
+
+def test_issue_304_start_as_current_span_from_traceparent_restores_previous_trace_id(monkeypatch):
+    saved_tracer = logging_context._TRACER
+    prev_trace_id = logging_context.get_trace_id()
+    try:
+        monkeypatch.setattr(logging_context, "_TRACER", None)
+        logging_context.set_trace_id("b" * 32)
+        with logging_context.start_as_current_span_from_traceparent(
+            "test.span",
+            traceparent="00-" + ("a" * 32) + "-" + ("1" * 16) + "-01",
+        ):
+            assert logging_context.get_trace_id() == "a" * 32
+        assert logging_context.get_trace_id() == "b" * 32
+    finally:
+        logging_context._TRACER = saved_tracer
+        logging_context.set_trace_id(prev_trace_id)
 
 
 def test_issue_304_traced_async_from_traceparent_binds_context(monkeypatch):

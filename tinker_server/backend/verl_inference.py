@@ -1803,6 +1803,17 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return out
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.compute_prompt_topk_with_lora",
+            component="vllm_actor",
+            op="sampling.compute_prompt_topk_with_lora",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "topk": a.get("k"),
+            },
+        )
         async def compute_prompt_topk_with_lora(
             self,
             prompt_ids: list[int],
@@ -1958,6 +1969,16 @@ def _create_extended_server_class(max_loras: int = 1, max_cpu_loras: int = 0):
 
             return out
 
+        @traced_async_from_traceparent(
+            "sampling.vllm_actor.compute_prompt_topk_base",
+            component="vllm_actor",
+            op="sampling.compute_prompt_topk_base",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "topk": a.get("k"),
+            },
+        )
         async def compute_prompt_topk_base(
             self,
             prompt_ids: list[int],

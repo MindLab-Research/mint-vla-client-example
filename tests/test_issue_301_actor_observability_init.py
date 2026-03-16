@@ -47,8 +47,8 @@ def test_issue_301_actor_entrypoints_call_observability_init():
 def test_issue_301_sampling_actor_entrypoints_use_traceparent_span_decorator():
     repo_root = Path(__file__).resolve().parents[1]
     required = {
-        "tinker_server/backend/verl_inference.py": 5,
-        "tinker_server/backend/multinode_inference.py": 3,
+        "tinker_server/backend/verl_inference.py": 7,
+        "tinker_server/backend/multinode_inference.py": 4,
     }
 
     for rel_path, min_count in required.items():

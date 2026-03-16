@@ -1580,6 +1580,17 @@ def _create_multinode_vllm_actor(
 
             return out
 
+        @traced_async_from_traceparent(
+            "sampling.multinode_vllm_actor.compute_prompt_topk",
+            component="multinode_vllm_actor",
+            op="sampling.compute_prompt_topk",
+            request_id_arg="request_id",
+            attributes_builder=lambda a: {
+                "lora_int_id": a.get("lora_int_id"),
+                "prompt_tokens": len(a.get("prompt_ids") or []),
+                "topk": a.get("k"),
+            },
+        )
         async def compute_prompt_topk(
             self,
             prompt_ids: list[int],
