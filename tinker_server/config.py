@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -168,11 +170,55 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
     }
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is not None:
+        out["RAY_ADDRESS"] = ray_address
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
+    for key in (
+        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "TINKER_ACTOR_LD_LIBRARY_PATH",
+    ):
+        value = _env_nonempty(os.environ, key)
+        if value is not None:
+            out[key] = value
     if extra:
         out.update(extra)
+    return out
+
+
+def preferred_vllm_python_executable() -> str | None:
+    if PFS_TINKER_PATH:
+        candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
+        if candidate.exists():
+            return str(candidate)
+    return _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+
+
+def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
+    """Return torch lib directories in priority order for this Python runtime."""
+    environ = os.environ if environ is None else environ
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    env_root = _env_nonempty(environ, "PFS_RUNTIME_ENV_ROOT") or PFS_RUNTIME_ENV_ROOT
+    candidates: list[str] = []
+    if env_root:
+        candidates.extend(
+            [
+                os.path.join(env_root, "host-venv", "lib", pyver, "site-packages", "torch", "lib"),
+                os.path.join(env_root, "site-packages", "torch", "lib"),
+            ]
+        )
+    candidates.append(f"/usr/local/lib/{pyver}/dist-packages/torch/lib")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen or not os.path.isdir(path):
+            continue
+        seen.add(norm)
+        out.append(path)
     return out
 
 
@@ -187,7 +233,7 @@ def actor_ld_library_path() -> str:
         return override
     return ":".join(
         [
-            "/usr/local/lib/python3.12/dist-packages/torch/lib",
+            *preferred_torch_lib_dirs(),
             "/usr/local/cuda/compat/lib",
             "/usr/local/nvidia/lib",
             "/usr/local/nvidia/lib64",

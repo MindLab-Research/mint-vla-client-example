@@ -42,6 +42,10 @@ def join_pythonpath(*parts: str | Sequence[str]) -> str:
     return ":".join(flat)
 
 
+def _norm_pythonpath_entry(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
 @dataclass(frozen=True)
 class RuntimeEnvLayout:
     root: str
@@ -158,6 +162,31 @@ def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = Tr
             f"root={layout.root!r} missing={missing!r}"
         )
     return layout
+
+
+def host_only_pythonpath_entries(env_root: str) -> tuple[str, ...]:
+    layout = runtime_env_layout(env_root)
+    return tuple(layout.host_pythonpath_entries)
+
+
+def sanitize_worker_pythonpath(raw: str | None, *, env_root: str | None) -> str:
+    entries = split_pythonpath(raw)
+    excluded: set[str] = set()
+    if env_root:
+        try:
+            excluded.update(_norm_pythonpath_entry(path) for path in host_only_pythonpath_entries(env_root))
+        except Exception:
+            pass
+
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        norm = _norm_pythonpath_entry(entry)
+        if norm in excluded or norm in seen:
+            continue
+        seen.add(norm)
+        sanitized.append(entry)
+    return join_pythonpath(sanitized)
 
 
 def build_runtime_pythonpath(

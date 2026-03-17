@@ -72,8 +72,10 @@ fi
 export TINKER_API_WORK_QUEUE_ACTOR_NAME=tinker_api_work_queue_v20260309
 export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY=1024
 
-export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/tinker-server-auth/tinker-runtime-py31213
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/tinker-server-auth
 export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
+export MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/tinker-server-auth/scripts/vllm_worker_python.py
+export TINKER_ACTOR_LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
 
-export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/tinker-server-auth/tinker-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
