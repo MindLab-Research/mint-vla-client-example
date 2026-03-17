@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 
 
 class _DummyRequest:
@@ -28,6 +29,53 @@ def _install_ray_stub(monkeypatch, *, available: dict | None = None, total: dict
         placement_group_table=lambda *args, **kwargs: {},
         get_placement_group=lambda name: None,
     )
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+
+def _install_ray_cluster_health_stub(monkeypatch) -> None:
+    ray = types.ModuleType("ray")
+    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray.available_resources = lambda: {"CPU": 12, "GPU": 3}  # type: ignore[attr-defined]
+    ray.cluster_resources = lambda: {"CPU": 16, "GPU": 8}  # type: ignore[attr-defined]
+    ray.nodes = lambda: [  # type: ignore[attr-defined]
+        {"Alive": True, "NodeManagerAddress": "10.0.0.1"},
+        {
+            "Alive": False,
+            "NodeManagerAddress": "10.0.0.2",
+            "DeathReasonMessage": "health check failed due to missing too many heartbeats",
+        },
+    ]
+    ray.util = SimpleNamespace(
+        placement_group_table=lambda *args, **kwargs: {
+            "pg1": {"name": "pg-ready", "state": "CREATED", "bundles": {0: {"GPU": 1}}},
+            "pg2": {"name": "pg-pending", "state": "PENDING", "bundles": {0: {"GPU": 4}}},
+        },
+        get_placement_group=lambda name: None,
+        list_named_actors=lambda all_namespaces=True: [
+            {"name": "a", "namespace": "tinker"},
+            {"name": "b", "namespace": "other"},
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+
+def _install_ray_gcs_metrics_stub(monkeypatch) -> None:
+    ray = types.ModuleType("ray")
+    ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray.nodes = lambda: [  # type: ignore[attr-defined]
+        {
+            "Alive": True,
+            "IsHeadNode": True,
+            "NodeManagerAddress": "10.0.0.1",
+            "MetricsExportPort": 8080,
+        },
+        {
+            "Alive": True,
+            "IsHeadNode": False,
+            "NodeManagerAddress": "10.0.0.2",
+            "MetricsExportPort": 8081,
+        },
+    ]
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
@@ -229,3 +277,164 @@ def test_issue_281_http_route_label_prefers_route_template() -> None:
     )
 
     assert _http_route_label(request) == "/api/v1/training_runs/{training_run_id}"
+
+
+def test_ray_cluster_health_snapshot_summarizes_cluster_state(monkeypatch) -> None:
+    from tinker_server import ray_cluster_health as rch
+
+    _install_ray_cluster_health_stub(monkeypatch)
+    monkeypatch.setattr(rch, "_CACHE_VALUE", None)
+    monkeypatch.setattr(rch, "_CACHE_AT_MONO", 0.0)
+
+    snapshot = rch.get_ray_cluster_health_snapshot(force_refresh=True)
+
+    assert snapshot["status"] == "degraded"
+    assert snapshot["up"] is True
+    assert snapshot["nodes"]["alive"] == 1
+    assert snapshot["nodes"]["dead"] == 1
+    assert snapshot["nodes"]["dead_missing_heartbeats"] == 1
+    assert snapshot["placement_groups"]["pending_gpu"] == 1
+    assert snapshot["placement_groups"]["pending_gpu_names"] == ["pg-pending"]
+    assert snapshot["named_actors"]["total"] == 2
+    assert snapshot["named_actors"]["namespace"] == 1
+    assert "slow_control_plane_probes" not in snapshot["warnings"]
+
+
+@pytest.mark.anyio
+async def test_internal_metrics_exports_ray_cluster_metrics(monkeypatch) -> None:
+    from tinker_server.routes import internal
+
+    async def _fake_admission_stats() -> dict:
+        return {
+            "capacity": {},
+            "work_queue": {},
+            "future_store": {},
+            "actors": {},
+            "process": {},
+            "ray_cluster": {
+                "up": True,
+                "warning_count": 2,
+                "probe_error_count": 1,
+                "slow_probe_count": 1,
+                "total_probe_latency_ms": 321.5,
+                "cache_age_s": 7.0,
+                "nodes": {"alive": 6, "dead": 2, "dead_missing_heartbeats": 2},
+                "resources": {"gpu_total": 72, "gpu_available": 56, "cpu_total": 100, "cpu_available": 84},
+                "placement_groups": {"total": 9, "created": 6, "removed": 1, "pending": 2, "pending_gpu": 2},
+                "named_actors": {"total": 11, "namespace": 8},
+                "probes": {
+                    "nodes": {"ok": True, "latency_ms": 12.5},
+                    "placement_groups": {"ok": False, "latency_ms": 2500.0},
+                },
+            },
+        }
+
+    monkeypatch.setattr(internal, "admission_stats", _fake_admission_stats)
+
+    response = await internal.metrics()
+
+    assert isinstance(response, Response)
+    body = response.body.decode()
+    assert 'tinker_ray_cluster_up 1' in body
+    assert 'tinker_ray_cluster_dead_nodes_missing_heartbeats 2' in body
+    assert 'tinker_ray_cluster_gpu_total 72' in body
+    assert 'tinker_ray_cluster_placement_groups_pending_gpu 2' in body
+    assert 'tinker_ray_cluster_probe_success{probe="nodes"} 1' in body
+    assert 'tinker_ray_cluster_probe_success{probe="placement_groups"} 0' in body
+
+
+def test_ray_gcs_metrics_snapshot_extracts_selected_metrics(monkeypatch) -> None:
+    from tinker_server import ray_gcs_metrics as rgm
+
+    _install_ray_gcs_metrics_stub(monkeypatch)
+    monkeypatch.setattr(rgm, "_CACHE_VALUE", None)
+    monkeypatch.setattr(rgm, "_CACHE_AT_MONO", 0.0)
+
+    prom_text = """
+# HELP gcs_task_manager_task_events_reported reported
+gcs_task_manager_task_events_reported{Component="gcs_server"} 1000
+gcs_task_manager_task_events_stored{Component="gcs_server"} 995
+gcs_task_manager_task_events_dropped{Component="gcs_server"} 5
+gcs_storage_operation_count{Component="gcs_server"} 200
+gcs_storage_operation_latency_ms_sum{Component="gcs_server"} 80
+gcs_storage_operation_latency_ms_count{Component="gcs_server"} 4
+gcs_placement_group_count{Component="gcs_server"} 9
+gcs_actors_count{Component="gcs_server"} 11
+grpc_server_req_handling{Component="gcs_server",grpc_server_method="GetAllNodeInfo"} 3
+grpc_server_req_failed{Component="gcs_server",grpc_server_method="GetAllNodeInfo",grpc_server_status="DEADLINE_EXCEEDED"} 7
+grpc_server_req_process_time_ms_sum{Component="gcs_server",grpc_server_method="GetAllNodeInfo"} 50
+grpc_server_req_process_time_ms_count{Component="gcs_server",grpc_server_method="GetAllNodeInfo"} 2
+health_check_rpc_latency_ms_sum{Component="gcs_server"} 20
+health_check_rpc_latency_ms_count{Component="gcs_server"} 2
+grpc_server_req_handling{Component="raylet",grpc_server_method="GetAllNodeInfo"} 99
+""".strip()
+
+    monkeypatch.setattr(rgm, "_scrape_metrics_text", lambda address, timeout_s: prom_text)
+
+    snapshot = rgm.get_ray_gcs_metrics_snapshot(force_refresh=True)
+
+    assert snapshot["status"] == "ready"
+    assert snapshot["up"] is True
+    assert snapshot["candidate_addresses"] == ["10.0.0.1:8080"]
+    assert snapshot["sources_with_metrics"] == ["10.0.0.1:8080"]
+    assert snapshot["aggregates"]["gcs_task_manager_task_events_dropped"] == 5.0
+    assert snapshot["derived"]["gcs_task_manager_task_events_drop_ratio"] == 0.005
+    assert snapshot["derived"]["gcs_storage_operation_latency_ms_mean"] == 20.0
+    assert snapshot["derived"]["health_check_rpc_latency_ms_mean"] == 10.0
+    sample_names = {sample["name"] for sample in snapshot["samples"]}
+    assert "gcs_task_manager_task_events_reported" in sample_names
+    assert "grpc_server_req_handling" in sample_names
+    assert snapshot["sample_count"] == 14
+
+
+@pytest.mark.anyio
+async def test_internal_metrics_exports_ray_gcs_bridge_metrics(monkeypatch) -> None:
+    from tinker_server.routes import internal
+
+    async def _fake_admission_stats() -> dict:
+        return {
+            "capacity": {},
+            "work_queue": {},
+            "future_store": {},
+            "actors": {},
+            "process": {},
+            "ray_cluster": {},
+            "ray_gcs_metrics": {
+                "up": True,
+                "scrape_error_count": 0,
+                "sample_count": 3,
+                "scrape_latency_ms": 42.0,
+                "cache_age_s": 5.0,
+                "derived": {
+                    "gcs_task_manager_task_events_drop_ratio": 0.01,
+                },
+                "samples": [
+                    {
+                        "name": "gcs_task_manager_task_events_dropped",
+                        "labels": {"Component": "gcs_server"},
+                        "value": 12,
+                    },
+                    {
+                        "name": "grpc_server_req_handling",
+                        "labels": {"Component": "gcs_server", "grpc_server_method": "GetAllNodeInfo"},
+                        "value": 4,
+                    },
+                    {
+                        "name": "health_check_rpc_latency_ms_count",
+                        "labels": {"Component": "gcs_server"},
+                        "value": 2,
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(internal, "admission_stats", _fake_admission_stats)
+
+    response = await internal.metrics()
+
+    assert isinstance(response, Response)
+    body = response.body.decode()
+    assert "tinker_ray_gcs_metrics_bridge_up 1" in body
+    assert "tinker_ray_gcs_gcs_task_manager_task_events_drop_ratio 0.01" in body
+    assert 'gcs_task_manager_task_events_dropped{Component="gcs_server"} 12' in body
+    assert 'grpc_server_req_handling{Component="gcs_server",grpc_server_method="GetAllNodeInfo"} 4' in body

@@ -24,6 +24,9 @@ from ..auth_identity import is_admin_request
 from ..checkpoints import get_persistent_search_roots
 from ..config import config as server_config
 from ..health_checks import deep_healthz_response
+from ..logging_context import get_otel_tracer
+from ..ray_cluster_health import get_ray_cluster_health_snapshot
+from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
 
 # Checkpoint directory (shared filesystem)
@@ -259,6 +262,18 @@ async def admission_stats() -> dict:
         except Exception as e:
             driver_state["sampling_sessions_error"] = f"{type(e).__name__}: {e}"
 
+    ray_cluster = None
+    try:
+        ray_cluster = get_ray_cluster_health_snapshot()
+    except Exception as e:
+        ray_cluster = {"error": f"{type(e).__name__}: {e}"}
+
+    ray_gcs_metrics = None
+    try:
+        ray_gcs_metrics = get_ray_gcs_metrics_snapshot()
+    except Exception as e:
+        ray_gcs_metrics = {"error": f"{type(e).__name__}: {e}"}
+
     return {
         "capacity": cap,
         "work_queue": q,
@@ -266,7 +281,19 @@ async def admission_stats() -> dict:
         "actors": actors,
         "process": proc,
         "driver_state": driver_state,
+        "ray_cluster": ray_cluster,
+        "ray_gcs_metrics": ray_gcs_metrics,
     }
+
+
+@router.get("/ray_cluster_health")
+async def ray_cluster_health() -> dict:
+    return get_ray_cluster_health_snapshot()
+
+
+@router.get("/ray_gcs_metrics")
+async def ray_gcs_metrics() -> dict:
+    return get_ray_gcs_metrics_snapshot()
 
 
 def _prom_sanitize_name(v: str) -> str:
@@ -326,6 +353,28 @@ def _append_metric(
             lines.append(f"{name}{{{','.join(label_parts)}}} {_prom_format_number(num)}")
             return
     lines.append(f"{name} {_prom_format_number(num)}")
+
+
+def _append_raw_prom_sample(
+    lines: list[str],
+    metric_name: str,
+    value: object,
+    labels: dict[str, object] | None = None,
+) -> None:
+    num = _prom_number(value)
+    if num is None:
+        return
+
+    if labels:
+        label_parts = []
+        for key, raw_v in sorted(labels.items()):
+            if raw_v is None:
+                continue
+            label_parts.append(f'{key}="{_prom_escape_label_value(raw_v)}"')
+        if label_parts:
+            lines.append(f"{metric_name}{{{','.join(label_parts)}}} {_prom_format_number(num)}")
+            return
+    lines.append(f"{metric_name} {_prom_format_number(num)}")
 
 
 @router.get("/metrics")
@@ -464,6 +513,102 @@ async def metrics() -> Response:
         _append_metric(lines, "MINT_driver_sampling_sessions_base_model", driver_state.get("sampling_sessions_base_model"))
         _append_metric(lines, "MINT_driver_sampling_sessions_lora_loaded", driver_state.get("sampling_sessions_lora_loaded"))
         _append_metric(lines, "MINT_driver_sampling_sessions_inflight", driver_state.get("sampling_sessions_inflight"))
+
+    ray_cluster = stats.get("ray_cluster")
+    if isinstance(ray_cluster, dict):
+        _append_metric(lines, "tinker_ray_cluster_up", ray_cluster.get("up"))
+        _append_metric(lines, "tinker_ray_cluster_warning_count", ray_cluster.get("warning_count"))
+        _append_metric(lines, "tinker_ray_cluster_probe_error_count", ray_cluster.get("probe_error_count"))
+        _append_metric(lines, "tinker_ray_cluster_slow_probe_count", ray_cluster.get("slow_probe_count"))
+        _append_metric(lines, "tinker_ray_cluster_total_probe_latency_ms", ray_cluster.get("total_probe_latency_ms"))
+        _append_metric(lines, "tinker_ray_cluster_cache_age_s", ray_cluster.get("cache_age_s"))
+
+        nodes = ray_cluster.get("nodes")
+        if isinstance(nodes, dict):
+            _append_metric(lines, "tinker_ray_cluster_nodes", nodes.get("alive"), labels={"state": "alive"})
+            _append_metric(lines, "tinker_ray_cluster_nodes", nodes.get("dead"), labels={"state": "dead"})
+            _append_metric(
+                lines,
+                "tinker_ray_cluster_dead_nodes_missing_heartbeats",
+                nodes.get("dead_missing_heartbeats"),
+            )
+
+        resources = ray_cluster.get("resources")
+        if isinstance(resources, dict):
+            for key in (
+                "cpu_total",
+                "cpu_available",
+                "gpu_total",
+                "gpu_available",
+                "memory_total",
+                "memory_available",
+                "object_store_memory_total",
+                "object_store_memory_available",
+            ):
+                _append_metric(lines, f"tinker_ray_cluster_{key}", resources.get(key))
+
+        placement_groups = ray_cluster.get("placement_groups")
+        if isinstance(placement_groups, dict):
+            for key in ("total", "created", "removed", "pending", "pending_gpu"):
+                _append_metric(lines, f"tinker_ray_cluster_placement_groups_{key}", placement_groups.get(key))
+
+        named_actors = ray_cluster.get("named_actors")
+        if isinstance(named_actors, dict):
+            _append_metric(lines, "tinker_ray_cluster_named_actors_total", named_actors.get("total"))
+            _append_metric(
+                lines,
+                "tinker_ray_cluster_named_actors_namespace",
+                named_actors.get("namespace"),
+            )
+
+        probes = ray_cluster.get("probes")
+        if isinstance(probes, dict):
+            for probe_name, probe in probes.items():
+                if not isinstance(probe, dict):
+                    continue
+                labels = {"probe": probe_name}
+                _append_metric(lines, "tinker_ray_cluster_probe_success", probe.get("ok"), labels=labels)
+                _append_metric(lines, "tinker_ray_cluster_probe_latency_ms", probe.get("latency_ms"), labels=labels)
+
+    ray_gcs_metrics = stats.get("ray_gcs_metrics")
+    if isinstance(ray_gcs_metrics, dict):
+        _append_metric(lines, "tinker_ray_gcs_metrics_bridge_up", ray_gcs_metrics.get("up"))
+        _append_metric(
+            lines,
+            "tinker_ray_gcs_metrics_bridge_scrape_error_count",
+            ray_gcs_metrics.get("scrape_error_count"),
+        )
+        _append_metric(
+            lines,
+            "tinker_ray_gcs_metrics_bridge_sample_count",
+            ray_gcs_metrics.get("sample_count"),
+        )
+        _append_metric(
+            lines,
+            "tinker_ray_gcs_metrics_bridge_scrape_latency_ms",
+            ray_gcs_metrics.get("scrape_latency_ms"),
+        )
+        _append_metric(
+            lines,
+            "tinker_ray_gcs_metrics_bridge_cache_age_s",
+            ray_gcs_metrics.get("cache_age_s"),
+        )
+
+        derived = ray_gcs_metrics.get("derived")
+        if isinstance(derived, dict):
+            for key, value in derived.items():
+                _append_metric(lines, f"tinker_ray_gcs_{key}", value)
+
+        samples = ray_gcs_metrics.get("samples")
+        if isinstance(samples, list):
+            for sample in samples:
+                if not isinstance(sample, dict):
+                    continue
+                metric_name = sample.get("name")
+                if not isinstance(metric_name, str) or not metric_name:
+                    continue
+                labels = sample.get("labels") if isinstance(sample.get("labels"), dict) else None
+                _append_raw_prom_sample(lines, metric_name, sample.get("value"), labels=labels)
 
     if not lines:
         lines.append("tinker_metrics_up 0")
