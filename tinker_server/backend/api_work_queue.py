@@ -1093,11 +1093,14 @@ class ApiWorkQueueClient:
             return None, None
         return key, seq
 
-    async def _acquire_execution_serial_state(self, key: str) -> _ExecutionSerialState:
+    async def _acquire_execution_serial_state(self, key: str, *, initial_seq: int) -> _ExecutionSerialState:
         async with self._execution_serial_states_guard:
             state = self._execution_serial_states.get(key)
             if state is None:
-                state = _ExecutionSerialState(cond=asyncio.Condition())
+                state = _ExecutionSerialState(
+                    cond=asyncio.Condition(),
+                    next_seq=max(1, int(initial_seq)),
+                )
                 self._execution_serial_states[key] = state
             state.refs += 1
             return state
@@ -1108,8 +1111,10 @@ class ApiWorkQueueClient:
             if current is not state:
                 return
             state.refs = max(0, int(state.refs) - 1)
-            if state.refs == 0:
-                self._execution_serial_states.pop(key, None)
+            # Keep the per-key sequence cursor even when there are no active waiters.
+            # Dequeue assigns monotonically increasing execution_serial_seq values per key,
+            # so dropping state here would reset next_seq back to 1 and deadlock the next
+            # non-overlapping item for the same key.
 
     @asynccontextmanager
     async def _execution_serialized(self, item: WorkItem):
@@ -1118,7 +1123,7 @@ class ApiWorkQueueClient:
             yield
             return
 
-        state = await self._acquire_execution_serial_state(key)
+        state = await self._acquire_execution_serial_state(key, initial_seq=seq)
         try:
             async with state.cond:
                 await state.cond.wait_for(lambda: int(state.next_seq) == int(seq))

@@ -104,3 +104,37 @@ async def test_issue_194_different_keys_can_execute_concurrently() -> None:
     await asyncio.gather(task1, task2)
 
     assert max_active == 2
+
+
+@pytest.mark.anyio
+async def test_issue_194_same_key_non_overlapping_requests_do_not_deadlock() -> None:
+    client = ApiWorkQueueClient()
+    item1 = _work_item("r1", key="training_session:model-a", seq=1)
+    item2 = _work_item("r2", key="training_session:model-a", seq=2)
+
+    async with client._execution_serialized(item1):
+        pass
+
+    entered_second = asyncio.Event()
+
+    async def _run_second() -> None:
+        async with client._execution_serialized(item2):
+            entered_second.set()
+
+    await asyncio.wait_for(asyncio.create_task(_run_second()), timeout=1.0)
+    assert entered_second.is_set()
+
+
+@pytest.mark.anyio
+async def test_issue_194_fresh_client_accepts_preadvanced_sequence_cursor() -> None:
+    client = ApiWorkQueueClient()
+    item = _work_item("r5", key="training_session:model-a", seq=5)
+
+    entered = asyncio.Event()
+
+    async def _run() -> None:
+        async with client._execution_serialized(item):
+            entered.set()
+
+    await asyncio.wait_for(asyncio.create_task(_run()), timeout=1.0)
+    assert entered.is_set()

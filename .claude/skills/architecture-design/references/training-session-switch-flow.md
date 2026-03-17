@@ -104,6 +104,8 @@ And the remaining same-session mutating sync routes now enqueue internal work on
 
 That means the following operations now share one per-session serialized lane:
 
+- `training.create_model`
+- `training.create_model_from_state`
 - `training.forward_backward`
 - `training.optim_step`
 - `training.save_weights_for_sampler`
@@ -141,6 +143,15 @@ This is the key difference:
 - execution serialization controls actual submission order
 
 Both are needed.
+
+The same `execution_serial_key` also now covers lifecycle creation for a concrete `model_id`:
+
+- `create_model`
+- `create_model_from_state`
+
+That prevents a follow-up op from running against a half-initialized session after
+`TrainingSessionManager` metadata has been published but before actor creation or
+checkpoint load has finished.
 
 ## App executor layer
 

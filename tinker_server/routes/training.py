@@ -357,6 +357,29 @@ def _build_training_scheduler_extra(
     return extra
 
 
+def _build_model_lifecycle_serial_extra(
+    *,
+    model_id: str,
+    base_model: str,
+    training_op: str,
+) -> dict[str, Any]:
+    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    domain_key = base_model if base_model else str(model_id)
+    return {
+        "scheduler_enabled": bool(enabled),
+        "scheduler_domain": f"lifecycle:{domain_key}",
+        "scheduler_session_key": str(model_id),
+        "execution_serial_key": f"training_session:{model_id}",
+        "training_op": str(training_op),
+    }
+
+
 def _sync_route_wait_timeout_s() -> float:
     try:
         return max(1.0, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_TIMEOUT_S", "3600")).strip()))
@@ -571,13 +594,18 @@ async def create_model(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "training.create_model"})
+        future_store.mark_queued(request_id, meta={"op": "training.create_model", "model_id": model_id})
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model",
             request_json=request_json,
             user_id=user_id,
             webhook_url=webhook_url,
+            extra=_build_model_lifecycle_serial_extra(
+                model_id=model_id,
+                base_model=request.base_model,
+                training_op="create_model",
+            ),
         )
         if webhook_url and user_id:
             send_task_event(
@@ -627,6 +655,7 @@ async def _do_create_model(
 ) -> None:
     """Background task to create training model."""
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    session_created = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -635,8 +664,9 @@ async def _do_create_model(
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
         if existing is not None:
-            # Clean up stale session and retry
-            logger.warning(f"[{model_id}] Cleaning up stale session from previous attempt")
+            if bool(getattr(existing, "is_active", False)):
+                raise RuntimeError(f"Model '{model_id}' already exists")
+            logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
             await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
@@ -653,6 +683,7 @@ async def _do_create_model(
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
+        session_created = True
 
         # Create Ray actor - if this fails, session will be cleaned up in except block
         await training_engine.create_training_session(session)
@@ -724,7 +755,7 @@ async def _do_create_model(
             "check_training_session_and_actor",
         )
         # Clean up session if it was created
-        if training_manager and training_manager.get_session(model_id):
+        if session_created and training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
         # If session tracking was updated in ResourcePool during a partially-failed
         # create_training_session, clear it to avoid pinning actors as non-idle.
@@ -929,13 +960,21 @@ async def create_model_from_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "training.create_model_from_state"})
+        future_store.mark_queued(
+            request_id,
+            meta={"op": "training.create_model_from_state", "model_id": model_id},
+        )
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.create_model_from_state",
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=_build_model_lifecycle_serial_extra(
+                model_id=model_id,
+                base_model=request.base_model,
+                training_op="create_model_from_state",
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -952,12 +991,12 @@ async def _do_create_model_from_state(
     request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
+    model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    session_created = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
-
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
         # Queue-time validation hands the background worker a concrete local path.
         load_path = request.state_path
@@ -965,7 +1004,9 @@ async def _do_create_model_from_state(
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
         if existing is not None:
-            logger.warning(f"[{model_id}] Cleaning up stale session from previous attempt")
+            if bool(getattr(existing, "is_active", False)):
+                raise RuntimeError(f"Model '{model_id}' already exists")
+            logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
             await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
@@ -982,6 +1023,7 @@ async def _do_create_model_from_state(
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
+        session_created = True
 
         # Create Ray actor
         await training_engine.create_training_session(session)
@@ -1052,8 +1094,7 @@ async def _do_create_model_from_state(
             "check_checkpoint_path_and_training_actor",
         )
         # Clean up session if it was created
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
-        if training_manager and training_manager.get_session(model_id):
+        if session_created and training_manager and training_manager.get_session(model_id):
             try:
                 session = training_manager.get_session(model_id)
                 if session:

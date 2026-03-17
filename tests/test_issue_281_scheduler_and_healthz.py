@@ -89,6 +89,64 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
 
 
 @pytest.mark.anyio
+async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch) -> None:
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.gateway as gateway
+    import tinker_server.supported_models_gate as gate
+    from tinker_server.models.types import CreateModelRequest, LoRAConfig
+    from tinker_server.routes import training as tr
+
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    captured: dict = {}
+
+    async def _fake_enqueue(**kwargs):
+        captured.update(kwargs)
+
+    async def _allow_model(*, base_model, http_request):
+        return base_model
+
+    monkeypatch.setattr(gate, "enforce_base_model_allowed", _allow_model)
+    monkeypatch.setattr(gateway, "upstream_for_model", lambda _base_model: None)
+    monkeypatch.setattr(gateway, "get_gateway_config", lambda: None)
+    monkeypatch.setattr(gateway, "remote_training_model", lambda _model_id: None)
+    monkeypatch.setattr(tr, "training_engine", object())
+    monkeypatch.setattr(tr, "training_manager", object())
+    monkeypatch.setattr(tr, "can_access_model", lambda _base_model, _user_data: True)
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            create_with_id=lambda _request_id: None,
+            mark_queued=lambda _request_id, meta=None: None,
+            cleanup=lambda _request_id: None,
+        ),
+    )
+    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
+    monkeypatch.setattr(
+        cm,
+        "capacity_manager",
+        SimpleNamespace(
+            try_reserve=lambda *args, **kwargs: {"ok": True},
+            release_all=lambda *_args, **_kwargs: None,
+        ),
+    )
+
+    req = CreateModelRequest(
+        session_id="s281",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        lora_config=LoRAConfig(rank=8),
+    )
+    await tr.create_model(req, _DummyRequest(user_id="owner-a"))
+
+    assert captured["op"] == "training.create_model"
+    assert captured["extra"]["execution_serial_key"] == "training_session:s281_0"
+    assert captured["extra"]["scheduler_session_key"] == "s281_0"
+    assert captured["extra"]["training_op"] == "create_model"
+
+
+@pytest.mark.anyio
 async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(monkeypatch) -> None:
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
@@ -243,6 +301,95 @@ async def test_issue_281_delete_model_enqueues_scheduler_metadata(monkeypatch) -
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "delete_model"
+
+
+@pytest.mark.anyio
+async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
+    from tinker_server.models.types import CreateModelRequest, LoRAConfig
+    from tinker_server.routes import training as tr
+
+    deleted: list[str] = []
+    failed: dict = {}
+
+    existing = SimpleNamespace(is_active=True)
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: existing,
+            delete_session=lambda model_id: deleted.append(model_id),
+        ),
+    )
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(shutdown_session=lambda _session: None))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
+        ),
+    )
+
+    await tr._do_create_model(
+        "rid-dup",
+        CreateModelRequest(
+            session_id="sdup",
+            model_seq_id=0,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            lora_config=LoRAConfig(rank=8),
+        ),
+        user_id="owner-a",
+        webhook_url=None,
+    )
+
+    assert deleted == []
+    assert failed["request_id"] == "rid-dup"
+    assert "already exists" in failed["error"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_do_create_model_from_state_active_duplicate_fails_without_deleting_existing(monkeypatch) -> None:
+    from tinker_server.models.types import CreateModelFromStateRequest, LoRAConfig
+    from tinker_server.routes import training as tr
+
+    deleted: list[str] = []
+    failed: dict = {}
+
+    existing = SimpleNamespace(is_active=True)
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: existing,
+            delete_session=lambda model_id: deleted.append(model_id),
+        ),
+    )
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(shutdown_session=lambda _session: None))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
+        ),
+    )
+
+    await tr._do_create_model_from_state(
+        "rid-dup2",
+        CreateModelFromStateRequest(
+            session_id="sdup2",
+            model_seq_id=0,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            state_path="/tmp/fake-checkpoint",
+            lora_config=LoRAConfig(rank=8),
+            load_optimizer=False,
+        ),
+        user_id="owner-a",
+    )
+
+    assert deleted == []
+    assert failed["request_id"] == "rid-dup2"
+    assert "already exists" in failed["error"]
 
 
 @pytest.mark.anyio
