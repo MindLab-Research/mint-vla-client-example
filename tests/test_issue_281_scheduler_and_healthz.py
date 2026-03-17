@@ -77,6 +77,7 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     assert captured["extra"]["scheduler_enabled"] is True
     assert captured["extra"]["scheduler_domain"] == "peft:Qwen/Qwen3-0.6B"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
+    assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "forward"
     assert captured["extra"]["seq_id"] == 7
 
@@ -126,6 +127,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     assert captured["extra"]["scheduler_enabled"] is True
     assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
+    assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "save_weights_for_sampler"
     assert captured["extra"]["seq_id"] == 9
     assert captured["extra"]["prefer_tinker"] is True

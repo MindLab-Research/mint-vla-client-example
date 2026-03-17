@@ -342,6 +342,9 @@ def _build_training_scheduler_extra(
         # Scheduler session key is model_id (server-side training session identity),
         # not the user-provided create_model session_id string.
         "scheduler_session_key": str(model_id),
+        # Always serialize model-bound training ops by server-side training session identity,
+        # regardless of whether the scheduler feature flag is enabled.
+        "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
     }
     if seq_id is not None:
