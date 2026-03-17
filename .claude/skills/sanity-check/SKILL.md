@@ -32,7 +32,7 @@ Required local file (repo root):
 
 Required access:
 - `ssh mint-prod-volcano` (Volcano router/master)
-- `ssh mint-prod-aliyun` (Aliyun upstream)
+- `ssh mint-prod-aliyun` only if current prod routing/config actually targets an Aliyun upstream
 
 ## What this skill runs
 
@@ -97,9 +97,14 @@ After each run, preserve these timing outputs as evidence:
 ### 2) If any test fails: evidence first, then remediation
 
 1) Check prod logs:
-- Volcano (0.6B, 4B, 30B):
+- Always check the router/master first:
   - `ssh mint-prod-volcano "tail -400 /tmp/tinker_server_auth.log"`
-- Aliyun (235B):
+- Do not assume `235B -> Aliyun`.
+- Before checking any remote upstream, verify the current routing target from current prod evidence:
+  - checked-in prod config such as `configs/prod_volcano.env.sh`
+  - live routing env such as `TINKER_GATEWAY_CONFIG_JSON`
+  - current actor inventory from `/api/v1/actors`
+- Only if that evidence shows the model is remotely routed should you inspect the remote target logs, for example:
   - `ssh mint-prod-aliyun "tail -400 /tmp/tinker_server_auth.log"`
 
 2) If 235B is "slow but pending" (no exception, just long `retrieve_future` / pending sampling):
@@ -137,8 +142,9 @@ Notes:
 2) Restart API server only if the server process itself is unhealthy:
 - Volcano:
   - `ssh mint-prod-volcano 'supervisorctl restart tinker-server-auth'`
-- Aliyun:
-  - Follow `.claude/skills/aliyun-cluster/SKILL.md` "Start tinker-server on mint-prod-aliyun".
+- Remote upstream:
+  - Only if current routing/config proves the failing model is hosted there, follow that deployment's start SOP.
+  - For Aliyun specifically, follow `.claude/skills/aliyun-cluster/SKILL.md` "Start tinker-server on mint-prod-aliyun".
   - Do not restart the local Ray head while actors exist.
 
 3) Log every remediation:
@@ -161,7 +167,7 @@ If a failure persists after remediation, stop doing ops and switch to evidence +
 
 Invoke `issue-reporter` and include:
 - Exact command that failed (and the captured local stdout/stderr path)
-- Model name and whether it was Volcano or Aliyun routed
+- Model name and whether it was local or remotely routed, plus the concrete remote target if confirmed from config/logs
 - Timestamps
 - Request IDs (from the test output, if present)
 - The timing summary for the run, especially the slowest stage and its `max_s`
