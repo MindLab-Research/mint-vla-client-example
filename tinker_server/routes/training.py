@@ -19,6 +19,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import time
@@ -35,7 +37,7 @@ from ..auth_identity import is_admin_request, is_admin_user_data
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import classify_failure_reason, set_request_id
 
-from ..backend.future_store import future_store
+from ..backend.future_store import FutureStatus, future_store
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
     begin_async_checkpoint_mirror,
@@ -353,6 +355,107 @@ def _build_training_scheduler_extra(
         except Exception:
             extra["seq_id"] = None
     return extra
+
+
+def _sync_route_wait_timeout_s() -> float:
+    try:
+        return max(1.0, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_TIMEOUT_S", "3600")).strip()))
+    except Exception:
+        return 3600.0
+
+
+def _sync_route_wait_poll_interval_s() -> float:
+    try:
+        return max(0.01, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_POLL_INTERVAL_S", "0.2")).strip()))
+    except Exception:
+        return 0.2
+
+
+async def _wait_internal_future_result(request_id: str) -> Any:
+    deadline = time.perf_counter() + _sync_route_wait_timeout_s()
+    poll_interval_s = _sync_route_wait_poll_interval_s()
+    try:
+        while True:
+            status = await run_in_threadpool(future_store.get_status, request_id)
+            if status == FutureStatus.PENDING:
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for internal future request_id={request_id}")
+                await asyncio.sleep(poll_interval_s)
+                continue
+            if status == FutureStatus.DONE:
+                try:
+                    from ..backend.capacity_manager import capacity_manager
+
+                    await run_in_threadpool(capacity_manager.release_all, request_id)
+                except Exception:
+                    pass
+                return await run_in_threadpool(future_store.get_result, request_id)
+            if status == FutureStatus.FAILED:
+                err = await run_in_threadpool(future_store.get_error, request_id)
+                try:
+                    from ..backend.capacity_manager import capacity_manager
+
+                    await run_in_threadpool(capacity_manager.release_all, request_id)
+                except Exception:
+                    pass
+                raise RuntimeError(str(err or f"internal queued op failed request_id={request_id}"))
+            try:
+                from ..backend.capacity_manager import capacity_manager
+
+                await run_in_threadpool(capacity_manager.release_all, request_id)
+            except Exception:
+                pass
+            raise RuntimeError(f"internal future reached unexpected terminal state={status.value} request_id={request_id}")
+    finally:
+        try:
+            await run_in_threadpool(future_store.cleanup, request_id)
+        except Exception:
+            pass
+
+
+async def _enqueue_internal_serialized_model_op(
+    *,
+    model_id: str,
+    op: str,
+    request_json: bytes,
+    extra: dict[str, Any],
+    user_id: str | None = None,
+) -> str:
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": op, "model_id": model_id})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op=op,
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+            extra=dict(extra),
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue {op} request: {e}") from e
+    return request_id
 
 
 # =============================================================================
@@ -1789,15 +1892,62 @@ async def reset_expert_bias(
         )
 
     try:
-        result = await training_engine.reset_expert_bias(session)
-        return ResetExpertBiasResponse(
+        request_id = await _enqueue_internal_serialized_model_op(
             model_id=request.model_id,
-            modules_reset=result.get("modules_reset", 0),
-            status="success" if result.get("modules_reset", 0) > 0 else "not_applicable",
+            op="training.reset_expert_bias",
+            request_json=request.model_dump_json().encode("utf-8"),
+            extra=_build_training_scheduler_extra(
+                session=session,
+                model_id=request.model_id,
+                training_op="reset_expert_bias",
+            ),
+            user_id=_get_user_id(http_request),
         )
+        payload = await _wait_internal_future_result(request_id)
+        return ResetExpertBiasResponse.model_validate(payload)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"[reset_expert_bias] Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _do_reset_expert_bias(
+    request_id: str,
+    request: ResetExpertBiasRequest,
+) -> None:
+    try:
+        set_request_id(request_id)
+        if training_engine is None or training_manager is None:
+            raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
+
+        result = await training_engine.reset_expert_bias(session)
+        modules_reset = int(result.get("modules_reset", 0) or 0)
+        future_store.resolve(
+            request_id,
+            ResetExpertBiasResponse(
+                model_id=request.model_id,
+                modules_reset=modules_reset,
+                status="success" if modules_reset > 0 else "not_applicable",
+            ).model_dump(),
+        )
+    except Exception as e:
+        logger.exception(
+            "[training.reset_expert_bias] failed request_id=%s model_id=%s error_type=%s error=%s",
+            str(request_id),
+            str(request.model_id),
+            type(e).__name__,
+            e,
+        )
+        future_store.fail(request_id, str(e))
 
 
 # =============================================================================
@@ -2444,24 +2594,62 @@ async def delete_model(model_id: str):
             status_code=404, detail=f"Model '{model_id}' not found"
         )
 
-    await training_engine.shutdown_session(session)
-    training_manager.delete_session(model_id)
+    request_id = await _enqueue_internal_serialized_model_op(
+        model_id=model_id,
+        op="training.delete_model",
+        request_json=json.dumps({"model_id": model_id}).encode("utf-8"),
+        extra=_build_training_scheduler_extra(
+            session=session,
+            model_id=model_id,
+            training_op="delete_model",
+        ),
+        user_id=session.user_id,
+    )
     try:
-        from ..backend.training_session_store import delete_training_session
+        return await _wait_internal_future_result(request_id)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[training.delete_model] Failed model_id=%s error=%s", str(model_id), e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
-        delete_training_session(model_id)
-    except Exception:
-        pass
-    # Clear ResourcePool session tracking even if shutdown_session couldn't find a worker
-    # (e.g., deletion races with create_training_session still in-flight).
+
+async def _do_delete_model(request_id: str, model_id: str) -> None:
     try:
-        from ..backend.resource_pool import get_resource_pool
+        set_request_id(request_id)
+        if training_engine is None or training_manager is None:
+            raise RuntimeError("Training engine not initialized")
 
-        get_resource_pool().clear_session(model_id)
-    except Exception:
-        pass
+        session = training_manager.get_session(model_id)
+        if session is not None:
+            await training_engine.shutdown_session(session)
+            training_manager.delete_session(model_id)
 
-    return {"model_id": model_id, "status": "deleted"}
+        try:
+            from ..backend.training_session_store import delete_training_session
+
+            delete_training_session(model_id)
+        except Exception:
+            pass
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            get_resource_pool().clear_session(model_id)
+        except Exception:
+            pass
+
+        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+    except Exception as e:
+        logger.exception(
+            "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",
+            str(request_id),
+            str(model_id),
+            type(e).__name__,
+            e,
+        )
+        future_store.fail(request_id, str(e))
 
 
 @router.get("/models/{model_id}/tokenizer")

@@ -97,11 +97,18 @@ This same key is also attached to checkpoint/state routes in `tinker_server/rout
 - `/save_state`
 - `/load_state`
 
+And the remaining same-session mutating sync routes now enqueue internal work onto that same serialized lane before returning:
+
+- `/reset_expert_bias`
+- `DELETE /models/{model_id}`
+
 That means the following operations now share one per-session serialized lane:
 
 - `training.forward_backward`
 - `training.optim_step`
 - `training.save_weights_for_sampler`
+- `training.reset_expert_bias`
+- `training.delete_model`
 - `weights.save_weights`
 - `weights.save_state`
 - `weights.load_state`
