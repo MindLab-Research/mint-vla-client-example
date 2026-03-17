@@ -14,6 +14,15 @@ async def _fake_admission_stats() -> dict:
             "dequeued": 8,
             "by_executor": {"sampling.asample": 1, "weights.save_weights": 1},
             "age_stats": {"oldest_queued_s": 12.5, "avg_queued_s": 6.25},
+            "execution_time_s_by_op": {
+                "training.train_step": {
+                    "last": 4.5,
+                    "ema": 4.0,
+                    "sum": 20.0,
+                    "count": 5,
+                    "max": 6.0,
+                }
+            },
         },
         "future_store": {
             "pending": 1,
@@ -76,6 +85,11 @@ def test_issue_248_internal_metrics_exposes_phase1_and_phase2_fields(monkeypatch
         "tinker_work_queue_depth 2",
         'tinker_work_queue_depth{executor="sampling.asample"} 1',
         "tinker_work_queue_oldest_queued_s 12.5",
+        'tinker_work_queue_execution_last_s{op="training.train_step"} 4.5',
+        'tinker_work_queue_execution_ema_s{op="training.train_step"} 4',
+        'tinker_work_queue_execution_sum_s{op="training.train_step"} 20',
+        'tinker_work_queue_execution_count{op="training.train_step"} 5',
+        'tinker_work_queue_execution_max_s{op="training.train_step"} 6',
         "tinker_future_store_pending 1",
         'tinker_future_store_pending{op="asample"} 1',
         "tinker_future_store_oldest_pending_s 8",

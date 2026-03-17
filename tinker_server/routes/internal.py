@@ -411,6 +411,18 @@ async def metrics() -> Response:
             _append_metric(lines, "tinker_work_queue_oldest_queued_s", age_stats.get("oldest_queued_s"))
             _append_metric(lines, "tinker_work_queue_avg_queued_s", age_stats.get("avg_queued_s"))
 
+        execution_time_s_by_op = wq.get("execution_time_s_by_op")
+        if isinstance(execution_time_s_by_op, dict):
+            for op, rec in execution_time_s_by_op.items():
+                if not isinstance(rec, dict):
+                    continue
+                labels = {"op": op}
+                _append_metric(lines, "tinker_work_queue_execution_last_s", rec.get("last"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_execution_ema_s", rec.get("ema"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_execution_sum_s", rec.get("sum"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_execution_count", rec.get("count"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_execution_max_s", rec.get("max"), labels=labels)
+
     fs = stats.get("future_store")
     if isinstance(fs, dict):
         # Existing FutureStore counters/settings from /internal/admission_stats.
