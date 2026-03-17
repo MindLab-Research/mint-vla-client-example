@@ -172,6 +172,9 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
     }
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is not None:
+        out["RAY_ADDRESS"] = ray_address
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
