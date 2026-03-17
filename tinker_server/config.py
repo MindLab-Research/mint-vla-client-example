@@ -17,6 +17,7 @@ from .runtime_env import (
     build_runtime_pythonpath,
     env_nonempty as _runtime_env_nonempty,
 )
+from .ray_utils import require_ray_address
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
@@ -167,12 +168,10 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "PFS_TINKER_PATH": PFS_TINKER_PATH,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
+        "RAY_ADDRESS": require_ray_address(),
         "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
     }
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    if ray_address is not None:
-        out["RAY_ADDRESS"] = ray_address
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
