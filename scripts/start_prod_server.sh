@@ -9,4 +9,4 @@ set -a
 . ./.secrets.env
 set +a
 
-exec /root/tinker_project/tinker-server-auth/.venv31213/bin/python scripts/run_server.py
+exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py

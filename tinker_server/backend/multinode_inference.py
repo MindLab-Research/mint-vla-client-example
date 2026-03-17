@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -22,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, preferred_torch_lib_dirs
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -31,6 +32,7 @@ from tinker_server.logging_context import (
     traced_async_from_traceparent,
 )
 from tinker_server.ray_utils import init_ray
+from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 from . import ray_kill
 from .multinode_resources import compute_multinode_engine_resources
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+VLLM_NO_COMPILED_DAG_ENV = "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE"
 
 
 def _progress_meta(tokens_generated: int, max_tokens: int) -> dict[str, Any]:
@@ -63,6 +66,76 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _enforce_vllm_no_compiled_dag(
+    env_vars: dict[str, str],
+    *,
+    distributed_executor_backend: str,
+) -> None:
+    """Keep compiled DAG disabled through the one patch flag the current build honors."""
+    env_vars.pop(VLLM_NO_COMPILED_DAG_ENV, None)
+    env_vars.pop("VLLM_DISABLE_RAY_COMPILED_DAG", None)
+    if distributed_executor_backend == "ray":
+        env_vars[VLLM_NO_COMPILED_DAG_ENV] = "1"
+
+
+def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: set[str] | None = None) -> str:
+    blocked = blocked or set()
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in [*entries, *str(raw or "").split(":")]:
+        if not entry:
+            continue
+        norm = os.path.normcase(os.path.abspath(entry))
+        if norm in blocked or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(entry)
+    return ":".join(out)
+
+
+def _stabilize_vllm_child_environment() -> None:
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    python_entries = [
+        path
+        for path in (
+            "/vllm",
+            f"/opt/venv/lib/{pyver}/site-packages",
+        )
+        if os.path.isdir(path)
+    ]
+    if python_entries:
+        os.environ["PYTHONPATH"] = _prepend_env_path_entries(os.environ.get("PYTHONPATH"), python_entries)
+        for entry in reversed(python_entries):
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+
+    blocked_ld = {
+        os.path.normcase("/usr/local/lib/python3.10/dist-packages/torch/lib"),
+        os.path.normcase("/usr/local/lib/python3.10/site-packages/torch/lib"),
+    }
+    ld_entries = [
+        *preferred_torch_lib_dirs(),
+        "/usr/local/cuda/compat/lib",
+        "/usr/local/nvidia/lib",
+        "/usr/local/nvidia/lib64",
+        "/usr/local/cuda/lib64",
+    ]
+    os.environ["LD_LIBRARY_PATH"] = _prepend_env_path_entries(
+        os.environ.get("LD_LIBRARY_PATH"),
+        ld_entries,
+        blocked=blocked_ld,
+    )
+
+    try:
+        import multiprocessing
+
+        preferred_executable = os.environ.get("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "").strip() or sys.executable
+        if preferred_executable and os.path.exists(preferred_executable):
+            multiprocessing.set_executable(preferred_executable)
+    except Exception as e:
+        logger.warning("failed to pin multiprocessing executable: %s: %s", type(e).__name__, e)
 
 
 def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
@@ -600,12 +673,20 @@ def _create_multinode_vllm_actor(
 
             import os
 
+            _stabilize_vllm_child_environment()
             distributed_executor_backend = os.environ.get("MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "ray").strip().lower()
             if "VLLM_USE_V1" not in os.environ:
                 os.environ["VLLM_USE_V1"] = "1" if distributed_executor_backend == "mp" else "0"
             # PyNcclCommunicator has hit NCCL internal errors in multi-node init;
             # disable to fall back to torch.distributed collectives.
             os.environ["VLLM_DISABLE_PYNCCL"] = "1"
+            logger.info(
+                "vllm_child_env python=%s ray_address=%s py_path_head=%s ld_library_path=%s",
+                sys.executable,
+                os.environ.get("RAY_ADDRESS", ""),
+                sys.path[:8],
+                os.environ.get("LD_LIBRARY_PATH", ""),
+            )
 
             # Import vLLM components AFTER setting env var
             from vllm import AsyncEngineArgs, AsyncLLMEngine
@@ -2194,9 +2275,21 @@ class MultiNodeInferenceEngine:
                         required_gpus=int(worker_gpus),
                     )
 
-            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            from ..config import (
+                actor_ld_library_path,
+                actor_runtime_env_vars,
+                otel_env_vars,
+                preferred_vllm_python_executable,
+            )
+            worker_pythonpath = join_pythonpath(
+                "/vllm",
+                sanitize_worker_pythonpath(
+                    PFS_PYTHONPATH,
+                    env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+                ),
+            )
             env_vars = actor_runtime_env_vars(
-                pythonpath=PFS_PYTHONPATH,
+                pythonpath=worker_pythonpath,
                 extra={
                 "LD_LIBRARY_PATH": actor_ld_library_path(),
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -2256,7 +2349,6 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_ENGINE_LOCK_MODE",
                 "MINT_VLLM_REQUEST_TIMING",
                 "MINT_VLLM_PROMPT_LOGPROBS_SERIALIZE",
-                "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
                 "MINT_VLLM_SERIALIZE_GENERATE",
                 "MINT_VLLM_SERIALIZE_MULTISAMPLE",
                 "MINT_VLLM_MULTISAMPLE_MODE",
@@ -2270,7 +2362,6 @@ class MultiNodeInferenceEngine:
                 "MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE",
                 "MINT_VLLM_MAX_NUM_BATCHED_TOKENS",
                 "MINT_VLLM_ADMISSION_CONTROL",
-                "VLLM_DISABLE_RAY_COMPILED_DAG",
                 "VLLM_USE_RAY_WRAPPED_PP_COMM",
                 "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
                 "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM",
@@ -2279,15 +2370,10 @@ class MultiNodeInferenceEngine:
                 if v is not None:
                     env_vars[k] = v
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
-
-            if distributed_executor_backend == "ray":
-                # Keep Ray compiled DAG disabled for all multinode-ray vLLM actors.
-                # This vLLM build does not honor VLLM_DISABLE_RAY_COMPILED_DAG in
-                # ray_executor.py, so the real no-compiled-DAG path is the
-                # sitecustomize monkey patch gated by
-                # MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE.
-                env_vars["MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE"] = "1"
-                env_vars["VLLM_DISABLE_RAY_COMPILED_DAG"] = "1"
+            _enforce_vllm_no_compiled_dag(
+                env_vars,
+                distributed_executor_backend=distributed_executor_backend,
+            )
 
             # Performance defaults: do not disable prefix caching or grouped-topk in code.
             # If stability requires toggling other vLLM knobs, do it via env.
@@ -2315,6 +2401,10 @@ class MultiNodeInferenceEngine:
             # Fully sharded LoRAs are the default for multinode MoE actors when
             # max_lora_rank is divisible by TP. Operators can still turn this off via:
             #   export MINT_VLLM_FULLY_SHARDED_LORAS=0
+            runtime_env = {"env_vars": env_vars}
+            preferred_python = (preferred_vllm_python_executable() or "").strip()
+            if preferred_python:
+                runtime_env["py_executable"] = preferred_python
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,
@@ -2324,7 +2414,7 @@ class MultiNodeInferenceEngine:
                 num_gpus=controller_gpus,
                 max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
                 **scheduling_opts,
-                runtime_env={"env_vars": env_vars},
+                runtime_env=runtime_env,
             ).remote(
                 model_path=self.model_path,
                 tensor_parallel_size=self.tensor_parallel_size,

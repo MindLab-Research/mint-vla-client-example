@@ -22,6 +22,7 @@ from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
 from tinker_server.ray_utils import init_ray
+from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 from . import ray_kill
 from .lora_registry import LoRARegistry
@@ -402,9 +403,21 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            from ..config import (
+                actor_ld_library_path,
+                actor_runtime_env_vars,
+                otel_env_vars,
+                preferred_vllm_python_executable,
+            )
+            worker_pythonpath = join_pythonpath(
+                "/vllm",
+                sanitize_worker_pythonpath(
+                    PFS_PYTHONPATH,
+                    env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+                ),
+            )
             env_vars = actor_runtime_env_vars(
-                pythonpath=PFS_PYTHONPATH,
+                pythonpath=worker_pythonpath,
                 extra={
                 "LD_LIBRARY_PATH": actor_ld_library_path(),
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -416,6 +429,7 @@ class MultiLoRAInferenceEngine:
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
+            preferred_python = (preferred_vllm_python_executable() or "").strip()
 
             actor_options: dict[str, object] = {
                 "num_gpus": total_gpus,
@@ -429,6 +443,8 @@ class MultiLoRAInferenceEngine:
                     }
                 },
             }
+            if preferred_python:
+                actor_options["runtime_env"]["py_executable"] = preferred_python
             if self.pinned_node_ip:
                 actor_options["resources"] = {f"node:{self.pinned_node_ip}": 0.001}
                 node_map = {
@@ -462,7 +478,6 @@ class MultiLoRAInferenceEngine:
                 "node_rank": 0,
                 "gpus_per_node": total_gpus,
                 "nnodes": 1,
-                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
             }
             self.server = ExtendedVLLMHttpServer.options(
                 **actor_options,
@@ -1359,7 +1374,28 @@ class MultiModelInferenceManager:
 
         try:
             await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
-            engine_ready = await asyncio.to_thread(ray.get, actor.is_engine_ready.remote(), timeout=10)
+            ready_method_name = None
+            ready_probe = None
+            for method_name in ("is_engine_ready", "is_ready"):
+                candidate = getattr(actor, method_name, None)
+                if candidate is None:
+                    continue
+                ready_method_name = method_name
+                ready_probe = candidate
+                break
+            if ready_probe is None:
+                logger.warning(
+                    "named actor probe found no readiness RPC actor=%s; reusing actor after __ray_ready__",
+                    actor_name,
+                )
+                return True
+            engine_ready = await asyncio.to_thread(ray.get, ready_probe.remote(), timeout=10)
+            logger.debug(
+                "named actor probe readiness actor=%s method=%s ready=%s",
+                actor_name,
+                ready_method_name,
+                engine_ready,
+            )
             return bool(engine_ready)
         except SystemExit as e:
             if getattr(e, "code", None) == 15:

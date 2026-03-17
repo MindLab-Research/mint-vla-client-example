@@ -6,10 +6,15 @@ Uses verl's Ray-based vLLM infrastructure for scalable inference.
 from __future__ import annotations
 
 import os
+import sys
 
 # Required for vLLM multiprocessing in Ray actors (prevents fork-related hangs)
 # Must be set before vLLM is imported anywhere in the process
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+if os.path.isdir("/vllm"):
+    if "/vllm" not in sys.path:
+        sys.path.insert(0, "/vllm")
+    os.environ["PYTHONPATH"] = f"/vllm:{os.environ.get('PYTHONPATH', '').lstrip(':')}".rstrip(":")
 
 import logging
 import time
@@ -28,6 +33,11 @@ from tinker_server.logging_context import (
     traced_async_from_traceparent,
 )
 from tinker_server.ray_utils import init_ray
+from tinker_server.runtime_env import (
+    host_only_pythonpath_entries,
+    join_pythonpath,
+    sanitize_worker_pythonpath,
+)
 
 from . import ray_kill
 
@@ -441,11 +451,19 @@ def _create_extended_server_class(
                 from verl.workers.rollout.replica import RolloutMode
 
                 kwargs["rollout_mode"] = RolloutMode(rollout_mode)
-            pfs_pythonpath = PFS_PYTHONPATH
-            os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
-            for p in reversed(pfs_pythonpath.split(":")):
-                if p and p not in sys.path:
-                    sys.path.insert(0, p)
+            env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT")
+            pfs_pythonpath = sanitize_worker_pythonpath(PFS_PYTHONPATH, env_root=env_root)
+            os.environ["PYTHONPATH"] = pfs_pythonpath
+            pfs_entries = [p for p in pfs_pythonpath.split(":") if p]
+            excluded = set(host_only_pythonpath_entries(env_root)) if env_root else set()
+            preserved = [
+                p
+                for p in sys.path
+                if p
+                and p not in pfs_entries
+                and p not in excluded
+            ]
+            sys.path[:] = [*pfs_entries, *preserved]
             print(f"[ExtendedVLLMHttpServer] Set PYTHONPATH, vLLM path: {sys.path[0]}", flush=True)
 
             # Always initialize through current MRO parent. Calling __init__ on a
@@ -463,11 +481,17 @@ def _create_extended_server_class(
                 sig = None
             print(f"[ExtendedVLLMHttpServer] vLLMHttpServer.__init__ sig={sig}", flush=True)
             print(f"[ExtendedVLLMHttpServer] Calling with args={args}, kwargs keys={list(kwargs.keys())}", flush=True)
+            call_kwargs = dict(kwargs)
             if 'cuda_visible_devices' in kwargs:
                 print(f"[ExtendedVLLMHttpServer] cuda_visible_devices={kwargs['cuda_visible_devices']}", flush=True)
             else:
-                print("[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
-            call_kwargs = dict(kwargs)
+                ray_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                print(
+                    "[ExtendedVLLMHttpServer] cuda_visible_devices omitted; "
+                    f"using Ray-assigned CUDA_VISIBLE_DEVICES={ray_visible_devices!r}",
+                    flush=True,
+                )
+                call_kwargs["cuda_visible_devices"] = ray_visible_devices
             rollout_cfg = call_kwargs.get("config")
             if rollout_cfg is not None:
                 from dataclasses import asdict, is_dataclass
@@ -2349,7 +2373,12 @@ class VerlInferenceEngine:
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-        from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+        from ..config import (
+            actor_ld_library_path,
+            actor_runtime_env_vars,
+            otel_env_vars,
+            preferred_vllm_python_executable,
+        )
         from dataclasses import asdict
 
         from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
@@ -2400,24 +2429,35 @@ class VerlInferenceEngine:
             "node_rank": 0,
             "gpus_per_node": total_gpus,
             "nnodes": 1,
-            "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
         }
-        self.server = ExtendedVLLMHttpServer.options(
-            num_gpus=total_gpus,
-            max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
-            runtime_env={
-                "env_vars": actor_runtime_env_vars(
-                    pythonpath=PFS_PYTHONPATH,
-                    extra={
+        worker_pythonpath = join_pythonpath(
+            "/vllm",
+            sanitize_worker_pythonpath(
+                PFS_PYTHONPATH,
+                env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+            ),
+        )
+        runtime_env = {
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=worker_pythonpath,
+                extra={
                     "LD_LIBRARY_PATH": actor_ld_library_path(),
                     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "VLLM_ATTENTION_BACKEND": server_config.vllm_attention_backend,
                     **otel_env_vars(),
-                    },
-                )
-            },
+                },
+            )
+        }
+        preferred_python = (preferred_vllm_python_executable() or "").strip()
+        if preferred_python:
+            runtime_env["py_executable"] = preferred_python
+
+        self.server = ExtendedVLLMHttpServer.options(
+            num_gpus=total_gpus,
+            max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
+            runtime_env=runtime_env,
         ).remote(**remote_kwargs)
 
         # Launch the server
