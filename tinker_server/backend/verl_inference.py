@@ -11,6 +11,7 @@ import os
 # Must be set before vLLM is imported anywhere in the process
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+import math
 import logging
 import time
 from dataclasses import dataclass
@@ -36,6 +37,59 @@ if TYPE_CHECKING:
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_sampled_token_logprobs(
+    *,
+    request_id: str,
+    token_ids: list[int],
+    step_logprobs: Any,
+    seq_index: int | None = None,
+) -> list[float]:
+    """Extract sampled-token logprobs from vLLM's per-step logprob payload."""
+    if step_logprobs is None:
+        if token_ids:
+            seq_ctx = f" seq_index={seq_index}" if seq_index is not None else ""
+            raise RuntimeError(
+                f"vLLM returned no sampled-token logprob payload: request_id={request_id} "
+                f"token_count={len(token_ids)}{seq_ctx}"
+            )
+        return []
+    step_logprobs = list(step_logprobs)
+    seq_ctx = f" seq_index={seq_index}" if seq_index is not None else ""
+    if len(step_logprobs) != len(token_ids):
+        raise RuntimeError(
+            f"vLLM returned mismatched sampled-token logprob payload length: request_id={request_id} "
+            f"token_count={len(token_ids)} logprob_count={len(step_logprobs)}{seq_ctx}"
+        )
+    out: list[float] = []
+    for i, lps in enumerate(step_logprobs):
+        tid = token_ids[i]
+        getter = getattr(lps, "get", None)
+        lp_obj = getter(tid) if callable(getter) else None
+        if lp_obj is None:
+            raise RuntimeError(
+                f"vLLM missing sampled-token logprob: request_id={request_id} idx={i} token_id={tid}{seq_ctx}"
+            )
+        if isinstance(lp_obj, (float, int)):
+            lp_f = float(lp_obj)
+        else:
+            lp_val = getattr(lp_obj, "logprob", None)
+            if lp_val is None and isinstance(lp_obj, dict):
+                lp_val = lp_obj.get("logprob")
+            if lp_val is None:
+                raise RuntimeError(
+                    f"vLLM returned None sampled-token logprob: request_id={request_id} "
+                    f"idx={i} token_id={tid}{seq_ctx}"
+                )
+            lp_f = float(lp_val)
+        if not math.isfinite(lp_f):
+            raise RuntimeError(
+                f"Non-finite sampled-token logprob: request_id={request_id} idx={i} "
+                f"token_id={tid} value={lp_f}{seq_ctx}"
+            )
+        out.append(lp_f)
+    return out
 
 
 def _mint_present_expert_ids_from_keys(keys: list[str]) -> set[int]:
@@ -967,7 +1021,7 @@ def _create_extended_server_class(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                logprobs=0 if logprobs else None,
+                logprobs=1 if logprobs else None,
                 n=effective_n,
                 **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
@@ -1067,11 +1121,12 @@ def _create_extended_server_class(
 
                 token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
-                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                    log_probs = [
-                        logprobs[token_ids[i]].logprob
-                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=token_ids,
+                        step_logprobs=final_res.outputs[0].logprobs,
+                    )
                 self._progress_last.pop(request_id, None)
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
@@ -1141,11 +1196,13 @@ def _create_extended_server_class(
                 out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
-                if sampling_params.logprobs is not None and out.logprobs:
-                    out_log_probs = [
-                        lp[out_token_ids[i]].logprob
-                        for i, lp in enumerate(out.logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    out_log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=out_token_ids,
+                        step_logprobs=out.logprobs,
+                        seq_index=idx,
+                    )
                 out_routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(out, "routed_experts", None)
@@ -1240,7 +1297,7 @@ def _create_extended_server_class(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                logprobs=0 if logprobs else None,
+                logprobs=1 if logprobs else None,
                 n=effective_n,
                 **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
@@ -1329,11 +1386,12 @@ def _create_extended_server_class(
 
                 token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
-                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                    log_probs = [
-                        logprobs[token_ids[i]].logprob
-                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=token_ids,
+                        step_logprobs=final_res.outputs[0].logprobs,
+                    )
                 self._progress_last.pop(request_id, None)
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
@@ -1403,11 +1461,13 @@ def _create_extended_server_class(
                 out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
-                if sampling_params.logprobs is not None and out.logprobs:
-                    out_log_probs = [
-                        lp[out_token_ids[i]].logprob
-                        for i, lp in enumerate(out.logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    out_log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=out_token_ids,
+                        step_logprobs=out.logprobs,
+                        seq_index=idx,
+                    )
                 out_routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(out, "routed_experts", None)
@@ -1480,7 +1540,7 @@ def _create_extended_server_class(
                 )
 
             # Rest of verl's generate() logic
-            sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+            sampling_params["logprobs"] = 1 if sampling_params.pop("logprobs", False) else None
             sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
             sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
 
@@ -1516,10 +1576,11 @@ def _create_extended_server_class(
             token_ids = final_res.outputs[0].token_ids
             log_probs = None
             if sampling_params.logprobs is not None:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+                log_probs = _extract_sampled_token_logprobs(
+                    request_id=request_id,
+                    token_ids=list(token_ids),
+                    step_logprobs=final_res.outputs[0].logprobs,
+                )
             routed_experts = None
             if self._enable_rollout_routing_replay:
                 raw = getattr(final_res.outputs[0], "routed_experts", None)
