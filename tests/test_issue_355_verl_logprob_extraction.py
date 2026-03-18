@@ -27,6 +27,42 @@ def test_issue_355_extract_sampled_token_logprobs_accepts_common_vllm_entry_shap
     assert result == [-0.1, -0.2, -0.3]
 
 
+def test_issue_355_extract_sampled_token_logprobs_accepts_real_vllm_completion_output_shape() -> None:
+    from vllm.logprobs import Logprob
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    completion = CompletionOutput(
+        index=0,
+        text="",
+        token_ids=[17, 0],
+        cumulative_logprob=-0.3,
+        logprobs=[
+            {17: Logprob(logprob=-0.1, rank=1, decoded_token="a")},
+            {
+                0: Logprob(logprob=-0.2, rank=2, decoded_token="<pad>"),
+                7: Logprob(logprob=-1.5, rank=1, decoded_token="b"),
+            },
+        ],
+        finish_reason="stop",
+    )
+    request_output = RequestOutput(
+        request_id="req-355",
+        prompt="",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[completion],
+        finished=True,
+    )
+
+    result = _extract_sampled_token_logprobs(
+        request_id=request_output.request_id,
+        token_ids=list(request_output.outputs[0].token_ids),
+        step_logprobs=request_output.outputs[0].logprobs,
+    )
+
+    assert result == [-0.1, -0.2]
+
+
 def test_issue_355_extract_sampled_token_logprobs_raises_explicit_error_for_missing_sampled_token() -> None:
     with pytest.raises(RuntimeError, match=r"missing sampled-token logprob: request_id=req-355 idx=1 token_id=0"):
         _extract_sampled_token_logprobs(
