@@ -28,8 +28,11 @@ def test_issue_355_extract_sampled_token_logprobs_accepts_common_vllm_entry_shap
 
 
 def test_issue_355_extract_sampled_token_logprobs_accepts_real_vllm_completion_output_shape() -> None:
-    from vllm.logprobs import Logprob
-    from vllm.outputs import CompletionOutput, RequestOutput
+    try:
+        from vllm.logprobs import Logprob
+        from vllm.outputs import CompletionOutput, RequestOutput
+    except ImportError as exc:
+        pytest.skip(f"requires importable vllm host bindings: {exc}")
 
     completion = CompletionOutput(
         index=0,
