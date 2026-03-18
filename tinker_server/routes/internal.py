@@ -35,6 +35,41 @@ CHECKPOINTS_DIR = server_config.checkpoint_dir
 router = APIRouter()
 
 
+async def _enqueue_internal_request_with_trace(
+    *,
+    route_start_s: float,
+    request_id: str,
+    op: str,
+    enqueue_coro,
+) -> None:
+    tracer = get_otel_tracer()
+    future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
+    if tracer is None:
+        await enqueue_coro
+        return
+
+    with tracer.start_as_current_span(f"{op}.enqueue") as span:
+        span.set_attribute("component", "routes.internal")
+        span.set_attribute("op", str(op))
+        span.set_attribute("request_id", str(request_id))
+        span.add_event(
+            "future_store_ready",
+            {
+                "elapsed_ms": round(future_ready_elapsed_ms, 3),
+                "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
+            },
+        )
+        enqueue_start_s = time.perf_counter()
+        await enqueue_coro
+        span.add_event(
+            "enqueue_done",
+            {
+                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
+                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+            },
+        )
+
+
 def _get_account_id(request: Request) -> str | None:
     """Extract account_id from request state (set by gateway auth middleware)."""
     user_data = _request_user_data(request)
@@ -637,6 +672,7 @@ async def work_queue_noop() -> dict:
     from ..backend.future_store import future_store
     from ..backend.result_size_estimator import estimate_small_result_bytes
 
+    route_start_s = time.perf_counter()
     request_id = uuid.uuid4().hex
     request_json = b"{}"
     reserve = capacity_manager.try_reserve(
@@ -655,13 +691,18 @@ async def work_queue_noop() -> dict:
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "internal.noop"})
-        await api_work_queue.enqueue(
+        await _enqueue_internal_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="internal.noop",
-            request_json=request_json,
-            user_id=None,
-            webhook_url=None,
-            extra={"ts": float(time.time())},
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="internal.noop",
+                request_json=request_json,
+                user_id=None,
+                webhook_url=None,
+                extra={"ts": float(time.time())},
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
