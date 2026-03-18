@@ -39,6 +39,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _sampled_logprob_entry_meta(entry: Any) -> dict[str, Any]:
+    """Return safe structure metadata for one per-step logprob entry."""
+    meta: dict[str, Any] = {
+        "entry_type": type(entry).__name__,
+        "entry_has_get": callable(getattr(entry, "get", None)),
+        "entry_size": None,
+        "entry_key_count": None,
+        "entry_key_preview": None,
+    }
+    try:
+        meta["entry_size"] = len(entry)
+    except Exception:
+        pass
+    if isinstance(entry, dict):
+        keys = list(entry.keys())
+        meta["entry_key_count"] = len(keys)
+        if len(keys) <= 8:
+            preview: list[Any] = []
+            for key in keys[:3]:
+                try:
+                    preview.append(int(key))
+                except Exception:
+                    preview.append(type(key).__name__)
+            meta["entry_key_preview"] = preview
+    return meta
+
+
 def _extract_sampled_token_logprobs(
     *,
     request_id: str,
@@ -47,17 +74,44 @@ def _extract_sampled_token_logprobs(
     seq_index: int | None = None,
 ) -> list[float]:
     """Extract sampled-token logprobs from vLLM's per-step logprob payload."""
+    seq_idx = -1 if seq_index is None else seq_index
     if step_logprobs is None:
         if token_ids:
+            logger.warning(
+                "vllm_sampled_logprob_payload_missing request_id=%s seq_index=%s token_count=%s payload_type=%s",
+                request_id,
+                seq_idx,
+                len(token_ids),
+                type(step_logprobs).__name__,
+            )
             seq_ctx = f" seq_index={seq_index}" if seq_index is not None else ""
             raise RuntimeError(
                 f"vLLM returned no sampled-token logprob payload: request_id={request_id} "
                 f"token_count={len(token_ids)}{seq_ctx}"
             )
         return []
-    step_logprobs = list(step_logprobs)
+    try:
+        step_logprobs = list(step_logprobs)
+    except Exception as e:
+        logger.warning(
+            "vllm_sampled_logprob_payload_non_iterable request_id=%s seq_index=%s token_count=%s payload_type=%s err_type=%s",
+            request_id,
+            seq_idx,
+            len(token_ids),
+            type(step_logprobs).__name__,
+            type(e).__name__,
+        )
+        raise
     seq_ctx = f" seq_index={seq_index}" if seq_index is not None else ""
     if len(step_logprobs) != len(token_ids):
+        logger.warning(
+            "vllm_sampled_logprob_payload_len_mismatch request_id=%s seq_index=%s token_count=%s logprob_count=%s payload_type=%s",
+            request_id,
+            seq_idx,
+            len(token_ids),
+            len(step_logprobs),
+            type(step_logprobs).__name__,
+        )
         raise RuntimeError(
             f"vLLM returned mismatched sampled-token logprob payload length: request_id={request_id} "
             f"token_count={len(token_ids)} logprob_count={len(step_logprobs)}{seq_ctx}"
@@ -68,6 +122,22 @@ def _extract_sampled_token_logprobs(
         getter = getattr(lps, "get", None)
         lp_obj = getter(tid) if callable(getter) else None
         if lp_obj is None:
+            meta = _sampled_logprob_entry_meta(lps)
+            logger.warning(
+                "vllm_sampled_logprob_entry_missing request_id=%s seq_index=%s idx=%s token_id=%s token_count=%s logprob_count=%s "
+                "entry_type=%s entry_has_get=%s entry_size=%s entry_key_count=%s entry_key_preview=%s",
+                request_id,
+                seq_idx,
+                i,
+                tid,
+                len(token_ids),
+                len(step_logprobs),
+                meta["entry_type"],
+                meta["entry_has_get"],
+                meta["entry_size"],
+                meta["entry_key_count"],
+                meta["entry_key_preview"],
+            )
             raise RuntimeError(
                 f"vLLM missing sampled-token logprob: request_id={request_id} idx={i} token_id={tid}{seq_ctx}"
             )
@@ -78,15 +148,38 @@ def _extract_sampled_token_logprobs(
             if lp_val is None and isinstance(lp_obj, dict):
                 lp_val = lp_obj.get("logprob")
             if lp_val is None:
+                logger.warning(
+                    "vllm_sampled_logprob_value_missing request_id=%s seq_index=%s idx=%s token_id=%s token_count=%s logprob_count=%s "
+                    "lp_obj_type=%s lp_obj_is_dict=%s",
+                    request_id,
+                    seq_idx,
+                    i,
+                    tid,
+                    len(token_ids),
+                    len(step_logprobs),
+                    type(lp_obj).__name__,
+                    isinstance(lp_obj, dict),
+                )
                 raise RuntimeError(
                     f"vLLM returned None sampled-token logprob: request_id={request_id} "
                     f"idx={i} token_id={tid}{seq_ctx}"
                 )
             lp_f = float(lp_val)
         if not math.isfinite(lp_f):
+            logger.warning(
+                "vllm_sampled_logprob_non_finite request_id=%s seq_index=%s idx=%s token_id=%s token_count=%s logprob_count=%s "
+                "lp_obj_type=%s",
+                request_id,
+                seq_idx,
+                i,
+                tid,
+                len(token_ids),
+                len(step_logprobs),
+                type(lp_obj).__name__,
+            )
             raise RuntimeError(
                 f"Non-finite sampled-token logprob: request_id={request_id} idx={i} "
-                f"token_id={tid} value={lp_f}{seq_ctx}"
+                f"token_id={tid}{seq_ctx}"
             )
         out.append(lp_f)
     return out
