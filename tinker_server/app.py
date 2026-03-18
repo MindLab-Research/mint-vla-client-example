@@ -37,8 +37,8 @@ from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
     from .backend.multi_lora_engine import MultiModelInferenceManager
+    from .backend.training_engine_router import TrainingEngineRouter
     from .backend.training_session_manager import TrainingSessionManager
-    from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -318,7 +318,7 @@ async def _cleanup_stale_actors() -> None:
         logger.error(f"Actor cleanup failed; healthz will be degraded: {type(e).__name__}: {e}")
 
 async def _prewarm_persistent_models(
-    train_engine: VerlTrainingEngine,
+    train_engine: TrainingEngineRouter,
     multi_model_manager: MultiModelInferenceManager | None,
 ) -> None:
     """Pre-create and protect persistent actors at server startup.
@@ -712,15 +712,15 @@ async def lifespan(app: FastAPI):
         logger.info("Multi-LoRA disabled, using per-session engines")
 
     # ==========================================================================
-    # Training: Initialize TrainingSessionManager and VerlTrainingEngine
+    # Training: Initialize TrainingSessionManager and training engine router
     # ==========================================================================
     logger.info("Initializing training components")
 
     from .backend.training_session_manager import TrainingSessionManager
-    from .backend.verl_training import VerlTrainingEngine
+    from .backend.training_engine_router import TrainingEngineRouter
 
     train_manager = TrainingSessionManager()
-    train_engine = VerlTrainingEngine()
+    train_engine = TrainingEngineRouter()
     await train_engine.initialize()
 
     # Make training components available to routes

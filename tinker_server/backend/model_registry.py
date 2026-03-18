@@ -81,6 +81,13 @@ class ModelConfig:
     # - "mp": single-node multiprocessing TP (avoid Ray compiled DAG)
     # - "ray": Ray distributed executor (uses Ray compiled DAG; keep for K2)
     vllm_distributed_executor_backend: Literal["mp", "ray"] = "mp"
+    # Cross-family dispatch metadata. Defaults preserve current text-model behavior.
+    policy_family: Literal["text_lm", "ar_action_tokens", "flow_action"] = "text_lm"
+    inference_modality: Literal["tokens", "actions"] = "tokens"
+    training_backend: str = "mint_text"
+    camera_layout: tuple[str, ...] = ()
+    action_dim: int | None = None
+    action_horizon: int | None = None
 
     @property
     def total_gpus(self) -> int:
@@ -113,6 +120,24 @@ class ModelConfig:
 
 # Supported models - only these are allowed
 MODEL_CONFIGS = {
+    # Read-only OpenPI FAST reference profiles.
+    # These are capability descriptors for Mint-owned integration code, not a claim that
+    # the full runtime path is already enabled everywhere.
+    "openpi/pi0-fast-libero-low-mem-finetune": ModelConfig(
+        num_parameters=2.0,
+        is_moe=False,
+        inference_tp=1,
+        inference_dp=1,
+        train_tp=1,
+        train_ep=1,
+        max_model_len=180,
+        policy_family="ar_action_tokens",
+        inference_modality="actions",
+        training_backend="openpi_fast",
+        camera_layout=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        action_dim=7,
+        action_horizon=10,
+    ),
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
     # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(
@@ -552,6 +577,7 @@ def list_supported_models() -> list[str]:
         return models
 
     allowed = [
+        "openpi/pi0-fast-libero-low-mem-finetune",
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",

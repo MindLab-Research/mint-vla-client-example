@@ -350,6 +350,12 @@ async def create_model(
         base_model=request.base_model,
         rollout_correction_config=request.rollout_correction_config,
     )
+    try:
+        from ..backend.openpi_fast_training import validate_openpi_fast_create_request
+
+        validate_openpi_fast_create_request(request)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Check model access permissions
     user_data = _get_user_data(http_request)
@@ -663,6 +669,12 @@ async def create_model_from_state(
         base_model=request.base_model,
         rollout_correction_config=request.rollout_correction_config,
     )
+    try:
+        from ..backend.openpi_fast_training import validate_openpi_fast_create_request
+
+        validate_openpi_fast_create_request(request)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Check model access permissions
     user_data = _get_user_data(http_request)

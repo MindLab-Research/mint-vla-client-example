@@ -3,10 +3,11 @@
 These types match the tinker client API for compatibility.
 """
 
+import base64
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 
 class EncodedTextChunk(BaseModel):
@@ -15,24 +16,87 @@ class EncodedTextChunk(BaseModel):
     tokens: list[int]
     type: Literal["encoded_text"] = "encoded_text"
 
+    @property
+    def length(self) -> int:
+        return len(self.tokens)
+
+
+class ImageAssetPointerChunk(BaseModel):
+    """A pointer to an image asset plus its expected token footprint."""
+
+    format: Literal["png", "jpeg"]
+    location: str
+    expected_tokens: int | None = None
+    type: Literal["image_asset_pointer"] = "image_asset_pointer"
+
+    @property
+    def length(self) -> int:
+        if self.expected_tokens is None:
+            raise ValueError("ImageAssetPointerChunk expected_tokens needs to be set in order to compute the length")
+        return self.expected_tokens
+
+
+class ImageChunk(BaseModel):
+    """Inline image bytes plus their expected token footprint."""
+
+    data: bytes
+    format: Literal["png", "jpeg"]
+    expected_tokens: int | None = None
+    type: Literal["image"] = "image"
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def validate_data(cls, value: bytes | str) -> bytes:
+        if isinstance(value, str):
+            return base64.b64decode(value)
+        return value
+
+    @field_serializer("data")
+    def serialize_data(self, value: bytes) -> str:
+        return base64.b64encode(value).decode("utf-8")
+
+    @property
+    def length(self) -> int:
+        if self.expected_tokens is None:
+            raise ValueError("ImageChunk expected_tokens needs to be set in order to compute the length")
+        return self.expected_tokens
+
+
+ModelInputChunk = Annotated[
+    EncodedTextChunk | ImageAssetPointerChunk | ImageChunk,
+    Field(discriminator="type"),
+]
+
 
 class ModelInput(BaseModel):
     """Input to the model as a list of chunks."""
 
-    chunks: list[EncodedTextChunk]
+    chunks: list[ModelInputChunk]
+
+    @property
+    def length(self) -> int:
+        return sum(chunk.length for chunk in self.chunks)
+
+    def to_ints(self) -> list[int]:
+        if not all(isinstance(chunk, EncodedTextChunk) for chunk in self.chunks):
+            raise ValueError(
+                "to_ints only supported for ModelInput with EncodedTextChunks, "
+                f"got {[type(chunk).__name__ for chunk in self.chunks]}"
+            )
+        return [token for chunk in self.chunks for token in chunk.tokens]
 
     def to_token_ids(self) -> list[int]:
-        """Flatten all chunks into a single list of token IDs."""
-        tokens = []
-        for chunk in self.chunks:
-            if chunk.type == "encoded_text":
-                tokens.extend(chunk.tokens)
-        return tokens
+        """Backward-compatible alias for strict text-only flattening."""
+        return self.to_ints()
 
     @classmethod
     def from_ints(cls, tokens: list[int]) -> "ModelInput":
         """Create ModelInput from a list of token IDs."""
         return cls(chunks=[EncodedTextChunk(tokens=tokens)])
+
+    @classmethod
+    def empty(cls) -> "ModelInput":
+        return cls(chunks=[])
 
 
 class SamplingParams(BaseModel):
