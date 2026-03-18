@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,29 @@ from .openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OpenPIFastRuntimeInitOverrides:
+    weights_path: str | None = None
+    random_init: bool = False
+
+    @classmethod
+    def from_env(cls) -> "OpenPIFastRuntimeInitOverrides":
+        weights_path = (os.environ.get("MINT_OPENPI_FAST_WEIGHTS_PATH") or "").strip() or None
+        random_init = (os.environ.get("MINT_OPENPI_FAST_RANDOM_INIT") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if weights_path and random_init:
+            raise ValueError(
+                "MINT_OPENPI_FAST_WEIGHTS_PATH and MINT_OPENPI_FAST_RANDOM_INIT are mutually exclusive"
+            )
+        if weights_path is not None:
+            weights_path = str(Path(weights_path).resolve())
+        return cls(weights_path=weights_path, random_init=random_init)
 
 
 def _reply(message: dict[str, Any]) -> None:
@@ -66,6 +90,7 @@ class OpenPIFastWorkerSession:
         import openpi.training.optimizer as optimizer_mod
         import openpi.training.sharding as sharding_mod
         import openpi.training.utils as training_utils
+        import openpi.training.weight_loaders as weight_loaders
         import orbax.checkpoint as ocp
         from flax import traverse_util
 
@@ -81,6 +106,7 @@ class OpenPIFastWorkerSession:
         self._optimizer_mod = optimizer_mod
         self._sharding_mod = sharding_mod
         self._training_utils = training_utils
+        self._weight_loaders = weight_loaders
         self._ocp = ocp
         self._traverse_util = traverse_util
 
@@ -110,6 +136,19 @@ class OpenPIFastWorkerSession:
             overwrite=False,
             resume=False,
         )
+        overrides = OpenPIFastRuntimeInitOverrides.from_env()
+        if overrides.weights_path is not None:
+            logger.info("OpenPI FAST worker using explicit weights path: %s", overrides.weights_path)
+            self._config = dataclasses.replace(
+                self._config,
+                weight_loader=weight_loaders.CheckpointWeightLoader(overrides.weights_path),
+            )
+        elif overrides.random_init:
+            logger.info("OpenPI FAST worker using explicit random-init mode")
+            self._config = dataclasses.replace(
+                self._config,
+                weight_loader=weight_loaders.NoOpWeightLoader(),
+            )
         self._data_loader = _StaticDataLoader(
             self._config.data.create(self._config.assets_dirs, self._config.model)
         )

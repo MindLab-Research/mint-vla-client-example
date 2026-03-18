@@ -56,8 +56,9 @@ class _FakeRuntimeClient:
         self.calls: list[tuple[str, dict | None]] = []
         self.closed = False
 
-    async def request(self, op: str, payload: dict | None = None) -> dict:
+    async def request(self, op: str, payload: dict | None = None, *, timeout_s: float | None = None) -> dict:
         self.calls.append((op, payload))
+        _ = timeout_s
         if op == "create_session":
             return {"session": "created"}
         if op == "forward_backward":
@@ -210,3 +211,51 @@ def test_openpi_fast_engine_save_load_and_shutdown_delegate_to_runtime() -> None
         "load_weights",
         "shutdown",
     ]
+
+
+def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(monkeypatch) -> None:
+    from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+
+    monkeypatch.setenv("MINT_OPENPI_FAST_CREATE_SESSION_TIMEOUT_S", "900")
+    monkeypatch.setenv("MINT_OPENPI_FAST_SAVE_TIMEOUT_S", "1200")
+    monkeypatch.setenv("MINT_OPENPI_FAST_LOAD_TIMEOUT_S", "1500")
+
+    spec = OpenPIFastRuntimeSpec.from_env()
+
+    assert spec.create_session_timeout_s == 900.0
+    assert spec.save_weights_timeout_s == 1200.0
+    assert spec.load_weights_timeout_s == 1500.0
+
+
+def test_openpi_fast_runtime_init_overrides_accept_local_weight_path(monkeypatch) -> None:
+    from tinker_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
+
+    monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/local-params")
+    monkeypatch.delenv("MINT_OPENPI_FAST_RANDOM_INIT", raising=False)
+
+    overrides = OpenPIFastRuntimeInitOverrides.from_env()
+
+    assert overrides.weights_path == "/tmp/local-params"
+    assert overrides.random_init is False
+
+
+def test_openpi_fast_runtime_init_overrides_accept_random_init(monkeypatch) -> None:
+    from tinker_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
+
+    monkeypatch.delenv("MINT_OPENPI_FAST_WEIGHTS_PATH", raising=False)
+    monkeypatch.setenv("MINT_OPENPI_FAST_RANDOM_INIT", "1")
+
+    overrides = OpenPIFastRuntimeInitOverrides.from_env()
+
+    assert overrides.weights_path is None
+    assert overrides.random_init is True
+
+
+def test_openpi_fast_runtime_init_overrides_reject_conflicting_weight_sources(monkeypatch) -> None:
+    from tinker_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
+
+    monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/local-params")
+    monkeypatch.setenv("MINT_OPENPI_FAST_RANDOM_INIT", "1")
+
+    with pytest.raises(ValueError, match="exclusive"):
+        OpenPIFastRuntimeInitOverrides.from_env()

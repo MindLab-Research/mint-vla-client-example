@@ -59,6 +59,9 @@ class OpenPIFastRuntimeSpec:
     pythonpath: tuple[str, ...] = field(default_factory=_default_pythonpath)
     startup_timeout_s: float = 30.0
     request_timeout_s: float = 300.0
+    create_session_timeout_s: float = 300.0
+    save_weights_timeout_s: float = 300.0
+    load_weights_timeout_s: float = 300.0
     cwd: str | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
 
@@ -66,6 +69,7 @@ class OpenPIFastRuntimeSpec:
     def from_env(cls) -> "OpenPIFastRuntimeSpec":
         pythonpath_env = os.environ.get("MINT_OPENPI_FAST_PYTHONPATH", "").strip()
         pythonpath = tuple(s for s in pythonpath_env.split(os.pathsep) if s) or _default_pythonpath()
+        request_timeout_s = float(os.environ.get("MINT_OPENPI_FAST_REQUEST_TIMEOUT_S", "300"))
         return cls(
             python_executable=os.environ.get("MINT_OPENPI_FAST_PYTHON", sys.executable),
             worker_module=os.environ.get(
@@ -74,7 +78,16 @@ class OpenPIFastRuntimeSpec:
             ),
             pythonpath=pythonpath,
             startup_timeout_s=float(os.environ.get("MINT_OPENPI_FAST_STARTUP_TIMEOUT_S", "30")),
-            request_timeout_s=float(os.environ.get("MINT_OPENPI_FAST_REQUEST_TIMEOUT_S", "300")),
+            request_timeout_s=request_timeout_s,
+            create_session_timeout_s=float(
+                os.environ.get("MINT_OPENPI_FAST_CREATE_SESSION_TIMEOUT_S", str(request_timeout_s))
+            ),
+            save_weights_timeout_s=float(
+                os.environ.get("MINT_OPENPI_FAST_SAVE_TIMEOUT_S", str(request_timeout_s))
+            ),
+            load_weights_timeout_s=float(
+                os.environ.get("MINT_OPENPI_FAST_LOAD_TIMEOUT_S", str(request_timeout_s))
+            ),
             cwd=os.environ.get("MINT_OPENPI_FAST_CWD") or None,
         )
 
@@ -160,7 +173,22 @@ class OpenPIFastWorkerClient:
             return ""
         return data.decode("utf-8", errors="replace").strip()
 
-    async def request(self, op: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def timeout_for(self, op: str) -> float:
+        if op == "create_session":
+            return self._spec.create_session_timeout_s
+        if op == "save_weights":
+            return self._spec.save_weights_timeout_s
+        if op == "load_weights":
+            return self._spec.load_weights_timeout_s
+        return self._spec.request_timeout_s
+
+    async def request(
+        self,
+        op: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
         if self._closed:
             raise OpenPIFastWorkerProtocolError("worker client is closed")
 
@@ -178,7 +206,13 @@ class OpenPIFastWorkerClient:
             )
             await stdin.drain()
 
-            message = await self._read_message(self._spec.request_timeout_s)
+            effective_timeout = self.timeout_for(op) if timeout_s is None else float(timeout_s)
+            try:
+                message = await self._read_message(effective_timeout)
+            except OpenPIFastWorkerProtocolError as exc:
+                raise OpenPIFastWorkerProtocolError(
+                    f"worker op {op!r} timed out or returned invalid protocol after {effective_timeout}s: {exc}"
+                ) from exc
             if message.get("id") != request_id:
                 raise OpenPIFastWorkerProtocolError(
                     f"worker reply id mismatch: expected {request_id!r}, got {message.get('id')!r}"

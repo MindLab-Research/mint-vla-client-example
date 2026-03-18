@@ -83,3 +83,20 @@ def test_openpi_fast_worker_client_rejects_malformed_replies() -> None:
             await client.close()
 
     asyncio.run(_run())
+
+
+def test_openpi_fast_worker_client_supports_per_request_timeouts() -> None:
+    from tinker_server.backend.openpi_fast_runtime import (
+        OpenPIFastWorkerClient,
+        OpenPIFastWorkerProtocolError,
+    )
+
+    async def _run() -> None:
+        client = await OpenPIFastWorkerClient.start(_runtime_spec())
+        try:
+            with pytest.raises(OpenPIFastWorkerProtocolError, match="sleep"):
+                await client.request("sleep", {"seconds": 0.2}, timeout_s=0.01)
+        finally:
+            await client.close()
+
+    asyncio.run(_run())

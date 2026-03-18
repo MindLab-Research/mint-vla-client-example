@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 
 
 def _reply(message: dict) -> None:
@@ -39,6 +40,11 @@ def main() -> None:
         if op == "malformed":
             sys.stdout.write("not-json\n")
             sys.stdout.flush()
+            continue
+
+        if op == "sleep":
+            time.sleep(float(payload.get("seconds", 0.0)))
+            _reply({"id": request_id, "ok": True, "payload": {"slept": payload.get("seconds", 0.0)}})
             continue
 
         if op == "shutdown":

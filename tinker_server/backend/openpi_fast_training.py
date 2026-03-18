@@ -201,6 +201,18 @@ class OpenPIFastTrainingEngine:
             "eps": float(params.eps),
         }
 
+    async def _request_runtime(
+        self,
+        runtime: Any,
+        op: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        timeout_s = None
+        timeout_getter = getattr(runtime, "timeout_for", None)
+        if callable(timeout_getter):
+            timeout_s = float(timeout_getter(op))
+        return await runtime.request(op, payload, timeout_s=timeout_s)
+
     async def create_training_session(self, session: Any) -> None:
         model_config = self._model_config(session.base_model)
         config_name = get_openpi_fast_config_name(session.base_model)
@@ -210,7 +222,8 @@ class OpenPIFastTrainingEngine:
             config_name=config_name,
         )
         try:
-            await client.request(
+            await self._request_runtime(
+                client,
                 "create_session",
                 self._create_session_payload(session=session, model_config=model_config),
             )
@@ -231,7 +244,8 @@ class OpenPIFastTrainingEngine:
             )
         model_config = self._model_config(session.base_model)
         runtime = self._runtime_for_session(session)
-        result = await runtime.request(
+        result = await self._request_runtime(
+            runtime,
             "forward_backward",
             {
                 "loss_fn": request.forward_backward_input.loss_fn,
@@ -258,7 +272,11 @@ class OpenPIFastTrainingEngine:
 
     async def optim_step(self, session: Any, request: Any) -> dict[str, Any]:
         runtime = self._runtime_for_session(session)
-        result = await runtime.request("optim_step", self._optim_payload(request.adam_params))
+        result = await self._request_runtime(
+            runtime,
+            "optim_step",
+            self._optim_payload(request.adam_params),
+        )
         session.current_step += 1
         session.accumulated_gradients = 0
         metrics = dict(result.get("metrics") or {})
@@ -308,7 +326,7 @@ class OpenPIFastTrainingEngine:
         if use_per_expert_lora:
             raise ValueError("OpenPI FAST does not support per-expert LoRA export")
         runtime = self._runtime_for_session(session)
-        result = await runtime.request("save_weights", {"save_path": save_path})
+        result = await self._request_runtime(runtime, "save_weights", {"save_path": save_path})
         return str(result["path"])
 
     async def load_weights(
@@ -318,7 +336,8 @@ class OpenPIFastTrainingEngine:
         load_optimizer: bool = True,
     ) -> None:
         runtime = self._runtime_for_session(session)
-        result = await runtime.request(
+        result = await self._request_runtime(
+            runtime,
             "load_weights",
             {
                 "load_path": load_path,
@@ -334,7 +353,7 @@ class OpenPIFastTrainingEngine:
     async def shutdown_session(self, session: Any) -> None:
         runtime = self._runtime_clients.pop(session.model_id, None)
         if runtime is not None:
-            await runtime.request("shutdown", {"model_id": session.model_id})
+            await self._request_runtime(runtime, "shutdown", {"model_id": session.model_id})
             close = getattr(runtime, "close", None)
             if callable(close):
                 await close()
