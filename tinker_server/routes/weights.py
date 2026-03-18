@@ -16,6 +16,7 @@ import os
 import shutil
 import uuid
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -53,7 +54,7 @@ from ..models.types import (
     SaveStateRequest,
     UntypedAPIFuture,
 )
-from ..logging_context import classify_failure_reason, set_request_id
+from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..webhook import EventType, send_task_event
 
@@ -87,6 +88,44 @@ def _get_webhook_url(request: Request) -> str | None:
     if user_data:
         return user_data.get("webhook_url")
     return None
+
+
+async def _enqueue_weights_request_with_trace(
+    *,
+    route_start_s: float,
+    request_id: str,
+    op: str,
+    enqueue_coro,
+    model_id: str | None = None,
+) -> None:
+    tracer = get_otel_tracer()
+    future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
+    if tracer is None:
+        await enqueue_coro
+        return
+
+    with tracer.start_as_current_span(f"{op}.enqueue") as span:
+        span.set_attribute("component", "routes.weights")
+        span.set_attribute("op", str(op))
+        span.set_attribute("request_id", str(request_id))
+        if model_id:
+            span.set_attribute("model_id", str(model_id))
+        span.add_event(
+            "future_store_ready",
+            {
+                "elapsed_ms": round(future_ready_elapsed_ms, 3),
+                "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
+            },
+        )
+        enqueue_start_s = time.perf_counter()
+        await enqueue_coro
+        span.add_event(
+            "enqueue_done",
+            {
+                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
+                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+            },
+        )
 
 
 def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
@@ -374,6 +413,7 @@ async def save_weights(
     Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
     This must produce a training checkpoint (weights + optimizer state).
     """
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -454,13 +494,19 @@ async def save_weights(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
-        await api_work_queue.enqueue(
+        await _enqueue_weights_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="weights.save_weights",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=webhook_url,
-            extra={"prefer_tinker": bool(prefer_tinker)},
+            model_id=request.model_id,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="weights.save_weights",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=webhook_url,
+                extra={"prefer_tinker": bool(prefer_tinker)},
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -485,6 +531,7 @@ async def save_state(
 
     This endpoint produces a training checkpoint intended for resume, including optimizer state.
     """
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -563,13 +610,19 @@ async def save_state(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
-        await api_work_queue.enqueue(
+        await _enqueue_weights_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="weights.save_state",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=webhook_url,
-            extra={"prefer_tinker": bool(prefer_tinker)},
+            model_id=request.model_id,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="weights.save_state",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=webhook_url,
+                extra={"prefer_tinker": bool(prefer_tinker)},
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -619,7 +672,20 @@ async def _do_save_state(
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Save training checkpoint on worker, returns path
-        abs_path = await training_engine.save_weights(session, save_path)
+        abs_path = await run_async_with_otel_span(
+            "weights.save_state.execute",
+            lambda: training_engine.save_weights(session, save_path),
+            component="routes.weights",
+            op="weights.save_state",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "checkpoint_type": "training",
+                "checkpoint_name": str(checkpoint_name),
+            },
+        )
 
         # Save ownership metadata (for user-scoped checkpoint API)
         # Note: Directory is created by Ray Worker on GPU node, but shared filesystem
@@ -777,11 +843,24 @@ async def _do_save_weights(
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
 
-        abs_path = await training_engine.save_weights_for_sampler(
-            session=session,
-            checkpoint_name=checkpoint_name,
-            checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
-            use_per_expert_lora=False,
+        abs_path = await run_async_with_otel_span(
+            "weights.save_weights.execute",
+            lambda: training_engine.save_weights_for_sampler(
+                session=session,
+                checkpoint_name=checkpoint_name,
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                use_per_expert_lora=False,
+            ),
+            component="routes.weights",
+            op="weights.save_weights",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "checkpoint_type": "sampler",
+                "checkpoint_name": str(checkpoint_name),
+            },
         )
 
         os.makedirs(save_path, exist_ok=True)
@@ -901,6 +980,7 @@ async def load_state(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Load model state from checkpoint."""
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_file,
@@ -1032,12 +1112,18 @@ async def load_state(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
-        await api_work_queue.enqueue(
+        await _enqueue_weights_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="weights.load_state",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
+            model_id=request.model_id,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="weights.load_state",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1071,7 +1157,19 @@ async def _do_load_state(
             validate_checkpoint_load_contract(load_path, load_optimizer=True)
 
         # Call training engine to load checkpoint
-        await training_engine.load_weights(session, load_path, load_optimizer=request.optimizer)
+        await run_async_with_otel_span(
+            "weights.load_state.execute",
+            lambda: training_engine.load_weights(session, load_path, load_optimizer=request.optimizer),
+            component="routes.weights",
+            op="weights.load_state",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "load_optimizer": bool(request.optimizer),
+            },
+        )
 
         future_store.resolve(request_id, {
             "path": request.path,
