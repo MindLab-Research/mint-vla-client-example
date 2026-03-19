@@ -236,11 +236,13 @@ def test_openpi_fast_runtime_spec_uses_canonical_conley_paths(monkeypatch, tmp_p
     hf_home = conley_root / "_cache" / "huggingface"
     openpi_cache = conley_root / "_cache" / "openpi"
     worker_python = conley_root / "_envs" / "openpi-runtime" / "bin" / "python"
+    worker_python_target = conley_root / "_envs" / "python-bin" / "python3.12"
 
-    for path in (tinker_root, openpi_src, hf_home, openpi_cache, worker_python.parent):
+    for path in (tinker_root, openpi_src, hf_home, openpi_cache, worker_python.parent, worker_python_target.parent):
         path.mkdir(parents=True, exist_ok=True)
-    worker_python.write_text("#!/bin/sh\n")
-    worker_python.chmod(0o755)
+    worker_python_target.write_text("#!/bin/sh\n")
+    worker_python_target.chmod(0o755)
+    worker_python.symlink_to(worker_python_target)
 
     monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
     monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
@@ -248,7 +250,7 @@ def test_openpi_fast_runtime_spec_uses_canonical_conley_paths(monkeypatch, tmp_p
     spec = OpenPIFastRuntimeSpec.from_env()
     env = spec.build_env()
 
-    assert spec.python_executable == str(worker_python.resolve())
+    assert spec.python_executable == str(worker_python)
     assert spec.pythonpath == (str(tinker_root.resolve()), str(openpi_src.resolve()))
     assert env["HF_HOME"] == str(hf_home.resolve())
     assert env["HF_HUB_OFFLINE"] == "1"

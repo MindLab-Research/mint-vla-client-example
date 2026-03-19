@@ -60,7 +60,7 @@ def _require_existing_dir(path: Path, *, label: str) -> str:
 
 
 def _require_existing_executable(path: Path, *, label: str) -> str:
-    resolved = path.expanduser().resolve()
+    resolved = Path(os.path.abspath(os.fspath(path.expanduser())))
     try:
         mode = resolved.stat().st_mode
     except FileNotFoundError as exc:
