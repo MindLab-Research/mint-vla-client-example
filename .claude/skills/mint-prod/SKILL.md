@@ -29,7 +29,7 @@ description: |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 >
-> Note: `GET /api/v1/healthz` can return `503` when Ray has pending GPU placement-group demand (capacity degraded).
+> Note: `GET /api/v1/healthz` is the cheap public API-worker health endpoint. For costly Ray / placement-group diagnostics, use the internal deep health surface instead of expecting `healthz` to reflect cluster capacity.
 
 ---
 
