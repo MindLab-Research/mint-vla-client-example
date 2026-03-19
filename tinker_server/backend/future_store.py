@@ -74,6 +74,56 @@ def _require_ray_address() -> str:
     return require_ray_address()
 
 
+def _is_training_step_op(op: Any) -> bool:
+    return str(op or "") in {"training.optim_step", "training.train_step"}
+
+
+def _extract_training_step(result: Any) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    step = metrics.get("step")
+    if isinstance(step, bool):
+        return None
+    if isinstance(step, int):
+        return int(step)
+    if isinstance(step, float) and step.is_integer():
+        return int(step)
+    return None
+
+
+def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any:
+    if not isinstance(meta, dict) or not _is_training_step_op(meta.get("op")):
+        return result
+    model_id = meta.get("model_id")
+    if not model_id:
+        return result
+
+    try:
+        from .training_session_store import bump_training_session_step, set_training_session_step
+
+        step = _extract_training_step(result)
+        if step is None:
+            step = int(bump_training_session_step(str(model_id)))
+            if isinstance(result, dict):
+                metrics = result.get("metrics")
+                if not isinstance(metrics, dict):
+                    metrics = {}
+                    result["metrics"] = metrics
+                metrics["step"] = int(step)
+        else:
+            step = int(set_training_session_step(str(model_id), int(step)))
+            if isinstance(result, dict):
+                metrics = result.get("metrics")
+                if isinstance(metrics, dict):
+                    metrics["step"] = int(step)
+        return result
+    except Exception:
+        return result
+
+
 def _get_or_create_ray_actor():
     import ray
 
@@ -386,6 +436,13 @@ def _get_or_create_ray_actor():
 
         def resolve(self, request_id: str, result: Any) -> None:
             self._prune()
+            if (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            ):
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
             self._update_op_from_meta(request_id, self._meta.get(request_id))
@@ -397,6 +454,13 @@ def _get_or_create_ray_actor():
 
         def resolve_ref(self, request_id: str, ref: Any) -> None:
             self._prune()
+            if (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            ):
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
             self._result_refs[request_id] = ref
@@ -404,6 +468,13 @@ def _get_or_create_ray_actor():
 
         def fail(self, request_id: str, error: str) -> None:
             self._prune()
+            if (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            ):
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
             self._update_op_from_meta(request_id, self._meta.get(request_id))
@@ -432,21 +503,7 @@ def _get_or_create_ray_actor():
                     self._update_op_from_meta(request_id, meta)
                     try:
                         result = ray.get(ref)
-                        if isinstance(meta, dict) and meta.get("op") == "optim_step":
-                            model_id = meta.get("model_id")
-                            if model_id and isinstance(result, dict):
-                                try:
-                                    from .training_session_store import _get_or_create_actor  # type: ignore
-
-                                    store = _get_or_create_actor()
-                                    step = ray.get(store.bump_step.remote(str(model_id)))
-                                    metrics = result.get("metrics")
-                                    if not isinstance(metrics, dict):
-                                        metrics = {}
-                                        result["metrics"] = metrics
-                                    metrics["step"] = int(step)
-                                except Exception:
-                                    pass
+                        result = _sync_training_session_step(meta, result)
                         self._result_refs[request_id] = ray.put(result)
                         self._done_at[request_id] = time.time()
                         self._refs.pop(request_id, None)
@@ -699,6 +756,8 @@ class FutureStore:
         import ray
 
         try:
+            meta = ray.get(actor.get_meta.remote(request_id=request_id))
+            result = _sync_training_session_step(meta, result)
             ref = ray.put(result)
             actor.resolve_ref.remote(request_id=request_id, ref=ref)
         except ray.exceptions.ActorDiedError as e:

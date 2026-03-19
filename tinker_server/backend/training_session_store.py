@@ -71,6 +71,13 @@ def _get_or_create_actor():
             s["current_step"] = int(s.get("current_step", 0)) + 1
             return int(s["current_step"])
 
+        def set_step(self, model_id: str, step: int) -> int:
+            s = self._sessions.get(model_id)
+            if s is None:
+                return int(step)
+            s["current_step"] = max(int(s.get("current_step", 0)), int(step))
+            return int(s["current_step"])
+
         def list(self) -> list[dict[str, Any]]:
             return list(self._sessions.values())
 
@@ -131,6 +138,24 @@ def get_training_session_info(model_id: str) -> dict[str, Any] | None:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.get.remote(model_id))
+
+
+def bump_training_session_step(model_id: str) -> int:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return int(ray.get(actor.bump_step.remote(model_id)))
+
+
+def set_training_session_step(model_id: str, step: int) -> int:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return int(ray.get(actor.set_step.remote(model_id, int(step))))
 
 
 def list_training_sessions() -> list[dict[str, Any]]:

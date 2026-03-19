@@ -1106,6 +1106,22 @@ async def lifespan(app: FastAPI):
 
     future_reaper_task = asyncio.create_task(_future_reaper_loop())
 
+    async def _stale_training_heartbeat_loop() -> None:
+        while True:
+            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+            try:
+                cleaned = await training.cleanup_stale_training_sessions_once()
+                if cleaned:
+                    logger.warning(
+                        "auto-terminated %d stale training session(s): %s",
+                        len(cleaned),
+                        cleaned,
+                    )
+            except Exception:
+                logger.exception("stale training heartbeat cleanup failed")
+
+    stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop())
+
     async def _checkpoint_reaper_loop() -> None:
         while True:
             await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
@@ -1146,10 +1162,12 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     future_reaper_task.cancel()
+    stale_training_heartbeat_task.cancel()
     checkpoint_reaper_task.cancel()
     checkpoint_mirror_task.cancel()
     await asyncio.gather(
         future_reaper_task,
+        stale_training_heartbeat_task,
         checkpoint_reaper_task,
         checkpoint_mirror_task,
         return_exceptions=True,
