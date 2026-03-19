@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import json
 import os
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,14 +30,44 @@ class OpenPIFastWorkerRemoteError(OpenPIFastWorkerError):
 
 
 def _default_pythonpath() -> tuple[str, ...]:
-    mint_root = Path(__file__).resolve().parents[2]
-    repo_root = mint_root.parents[1]
-    openpi_src = repo_root / "src" / "openpi" / "src"
+    mint_root = _default_mint_root()
+    openpi_src = mint_root.parent / "openpi" / "src"
 
     entries = [str(mint_root)]
     if openpi_src.exists():
-        entries.append(str(openpi_src))
+        entries.append(str(openpi_src.resolve()))
     return tuple(entries)
+
+
+def _default_mint_root() -> Path:
+    pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
+    if pfs_tinker_path:
+        return Path(pfs_tinker_path).expanduser().resolve()
+    return Path(__file__).resolve().parents[2]
+
+
+def _conley_workspace_root(mint_root: Path) -> Path | None:
+    if mint_root.name != "tinker-server":
+        return None
+    return mint_root.parent
+
+
+def _require_existing_dir(path: Path, *, label: str) -> str:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"OpenPI FAST {label} does not exist: {resolved}")
+    return str(resolved)
+
+
+def _require_existing_executable(path: Path, *, label: str) -> str:
+    resolved = path.expanduser().resolve()
+    try:
+        mode = resolved.stat().st_mode
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"OpenPI FAST {label} does not exist: {resolved}") from exc
+    if not stat.S_ISREG(mode) or not os.access(resolved, os.X_OK):
+        raise FileNotFoundError(f"OpenPI FAST {label} is not executable: {resolved}")
+    return str(resolved)
 
 
 def _merge_pythonpath(entries: tuple[str, ...], current: str | None) -> str:
@@ -67,11 +98,37 @@ class OpenPIFastRuntimeSpec:
 
     @classmethod
     def from_env(cls) -> "OpenPIFastRuntimeSpec":
+        mint_root = _default_mint_root()
+        conley_root = _conley_workspace_root(mint_root)
         pythonpath_env = os.environ.get("MINT_OPENPI_FAST_PYTHONPATH", "").strip()
         pythonpath = tuple(s for s in pythonpath_env.split(os.pathsep) if s) or _default_pythonpath()
         request_timeout_s = float(os.environ.get("MINT_OPENPI_FAST_REQUEST_TIMEOUT_S", "300"))
+        python_executable = (os.environ.get("MINT_OPENPI_FAST_PYTHON") or "").strip()
+        extra_env: dict[str, str] = {}
+        if conley_root is not None:
+            extra_env = {
+                "HF_HOME": _require_existing_dir(
+                    conley_root / "_cache" / "huggingface",
+                    label="HF cache root",
+                ),
+                "HF_HUB_OFFLINE": "1",
+                "OPENPI_DATA_HOME": _require_existing_dir(
+                    conley_root / "_cache" / "openpi",
+                    label="OpenPI cache root",
+                ),
+            }
+            if not python_executable:
+                python_executable = _require_existing_executable(
+                    conley_root / "_envs" / "openpi-runtime" / "bin" / "python",
+                    label="runtime python",
+                )
+        elif python_executable:
+            python_executable = _require_existing_executable(
+                Path(python_executable),
+                label="runtime python",
+            )
         return cls(
-            python_executable=os.environ.get("MINT_OPENPI_FAST_PYTHON", sys.executable),
+            python_executable=python_executable or sys.executable,
             worker_module=os.environ.get(
                 "MINT_OPENPI_FAST_WORKER_MODULE",
                 "tinker_server.backend.openpi_fast_worker",
@@ -89,6 +146,7 @@ class OpenPIFastRuntimeSpec:
                 os.environ.get("MINT_OPENPI_FAST_LOAD_TIMEOUT_S", str(request_timeout_s))
             ),
             cwd=os.environ.get("MINT_OPENPI_FAST_CWD") or None,
+            extra_env=extra_env,
         )
 
     def build_env(self) -> dict[str, str]:

@@ -227,6 +227,55 @@ def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(monkeypatch)
     assert spec.load_weights_timeout_s == 1500.0
 
 
+def test_openpi_fast_runtime_spec_uses_canonical_conley_paths(monkeypatch, tmp_path) -> None:
+    from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+
+    conley_root = tmp_path / "conley"
+    tinker_root = conley_root / "tinker-server"
+    openpi_src = conley_root / "openpi" / "src"
+    hf_home = conley_root / "_cache" / "huggingface"
+    openpi_cache = conley_root / "_cache" / "openpi"
+    worker_python = conley_root / "_envs" / "openpi-runtime" / "bin" / "python"
+
+    for path in (tinker_root, openpi_src, hf_home, openpi_cache, worker_python.parent):
+        path.mkdir(parents=True, exist_ok=True)
+    worker_python.write_text("#!/bin/sh\n")
+    worker_python.chmod(0o755)
+
+    monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
+    monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
+
+    spec = OpenPIFastRuntimeSpec.from_env()
+    env = spec.build_env()
+
+    assert spec.python_executable == str(worker_python.resolve())
+    assert spec.pythonpath == (str(tinker_root.resolve()), str(openpi_src.resolve()))
+    assert env["HF_HOME"] == str(hf_home.resolve())
+    assert env["HF_HUB_OFFLINE"] == "1"
+    assert env["OPENPI_DATA_HOME"] == str(openpi_cache.resolve())
+
+
+def test_openpi_fast_runtime_spec_rejects_missing_canonical_runtime_python(
+    monkeypatch, tmp_path
+) -> None:
+    from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+
+    conley_root = tmp_path / "conley"
+    tinker_root = conley_root / "tinker-server"
+    openpi_src = conley_root / "openpi" / "src"
+    hf_home = conley_root / "_cache" / "huggingface"
+    openpi_cache = conley_root / "_cache" / "openpi"
+
+    for path in (tinker_root, openpi_src, hf_home, openpi_cache):
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
+    monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
+
+    with pytest.raises(FileNotFoundError, match="_envs/openpi-runtime/bin/python"):
+        OpenPIFastRuntimeSpec.from_env()
+
+
 def test_openpi_fast_runtime_init_overrides_accept_local_weight_path(monkeypatch) -> None:
     from tinker_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
 
