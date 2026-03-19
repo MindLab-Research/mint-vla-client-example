@@ -23,6 +23,7 @@ from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request
 from ..checkpoints import get_persistent_search_roots
 from ..config import config as server_config
+from ..health_checks import deep_healthz_response
 from ..usage_store import get_usage_store
 
 # Checkpoint directory (shared filesystem)
@@ -163,6 +164,12 @@ async def health_check():
         database=db_status,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@router.get("/healthz/deep", response_model=None)
+async def deep_health_check():
+    """Costly internal health endpoint with active Ray diagnostics."""
+    return await deep_healthz_response()
 
 
 @router.get("/admission_stats")
