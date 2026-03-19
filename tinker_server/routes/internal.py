@@ -180,6 +180,9 @@ async def admission_stats() -> dict:
     from ..backend.capacity_manager import capacity_manager
     from ..backend.future_store import future_store
     from ..backend.resource_pool import get_resource_pool
+    from ..backend.session_heartbeat_store import session_heartbeat_store
+    from ..routes import sampling as sampling_route
+    from ..routes import service as service_route
 
     def _self_rss_bytes() -> int:
         with open("/proc/self/statm", encoding="utf-8") as f:
@@ -240,14 +243,37 @@ async def admission_stats() -> dict:
     except Exception as e:
         proc["rss_error"] = f"{type(e).__name__}: {e}"
 
-    return {"capacity": cap, "work_queue": q, "future_store": fs, "actors": actors, "process": proc}
+    driver_state: dict = {
+        "sdk_sessions_fallback": int(len(service_route.sessions)),
+        "session_heartbeat_entries": int(session_heartbeat_store.size()),
+    }
+    try:
+        driver_state["lora_load_locks"] = int(await sampling_route._lora_load_lock_count())
+    except Exception as e:
+        driver_state["lora_load_locks_error"] = f"{type(e).__name__}: {e}"
+
+    manager = service_route.session_manager
+    if manager is not None:
+        try:
+            driver_state.update(manager.observability_snapshot())
+        except Exception as e:
+            driver_state["sampling_sessions_error"] = f"{type(e).__name__}: {e}"
+
+    return {
+        "capacity": cap,
+        "work_queue": q,
+        "future_store": fs,
+        "actors": actors,
+        "process": proc,
+        "driver_state": driver_state,
+    }
 
 
 def _prom_sanitize_name(v: str) -> str:
     out = []
     for ch in str(v):
         if ch.isalnum() or ch == "_":
-            out.append(ch.lower())
+            out.append(ch)
         else:
             out.append("_")
     s = "".join(out).strip("_")
@@ -426,6 +452,18 @@ async def metrics() -> Response:
     if isinstance(proc, dict):
         _append_metric(lines, "tinker_api_server_process_rss_bytes", proc.get("rss_bytes"))
         _append_metric(lines, "tinker_api_server_process_pid", proc.get("pid"))
+        _append_metric(lines, "MINT_driver_process_rss_bytes", proc.get("rss_bytes"))
+
+    driver_state = stats.get("driver_state")
+    if isinstance(driver_state, dict):
+        _append_metric(lines, "MINT_driver_sdk_sessions_fallback", driver_state.get("sdk_sessions_fallback"))
+        _append_metric(lines, "MINT_driver_session_heartbeat_entries", driver_state.get("session_heartbeat_entries"))
+        _append_metric(lines, "MINT_driver_lora_load_locks", driver_state.get("lora_load_locks"))
+        _append_metric(lines, "MINT_driver_sampling_sessions_total", driver_state.get("sampling_sessions_total"))
+        _append_metric(lines, "MINT_driver_sampling_sessions_multi_lora", driver_state.get("sampling_sessions_multi_lora"))
+        _append_metric(lines, "MINT_driver_sampling_sessions_base_model", driver_state.get("sampling_sessions_base_model"))
+        _append_metric(lines, "MINT_driver_sampling_sessions_lora_loaded", driver_state.get("sampling_sessions_lora_loaded"))
+        _append_metric(lines, "MINT_driver_sampling_sessions_inflight", driver_state.get("sampling_sessions_inflight"))
 
     if not lines:
         lines.append("tinker_metrics_up 0")

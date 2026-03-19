@@ -73,6 +73,16 @@ async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
         return lock
 
 
+async def _drop_lora_load_lock(session_id: str) -> None:
+    async with _lora_load_locks_guard:
+        _lora_load_locks.pop(session_id, None)
+
+
+async def _lora_load_lock_count() -> int:
+    async with _lora_load_locks_guard:
+        return len(_lora_load_locks)
+
+
 def _resolve_billing_model(session_id: str) -> str:
     if session_manager is None:
         return session_id

@@ -52,7 +52,6 @@ logger = logging.getLogger(__name__)
 
 # In-memory session storage
 sessions: dict[str, dict] = {}
-sampling_sessions: dict[str, str] = {}  # sampling_session_id -> base_model
 
 # Global session manager reference (set by app lifespan)
 session_manager: SessionManager | None = None
@@ -418,7 +417,6 @@ async def _create_sampling_session_impl(
                     status_code=409,
                     detail="Sampling session already exists with different configuration",
                 )
-            sampling_sessions[sampling_session_id] = base_model
             _write_sampler_index(sampling_session_id)
             return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
     else:
@@ -447,9 +445,6 @@ async def _create_sampling_session_impl(
     else:
         # Base model (no LoRA): register session directly
         session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
-
-    # Store metadata
-    sampling_sessions[sampling_session_id] = base_model
 
     _write_sampler_index(sampling_session_id)
 
