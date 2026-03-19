@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from types import SimpleNamespace
 
 import pytest
+from fastapi.responses import JSONResponse
 
 
 class _DummyRequest:
@@ -152,13 +154,21 @@ async def test_issue_281_public_healthz_stays_ready_without_ray_probe(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_issue_281_public_healthz_ignores_startup_degraded_state() -> None:
+async def test_issue_281_public_healthz_reports_startup_degraded_state() -> None:
     from tinker_server.health_state import clear_startup_degraded_state, set_startup_degraded_state
     from tinker_server.routes import service
 
     set_startup_degraded_state(reason="startup_degraded", error="boom", details={"phase": "init"})
     try:
-        assert await service.healthz() == {"status": "ready"}
+        payload = await service.healthz()
+        assert isinstance(payload, JSONResponse)
+        assert payload.status_code == 503
+        assert json.loads(payload.body) == {
+            "status": "degraded",
+            "reason": "startup_degraded",
+            "error": "boom",
+            "details": {"phase": "init"},
+        }
     finally:
         clear_startup_degraded_state()
 

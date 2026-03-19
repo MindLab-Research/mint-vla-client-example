@@ -6,26 +6,36 @@ import os
 from fastapi.responses import JSONResponse
 
 
+def _startup_degraded_response() -> JSONResponse | None:
+    from .health_state import get_startup_degraded_state
+
+    degraded = get_startup_degraded_state()
+    if degraded is None:
+        return None
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "degraded",
+            "reason": degraded.get("reason", "startup_degraded"),
+            "error": degraded.get("error", ""),
+            "details": degraded.get("details", {}),
+        },
+    )
+
+
 def public_healthz_response() -> dict | JSONResponse:
-    """Return public API-worker health without probing Ray or other backends."""
+    """Return cheap public API-worker health without probing Ray or other backends."""
+    degraded = _startup_degraded_response()
+    if degraded is not None:
+        return degraded
     return {"status": "ready"}
 
 
 async def deep_healthz_response() -> dict | JSONResponse:
     """Return internal deep health with Ray and placement-group observations."""
-    from .health_state import get_startup_degraded_state
-
-    degraded = get_startup_degraded_state()
+    degraded = _startup_degraded_response()
     if degraded is not None:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "degraded",
-                "reason": degraded.get("reason", "startup_degraded"),
-                "error": degraded.get("error", ""),
-                "details": degraded.get("details", {}),
-            },
-        )
+        return degraded
 
     try:
         import ray
