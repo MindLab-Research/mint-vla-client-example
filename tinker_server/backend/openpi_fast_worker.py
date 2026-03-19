@@ -67,6 +67,37 @@ def _decode_image(encoded: dict[str, Any]) -> np.ndarray:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
+def _compute_importance_sampling_stats(
+    *,
+    current_logprobs: np.ndarray,
+    old_logprobs: np.ndarray,
+    advantages: np.ndarray,
+    loss_mask: np.ndarray,
+) -> dict[str, float | int]:
+    current = np.asarray(current_logprobs, dtype=np.float32).reshape(-1)
+    old = np.asarray(old_logprobs, dtype=np.float32).reshape(-1)
+    adv = np.asarray(advantages, dtype=np.float32).reshape(-1)
+    mask = np.asarray(loss_mask, dtype=np.bool_).reshape(-1)
+
+    if not (current.shape == old.shape == adv.shape == mask.shape):
+        raise ValueError("importance_sampling inputs must share the same length")
+
+    token_count = int(mask.sum())
+    if token_count == 0:
+        raise ValueError("importance_sampling requires at least one masked token")
+
+    mask_f = mask.astype(np.float32)
+    log_ratio = np.clip(current - old, a_min=-20.0, a_max=20.0)
+    ratio = np.exp(log_ratio)
+    loss = -float(np.sum(ratio * adv * mask_f))
+    ratio_mean = float(np.sum(ratio * mask_f) / token_count)
+    return {
+        "loss": loss,
+        "ratio_mean": ratio_mean,
+        "token_count": token_count,
+    }
+
+
 class _StaticDataLoader:
     def __init__(self, data_config: Any) -> None:
         self._data_config = data_config
@@ -83,6 +114,7 @@ class OpenPIFastWorkerSession:
         import optax
 
         import openpi.models.model as openpi_model
+        import openpi.models.pi0_fast as openpi_pi0_fast
         import openpi.shared.array_typing as array_typing
         import openpi.shared.nnx_utils as nnx_utils
         import openpi.training.checkpoints as checkpoints
@@ -99,6 +131,7 @@ class OpenPIFastWorkerSession:
         self._jnp = jnp
         self._optax = optax
         self._openpi_model = openpi_model
+        self._openpi_pi0_fast = openpi_pi0_fast
         self._array_typing = array_typing
         self._nnx_utils = nnx_utils
         self._checkpoints = checkpoints
@@ -254,6 +287,21 @@ class OpenPIFastWorkerSession:
         actions = np.zeros((1, self._action_horizon, self._action_dim), dtype=np.float32)
         return observation, actions
 
+    def _grad_and_param_norm(self, model: Any, grads: Any) -> tuple[float, float]:
+        nnx = self._nnx
+
+        kernel_params = nnx.state(
+            model,
+            nnx.All(
+                nnx.Param,
+                nnx.Not(self._nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+                lambda _, x: x.value.ndim > 1,
+            ),
+        )
+        grad_norm = _float_scalar(self._optax.global_norm(grads))
+        param_norm = _float_scalar(self._optax.global_norm(kernel_params))
+        return grad_norm, param_norm
+
     def _compute_grads(self, observation: Any, actions: Any) -> tuple[Any, float, float, float]:
         nnx = self._nnx
         jax = self._jax
@@ -268,30 +316,120 @@ class OpenPIFastWorkerSession:
 
         diff_state = nnx.DiffState(0, self._config.trainable_filter)
         loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, step_rng, observation, actions)
-
-        params = self._state.params.filter(self._config.trainable_filter)
-        kernel_params = nnx.state(
-            model,
-            nnx.All(
-                nnx.Param,
-                nnx.Not(self._nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-                lambda _, x: x.value.ndim > 1,
-            ),
-        )
-        grad_norm = _float_scalar(self._optax.global_norm(grads))
-        param_norm = _float_scalar(self._optax.global_norm(kernel_params))
+        grad_norm, param_norm = self._grad_and_param_norm(model, grads)
         loss_value = _float_scalar(jax.device_get(loss))
-        _ = params
         return grads, loss_value, grad_norm, param_norm
+
+    def _compute_target_logprobs(self, model_obj: Any, rng: Any, observation: Any) -> Any:
+        observation = self._openpi_model.preprocess_observation(
+            rng,
+            observation,
+            train=True,
+            image_keys=list(observation.images.keys()),
+        )
+        input_token_embeddings, input_mask, ar_mask = model_obj.embed_inputs(observation)
+        attn_mask = self._openpi_pi0_fast.make_attn_mask(input_mask, ar_mask)
+        target_tokens = observation.tokenized_prompt[:, 1:]
+        pre_logits, _, _ = model_obj.PaliGemma.llm(
+            embedded_prefix=input_token_embeddings[:, :-1],
+            mask=attn_mask[:, :-1, :-1],
+            return_prelogits=True,
+        )
+        logits, _ = model_obj.PaliGemma.llm(
+            pre_logits=pre_logits[:, -target_tokens.shape[1] :],
+        )
+        logp = self._jax.nn.log_softmax(logits, axis=-1)
+        return self._jnp.take_along_axis(logp, target_tokens[..., None], axis=-1).squeeze(-1)
+
+    def _importance_sampling_inputs(
+        self,
+        item: dict[str, Any],
+        *,
+        target_len: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        loss_mask = np.asarray(item["token_loss_mask"], dtype=np.bool_).reshape(-1)[1:]
+        old_logprobs = np.asarray(item["old_logprobs"], dtype=np.float32).reshape(-1)
+        advantages = np.asarray(item["advantages"], dtype=np.float32).reshape(-1)
+
+        if loss_mask.shape[0] != target_len:
+            raise ValueError("importance_sampling token_loss_mask must align with target tokens")
+        if old_logprobs.shape != advantages.shape:
+            raise ValueError("importance_sampling old_logprobs and advantages must share one length")
+        if int(loss_mask.sum()) != old_logprobs.shape[0]:
+            raise ValueError("importance_sampling suffix inputs must match masked token count")
+
+        padded_old_logprobs = np.zeros(target_len, dtype=np.float32)
+        padded_advantages = np.zeros(target_len, dtype=np.float32)
+        padded_old_logprobs[loss_mask] = old_logprobs
+        padded_advantages[loss_mask] = advantages
+        return padded_old_logprobs, padded_advantages, loss_mask
+
+    def _compute_importance_sampling_grads(
+        self,
+        observation: Any,
+        actions: Any,
+        item: dict[str, Any],
+    ) -> tuple[Any, float, float, float, float, float, list[float]]:
+        nnx = self._nnx
+        jax = self._jax
+
+        target_len = len(list(item["tokenized_prompt"])) - 1
+        old_logprobs, advantages, loss_mask = self._importance_sampling_inputs(
+            item,
+            target_len=target_len,
+        )
+
+        old_logprobs_t = self._jnp.asarray(old_logprobs[None, :], dtype=self._jnp.float32)
+        advantages_t = self._jnp.asarray(advantages[None, :], dtype=self._jnp.float32)
+        loss_mask_t = self._jnp.asarray(loss_mask.astype(np.float32)[None, :], dtype=self._jnp.float32)
+
+        model = nnx.merge(self._state.model_def, self._state.params)
+        model.train()
+        self._rng, step_rng = jax.random.split(self._rng)
+
+        def loss_fn(model_obj: Any, rng: Any, obs: Any, act: Any):
+            del act
+            current_logprobs = self._compute_target_logprobs(model_obj, rng, obs)
+            log_ratio = self._jnp.clip(current_logprobs - old_logprobs_t, a_min=-20.0, a_max=20.0)
+            ratio = self._jnp.exp(log_ratio)
+            loss = -self._jnp.sum(ratio * advantages_t * loss_mask_t)
+            return loss, current_logprobs
+
+        diff_state = nnx.DiffState(0, self._config.trainable_filter)
+        (loss, current_logprobs), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(model, step_rng, observation, actions)
+        grad_norm, param_norm = self._grad_and_param_norm(model, grads)
+
+        current_logprobs_np = np.asarray(jax.device_get(current_logprobs), dtype=np.float32).reshape(-1)
+        stats = _compute_importance_sampling_stats(
+            current_logprobs=current_logprobs_np,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            loss_mask=loss_mask,
+        )
+        _ = loss
+        return (
+            grads,
+            float(stats["loss"]),
+            grad_norm,
+            param_norm,
+            float(stats["ratio_mean"]),
+            float(stats["token_count"]),
+            current_logprobs_np[loss_mask].tolist(),
+        )
 
     def create_session(self) -> dict[str, Any]:
         return {"backend": "openpi_fast", "config_name": self._config_name}
 
     def forward_backward(self, payload: dict[str, Any]) -> dict[str, Any]:
         loss_fn = str(payload.get("loss_fn") or "")
-        if loss_fn != "cross_entropy":
+        if loss_fn not in {"cross_entropy", "importance_sampling"}:
             raise ValueError(
-                f"OpenPI FAST ST-02 only supports cross_entropy, got {loss_fn!r}"
+                "OpenPI FAST ST-03 first slice only supports cross_entropy and "
+                f"importance_sampling, got {loss_fn!r}"
             )
 
         batch = list(payload.get("batch") or [])
@@ -302,29 +440,58 @@ class OpenPIFastWorkerSession:
         total_tokens = 0.0
         total_grad_norm = 0.0
         total_param_norm = 0.0
+        total_ratio = 0.0
+        num_rl_items = 0
         loss_fn_outputs: list[dict[str, Any]] = []
         pending_grads = self._pending_grads
 
         for item in batch:
             observation, actions = self._observation_from_payload(item)
-            grads, loss_value, grad_norm, param_norm = self._compute_grads(observation, actions)
+            if loss_fn == "cross_entropy":
+                grads, loss_value, grad_norm, param_norm = self._compute_grads(observation, actions)
+                token_count = float(sum(bool(x) for x in item["token_loss_mask"]))
+                loss_fn_outputs.append(
+                    {
+                        "loss": {
+                            "data": [loss_value],
+                            "shape": [1],
+                            "dtype": "float32",
+                        }
+                    }
+                )
+            else:
+                (
+                    grads,
+                    loss_value,
+                    grad_norm,
+                    param_norm,
+                    ratio_mean,
+                    token_count,
+                    new_logprobs,
+                ) = self._compute_importance_sampling_grads(observation, actions, item)
+                total_ratio += ratio_mean
+                num_rl_items += 1
+                loss_fn_outputs.append(
+                    {
+                        "loss": {
+                            "data": [loss_value],
+                            "shape": [1],
+                            "dtype": "float32",
+                        },
+                        "logprobs": {
+                            "data": new_logprobs,
+                            "shape": [len(new_logprobs)],
+                            "dtype": "float32",
+                        },
+                    }
+                )
             pending_grads = (
                 grads
                 if pending_grads is None
                 else self._jax.tree.map(lambda a, b: a + b, pending_grads, grads)
             )
-
-            loss_fn_outputs.append(
-                {
-                    "loss": {
-                        "data": [loss_value],
-                        "shape": [1],
-                        "dtype": "float32",
-                    }
-                }
-            )
             total_loss += loss_value
-            total_tokens += float(sum(bool(x) for x in item["token_loss_mask"]))
+            total_tokens += token_count
             total_grad_norm += grad_norm
             total_param_norm += param_norm
 
@@ -332,16 +499,19 @@ class OpenPIFastWorkerSession:
 
         denom = max(total_tokens, 1.0)
         batch_size = float(len(batch))
+        metrics = {
+            "loss:mean": total_loss / denom,
+            "num_samples:sum": batch_size,
+            "num_tokens:sum": total_tokens,
+            "grad_norm:mean": total_grad_norm / batch_size,
+            "param_norm:mean": total_param_norm / batch_size,
+        }
+        if num_rl_items > 0:
+            metrics["ratio:mean"] = total_ratio / num_rl_items
         return {
-            "loss_fn_output_type": "cross_entropy_loss",
+            "loss_fn_output_type": f"{loss_fn}_loss",
             "loss_fn_outputs": loss_fn_outputs,
-            "metrics": {
-                "loss:mean": total_loss / denom,
-                "num_samples:sum": batch_size,
-                "num_tokens:sum": total_tokens,
-                "grad_norm:mean": total_grad_norm / batch_size,
-                "param_norm:mean": total_param_norm / batch_size,
-            },
+            "metrics": metrics,
         }
 
     def optim_step(self, payload: dict[str, Any]) -> dict[str, Any]:

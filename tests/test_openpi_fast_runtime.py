@@ -34,6 +34,24 @@ def _make_session() -> TrainingSession:
 
 
 def _make_datum() -> Datum:
+    return _make_datum_with_rl()
+
+
+def _make_datum_with_rl(
+    *,
+    logprobs: list[float] | None = None,
+    advantages: list[float] | None = None,
+) -> Datum:
+    loss_fn_inputs: dict[str, object] = {
+        "state": {"data": [0.1] * 7, "shape": [7], "dtype": "float32"},
+        "target_tokens": {"data": [21, 22], "shape": [2], "dtype": "int64"},
+        "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
+        "token_ar_mask": {"data": [1, 1], "shape": [2], "dtype": "int32"},
+    }
+    if logprobs is not None:
+        loss_fn_inputs["logprobs"] = {"data": logprobs, "shape": [2], "dtype": "float32"}
+    if advantages is not None:
+        loss_fn_inputs["advantages"] = {"data": advantages, "shape": [2], "dtype": "float32"}
     return Datum(
         model_input=ModelInput(
             chunks=[
@@ -43,12 +61,7 @@ def _make_datum() -> Datum:
                 EncodedTextChunk(tokens=[11, 12, 13]),
             ]
         ),
-        loss_fn_inputs={
-            "state": {"data": [0.1] * 7, "shape": [7], "dtype": "float32"},
-            "target_tokens": {"data": [21, 22], "shape": [2], "dtype": "int64"},
-            "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
-            "token_ar_mask": {"data": [1, 1], "shape": [2], "dtype": "int32"},
-        },
+        loss_fn_inputs=loss_fn_inputs,
     )
 
 
@@ -64,6 +77,19 @@ class _FakeRuntimeClient:
             return {"session": "created"}
         if op == "forward_backward":
             batch = payload["batch"]
+            if payload["loss_fn"] == "importance_sampling":
+                return {
+                    "loss_fn_output_type": "importance_sampling_loss",
+                    "loss_fn_outputs": [
+                        {"loss": {"data": [float(i + 1)], "shape": [1], "dtype": "float32"}}
+                        for i, _ in enumerate(batch)
+                    ],
+                    "metrics": {
+                        "loss:mean": 0.5,
+                        "num_samples:sum": float(len(batch)),
+                        "ratio:mean": 1.25,
+                    },
+                }
             return {
                 "loss_fn_output_type": "cross_entropy_loss",
                 "loss_fn_outputs": [
@@ -163,8 +189,40 @@ def test_openpi_fast_engine_rejects_non_sft_loss_functions() -> None:
         forward_backward_input=ForwardBackwardInput(data=[_make_datum()], loss_fn="ppo"),
     )
 
-    with pytest.raises(ValueError, match="cross_entropy"):
+    with pytest.raises(ValueError, match="cross_entropy|importance_sampling"):
         asyncio.run(engine.forward_backward(session, request))
+
+
+def test_openpi_fast_engine_importance_sampling_builds_rl_payload_and_updates_grad_state() -> None:
+    from tinker_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+
+    factory = _FakeRuntimeFactory()
+    engine = OpenPIFastTrainingEngine(runtime_factory=factory)
+    session = _make_session()
+    asyncio.run(engine.create_training_session(session))
+    request = ForwardBackwardRequest(
+        model_id=session.model_id,
+        forward_backward_input=ForwardBackwardInput(
+            data=[
+                _make_datum_with_rl(
+                    logprobs=[-0.1, -0.2],
+                    advantages=[1.5, -0.5],
+                )
+            ],
+            loss_fn="importance_sampling",
+        ),
+    )
+
+    result = asyncio.run(engine.forward_backward(session, request))
+
+    assert session.accumulated_gradients == 1
+    assert result["loss_fn_output_type"] == "importance_sampling_loss"
+    op, payload = factory.clients[0].calls[-1]
+    assert op == "forward_backward"
+    assert payload["loss_fn"] == "importance_sampling"
+    assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
+    assert payload["batch"][0]["old_logprobs"] == [-0.1, -0.2]
+    assert payload["batch"][0]["advantages"] == [1.5, -0.5]
 
 
 def test_openpi_fast_engine_train_step_composes_forward_backward_and_optim_step() -> None:

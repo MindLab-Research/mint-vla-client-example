@@ -80,7 +80,7 @@ def _binary_loss_mask(weights: list[Any]) -> list[bool]:
     return mask
 
 
-def build_openpi_fast_sft_runtime_payload(
+def _build_openpi_fast_common_payload(
     *,
     datum: Any,
     model_config: ModelConfig,
@@ -134,11 +134,59 @@ def build_openpi_fast_sft_runtime_payload(
         "image_bytes": image_bytes,
         "image_mask": image_mask,
         "state": state,
+        "prefix_tokens": prefix_tokens,
+        "target_tokens": target_tokens,
+        "suffix_token_ar_mask": token_ar_mask,
+        "suffix_loss_mask": loss_mask,
+    }
+
+
+def _build_openpi_fast_prompt_payload(common: dict[str, Any]) -> dict[str, Any]:
+    prefix_tokens = list(common["prefix_tokens"])
+    target_tokens = list(common["target_tokens"])
+    suffix_token_ar_mask = list(common["suffix_token_ar_mask"])
+    suffix_loss_mask = list(common["suffix_loss_mask"])
+
+    return {
+        "image_bytes": common["image_bytes"],
+        "image_mask": common["image_mask"],
+        "state": common["state"],
         "tokenized_prompt": prefix_tokens + target_tokens,
         "tokenized_prompt_mask": [True] * (len(prefix_tokens) + len(target_tokens)),
-        "token_ar_mask": ([0] * len(prefix_tokens)) + token_ar_mask,
-        "token_loss_mask": ([False] * len(prefix_tokens)) + loss_mask,
+        "token_ar_mask": ([0] * len(prefix_tokens)) + suffix_token_ar_mask,
+        "token_loss_mask": ([False] * len(prefix_tokens)) + suffix_loss_mask,
     }
+
+
+def build_openpi_fast_sft_runtime_payload(
+    *,
+    datum: Any,
+    model_config: ModelConfig,
+) -> dict[str, Any]:
+    return _build_openpi_fast_prompt_payload(
+        _build_openpi_fast_common_payload(datum=datum, model_config=model_config)
+    )
+
+
+def build_openpi_fast_rl_runtime_payload(
+    *,
+    datum: Any,
+    model_config: ModelConfig,
+) -> dict[str, Any]:
+    common = _build_openpi_fast_common_payload(datum=datum, model_config=model_config)
+    target_len = len(common["target_tokens"])
+    old_logprobs = [float(value) for value in _tensor_values(datum.loss_fn_inputs, "logprobs")]
+    advantages = [float(value) for value in _tensor_values(datum.loss_fn_inputs, "advantages")]
+
+    if len(old_logprobs) != target_len or len(advantages) != target_len:
+        raise ValueError(
+            "OpenPI FAST RL requires logprobs, advantages, and target_tokens to share one length"
+        )
+
+    payload = _build_openpi_fast_prompt_payload(common)
+    payload["old_logprobs"] = old_logprobs
+    payload["advantages"] = advantages
+    return payload
 
 
 async def _default_runtime_factory(
@@ -238,9 +286,15 @@ class OpenPIFastTrainingEngine:
         session.is_active = True
 
     async def forward_backward(self, session: Any, request: Any) -> dict[str, Any]:
-        if request.forward_backward_input.loss_fn != "cross_entropy":
+        loss_fn = str(request.forward_backward_input.loss_fn)
+        if loss_fn == "cross_entropy":
+            payload_builder = build_openpi_fast_sft_runtime_payload
+        elif loss_fn == "importance_sampling":
+            payload_builder = build_openpi_fast_rl_runtime_payload
+        else:
             raise ValueError(
-                "OpenPI FAST ST-02 only supports cross_entropy forward_backward requests"
+                "OpenPI FAST ST-03 first slice only supports cross_entropy and "
+                "importance_sampling forward_backward requests"
             )
         model_config = self._model_config(session.base_model)
         runtime = self._runtime_for_session(session)
@@ -248,10 +302,10 @@ class OpenPIFastTrainingEngine:
             runtime,
             "forward_backward",
             {
-                "loss_fn": request.forward_backward_input.loss_fn,
+                "loss_fn": loss_fn,
                 "loss_fn_config": dict(request.forward_backward_input.loss_fn_config or {}),
                 "batch": [
-                    build_openpi_fast_sft_runtime_payload(datum=datum, model_config=model_config)
+                    payload_builder(datum=datum, model_config=model_config)
                     for datum in request.forward_backward_input.data
                 ],
             },
