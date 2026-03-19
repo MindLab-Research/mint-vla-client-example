@@ -152,7 +152,9 @@ class OpenPIFastRuntimeSpec:
     def build_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONPATH"] = _merge_pythonpath(self.pythonpath, env.get("PYTHONPATH"))
+        # Do not inherit the parent server PYTHONPATH; helper venvs can shadow
+        # the OpenPI runtime torch/torchvision pair that the child must use.
+        env["PYTHONPATH"] = _merge_pythonpath(self.pythonpath, None)
         env.update(self.extra_env)
         return env
 

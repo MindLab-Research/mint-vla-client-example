@@ -27,8 +27,10 @@ def checkpoint_has_lora_weights(path: str) -> bool:
 
 
 def checkpoint_has_optimizer_state(path: str) -> bool:
-    return os.path.exists(os.path.join(path, "optimizer.pt")) or bool(
-        glob.glob(os.path.join(path, "*_optimizer.pt"))
+    return (
+        os.path.exists(os.path.join(path, "optimizer.pt"))
+        or bool(glob.glob(os.path.join(path, "*_optimizer.pt")))
+        or bool(glob.glob(os.path.join(path, "*", "train_state", "_METADATA")))
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -255,6 +256,38 @@ def test_openpi_fast_runtime_spec_uses_canonical_conley_paths(monkeypatch, tmp_p
     assert env["HF_HOME"] == str(hf_home.resolve())
     assert env["HF_HUB_OFFLINE"] == "1"
     assert env["OPENPI_DATA_HOME"] == str(openpi_cache.resolve())
+
+
+def test_openpi_fast_runtime_build_env_does_not_inherit_parent_pythonpath(
+    monkeypatch, tmp_path
+) -> None:
+    from tinker_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+
+    conley_root = tmp_path / "conley"
+    tinker_root = conley_root / "tinker-server"
+    openpi_src = conley_root / "openpi" / "src"
+    hf_home = conley_root / "_cache" / "huggingface"
+    openpi_cache = conley_root / "_cache" / "openpi"
+    worker_python = conley_root / "_envs" / "openpi-runtime" / "bin" / "python"
+
+    for path in (tinker_root, openpi_src, hf_home, openpi_cache, worker_python.parent):
+        path.mkdir(parents=True, exist_ok=True)
+    worker_python.write_text("#!/bin/sh\n")
+    worker_python.chmod(0o755)
+
+    monkeypatch.setenv("PFS_TINKER_PATH", str(tinker_root))
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        "/vePFS-Mindverse/share/code/tinker-server-auth/.venv31213/lib/python3.12/site-packages",
+    )
+    monkeypatch.delenv("MINT_OPENPI_FAST_PYTHON", raising=False)
+
+    spec = OpenPIFastRuntimeSpec.from_env()
+    env = spec.build_env()
+
+    assert env["PYTHONPATH"] == os.pathsep.join(
+        (str(tinker_root.resolve()), str(openpi_src.resolve()))
+    )
 
 
 def test_openpi_fast_runtime_spec_rejects_missing_canonical_runtime_python(
