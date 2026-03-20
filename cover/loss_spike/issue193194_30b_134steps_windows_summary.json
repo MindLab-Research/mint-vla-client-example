@@ -1,0 +1,95 @@
+{
+  "metrics_jsonl": "/tmp/issue193194_loss_spike_30b_140step_3861_debug_20260319_221508/target/train_metrics.jsonl",
+  "row_count_raw": 134,
+  "row_count_dedup": 134,
+  "loss_key": "loss:mean",
+  "time_key": "step_time_sec",
+  "step_count_with_both": 134,
+  "baseline_window": 5,
+  "loss_spike_factor": 2.0,
+  "loss_spike_abs": 0.08,
+  "time_spike_factor": 2.0,
+  "time_spike_abs": 20.0,
+  "loss_spike_count": 1,
+  "time_spike_count": 6,
+  "loss_spikes": [
+    {
+      "step": 32,
+      "value": 0.4195590317249298,
+      "baseline": 0.1985733062028885,
+      "factor": 2.1128672314910917,
+      "abs_increase": 0.22098572552204132
+    }
+  ],
+  "time_spikes": [
+    {
+      "step": 62,
+      "value": 93.835777,
+      "baseline": 9.808192,
+      "factor": 9.56708198616014,
+      "abs_increase": 84.02758499999999
+    },
+    {
+      "step": 63,
+      "value": 91.359436,
+      "baseline": 12.240484,
+      "factor": 7.463711075477081,
+      "abs_increase": 79.11895200000001
+    },
+    {
+      "step": 64,
+      "value": 96.186045,
+      "baseline": 12.246964,
+      "factor": 7.8538685179445284,
+      "abs_increase": 83.93908099999999
+    },
+    {
+      "step": 101,
+      "value": 88.101376,
+      "baseline": 11.051654,
+      "factor": 7.971781961324523,
+      "abs_increase": 77.049722
+    },
+    {
+      "step": 102,
+      "value": 130.959303,
+      "baseline": 12.263773,
+      "factor": 10.6785491707976,
+      "abs_increase": 118.69553
+    },
+    {
+      "step": 103,
+      "value": 132.081326,
+      "baseline": 12.263773,
+      "factor": 10.770040019494814,
+      "abs_increase": 119.81755299999999
+    }
+  ],
+  "loss_spikes_near_time_spikes": [],
+  "time_spikes_near_loss_spikes": [],
+  "pearson_loss_time": -0.30381014611199303,
+  "loss_min": 0.07663802057504654,
+  "loss_max": 0.7304330468177795,
+  "time_min": 8.57571,
+  "time_max": 212.494006,
+  "perturbation_windows": [
+    {
+      "start_step": 60,
+      "end_step": 90,
+      "total_sessions": 2,
+      "label": "W1: 60-90 (2 sessions)"
+    },
+    {
+      "start_step": 100,
+      "end_step": 145,
+      "total_sessions": 3,
+      "label": "W2: 100-145 (3 sessions)"
+    },
+    {
+      "start_step": 155,
+      "end_step": 180,
+      "total_sessions": 2,
+      "label": "W3: 155-180 (2 sessions)"
+    }
+  ]
+}

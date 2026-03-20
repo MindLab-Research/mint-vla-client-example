@@ -194,8 +194,11 @@ def test_issue_194_dequeue_assigns_monotonic_execution_serial_seq(monkeypatch):
     )
     out = asyncio.run(_dequeue_many(actor, 2))
     seqs = [int((x.get("extra") or {}).get("execution_serial_seq")) for x in out]
+    epochs = [str((x.get("extra") or {}).get("execution_serial_epoch") or "") for x in out]
 
     assert seqs == [1, 2]
+    assert epochs[0]
+    assert epochs == [epochs[0], epochs[0]]
 
 
 def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):

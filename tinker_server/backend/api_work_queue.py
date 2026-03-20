@@ -5,8 +5,9 @@ import concurrent.futures
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config, otel_env_vars
@@ -98,7 +99,11 @@ class WorkItem:
 @dataclass
 class _ExecutionSerialState:
     cond: asyncio.Condition
+    current_epoch: str | None = None
     next_seq: int = 1
+    active_epoch: str | None = None
+    active_seq: int | None = None
+    pending_seqs_by_epoch: dict[str, set[int]] = field(default_factory=dict)
     refs: int = 0
 
 
@@ -217,6 +222,7 @@ def _get_or_create_ray_actor():
                 "switch_reasons": {},
             }
             self._execution_serial_seq_by_key: dict[str, int] = {}
+            self._execution_serial_epoch = uuid.uuid4().hex
 
         def _asample_throttle_identity(self, item: dict[str, Any]) -> tuple[str | None, str | None]:
             if str(item.get("op")) != "sampling.asample":
@@ -846,6 +852,7 @@ def _get_or_create_ray_actor():
                             item["extra"] = extra
                         next_seq = int(self._execution_serial_seq_by_key.get(serial_key, 0)) + 1
                         self._execution_serial_seq_by_key[serial_key] = next_seq
+                        extra["execution_serial_epoch"] = self._execution_serial_epoch
                         extra["execution_serial_seq"] = next_seq
                     self._mark_asample_leased_to_consumer(item.get("request_id", ""), consumer_job_id)
                     break
@@ -1021,13 +1028,11 @@ def _get_or_create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
-    options["runtime_env"] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=PFS_PYTHONPATH,
-            extra=actor_otel_env,
-        )
-    }
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=actor_otel_env,
+    )
     if resources is not None:
         options["resources"] = resources
 
@@ -1083,24 +1088,23 @@ class ApiWorkQueueClient:
     def set_executor(self, op: str, executor: Executor) -> None:
         self._executors[str(op)] = executor
 
-    def _execution_serial_info(self, item: WorkItem) -> tuple[str | None, int | None]:
+    def _execution_serial_info(self, item: WorkItem) -> tuple[str | None, str | None, int | None]:
         extra = item.extra if isinstance(item.extra, dict) else {}
         raw_key = extra.get("execution_serial_key")
         key = raw_key.strip() if isinstance(raw_key, str) else ""
+        raw_epoch = extra.get("execution_serial_epoch")
+        epoch = raw_epoch.strip() if isinstance(raw_epoch, str) else "legacy"
         raw_seq = extra.get("execution_serial_seq")
         seq = raw_seq if isinstance(raw_seq, int) and not isinstance(raw_seq, bool) else None
         if not key or seq is None or seq < 1:
-            return None, None
-        return key, seq
+            return None, None, None
+        return key, epoch, seq
 
-    async def _acquire_execution_serial_state(self, key: str, *, initial_seq: int) -> _ExecutionSerialState:
+    async def _acquire_execution_serial_state(self, key: str) -> _ExecutionSerialState:
         async with self._execution_serial_states_guard:
             state = self._execution_serial_states.get(key)
             if state is None:
-                state = _ExecutionSerialState(
-                    cond=asyncio.Condition(),
-                    next_seq=max(1, int(initial_seq)),
-                )
+                state = _ExecutionSerialState(cond=asyncio.Condition())
                 self._execution_serial_states[key] = state
             state.refs += 1
             return state
@@ -1118,20 +1122,51 @@ class ApiWorkQueueClient:
 
     @asynccontextmanager
     async def _execution_serialized(self, item: WorkItem):
-        key, seq = self._execution_serial_info(item)
-        if key is None or seq is None:
+        key, epoch, seq = self._execution_serial_info(item)
+        if key is None or epoch is None or seq is None:
             yield
             return
 
-        state = await self._acquire_execution_serial_state(key, initial_seq=seq)
+        state = await self._acquire_execution_serial_state(key)
         try:
             async with state.cond:
-                await state.cond.wait_for(lambda: int(state.next_seq) == int(seq))
+                state.pending_seqs_by_epoch.setdefault(epoch, set()).add(int(seq))
+                if state.current_epoch is None:
+                    state.current_epoch = epoch
+                    state.next_seq = int(seq)
+                while True:
+                    current_epoch = state.current_epoch
+                    if current_epoch != epoch:
+                        current_pending = (
+                            set()
+                            if current_epoch is None
+                            else state.pending_seqs_by_epoch.get(current_epoch, set())
+                        )
+                        if state.active_seq is None and not current_pending:
+                            state.current_epoch = epoch
+                            state.next_seq = min(state.pending_seqs_by_epoch[epoch])
+                            current_epoch = epoch
+                        else:
+                            await state.cond.wait()
+                            continue
+                    if state.active_seq is None and int(state.next_seq) == int(seq):
+                        state.active_epoch = epoch
+                        state.active_seq = int(seq)
+                        break
+                    await state.cond.wait()
             try:
                 yield
             finally:
                 async with state.cond:
-                    if int(state.next_seq) == int(seq):
+                    pending = state.pending_seqs_by_epoch.get(epoch)
+                    if pending is not None:
+                        pending.discard(int(seq))
+                        if not pending:
+                            state.pending_seqs_by_epoch.pop(epoch, None)
+                    if state.active_epoch == epoch and state.active_seq == int(seq):
+                        state.active_epoch = None
+                        state.active_seq = None
+                    if state.current_epoch == epoch and int(state.next_seq) == int(seq):
                         state.next_seq += 1
                     state.cond.notify_all()
         finally:

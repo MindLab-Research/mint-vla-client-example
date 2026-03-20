@@ -176,6 +176,19 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
     return out
 
 
+def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, object]:
+    runtime_env: dict[str, object] = {
+        "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
+    }
+    py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
+    if py_modules_csv:
+        runtime_env["py_modules"] = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
+    working_dir = _env_nonempty(os.environ, "MINT_RAY_WORKING_DIR")
+    if working_dir:
+        runtime_env["working_dir"] = working_dir
+    return runtime_env
+
+
 def actor_ld_library_path() -> str:
     """Return the library path Ray actors should use on GPU workers.
 

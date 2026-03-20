@@ -1762,21 +1762,32 @@ class VerlTrainingEngine:
         during long Ray calls.
         """
         start = time.time()
-        while True:
-            self._touch_actor(session)
+        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        pool = None
+        if actor_name:
+            from .resource_pool import get_resource_pool
 
-            wait_s = interval_s
-            if timeout_s is not None and timeout_s > 0:
-                remaining = timeout_s - (time.time() - start)
-                if remaining <= 0:
-                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
-                    raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
-                wait_s = min(wait_s, remaining)
+            pool = get_resource_pool()
+            pool.mark_inflight(actor_name, +1)
+        try:
+            while True:
+                self._touch_actor(session)
 
-            try:
-                return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
-            except ray.exceptions.GetTimeoutError:
-                continue
+                wait_s = interval_s
+                if timeout_s is not None and timeout_s > 0:
+                    remaining = timeout_s - (time.time() - start)
+                    if remaining <= 0:
+                        logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
+                        raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+                    wait_s = min(wait_s, remaining)
+
+                try:
+                    return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
+                except ray.exceptions.GetTimeoutError:
+                    continue
+        finally:
+            if pool is not None and actor_name is not None:
+                pool.mark_inflight(actor_name, -1)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -2761,6 +2772,7 @@ class VerlTrainingEngine:
         if actor_name:
             other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
         should_kill_actor = not other_users
+        replacement_session = other_users[0] if other_users else None
         if actor_name:
             try:
                 from .resource_pool import get_resource_pool
@@ -2783,12 +2795,13 @@ class VerlTrainingEngine:
                 clear_dense_trainer_session(model_id)
         except Exception:
             pass
-        # Also clear ResourcePool session pinning so protected actors can become idle.
+        # For shared dense actors, immediately re-pin a surviving session so the
+        # actor does not become evictable during session switches.
         try:
             if actor_name:
                 from .resource_pool import get_resource_pool
 
-                get_resource_pool().set_session(actor_name, None)
+                get_resource_pool().set_session(actor_name, replacement_session)
         except Exception:
             pass
 

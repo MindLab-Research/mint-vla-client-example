@@ -12,7 +12,7 @@ def anyio_backend():
     return "asyncio"
 
 
-def _work_item(request_id: str, *, key: str, seq: int) -> WorkItem:
+def _work_item(request_id: str, *, key: str, seq: int, epoch: str = "legacy") -> WorkItem:
     return WorkItem(
         request_id=request_id,
         op="training.forward_backward",
@@ -23,6 +23,7 @@ def _work_item(request_id: str, *, key: str, seq: int) -> WorkItem:
         webhook_url=None,
         extra={
             "execution_serial_key": key,
+            "execution_serial_epoch": epoch,
             "execution_serial_seq": seq,
         },
         created_at=0.0,
@@ -134,6 +135,73 @@ async def test_issue_194_fresh_client_accepts_preadvanced_sequence_cursor() -> N
 
     async def _run() -> None:
         async with client._execution_serialized(item):
+            entered.set()
+
+    await asyncio.wait_for(asyncio.create_task(_run()), timeout=1.0)
+    assert entered.is_set()
+
+
+@pytest.mark.anyio
+async def test_issue_194_new_epoch_waits_for_old_epoch_then_rewinds_sequence() -> None:
+    client = ApiWorkQueueClient()
+    item1 = _work_item("r1", key="training_session:model-a", seq=5, epoch="epoch-a")
+    item2 = _work_item("r2", key="training_session:model-a", seq=6, epoch="epoch-a")
+    item3 = _work_item("r3", key="training_session:model-a", seq=1, epoch="epoch-b")
+
+    entered: list[str] = []
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    first_entered = asyncio.Event()
+    second_entered = asyncio.Event()
+    third_entered = asyncio.Event()
+
+    async def _run(item: WorkItem) -> None:
+        async with client._execution_serialized(item):
+            entered.append(item.request_id)
+            if item.request_id == "r1":
+                first_entered.set()
+                await release_first.wait()
+            elif item.request_id == "r2":
+                second_entered.set()
+                await release_second.wait()
+            else:
+                third_entered.set()
+
+    task1 = asyncio.create_task(_run(item1))
+    await asyncio.wait_for(first_entered.wait(), timeout=1.0)
+
+    task2 = asyncio.create_task(_run(item2))
+    await asyncio.sleep(0)
+    assert not second_entered.is_set()
+
+    task3 = asyncio.create_task(_run(item3))
+    await asyncio.sleep(0)
+    assert not third_entered.is_set()
+
+    release_first.set()
+    await asyncio.wait_for(second_entered.wait(), timeout=1.0)
+    assert not third_entered.is_set()
+
+    release_second.set()
+    await asyncio.wait_for(third_entered.wait(), timeout=1.0)
+    await asyncio.gather(task1, task2, task3)
+
+    assert entered == ["r1", "r2", "r3"]
+
+
+@pytest.mark.anyio
+async def test_issue_194_same_key_recovers_after_sequence_restarts_from_one() -> None:
+    client = ApiWorkQueueClient()
+
+    async with client._execution_serialized(_work_item("r1", key="training_session:model-a", seq=1, epoch="epoch-a")):
+        pass
+    async with client._execution_serialized(_work_item("r2", key="training_session:model-a", seq=2, epoch="epoch-a")):
+        pass
+
+    entered = asyncio.Event()
+
+    async def _run() -> None:
+        async with client._execution_serialized(_work_item("r3", key="training_session:model-a", seq=1, epoch="epoch-b")):
             entered.set()
 
     await asyncio.wait_for(asyncio.create_task(_run()), timeout=1.0)
