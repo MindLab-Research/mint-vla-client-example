@@ -500,16 +500,18 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         else:
             batch_num_tokens_value = float(batch_num_tokens)
 
+        loss_sum = -weighted_log_probs.sum()
         if batch_num_tokens_value > 0:
-            nll = -weighted_log_probs.sum() / batch_num_tokens_value * dp_size
+            nll = loss_sum / batch_num_tokens_value * dp_size
         else:
-            nll = -weighted_log_probs.sum()
+            nll = loss_sum
 
         # Clone log_probs for metrics (detach to avoid affecting gradients)
         log_probs_cpu = log_probs_flat.detach().cpu()
 
         metrics = {
             "loss": nll.detach(),
+            "loss_sum": loss_sum.detach(),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
         }
 
@@ -610,8 +612,19 @@ def create_ppo_loss_fn(
         clip_frac = (clipped * response_mask_float).sum() / denom
         ratio_mean = (ratio * response_mask_float).sum() / denom
 
+        if math.isinf(clip_ratio):
+            loss_sum = (-advantages * ratio * response_mask_float).sum()
+        else:
+            clip_low = 1.0 - clip_ratio
+            clip_high = 1.0 + clip_ratio
+            pg_loss1 = -advantages * ratio
+            clipped_ratio = torch.clamp(ratio, clip_low, clip_high)
+            pg_loss2 = -advantages * clipped_ratio
+            loss_sum = (torch.maximum(pg_loss1, pg_loss2) * response_mask_float).sum()
+
         metrics = {
             "loss": loss.detach().item() if hasattr(loss, "item") else float(loss),
+            "loss_sum": loss_sum.detach().item() if hasattr(loss_sum, "item") else float(loss_sum),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
             "clip_frac": clip_frac.detach().item() if hasattr(clip_frac, "item") else float(clip_frac),
             "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, "item") else float(ratio_mean),
@@ -732,7 +745,7 @@ def create_logprob_extractor_fn() -> Callable:
             use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
             if not use_external_label:
                 loss_mask_float = torch.roll(loss_mask_float, shifts=-1, dims=0)
-            nll = -(log_probs * loss_mask_float).sum()
+            loss_sum = -(log_probs * loss_mask_float).sum()
             num_tokens = loss_mask_float.sum()
             dp_size = tu.get_non_tensor_data(data, key="dp_size", default=1)
             batch_num_tokens = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
@@ -743,14 +756,18 @@ def create_logprob_extractor_fn() -> Callable:
             else:
                 batch_num_tokens_value = float(batch_num_tokens)
             if batch_num_tokens_value > 0:
-                nll = nll / batch_num_tokens_value * dp_size
+                nll = loss_sum / batch_num_tokens_value * dp_size
+            else:
+                nll = loss_sum
         else:
+            loss_sum = -log_probs.sum()
             nll = -log_probs.mean()
             num_tokens = log_probs.numel()
 
         # Return log_probs in metrics
         metrics = {
             "loss": nll.detach().item() if hasattr(nll, 'item') else float(nll),
+            "loss_sum": loss_sum.detach().item() if hasattr(loss_sum, "item") else float(loss_sum),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
             "log_probs": log_probs_cpu,  # Per-token log probabilities tensor
         }
@@ -955,7 +972,7 @@ class MegatronTrainingWorker:
             return {
                 "loss_fn_output_type": f"{loss_fn}_loss",
                 "loss_fn_outputs": empty_outputs,
-                "metrics": {"loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
+                "metrics": {"loss:sum": 0.0, "loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
             }
 
         # Create TensorDict directly on device to avoid NestedTensor .to() issues.
@@ -999,6 +1016,7 @@ class MegatronTrainingWorker:
         clip_frac_sum = 0.0
         ratio_mean_sum = 0.0
         n_ppo_results = 0
+        loss_sum_value = 0.0
         all_log_probs = []
         loss_fn_outputs = []
         per_sample_log_probs = None
@@ -1016,6 +1034,12 @@ class MegatronTrainingWorker:
                 if hasattr(tokens, "item"):
                     tokens = tokens.item()
                 num_tokens += int(tokens)
+
+            loss_sum_list = result_metrics.get("loss_sum", [])
+            for raw_loss_sum in loss_sum_list:
+                if hasattr(raw_loss_sum, "item"):
+                    raw_loss_sum = raw_loss_sum.item()
+                loss_sum_value += float(raw_loss_sum)
 
             log_probs_list = result_metrics.get("log_probs", [])
             for log_probs in log_probs_list:
@@ -1091,6 +1115,7 @@ class MegatronTrainingWorker:
             loss_fn_outputs = full_outputs
 
         metrics = {
+            "loss:sum": float(loss_sum_value),
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
@@ -1167,7 +1192,7 @@ class MegatronTrainingWorker:
             return {
                 "loss_fn_output_type": "logprob_extractor",
                 "loss_fn_outputs": empty_outputs,
-                "metrics": {"loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
+                "metrics": {"loss:sum": 0.0, "loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
                 "log_probs": None,
             }
 
@@ -1191,6 +1216,7 @@ class MegatronTrainingWorker:
         # Extract per-token log_probs from result (verl returns a dict).
         loss_value = 0.0
         num_tokens = 0
+        loss_sum_value = 0.0
         all_log_probs = []
         loss_fn_outputs = []
         per_sample_log_probs = None
@@ -1211,6 +1237,12 @@ class MegatronTrainingWorker:
                 if hasattr(tokens, "item"):
                     tokens = tokens.item()
                 num_tokens += int(tokens)
+
+            loss_sum_list = result_metrics.get("loss_sum", [])
+            for raw_loss_sum in loss_sum_list:
+                if hasattr(raw_loss_sum, "item"):
+                    raw_loss_sum = raw_loss_sum.item()
+                loss_sum_value += float(raw_loss_sum)
 
             log_probs_list = result_metrics.get("log_probs", [])
             for log_probs in log_probs_list:
@@ -1296,6 +1328,7 @@ class MegatronTrainingWorker:
             }
 
         metrics = {
+            "loss:sum": float(loss_sum_value),
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),

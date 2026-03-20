@@ -752,6 +752,7 @@ class TrainingWorker:
         avg_loss = total_loss / max(total_tokens, 1)
 
         metrics = {
+            "loss:sum": float(total_loss),
             "loss:mean": avg_loss,
             "num_samples:sum": float(len(data_items)),
             "num_tokens:sum": float(total_tokens),
@@ -910,6 +911,7 @@ class TrainingWorker:
             "loss_fn_output_type": "sft_loss",
             "loss_fn_outputs": loss_fn_outputs,
             "metrics": {
+                "loss:sum": float(total_loss),
                 "loss:mean": avg_loss,
                 "num_samples:sum": float(len(data_items)),
                 "num_tokens:sum": float(total_tokens),
