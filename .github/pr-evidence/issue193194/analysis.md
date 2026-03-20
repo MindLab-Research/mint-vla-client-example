@@ -17,8 +17,8 @@ The target was allowed to settle first, then short background sessions were inje
 
 ## Evidence
 
-- Figure: [issue193194_30b_134steps_windows.svg](/vePFS-Mindverse/user/intern/nolanho/code/mint-issue193-194-session-serialization/cover/loss_spike/issue193194_30b_134steps_windows.svg)
-- Summary: [issue193194_30b_134steps_windows_summary.json](/vePFS-Mindverse/user/intern/nolanho/code/mint-issue193-194-session-serialization/cover/loss_spike/issue193194_30b_134steps_windows_summary.json)
+- Figure: `curve_30b_134steps.svg`
+- Summary: `curve_30b_134steps_summary.json`
 
 ## Key result
 

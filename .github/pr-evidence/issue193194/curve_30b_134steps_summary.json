@@ -1,5 +1,5 @@
 {
-  "metrics_jsonl": "/tmp/issue193194_loss_spike_30b_140step_3861_debug_20260319_221508/target/train_metrics.jsonl",
+  "metrics_jsonl": null,
   "row_count_raw": 134,
   "row_count_dedup": 134,
   "loss_key": "loss:mean",
