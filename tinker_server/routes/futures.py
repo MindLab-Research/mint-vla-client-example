@@ -361,6 +361,7 @@ async def retrieve_future(
             "true",
             "yes",
             "y",
+            "on",
         )
         pos = None
         if status_field == "queued" and not scheduler_enabled:

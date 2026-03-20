@@ -49,6 +49,8 @@ _STRUCTLOG_WARNED = False
 _HTTP_REQUEST_COUNTER: Any | None = None
 _HTTP_DURATION_HISTOGRAM: Any | None = None
 _HTTP_ERROR_COUNTER: Any | None = None
+_SAMPLING_ADMISSION_COUNTER: Any | None = None
+_FUTURE_STORE_TIMEOUT_COUNTER: Any | None = None
 _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
@@ -491,7 +493,8 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
 def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
-    global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER, _TRACER
+    global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
+    global _SAMPLING_ADMISSION_COUNTER, _FUTURE_STORE_TIMEOUT_COUNTER, _TRACER
 
     if _OTEL_INITIALIZED:
         return
@@ -563,6 +566,16 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             unit="ms",
             description="HTTP request duration in milliseconds",
         )
+        _SAMPLING_ADMISSION_COUNTER = meter.create_counter(
+            "mint_sampling_admission_total",
+            unit="{decision}",
+            description="Sampling admission decisions observed by mint",
+        )
+        _FUTURE_STORE_TIMEOUT_COUNTER = meter.create_counter(
+            "mint_future_store_timeout_events_total",
+            unit="{timeout}",
+            description="FutureStore queue and execution timeout events observed by mint",
+        )
 
         # 3) Logs
         log_exporter = OTLPLogExporter(endpoint=endpoint, headers=headers or None, insecure=insecure)
@@ -616,6 +629,42 @@ def record_http_server_metrics(*, method: str, route: str, status_code: int, dur
             _HTTP_DURATION_HISTOGRAM.record(float(duration_ms), attributes=attrs)
     except Exception:
         # Metrics are best-effort and must never break request handling.
+        pass
+
+
+def record_sampling_admission_metric(
+    *,
+    route: str,
+    decision: str,
+    reason: str,
+    scope: str | None = None,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {
+        "route": str(route),
+        "decision": str(decision),
+        "reason": str(reason),
+    }
+    if isinstance(scope, str) and scope.strip():
+        attrs["scope"] = scope.strip()
+    try:
+        if _SAMPLING_ADMISSION_COUNTER is not None:
+            _SAMPLING_ADMISSION_COUNTER.add(1, attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_future_store_timeout_metric(*, kind: str, op: str | None = None) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {"kind": str(kind)}
+    if isinstance(op, str) and op.strip():
+        attrs["op"] = op.strip()
+    try:
+        if _FUTURE_STORE_TIMEOUT_COUNTER is not None:
+            _FUTURE_STORE_TIMEOUT_COUNTER.add(1, attributes=attrs)
+    except Exception:
         pass
 
 

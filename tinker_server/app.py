@@ -830,6 +830,7 @@ async def lifespan(app: FastAPI):
         ForwardBackwardRequest,
         LoadStateRequest,
         OptimStepRequest,
+        ResetExpertBiasRequest,
         SampleRequest,
         SaveStateRequest,
         SaveWeightsForSamplerRequest,
@@ -1002,6 +1003,37 @@ async def lifespan(app: FastAPI):
             attributes={"queue.stage": "queue.stage.training.optim_step"},
         )
 
+    async def _exec_training_reset_expert_bias(item):
+        async def _run():
+            req = ResetExpertBiasRequest.model_validate_json(item.request_json)
+            await training._do_reset_expert_bias(item.request_id, req)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.reset_expert_bias",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.reset_expert_bias"},
+        )
+
+    async def _exec_training_delete_model(item):
+        async def _run():
+            payload = json.loads(item.request_json.decode("utf-8"))
+            model_id = payload.get("model_id")
+            if not isinstance(model_id, str) or not model_id:
+                raise ValueError("training.delete_model missing model_id")
+            await training._do_delete_model(item.request_id, model_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.delete_model",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.delete_model"},
+        )
+
     async def _exec_weights_save_weights(item):
         async def _run():
             req = SaveStateRequest.model_validate_json(item.request_json)
@@ -1087,6 +1119,8 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
     api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
     api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
+    api_work_queue.set_executor("training.reset_expert_bias", _exec_training_reset_expert_bias)
+    api_work_queue.set_executor("training.delete_model", _exec_training_delete_model)
     api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
     api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
     api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
@@ -1105,6 +1139,22 @@ async def lifespan(app: FastAPI):
                 pass
 
     future_reaper_task = asyncio.create_task(_future_reaper_loop())
+
+    async def _stale_training_heartbeat_loop() -> None:
+        while True:
+            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+            try:
+                cleaned = await training.cleanup_stale_training_sessions_once()
+                if cleaned:
+                    logger.warning(
+                        "auto-terminated %d stale training session(s): %s",
+                        len(cleaned),
+                        cleaned,
+                    )
+            except Exception:
+                logger.exception("stale training heartbeat cleanup failed")
+
+    stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop())
 
     async def _checkpoint_reaper_loop() -> None:
         while True:
@@ -1146,10 +1196,12 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     future_reaper_task.cancel()
+    stale_training_heartbeat_task.cancel()
     checkpoint_reaper_task.cancel()
     checkpoint_mirror_task.cancel()
     await asyncio.gather(
         future_reaper_task,
+        stale_training_heartbeat_task,
         checkpoint_reaper_task,
         checkpoint_mirror_task,
         return_exceptions=True,

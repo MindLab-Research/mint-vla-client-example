@@ -298,6 +298,29 @@ def test_issue_182_scheduler_enabled_pending_payload_ignores_queue_lookup_outage
     assert payload.get("estimated_wait_s") is None
 
 
+def test_issue_182_scheduler_enabled_on_pending_payload_ignores_queue_lookup_outage(monkeypatch):
+    meta = {"queue_state": "queued", "stage": "queued", "op": "training.forward_backward"}
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueueUnavailable())
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "on")
+
+    body = FutureRetrieveRequest(request_id="rid_sched_on")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("queue_state_reason") == "scheduler_enabled"
+    assert payload.get("queue_depth") is None
+    assert payload.get("queue_position") is None
+    assert payload.get("estimated_wait_s") is None
+
+
 def test_issue_182_non_sampling_status_is_generic(monkeypatch):
     meta = {"queue_state": "running", "stage": "prefill", "op": "training.train_step"}
     monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))

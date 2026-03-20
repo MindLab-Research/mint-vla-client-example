@@ -1546,7 +1546,7 @@ class VerlTrainingEngine:
         # exists only in actor memory until a session switch or checkpoint save
         # persists it. If that actor dies, automatic retry must fail closed.
         self._actor_loaded_sessions: dict[str, str] = {}
-        self._actor_volatile_sessions: dict[str, str] = {}
+        self._actor_volatile_sessions: dict[str, set[str]] = {}
         self._poisoned_sessions: dict[str, str] = {}
         self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
         self._megatron_recycle_locks_guard = asyncio.Lock()
@@ -1591,19 +1591,13 @@ class VerlTrainingEngine:
         actor_name = self._actor_name_for_session(session)
         if not actor_name:
             return
-        prev_loaded = self._actor_loaded_sessions.get(actor_name)
-        if (
-            isinstance(prev_loaded, str)
-            and prev_loaded
-            and prev_loaded != session.model_id
-            and self._actor_volatile_sessions.get(actor_name) == prev_loaded
-        ):
-            self._actor_volatile_sessions.pop(actor_name, None)
+        volatile_sessions = self._actor_volatile_sessions.setdefault(actor_name, set())
         self._actor_loaded_sessions[actor_name] = session.model_id
         if op in {"forward_backward", "optim_step", "train_step"}:
-            self._actor_volatile_sessions[actor_name] = session.model_id
-        if op in {"save_weights", "save_lora_weights_for_sampler", "load_weights"}:
-            if self._actor_volatile_sessions.get(actor_name) == session.model_id:
+            volatile_sessions.add(session.model_id)
+        if op in {"save_weights", "load_weights"}:
+            volatile_sessions.discard(session.model_id)
+            if not volatile_sessions:
                 self._actor_volatile_sessions.pop(actor_name, None)
         if op == "load_weights":
             self._poisoned_sessions.pop(session.model_id, None)
@@ -1616,20 +1610,31 @@ class VerlTrainingEngine:
         cause: BaseException,
     ) -> ray.actor.ActorHandle:
         actor_name = self._actor_name_for_session(session)
-        lost_session_id = None if actor_name is None else self._actor_volatile_sessions.get(actor_name)
+        lost_session_ids = []
+        if actor_name is not None:
+            lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
         lost_state_error = None
-        if session.backend == "megatron" and isinstance(lost_session_id, str) and lost_session_id:
+        if session.backend == "megatron" and lost_session_ids:
+            joined = ", ".join(lost_session_ids)
             lost_state_error = (
                 f"[{session.model_id}] megatron actor recycle detected after op={op}, but "
-                f"session {lost_session_id} had live in-memory state that was never persisted. "
+                f"session(s) {joined} had live in-memory state that was never persisted. "
                 "The actor was recycled, but this request was not retried because that would hide "
                 "the rollback. Reload the lost session from a checkpoint before continuing."
             )
-            self._poisoned_sessions[lost_session_id] = lost_state_error
+            for lost_session_id in lost_session_ids:
+                self._poisoned_sessions[lost_session_id] = lost_state_error
         if session.backend == "megatron":
             worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
         else:
             worker = await self._recycle_dense_actor(session, op=op, cause=cause)
+            if op != "load_weights":
+                lost_state_error = (
+                    f"[{session.model_id}] dense actor recycle detected after op={op}. "
+                    "The actor was recycled, but this request was not retried because in-memory "
+                    "session state may have been lost. Reload from a checkpoint before continuing."
+                )
+                self._poisoned_sessions[session.model_id] = lost_state_error
         if actor_name:
             self._actor_loaded_sessions.pop(actor_name, None)
             self._actor_volatile_sessions.pop(actor_name, None)
@@ -2244,21 +2249,32 @@ class VerlTrainingEngine:
         during long Ray calls.
         """
         start = time.time()
-        while True:
-            self._touch_actor(session)
+        actor_name = self._resource_pool_actor_names.get(session.model_id)
+        pool = None
+        if actor_name:
+            from .resource_pool import get_resource_pool
 
-            wait_s = interval_s
-            if timeout_s is not None and timeout_s > 0:
-                remaining = timeout_s - (time.time() - start)
-                if remaining <= 0:
-                    logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
-                    raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
-                wait_s = min(wait_s, remaining)
+            pool = get_resource_pool()
+            pool.mark_inflight(actor_name, +1)
+        try:
+            while True:
+                self._touch_actor(session)
 
-            try:
-                return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
-            except ray.exceptions.GetTimeoutError:
-                continue
+                wait_s = interval_s
+                if timeout_s is not None and timeout_s > 0:
+                    remaining = timeout_s - (time.time() - start)
+                    if remaining <= 0:
+                        logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
+                        raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+                    wait_s = min(wait_s, remaining)
+
+                try:
+                    return await asyncio.to_thread(ray.get, awaitable, timeout=wait_s)
+                except ray.exceptions.GetTimeoutError:
+                    continue
+        finally:
+            if pool is not None and actor_name is not None:
+                pool.mark_inflight(actor_name, -1)
 
     def _resolve_hf_model_path(self, hf_model_id: str) -> str | None:
         """Resolve HuggingFace model ID to local cache path.
@@ -2486,28 +2502,6 @@ class VerlTrainingEngine:
             session.backend = "peft"
             logger.info(f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})")
 
-        # For Megatron: avoid blocking create_session on __ray_ready__.
-        #
-        # __ray_ready__ is a normal actor task, so it can queue behind long-running
-        # initialization/work tasks and appear to "hang" for hours even when the actor
-        # is healthy. Returning early lets clients proceed; subsequent training calls
-        # will naturally queue until the actor is ready.
-        if session.backend == "megatron":
-            actor_name = self._resource_pool_actor_names.get(model_id)
-            if actor_name:
-                from .resource_pool import get_resource_pool
-
-                get_resource_pool().mark_ready(actor_name)
-                self._actor_loaded_sessions[actor_name] = model_id
-                if self._actor_volatile_sessions.get(actor_name) == model_id:
-                    self._actor_volatile_sessions.pop(actor_name, None)
-
-            self._workers[model_id] = worker
-            session.is_active = True
-            self._poisoned_sessions.pop(model_id, None)
-            logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
-            return
-
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
         default_ready_timeout_s = 3600.0 if session.backend == "megatron" else 900.0
@@ -2546,6 +2540,12 @@ class VerlTrainingEngine:
             from .resource_pool import get_resource_pool
 
             get_resource_pool().mark_ready(actor_name)
+            self._actor_loaded_sessions[actor_name] = model_id
+            volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+            if volatile_sessions:
+                volatile_sessions.discard(model_id)
+                if not volatile_sessions:
+                    self._actor_volatile_sessions.pop(actor_name, None)
 
         self._workers[model_id] = worker
         session.is_active = True
@@ -3199,12 +3199,21 @@ class VerlTrainingEngine:
                 if server_config.training_actor_ready_timeout_s is not None
                 else 1800.0
             )
-            await self._await_with_keepalive(
-                worker.__ray_ready__.remote(),
-                session,
-                interval_s=30.0,
-                timeout_s=ready_timeout_s,
-            )
+            ready_attempts = 0
+            while True:
+                try:
+                    await self._await_with_keepalive(
+                        worker.__ray_ready__.remote(),
+                        session,
+                        interval_s=30.0,
+                        timeout_s=ready_timeout_s,
+                    )
+                    break
+                except Exception as e:
+                    if not self._is_dead_actor_error(e) or ready_attempts >= 1:
+                        raise
+                    ready_attempts += 1
+                    worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
 
         default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
         load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
@@ -3242,7 +3251,7 @@ class VerlTrainingEngine:
 
         if session.backend == "megatron":
             worker = await self._get_live_worker(session, op="load_weights")
-            actual_rank = meta.get("actual_rank")
+            actual_rank = meta.get("actual_rank") if isinstance(meta, dict) else None
             await asyncio.to_thread(
                 ray.get,
                 worker.mark_session_loaded.remote(
@@ -3272,6 +3281,7 @@ class VerlTrainingEngine:
         if actor_name:
             other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
         should_kill_actor = not other_users
+        replacement_session = other_users[0] if other_users else None
         if actor_name:
             try:
                 from .resource_pool import get_resource_pool
@@ -3288,8 +3298,11 @@ class VerlTrainingEngine:
         if actor_name:
             if self._actor_loaded_sessions.get(actor_name) == model_id:
                 self._actor_loaded_sessions.pop(actor_name, None)
-            if self._actor_volatile_sessions.get(actor_name) == model_id:
-                self._actor_volatile_sessions.pop(actor_name, None)
+            volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+            if volatile_sessions:
+                volatile_sessions.discard(model_id)
+                if not volatile_sessions:
+                    self._actor_volatile_sessions.pop(actor_name, None)
 
         # If this session was loaded on a pooled dense actor, clear pool tracking
         # so the actor can become evictable after session deletion.
@@ -3300,12 +3313,13 @@ class VerlTrainingEngine:
                 clear_dense_trainer_session(model_id)
         except Exception:
             pass
-        # Also clear ResourcePool session pinning so protected actors can become idle.
+        # For shared dense actors, immediately re-pin a surviving session so the
+        # actor does not become evictable during session switches.
         try:
             if actor_name:
                 from .resource_pool import get_resource_pool
 
-                get_resource_pool().set_session(actor_name, None)
+                get_resource_pool().set_session(actor_name, replacement_session)
         except Exception:
             pass
 

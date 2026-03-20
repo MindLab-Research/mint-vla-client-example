@@ -147,8 +147,14 @@ def _remove_pg(actor_name: str) -> None:
         return
     try:
         ray.util.remove_placement_group(pg)
+        logger.warning("[dense_trainer] removed placement_group=%s actor_name=%s", pg_name, actor_name)
     except Exception:
-        pass
+        logger.warning(
+            "[dense_trainer] failed remove placement_group=%s actor_name=%s",
+            pg_name,
+            actor_name,
+            exc_info=True,
+        )
 
 
 def clear_dense_trainer_session(session_id: str) -> int:
