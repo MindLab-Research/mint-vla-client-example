@@ -621,6 +621,11 @@ async def _do_create_model(
             },
         )
 
+        # Actor creation may take minutes (DenseTrainerPool cold start,
+        # Megatron placement).  Touch activity so the idle cleanup loop
+        # does not evict the session while the actor was initialising.
+        training_manager.touch_session(model_id)
+
         try:
             from ..backend.training_session_store import upsert_training_session
 
@@ -979,6 +984,10 @@ async def _do_create_model_from_state(
             },
         )
 
+        # Touch after potentially slow actor creation + checkpoint load
+        # (same rationale as _do_create_model).
+        training_manager.touch_session(model_id)
+
         try:
             from ..backend.training_session_store import upsert_training_session
 
@@ -1220,6 +1229,7 @@ async def _do_forward_backward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         max_model_len = _get_max_model_len(session.base_model)
         _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
         if max_seq_len > max_model_len:
@@ -1441,6 +1451,7 @@ async def _do_train_step(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
@@ -1659,6 +1670,7 @@ async def _do_forward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         token_count, _ = _compute_token_stats(request.forward_input.data)
         result = await run_async_with_otel_span(
             "training.forward.execute",
@@ -1857,6 +1869,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
@@ -2130,6 +2143,7 @@ async def _do_save_weights_for_sampler(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path

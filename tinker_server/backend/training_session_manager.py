@@ -1,11 +1,14 @@
 """Training session manager for per-model training state.
 
 Each training model gets its own session with LoRA weights and optimizer.
+Sessions are automatically cleaned up after inactivity.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -14,6 +17,11 @@ if TYPE_CHECKING:
     from ..models.types import LoRAConfig
 
 logger = logging.getLogger(__name__)
+
+# Default training inactivity timeout: 1 hour.
+# Training clients may have long intervals between steps (sampling, reward
+# computation, etc.), so use a longer timeout than inference (30 min).
+DEFAULT_TRAINING_INACTIVITY_TIMEOUT = 3600
 
 
 @dataclass
@@ -36,6 +44,7 @@ class TrainingSession:
     accumulated_gradients: int = 0
     is_active: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    last_activity: float = field(default_factory=time.time)
     backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
 
     # Per-session inference engine for isolated concurrent access
@@ -66,11 +75,18 @@ class TrainingSessionManager:
     """Manages multiple training sessions.
 
     Maps model_id → TrainingSession.
+    Includes background cleanup of idle sessions (mirrors SessionManager pattern).
     """
 
-    def __init__(self):
+    def __init__(self, inactivity_timeout: float = DEFAULT_TRAINING_INACTIVITY_TIMEOUT):
         self._sessions: dict[str, TrainingSession] = {}
-        logger.info("TrainingSessionManager initialized")
+        self._inactivity_timeout = inactivity_timeout
+        self._cleanup_task: asyncio.Task | None = None
+        self._engine = None  # Set via start_cleanup_task; used by cleanup loop
+        logger.info(
+            "TrainingSessionManager initialized "
+            f"(inactivity_timeout={self._inactivity_timeout}s)"
+        )
 
     def create_session(
         self,
@@ -126,7 +142,13 @@ class TrainingSessionManager:
         return session
 
     def get_session(self, model_id: str) -> TrainingSession | None:
-        """Get training session by model_id."""
+        """Get training session by model_id.
+
+        Does NOT update last_activity; call touch_session() explicitly
+        in training operation routes to prevent idle cleanup.  Read-only
+        lookups (GET /models, GET /training_runs, existence checks) must
+        not extend the idle deadline.
+        """
         return self._sessions.get(model_id)
 
     def list_sessions(self) -> list[TrainingSession]:
@@ -154,12 +176,141 @@ class TrainingSessionManager:
         """Get total number of active sessions."""
         return len(self._sessions)
 
+    def touch_session(self, model_id: str) -> None:
+        """Update last_activity timestamp for a session.
+
+        Called from training routes on each request to prevent idle cleanup.
+        """
+        session = self._sessions.get(model_id)
+        if session is not None:
+            session.last_activity = time.time()
+
+    # =========================================================================
+    # Background cleanup of idle training sessions
+    # =========================================================================
+
+    async def start_cleanup_task(self, engine) -> None:
+        """Start the background cleanup task.
+
+        Args:
+            engine: VerlTrainingEngine used to shutdown idle sessions.
+        """
+        self._engine = engine
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            logger.info(
+                f"Started training session cleanup task "
+                f"(timeout={self._inactivity_timeout}s)"
+            )
+
+    async def _cleanup_loop(self) -> None:
+        """Periodically check for and cleanup inactive training sessions."""
+        while True:
+            await asyncio.sleep(60)  # Check every minute
+            try:
+                await self._cleanup_inactive()
+            except Exception as e:
+                logger.error(f"Training session cleanup error: {e}")
+
+    async def _cleanup_inactive(self) -> None:
+        """Cleanup training sessions inactive for longer than timeout."""
+        now = time.time()
+        inactive = [
+            model_id
+            for model_id, session in self._sessions.items()
+            if now - session.last_activity > self._inactivity_timeout
+        ]
+        for model_id in inactive:
+            session = self._sessions.get(model_id)
+            if session is None:
+                continue  # Concurrently deleted (e.g. explicit DELETE)
+            idle_s = now - session.last_activity
+            logger.info(
+                f"Auto-cleaning inactive training session {model_id} "
+                f"(idle {idle_s:.0f}s > {self._inactivity_timeout}s)"
+            )
+            await self._cleanup_session(model_id)
+
+    async def _cleanup_session(self, model_id: str) -> None:
+        """Full cleanup of a single training session.
+
+        Mirrors the DELETE /models/{model_id} flow:
+        1. engine.shutdown_session (release GPU actor if applicable)
+        2. delete_session (remove from in-memory manager)
+        3. delete_training_session (remove from detached Ray store)
+        4. resource_pool.clear_session (clear stale session pins)
+        """
+        session = self._sessions.get(model_id)
+        if session is None:
+            return
+
+        # Re-check: session may have become active between candidate
+        # selection in _cleanup_inactive and this point (an intervening
+        # request calls touch_session, refreshing last_activity).
+        if time.time() - session.last_activity <= self._inactivity_timeout:
+            return
+
+        # 1. Shutdown training worker (best-effort, unconditional —
+        #    matches DELETE route which calls shutdown_session regardless
+        #    of is_active; shutdown_session is a safe no-op when no
+        #    worker mapping exists for this model_id).
+        if self._engine is not None:
+            try:
+                await self._engine.shutdown_session(session)
+            except Exception as e:
+                logger.error(
+                    f"Failed to shutdown training session {model_id} "
+                    f"during idle cleanup: {e}"
+                )
+
+        # 2. Shutdown per-session inference engine if present
+        if session.inference_engine is not None:
+            try:
+                await session.inference_engine.shutdown()
+                logger.info(
+                    f"Shutdown inference engine for idle session: {model_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to shutdown inference engine for {model_id}: {e}"
+                )
+
+        # 3. Remove from in-memory manager
+        self.delete_session(model_id)
+
+        # 4. Remove from detached Ray store (best-effort)
+        try:
+            from .training_session_store import delete_training_session
+
+            delete_training_session(model_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to delete training session {model_id} from store: {e}"
+            )
+
+        # 5. Clear ResourcePool session tracking (best-effort)
+        try:
+            from .resource_pool import get_resource_pool
+
+            get_resource_pool().clear_session(model_id)
+        except Exception:
+            pass
+
     async def shutdown_all(self, engine) -> None:
         """Shutdown all sessions. Called on application exit.
 
         Args:
             engine: VerlTrainingEngine to shutdown sessions with.
         """
+        # Stop cleanup task
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+
         session_ids = list(self._sessions.keys())
         for model_id in session_ids:
             session = self._sessions.get(model_id)

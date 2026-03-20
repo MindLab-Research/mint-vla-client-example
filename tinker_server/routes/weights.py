@@ -656,6 +656,7 @@ async def _do_save_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
             if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
@@ -828,6 +829,7 @@ async def _do_save_weights(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
             if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\\\" in checkpoint_name:
@@ -1147,6 +1149,7 @@ async def _do_load_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        training_manager.touch_session(request.model_id)
         load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")

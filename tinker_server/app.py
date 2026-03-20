@@ -796,7 +796,9 @@ async def lifespan(app: FastAPI):
     from .backend.training_session_manager import TrainingSessionManager
     from .backend.verl_training import VerlTrainingEngine
 
-    train_manager = TrainingSessionManager()
+    train_manager = TrainingSessionManager(
+        inactivity_timeout=config.training_inactivity_timeout_s,
+    )
     train_engine = VerlTrainingEngine()
     await train_engine.initialize()
 
@@ -809,6 +811,9 @@ async def lifespan(app: FastAPI):
     weights.training_manager = train_manager
     weights.training_engine = train_engine
     weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
+
+    # Start background cleanup task for idle training sessions
+    await train_manager.start_cleanup_task(train_engine)
 
     logger.info("Training components initialized")
 
