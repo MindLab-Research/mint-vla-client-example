@@ -890,6 +890,109 @@ def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypa
     assert model_id not in engine._poisoned_sessions
 
 
+def test_issue_193_megatron_load_restore_stays_recoverable_until_next_train_step(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_loaded_clean"
+    dead_worker = object()
+    recovered_worker = object()
+    engine._workers[model_id] = dead_worker
+    engine._resource_pool_actor_names[model_id] = "shared-megatron-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_loaded_clean",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+    engine._note_successful_worker_call(session, op="load_weights")
+
+    async def fake_get_live_worker(*args, **kwargs):
+        return dead_worker
+
+    submit_workers: list[object] = []
+    recycle_calls: list[tuple[str, str]] = []
+    keepalive_count = {"n": 0}
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        keepalive_count["n"] += 1
+        if keepalive_count["n"] == 1:
+            raise ray.exceptions.ActorDiedError()
+        return {"ok": True}
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        recycle_calls.append((op, type(cause).__name__))
+        return recovered_worker
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    async def _run():
+        return await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward",
+            submit_fn=lambda worker: submit_workers.append(worker) or worker,
+        )
+
+    result = asyncio.run(_run())
+
+    assert result == {"ok": True}
+    assert submit_workers == [dead_worker, recovered_worker]
+    assert recycle_calls == [("forward", "ActorDiedError")]
+    assert engine._actor_volatile_sessions.get("shared-megatron-actor") is None
+    assert model_id not in engine._poisoned_sessions
+
+
+def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_train_step_dirty"
+    dead_worker = object()
+    recovered_worker = object()
+    engine._workers[model_id] = dead_worker
+    engine._resource_pool_actor_names[model_id] = "shared-megatron-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_train_step_dirty",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+    engine._note_successful_worker_call(session, op="train_step")
+
+    async def fake_get_live_worker(*args, **kwargs):
+        return dead_worker
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        raise ray.exceptions.ActorDiedError()
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        assert op == "forward"
+        return recovered_worker
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    async def _run():
+        await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward",
+            submit_fn=lambda worker: worker,
+        )
+
+    with pytest.raises(RuntimeError, match="live in-memory state that was never persisted"):
+        asyncio.run(_run())
+
+    assert engine._actor_volatile_sessions["shared-megatron-actor"] == model_id
+    assert model_id in engine._poisoned_sessions
+
+
 @pytest.mark.parametrize(
     "meta_payload",
     [

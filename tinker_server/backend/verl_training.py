@@ -1600,9 +1600,9 @@ class VerlTrainingEngine:
         ):
             self._actor_volatile_sessions.pop(actor_name, None)
         self._actor_loaded_sessions[actor_name] = session.model_id
-        if op in {"forward_backward", "optim_step", "load_weights"}:
+        if op in {"forward_backward", "optim_step", "train_step"}:
             self._actor_volatile_sessions[actor_name] = session.model_id
-        if op in {"save_weights", "save_lora_weights_for_sampler"}:
+        if op in {"save_weights", "save_lora_weights_for_sampler", "load_weights"}:
             if self._actor_volatile_sessions.get(actor_name) == session.model_id:
                 self._actor_volatile_sessions.pop(actor_name, None)
         if op == "load_weights":
@@ -1990,10 +1990,11 @@ class VerlTrainingEngine:
         batch_stats: dict[str, int] | None = None,
         interval_s: float = 30.0,
         timeout_s: float | None = None,
+        allow_recover: bool = False,
     ):
         self._raise_if_session_poisoned(session, op=op)
         try:
-            worker = await self._get_live_worker(session, op=op)
+            worker = await self._get_live_worker(session, op=op, allow_recover=allow_recover)
         except RuntimeError as e:
             if "missing worker" not in str(e):
                 raise
@@ -2498,7 +2499,8 @@ class VerlTrainingEngine:
 
                 get_resource_pool().mark_ready(actor_name)
                 self._actor_loaded_sessions[actor_name] = model_id
-                self._actor_volatile_sessions[actor_name] = model_id
+                if self._actor_volatile_sessions.get(actor_name) == model_id:
+                    self._actor_volatile_sessions.pop(actor_name, None)
 
             self._workers[model_id] = worker
             session.is_active = True
@@ -3227,6 +3229,7 @@ class VerlTrainingEngine:
             submit_fn=_submit,
             interval_s=30.0,
             timeout_s=load_timeout_s,
+            allow_recover=(session.backend == "peft"),
         )
 
         # Update session state from loaded metadata without polluting existing
