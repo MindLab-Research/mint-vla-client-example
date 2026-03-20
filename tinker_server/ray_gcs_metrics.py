@@ -152,9 +152,6 @@ def _derived_values(aggregates: dict[str, float]) -> dict[str, float]:
     dropped = float(aggregates.get("gcs_task_manager_task_events_dropped", 0.0))
     stored = float(aggregates.get("gcs_task_manager_task_events_stored", 0.0))
 
-    out["gcs_task_manager_task_events_reported_total"] = reported
-    out["gcs_task_manager_task_events_dropped_total"] = dropped
-    out["gcs_task_manager_task_events_stored_total"] = stored
     if reported > 0:
         out["gcs_task_manager_task_events_drop_ratio"] = dropped / reported
         out["gcs_task_manager_task_events_store_ratio"] = stored / reported

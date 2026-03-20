@@ -335,12 +335,12 @@ async def test_internal_metrics_exports_ray_cluster_metrics(monkeypatch) -> None
 
     assert isinstance(response, Response)
     body = response.body.decode()
-    assert 'tinker_ray_cluster_up 1' in body
-    assert 'tinker_ray_cluster_dead_nodes_missing_heartbeats 2' in body
-    assert 'tinker_ray_cluster_gpu_total 72' in body
-    assert 'tinker_ray_cluster_placement_groups_pending_gpu 2' in body
-    assert 'tinker_ray_cluster_probe_success{probe="nodes"} 1' in body
-    assert 'tinker_ray_cluster_probe_success{probe="placement_groups"} 0' in body
+    assert 'mint_ray_cluster_up 1' in body
+    assert 'mint_ray_cluster_dead_nodes_missing_heartbeats 2' in body
+    assert 'mint_ray_cluster_gpu_total 72' in body
+    assert 'mint_ray_cluster_placement_groups_pending_gpu 2' in body
+    assert 'mint_ray_cluster_probe_success{probe="nodes"} 1' in body
+    assert 'mint_ray_cluster_probe_success{probe="placement_groups"} 0' in body
 
 
 def test_ray_gcs_metrics_snapshot_extracts_selected_metrics(monkeypatch) -> None:
@@ -434,7 +434,7 @@ async def test_internal_metrics_exports_ray_gcs_bridge_metrics(monkeypatch) -> N
 
     assert isinstance(response, Response)
     body = response.body.decode()
-    assert "tinker_ray_gcs_metrics_bridge_up 1" in body
-    assert "tinker_ray_gcs_gcs_task_manager_task_events_drop_ratio 0.01" in body
+    assert "mint_ray_gcs_metrics_bridge_up 1" in body
+    assert "mint_ray_gcs_gcs_task_manager_task_events_drop_ratio 0.01" in body
     assert 'gcs_task_manager_task_events_dropped{Component="gcs_server"} 12' in body
     assert 'grpc_server_req_handling{Component="gcs_server",grpc_server_method="GetAllNodeInfo"} 4' in body

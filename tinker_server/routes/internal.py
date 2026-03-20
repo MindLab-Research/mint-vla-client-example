@@ -420,14 +420,26 @@ async def metrics() -> Response:
     cap = stats.get("capacity")
     if isinstance(cap, dict):
         for key, value in cap.items():
-            _append_metric(lines, f"tinker_capacity_{key}", value)
+            _append_metric(lines, f"mint_capacity_{key}", value)
 
     wq = stats.get("work_queue")
     if isinstance(wq, dict):
         # Existing queue counters.
-        _append_metric(lines, "tinker_work_queue_depth", wq.get("depth"))
-        _append_metric(lines, "tinker_work_queue_enqueued", wq.get("enqueued"))
-        _append_metric(lines, "tinker_work_queue_dequeued", wq.get("dequeued"))
+        _append_metric(lines, "mint_work_queue_depth", wq.get("depth"))
+        _append_metric(lines, "mint_work_queue_depth_legacy", wq.get("depth_legacy"))
+        _append_metric(lines, "mint_work_queue_depth_scheduled", wq.get("depth_scheduled"))
+        _append_metric(lines, "mint_work_queue_enqueued", wq.get("enqueued"))
+        _append_metric(lines, "mint_work_queue_dequeued", wq.get("dequeued"))
+        _append_metric(lines, "mint_work_queue_scheduler_enabled", wq.get("scheduler_enabled"))
+        _append_metric(lines, "mint_work_queue_scheduler_picks_total", wq.get("scheduler_picks_total"))
+        _append_metric(lines, "mint_work_queue_scheduler_switches_total", wq.get("scheduler_switches_total"))
+        _append_metric(
+            lines,
+            "mint_work_queue_scheduler_starvation_picks_total",
+            wq.get("scheduler_starvation_picks_total"),
+        )
+        _append_metric(lines, "mint_work_queue_scheduler_wait_s_sum", wq.get("scheduler_wait_s_sum"))
+        _append_metric(lines, "mint_work_queue_scheduler_domains_total", wq.get("scheduler_domains_total"))
 
         # Phase 2: grouped depth by executor/op.
         by_executor = wq.get("by_executor")
@@ -435,7 +447,7 @@ async def metrics() -> Response:
             for executor, depth in by_executor.items():
                 _append_metric(
                     lines,
-                    "tinker_work_queue_depth",
+                    "mint_work_queue_depth",
                     depth,
                     labels={"executor": executor},
                 )
@@ -443,8 +455,8 @@ async def metrics() -> Response:
         # Phase 2: queued age stats.
         age_stats = wq.get("age_stats")
         if isinstance(age_stats, dict):
-            _append_metric(lines, "tinker_work_queue_oldest_queued_s", age_stats.get("oldest_queued_s"))
-            _append_metric(lines, "tinker_work_queue_avg_queued_s", age_stats.get("avg_queued_s"))
+            _append_metric(lines, "mint_work_queue_oldest_queued_s", age_stats.get("oldest_queued_s"))
+            _append_metric(lines, "mint_work_queue_avg_queued_s", age_stats.get("avg_queued_s"))
 
         execution_time_s_by_op = wq.get("execution_time_s_by_op")
         if isinstance(execution_time_s_by_op, dict):
@@ -452,11 +464,11 @@ async def metrics() -> Response:
                 if not isinstance(rec, dict):
                     continue
                 labels = {"op": op}
-                _append_metric(lines, "tinker_work_queue_execution_last_s", rec.get("last"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_execution_ema_s", rec.get("ema"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_execution_sum_s", rec.get("sum"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_execution_count", rec.get("count"), labels=labels)
-                _append_metric(lines, "tinker_work_queue_execution_max_s", rec.get("max"), labels=labels)
+                _append_metric(lines, "mint_work_queue_execution_last_s", rec.get("last"), labels=labels)
+                _append_metric(lines, "mint_work_queue_execution_ema_s", rec.get("ema"), labels=labels)
+                _append_metric(lines, "mint_work_queue_execution_sum_s", rec.get("sum"), labels=labels)
+                _append_metric(lines, "mint_work_queue_execution_count", rec.get("count"), labels=labels)
+                _append_metric(lines, "mint_work_queue_execution_max_s", rec.get("max"), labels=labels)
 
     fs = stats.get("future_store")
     if isinstance(fs, dict):
@@ -474,7 +486,7 @@ async def metrics() -> Response:
             "result_ttl_s",
             "tombstone_ttl_s",
         ):
-            _append_metric(lines, f"tinker_future_store_{key}", fs.get(key))
+            _append_metric(lines, f"mint_future_store_{key}", fs.get(key))
 
         # Phase 2: grouped counters by operation.
         by_op = fs.get("by_op")
@@ -482,22 +494,44 @@ async def metrics() -> Response:
             for op, counters in by_op.items():
                 if not isinstance(counters, dict):
                     continue
-                _append_metric(lines, "tinker_future_store_pending", counters.get("pending"), labels={"op": op})
-                _append_metric(lines, "tinker_future_store_results", counters.get("results"), labels={"op": op})
-                _append_metric(lines, "tinker_future_store_errors", counters.get("errors"), labels={"op": op})
+                _append_metric(lines, "mint_future_store_pending", counters.get("pending"), labels={"op": op})
+                _append_metric(lines, "mint_future_store_results", counters.get("results"), labels={"op": op})
+                _append_metric(lines, "mint_future_store_errors", counters.get("errors"), labels={"op": op})
 
         age_stats = fs.get("age_stats")
         if isinstance(age_stats, dict):
-            _append_metric(lines, "tinker_future_store_oldest_pending_s", age_stats.get("oldest_pending_s"))
-            _append_metric(lines, "tinker_future_store_oldest_done_s", age_stats.get("oldest_done_s"))
-            _append_metric(lines, "tinker_future_store_avg_pending_s", age_stats.get("avg_pending_s"))
-            _append_metric(lines, "tinker_future_store_avg_done_s", age_stats.get("avg_done_s"))
+            _append_metric(lines, "mint_future_store_oldest_pending_s", age_stats.get("oldest_pending_s"))
+            _append_metric(lines, "mint_future_store_oldest_done_s", age_stats.get("oldest_done_s"))
+            _append_metric(lines, "mint_future_store_avg_pending_s", age_stats.get("avg_pending_s"))
+            _append_metric(lines, "mint_future_store_avg_done_s", age_stats.get("avg_done_s"))
 
         payload_stats = fs.get("payload_stats")
         if isinstance(payload_stats, dict):
-            _append_metric(lines, "tinker_future_store_result_refs_count", payload_stats.get("result_refs_count"))
-            _append_metric(lines, "tinker_future_store_errors_count", payload_stats.get("errors_count"))
-            _append_metric(lines, "tinker_future_store_refs_count", payload_stats.get("refs_count"))
+            _append_metric(lines, "mint_future_store_result_refs_count", payload_stats.get("result_refs_count"))
+            _append_metric(lines, "mint_future_store_errors_count", payload_stats.get("errors_count"))
+            _append_metric(lines, "mint_future_store_refs_count", payload_stats.get("refs_count"))
+
+        timeout_counts = fs.get("timeout_counts")
+        if isinstance(timeout_counts, dict):
+            for kind in ("queue", "execution", "total"):
+                _append_metric(
+                    lines,
+                    "mint_future_store_timeouts_total",
+                    timeout_counts.get(kind),
+                    labels={"kind": kind},
+                )
+            by_op = timeout_counts.get("by_op")
+            if isinstance(by_op, dict):
+                for op, rec in by_op.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    for kind in ("queue", "execution", "total"):
+                        _append_metric(
+                            lines,
+                            "mint_future_store_timeouts_total",
+                            rec.get(kind),
+                            labels={"op": op, "kind": kind},
+                        )
 
     actors = stats.get("actors")
     if isinstance(actors, dict):
@@ -506,7 +540,7 @@ async def metrics() -> Response:
             if isinstance(rec, dict):
                 _append_metric(
                     lines,
-                    "tinker_actor_rss_bytes",
+                    "mint_actor_rss_bytes",
                     rec.get("rss_bytes"),
                     labels={"actor": actor_key},
                 )
@@ -521,9 +555,9 @@ async def metrics() -> Response:
                 model = str(rec.get("base_model") or "unknown")
                 actor_name = str(rec.get("actor_name") or "unknown")
                 labels = {"actor_type": actor_type, "model": model, "actor_name": actor_name}
-                _append_metric(lines, "tinker_resource_pool_actor_idle_time_s", rec.get("idle_time"), labels=labels)
-                _append_metric(lines, "tinker_resource_pool_actor_age_s", rec.get("age"), labels=labels)
-                _append_metric(lines, "tinker_resource_pool_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
+                _append_metric(lines, "mint_resource_pool_actor_idle_time_s", rec.get("idle_time"), labels=labels)
+                _append_metric(lines, "mint_resource_pool_actor_age_s", rec.get("age"), labels=labels)
+                _append_metric(lines, "mint_resource_pool_actor_rss_bytes", rec.get("rss_bytes"), labels=labels)
 
                 bucket = grouped.setdefault((actor_type, model), {"count": 0.0, "rss_sum": 0.0, "max_idle": 0.0, "max_age": 0.0})
                 bucket["count"] += 1.0
@@ -539,44 +573,60 @@ async def metrics() -> Response:
 
             for (actor_type, model), agg in grouped.items():
                 labels = {"actor_type": actor_type, "model": model}
-                _append_metric(lines, "tinker_resource_pool_actors", agg["count"], labels=labels)
-                _append_metric(lines, "tinker_resource_pool_group_rss_bytes", agg["rss_sum"], labels=labels)
-                _append_metric(lines, "tinker_resource_pool_group_oldest_idle_time_s", agg["max_idle"], labels=labels)
-                _append_metric(lines, "tinker_resource_pool_group_oldest_age_s", agg["max_age"], labels=labels)
+                _append_metric(lines, "mint_resource_pool_actors", agg["count"], labels=labels)
+                _append_metric(lines, "mint_resource_pool_group_rss_bytes", agg["rss_sum"], labels=labels)
+                _append_metric(lines, "mint_resource_pool_group_oldest_idle_time_s", agg["max_idle"], labels=labels)
+                _append_metric(lines, "mint_resource_pool_group_oldest_age_s", agg["max_age"], labels=labels)
 
     proc = stats.get("process")
     if isinstance(proc, dict):
-        _append_metric(lines, "tinker_api_server_process_rss_bytes", proc.get("rss_bytes"))
-        _append_metric(lines, "tinker_api_server_process_pid", proc.get("pid"))
-        _append_metric(lines, "MINT_driver_process_rss_bytes", proc.get("rss_bytes"))
+        _append_metric(lines, "mint_api_server_process_rss_bytes", proc.get("rss_bytes"))
+        _append_metric(lines, "mint_api_server_process_pid", proc.get("pid"))
+        _append_metric(lines, "mint_driver_process_rss_bytes", proc.get("rss_bytes"))
 
     driver_state = stats.get("driver_state")
     if isinstance(driver_state, dict):
-        _append_metric(lines, "MINT_driver_sdk_sessions_fallback", driver_state.get("sdk_sessions_fallback"))
-        _append_metric(lines, "MINT_driver_session_heartbeat_entries", driver_state.get("session_heartbeat_entries"))
-        _append_metric(lines, "MINT_driver_lora_load_locks", driver_state.get("lora_load_locks"))
-        _append_metric(lines, "MINT_driver_sampling_sessions_total", driver_state.get("sampling_sessions_total"))
-        _append_metric(lines, "MINT_driver_sampling_sessions_multi_lora", driver_state.get("sampling_sessions_multi_lora"))
-        _append_metric(lines, "MINT_driver_sampling_sessions_base_model", driver_state.get("sampling_sessions_base_model"))
-        _append_metric(lines, "MINT_driver_sampling_sessions_lora_loaded", driver_state.get("sampling_sessions_lora_loaded"))
-        _append_metric(lines, "MINT_driver_sampling_sessions_inflight", driver_state.get("sampling_sessions_inflight"))
+        _append_metric(lines, "mint_driver_sdk_sessions_fallback", driver_state.get("sdk_sessions_fallback"))
+        _append_metric(lines, "mint_driver_session_heartbeat_entries", driver_state.get("session_heartbeat_entries"))
+        _append_metric(lines, "mint_driver_lora_load_locks", driver_state.get("lora_load_locks"))
+        _append_metric(lines, "mint_driver_sampling_sessions_total", driver_state.get("sampling_sessions_total"))
+        _append_metric(
+            lines,
+            "mint_driver_sampling_sessions_multi_lora",
+            driver_state.get("sampling_sessions_multi_lora"),
+        )
+        _append_metric(
+            lines,
+            "mint_driver_sampling_sessions_base_model",
+            driver_state.get("sampling_sessions_base_model"),
+        )
+        _append_metric(
+            lines,
+            "mint_driver_sampling_sessions_lora_loaded",
+            driver_state.get("sampling_sessions_lora_loaded"),
+        )
+        _append_metric(
+            lines,
+            "mint_driver_sampling_sessions_inflight",
+            driver_state.get("sampling_sessions_inflight"),
+        )
 
     ray_cluster = stats.get("ray_cluster")
     if isinstance(ray_cluster, dict):
-        _append_metric(lines, "tinker_ray_cluster_up", ray_cluster.get("up"))
-        _append_metric(lines, "tinker_ray_cluster_warning_count", ray_cluster.get("warning_count"))
-        _append_metric(lines, "tinker_ray_cluster_probe_error_count", ray_cluster.get("probe_error_count"))
-        _append_metric(lines, "tinker_ray_cluster_slow_probe_count", ray_cluster.get("slow_probe_count"))
-        _append_metric(lines, "tinker_ray_cluster_total_probe_latency_ms", ray_cluster.get("total_probe_latency_ms"))
-        _append_metric(lines, "tinker_ray_cluster_cache_age_s", ray_cluster.get("cache_age_s"))
+        _append_metric(lines, "mint_ray_cluster_up", ray_cluster.get("up"))
+        _append_metric(lines, "mint_ray_cluster_warning_count", ray_cluster.get("warning_count"))
+        _append_metric(lines, "mint_ray_cluster_probe_error_count", ray_cluster.get("probe_error_count"))
+        _append_metric(lines, "mint_ray_cluster_slow_probe_count", ray_cluster.get("slow_probe_count"))
+        _append_metric(lines, "mint_ray_cluster_total_probe_latency_ms", ray_cluster.get("total_probe_latency_ms"))
+        _append_metric(lines, "mint_ray_cluster_cache_age_s", ray_cluster.get("cache_age_s"))
 
         nodes = ray_cluster.get("nodes")
         if isinstance(nodes, dict):
-            _append_metric(lines, "tinker_ray_cluster_nodes", nodes.get("alive"), labels={"state": "alive"})
-            _append_metric(lines, "tinker_ray_cluster_nodes", nodes.get("dead"), labels={"state": "dead"})
+            _append_metric(lines, "mint_ray_cluster_nodes", nodes.get("alive"), labels={"state": "alive"})
+            _append_metric(lines, "mint_ray_cluster_nodes", nodes.get("dead"), labels={"state": "dead"})
             _append_metric(
                 lines,
-                "tinker_ray_cluster_dead_nodes_missing_heartbeats",
+                "mint_ray_cluster_dead_nodes_missing_heartbeats",
                 nodes.get("dead_missing_heartbeats"),
             )
 
@@ -592,19 +642,19 @@ async def metrics() -> Response:
                 "object_store_memory_total",
                 "object_store_memory_available",
             ):
-                _append_metric(lines, f"tinker_ray_cluster_{key}", resources.get(key))
+                _append_metric(lines, f"mint_ray_cluster_{key}", resources.get(key))
 
         placement_groups = ray_cluster.get("placement_groups")
         if isinstance(placement_groups, dict):
             for key in ("total", "created", "removed", "pending", "pending_gpu"):
-                _append_metric(lines, f"tinker_ray_cluster_placement_groups_{key}", placement_groups.get(key))
+                _append_metric(lines, f"mint_ray_cluster_placement_groups_{key}", placement_groups.get(key))
 
         named_actors = ray_cluster.get("named_actors")
         if isinstance(named_actors, dict):
-            _append_metric(lines, "tinker_ray_cluster_named_actors_total", named_actors.get("total"))
+            _append_metric(lines, "mint_ray_cluster_named_actors_total", named_actors.get("total"))
             _append_metric(
                 lines,
-                "tinker_ray_cluster_named_actors_namespace",
+                "mint_ray_cluster_named_actors_namespace",
                 named_actors.get("namespace"),
             )
 
@@ -614,37 +664,37 @@ async def metrics() -> Response:
                 if not isinstance(probe, dict):
                     continue
                 labels = {"probe": probe_name}
-                _append_metric(lines, "tinker_ray_cluster_probe_success", probe.get("ok"), labels=labels)
-                _append_metric(lines, "tinker_ray_cluster_probe_latency_ms", probe.get("latency_ms"), labels=labels)
+                _append_metric(lines, "mint_ray_cluster_probe_success", probe.get("ok"), labels=labels)
+                _append_metric(lines, "mint_ray_cluster_probe_latency_ms", probe.get("latency_ms"), labels=labels)
 
     ray_gcs_metrics = stats.get("ray_gcs_metrics")
     if isinstance(ray_gcs_metrics, dict):
-        _append_metric(lines, "tinker_ray_gcs_metrics_bridge_up", ray_gcs_metrics.get("up"))
+        _append_metric(lines, "mint_ray_gcs_metrics_bridge_up", ray_gcs_metrics.get("up"))
         _append_metric(
             lines,
-            "tinker_ray_gcs_metrics_bridge_scrape_error_count",
+            "mint_ray_gcs_metrics_bridge_scrape_error_count",
             ray_gcs_metrics.get("scrape_error_count"),
         )
         _append_metric(
             lines,
-            "tinker_ray_gcs_metrics_bridge_sample_count",
+            "mint_ray_gcs_metrics_bridge_sample_count",
             ray_gcs_metrics.get("sample_count"),
         )
         _append_metric(
             lines,
-            "tinker_ray_gcs_metrics_bridge_scrape_latency_ms",
+            "mint_ray_gcs_metrics_bridge_scrape_latency_ms",
             ray_gcs_metrics.get("scrape_latency_ms"),
         )
         _append_metric(
             lines,
-            "tinker_ray_gcs_metrics_bridge_cache_age_s",
+            "mint_ray_gcs_metrics_bridge_cache_age_s",
             ray_gcs_metrics.get("cache_age_s"),
         )
 
         derived = ray_gcs_metrics.get("derived")
         if isinstance(derived, dict):
             for key, value in derived.items():
-                _append_metric(lines, f"tinker_ray_gcs_{key}", value)
+                _append_metric(lines, f"mint_ray_gcs_{key}", value)
 
         samples = ray_gcs_metrics.get("samples")
         if isinstance(samples, list):
@@ -658,9 +708,9 @@ async def metrics() -> Response:
                 _append_raw_prom_sample(lines, metric_name, sample.get("value"), labels=labels)
 
     if not lines:
-        lines.append("tinker_metrics_up 0")
+        lines.append("mint_metrics_up 0")
     else:
-        lines.append("tinker_metrics_up 1")
+        lines.append("mint_metrics_up 1")
     payload = "\n".join(lines) + "\n"
     return Response(content=payload, media_type="text/plain; version=0.0.4")
 

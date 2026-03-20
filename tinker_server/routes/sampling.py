@@ -21,7 +21,13 @@ from fastapi import APIRouter, HTTPException, Request
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
+from ..logging_context import (
+    classify_failure_reason,
+    get_otel_tracer,
+    record_sampling_admission_metric,
+    run_async_with_otel_span,
+    set_request_id,
+)
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
@@ -62,6 +68,10 @@ _coalesced_abort_aliases: dict[str, str] = {}
 
 _lora_load_locks_guard = asyncio.Lock()
 _lora_load_locks: dict[str, asyncio.Lock] = {}
+
+_ASAMPLE_ROUTE = "/api/v1/asample"
+_COMPUTE_LOGPROBS_ROUTE = "/api/v1/compute_logprobs"
+_SAMPLE_ONCE_ROUTE = "sample_once"
 
 
 async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
@@ -641,6 +651,11 @@ async def asample(
 
     global _inflight_sample_tasks
     if _should_backpressure(http_request):
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="server_overloaded",
+        )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import ApiWorkQueueThrottleError, api_work_queue
@@ -712,6 +727,11 @@ async def asample(
                 future_store.forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="capacity_rejected",
+        )
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -758,6 +778,13 @@ async def asample(
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         elif created:
             future_store.cleanup(request_id)
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="queue_throttled",
+            scope=detail.get("scope") if isinstance(detail, dict) else None,
+        )
         raise HTTPException(status_code=429, detail=e.detail) from e
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -770,6 +797,12 @@ async def asample(
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
+    record_sampling_admission_metric(
+        route=_ASAMPLE_ROUTE,
+        decision="accepted",
+        reason="queued",
+        scope=throttle_scope,
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -789,6 +822,11 @@ async def sample_once(
     from ..gateway import forward_json, remote_sampling_session, upstream_for_alias
 
     if _should_backpressure(http_request):
+        record_sampling_admission_metric(
+            route=_SAMPLE_ONCE_ROUTE,
+            decision="rejected",
+            reason="server_overloaded",
+        )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
 
     is_local = False
@@ -1479,6 +1517,11 @@ async def compute_logprobs(
         object_store_bytes=estimate_compute_logprobs_result_bytes(request),
     )
     if not bool(reserve.get("ok")):
+        record_sampling_admission_metric(
+            route=_COMPUTE_LOGPROBS_ROUTE,
+            decision="rejected",
+            reason="capacity_rejected",
+        )
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -1511,6 +1554,11 @@ async def compute_logprobs(
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
 
+    record_sampling_admission_metric(
+        route=_COMPUTE_LOGPROBS_ROUTE,
+        decision="accepted",
+        reason="queued",
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 

@@ -165,6 +165,8 @@ def _get_or_create_ray_actor():
             self._queue_timeout_s = float(queue_ttl_s)
             self._result_ttl_s = float(done_ttl_s)
             self._tombstone_ttl_s = float(tombstone_ttl_s)
+            self._timeout_counts: dict[str, int] = {"queue": 0, "execution": 0}
+            self._timeout_counts_by_op: dict[str, dict[str, int]] = {}
 
         def _op_from_meta(self, meta: dict[str, Any] | None) -> str | None:
             if not isinstance(meta, dict):
@@ -237,6 +239,37 @@ def _get_or_create_ray_actor():
                 "refs_count": len(self._refs),
             }
 
+        def _record_timeout(self, request_id: str, *, kind: str) -> None:
+            from ..logging_context import record_future_store_timeout_metric
+
+            timeout_kind = str(kind).strip() or "unknown"
+            self._timeout_counts[timeout_kind] = int(self._timeout_counts.get(timeout_kind, 0)) + 1
+            op = self._request_op(request_id)
+            bucket = self._timeout_counts_by_op.setdefault(op, {"queue": 0, "execution": 0})
+            bucket[timeout_kind] = int(bucket.get(timeout_kind, 0)) + 1
+            record_future_store_timeout_metric(kind=timeout_kind, op=op)
+
+        def _timeout_stats(self) -> dict[str, Any]:
+            queue_count = int(self._timeout_counts.get("queue", 0))
+            execution_count = int(self._timeout_counts.get("execution", 0))
+            by_op: dict[str, dict[str, int]] = {}
+            for op, bucket in sorted(self._timeout_counts_by_op.items()):
+                if not isinstance(bucket, dict):
+                    continue
+                queue_op = int(bucket.get("queue", 0))
+                execution_op = int(bucket.get("execution", 0))
+                by_op[op] = {
+                    "queue": queue_op,
+                    "execution": execution_op,
+                    "total": queue_op + execution_op,
+                }
+            return {
+                "queue": queue_count,
+                "execution": execution_count,
+                "total": queue_count + execution_count,
+                "by_op": by_op,
+            }
+
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
                 parts = f.read().strip().split()
@@ -263,6 +296,7 @@ def _get_or_create_ray_actor():
                 "by_op": self._stats_by_op(),
                 "age_stats": self._age_stats(),
                 "payload_stats": self._payload_stats(),
+                "timeout_counts": self._timeout_stats(),
             }
 
         def _prune(self) -> dict[str, list[str]]:
@@ -285,6 +319,7 @@ def _get_or_create_ray_actor():
                         self._done_at[rid] = now
                         self._queued_at.pop(rid, None)
                         self._running_at.pop(rid, None)
+                        self._record_timeout(rid, kind="queue")
                         timed_out.append(rid)
 
             # Execution timeout applies only once RUNNING begins.
@@ -297,6 +332,7 @@ def _get_or_create_ray_actor():
                         self._errors[rid] = "execution timeout"
                         self._done_at[rid] = now
                         self._running_at.pop(rid, None)
+                        self._record_timeout(rid, kind="execution")
                         timed_out.append(rid)
 
             # Result retention TTL: DONE/FAILED become EXPIRED tombstones.
