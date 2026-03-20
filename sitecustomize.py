@@ -12,6 +12,7 @@ propagated into vLLM worker processes.
 from __future__ import annotations
 
 import importlib.util
+import json
 import multiprocessing.spawn as _mp_spawn
 import os
 import sys
@@ -52,6 +53,130 @@ def _sanitize_paths(paths: list[str]) -> list[str]:
     return out
 
 
+def _sanitize_vllm_worker_pythonpath(raw: str | None) -> str:
+    if raw is None:
+        return ""
+    try:
+        from tinker_server.runtime_env import sanitize_worker_pythonpath
+
+        return sanitize_worker_pythonpath(
+            raw,
+            env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+        )
+    except Exception:
+        return ":".join(p for p in str(raw).split(":") if p)
+
+
+def _strip_host_only_sys_path_entries(paths: list[str]) -> list[str]:
+    env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT")
+    if not env_root:
+        return paths
+    try:
+        from tinker_server.runtime_env import host_only_pythonpath_entries
+
+        excluded = {
+            os.path.normcase(os.path.abspath(path))
+            for path in host_only_pythonpath_entries(env_root)
+        }
+    except Exception:
+        return paths
+    return [
+        path
+        for path in paths
+        if not path or os.path.normcase(os.path.abspath(path)) not in excluded
+    ]
+
+
+def _preferred_torch_lib_dirs() -> list[str]:
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
+    candidates: list[str] = []
+    if env_root:
+        candidates.extend(
+            [
+                os.path.join(env_root, "host-venv", "lib", pyver, "site-packages", "torch", "lib"),
+                os.path.join(env_root, "site-packages", "torch", "lib"),
+            ]
+        )
+    candidates.append(f"/usr/local/lib/{pyver}/dist-packages/torch/lib")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen or not os.path.isdir(path):
+            continue
+        seen.add(norm)
+        out.append(path)
+    return out
+
+
+def _patch_torch_ld_library_path() -> None:
+    preferred = _preferred_torch_lib_dirs()
+    if not preferred:
+        return
+
+    blocked = {
+        os.path.normcase("/usr/local/lib/python3.10/dist-packages/torch/lib"),
+        os.path.normcase("/usr/local/lib/python3.10/site-packages/torch/lib"),
+    }
+    current = [
+        p
+        for p in os.environ.get("LD_LIBRARY_PATH", "").split(":")
+        if p and os.path.normcase(os.path.abspath(p)) not in blocked
+    ]
+    os.environ["LD_LIBRARY_PATH"] = ":".join(_sanitize_paths([*preferred, *current]))
+
+
+def _patch_multiprocessing_executable() -> None:
+    try:
+        import multiprocessing
+
+        executable = os.environ.get("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "").strip() or sys.executable
+        if executable and os.path.exists(executable):
+            multiprocessing.set_executable(executable)
+    except Exception:
+        pass
+
+
+def _maybe_log_vllm_child_startup() -> None:
+    try:
+        import multiprocessing
+
+        proc_name = multiprocessing.current_process().name
+    except Exception:
+        proc_name = ""
+    if not proc_name.startswith(("EngineCore_", "VllmWorker", "SpawnProcess")):
+        return
+
+    payload: dict[str, object] = {
+        "proc_name": proc_name,
+        "python": sys.executable,
+        "sys_path_head": sys.path[:10],
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    }
+    try:
+        spec = importlib.util.find_spec("vllm")
+        payload["vllm_spec"] = getattr(spec, "origin", None)
+    except Exception as e:
+        payload["vllm_spec_error"] = repr(e)
+    try:
+        import vllm  # type: ignore
+
+        payload["vllm_file"] = getattr(vllm, "__file__", None)
+    except Exception as e:
+        payload["vllm_import_error"] = repr(e)
+    try:
+        import vllm._C as vllm_c  # type: ignore
+
+        payload["vllm_c_file"] = getattr(vllm_c, "__file__", None)
+    except Exception as e:
+        payload["vllm_c_import_error"] = repr(e)
+    print(f"[sitecustomize:vllm_child_startup] {json.dumps(payload, default=str)}", flush=True)
+
+
 def _patch_cv2_typing_shadow() -> None:
     """Prevent accidental import of `cv2/typing` as top-level `typing`.
 
@@ -63,12 +188,17 @@ def _patch_cv2_typing_shadow() -> None:
         return
 
     # 1) Clean current process paths.
-    sys.path[:] = _sanitize_paths(list(sys.path))
+    _patch_torch_ld_library_path()
+    _patch_multiprocessing_executable()
+    sanitized_pythonpath = _sanitize_vllm_worker_pythonpath(os.environ.get("PYTHONPATH"))
+    if sanitized_pythonpath:
+        os.environ["PYTHONPATH"] = sanitized_pythonpath
+    sys.path[:] = _sanitize_paths(_strip_host_only_sys_path_entries(list(sys.path)))
 
     raw_py = os.environ.get("PYTHONPATH", "")
     if raw_py:
         parts = [p.strip() for p in raw_py.split(":")]
-        os.environ["PYTHONPATH"] = ":".join(_sanitize_paths(parts))
+        os.environ["PYTHONPATH"] = ":".join(_sanitize_paths(_strip_host_only_sys_path_entries(parts)))
 
     # 2) Ensure multiprocessing spawn does not reintroduce bad paths.
     orig = _mp_spawn.get_preparation_data
@@ -255,6 +385,41 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
 
     sample_tokens._tinker_patched_no_compiled_dag_sample = True  # type: ignore[attr-defined]
     cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
+
+
+def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
+    """Prevent vLLM Ray executor from silently starting a local Ray head.
+
+    In our server, multinode vLLM actors already run inside a managed Ray
+    cluster. If vLLM initializes its Ray executor with no address, Ray starts a
+    standalone local head inside EngineCore, which hides the real failure behind
+    a nested cluster. Fail closed unless `RAY_ADDRESS` is explicitly available.
+    """
+
+    import vllm.v1.executor.ray_executor as ray_exec_mod
+    import vllm.v1.executor.ray_utils as ray_utils_mod
+
+    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
+    if original is None:
+        raise RuntimeError("vLLM missing initialize_ray_cluster")
+    if getattr(original, "_tinker_patched_explicit_cluster_address", False):
+        return
+
+    def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
+        addr = ray_address
+        if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
+            env_addr = os.environ.get("RAY_ADDRESS", "").strip()
+            if not env_addr:
+                raise RuntimeError(
+                    "vLLM RayDistributedExecutor requires explicit RAY_ADDRESS; "
+                    "refusing to start nested local Ray inside EngineCore"
+                )
+            addr = env_addr
+        return original(parallel_config, ray_address=addr)
+
+    initialize_ray_cluster._tinker_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
+    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    ray_exec_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
 
 
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
@@ -1620,9 +1785,12 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
         additional_vars=None,
         destination=None,
     ):
+        os.environ["PYTHONPATH"] = _sanitize_vllm_worker_pythonpath(os.environ.get("PYTHONPATH"))
         extra = {
             "PYTHONPATH",
+            "LD_LIBRARY_PATH",
             "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+            "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
             "VLLM_USE_V1",
             "MINT_VLLM_DISABLE_MOE_LORA_PACKING",
             "MINT_VLLM_FULLY_SHARDED_LORAS",
@@ -1641,6 +1809,50 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
 
     get_env_vars_to_copy._tinker_pythonpath_carryover = True  # type: ignore[attr-defined]
     ray_env.get_env_vars_to_copy = get_env_vars_to_copy  # type: ignore[method-assign]
+
+
+def _patch_ray_placement_group_bundle_cache() -> None:
+    """Handle Ray state payloads that omit `bundles` for direct PG lookup."""
+    try:
+        import importlib
+
+        pg_mod = importlib.import_module("ray.util.placement_group")
+    except Exception:
+        return
+
+    original = getattr(pg_mod, "_get_bundle_cache", None)
+    if not callable(original) or getattr(original, "_tinker_bundle_cache_patch", False):
+        return
+
+    def _normalize_pg_id(pg_id):  # type: ignore[no-untyped-def]
+        try:
+            return pg_id.hex()
+        except Exception:
+            return str(pg_id)
+
+    def _get_bundle_cache(pg_id):  # type: ignore[no-untyped-def]
+        worker = pg_mod.ray._private.worker.global_worker
+        worker.check_connected()
+
+        info = pg_mod.ray._private.state.state.placement_group_table(pg_id)
+        bundles = info.get("bundles")
+        if bundles is not None:
+            return list(bundles.values())
+
+        target = _normalize_pg_id(pg_id)
+        table = pg_mod.placement_group_table()
+        for key, candidate in table.items():
+            candidate_id = str(candidate.get("placement_group_id") or key)
+            if candidate_id == target and candidate.get("bundles") is not None:
+                return list(candidate["bundles"].values())
+
+        raise KeyError(
+            f"placement group {target} missing bundles in both direct and full table lookup: "
+            f"direct_keys={sorted(info.keys())}"
+        )
+
+    _get_bundle_cache._tinker_bundle_cache_patch = True  # type: ignore[attr-defined]
+    pg_mod._get_bundle_cache = _get_bundle_cache  # type: ignore[assignment]
 
 
 def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
@@ -1765,6 +1977,7 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_worker_lora_load_to_device()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
+    _patch_vllm_ray_executor_use_explicit_cluster_address()
     _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
     _patch_vllm_gpu_worker_kv_debug_info()
     # Keep worker/runtime LoRA fixes, but do not alter vLLM's native startup
@@ -1775,5 +1988,9 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
 
 
+_patch_torch_ld_library_path()
+_patch_multiprocessing_executable()
 _patch_cv2_typing_shadow()
+_patch_ray_placement_group_bundle_cache()
+_maybe_log_vllm_child_startup()
 _apply_vllm_worker_patches()

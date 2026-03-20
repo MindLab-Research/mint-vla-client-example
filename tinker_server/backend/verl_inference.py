@@ -6,11 +6,17 @@ Uses verl's Ray-based vLLM infrastructure for scalable inference.
 from __future__ import annotations
 
 import os
+import sys
 
 # Required for vLLM multiprocessing in Ray actors (prevents fork-related hangs)
 # Must be set before vLLM is imported anywhere in the process
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+if os.path.isdir("/vllm"):
+    if "/vllm" not in sys.path:
+        sys.path.insert(0, "/vllm")
+    os.environ["PYTHONPATH"] = f"/vllm:{os.environ.get('PYTHONPATH', '').lstrip(':')}".rstrip(":")
 
+import math
 import logging
 import time
 from dataclasses import dataclass
@@ -28,6 +34,11 @@ from tinker_server.logging_context import (
     traced_async_from_traceparent,
 )
 from tinker_server.ray_utils import init_ray
+from tinker_server.runtime_env import (
+    host_only_pythonpath_entries,
+    join_pythonpath,
+    sanitize_worker_pythonpath,
+)
 
 from . import ray_kill
 
@@ -36,6 +47,152 @@ if TYPE_CHECKING:
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 logger = logging.getLogger(__name__)
+
+
+def _sampled_logprob_entry_meta(entry: Any) -> dict[str, Any]:
+    """Return safe structure metadata for one per-step logprob entry."""
+    meta: dict[str, Any] = {
+        "entry_type": type(entry).__name__,
+        "entry_has_get": callable(getattr(entry, "get", None)),
+        "entry_size": None,
+        "entry_key_count": None,
+        "entry_key_preview": None,
+    }
+    try:
+        meta["entry_size"] = len(entry)
+    except Exception:
+        pass
+    if isinstance(entry, dict):
+        keys = list(entry.keys())
+        meta["entry_key_count"] = len(keys)
+        if len(keys) <= 8:
+            preview: list[Any] = []
+            for key in keys[:3]:
+                try:
+                    preview.append(int(key))
+                except Exception:
+                    preview.append(type(key).__name__)
+            meta["entry_key_preview"] = preview
+    return meta
+
+
+def _extract_sampled_token_logprobs(
+    *,
+    request_id: str,
+    token_ids: list[int],
+    step_logprobs: Any,
+    seq_index: int | None = None,
+) -> list[float]:
+    """Extract sampled-token logprobs from vLLM's per-step logprob payload."""
+    seq_idx = -1 if seq_index is None else seq_index
+    if step_logprobs is None:
+        if token_ids:
+            logger.warning(
+                "vllm_sampled_logprob_payload_missing request_id=%s seq_index=%s token_count=%s payload_type=%s",
+                request_id,
+                seq_idx,
+                len(token_ids),
+                type(step_logprobs).__name__,
+            )
+            seq_ctx = f" seq_index={seq_index}" if seq_index is not None else ""
+            raise RuntimeError(
+                f"vLLM returned no sampled-token logprob payload: request_id={request_id} "
+                f"token_count={len(token_ids)}{seq_ctx}"
+            )
+        return []
+    try:
+        step_logprobs = list(step_logprobs)
+    except Exception as e:
+        logger.warning(
+            "vllm_sampled_logprob_payload_non_iterable request_id=%s seq_index=%s token_count=%s payload_type=%s err_type=%s",
+            request_id,
+            seq_idx,
+            len(token_ids),
+            type(step_logprobs).__name__,
+            type(e).__name__,
+        )
+        raise
+    seq_ctx = f" seq_index={seq_index}" if seq_index is not None else ""
+    if len(step_logprobs) != len(token_ids):
+        logger.warning(
+            "vllm_sampled_logprob_payload_len_mismatch request_id=%s seq_index=%s token_count=%s logprob_count=%s payload_type=%s",
+            request_id,
+            seq_idx,
+            len(token_ids),
+            len(step_logprobs),
+            type(step_logprobs).__name__,
+        )
+        raise RuntimeError(
+            f"vLLM returned mismatched sampled-token logprob payload length: request_id={request_id} "
+            f"token_count={len(token_ids)} logprob_count={len(step_logprobs)}{seq_ctx}"
+        )
+    out: list[float] = []
+    for i, lps in enumerate(step_logprobs):
+        tid = token_ids[i]
+        getter = getattr(lps, "get", None)
+        lp_obj = getter(tid) if callable(getter) else None
+        if lp_obj is None:
+            meta = _sampled_logprob_entry_meta(lps)
+            logger.warning(
+                "vllm_sampled_logprob_entry_missing request_id=%s seq_index=%s idx=%s token_id=%s token_count=%s logprob_count=%s "
+                "entry_type=%s entry_has_get=%s entry_size=%s entry_key_count=%s entry_key_preview=%s",
+                request_id,
+                seq_idx,
+                i,
+                tid,
+                len(token_ids),
+                len(step_logprobs),
+                meta["entry_type"],
+                meta["entry_has_get"],
+                meta["entry_size"],
+                meta["entry_key_count"],
+                meta["entry_key_preview"],
+            )
+            raise RuntimeError(
+                f"vLLM missing sampled-token logprob: request_id={request_id} idx={i} token_id={tid}{seq_ctx}"
+            )
+        if isinstance(lp_obj, (float, int)):
+            lp_f = float(lp_obj)
+        else:
+            lp_val = getattr(lp_obj, "logprob", None)
+            if lp_val is None and isinstance(lp_obj, dict):
+                lp_val = lp_obj.get("logprob")
+            if lp_val is None:
+                logger.warning(
+                    "vllm_sampled_logprob_value_missing request_id=%s seq_index=%s idx=%s token_id=%s token_count=%s logprob_count=%s "
+                    "lp_obj_type=%s lp_obj_is_dict=%s",
+                    request_id,
+                    seq_idx,
+                    i,
+                    tid,
+                    len(token_ids),
+                    len(step_logprobs),
+                    type(lp_obj).__name__,
+                    isinstance(lp_obj, dict),
+                )
+                raise RuntimeError(
+                    f"vLLM returned None sampled-token logprob: request_id={request_id} "
+                    f"idx={i} token_id={tid}{seq_ctx}"
+                )
+            lp_f = float(lp_val)
+        if not math.isfinite(lp_f):
+            logger.warning(
+                "vllm_sampled_logprob_non_finite request_id=%s seq_index=%s idx=%s token_id=%s token_count=%s logprob_count=%s "
+                "lp_obj_type=%s",
+                request_id,
+                seq_idx,
+                i,
+                tid,
+                len(token_ids),
+                len(step_logprobs),
+                type(lp_obj).__name__,
+            )
+            raise RuntimeError(
+                f"Non-finite sampled-token logprob: request_id={request_id} idx={i} "
+                f"token_id={tid}{seq_ctx}"
+            )
+        out.append(lp_f)
+    return out
 
 
 def _mint_present_expert_ids_from_keys(keys: list[str]) -> set[int]:
@@ -441,11 +598,19 @@ def _create_extended_server_class(
                 from verl.workers.rollout.replica import RolloutMode
 
                 kwargs["rollout_mode"] = RolloutMode(rollout_mode)
-            pfs_pythonpath = PFS_PYTHONPATH
-            os.environ["PYTHONPATH"] = pfs_pythonpath + ":" + os.environ.get("PYTHONPATH", "")
-            for p in reversed(pfs_pythonpath.split(":")):
-                if p and p not in sys.path:
-                    sys.path.insert(0, p)
+            env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT")
+            pfs_pythonpath = sanitize_worker_pythonpath(PFS_PYTHONPATH, env_root=env_root)
+            os.environ["PYTHONPATH"] = pfs_pythonpath
+            pfs_entries = [p for p in pfs_pythonpath.split(":") if p]
+            excluded = set(host_only_pythonpath_entries(env_root)) if env_root else set()
+            preserved = [
+                p
+                for p in sys.path
+                if p
+                and p not in pfs_entries
+                and p not in excluded
+            ]
+            sys.path[:] = [*pfs_entries, *preserved]
             print(f"[ExtendedVLLMHttpServer] Set PYTHONPATH, vLLM path: {sys.path[0]}", flush=True)
 
             # Always initialize through current MRO parent. Calling __init__ on a
@@ -463,11 +628,17 @@ def _create_extended_server_class(
                 sig = None
             print(f"[ExtendedVLLMHttpServer] vLLMHttpServer.__init__ sig={sig}", flush=True)
             print(f"[ExtendedVLLMHttpServer] Calling with args={args}, kwargs keys={list(kwargs.keys())}", flush=True)
+            call_kwargs = dict(kwargs)
             if 'cuda_visible_devices' in kwargs:
                 print(f"[ExtendedVLLMHttpServer] cuda_visible_devices={kwargs['cuda_visible_devices']}", flush=True)
             else:
-                print("[ExtendedVLLMHttpServer] WARNING: cuda_visible_devices NOT in kwargs!", flush=True)
-            call_kwargs = dict(kwargs)
+                ray_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                print(
+                    "[ExtendedVLLMHttpServer] cuda_visible_devices omitted; "
+                    f"using Ray-assigned CUDA_VISIBLE_DEVICES={ray_visible_devices!r}",
+                    flush=True,
+                )
+                call_kwargs["cuda_visible_devices"] = ray_visible_devices
             rollout_cfg = call_kwargs.get("config")
             if rollout_cfg is not None:
                 from dataclasses import asdict, is_dataclass
@@ -967,7 +1138,7 @@ def _create_extended_server_class(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                logprobs=0 if logprobs else None,
+                logprobs=1 if logprobs else None,
                 n=effective_n,
                 **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
@@ -1067,11 +1238,12 @@ def _create_extended_server_class(
 
                 token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
-                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                    log_probs = [
-                        logprobs[token_ids[i]].logprob
-                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=token_ids,
+                        step_logprobs=final_res.outputs[0].logprobs,
+                    )
                 self._progress_last.pop(request_id, None)
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
@@ -1141,11 +1313,13 @@ def _create_extended_server_class(
                 out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
-                if sampling_params.logprobs is not None and out.logprobs:
-                    out_log_probs = [
-                        lp[out_token_ids[i]].logprob
-                        for i, lp in enumerate(out.logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    out_log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=out_token_ids,
+                        step_logprobs=out.logprobs,
+                        seq_index=idx,
+                    )
                 out_routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(out, "routed_experts", None)
@@ -1240,7 +1414,7 @@ def _create_extended_server_class(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                logprobs=0 if logprobs else None,
+                logprobs=1 if logprobs else None,
                 n=effective_n,
                 **vllm_stop_kwargs(stop, default_stop_token_ids=[151645, 151643, 163586, 163585]),
             )
@@ -1329,11 +1503,12 @@ def _create_extended_server_class(
 
                 token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
-                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
-                    log_probs = [
-                        logprobs[token_ids[i]].logprob
-                        for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=token_ids,
+                        step_logprobs=final_res.outputs[0].logprobs,
+                    )
                 self._progress_last.pop(request_id, None)
                 routed_experts = None
                 if self._enable_rollout_routing_replay:
@@ -1403,11 +1578,13 @@ def _create_extended_server_class(
                 out = by_index[idx]
                 out_token_ids = list(out.token_ids)
                 out_log_probs = None
-                if sampling_params.logprobs is not None and out.logprobs:
-                    out_log_probs = [
-                        lp[out_token_ids[i]].logprob
-                        for i, lp in enumerate(out.logprobs)
-                    ]
+                if sampling_params.logprobs is not None:
+                    out_log_probs = _extract_sampled_token_logprobs(
+                        request_id=request_id,
+                        token_ids=out_token_ids,
+                        step_logprobs=out.logprobs,
+                        seq_index=idx,
+                    )
                 out_routed_experts = None
                 if self._enable_rollout_routing_replay:
                     raw = getattr(out, "routed_experts", None)
@@ -1480,7 +1657,7 @@ def _create_extended_server_class(
                 )
 
             # Rest of verl's generate() logic
-            sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+            sampling_params["logprobs"] = 1 if sampling_params.pop("logprobs", False) else None
             sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
             sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
 
@@ -1516,10 +1693,11 @@ def _create_extended_server_class(
             token_ids = final_res.outputs[0].token_ids
             log_probs = None
             if sampling_params.logprobs is not None:
-                log_probs = [
-                    logprobs[token_ids[i]].logprob
-                    for i, logprobs in enumerate(final_res.outputs[0].logprobs)
-                ]
+                log_probs = _extract_sampled_token_logprobs(
+                    request_id=request_id,
+                    token_ids=list(token_ids),
+                    step_logprobs=final_res.outputs[0].logprobs,
+                )
             routed_experts = None
             if self._enable_rollout_routing_replay:
                 raw = getattr(final_res.outputs[0], "routed_experts", None)
@@ -2349,7 +2527,12 @@ class VerlInferenceEngine:
         # Create ExtendedVLLMHttpServer as Ray actor
         # Request total_gpus (TP * DP) via .options() for MoE expert parallelism
         # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-        from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+        from ..config import (
+            actor_ld_library_path,
+            actor_runtime_env_vars,
+            otel_env_vars,
+            preferred_vllm_python_executable,
+        )
         from dataclasses import asdict
 
         from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
@@ -2400,24 +2583,35 @@ class VerlInferenceEngine:
             "node_rank": 0,
             "gpus_per_node": total_gpus,
             "nnodes": 1,
-            "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
         }
-        self.server = ExtendedVLLMHttpServer.options(
-            num_gpus=total_gpus,
-            max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
-            runtime_env={
-                "env_vars": actor_runtime_env_vars(
-                    pythonpath=PFS_PYTHONPATH,
-                    extra={
+        worker_pythonpath = join_pythonpath(
+            "/vllm",
+            sanitize_worker_pythonpath(
+                PFS_PYTHONPATH,
+                env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+            ),
+        )
+        runtime_env = {
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=worker_pythonpath,
+                extra={
                     "LD_LIBRARY_PATH": actor_ld_library_path(),
                     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                     "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                     "HF_HUB_OFFLINE": "1",
                     "VLLM_ATTENTION_BACKEND": server_config.vllm_attention_backend,
                     **otel_env_vars(),
-                    },
-                )
-            },
+                },
+            )
+        }
+        preferred_python = (preferred_vllm_python_executable() or "").strip()
+        if preferred_python:
+            runtime_env["py_executable"] = preferred_python
+
+        self.server = ExtendedVLLMHttpServer.options(
+            num_gpus=total_gpus,
+            max_concurrency=int(os.environ.get("MINT_VLLM_ACTOR_MAX_CONCURRENCY", "64")),
+            runtime_env=runtime_env,
         ).remote(**remote_kwargs)
 
         # Launch the server

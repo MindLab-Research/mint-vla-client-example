@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tinker_server.runtime_env import (
+    DEFAULT_BASE_PYTHON_DIRNAME,
     DEFAULT_HOST_VENV_DIRNAME,
     DEFAULT_SITE_PACKAGES_DIRNAME,
     DEFAULT_SOURCE_DIRNAME,
@@ -30,6 +31,10 @@ from tinker_server.runtime_env import (
 
 def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
+
+
+def _capture(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
+    return subprocess.check_output(cmd, cwd=cwd, env=env, text=True)
 
 
 def _resolve_uv() -> str:
@@ -129,17 +134,55 @@ def _install_target(python: Path, target: Path, requirements_file: Path) -> None
     )
 
 
+def _materialize_base_python(
+    python_request: str,
+    base_python_root: Path,
+) -> Path:
+    uv = _resolve_uv()
+    find_cmd = [uv, "python", "find", "--managed-python", "--resolve-links", python_request]
+    try:
+        bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
+    except subprocess.CalledProcessError:
+        _run([uv, "python", "install", python_request], cwd=REPO_ROOT)
+        bootstrap_python = Path(_capture(find_cmd, cwd=REPO_ROOT).strip())
+    if not bootstrap_python.exists():
+        raise RuntimeError(f"uv python find returned missing interpreter: {bootstrap_python}")
+    bootstrap_root = bootstrap_python.resolve().parent.parent
+    if base_python_root.exists():
+        shutil.rmtree(base_python_root)
+    shutil.copytree(bootstrap_root, base_python_root)
+    materialized_python = base_python_root / "bin" / bootstrap_python.name
+    if not materialized_python.exists():
+        raise RuntimeError(
+            f"materialized base python missing after copy: {materialized_python}"
+        )
+    return materialized_python
+
+
 def _create_host_venv(
-    uv_python: str,
+    base_python: Path,
     host_venv: Path,
     host_requirements: Path,
 ) -> Path:
     if host_venv.exists():
         shutil.rmtree(host_venv)
-    _run([_resolve_uv(), "venv", "--seed", "--python", uv_python, str(host_venv)])
+    _run([str(base_python), "-m", "venv", "--copies", str(host_venv)])
     python = host_venv / "bin" / "python"
     _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-    _run([str(python), "-m", "pip", "install", "-r", str(host_requirements)])
+    _run(
+        [
+            _resolve_uv(),
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--requirements",
+            str(host_requirements),
+            "--torch-backend",
+            "cpu",
+        ],
+        cwd=REPO_ROOT,
+    )
     return python
 
 
@@ -154,6 +197,7 @@ def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path
         "runtime_env": {
             "site_packages_dir": runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME),
             "source_dir": runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME),
+            "base_python_dir": runtime.get("base_python_dir", DEFAULT_BASE_PYTHON_DIRNAME),
             "host_venv_dir": runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME),
         },
         "sources": runtime["sources"],
@@ -292,13 +336,15 @@ def build_runtime_env(env_root: Path) -> None:
     shared_deps = _shared_deps(pyproject)
     env_root.mkdir(parents=True, exist_ok=True)
     shared_site_packages = env_root / runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)
+    base_python_root = env_root / runtime.get("base_python_dir", DEFAULT_BASE_PYTHON_DIRNAME)
     host_venv = env_root / runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)
     source_root = env_root / runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)
     shared_requirements = env_root / "shared-requirements.txt"
     host_requirements = env_root / "host-requirements.txt"
 
     _export_host_requirements(host_requirements)
-    host_python = _create_host_venv(runtime["python_version"], host_venv, host_requirements)
+    base_python = _materialize_base_python(runtime["python_version"], base_python_root)
+    host_python = _create_host_venv(base_python, host_venv, host_requirements)
     _export_shared_requirements(pyproject, shared_requirements)
     _install_target(host_python, shared_site_packages, shared_requirements)
 

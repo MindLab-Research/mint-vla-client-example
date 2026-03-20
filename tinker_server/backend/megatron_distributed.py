@@ -28,6 +28,7 @@ import ray
 # (tensordict imports torch internally)
 
 from . import ray_kill
+from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from ..logging_context import (
     get_request_id,
     init_actor_observability,
@@ -5050,7 +5051,25 @@ class MegatronWorkerGroup:
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
         pg_name = f"{_make_megatron_actor_name(self.base_model)}_pg"
         try:
-            self.placement_group = ray.util.get_placement_group(pg_name)
+            self.placement_group = get_named_placement_group(
+                pg_name,
+                namespace=PERSISTENT_NAMESPACE,
+                expected_bundles=bundles,
+            )
+        except PlacementGroupMismatchError as e:
+            logger.warning(
+                "[MegatronWorkerGroup] Removing incompatible placement group %s for base_model=%s: %s",
+                pg_name,
+                self.base_model,
+                e,
+            )
+            ray.util.remove_placement_group(e.pg)
+            self.placement_group = ray.util.placement_group(
+                bundles,
+                strategy="PACK",
+                name=pg_name,
+                lifetime="detached",
+            )
         except Exception:
             self.placement_group = ray.util.placement_group(
                 bundles,
@@ -6714,7 +6733,7 @@ def get_or_create_megatron_worker_group(
         # make ensure_gpus_available() block forever even though nothing is actually running.
         pg_name = f"{actor_name}_pg"
         try:
-            orphan_pg = ray.util.get_placement_group(pg_name)
+            orphan_pg = get_named_placement_group(pg_name, namespace=PERSISTENT_NAMESPACE)
         except ValueError:
             orphan_pg = None
         except Exception as e:
@@ -6920,7 +6939,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     def _remove_detached_pg(actor_name: str) -> None:
         pg_name = f"{actor_name}_pg"
         try:
-            pg = ray.util.get_placement_group(pg_name)
+            pg = get_named_placement_group(pg_name, namespace=PERSISTENT_NAMESPACE)
         except ValueError:
             return
         except Exception as e:

@@ -87,18 +87,16 @@ def main() -> int:
         if state in ("CREATED", "REMOVED"):
             return _fail(f"Expected placement group to be pending, got state={state!r}")
 
-        code, data, text = _get_json(f"{BASE_URL}/api/v1/healthz", timeout_s=10.0)
-        if code == 200:
-            return _fail(
-                "healthz returned 200 while Ray has pending GPU placement-group demand; "
-                f"expected 503. body={text[:400]!r}"
-            )
-        if code != 503:
-            return _fail(f"healthz returned {code}, expected 503. body={text[:400]!r}")
-        if not isinstance(data, dict) or data.get("status") != "degraded":
-            return _fail(f"healthz 503 returned unexpected json: {data!r}")
-        if data.get("reason") != "pending_placement_groups":
-            return _fail(f"healthz 503 unexpected reason: {data.get('reason')!r} body={data!r}")
+        code, data, text = _get_json(f"{BASE_URL}/internal/healthz/deep", timeout_s=10.0)
+        if code != 200:
+            return _fail(f"internal deep health returned {code}, expected 200. body={text[:400]!r}")
+        if not isinstance(data, dict) or data.get("status") != "ready":
+            return _fail(f"internal deep health returned unexpected json: {data!r}")
+        obs = data.get("ray_observation")
+        if not isinstance(obs, dict):
+            return _fail(f"internal deep health missing ray_observation: {data!r}")
+        if obs.get("reason") != "pending_placement_groups":
+            return _fail(f"internal deep health unexpected reason: {obs.get('reason')!r} body={data!r}")
 
         print("PASS")
         return 0

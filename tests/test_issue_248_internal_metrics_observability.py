@@ -52,6 +52,16 @@ async def _fake_admission_stats() -> dict:
             ],
         },
         "process": {"rss_bytes": 12345, "pid": 999},
+        "driver_state": {
+            "sdk_sessions_fallback": 7,
+            "session_heartbeat_entries": 11,
+            "lora_load_locks": 3,
+            "sampling_sessions_total": 5,
+            "sampling_sessions_multi_lora": 4,
+            "sampling_sessions_base_model": 1,
+            "sampling_sessions_lora_loaded": 2,
+            "sampling_sessions_inflight": 1,
+        },
     }
 
 
@@ -73,6 +83,15 @@ def test_issue_248_internal_metrics_exposes_phase1_and_phase2_fields(monkeypatch
         'tinker_actor_rss_bytes{actor="future_store"} 3000',
         'tinker_resource_pool_actor_rss_bytes{actor_name="vllm-1",actor_type="vllm",model="Qwen/Qwen3-4B-Instruct-2507"} 100',
         "tinker_api_server_process_rss_bytes 12345",
+        "MINT_driver_process_rss_bytes 12345",
+        "MINT_driver_sdk_sessions_fallback 7",
+        "MINT_driver_session_heartbeat_entries 11",
+        "MINT_driver_lora_load_locks 3",
+        "MINT_driver_sampling_sessions_total 5",
+        "MINT_driver_sampling_sessions_multi_lora 4",
+        "MINT_driver_sampling_sessions_base_model 1",
+        "MINT_driver_sampling_sessions_lora_loaded 2",
+        "MINT_driver_sampling_sessions_inflight 1",
         "tinker_metrics_up 1",
     )
     for line in expected_lines:

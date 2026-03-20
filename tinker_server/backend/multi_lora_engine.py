@@ -22,9 +22,11 @@ from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
 from tinker_server.ray_utils import init_ray
+from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 from . import ray_kill
 from .lora_registry import LoRARegistry
+from .ray_placement_groups import remove_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
 from .volc_placement import (
     assert_node_ip_capacity,
@@ -402,9 +404,21 @@ class MultiLoRAInferenceEngine:
             # lifetime="detached" ensures actor survives owner process termination
             # Request total_gpus for MoE expert parallelism
             # runtime_env prepends vLLM 0.12.0 from PFS for MoE LoRA support
-            from ..config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
+            from ..config import (
+                actor_ld_library_path,
+                actor_runtime_env_vars,
+                otel_env_vars,
+                preferred_vllm_python_executable,
+            )
+            worker_pythonpath = join_pythonpath(
+                "/vllm",
+                sanitize_worker_pythonpath(
+                    PFS_PYTHONPATH,
+                    env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+                ),
+            )
             env_vars = actor_runtime_env_vars(
-                pythonpath=PFS_PYTHONPATH,
+                pythonpath=worker_pythonpath,
                 extra={
                 "LD_LIBRARY_PATH": actor_ld_library_path(),
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -416,6 +430,7 @@ class MultiLoRAInferenceEngine:
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
+            preferred_python = (preferred_vllm_python_executable() or "").strip()
 
             actor_options: dict[str, object] = {
                 "num_gpus": total_gpus,
@@ -429,6 +444,8 @@ class MultiLoRAInferenceEngine:
                     }
                 },
             }
+            if preferred_python:
+                actor_options["runtime_env"]["py_executable"] = preferred_python
             if self.pinned_node_ip:
                 actor_options["resources"] = {f"node:{self.pinned_node_ip}": 0.001}
                 node_map = {
@@ -462,7 +479,6 @@ class MultiLoRAInferenceEngine:
                 "node_rank": 0,
                 "gpus_per_node": total_gpus,
                 "nnodes": 1,
-                "cuda_visible_devices": ",".join(str(i) for i in range(total_gpus)),
             }
             self.server = ExtendedVLLMHttpServer.options(
                 **actor_options,
@@ -1256,8 +1272,7 @@ class MultiLoRAInferenceEngine:
             except Exception as e:
                 logger.warning(f"Error killing server actor: {e}")
             try:
-                pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
-                ray.util.remove_placement_group(pg)
+                remove_named_placement_group(f"{self.actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
                 pass
         self.server = None
@@ -1359,7 +1374,28 @@ class MultiModelInferenceManager:
 
         try:
             await asyncio.to_thread(ray.get, actor.__ray_ready__.remote(), timeout=5)
-            engine_ready = await asyncio.to_thread(ray.get, actor.is_engine_ready.remote(), timeout=10)
+            ready_method_name = None
+            ready_probe = None
+            for method_name in ("is_engine_ready", "is_ready"):
+                candidate = getattr(actor, method_name, None)
+                if candidate is None:
+                    continue
+                ready_method_name = method_name
+                ready_probe = candidate
+                break
+            if ready_probe is None:
+                logger.warning(
+                    "named actor probe found no readiness RPC actor=%s; reusing actor after __ray_ready__",
+                    actor_name,
+                )
+                return True
+            engine_ready = await asyncio.to_thread(ray.get, ready_probe.remote(), timeout=10)
+            logger.debug(
+                "named actor probe readiness actor=%s method=%s ready=%s",
+                actor_name,
+                ready_method_name,
+                engine_ready,
+            )
             return bool(engine_ready)
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
@@ -1756,16 +1792,14 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
             logger.info(f"Killed vLLM actor: {actor_name}")
             resource_pool.unregister(actor_name)
             try:
-                pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                ray.util.remove_placement_group(pg)
+                remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
                 pass
             return True
         except ValueError:
             logger.info(f"No vLLM actor found: {actor_name}")
             try:
-                pg = ray.util.get_placement_group(f"{actor_name}_pg")
-                ray.util.remove_placement_group(pg)
+                remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
                 pass
             return False
@@ -1785,8 +1819,10 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     logger.info(f"Killed vLLM actor: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     try:
-                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
-                        ray.util.remove_placement_group(pg)
+                        remove_named_placement_group(
+                            f"{entry.actor_name}_pg",
+                            namespace=entry.namespace,
+                        )
                     except Exception:
                         pass
                     killed_any = True
@@ -1794,8 +1830,10 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                     logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
                     resource_pool.unregister(entry.actor_name)
                     try:
-                        pg = ray.util.get_placement_group(f"{entry.actor_name}_pg")
-                        ray.util.remove_placement_group(pg)
+                        remove_named_placement_group(
+                            f"{entry.actor_name}_pg",
+                            namespace=entry.namespace,
+                        )
                     except Exception:
                         pass
                 except Exception as e:
