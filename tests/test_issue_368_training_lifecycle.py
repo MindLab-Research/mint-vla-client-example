@@ -78,6 +78,14 @@ class _StubRemoteDelete:
         return self._fn(*args, **kwargs)
 
 
+class _StubRemoteMethod:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def remote(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
 class _StubSharedWorker:
     def __init__(self):
         self.delete_calls = []
@@ -86,6 +94,17 @@ class _StubSharedWorker:
     def _delete_session(self, model_id: str) -> bool:
         self.delete_calls.append(model_id)
         return True
+
+
+class _StubFutureStoreActor:
+    def __init__(self, failed_request_ids):
+        self.calls = []
+        self._failed_request_ids = list(failed_request_ids)
+        self.fail_training_requests_for_model = _StubRemoteMethod(self._fail_training_requests_for_model)
+
+    def _fail_training_requests_for_model(self, *, model_id: str, error: str) -> list[str]:
+        self.calls.append((model_id, error))
+        return list(self._failed_request_ids)
 
 
 @pytest.mark.anyio
@@ -100,9 +119,15 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
     heartbeat_store = _StubHeartbeatStore({"sess-stale"})
     deleted_model_ids = []
     cleared_model_ids = []
+    failed_future_calls = []
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+    monkeypatch.setattr(
+        training_routes.future_store,
+        "fail_training_requests_for_model",
+        lambda model_id, error: failed_future_calls.append((model_id, error)) or ["req-stale"],
+    )
     monkeypatch.setattr(
         training_store_module,
         "list_training_sessions",
@@ -138,6 +163,9 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
     assert deleted_model_ids == ["model-stale"]
     assert cleared_model_ids == ["model-stale"]
     assert heartbeat_store.calls == [("sess-stale", 123.0), ("sess-live", 123.0)]
+    assert failed_future_calls == [
+        ("model-stale", "Training session terminated due to stale heartbeat (> 123.0s)")
+    ]
 
 
 @pytest.mark.anyio
@@ -150,6 +178,11 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+    monkeypatch.setattr(
+        training_routes.future_store,
+        "fail_training_requests_for_model",
+        lambda model_id, error: [],
+    )
     monkeypatch.setattr(
         training_store_module,
         "list_training_sessions",
@@ -181,6 +214,51 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
 
 
 @pytest.mark.anyio
+async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    stale_session = _StubSession("model-stale", "sess-stale")
+    manager = _StubTrainingManager({stale_session.model_id: stale_session})
+    engine = _StubTrainingEngine()
+    heartbeat_store = _StubHeartbeatStore({"sess-stale"})
+    deleted_model_ids = []
+
+    monkeypatch.setattr(training_routes, "training_manager", manager)
+    monkeypatch.setattr(training_routes, "training_engine", engine)
+    monkeypatch.setattr(
+        training_routes.future_store,
+        "fail_training_requests_for_model",
+        lambda model_id, error: (_ for _ in ()).throw(RuntimeError("future-store-down")),
+    )
+    monkeypatch.setattr(
+        training_store_module,
+        "list_training_sessions",
+        lambda: [
+            {
+                "model_id": stale_session.model_id,
+                "session_id": stale_session.session_id,
+                "actor_name": "dedicated-stale-actor",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        training_store_module,
+        "delete_training_session",
+        lambda model_id: deleted_model_ids.append(model_id),
+    )
+    monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
+    monkeypatch.setattr(
+        "tinker_server.backend.resource_pool.get_resource_pool",
+        lambda: SimpleNamespace(clear_session=lambda model_id: None),
+    )
+
+    cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
+
+    assert cleaned == []
+    assert engine.shutdown_calls == []
+    assert manager.deleted == []
+    assert deleted_model_ids == []
+
+
+@pytest.mark.anyio
 async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -197,6 +275,11 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
+    monkeypatch.setattr(
+        training_routes.future_store,
+        "fail_training_requests_for_model",
+        lambda model_id, error: [],
+    )
     monkeypatch.setattr(
         training_store_module,
         "list_training_sessions",
@@ -258,3 +341,31 @@ def test_issue_368_sync_training_session_step_uses_reported_step_when_present(
     assert actor.bump_calls == []
     assert actor.set_calls == [("model-b", 11)]
     assert result["metrics"]["step"] == 11
+
+
+def test_issue_368_fail_training_requests_for_model_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = _StubFutureStoreActor(["req-1", "req-2"])
+    store = future_store_module.FutureStore()
+    released_request_ids = []
+
+    monkeypatch.setattr(store, "_get_ray_actor", lambda: actor)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(
+            get=lambda value: value,
+            exceptions=SimpleNamespace(ActorDiedError=RuntimeError),
+        ),
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.capacity_manager.capacity_manager.release_all",
+        lambda request_id: released_request_ids.append(request_id),
+    )
+
+    failed = store.fail_training_requests_for_model("model-z", "stale heartbeat")
+
+    assert failed == ["req-1", "req-2"]
+    assert actor.calls == [("model-z", "stale heartbeat")]
+    assert released_request_ids == ["req-1", "req-2"]

@@ -569,6 +569,32 @@ def _get_or_create_ray_actor():
                 failed.append(str(request_id))
             return failed
 
+        def fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
+            self._prune()
+            target_model_id = str(model_id).strip()
+            if not target_model_id:
+                return []
+            now = time.time()
+            message = str(error)
+            failed: list[str] = []
+            for request_id in list(self._pending):
+                meta = self._meta.get(request_id)
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("model_id") or "").strip() != target_model_id:
+                    continue
+                op = self._op_from_meta(meta) or ""
+                if not op.startswith("training."):
+                    continue
+                self._pending.discard(request_id)
+                self._refs.pop(request_id, None)
+                self._update_op_from_meta(request_id, meta)
+                self._meta.pop(request_id, None)
+                self._errors[request_id] = message
+                self._done_at[request_id] = now
+                failed.append(str(request_id))
+            return failed
+
         def forget(self, request_id: str) -> None:
             self._forget(request_id)
 
@@ -779,6 +805,38 @@ class FutureStore:
             capacity_manager.release_object_store(request_id)
         except Exception:
             pass
+
+    def fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            failed = ray.get(
+                actor.fail_training_requests_for_model.remote(
+                    model_id=str(model_id),
+                    error=str(error),
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+
+        if not isinstance(failed, list):
+            raise TypeError("FutureStore.fail_training_requests_for_model returned non-list")
+
+        failed_ids = [str(request_id) for request_id in failed]
+        if not failed_ids:
+            return []
+
+        try:
+            from .capacity_manager import capacity_manager
+
+            for request_id in failed_ids:
+                capacity_manager.release_all(request_id)
+        except Exception:
+            pass
+
+        return failed_ids
 
     def get_status(self, request_id: str) -> FutureStatus:
         actor = self._get_ray_actor()

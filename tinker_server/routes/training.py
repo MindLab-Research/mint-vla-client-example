@@ -276,6 +276,28 @@ async def _best_effort_delete_training_session(
     if training_engine is None or training_manager is None:
         return False
 
+    try:
+        failed_request_ids = future_store.fail_training_requests_for_model(
+            model_id,
+            f"Training session terminated due to {reason}",
+        )
+        if failed_request_ids:
+            logger.warning(
+                "[%s] failed pending training futures during stale cleanup (%s): request_ids=%s",
+                model_id,
+                reason,
+                failed_request_ids,
+            )
+    except Exception as e:
+        logger.warning(
+            "[%s] stale training cleanup aborted because pending future fail failed (%s): %s: %s",
+            model_id,
+            reason,
+            type(e).__name__,
+            e,
+        )
+        return False
+
     session = training_manager.get_session(model_id)
     restored = False
     if session is None:
@@ -395,11 +417,13 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
             continue
         try:
             allow_actor_shutdown = bool(actor_name) and actor_refcounts.get(actor_name, 0) <= 1
-            await _best_effort_delete_training_session(
+            deleted = await _best_effort_delete_training_session(
                 model_id,
                 reason=f"stale heartbeat (> {float(stale_after_s):.1f}s)",
                 allow_actor_shutdown=allow_actor_shutdown,
             )
+            if not deleted:
+                continue
             cleaned.append(model_id)
             logger.warning(
                 "[%s] auto-terminated stale training session: session_id=%s stale_after_s=%.1f "
