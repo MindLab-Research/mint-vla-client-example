@@ -1551,8 +1551,16 @@ async def _do_forward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        token_count, _ = _compute_token_stats(request.forward_input.data)
+        batch = request.forward_input.data
+        token_count, max_seq_len = _compute_token_stats(batch)
+        t0 = time.time()
+        logger.info(
+            f"[{session.model_id}] forward start: "
+            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
+        )
         result = await training_engine.forward(session, request)
+        elapsed_s = time.time() - t0
+        logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(

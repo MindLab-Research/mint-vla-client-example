@@ -584,6 +584,33 @@ class MegatronRankWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
+    def get_cuda_memory_stats(self) -> dict[str, object]:
+        try:
+            import torch
+        except Exception as e:
+            return {
+                "current_session_id": self._current_session_id,
+                "cuda_available": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        if not torch.cuda.is_available():
+            return {
+                "current_session_id": self._current_session_id,
+                "cuda_available": False,
+            }
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "current_session_id": self._current_session_id,
+            "cuda_available": True,
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+        }
+
     def _bind_traceparent(self, traceparent: str | None) -> None:
         if isinstance(traceparent, str) and traceparent:
             restore_trace_id_from_traceparent(traceparent)
@@ -4786,6 +4813,76 @@ class MegatronWorkerGroup:
         rss_pages = int(parts[1])
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
+
+    def get_cuda_memory_summary(self) -> dict[str, object]:
+        timeout_s = float(os.environ.get("MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S", "2.0"))
+        refs = [w.get_cuda_memory_stats.remote() for w in self.workers]
+        ref_to_rank = {ref: rank for rank, ref in enumerate(refs)}
+        pending = list(refs)
+        stats: list[dict[str, object] | None] = [None] * len(refs)
+
+        while pending:
+            ready, pending = ray.wait(pending, num_returns=1, timeout=timeout_s)
+            if not ready:
+                break
+            ref = ready[0]
+            rank = ref_to_rank[ref]
+            try:
+                stats[rank] = ray.get(ref)
+            except Exception as e:
+                stats[rank] = {
+                    "rank": rank,
+                    "cuda_available": False,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }
+
+        for ref in pending:
+            rank = ref_to_rank[ref]
+            stats[rank] = {
+                "rank": rank,
+                "cuda_available": False,
+                "error_type": "GetTimeoutError",
+                "error": f"get_cuda_memory_stats timed out after {timeout_s:.3f}s for rank {rank}",
+            }
+
+        final_stats: list[dict[str, object]] = []
+        allocated_max = 0
+        reserved_max = 0
+        free_min = None
+        total_bytes = None
+        hottest_rank = None
+        hottest_session = None
+
+        for rank, entry in enumerate(stats):
+            item = dict(entry or {"cuda_available": False})
+            item.setdefault("rank", rank)
+            final_stats.append(item)
+            if not bool(item.get("cuda_available")):
+                continue
+            allocated = int(item.get("allocated_bytes", 0) or 0)
+            reserved = int(item.get("reserved_bytes", 0) or 0)
+            free_bytes = int(item.get("free_bytes", 0) or 0)
+            total = int(item.get("total_bytes", 0) or 0)
+            if allocated >= allocated_max:
+                allocated_max = allocated
+                hottest_rank = rank
+                hottest_session = item.get("current_session_id")
+            reserved_max = max(reserved_max, reserved)
+            free_min = free_bytes if free_min is None else min(free_min, free_bytes)
+            total_bytes = total if total_bytes is None else max(total_bytes, total)
+
+        return {
+            "world_size": len(self.workers),
+            "cuda_available": any(bool(item.get("cuda_available")) for item in final_stats),
+            "allocated_bytes_max": int(allocated_max),
+            "reserved_bytes_max": int(reserved_max),
+            "free_bytes_min": None if free_min is None else int(free_min),
+            "total_bytes": None if total_bytes is None else int(total_bytes),
+            "hottest_rank": hottest_rank,
+            "hottest_session_id": hottest_session,
+            "rank_stats": final_stats,
+        }
 
     def get_master_addr(self) -> str | None:
         return self._master_addr

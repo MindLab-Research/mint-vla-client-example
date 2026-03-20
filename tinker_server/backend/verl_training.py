@@ -515,6 +515,26 @@ class TrainingWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
+    def get_cuda_memory_stats(self) -> dict[str, object]:
+        """Return a lightweight CUDA memory snapshot for this worker."""
+        torch = _get_torch()
+        if not torch.cuda.is_available():
+            return {
+                "current_session_id": self._current_session_id,
+                "cuda_available": False,
+            }
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "current_session_id": self._current_session_id,
+            "cuda_available": True,
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+        }
+
     def forward_backward(
         self,
         data_items: list[dict],
@@ -1648,6 +1668,70 @@ class VerlTrainingEngine:
         except Exception:
             return "UNKNOWN"
 
+    def _serialized_batch_stats(self, data_items: list[dict[str, Any]]) -> dict[str, int]:
+        total_tokens = 0
+        max_seq_len = 0
+        for item in data_items:
+            seq_len = 0
+            model_input = item.get("model_input") or {}
+            for chunk in model_input.get("chunks") or []:
+                if chunk.get("type") == "encoded_text":
+                    seq_len += len(chunk.get("tokens") or [])
+            total_tokens += seq_len
+            max_seq_len = max(max_seq_len, seq_len)
+        return {
+            "batch_size": len(data_items),
+            "total_tokens": total_tokens,
+            "max_seq_len": max_seq_len,
+        }
+
+    async def _maybe_collect_worker_cuda_memory_summary(
+        self,
+        worker: ray.actor.ActorHandle,
+    ) -> dict[str, Any] | None:
+        timeout_s = float(os.environ.get("MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S", "2.0"))
+        try:
+            try:
+                return await asyncio.to_thread(
+                    ray.get,
+                    worker.get_cuda_memory_summary.remote(),
+                    timeout=timeout_s,
+                )
+            except AttributeError:
+                return await asyncio.to_thread(
+                    ray.get,
+                    worker.get_cuda_memory_stats.remote(),
+                    timeout=timeout_s,
+                )
+        except Exception as e:
+            return {
+                "cuda_available": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+
+    async def _log_worker_request_context(
+        self,
+        session: "TrainingSession",
+        worker: ray.actor.ActorHandle,
+        *,
+        op: str,
+        stage: str,
+        batch_stats: dict[str, int] | None = None,
+    ) -> None:
+        cuda_summary = await self._maybe_collect_worker_cuda_memory_summary(worker)
+        logger.info(
+            "[%s] worker_request_context backend=%s op=%s stage=%s batch_size=%s total_tokens=%s max_seq_len=%s cuda_summary=%s",
+            session.model_id,
+            session.backend,
+            op,
+            stage,
+            None if batch_stats is None else batch_stats.get("batch_size"),
+            None if batch_stats is None else batch_stats.get("total_tokens"),
+            None if batch_stats is None else batch_stats.get("max_seq_len"),
+            cuda_summary,
+        )
+
     async def _recycle_megatron_actor(
         self,
         session: "TrainingSession",
@@ -1837,6 +1921,7 @@ class VerlTrainingEngine:
         *,
         op: str,
         submit_fn,
+        batch_stats: dict[str, int] | None = None,
         interval_s: float = 30.0,
         timeout_s: float | None = None,
     ):
@@ -1850,6 +1935,13 @@ class VerlTrainingEngine:
             else:
                 worker = await self._recycle_dense_actor(session, op=op, cause=e)
         self._touch_actor(session)
+        await self._log_worker_request_context(
+            session,
+            worker,
+            op=op,
+            stage="before_submit",
+            batch_stats=batch_stats,
+        )
         attempts = 0
         while True:
             try:
@@ -1877,6 +1969,13 @@ class VerlTrainingEngine:
                     worker = await self._recycle_megatron_actor(session, op=op, cause=e)
                 else:
                     worker = await self._recycle_dense_actor(session, op=op, cause=e)
+                await self._log_worker_request_context(
+                    session,
+                    worker,
+                    op=op,
+                    stage="after_recycle",
+                    batch_stats=batch_stats,
+                )
 
     async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
@@ -2400,6 +2499,7 @@ class VerlTrainingEngine:
         """
         model_id = session.model_id
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        batch_stats = self._serialized_batch_stats(data_items)
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = dict(request.forward_backward_input.loss_fn_config or {})
         session_rollout_corr = getattr(session, "rollout_correction_config", None)
@@ -2449,6 +2549,7 @@ class VerlTrainingEngine:
             session,
             op="forward_backward",
             submit_fn=_submit,
+            batch_stats=batch_stats,
             interval_s=30.0,
         )
 
@@ -2474,6 +2575,7 @@ class VerlTrainingEngine:
         """
         model_id = session.model_id
         data_items = [item.model_dump() for item in request.forward_input.data]
+        batch_stats = self._serialized_batch_stats(data_items)
 
         lora_cfg = getattr(session, "lora_config", None)
         train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
@@ -2497,6 +2599,7 @@ class VerlTrainingEngine:
             session,
             op="forward",
             submit_fn=_submit,
+            batch_stats=batch_stats,
             interval_s=30.0,
         )
 
@@ -2600,6 +2703,7 @@ class VerlTrainingEngine:
         model_id = session.model_id
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
+        batch_stats = self._serialized_batch_stats(data_items)
         loss_fn = request.forward_backward_input.loss_fn
         loss_fn_config = dict(request.forward_backward_input.loss_fn_config or {})
         session_rollout_corr = getattr(session, "rollout_correction_config", None)
@@ -2654,6 +2758,7 @@ class VerlTrainingEngine:
                 session,
                 op="train_step",
                 submit_fn=_submit_train,
+                batch_stats=batch_stats,
                 interval_s=30.0,
             )
         else:
@@ -2682,6 +2787,7 @@ class VerlTrainingEngine:
                 session,
                 op="forward_backward",
                 submit_fn=_submit_fb,
+                batch_stats=batch_stats,
                 interval_s=30.0,
             )
 
