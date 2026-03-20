@@ -183,7 +183,8 @@ def _get_or_create_ray_actor():
             self._queued_asample_by_principal: dict[str, int] = {}
             self._queued_asample_by_apikey: dict[str, int] = {}
             self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
-            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
+            self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
+            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
             self._scheduler_max_consecutive = max(
                 1,
                 int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
@@ -199,6 +200,10 @@ def _get_or_create_ray_actor():
             self._scheduler_coalesce_ms = max(
                 0.0,
                 float(os.environ.get("MINT_SCHEDULER_COALESCE_MS", "20")),
+            )
+            self._scheduler_train_followup_hold_s = max(
+                0.0,
+                float(os.environ.get("MINT_SCHEDULER_TRAIN_FOLLOWUP_HOLD_S", "60.0")),
             )
             self._sched_domains: dict[str, dict[str, Any]] = {}
             self._sched_stats: dict[str, Any] = {
@@ -258,8 +263,24 @@ def _get_or_create_ray_actor():
                 else:
                     self._queued_asample_by_apikey.pop(apikey_id, None)
 
-        def finalize_request(self, request_id: str) -> None:
-            self._release_asample_slot(str(request_id))
+        async def finalize_request(self, request_id: str) -> None:
+            rid = str(request_id)
+            self._release_asample_slot(rid)
+            async with self._cv:
+                meta = self._scheduler_request_meta.pop(rid, None)
+                if meta is None:
+                    return
+                domain, session_id, op = meta
+                state = self._sched_domains.get(domain)
+                if state is None:
+                    return
+                if state.get("leased_request_id") == rid:
+                    state["leased_request_id"] = None
+                    state["leased_session"] = None
+                if op == "training.forward_backward" and self._scheduler_train_followup_hold_s > 0:
+                    state["followup_session"] = session_id
+                    state["followup_deadline"] = time.time() + float(self._scheduler_train_followup_hold_s)
+                self._cv.notify_all()
 
         def _mark_asample_leased_to_consumer(self, request_id: str, consumer_job_id: str | None) -> None:
             request_id = str(request_id)
@@ -347,6 +368,10 @@ def _get_or_create_ray_actor():
                 "current_session": None,
                 "last_session": None,
                 "consecutive_count": 0,
+                "followup_session": None,
+                "followup_deadline": 0.0,
+                "leased_request_id": None,
+                "leased_session": None,
                 "stats": {
                     "picks": 0,
                     "switches": 0,
@@ -476,6 +501,16 @@ def _get_or_create_ray_actor():
             if not rr_order:
                 return None
 
+            followup_session = state.get("followup_session")
+            followup_deadline = float(state.get("followup_deadline", 0.0) or 0.0)
+            if (
+                isinstance(followup_session, str)
+                and followup_session
+                and followup_deadline > now
+                and queues_by_session.get(followup_session)
+            ):
+                return followup_session, "followup_hold"
+
             if self._scheduler_starvation_s > 0:
                 chosen_starved_sid: str | None = None
                 max_wait = self._scheduler_starvation_s
@@ -513,6 +548,8 @@ def _get_or_create_ray_actor():
         def _pick_scheduled_candidate(self, *, now: float) -> tuple[str, str, str] | None:
             best: tuple[float, str, str, str] | None = None
             for domain, state in self._sched_domains.items():
+                if state.get("leased_request_id") is not None:
+                    continue
                 chosen = self._choose_session_for_domain(domain, state, now=now)
                 if chosen is None:
                     continue
@@ -549,6 +586,10 @@ def _get_or_create_ray_actor():
                 queues_by_session.pop(session_id, None)
                 self._remove_session_from_ready(state, session_id)
 
+            if state.get("followup_session") == session_id:
+                state["followup_session"] = None
+                state["followup_deadline"] = 0.0
+
             next_consecutive = 1
             if previous_current == session_id:
                 next_consecutive = int(state.get("consecutive_count", 0)) + 1
@@ -577,6 +618,8 @@ def _get_or_create_ray_actor():
                 state["consecutive_count"] = 0
             state["last_session"] = session_id
             state["last_pick_ts"] = float(now)
+            state["leased_request_id"] = str(item.get("request_id") or "")
+            state["leased_session"] = session_id
 
             return item
 
@@ -667,6 +710,11 @@ def _get_or_create_ray_actor():
                 is_sched, domain, session_id = self._scheduler_item_info(packed)
                 if is_sched:
                     self._enqueue_scheduled(packed, domain=domain, session_id=session_id)
+                    self._scheduler_request_meta[str(packed.get("request_id"))] = (
+                        str(domain),
+                        str(session_id),
+                        str(packed.get("op")),
+                    )
                 else:
                     self._items.append(packed)
                 self._enqueued += 1
@@ -753,6 +801,27 @@ def _get_or_create_ray_actor():
                         and self._scheduler_coalesce_ms > 0.0
                     ):
                         sched_domain, sched_session_id, sched_reason = sched_choice
+                        state = self._sched_domains.get(sched_domain)
+                        followup_session = None if state is None else state.get("followup_session")
+                        followup_deadline = 0.0 if state is None else float(state.get("followup_deadline", 0.0) or 0.0)
+                        followup_wait_s = max(0.0, followup_deadline - now)
+                        followup_queue = None
+                        if state is not None:
+                            followup_queue = (state.get("queues_by_session", {}) or {}).get(followup_session)
+                        if (
+                            isinstance(followup_session, str)
+                            and followup_session
+                            and followup_wait_s > 0.0
+                            and not followup_queue
+                            and followup_session != sched_session_id
+                        ):
+                            try:
+                                await asyncio.wait_for(self._cv.wait(), timeout=followup_wait_s)
+                            except asyncio.TimeoutError:
+                                if state is not None and state.get("followup_session") == followup_session:
+                                    state["followup_session"] = None
+                                    state["followup_deadline"] = 0.0
+                            continue
                         if str(sched_reason).startswith("fairness"):
                             state = self._sched_domains.get(sched_domain)
                             if isinstance(state, dict):

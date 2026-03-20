@@ -326,7 +326,7 @@ def _build_training_scheduler_extra(
     training_op: str,
     seq_id: int | None = None,
 ) -> dict[str, Any]:
-    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -335,7 +335,12 @@ def _build_training_scheduler_extra(
     )
     backend = str(getattr(session, "backend", "") or "unknown")
     base_model = str(getattr(session, "base_model", "") or "")
-    domain_key = base_model if base_model else str(model_id)
+    if backend == "megatron" and base_model:
+        from ..backend.megatron_distributed import _make_megatron_actor_name
+
+        domain_key = _make_megatron_actor_name(base_model)
+    else:
+        domain_key = base_model if base_model else str(model_id)
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
         "scheduler_domain": f"{backend}:{domain_key}",
@@ -350,6 +355,31 @@ def _build_training_scheduler_extra(
         except Exception:
             extra["seq_id"] = None
     return extra
+
+
+def _build_create_scheduler_extra(
+    *,
+    base_model: str,
+    model_id: str,
+    training_op: str,
+) -> dict[str, Any]:
+    from ..backend.model_registry import get_model_config
+
+    if bool(get_model_config(base_model).is_moe):
+        backend = "megatron"
+        from ..backend.megatron_distributed import _make_megatron_actor_name
+
+        domain_key = _make_megatron_actor_name(base_model)
+    else:
+        backend = "peft"
+        domain_key = base_model
+    return {
+        "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower()
+        in ("1", "true", "yes", "y", "on"),
+        "scheduler_domain": f"{backend}:{domain_key}",
+        "scheduler_session_key": str(model_id),
+        "training_op": str(training_op),
+    }
 
 
 # =============================================================================
@@ -442,6 +472,11 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
+    scheduler_extra = _build_create_scheduler_extra(
+        base_model=request.base_model,
+        model_id=model_id,
+        training_op="create_model",
+    )
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
@@ -472,6 +507,7 @@ async def create_model(
             request_json=request_json,
             user_id=user_id,
             webhook_url=webhook_url,
+            extra=scheduler_extra,
         )
         if webhook_url and user_id:
             send_task_event(
@@ -808,6 +844,11 @@ async def create_model_from_state(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    scheduler_extra = _build_create_scheduler_extra(
+        base_model=request.base_model,
+        model_id=model_id,
+        training_op="create_model_from_state",
+    )
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -830,6 +871,7 @@ async def create_model_from_state(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
