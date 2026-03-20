@@ -176,6 +176,10 @@ def _get_or_create_ray_actor():
             self._recent_enqueues = deque(maxlen=int(os.environ.get("MINT_API_WORK_QUEUE_DEBUG_MAX", "50")))
             self._active_job_id: str | None = None
             self._ema_exec_s_by_op: dict[str, float] = {}
+            self._last_exec_s_by_op: dict[str, float] = {}
+            self._sum_exec_s_by_op: dict[str, float] = {}
+            self._count_exec_by_op: dict[str, int] = {}
+            self._max_exec_s_by_op: dict[str, float] = {}
             self._ema_alpha = float(os.environ.get("MINT_API_WORK_QUEUE_ETA_ALPHA", "0.1"))
             self._max_pending_asample_per_apikey = int(
                 getattr(server_config, "sampling_max_pending_asample_per_apikey", 64)
@@ -925,6 +929,22 @@ def _get_or_create_ray_actor():
                 "by_apikey_id": dict(self._queued_asample_by_apikey),
                 "by_throttle_principal": dict(self._queued_asample_by_principal),
                 "age_stats": self._queued_age_stats(),
+                "execution_time_s_by_op": {
+                    op: {
+                        "last": float(self._last_exec_s_by_op.get(op, 0.0)),
+                        "ema": float(self._ema_exec_s_by_op.get(op, 0.0)),
+                        "sum": float(self._sum_exec_s_by_op.get(op, 0.0)),
+                        "count": int(self._count_exec_by_op.get(op, 0)),
+                        "max": float(self._max_exec_s_by_op.get(op, 0.0)),
+                    }
+                    for op in sorted(
+                        set(self._last_exec_s_by_op)
+                        | set(self._ema_exec_s_by_op)
+                        | set(self._sum_exec_s_by_op)
+                        | set(self._count_exec_by_op)
+                        | set(self._max_exec_s_by_op)
+                    )
+                },
                 "scheduler_enabled": bool(self._scheduler_enabled),
                 "scheduler_picks_total": int(self._sched_stats.get("picks_total", 0)),
                 "scheduler_switches_total": int(self._sched_stats.get("switches_total", 0)),
@@ -960,6 +980,10 @@ def _get_or_create_ray_actor():
                 return
             if d <= 0:
                 return
+            self._last_exec_s_by_op[key] = d
+            self._sum_exec_s_by_op[key] = float(self._sum_exec_s_by_op.get(key, 0.0)) + d
+            self._count_exec_by_op[key] = int(self._count_exec_by_op.get(key, 0)) + 1
+            self._max_exec_s_by_op[key] = max(float(self._max_exec_s_by_op.get(key, 0.0)), d)
             alpha = self._ema_alpha
             prev = self._ema_exec_s_by_op.get(key)
             if prev is None:
