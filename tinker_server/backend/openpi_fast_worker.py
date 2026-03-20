@@ -98,6 +98,44 @@ def _compute_importance_sampling_stats(
     }
 
 
+def _compute_ppo_stats(
+    *,
+    current_logprobs: np.ndarray,
+    old_logprobs: np.ndarray,
+    advantages: np.ndarray,
+    loss_mask: np.ndarray,
+    clip_low: float,
+    clip_high: float,
+) -> dict[str, float | int]:
+    current = np.asarray(current_logprobs, dtype=np.float32).reshape(-1)
+    old = np.asarray(old_logprobs, dtype=np.float32).reshape(-1)
+    adv = np.asarray(advantages, dtype=np.float32).reshape(-1)
+    mask = np.asarray(loss_mask, dtype=np.bool_).reshape(-1)
+
+    if not (current.shape == old.shape == adv.shape == mask.shape):
+        raise ValueError("ppo inputs must share the same length")
+
+    token_count = int(mask.sum())
+    if token_count == 0:
+        raise ValueError("ppo requires at least one masked token")
+
+    mask_f = mask.astype(np.float32)
+    log_ratio = np.clip(current - old, a_min=-20.0, a_max=20.0)
+    ratio = np.exp(log_ratio)
+    clipped_ratio = np.clip(ratio, a_min=clip_low, a_max=clip_high)
+    unclipped = -ratio * adv
+    clipped = -clipped_ratio * adv
+    loss = float(np.sum(np.maximum(unclipped, clipped) * mask_f))
+    ratio_mean = float(np.sum(ratio * mask_f) / token_count)
+    clipfrac_mean = float(np.sum(((ratio < clip_low) | (ratio > clip_high)).astype(np.float32) * mask_f) / token_count)
+    return {
+        "loss": loss,
+        "ratio_mean": ratio_mean,
+        "clipfrac_mean": clipfrac_mean,
+        "token_count": token_count,
+    }
+
+
 class _StaticDataLoader:
     def __init__(self, data_config: Any) -> None:
         self._data_config = data_config
@@ -421,26 +459,99 @@ class OpenPIFastWorkerSession:
             current_logprobs_np[loss_mask].tolist(),
         )
 
+    def _compute_ppo_grads(
+        self,
+        observation: Any,
+        actions: Any,
+        item: dict[str, Any],
+        loss_fn_config: dict[str, Any] | None,
+    ) -> tuple[Any, float, float, float, float, float, float, list[float]]:
+        nnx = self._nnx
+        jax = self._jax
+
+        target_len = len(list(item["tokenized_prompt"])) - 1
+        old_logprobs, advantages, loss_mask = self._importance_sampling_inputs(
+            item,
+            target_len=target_len,
+        )
+
+        cfg = dict(loss_fn_config or {})
+        epsilon = float(cfg.get("epsilon", 0.2))
+        clip_low = float(cfg.get("clip_low", 1.0 - epsilon))
+        clip_high = float(cfg.get("clip_high", 1.0 + epsilon))
+        if clip_low > clip_high:
+            raise ValueError("ppo clip_low must be <= clip_high")
+
+        old_logprobs_t = self._jnp.asarray(old_logprobs[None, :], dtype=self._jnp.float32)
+        advantages_t = self._jnp.asarray(advantages[None, :], dtype=self._jnp.float32)
+        loss_mask_t = self._jnp.asarray(loss_mask.astype(np.float32)[None, :], dtype=self._jnp.float32)
+
+        model = nnx.merge(self._state.model_def, self._state.params)
+        model.train()
+        self._rng, step_rng = jax.random.split(self._rng)
+
+        def loss_fn(model_obj: Any, rng: Any, obs: Any, act: Any):
+            del act
+            current_logprobs = self._compute_target_logprobs(model_obj, rng, obs)
+            log_ratio = self._jnp.clip(current_logprobs - old_logprobs_t, a_min=-20.0, a_max=20.0)
+            ratio = self._jnp.exp(log_ratio)
+            clipped_ratio = self._jnp.clip(ratio, a_min=clip_low, a_max=clip_high)
+            unclipped = -ratio * advantages_t
+            clipped = -clipped_ratio * advantages_t
+            loss = self._jnp.sum(self._jnp.maximum(unclipped, clipped) * loss_mask_t)
+            return loss, current_logprobs
+
+        diff_state = nnx.DiffState(0, self._config.trainable_filter)
+        (loss, current_logprobs), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(model, step_rng, observation, actions)
+        grad_norm, param_norm = self._grad_and_param_norm(model, grads)
+
+        current_logprobs_np = np.asarray(jax.device_get(current_logprobs), dtype=np.float32).reshape(-1)
+        stats = _compute_ppo_stats(
+            current_logprobs=current_logprobs_np,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            loss_mask=loss_mask,
+            clip_low=clip_low,
+            clip_high=clip_high,
+        )
+        _ = loss
+        return (
+            grads,
+            float(stats["loss"]),
+            grad_norm,
+            param_norm,
+            float(stats["ratio_mean"]),
+            float(stats["clipfrac_mean"]),
+            float(stats["token_count"]),
+            current_logprobs_np[loss_mask].tolist(),
+        )
+
     def create_session(self) -> dict[str, Any]:
         return {"backend": "openpi_fast", "config_name": self._config_name}
 
     def forward_backward(self, payload: dict[str, Any]) -> dict[str, Any]:
         loss_fn = str(payload.get("loss_fn") or "")
-        if loss_fn not in {"cross_entropy", "importance_sampling"}:
+        if loss_fn not in {"cross_entropy", "importance_sampling", "ppo"}:
             raise ValueError(
-                "OpenPI FAST ST-03 first slice only supports cross_entropy and "
-                f"importance_sampling, got {loss_fn!r}"
+                "OpenPI FAST ST-03 only supports cross_entropy, importance_sampling, "
+                f"and ppo, got {loss_fn!r}"
             )
 
         batch = list(payload.get("batch") or [])
         if not batch:
             raise ValueError("OpenPI FAST forward_backward requires a non-empty batch")
 
+        loss_fn_config = dict(payload.get("loss_fn_config") or {})
         total_loss = 0.0
         total_tokens = 0.0
         total_grad_norm = 0.0
         total_param_norm = 0.0
         total_ratio = 0.0
+        total_clipfrac = 0.0
         num_rl_items = 0
         loss_fn_outputs: list[dict[str, Any]] = []
         pending_grads = self._pending_grads
@@ -459,7 +570,7 @@ class OpenPIFastWorkerSession:
                         }
                     }
                 )
-            else:
+            elif loss_fn == "importance_sampling":
                 (
                     grads,
                     loss_value,
@@ -470,6 +581,34 @@ class OpenPIFastWorkerSession:
                     new_logprobs,
                 ) = self._compute_importance_sampling_grads(observation, actions, item)
                 total_ratio += ratio_mean
+                num_rl_items += 1
+                loss_fn_outputs.append(
+                    {
+                        "loss": {
+                            "data": [loss_value],
+                            "shape": [1],
+                            "dtype": "float32",
+                        },
+                        "logprobs": {
+                            "data": new_logprobs,
+                            "shape": [len(new_logprobs)],
+                            "dtype": "float32",
+                        },
+                    }
+                )
+            else:
+                (
+                    grads,
+                    loss_value,
+                    grad_norm,
+                    param_norm,
+                    ratio_mean,
+                    clipfrac_mean,
+                    token_count,
+                    new_logprobs,
+                ) = self._compute_ppo_grads(observation, actions, item, loss_fn_config)
+                total_ratio += ratio_mean
+                total_clipfrac += clipfrac_mean
                 num_rl_items += 1
                 loss_fn_outputs.append(
                     {
@@ -508,6 +647,8 @@ class OpenPIFastWorkerSession:
         }
         if num_rl_items > 0:
             metrics["ratio:mean"] = total_ratio / num_rl_items
+        if loss_fn == "ppo" and num_rl_items > 0:
+            metrics["clipfrac:mean"] = total_clipfrac / num_rl_items
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
             "loss_fn_outputs": loss_fn_outputs,

@@ -289,12 +289,12 @@ class OpenPIFastTrainingEngine:
         loss_fn = str(request.forward_backward_input.loss_fn)
         if loss_fn == "cross_entropy":
             payload_builder = build_openpi_fast_sft_runtime_payload
-        elif loss_fn == "importance_sampling":
+        elif loss_fn in {"importance_sampling", "ppo"}:
             payload_builder = build_openpi_fast_rl_runtime_payload
         else:
             raise ValueError(
-                "OpenPI FAST ST-03 first slice only supports cross_entropy and "
-                "importance_sampling forward_backward requests"
+                "OpenPI FAST ST-03 only supports cross_entropy, importance_sampling, "
+                "and ppo forward_backward requests"
             )
         model_config = self._model_config(session.base_model)
         runtime = self._runtime_for_session(session)

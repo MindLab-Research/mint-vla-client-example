@@ -90,6 +90,20 @@ class _FakeRuntimeClient:
                         "ratio:mean": 1.25,
                     },
                 }
+            if payload["loss_fn"] == "ppo":
+                return {
+                    "loss_fn_output_type": "ppo_loss",
+                    "loss_fn_outputs": [
+                        {"loss": {"data": [float(i + 1)], "shape": [1], "dtype": "float32"}}
+                        for i, _ in enumerate(batch)
+                    ],
+                    "metrics": {
+                        "loss:mean": 0.75,
+                        "num_samples:sum": float(len(batch)),
+                        "ratio:mean": 1.15,
+                        "clipfrac:mean": 0.5,
+                    },
+                }
             return {
                 "loss_fn_output_type": "cross_entropy_loss",
                 "loss_fn_outputs": [
@@ -177,7 +191,7 @@ def test_openpi_fast_engine_forward_backward_builds_payload_and_updates_grad_sta
     assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
 
 
-def test_openpi_fast_engine_rejects_non_sft_loss_functions() -> None:
+def test_openpi_fast_engine_rejects_unknown_loss_functions() -> None:
     from tinker_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
@@ -186,10 +200,10 @@ def test_openpi_fast_engine_rejects_non_sft_loss_functions() -> None:
     asyncio.run(engine.create_training_session(session))
     request = ForwardBackwardRequest(
         model_id=session.model_id,
-        forward_backward_input=ForwardBackwardInput(data=[_make_datum()], loss_fn="ppo"),
+        forward_backward_input=ForwardBackwardInput(data=[_make_datum()], loss_fn="mystery_loss"),
     )
 
-    with pytest.raises(ValueError, match="cross_entropy|importance_sampling"):
+    with pytest.raises(ValueError, match="cross_entropy|importance_sampling|ppo"):
         asyncio.run(engine.forward_backward(session, request))
 
 
@@ -220,6 +234,41 @@ def test_openpi_fast_engine_importance_sampling_builds_rl_payload_and_updates_gr
     op, payload = factory.clients[0].calls[-1]
     assert op == "forward_backward"
     assert payload["loss_fn"] == "importance_sampling"
+    assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
+    assert payload["batch"][0]["old_logprobs"] == [-0.1, -0.2]
+    assert payload["batch"][0]["advantages"] == [1.5, -0.5]
+
+
+def test_openpi_fast_engine_ppo_builds_rl_payload_and_updates_grad_state() -> None:
+    from tinker_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+
+    factory = _FakeRuntimeFactory()
+    engine = OpenPIFastTrainingEngine(runtime_factory=factory)
+    session = _make_session()
+    asyncio.run(engine.create_training_session(session))
+    request = ForwardBackwardRequest(
+        model_id=session.model_id,
+        forward_backward_input=ForwardBackwardInput(
+            data=[
+                _make_datum_with_rl(
+                    logprobs=[-0.1, -0.2],
+                    advantages=[1.5, -0.5],
+                )
+            ],
+            loss_fn="ppo",
+            loss_fn_config={"epsilon": 0.15},
+        ),
+    )
+
+    result = asyncio.run(engine.forward_backward(session, request))
+
+    assert session.accumulated_gradients == 1
+    assert result["loss_fn_output_type"] == "ppo_loss"
+    assert result["metrics"]["clipfrac:mean"] == pytest.approx(0.5)
+    op, payload = factory.clients[0].calls[-1]
+    assert op == "forward_backward"
+    assert payload["loss_fn"] == "ppo"
+    assert payload["loss_fn_config"] == {"epsilon": 0.15}
     assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
     assert payload["batch"][0]["old_logprobs"] == [-0.1, -0.2]
     assert payload["batch"][0]["advantages"] == [1.5, -0.5]
