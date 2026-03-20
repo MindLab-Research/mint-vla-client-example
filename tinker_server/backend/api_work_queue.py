@@ -5,7 +5,9 @@ import concurrent.futures
 import logging
 import os
 import time
-from dataclasses import dataclass
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from ..config import config as server_config, otel_env_vars
@@ -92,6 +94,17 @@ class WorkItem:
     webhook_url: str | None
     extra: dict[str, Any]
     created_at: float
+
+
+@dataclass
+class _ExecutionSerialState:
+    cond: asyncio.Condition
+    current_epoch: str | None = None
+    next_seq: int = 1
+    active_epoch: str | None = None
+    active_seq: int | None = None
+    pending_seqs_by_epoch: dict[str, set[int]] = field(default_factory=dict)
+    refs: int = 0
 
 
 
@@ -212,6 +225,8 @@ def _get_or_create_ray_actor():
                 "wait_s_sum": 0.0,
                 "switch_reasons": {},
             }
+            self._execution_serial_seq_by_key: dict[str, int] = {}
+            self._execution_serial_epoch = uuid.uuid4().hex
 
         def _asample_throttle_identity(self, item: dict[str, Any]) -> tuple[str | None, str | None]:
             if str(item.get("op")) != "sampling.asample":
@@ -833,6 +848,16 @@ def _get_or_create_ray_actor():
                         dequeue_reason = str(sched_reason)
                         scheduler_domain = str(sched_domain)
                         scheduler_session_id = str(sched_session_id)
+                    serial_key = self._execution_serial_key(item)
+                    if serial_key is not None:
+                        extra = item.get("extra")
+                        if not isinstance(extra, dict):
+                            extra = {}
+                            item["extra"] = extra
+                        next_seq = int(self._execution_serial_seq_by_key.get(serial_key, 0)) + 1
+                        self._execution_serial_seq_by_key[serial_key] = next_seq
+                        extra["execution_serial_epoch"] = self._execution_serial_epoch
+                        extra["execution_serial_seq"] = next_seq
                     self._mark_asample_leased_to_consumer(item.get("request_id", ""), consumer_job_id)
                     break
 
@@ -885,6 +910,16 @@ def _get_or_create_ray_actor():
             if isinstance(op, str) and op.strip():
                 return op.strip()
             return "unknown"
+
+        def _execution_serial_key(self, item: dict[str, Any]) -> str | None:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                return None
+            raw = extra.get("execution_serial_key")
+            if not isinstance(raw, str):
+                return None
+            key = raw.strip()
+            return key or None
 
         def _iter_all_queued_items(self):
             for item in self._items:
@@ -1017,13 +1052,11 @@ def _get_or_create_ray_actor():
         "max_task_retries": -1,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
-    options["runtime_env"] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=PFS_PYTHONPATH,
-            extra=actor_otel_env,
-        )
-    }
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=actor_otel_env,
+    )
     if resources is not None:
         options["resources"] = resources
 
@@ -1043,6 +1076,8 @@ class ApiWorkQueueClient:
         self._running = False
         self._dequeue_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._consumer_job_id: str | None = None
+        self._execution_serial_states: dict[str, _ExecutionSerialState] = {}
+        self._execution_serial_states_guard = asyncio.Lock()
 
     def _get_ray_actor(self):
         try:
@@ -1076,6 +1111,90 @@ class ApiWorkQueueClient:
 
     def set_executor(self, op: str, executor: Executor) -> None:
         self._executors[str(op)] = executor
+
+    def _execution_serial_info(self, item: WorkItem) -> tuple[str | None, str | None, int | None]:
+        extra = item.extra if isinstance(item.extra, dict) else {}
+        raw_key = extra.get("execution_serial_key")
+        key = raw_key.strip() if isinstance(raw_key, str) else ""
+        raw_epoch = extra.get("execution_serial_epoch")
+        epoch = raw_epoch.strip() if isinstance(raw_epoch, str) else "legacy"
+        raw_seq = extra.get("execution_serial_seq")
+        seq = raw_seq if isinstance(raw_seq, int) and not isinstance(raw_seq, bool) else None
+        if not key or seq is None or seq < 1:
+            return None, None, None
+        return key, epoch, seq
+
+    async def _acquire_execution_serial_state(self, key: str) -> _ExecutionSerialState:
+        async with self._execution_serial_states_guard:
+            state = self._execution_serial_states.get(key)
+            if state is None:
+                state = _ExecutionSerialState(cond=asyncio.Condition())
+                self._execution_serial_states[key] = state
+            state.refs += 1
+            return state
+
+    async def _release_execution_serial_state(self, key: str, state: _ExecutionSerialState) -> None:
+        async with self._execution_serial_states_guard:
+            current = self._execution_serial_states.get(key)
+            if current is not state:
+                return
+            state.refs = max(0, int(state.refs) - 1)
+            # Keep the per-key sequence cursor even when there are no active waiters.
+            # Dequeue assigns monotonically increasing execution_serial_seq values per key,
+            # so dropping state here would reset next_seq back to 1 and deadlock the next
+            # non-overlapping item for the same key.
+
+    @asynccontextmanager
+    async def _execution_serialized(self, item: WorkItem):
+        key, epoch, seq = self._execution_serial_info(item)
+        if key is None or epoch is None or seq is None:
+            yield
+            return
+
+        state = await self._acquire_execution_serial_state(key)
+        try:
+            async with state.cond:
+                state.pending_seqs_by_epoch.setdefault(epoch, set()).add(int(seq))
+                if state.current_epoch is None:
+                    state.current_epoch = epoch
+                    state.next_seq = int(seq)
+                while True:
+                    current_epoch = state.current_epoch
+                    if current_epoch != epoch:
+                        current_pending = (
+                            set()
+                            if current_epoch is None
+                            else state.pending_seqs_by_epoch.get(current_epoch, set())
+                        )
+                        if state.active_seq is None and not current_pending:
+                            state.current_epoch = epoch
+                            state.next_seq = min(state.pending_seqs_by_epoch[epoch])
+                            current_epoch = epoch
+                        else:
+                            await state.cond.wait()
+                            continue
+                    if state.active_seq is None and int(state.next_seq) == int(seq):
+                        state.active_epoch = epoch
+                        state.active_seq = int(seq)
+                        break
+                    await state.cond.wait()
+            try:
+                yield
+            finally:
+                async with state.cond:
+                    pending = state.pending_seqs_by_epoch.get(epoch)
+                    if pending is not None:
+                        pending.discard(int(seq))
+                        if not pending:
+                            state.pending_seqs_by_epoch.pop(epoch, None)
+                    if state.active_epoch == epoch and state.active_seq == int(seq):
+                        state.active_epoch = None
+                        state.active_seq = None
+                    if state.current_epoch == epoch and int(state.next_seq) == int(seq):
+                        state.next_seq += 1
+                    state.cond.notify_all()
+        finally:
+            await self._release_execution_serial_state(key, state)
 
     async def enqueue(
         self,
@@ -1454,280 +1573,281 @@ class ApiWorkQueueClient:
                     e,
                 )
 
-            # If the future has already transitioned to a terminal state (for example due to
-            # queue-timeout), do not run the executor. This prevents a timed-out future from
-            # later being overwritten by a "successful" resolve.
-            try:
-                status = future_store.get_status(item.request_id)
-            except KeyError:
-                await _finalize_request_slot(item.request_id)
+            async with self._execution_serialized(item):
+                # If the future has already transitioned to a terminal state (for example due to
+                # queue-timeout), do not run the executor. This prevents a timed-out future from
+                # later being overwritten by a "successful" resolve.
                 try:
-                    capacity_manager.release_all(item.request_id)
+                    status = future_store.get_status(item.request_id)
+                except KeyError:
+                    await _finalize_request_slot(item.request_id)
+                    try:
+                        capacity_manager.release_all(item.request_id)
+                    except Exception as e:
+                        logger.error(
+                            "[api_work_queue] release_all failed after unknown future (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e).__name__,
+                            e,
+                        )
+                    continue
                 except Exception as e:
                     logger.error(
-                        "[api_work_queue] release_all failed after unknown future (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        "[api_work_queue] get_status failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
                         int(worker_idx),
                         str(item.request_id),
                         str(item.op),
                         type(e).__name__,
                         e,
                     )
-                continue
-            except Exception as e:
-                logger.error(
-                    "[api_work_queue] get_status failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                    int(worker_idx),
-                    str(item.request_id),
-                    str(item.op),
-                    type(e).__name__,
-                    e,
-                )
-                try:
-                    future_store.fail(item.request_id, f"internal error: future_store.get_status failed: {type(e).__name__}: {e}")
-                except Exception as e2:
-                    logger.error(
-                        "[api_work_queue] future_store.fail failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e2).__name__,
-                        e2,
-                    )
-                try:
-                    capacity_manager.release_all(item.request_id)
-                except Exception as e2:
-                    logger.error(
-                        "[api_work_queue] release_all failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e2).__name__,
-                        e2,
-                    )
-                await _finalize_request_slot(item.request_id)
-                continue
+                    try:
+                        future_store.fail(item.request_id, f"internal error: future_store.get_status failed: {type(e).__name__}: {e}")
+                    except Exception as e2:
+                        logger.error(
+                            "[api_work_queue] future_store.fail failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e2).__name__,
+                            e2,
+                        )
+                    try:
+                        capacity_manager.release_all(item.request_id)
+                    except Exception as e2:
+                        logger.error(
+                            "[api_work_queue] release_all failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e2).__name__,
+                            e2,
+                        )
+                    await _finalize_request_slot(item.request_id)
+                    continue
 
-            if status is not None and status != FutureStatus.PENDING:
+                if status is not None and status != FutureStatus.PENDING:
+                    if str(item.op) == "training.create_model":
+                        logger.info(
+                            "[api_work_queue] skip_non_pending request_id=%s op=%s worker_idx=%s status=%s",
+                            str(item.request_id),
+                            str(item.op),
+                            int(worker_idx),
+                            str(status),
+                        )
+                    try:
+                        capacity_manager.release_all(item.request_id)
+                    except Exception as e:
+                        logger.error(
+                            "[api_work_queue] release_all failed after skip_non_pending (worker_idx=%s, request_id=%s, op=%s, status=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            str(status),
+                            type(e).__name__,
+                            e,
+                        )
+                    await _finalize_request_slot(item.request_id)
+                    continue
+
+                try:
+                    future_store.mark_running(
+                        item.request_id,
+                        meta={
+                            "worker_idx": int(worker_idx),
+                            "consumer_job_id": str(self._consumer_job_id),
+                            "op": item.op,
+                            "queue_state": "running",
+                            "stage": "prefill",
+                            "running_at": time.time(),
+                        },
+                    )
+                    logger.debug(
+                        "[api_work_queue] mark_running request_id=%s op=%s worker_idx=%s",
+                        str(item.request_id),
+                        str(item.op),
+                        int(worker_idx),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "[api_work_queue] mark_running failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                        int(worker_idx),
+                        str(item.request_id),
+                        str(item.op),
+                        type(e).__name__,
+                        e,
+                    )
+                    try:
+                        future_store.fail(item.request_id, f"internal error: future_store.mark_running failed: {type(e).__name__}: {e}")
+                    except Exception as e2:
+                        logger.error(
+                            "[api_work_queue] future_store.fail failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e2).__name__,
+                            e2,
+                        )
+                    try:
+                        capacity_manager.release_all(item.request_id)
+                    except Exception as e2:
+                        logger.error(
+                            "[api_work_queue] release_all failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e2).__name__,
+                            e2,
+                        )
+                    await _finalize_request_slot(item.request_id)
+                    continue
                 if str(item.op) == "training.create_model":
                     logger.info(
-                        "[api_work_queue] skip_non_pending request_id=%s op=%s worker_idx=%s status=%s",
+                        "[api_work_queue] running request_id=%s op=%s worker_idx=%s",
                         str(item.request_id),
                         str(item.op),
                         int(worker_idx),
-                        str(status),
                     )
-                try:
-                    capacity_manager.release_all(item.request_id)
-                except Exception as e:
-                    logger.error(
-                        "[api_work_queue] release_all failed after skip_non_pending (worker_idx=%s, request_id=%s, op=%s, status=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        str(status),
-                        type(e).__name__,
-                        e,
-                    )
-                await _finalize_request_slot(item.request_id)
-                continue
 
-            try:
-                future_store.mark_running(
-                    item.request_id,
-                    meta={
-                        "worker_idx": int(worker_idx),
-                        "consumer_job_id": str(self._consumer_job_id),
-                        "op": item.op,
-                        "queue_state": "running",
-                        "stage": "prefill",
-                        "running_at": time.time(),
-                    },
-                )
-                logger.debug(
-                    "[api_work_queue] mark_running request_id=%s op=%s worker_idx=%s",
-                    str(item.request_id),
-                    str(item.op),
-                    int(worker_idx),
-                )
-            except Exception as e:
-                logger.error(
-                    "[api_work_queue] mark_running failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                    int(worker_idx),
-                    str(item.request_id),
-                    str(item.op),
-                    type(e).__name__,
-                    e,
-                )
-                try:
-                    future_store.fail(item.request_id, f"internal error: future_store.mark_running failed: {type(e).__name__}: {e}")
-                except Exception as e2:
+                ex = self._executors.get(item.op)
+                if ex is None:
                     logger.error(
-                        "[api_work_queue] future_store.fail failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
+                        "[api_work_queue] unknown op request_id=%s op=%s worker_idx=%s",
                         str(item.request_id),
                         str(item.op),
-                        type(e2).__name__,
-                        e2,
-                    )
-                try:
-                    capacity_manager.release_all(item.request_id)
-                except Exception as e2:
-                    logger.error(
-                        "[api_work_queue] release_all failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
                         int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e2).__name__,
-                        e2,
                     )
-                await _finalize_request_slot(item.request_id)
-                continue
-            if str(item.op) == "training.create_model":
-                logger.info(
-                    "[api_work_queue] running request_id=%s op=%s worker_idx=%s",
-                    str(item.request_id),
-                    str(item.op),
-                    int(worker_idx),
-                )
-
-            ex = self._executors.get(item.op)
-            if ex is None:
-                logger.error(
-                    "[api_work_queue] unknown op request_id=%s op=%s worker_idx=%s",
-                    str(item.request_id),
-                    str(item.op),
-                    int(worker_idx),
-                )
-                try:
-                    future_store.fail(item.request_id, f"unknown op: {item.op!r}")
-                except Exception as e:
-                    logger.error(
-                        "[api_work_queue] future_store.fail failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e).__name__,
-                        e,
-                    )
-                try:
-                    capacity_manager.release_object_store(item.request_id)
-                except Exception as e:
-                    logger.error(
-                        "[api_work_queue] release_object_store failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e).__name__,
-                        e,
-                    )
-                await _finalize_request_slot(item.request_id)
-                continue
-
-            try:
-                exec_start = time.perf_counter()
-                logger.debug(
-                    "[api_work_queue] executing request_id=%s op=%s worker_idx=%s",
-                    str(item.request_id),
-                    str(item.op),
-                    int(worker_idx),
-                )
-                tracer = get_otel_tracer()
-                if tracer is None:
-                    await ex(item)
-                else:
                     try:
-                        from opentelemetry.trace import SpanKind, Status, StatusCode
-                        from opentelemetry.propagate import extract
-                    except Exception:
-                        # Best-effort: never block execution if OTel deps are unavailable.
+                        future_store.fail(item.request_id, f"unknown op: {item.op!r}")
+                    except Exception as e:
+                        logger.error(
+                            "[api_work_queue] future_store.fail failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e).__name__,
+                            e,
+                        )
+                    try:
+                        capacity_manager.release_object_store(item.request_id)
+                    except Exception as e:
+                        logger.error(
+                            "[api_work_queue] release_object_store failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e).__name__,
+                            e,
+                        )
+                    await _finalize_request_slot(item.request_id)
+                    continue
+
+                try:
+                    exec_start = time.perf_counter()
+                    logger.debug(
+                        "[api_work_queue] executing request_id=%s op=%s worker_idx=%s",
+                        str(item.request_id),
+                        str(item.op),
+                        int(worker_idx),
+                    )
+                    tracer = get_otel_tracer()
+                    if tracer is None:
                         await ex(item)
                     else:
-                        span_context = None
-                        traceparent = None
-                        if isinstance(item.extra, dict):
-                            traceparent = item.extra.get("_traceparent")
-                        if isinstance(traceparent, str) and traceparent:
-                            try:
-                                span_context = extract({"traceparent": traceparent})
-                            except Exception:
-                                span_context = None
-                        with tracer.start_as_current_span(
-                            "queue.execute",
-                            kind=SpanKind.INTERNAL,
-                            context=span_context,
-                        ) as span:
-                            span.set_attribute("component", "api_work_queue")
-                            span.set_attribute("op", str(item.op))
-                            span.set_attribute("request_id", str(item.request_id))
-                            span.set_attribute("worker_idx", int(worker_idx))
-                            try:
-                                await ex(item)
-                            except Exception as e:
-                                span.record_exception(e)
-                                span.set_status(Status(StatusCode.ERROR, str(e)))
-                                raise
-                logger.debug(
-                    "[api_work_queue] executor completed request_id=%s op=%s worker_idx=%s",
-                    str(item.request_id),
-                    str(item.op),
-                    int(worker_idx),
-                )
-                exec_elapsed = time.perf_counter() - exec_start
-                try:
-                    actor = self._get_ray_actor()
-                    actor.record_execution_time.remote(str(item.op), float(exec_elapsed))
+                        try:
+                            from opentelemetry.trace import SpanKind, Status, StatusCode
+                            from opentelemetry.propagate import extract
+                        except Exception:
+                            # Best-effort: never block execution if OTel deps are unavailable.
+                            await ex(item)
+                        else:
+                            span_context = None
+                            traceparent = None
+                            if isinstance(item.extra, dict):
+                                traceparent = item.extra.get("_traceparent")
+                            if isinstance(traceparent, str) and traceparent:
+                                try:
+                                    span_context = extract({"traceparent": traceparent})
+                                except Exception:
+                                    span_context = None
+                            with tracer.start_as_current_span(
+                                "queue.execute",
+                                kind=SpanKind.INTERNAL,
+                                context=span_context,
+                            ) as span:
+                                span.set_attribute("component", "api_work_queue")
+                                span.set_attribute("op", str(item.op))
+                                span.set_attribute("request_id", str(item.request_id))
+                                span.set_attribute("worker_idx", int(worker_idx))
+                                try:
+                                    await ex(item)
+                                except Exception as e:
+                                    span.record_exception(e)
+                                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                                    raise
+                    logger.debug(
+                        "[api_work_queue] executor completed request_id=%s op=%s worker_idx=%s",
+                        str(item.request_id),
+                        str(item.op),
+                        int(worker_idx),
+                    )
+                    exec_elapsed = time.perf_counter() - exec_start
+                    try:
+                        actor = self._get_ray_actor()
+                        actor.record_execution_time.remote(str(item.op), float(exec_elapsed))
+                    except Exception as e:
+                        logger.warning(
+                            "[api_work_queue] record_execution_time failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e).__name__,
+                            e,
+                        )
+                    if str(item.op) == "training.create_model":
+                        logger.info(
+                            "[api_work_queue] done request_id=%s op=%s worker_idx=%s",
+                            str(item.request_id),
+                            str(item.op),
+                            int(worker_idx),
+                        )
+                    await _finalize_request_slot(item.request_id)
                 except Exception as e:
-                    logger.warning(
-                        "[api_work_queue] record_execution_time failed (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                    logger.error(
+                        "[api_work_queue] executor failed (worker_idx=%s, request_id=%s, op=%s): %s: %s failure_reason=%s next_action=%s",
                         int(worker_idx),
                         str(item.request_id),
                         str(item.op),
                         type(e).__name__,
                         e,
+                        classify_failure_reason(e),
+                        "check_executor_and_future_store",
                     )
-                if str(item.op) == "training.create_model":
-                    logger.info(
-                        "[api_work_queue] done request_id=%s op=%s worker_idx=%s",
-                        str(item.request_id),
-                        str(item.op),
-                        int(worker_idx),
-                    )
-                await _finalize_request_slot(item.request_id)
-            except Exception as e:
-                logger.error(
-                    "[api_work_queue] executor failed (worker_idx=%s, request_id=%s, op=%s): %s: %s failure_reason=%s next_action=%s",
-                    int(worker_idx),
-                    str(item.request_id),
-                    str(item.op),
-                    type(e).__name__,
-                    e,
-                    classify_failure_reason(e),
-                    "check_executor_and_future_store",
-                )
-                # Ensure the future does not remain pending forever.
-                try:
-                    future_store.fail(item.request_id, f"executor failed: {e}")
-                except Exception as e2:
-                    logger.error(
-                        "[api_work_queue] future_store.fail failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e2).__name__,
-                        e2,
-                    )
-                try:
-                    capacity_manager.release_object_store(item.request_id)
-                except Exception as e2:
-                    logger.error(
-                        "[api_work_queue] release_object_store failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
-                        int(worker_idx),
-                        str(item.request_id),
-                        str(item.op),
-                        type(e2).__name__,
-                        e2,
-                    )
-                await _finalize_request_slot(item.request_id)
+                    # Ensure the future does not remain pending forever.
+                    try:
+                        future_store.fail(item.request_id, f"executor failed: {e}")
+                    except Exception as e2:
+                        logger.error(
+                            "[api_work_queue] future_store.fail failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e2).__name__,
+                            e2,
+                        )
+                    try:
+                        capacity_manager.release_object_store(item.request_id)
+                    except Exception as e2:
+                        logger.error(
+                            "[api_work_queue] release_object_store failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
+                            int(worker_idx),
+                            str(item.request_id),
+                            str(item.op),
+                            type(e2).__name__,
+                            e2,
+                        )
+                    await _finalize_request_slot(item.request_id)
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         import ray

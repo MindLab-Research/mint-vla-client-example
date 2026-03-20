@@ -46,8 +46,15 @@ def _install_ray_stub(monkeypatch) -> None:
 
 def _load_api_work_queue_module(monkeypatch):
     _install_ray_stub(monkeypatch)
+    import tinker_server.config as config_mod
     import tinker_server.backend.api_work_queue as api_work_queue
 
+    monkeypatch.setattr(config_mod, "PFS_PYTHONPATH", "")
+    monkeypatch.setattr(
+        config_mod,
+        "actor_runtime_env_vars",
+        lambda *, pythonpath, extra=None: {"PYTHONPATH": pythonpath, **(extra or {})},
+    )
     return importlib.reload(api_work_queue)
 
 
@@ -59,9 +66,11 @@ def _item(
     legacy_session_id: str | None = None,
     created_at: float = 0.0,
 ) -> dict:
+    serial_session_key = session_key or legacy_session_id or "unknown"
     extra = {
         "scheduler_enabled": True,
         "scheduler_domain": domain,
+        "execution_serial_key": f"training_session:{serial_session_key}",
     }
     if session_key is not None:
         extra["scheduler_session_key"] = session_key
@@ -166,6 +175,30 @@ def test_mock_scheduler_accepts_new_and_legacy_session_key_fields(monkeypatch):
     sessions = {_session_key_from_item(x) for x in out}
 
     assert sessions == {"new-key-A", "legacy-key-B"}
+
+
+def test_issue_194_dequeue_assigns_monotonic_execution_serial_seq(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    asyncio.run(
+        _enqueue_many(
+            actor,
+            [
+                _item("r1", domain="d", session_key="A", created_at=1.0),
+                _item("r2", domain="d", session_key="A", created_at=2.0),
+            ],
+        )
+    )
+    out = asyncio.run(_dequeue_many(actor, 2))
+    seqs = [int((x.get("extra") or {}).get("execution_serial_seq")) for x in out]
+    epochs = [str((x.get("extra") or {}).get("execution_serial_epoch") or "") for x in out]
+
+    assert seqs == [1, 2]
+    assert epochs[0]
+    assert epochs == [epochs[0], epochs[0]]
 
 
 def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):

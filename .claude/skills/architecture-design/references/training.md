@@ -2,6 +2,8 @@
 
 Training is controlled via `/api/v1/*` routes in `tinker_server/routes/training.py`. The API surface follows the Tinker SDK expectations (create model, forward/backward, optimizer step, checkpointing).
 
+For a request-by-request walkthrough of queueing, execution serialization, backend session switching, and checkpoint/export interactions, see `training-session-switch-flow.md`.
+
 ## Why time-slicing exists
 
 Training is designed to support multiple sessions with limited GPUs by swapping session-local state (LoRA weights, gradients, optimizer state) into a smaller number of trainer actors. This keeps per-session isolation while reusing expensive base model initialization.
