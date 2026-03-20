@@ -112,6 +112,15 @@ def _build_training_usage_label(*, model: str, route: str) -> str:
     return f"model={model},route={route},dimension=train"
 
 
+def _training_heartbeat_stale_timeout_s() -> float:
+    raw = os.environ.get("MINT_TRAINING_HEARTBEAT_STALE_S", "300")
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        logger.warning("Invalid MINT_TRAINING_HEARTBEAT_STALE_S=%r; defaulting to 300s", raw)
+        return 300.0
+
+
 async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
     usage_store = await get_usage_store()
     await usage_store.write_events(events)
@@ -257,6 +266,185 @@ def _session_info_from_live(session) -> dict:
         "backend": session.backend,
         "user_id": session.user_id,
     }
+
+
+async def _best_effort_delete_training_session(
+    model_id: str,
+    *,
+    reason: str,
+    allow_actor_shutdown: bool,
+) -> bool:
+    if training_engine is None or training_manager is None:
+        return False
+
+    try:
+        failed_request_ids = future_store.fail_training_requests_for_model(
+            model_id,
+            f"Training session terminated due to {reason}",
+        )
+        if failed_request_ids:
+            logger.warning(
+                "[%s] failed pending training futures during stale cleanup (%s): request_ids=%s",
+                model_id,
+                reason,
+                failed_request_ids,
+            )
+    except Exception as e:
+        logger.warning(
+            "[%s] stale training cleanup aborted because pending future fail failed (%s): %s: %s",
+            model_id,
+            reason,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+    session = training_manager.get_session(model_id)
+    restored = False
+    if session is None:
+        session = _restore_training_session(model_id)
+        restored = session is not None
+
+    shutdown_attempted = False
+    if session is not None:
+        if allow_actor_shutdown:
+            try:
+                shutdown_attempted = True
+                await training_engine.shutdown_session(session)
+            except Exception as e:
+                logger.warning(
+                    "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
+                    model_id,
+                    reason,
+                    type(e).__name__,
+                    e,
+                )
+        else:
+            logger.warning(
+                "[%s] skipping actor shutdown during stale training cleanup (%s); "
+                "restored=%s allow_actor_shutdown=%s",
+                model_id,
+                reason,
+                restored,
+                allow_actor_shutdown,
+            )
+            worker = getattr(training_engine, "_workers", {}).get(model_id)
+            delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+            if delete_session is not None:
+                try:
+                    import ray
+
+                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
+                        model_id,
+                        reason,
+                        type(e).__name__,
+                        e,
+                    )
+            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+            getattr(training_engine, "_workers", {}).pop(model_id, None)
+            session.is_active = False
+
+    try:
+        training_manager.delete_session(model_id)
+    except Exception:
+        pass
+
+    try:
+        from ..backend.training_session_store import delete_training_session
+
+        delete_training_session(model_id)
+    except Exception as e:
+        logger.warning(
+            "[%s] best-effort stale training cleanup store delete failed (%s): %s: %s",
+            model_id,
+            reason,
+            type(e).__name__,
+            e,
+        )
+
+    try:
+        from ..backend.resource_pool import get_resource_pool
+
+        get_resource_pool().clear_session(model_id)
+    except Exception:
+        pass
+
+    return session is not None or shutdown_attempted
+
+
+async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = None) -> list[str]:
+    if stale_after_s is None:
+        stale_after_s = _training_heartbeat_stale_timeout_s()
+    if stale_after_s <= 0:
+        return []
+    if training_engine is None or training_manager is None:
+        return []
+
+    from ..backend.session_heartbeat_store import session_heartbeat_store
+
+    try:
+        from ..backend.training_session_store import list_training_sessions
+
+        infos = list_training_sessions()
+    except Exception as e:
+        logger.warning(
+            "stale training cleanup skipped: failed to list detached training sessions: %s: %s",
+            type(e).__name__,
+            e,
+        )
+        return []
+
+    cleaned: list[str] = []
+    actor_refcounts: dict[str, int] = {}
+    for info in infos:
+        if not isinstance(info, dict):
+            continue
+        actor_name = str(info.get("actor_name") or "").strip()
+        if actor_name:
+            actor_refcounts[actor_name] = actor_refcounts.get(actor_name, 0) + 1
+
+    for info in infos:
+        if not isinstance(info, dict):
+            continue
+        model_id = str(info.get("model_id") or "").strip()
+        session_id = str(info.get("session_id") or "").strip()
+        actor_name = str(info.get("actor_name") or "").strip()
+        if not model_id or not session_id:
+            continue
+        if not session_heartbeat_store.is_stale(session_id, float(stale_after_s)):
+            continue
+        try:
+            allow_actor_shutdown = bool(actor_name) and actor_refcounts.get(actor_name, 0) <= 1
+            deleted = await _best_effort_delete_training_session(
+                model_id,
+                reason=f"stale heartbeat (> {float(stale_after_s):.1f}s)",
+                allow_actor_shutdown=allow_actor_shutdown,
+            )
+            if not deleted:
+                continue
+            cleaned.append(model_id)
+            logger.warning(
+                "[%s] auto-terminated stale training session: session_id=%s stale_after_s=%.1f "
+                "allow_actor_shutdown=%s actor_name=%s actor_refcount=%s",
+                model_id,
+                session_id,
+                float(stale_after_s),
+                allow_actor_shutdown,
+                actor_name or "<unknown>",
+                actor_refcounts.get(actor_name, 0) if actor_name else 0,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] stale training cleanup failed for session_id=%s: %s: %s",
+                model_id,
+                session_id,
+                type(e).__name__,
+                e,
+            )
+    return cleaned
 
 
 def _training_run_from_info(info: dict) -> TrainingRun:
@@ -773,6 +961,7 @@ async def _do_create_model(
                 else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
+                "current_step": session.current_step,
                 "backend": session.backend,
                 "actor_name": actor_name,
                 "namespace": RAY_NAMESPACE,
@@ -1142,6 +1331,7 @@ async def _do_create_model_from_state(
                 else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
+                "current_step": session.current_step,
                 "backend": session.backend,
                 "actor_name": actor_name,
                 "namespace": RAY_NAMESPACE,
