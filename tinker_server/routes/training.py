@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -33,7 +34,12 @@ from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request, is_admin_user_data
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import classify_failure_reason, set_request_id
+from ..logging_context import (
+    classify_failure_reason,
+    get_otel_tracer,
+    run_async_with_otel_span,
+    set_request_id,
+)
 
 from ..backend.future_store import future_store
 from ..checkpoints import (
@@ -108,6 +114,50 @@ def _build_training_usage_label(*, model: str, route: str) -> str:
 async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
     usage_store = await get_usage_store()
     await usage_store.write_events(events)
+
+
+async def _enqueue_training_request_with_trace(
+    *,
+    route_start_s: float,
+    request_id: str,
+    op: str,
+    enqueue_coro,
+    model_id: str | None = None,
+    base_model: str | None = None,
+    backend: str | None = None,
+) -> None:
+    tracer = get_otel_tracer()
+    future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
+    if tracer is None:
+        await enqueue_coro
+        return
+
+    with tracer.start_as_current_span(f"{op}.enqueue") as span:
+        span.set_attribute("component", "routes.training")
+        span.set_attribute("op", str(op))
+        span.set_attribute("request_id", str(request_id))
+        if model_id:
+            span.set_attribute("model_id", str(model_id))
+        if base_model:
+            span.set_attribute("base_model", str(base_model))
+        if backend:
+            span.set_attribute("backend", str(backend))
+        span.add_event(
+            "future_store_ready",
+            {
+                "elapsed_ms": round(future_ready_elapsed_ms, 3),
+                "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
+            },
+        )
+        enqueue_start_s = time.perf_counter()
+        await enqueue_coro
+        span.add_event(
+            "enqueue_done",
+            {
+                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
+                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+            },
+        )
 
 
 def _get_webhook_url(request: Request) -> str | None:
@@ -251,6 +301,17 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
 
+
+def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
+    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
+    match = re.search(hf_cache_pattern, base_model)
+    if match:
+        _org, model = match.groups()
+        model_name = model.lower().replace("-", "_").replace(".", "_")
+    else:
+        model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    return f"megatron_{model_name}"
+
 def _get_max_model_len(base_model: str | None) -> int:
     """Return the configured max_model_len for a supported model name.
 
@@ -336,9 +397,7 @@ def _build_training_scheduler_extra(
     backend = str(getattr(session, "backend", "") or "unknown")
     base_model = str(getattr(session, "base_model", "") or "")
     if backend == "megatron" and base_model:
-        from ..backend.megatron_distributed import _make_megatron_actor_name
-
-        domain_key = _make_megatron_actor_name(base_model)
+        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
     else:
         domain_key = base_model if base_model else str(model_id)
     extra: dict[str, Any] = {
@@ -367,9 +426,7 @@ def _build_create_scheduler_extra(
 
     if bool(get_model_config(base_model).is_moe):
         backend = "megatron"
-        from ..backend.megatron_distributed import _make_megatron_actor_name
-
-        domain_key = _make_megatron_actor_name(base_model)
+        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
     else:
         backend = "peft"
         domain_key = base_model
@@ -393,6 +450,7 @@ async def create_model(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Create a new training model with LoRA."""
+    route_start_s = time.perf_counter()
     from ..supported_models_gate import enforce_base_model_allowed
 
     base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
@@ -501,13 +559,20 @@ async def create_model(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.create_model"})
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.create_model",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=webhook_url,
-            extra=scheduler_extra,
+            model_id=model_id,
+            base_model=request.base_model,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.create_model",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=webhook_url,
+                extra=scheduler_extra,
+            ),
         )
         if webhook_url and user_id:
             send_task_event(
@@ -585,7 +650,20 @@ async def _do_create_model(
         )
 
         # Create Ray actor - if this fails, session will be cleaned up in except block
-        await training_engine.create_training_session(session)
+        await run_async_with_otel_span(
+            "training.create_model.execute",
+            lambda: training_engine.create_training_session(session),
+            component="routes.training",
+            op="training.create_model",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(model_id),
+                "base_model": str(request.base_model),
+                "backend": str(session.backend),
+                "lora_enabled": bool(request.lora_config is not None),
+                "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
+            },
+        )
 
         try:
             from ..backend.training_session_store import upsert_training_session
@@ -708,6 +786,7 @@ async def create_model_from_state(
     Composes create_model + load_state into single operation.
     Useful for resuming training from a saved checkpoint.
     """
+    route_start_s = time.perf_counter()
     from ..supported_models_gate import enforce_base_model_allowed
 
     base_model = await enforce_base_model_allowed(base_model=request.base_model, http_request=http_request)
@@ -865,13 +944,20 @@ async def create_model_from_state(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.create_model_from_state"})
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.create_model_from_state",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra=scheduler_extra,
+            model_id=model_id,
+            base_model=request.base_model,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.create_model_from_state",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -919,14 +1005,28 @@ async def _do_create_model_from_state(
             user_id=user_id,
         )
 
-        # Create Ray actor
-        await training_engine.create_training_session(session)
+        async def _create_and_restore_model():
+            await training_engine.create_training_session(session)
+            await training_engine.load_weights(
+                session=session,
+                load_path=load_path,
+                load_optimizer=request.load_optimizer,
+            )
 
-        # Load checkpoint into the newly created model
-        await training_engine.load_weights(
-            session=session,
-            load_path=load_path,
-            load_optimizer=request.load_optimizer,
+        await run_async_with_otel_span(
+            "training.create_model_from_state.execute",
+            _create_and_restore_model,
+            component="routes.training",
+            op="training.create_model_from_state",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(model_id),
+                "base_model": str(request.base_model),
+                "backend": str(session.backend),
+                "load_optimizer": bool(request.load_optimizer),
+                "lora_enabled": bool(request.lora_config is not None),
+                "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
+            },
         )
 
         try:
@@ -1017,6 +1117,7 @@ async def forward_backward(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform forward + backward pass on training data."""
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1124,13 +1225,21 @@ async def forward_backward(
             request_id,
             meta={"op": "training.forward_backward", "model_id": request.model_id},
         )
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.forward_backward",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=session.base_model,
+            backend=session.backend,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.forward_backward",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1177,7 +1286,22 @@ async def _do_forward_backward(
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len} "
             f"loss_fn={request.forward_backward_input.loss_fn}"
         )
-        result = await training_engine.forward_backward(session, request)
+        result = await run_async_with_otel_span(
+            "training.forward_backward.execute",
+            lambda: training_engine.forward_backward(session, request),
+            component="routes.training",
+            op="training.forward_backward",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "batch_size": int(len(batch)),
+                "token_count": int(token_count),
+                "max_seq_len": int(max_seq_len),
+                "loss_fn": str(request.forward_backward_input.loss_fn),
+            },
+        )
         elapsed_s = time.time() - t0
         logger.info(
             f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
@@ -1224,6 +1348,7 @@ async def train_step(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform a combined forward_backward + optim_step."""
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1323,13 +1448,21 @@ async def train_step(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.train_step",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=session.base_model,
+            backend=session.backend,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.train_step",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1366,7 +1499,23 @@ async def _do_train_step(
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
         )
         logger.info(msg)
-        result = await training_engine.train_step(session, request)
+        result = await run_async_with_otel_span(
+            "training.train_step.execute",
+            lambda: training_engine.train_step(session, request),
+            component="routes.training",
+            op="training.train_step",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "batch_size": int(len(batch)),
+                "token_count": int(token_count),
+                "max_seq_len": int(max_seq_len),
+                "seq_id": int(request.seq_id) if request.seq_id is not None else None,
+                "loss_fn": str(request.forward_backward_input.loss_fn),
+            },
+        )
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
@@ -1416,6 +1565,7 @@ async def forward(
     Uses ForwardRequest with forward_input field (not forward_backward_input)
     to match tinker client API.
     """
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1517,13 +1667,21 @@ async def forward(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.forward",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=session.base_model,
+            backend=session.backend,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.forward",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1558,7 +1716,22 @@ async def _do_forward(
             f"[{session.model_id}] forward start: "
             f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
         )
-        result = await training_engine.forward(session, request)
+        result = await run_async_with_otel_span(
+            "training.forward.execute",
+            lambda: training_engine.forward(session, request),
+            component="routes.training",
+            op="training.forward",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "batch_size": int(len(batch)),
+                "token_count": int(token_count),
+                "max_seq_len": int(max_seq_len),
+                "seq_id": int(request.seq_id) if request.seq_id is not None else None,
+            },
+        )
         elapsed_s = time.time() - t0
         logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
         if gateway_auth:
@@ -1702,31 +1875,24 @@ async def optim_step(
             training_op="optim_step",
             seq_id=request.seq_id,
         )
-        future_create_start_s = time.perf_counter()
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
-        logger.info(
-            "[optim_step route] request_id=%s model_id=%s stage=future_store_ready elapsed_ms=%.3f",
-            str(request_id),
-            str(request.model_id),
-            (time.perf_counter() - future_create_start_s) * 1000.0,
-        )
-        enqueue_start_s = time.perf_counter()
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.optim_step",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra=scheduler_extra,
-        )
-        logger.info(
-            "[optim_step route] request_id=%s model_id=%s stage=enqueue_done elapsed_ms=%.3f route_elapsed_ms=%.3f",
-            str(request_id),
-            str(request.model_id),
-            (time.perf_counter() - enqueue_start_s) * 1000.0,
-            (time.perf_counter() - route_start_s) * 1000.0,
+            model_id=request.model_id,
+            base_model=session.base_model,
+            backend=session.backend,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.optim_step",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1754,7 +1920,20 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
         logger.info(msg)
-        result = await training_engine.optim_step(session, request)
+        result = await run_async_with_otel_span(
+            "training.optim_step.execute",
+            lambda: training_engine.optim_step(session, request),
+            component="routes.training",
+            op="training.optim_step",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "learning_rate": float(lr) if lr is not None else None,
+                "seq_id": int(request.seq_id),
+            },
+        )
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] optim_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
@@ -1858,6 +2037,7 @@ async def save_weights_for_sampler(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Save model weights for inference use."""
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1958,13 +2138,21 @@ async def save_weights_for_sampler(
             request_id,
             meta={"op": "training.save_weights_for_sampler", "model_id": request.model_id},
         )
-        await api_work_queue.enqueue(
+        await _enqueue_training_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="training.save_weights_for_sampler",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra=scheduler_extra,
+            model_id=request.model_id,
+            base_model=session.base_model,
+            backend=session.backend,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="training.save_weights_for_sampler",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra=scheduler_extra,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -2038,11 +2226,24 @@ async def _do_save_weights_for_sampler(
                 use_per_expert_lora = False
 
         # Save weights
-        save_path = await training_engine.save_weights_for_sampler(
-            session=session,
-            checkpoint_name=checkpoint_name,
-            checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
-            use_per_expert_lora=use_per_expert_lora,
+        save_path = await run_async_with_otel_span(
+            "training.save_weights_for_sampler.execute",
+            lambda: training_engine.save_weights_for_sampler(
+                session=session,
+                checkpoint_name=checkpoint_name,
+                checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
+                use_per_expert_lora=use_per_expert_lora,
+            ),
+            component="routes.training",
+            op="training.save_weights_for_sampler",
+            request_id=str(request_id),
+            attributes={
+                "model_id": str(request.model_id),
+                "base_model": str(session.base_model),
+                "backend": str(session.backend),
+                "save_mode": "named" if request.path is not None else "ephemeral",
+                "use_per_expert_lora": bool(use_per_expert_lora),
+            },
         )
 
         if checkpoint_has_optimizer_state(save_path):

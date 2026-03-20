@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from types import SimpleNamespace
 
 import pytest
+from fastapi.responses import JSONResponse
 
 
 class _DummyRequest:
@@ -124,7 +126,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     await tr.save_weights_for_sampler(req, _DummyRequest(user_id="owner-a"))
 
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["training_op"] == "save_weights_for_sampler"
     assert captured["extra"]["seq_id"] == 9
@@ -132,25 +134,67 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
 
 
 @pytest.mark.anyio
-async def test_issue_281_healthz_timeout_is_observation_not_failure(monkeypatch) -> None:
+async def test_issue_281_public_healthz_stays_ready_without_ray_probe(monkeypatch) -> None:
     from tinker_server.routes import service
 
     _install_ray_stub(monkeypatch)
 
-    async def _raise_timeout(awaitable, timeout):
-        awaitable.close()
-        raise service.asyncio.TimeoutError()
+    def _boom(*args, **kwargs):
+        raise AssertionError("public /api/v1/healthz should not call Ray")
 
-    monkeypatch.setattr(service.asyncio, "wait_for", _raise_timeout)
+    ray = sys.modules["ray"]
+    monkeypatch.setattr(ray, "is_initialized", _boom)
+    monkeypatch.setattr(ray, "available_resources", _boom)
+    monkeypatch.setattr(ray, "cluster_resources", _boom)
+    monkeypatch.setattr(ray.util, "placement_group_table", _boom)
+    monkeypatch.setattr(ray.util, "get_placement_group", _boom)
 
     payload = await service.healthz()
+    assert payload == {"status": "ready"}
+
+
+@pytest.mark.anyio
+async def test_issue_281_public_healthz_reports_startup_degraded_state() -> None:
+    from tinker_server.health_state import clear_startup_degraded_state, set_startup_degraded_state
+    from tinker_server.routes import service
+
+    set_startup_degraded_state(reason="startup_degraded", error="boom", details={"phase": "init"})
+    try:
+        payload = await service.healthz()
+        assert isinstance(payload, JSONResponse)
+        assert payload.status_code == 503
+        assert json.loads(payload.body) == {
+            "status": "degraded",
+            "reason": "startup_degraded",
+            "error": "boom",
+            "details": {"phase": "init"},
+        }
+    finally:
+        clear_startup_degraded_state()
+
+
+@pytest.mark.anyio
+async def test_issue_281_internal_deep_healthz_timeout_is_observation_not_failure(monkeypatch) -> None:
+    from tinker_server import health_checks
+    from tinker_server.routes import internal
+
+    _install_ray_stub(monkeypatch, available={"GPU": 2}, total={"GPU": 8})
+
+    async def _raise_timeout(awaitable, timeout):
+        awaitable.close()
+        raise health_checks.asyncio.TimeoutError()
+
+    monkeypatch.setattr(health_checks.asyncio, "wait_for", _raise_timeout)
+
+    payload = await internal.deep_health_check()
     assert payload["status"] == "ready"
     assert payload["ray_observation"]["reason"] == "ray_healthz_timeout"
 
 
 @pytest.mark.anyio
-async def test_issue_281_healthz_pending_pg_is_observation_not_failure(monkeypatch) -> None:
-    from tinker_server.routes import service
+async def test_issue_281_internal_deep_healthz_pending_pg_is_observation_not_failure(monkeypatch) -> None:
+    from tinker_server import health_checks
+    from tinker_server.routes import internal
 
     _install_ray_stub(monkeypatch, available={"GPU": 2}, total={"GPU": 8})
 
@@ -158,9 +202,9 @@ async def test_issue_281_healthz_pending_pg_is_observation_not_failure(monkeypat
         awaitable.close()
         return ["pg-a"]
 
-    monkeypatch.setattr(service.asyncio, "wait_for", _return_pending)
+    monkeypatch.setattr(health_checks.asyncio, "wait_for", _return_pending)
 
-    payload = await service.healthz()
+    payload = await internal.deep_health_check()
     assert payload["status"] == "ready"
     assert payload["ray_observation"]["reason"] == "pending_placement_groups"
     assert payload["ray_observation"]["pending_pg_names"] == ["pg-a"]

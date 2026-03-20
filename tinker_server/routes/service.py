@@ -13,23 +13,21 @@ Endpoints:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request, is_admin_user_data
 from ..backend.session_heartbeat_store import session_heartbeat_store
+from ..health_checks import public_healthz_response
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateSamplingSessionRequest,
@@ -54,7 +52,6 @@ logger = logging.getLogger(__name__)
 
 # In-memory session storage
 sessions: dict[str, dict] = {}
-sampling_sessions: dict[str, str] = {}  # sampling_session_id -> base_model
 
 # Global session manager reference (set by app lifespan)
 session_manager: SessionManager | None = None
@@ -96,109 +93,8 @@ def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
 
 @router.get("/healthz", response_model=None)
 async def healthz() -> dict:
-    """Health check endpoint.
-
-    Returns HTTP 503 only for startup degradation or Ray unavailability.
-    Queue pressure and slow Ray inspection are reported as observations on a
-    ready server rather than as readiness failures.
-    """
-    from ..health_state import get_startup_degraded_state
-
-    degraded = get_startup_degraded_state()
-    if degraded is not None:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "degraded",
-                "reason": degraded.get("reason", "startup_degraded"),
-                "error": degraded.get("error", ""),
-                "details": degraded.get("details", {}),
-            },
-        )
-    try:
-        import ray
-
-        from ..config import RAY_NAMESPACE
-        from ..ray_utils import init_ray
-
-        if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
-        def _pending_gpu_pg_names_in_namespace() -> list[str]:
-            tbl = ray.util.placement_group_table()
-            candidates: set[str] = set()
-            for info in tbl.values():
-                if not isinstance(info, dict):
-                    continue
-                name = info.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                state = info.get("state")
-                if state in ("CREATED", "REMOVED"):
-                    continue
-                candidates.add(name)
-
-            pending: list[str] = []
-            for name in sorted(candidates):
-                try:
-                    pg = ray.util.get_placement_group(name)
-                except Exception:
-                    continue
-                try:
-                    info = ray.util.placement_group_table(pg)
-                except Exception:
-                    continue
-                state = info.get("state")
-                if state in ("CREATED", "REMOVED"):
-                    continue
-                bundles = info.get("bundles") or {}
-                total_gpu = 0.0
-                for b in bundles.values():
-                    if isinstance(b, dict):
-                        total_gpu += float(b.get("GPU", 0) or 0)
-                if total_gpu <= 0:
-                    continue
-                pending.append(name)
-            return pending
-
-        healthz_ray_timeout_s = float(os.environ.get("MINT_HEALTHZ_RAY_TIMEOUT_S", "10.0"))
-        try:
-            pending_pg_names = await asyncio.wait_for(
-                asyncio.to_thread(_pending_gpu_pg_names_in_namespace),
-                timeout=healthz_ray_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            return {
-                "status": "ready",
-                "ray_observation": {
-                    "reason": "ray_healthz_timeout",
-                    "timeout_s": healthz_ray_timeout_s,
-                },
-            }
-        if pending_pg_names:
-            ar = ray.available_resources()
-            cr = ray.cluster_resources()
-            return {
-                "status": "ready",
-                "ray_observation": {
-                    "reason": "pending_placement_groups",
-                    "pending_pg_count": len(pending_pg_names),
-                    "pending_pg_names": pending_pg_names[:20],
-                    "ray_gpu_available": float(ar.get("GPU", 0) or 0),
-                    "ray_gpu_total": float(cr.get("GPU", 0) or 0),
-                },
-            }
-
-        return {"status": "ready"}
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "degraded",
-                "reason": "ray_unavailable",
-                "error": f"{type(e).__name__}: {e}",
-            },
-        )
+    """Public health endpoint for cheap API-worker readiness only."""
+    return public_healthz_response()
 
 
 @router.get("/get_server_capabilities")
@@ -521,7 +417,6 @@ async def _create_sampling_session_impl(
                     status_code=409,
                     detail="Sampling session already exists with different configuration",
                 )
-            sampling_sessions[sampling_session_id] = base_model
             _write_sampler_index(sampling_session_id)
             return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
     else:
@@ -550,9 +445,6 @@ async def _create_sampling_session_impl(
     else:
         # Base model (no LoRA): register session directly
         session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
-
-    # Store metadata
-    sampling_sessions[sampling_session_id] = base_model
 
     _write_sampler_index(sampling_session_id)
 
@@ -951,6 +843,136 @@ class KillActorsRequest(BaseModel):
 
     actor_type: str  # "vllm" | "megatron" | "dense" | "all"
     model_name: str | None = None  # optional per-type model filter
+    actor_name: str | None = None  # optional exact actor target
+
+
+def _remove_actor_pg(actor_name: str) -> None:
+    try:
+        import ray
+
+        pg = ray.util.get_placement_group(f"{actor_name}_pg")
+        ray.util.remove_placement_group(pg)
+    except Exception:
+        pass
+
+
+def _kill_exact_vllm_actor(*, actor_name: str) -> int:
+    import ray
+
+    from ..backend import ray_kill
+    from ..backend.multi_lora_engine import PERSISTENT_NAMESPACE
+    from ..backend.resource_pool import ActorType, ResourcePoolStaleError, get_resource_pool
+    from ..ray_utils import init_ray
+
+    if not ray.is_initialized():
+        init_ray(namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    pool = get_resource_pool()
+    entry = pool.get(actor_name)
+    if entry is not None and entry.actor_type != ActorType.VLLM:
+        return 0
+
+    namespace = entry.namespace if entry is not None else PERSISTENT_NAMESPACE
+    try:
+        actor = ray.get_actor(actor_name, namespace=namespace)
+    except ValueError:
+        pool.unregister(actor_name)
+        _remove_actor_pg(actor_name)
+        return 0
+
+    try:
+        ray_kill.kill(
+            actor,
+            reason="vllm_kill_by_actor_name",
+            actor_name=actor_name,
+            namespace=namespace,
+        )
+    except ResourcePoolStaleError:
+        raise
+    pool.unregister(actor_name)
+    _remove_actor_pg(actor_name)
+    return 1
+
+
+def _kill_exact_megatron_actor(*, actor_name: str) -> int:
+    import ray
+
+    from ..backend import ray_kill
+    from ..backend.megatron_distributed import PERSISTENT_NAMESPACE
+    from ..backend.resource_pool import ActorType, get_resource_pool
+    from ..ray_utils import init_ray
+
+    if not ray.is_initialized():
+        init_ray(namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
+
+    pool = get_resource_pool()
+    entry = pool.get(actor_name)
+    if entry is not None and entry.actor_type != ActorType.MEGATRON:
+        return 0
+
+    namespace = entry.namespace if entry is not None else PERSISTENT_NAMESPACE
+    try:
+        actor = ray.get_actor(actor_name, namespace=namespace)
+    except ValueError:
+        pool.unregister(actor_name)
+        _remove_actor_pg(actor_name)
+        return 0
+
+    try:
+        try:
+            ray.get(actor.shutdown.remote(), timeout=10)
+        except Exception:
+            pass
+        ray_kill.kill(
+            actor,
+            reason="kill_megatron_actor_by_name",
+            actor_name=actor_name,
+            namespace=namespace,
+            no_restart=True,
+            verify_absent=True,
+        )
+    finally:
+        pool.unregister(actor_name)
+        _remove_actor_pg(actor_name)
+    return 1
+
+
+def _kill_exact_dense_actor(*, actor_name: str) -> int:
+    from ..backend.resource_pool import ActorType, get_resource_pool
+
+    pool = get_resource_pool()
+    entry = pool.get(actor_name)
+    if entry is not None and entry.actor_type != ActorType.DENSE:
+        return 0
+    if entry is None:
+        return 0
+
+    try:
+        import ray
+
+        from ..backend import ray_kill
+        from ..config import RAY_NAMESPACE
+        from ..ray_utils import init_ray
+
+        if not ray.is_initialized():
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+        try:
+            actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
+            ray_kill.kill(
+                actor,
+                reason="dense_kill_by_actor_name",
+                actor_name=entry.actor_name,
+                namespace=entry.namespace,
+                base_model=entry.base_model,
+                no_restart=True,
+            )
+        except Exception:
+            pass
+    finally:
+        pool.unregister(entry.actor_name)
+        _remove_actor_pg(entry.actor_name)
+    return 1
 
 
 def _kill_dense_actors(base_model: str | None) -> int:
@@ -1007,8 +1029,30 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
 
     t = body.actor_type.strip().lower()
     model_name = body.model_name
+    actor_name = body.actor_name.strip() if body.actor_name else None
 
     killed_by_type: dict[str, int] = {"vllm": 0, "megatron": 0, "dense": 0}
+
+    if actor_name:
+        if t == "all":
+            raise HTTPException(status_code=422, detail="actor_name cannot be combined with actor_type=all")
+        if t == "vllm":
+            from ..backend.resource_pool import ResourcePoolStaleError
+
+            try:
+                killed_by_type["vllm"] = _kill_exact_vllm_actor(actor_name=actor_name)
+            except ResourcePoolStaleError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+        elif t == "megatron":
+            killed_by_type["megatron"] = _kill_exact_megatron_actor(actor_name=actor_name)
+        elif t == "dense":
+            killed_by_type["dense"] = _kill_exact_dense_actor(actor_name=actor_name)
+        else:
+            raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
+        return {
+            "killed": int(sum(killed_by_type.values())),
+            "killed_by_type": killed_by_type,
+        }
 
     if t in ("vllm", "all"):
         from ..backend.multi_lora_engine import kill_persistent_vllm_actor

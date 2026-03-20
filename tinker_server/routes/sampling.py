@@ -73,6 +73,16 @@ async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
         return lock
 
 
+async def _drop_lora_load_lock(session_id: str) -> None:
+    async with _lora_load_locks_guard:
+        _lora_load_locks.pop(session_id, None)
+
+
+async def _lora_load_lock_count() -> int:
+    async with _lora_load_locks_guard:
+        return len(_lora_load_locks)
+
+
 def _resolve_billing_model(session_id: str) -> str:
     if session_manager is None:
         return session_id
@@ -1394,10 +1404,14 @@ async def compute_logprobs(
                     f"{type(e).__name__}: {e}"
                 ),
             )
-        if len(token_ids) > max_model_len:
+        total_len = len(token_ids) + 1
+        if total_len > max_model_len:
             raise HTTPException(
                 status_code=400,
-                detail=f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} for model {base_model}",
+                detail=(
+                    f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                    f"for model {base_model}"
+                ),
             )
 
     user_id = _get_user_id(http_request)
@@ -1467,9 +1481,10 @@ async def _do_compute_logprobs(
             from ..backend.model_registry import get_model_config
 
             max_model_len = int(get_model_config(base_model).max_model_len)
-            if len(token_ids) > max_model_len:
+            total_len = len(token_ids) + 1
+            if total_len > max_model_len:
                 raise ValueError(
-                    f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
+                    f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
                     f"for model {base_model}"
                 )
 
