@@ -341,3 +341,24 @@ def test_issue_324_consumer_handoff_releases_leased_slots(monkeypatch):
 
     accepted = asyncio.run(actor.enqueue(dict(item, request_id="r2")))
     assert accepted == {"ok": True}
+
+
+def test_issue_324_consumer_handoff_releases_scheduler_lease(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    actor.set_active_job_id("consumer-old")
+    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
+    first = asyncio.run(actor.dequeue("consumer-old"))
+    assert first["request_id"] == "r1"
+
+    asyncio.run(_enqueue_many(actor, [_item("r2", domain="d", session_key="B", created_at=2.0)]))
+    actor.set_active_job_id("consumer-new")
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
+
+    assert second["request_id"] == "r2"

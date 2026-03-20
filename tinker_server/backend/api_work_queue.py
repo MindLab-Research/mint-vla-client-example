@@ -184,6 +184,7 @@ def _get_or_create_ray_actor():
             self._queued_asample_by_apikey: dict[str, int] = {}
             self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
             self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
+            self._scheduler_lease_consumer: dict[str, str] = {}
             self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
             self._scheduler_max_consecutive = max(
                 1,
@@ -268,6 +269,7 @@ def _get_or_create_ray_actor():
             self._release_asample_slot(rid)
             async with self._cv:
                 meta = self._scheduler_request_meta.pop(rid, None)
+                self._scheduler_lease_consumer.pop(rid, None)
                 if meta is None:
                     return
                 domain, session_id, op = meta
@@ -297,6 +299,7 @@ def _get_or_create_ray_actor():
         def _release_slots_for_consumer(self, consumer_job_id: str | None) -> int:
             if consumer_job_id is None:
                 return 0
+            released = 0
             doomed = [
                 request_id
                 for request_id, (_principal, _apikey_id, leased_consumer) in self._queued_asample_request_state.items()
@@ -304,7 +307,23 @@ def _get_or_create_ray_actor():
             ]
             for request_id in doomed:
                 self._release_asample_slot(request_id)
-            return len(doomed)
+            released += len(doomed)
+            leased_request_ids = [
+                request_id
+                for request_id, leased_consumer in self._scheduler_lease_consumer.items()
+                if leased_consumer == str(consumer_job_id)
+            ]
+            if leased_request_ids:
+                doomed_ids = set(leased_request_ids)
+                for state in self._sched_domains.values():
+                    leased_request_id = state.get("leased_request_id")
+                    if leased_request_id in doomed_ids:
+                        state["leased_request_id"] = None
+                        state["leased_session"] = None
+                for request_id in leased_request_ids:
+                    self._scheduler_lease_consumer.pop(request_id, None)
+                released += len(leased_request_ids)
+            return released
         def _to_bool(self, v: Any) -> bool:
             if isinstance(v, bool):
                 return v
@@ -618,7 +637,8 @@ def _get_or_create_ray_actor():
                 state["consecutive_count"] = 0
             state["last_session"] = session_id
             state["last_pick_ts"] = float(now)
-            state["leased_request_id"] = str(item.get("request_id") or "")
+            leased_request_id = str(item.get("request_id") or "")
+            state["leased_request_id"] = leased_request_id
             state["leased_session"] = session_id
 
             return item
@@ -878,6 +898,10 @@ def _get_or_create_ray_actor():
                         scheduler_domain = str(sched_domain)
                         scheduler_session_id = str(sched_session_id)
                     self._mark_asample_leased_to_consumer(item.get("request_id", ""), consumer_job_id)
+                    if scheduler_domain is not None:
+                        leased_request_id = str(item.get("request_id") or "")
+                        if leased_request_id:
+                            self._scheduler_lease_consumer[leased_request_id] = str(consumer_job_id)
                     break
 
                 self._dequeued += 1

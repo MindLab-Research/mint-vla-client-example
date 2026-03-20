@@ -722,6 +722,66 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     assert session.learning_rate == pytest.approx(3e-4)
 
 
+def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_load_recycle"
+    dead_worker = _FakeLoadWorker(ref="dead-load-ref")
+    recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
+    engine._workers[model_id] = dead_worker
+    engine._resource_pool_actor_names[model_id] = "megatron-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_load_recycle",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    live_workers = [dead_worker, recovered_worker]
+    keepalive_calls: list[tuple[object, str, float, float | None]] = []
+
+    async def fake_get_live_worker(*args, **kwargs):
+        return live_workers.pop(0)
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        keepalive_calls.append((awaitable, keepalive_session.model_id, interval_s, timeout_s))
+        return {"status": "ok"}
+
+    async def fake_run_with_recycle(*args, **kwargs):
+        engine._workers[model_id] = recovered_worker
+        return {"current_step": 9, "learning_rate": 2e-4, "actual_rank": 7}
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_run_worker_call_with_actor_recycle", fake_run_with_recycle)
+    monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_megatron_load_recycle",
+            load_optimizer=True,
+        )
+
+    asyncio.run(_run())
+
+    assert keepalive_calls == [
+        ("fake-load-ready-ref", model_id, 30.0, 1800.0),
+    ]
+    assert dead_worker.mark_session_loaded.calls == []
+    assert recovered_worker.mark_session_loaded.calls == [
+        (
+            (model_id,),
+            {
+                "step_count": 9,
+                "learning_rate": pytest.approx(2e-4),
+                "actual_rank": 7,
+            },
+        )
+    ]
+
+
 def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memory(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_dead_dirty"

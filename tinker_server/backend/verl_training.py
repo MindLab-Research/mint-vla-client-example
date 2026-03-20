@@ -3238,6 +3238,7 @@ class VerlTrainingEngine:
         )
 
         if session.backend == "megatron":
+            worker = await self._get_live_worker(session, op="load_weights")
             actual_rank = meta.get("actual_rank")
             await asyncio.to_thread(
                 ray.get,
