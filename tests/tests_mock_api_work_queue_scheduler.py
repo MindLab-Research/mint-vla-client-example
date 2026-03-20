@@ -1,8 +1,10 @@
 import asyncio
 import importlib
 import importlib.machinery
+import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -45,9 +47,42 @@ def _install_ray_stub(monkeypatch) -> None:
 
 
 def _load_api_work_queue_module(monkeypatch):
+    env_root = Path("/tmp/runtime-env")
+    (env_root / "site-packages").mkdir(parents=True, exist_ok=True)
+    (env_root / "src" / "repo").mkdir(parents=True, exist_ok=True)
+    (env_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "runtime_env": {
+                    "site_packages_dir": "site-packages",
+                    "source_dir": "src",
+                    "base_python_dir": "base-python",
+                    "host_venv_dir": "host-venv",
+                },
+                "sources": [{"name": "repo", "pythonpath": ["."]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-env")
+    monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker-server")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setenv("RAY_ADDRESS", "ray://stub-head")
     _install_ray_stub(monkeypatch)
+    import tinker_server.config as config_module
     import tinker_server.backend.api_work_queue as api_work_queue
 
+    importlib.reload(config_module)
+    monkeypatch.setattr(config_module, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-env", raising=False)
+    monkeypatch.setattr(config_module, "PFS_TINKER_PATH", "/tmp/tinker-server", raising=False)
+    monkeypatch.setattr(config_module, "PFS_HF_MODULES_PATH", "/tmp/hf-modules", raising=False)
+    monkeypatch.setattr(
+        config_module,
+        "PFS_PYTHONPATH",
+        "/tmp/runtime-env:/tmp/tinker-server:/tmp/hf-modules",
+        raising=False,
+    )
+    monkeypatch.setattr(config_module, "ensure_runtime_env_configured", lambda: "/tmp/runtime-env")
     return importlib.reload(api_work_queue)
 
 
@@ -88,7 +123,9 @@ async def _enqueue_many(actor, items: list[dict]) -> None:
 async def _dequeue_many(actor, n: int) -> list[dict]:
     out: list[dict] = []
     for _ in range(n):
-        out.append(await actor.dequeue("consumer-job"))
+        item = await actor.dequeue("consumer-job")
+        out.append(item)
+        await actor.finalize_request(item["request_id"])
     return out
 
 
@@ -166,6 +203,27 @@ def test_mock_scheduler_accepts_new_and_legacy_session_key_fields(monkeypatch):
     sessions = {_session_key_from_item(x) for x in out}
 
     assert sessions == {"new-key-A", "legacy-key-B"}
+
+
+def test_mock_scheduler_does_not_idle_wait_for_missing_followup(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "20")
+    monkeypatch.setenv("MINT_SCHEDULER_TRAIN_FOLLOWUP_HOLD_S", "60")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert _session_key_from_item(first) == "A"
+    asyncio.run(actor.finalize_request("r1"))
+
+    asyncio.run(_enqueue_many(actor, [_item("r2", domain="d", session_key="B", created_at=2.0)]))
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-job"), timeout=0.05))
+
+    assert _session_key_from_item(second) == "B"
 
 
 def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):
@@ -258,7 +316,7 @@ def test_issue_324_finalize_request_releases_running_slot(monkeypatch):
     dequeued = asyncio.run(actor.dequeue("consumer-job"))
     assert dequeued["request_id"] == "r1"
     assert actor.stats()["by_apikey_id"] == {"bbbbbbbbbbbbbbbbbbbbbbbb": 1}
-    actor.finalize_request("r1")
+    asyncio.run(actor.finalize_request("r1"))
     assert actor.stats()["by_apikey_id"] == {}
 
 

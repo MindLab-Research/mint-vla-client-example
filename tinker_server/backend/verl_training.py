@@ -1542,6 +1542,12 @@ class VerlTrainingEngine:
         # Map model_id -> Ray actor name registered in ResourcePool, used to keep
         # actors marked as active during long-running calls (32k forward/backward).
         self._resource_pool_actor_names: dict[str, str] = {}
+        # Shared Megatron actors can carry one loaded session whose newest state
+        # exists only in actor memory until a session switch or checkpoint save
+        # persists it. If that actor dies, automatic retry must fail closed.
+        self._actor_loaded_sessions: dict[str, str] = {}
+        self._actor_volatile_sessions: dict[str, str] = {}
+        self._poisoned_sessions: dict[str, str] = {}
         self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
         self._megatron_recycle_locks_guard = asyncio.Lock()
 
@@ -1570,6 +1576,66 @@ class VerlTrainingEngine:
         resource_pool = get_resource_pool()
         resource_pool.touch(actor_name)
         resource_pool.set_session(actor_name, session.model_id)
+
+    def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
+        return self._resource_pool_actor_names.get(session.model_id)
+
+    def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
+        if op == "load_weights":
+            return
+        error = self._poisoned_sessions.get(session.model_id)
+        if error is not None:
+            raise RuntimeError(error)
+
+    def _note_successful_worker_call(self, session: "TrainingSession", *, op: str) -> None:
+        actor_name = self._actor_name_for_session(session)
+        if not actor_name:
+            return
+        prev_loaded = self._actor_loaded_sessions.get(actor_name)
+        if (
+            isinstance(prev_loaded, str)
+            and prev_loaded
+            and prev_loaded != session.model_id
+            and self._actor_volatile_sessions.get(actor_name) == prev_loaded
+        ):
+            self._actor_volatile_sessions.pop(actor_name, None)
+        self._actor_loaded_sessions[actor_name] = session.model_id
+        if op in {"forward_backward", "optim_step", "load_weights"}:
+            self._actor_volatile_sessions[actor_name] = session.model_id
+        if op in {"save_weights", "save_lora_weights_for_sampler"}:
+            if self._actor_volatile_sessions.get(actor_name) == session.model_id:
+                self._actor_volatile_sessions.pop(actor_name, None)
+        if op == "load_weights":
+            self._poisoned_sessions.pop(session.model_id, None)
+
+    async def _recycle_worker_after_failure(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> ray.actor.ActorHandle:
+        actor_name = self._actor_name_for_session(session)
+        lost_session_id = None if actor_name is None else self._actor_volatile_sessions.get(actor_name)
+        lost_state_error = None
+        if session.backend == "megatron" and isinstance(lost_session_id, str) and lost_session_id:
+            lost_state_error = (
+                f"[{session.model_id}] megatron actor recycle detected after op={op}, but "
+                f"session {lost_session_id} had live in-memory state that was never persisted. "
+                "The actor was recycled, but this request was not retried because that would hide "
+                "the rollback. Reload the lost session from a checkpoint before continuing."
+            )
+            self._poisoned_sessions[lost_session_id] = lost_state_error
+        if session.backend == "megatron":
+            worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
+        else:
+            worker = await self._recycle_dense_actor(session, op=op, cause=cause)
+        if actor_name:
+            self._actor_loaded_sessions.pop(actor_name, None)
+            self._actor_volatile_sessions.pop(actor_name, None)
+        if lost_state_error is not None:
+            raise RuntimeError(lost_state_error) from cause
+        return worker
 
     def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
         """Resolve session base model to a local path (same policy as create_training_session)."""
@@ -1925,15 +1991,13 @@ class VerlTrainingEngine:
         interval_s: float = 30.0,
         timeout_s: float | None = None,
     ):
+        self._raise_if_session_poisoned(session, op=op)
         try:
             worker = await self._get_live_worker(session, op=op)
         except RuntimeError as e:
             if "missing worker" not in str(e):
                 raise
-            if session.backend == "megatron":
-                worker = await self._recycle_megatron_actor(session, op=op, cause=e)
-            else:
-                worker = await self._recycle_dense_actor(session, op=op, cause=e)
+            worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
         self._touch_actor(session)
         await self._log_worker_request_context(
             session,
@@ -1946,12 +2010,14 @@ class VerlTrainingEngine:
         while True:
             try:
                 pending = submit_fn(worker)
-                return await self._await_with_keepalive(
+                result = await self._await_with_keepalive(
                     pending,
                     session,
                     interval_s=interval_s,
                     timeout_s=timeout_s,
                 )
+                self._note_successful_worker_call(session, op=op)
+                return result
             except Exception as e:
                 if not self._is_dead_actor_error(e):
                     raise
@@ -1965,10 +2031,7 @@ class VerlTrainingEngine:
                     attempts,
                     type(e).__name__,
                 )
-                if session.backend == "megatron":
-                    worker = await self._recycle_megatron_actor(session, op=op, cause=e)
-                else:
-                    worker = await self._recycle_dense_actor(session, op=op, cause=e)
+                worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
                 await self._log_worker_request_context(
                     session,
                     worker,
@@ -2434,9 +2497,12 @@ class VerlTrainingEngine:
                 from .resource_pool import get_resource_pool
 
                 get_resource_pool().mark_ready(actor_name)
+                self._actor_loaded_sessions[actor_name] = model_id
+                self._actor_volatile_sessions[actor_name] = model_id
 
             self._workers[model_id] = worker
             session.is_active = True
+            self._poisoned_sessions.pop(model_id, None)
             logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
             return
 
@@ -2481,6 +2547,7 @@ class VerlTrainingEngine:
 
         self._workers[model_id] = worker
         session.is_active = True
+        self._poisoned_sessions.pop(model_id, None)
         logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
 
     async def forward_backward(
@@ -3213,6 +3280,12 @@ class VerlTrainingEngine:
 
         self._resource_pool_actor_names.pop(model_id, None)
         self._workers.pop(model_id, None)
+        self._poisoned_sessions.pop(model_id, None)
+        if actor_name:
+            if self._actor_loaded_sessions.get(actor_name) == model_id:
+                self._actor_loaded_sessions.pop(actor_name, None)
+            if self._actor_volatile_sessions.get(actor_name) == model_id:
+                self._actor_volatile_sessions.pop(actor_name, None)
 
         # If this session was loaded on a pooled dense actor, clear pool tracking
         # so the actor can become evictable after session deletion.

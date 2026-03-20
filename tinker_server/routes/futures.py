@@ -356,7 +356,7 @@ async def retrieve_future(
         queue_depth = None
         estimated_wait_s = None
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
-        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
             "1",
             "true",
             "yes",

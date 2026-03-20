@@ -801,27 +801,6 @@ def _get_or_create_ray_actor():
                         and self._scheduler_coalesce_ms > 0.0
                     ):
                         sched_domain, sched_session_id, sched_reason = sched_choice
-                        state = self._sched_domains.get(sched_domain)
-                        followup_session = None if state is None else state.get("followup_session")
-                        followup_deadline = 0.0 if state is None else float(state.get("followup_deadline", 0.0) or 0.0)
-                        followup_wait_s = max(0.0, followup_deadline - now)
-                        followup_queue = None
-                        if state is not None:
-                            followup_queue = (state.get("queues_by_session", {}) or {}).get(followup_session)
-                        if (
-                            isinstance(followup_session, str)
-                            and followup_session
-                            and followup_wait_s > 0.0
-                            and not followup_queue
-                            and followup_session != sched_session_id
-                        ):
-                            try:
-                                await asyncio.wait_for(self._cv.wait(), timeout=followup_wait_s)
-                            except asyncio.TimeoutError:
-                                if state is not None and state.get("followup_session") == followup_session:
-                                    state["followup_session"] = None
-                                    state["followup_deadline"] = 0.0
-                            continue
                         if str(sched_reason).startswith("fairness"):
                             state = self._sched_domains.get(sched_domain)
                             if isinstance(state, dict):
