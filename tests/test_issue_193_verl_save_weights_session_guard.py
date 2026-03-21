@@ -1101,6 +1101,49 @@ def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(m
     assert engine._actor_volatile_sessions["shared-megatron-actor"] == {model_id}
 
 
+def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loaded_finishes(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_load_mark_gap"
+    worker = _FakeLoadWorker(ref="megatron-load-mark-gap-ref")
+    worker.mark_session_loaded = _RecordingRemoteMethod("mark-loaded-gap-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "shared-megatron-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_load_mark_gap",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        if awaitable == "fake-load-ready-ref":
+            return {"status": "ok"}
+        assert awaitable == "megatron-load-mark-gap-ref"
+        return {"current_step": 8, "learning_rate": 1e-4, "actual_rank": 5}
+
+    def fake_ray_get(ref, timeout=None):
+        if ref == "mark-loaded-gap-ref":
+            raise ray.exceptions.ActorDiedError()
+        return {"status": "ok"}
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(ray, "get", fake_ray_get)
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_megatron_load_mark_gap",
+            load_optimizer=True,
+        )
+
+    with pytest.raises(ray.exceptions.ActorDiedError):
+        asyncio.run(_run())
+
+    assert engine._actor_volatile_sessions["shared-megatron-actor"] == {model_id}
+
+
 def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_train_step_dirty"

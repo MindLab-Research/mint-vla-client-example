@@ -1595,12 +1595,10 @@ class VerlTrainingEngine:
         self._actor_loaded_sessions[actor_name] = session.model_id
         if op in {"forward_backward", "optim_step", "train_step"}:
             volatile_sessions.add(session.model_id)
-        if op in {"save_weights", "load_weights"}:
+        if op == "save_weights":
             volatile_sessions.discard(session.model_id)
             if not volatile_sessions:
                 self._actor_volatile_sessions.pop(actor_name, None)
-        if op == "load_weights":
-            self._poisoned_sessions.pop(session.model_id, None)
 
     async def _recycle_worker_after_failure(
         self,
@@ -3241,6 +3239,11 @@ class VerlTrainingEngine:
             allow_recover=(session.backend == "peft"),
         )
 
+        if session.backend == "megatron":
+            actor_name = self._actor_name_for_session(session)
+            if actor_name:
+                self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+
         # Update session state from loaded metadata without polluting existing
         # client-side state when old/corrupt checkpoints omit metadata.
         self._update_session_from_load_meta(
@@ -3262,10 +3265,16 @@ class VerlTrainingEngine:
                 ),
                 timeout=30,
             )
-            if load_optimizer:
+            if not load_optimizer:
                 actor_name = self._actor_name_for_session(session)
                 if actor_name:
-                    self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+                    if volatile_sessions:
+                        volatile_sessions.discard(session.model_id)
+                        if not volatile_sessions:
+                            self._actor_volatile_sessions.pop(actor_name, None)
+
+        self._poisoned_sessions.pop(session.model_id, None)
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
