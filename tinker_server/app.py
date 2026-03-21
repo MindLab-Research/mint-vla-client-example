@@ -32,7 +32,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import futures, internal, sampling, service, training, weights
+from .routes import action_sampling, futures, internal, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -716,17 +716,21 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     logger.info("Initializing training components")
 
+    from .backend.action_session_manager import OpenPIFastActionSessionManager
     from .backend.training_session_manager import TrainingSessionManager
     from .backend.training_engine_router import TrainingEngineRouter
 
     train_manager = TrainingSessionManager()
     train_engine = TrainingEngineRouter()
+    action_manager = OpenPIFastActionSessionManager()
     await train_engine.initialize()
 
     # Make training components available to routes
     training.training_manager = train_manager
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
+    service.action_session_manager = action_manager
+    action_sampling.action_session_manager = action_manager
 
     # Weights router also needs training components and inference manager
     weights.training_manager = train_manager
@@ -880,6 +884,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown training sessions
     await train_manager.shutdown_all(train_engine)
+    await action_manager.shutdown_all()
 
     # Shutdown inference sessions
     await inference_manager.shutdown_all()
@@ -1181,6 +1186,7 @@ async def api_key_auth_middleware(request: Request, call_next):
 
 # Register routes with API prefix
 app.include_router(service.router, prefix="/api/v1", tags=["service"])
+app.include_router(action_sampling.router, prefix="/api/v1", tags=["action_sampling"])
 app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])

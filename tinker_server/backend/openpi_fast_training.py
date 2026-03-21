@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import base64
+import shutil
+import uuid
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..models.types import AdamParams
 from .model_registry import ModelConfig, get_model_config
+from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 
 
 OPENPI_FAST_TRAINING_BACKEND = "openpi_fast"
@@ -366,10 +370,32 @@ class OpenPIFastTrainingEngine:
         checkpoint_base_dir: str,
         use_per_expert_lora: bool,
     ) -> str:
-        del checkpoint_name, checkpoint_base_dir, use_per_expert_lora
-        raise NotImplementedError(
-            "OpenPI FAST sampler export belongs to ST-04 and is not wired in ST-02"
-        )
+        if use_per_expert_lora:
+            raise ValueError("OpenPI FAST does not support per-expert LoRA sampler export")
+
+        runtime = self._runtime_for_session(session)
+        checkpoint_root = Path(checkpoint_base_dir).expanduser().resolve() / str(session.model_id)
+        export_dir = checkpoint_root / checkpoint_name
+        if export_dir.exists():
+            raise FileExistsError(f"OpenPI FAST sampler export path already exists: {export_dir}")
+
+        temp_dir = checkpoint_root / f".openpi_fast_sampler_export_{checkpoint_name}_{uuid.uuid4().hex}"
+        try:
+            result = await self._request_runtime(runtime, "save_weights", {"save_path": str(temp_dir)})
+            source_dir = find_openpi_policy_checkpoint_dir(result["path"])
+            params_dir = source_dir / "params"
+            assets_dir = source_dir / "assets"
+            if not params_dir.is_dir():
+                raise FileNotFoundError(f"OpenPI FAST sampler export missing params dir: {params_dir}")
+            if not assets_dir.is_dir():
+                raise FileNotFoundError(f"OpenPI FAST sampler export missing assets dir: {assets_dir}")
+
+            export_dir.mkdir(parents=True, exist_ok=False)
+            shutil.copytree(params_dir, export_dir / "params")
+            shutil.copytree(assets_dir, export_dir / "assets")
+            return str(export_dir)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     async def save_weights(
         self,

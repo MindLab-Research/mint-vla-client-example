@@ -211,6 +211,21 @@ class CreateSamplingSessionResponse(BaseModel):
     sampling_session_id: str
 
 
+class CreateActionSessionRequest(BaseModel):
+    """Request to create an action inference session."""
+
+    session_id: str
+    action_session_seq_id: int | None = None
+    base_model: str | None = None
+    model_path: str | None = None
+
+
+class CreateActionSessionResponse(BaseModel):
+    """Response from action session creation."""
+
+    action_session_id: str
+
+
 class UntypedAPIFuture(BaseModel):
     """An async operation handle that can be polled for results."""
 
@@ -345,6 +360,23 @@ class TensorData(BaseModel):
     data: list[float] | float
     shape: list[int]
     dtype: str = "float32"
+
+
+class ActRequest(BaseModel):
+    """Request to run action inference."""
+
+    action_session_id: str
+    seq_id: int | None = None
+    observation: ModelInput
+    extra_inputs: dict[str, TensorData] = {}
+
+
+class ActResponse(BaseModel):
+    """Response containing action outputs."""
+
+    actions: TensorData
+    policy_timing: dict[str, float] | None = None
+    type: Literal["act"] = "act"
 
 
 class LossFnOutput(BaseModel):
