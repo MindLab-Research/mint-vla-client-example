@@ -5493,6 +5493,11 @@ class MegatronWorkerGroup:
         if session_exists:
             new_path = self._session_manager.get_session_path(session_id)
             meta = self._session_manager.get_metadata(session_id)
+            if not isinstance(meta, dict):
+                raise RuntimeError(
+                    f"Session cache for {session_id} is missing session_metadata.json; "
+                    "reload from an explicit checkpoint before continuing."
+                )
             actual_rank = meta.get("actual_rank") if meta else None
             logger.info(f"[MegatronWorkerGroup] Loading session {session_id} from {new_path}")
             self.load_adapter_state(
@@ -5504,10 +5509,9 @@ class MegatronWorkerGroup:
                 train_unembed=train_unembed,
             )
             # Restore metadata
-            if meta:
-                self._step_count = meta.get("step", 0)
-                self.learning_rate = meta.get("lr", self.learning_rate)
-                self._actual_rank = meta.get("actual_rank", self.lora_rank)
+            self._step_count = meta.get("step", 0)
+            self.learning_rate = meta.get("lr", self.learning_rate)
+            self._actual_rank = meta.get("actual_rank", self.lora_rank)
         else:
             # New session: reinitialize LoRA weights
             logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
@@ -6281,10 +6285,27 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
 
+        adapter_config_path = os.path.join(load_path, "adapter_config.json")
+        if not os.path.isfile(adapter_config_path):
+            raise FileNotFoundError(
+                f"Missing adapter_config.json required to recover actual LoRA rank: {adapter_config_path}"
+            )
+        with open(adapter_config_path, "r", encoding="utf-8") as f:
+            adapter_config = json.load(f)
+        if not isinstance(adapter_config, dict):
+            raise RuntimeError(
+                f"Invalid adapter_config.json type {type(adapter_config).__name__} in {adapter_config_path}"
+            )
+        checkpoint_rank = adapter_config.get("r")
+        if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
+            raise RuntimeError(
+                f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
+            )
+
         # Delegate to load_adapter_state
         result = self.load_adapter_state(
             load_path,
-            actual_rank=self._actual_rank or self.lora_rank,
+            actual_rank=checkpoint_rank,
             traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
