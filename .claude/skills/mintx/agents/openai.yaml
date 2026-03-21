@@ -1,0 +1,3 @@
+display_name: MintX
+short_description: Mint-only API design and docs sync
+default_prompt: Use MintX for Mint-only interfaces under /api/v1/mint and mint.mint, and keep docs synchronized with code.

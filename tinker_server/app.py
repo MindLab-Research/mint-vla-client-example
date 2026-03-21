@@ -32,7 +32,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import futures, internal, openai_compat, sampling, service, training, weights
+from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -804,6 +804,8 @@ async def lifespan(app: FastAPI):
     training.training_manager = train_manager
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
+    mint.training_manager = train_manager
+    mint.training_engine = train_engine
 
     # Weights router also needs training components and inference manager
     weights.training_manager = train_manager
@@ -834,6 +836,10 @@ async def lifespan(app: FastAPI):
         SaveStateRequest,
         SaveWeightsForSamplerRequest,
         TrainStepRequest,
+    )
+    from .models.mint_types import (
+        ForwardBackwardReverseKLRequest,
+        InterpolateCheckpointsRequest,
     )
 
     async def _exec_sampling_asample(item):
@@ -1078,6 +1084,34 @@ async def lifespan(app: FastAPI):
             attributes={"queue.stage": "queue.stage.internal.noop"},
         )
 
+    async def _exec_mint_interpolate_checkpoints(item):
+        async def _run():
+            req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
+            await mint._do_interpolate_checkpoints(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.mint.interpolate_checkpoints",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.interpolate_checkpoints"},
+        )
+
+    async def _exec_mint_forward_backward_reverse_kl(item):
+        async def _run():
+            req = ForwardBackwardReverseKLRequest.model_validate_json(item.request_json)
+            await mint._do_forward_backward_reverse_kl(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.mint.forward_backward_reverse_kl",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
+        )
+
     api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
     api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
     api_work_queue.set_executor("training.create_model", _exec_training_create_model)
@@ -1091,6 +1125,8 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
     api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
     api_work_queue.set_executor("internal.noop", _exec_internal_noop)
+    api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
+    api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
 
     await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
 
@@ -1507,6 +1543,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(mint.router, prefix="/api/v1/mint", tags=["mint"])
 app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
