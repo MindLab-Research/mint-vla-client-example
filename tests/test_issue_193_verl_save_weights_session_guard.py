@@ -1007,7 +1007,7 @@ def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_d
     assert session_a.model_id in engine._poisoned_sessions
 
 
-def test_issue_193_megatron_load_restore_stays_recoverable_until_next_train_step(monkeypatch):
+def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_next_train_step(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_loaded_clean"
     dead_worker = object()
@@ -1022,6 +1022,8 @@ def test_issue_193_megatron_load_restore_stays_recoverable_until_next_train_step
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    # load_optimizer=False path clears volatility because adapter shards plus
+    # metadata are persisted to the Megatron session cache.
     engine._note_successful_worker_call(session, op="load_weights")
 
     async def fake_get_live_worker(*args, **kwargs):
@@ -1061,6 +1063,42 @@ def test_issue_193_megatron_load_restore_stays_recoverable_until_next_train_step
     assert recycle_calls == [("forward", "ActorDiedError")]
     assert engine._actor_volatile_sessions.get("shared-megatron-actor") is None
     assert model_id not in engine._poisoned_sessions
+
+
+def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_load_with_optimizer"
+    worker = _FakeLoadWorker(ref="megatron-load-with-optimizer-ref")
+    engine._workers[model_id] = worker
+    engine._resource_pool_actor_names[model_id] = "shared-megatron-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_load_with_optimizer",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        if awaitable == "fake-load-ready-ref":
+            return {"status": "ok"}
+        assert awaitable == "megatron-load-with-optimizer-ref"
+        return {"current_step": 4, "learning_rate": 7e-5, "actual_rank": 6}
+
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(ray, "get", lambda ref, timeout=None: {"status": "ok"})
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_megatron_load_with_optimizer",
+            load_optimizer=True,
+        )
+
+    asyncio.run(_run())
+
+    assert engine._actor_volatile_sessions["shared-megatron-actor"] == {model_id}
 
 
 def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):

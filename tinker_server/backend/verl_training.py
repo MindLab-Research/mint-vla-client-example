@@ -3262,6 +3262,10 @@ class VerlTrainingEngine:
                 ),
                 timeout=30,
             )
+            if load_optimizer:
+                actor_name = self._actor_name_for_session(session)
+                if actor_name:
+                    self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
