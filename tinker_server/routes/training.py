@@ -352,8 +352,10 @@ async def create_model(
     )
     try:
         from ..backend.openpi_fast_training import validate_openpi_fast_create_request
+        from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
 
         validate_openpi_fast_create_request(request)
+        validate_openpi_pi05_create_request(request)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -671,8 +673,10 @@ async def create_model_from_state(
     )
     try:
         from ..backend.openpi_fast_training import validate_openpi_fast_create_request
+        from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
 
         validate_openpi_fast_create_request(request)
+        validate_openpi_pi05_create_request(request)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -716,13 +716,13 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     logger.info("Initializing training components")
 
-    from .backend.action_session_manager import OpenPIFastActionSessionManager
+    from .backend.action_session_manager import ActionSessionRouter
     from .backend.training_session_manager import TrainingSessionManager
     from .backend.training_engine_router import TrainingEngineRouter
 
     train_manager = TrainingSessionManager()
     train_engine = TrainingEngineRouter()
-    action_manager = OpenPIFastActionSessionManager()
+    action_manager = ActionSessionRouter()
     await train_engine.initialize()
 
     # Make training components available to routes

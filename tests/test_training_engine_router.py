@@ -53,6 +53,30 @@ def test_training_engine_router_delegates_openpi_fast_models_by_training_backend
     assert text_engine.calls == []
 
 
+def test_training_engine_router_delegates_openpi_pi05_models_by_training_backend(monkeypatch) -> None:
+    text_engine = _RecordingEngine("text")
+    openpi_fast_engine = _RecordingEngine("openpi-fast")
+    openpi_pi05_engine = _RecordingEngine("openpi-pi05")
+    router = TrainingEngineRouter(
+        text_engine=text_engine,
+        openpi_fast_engine=openpi_fast_engine,
+        openpi_pi05_engine=openpi_pi05_engine,
+    )
+    session = SimpleNamespace(base_model="openpi/pi05-libero-low-mem-finetune")
+
+    monkeypatch.setattr(
+        "tinker_server.backend.training_engine_router.get_model_config",
+        lambda base_model: SimpleNamespace(training_backend="openpi_pi05"),
+    )
+
+    result = asyncio.run(router.forward_backward(session, request={"batch": 2}))
+
+    assert result == {"engine": "openpi-pi05", "request": {"batch": 2}}
+    assert openpi_pi05_engine.calls == [("forward_backward", "openpi/pi05-libero-low-mem-finetune")]
+    assert openpi_fast_engine.calls == []
+    assert text_engine.calls == []
+
+
 def test_training_engine_router_forwards_hf_path_resolution_to_text_engine() -> None:
     text_engine = _RecordingEngine("text")
     router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=_RecordingEngine("openpi-fast"))

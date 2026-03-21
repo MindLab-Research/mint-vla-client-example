@@ -138,6 +138,21 @@ MODEL_CONFIGS = {
         action_dim=7,
         action_horizon=10,
     ),
+    "openpi/pi05-libero-low-mem-finetune": ModelConfig(
+        num_parameters=3.0,
+        is_moe=False,
+        inference_tp=1,
+        inference_dp=1,
+        train_tp=1,
+        train_ep=1,
+        max_model_len=200,
+        policy_family="flow_action",
+        inference_modality="actions",
+        training_backend="openpi_pi05",
+        camera_layout=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        action_dim=32,
+        action_horizon=10,
+    ),
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
     # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences
     "Qwen/Qwen2.5-7B-Instruct": ModelConfig(

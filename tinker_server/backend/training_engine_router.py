@@ -4,6 +4,10 @@ from typing import Any
 
 from .model_registry import get_model_config
 from .openpi_fast_training import OpenPIFastTrainingEngine, OPENPI_FAST_TRAINING_BACKEND
+from .openpi_pi05_training import (
+    OpenPIPi05TrainingEngine,
+    OPENPI_PI05_TRAINING_BACKEND,
+)
 
 
 class TrainingEngineRouter:
@@ -12,6 +16,7 @@ class TrainingEngineRouter:
         *,
         text_engine: Any | None = None,
         openpi_fast_engine: Any | None = None,
+        openpi_pi05_engine: Any | None = None,
     ) -> None:
         if text_engine is None:
             from .verl_training import VerlTrainingEngine
@@ -21,11 +26,18 @@ class TrainingEngineRouter:
         self._openpi_fast_engine = (
             openpi_fast_engine if openpi_fast_engine is not None else OpenPIFastTrainingEngine()
         )
+        self._openpi_pi05_engine = (
+            openpi_pi05_engine
+            if openpi_pi05_engine is not None
+            else OpenPIPi05TrainingEngine()
+        )
 
     async def initialize(self) -> None:
         await self._text_engine.initialize()
         if hasattr(self._openpi_fast_engine, "initialize"):
             await self._openpi_fast_engine.initialize()
+        if hasattr(self._openpi_pi05_engine, "initialize"):
+            await self._openpi_pi05_engine.initialize()
 
     def _resolve_hf_model_path(self, model_name: str) -> str | None:
         resolver = getattr(self._text_engine, "_resolve_hf_model_path", None)
@@ -37,6 +49,8 @@ class TrainingEngineRouter:
         training_backend = get_model_config(base_model).training_backend
         if training_backend == OPENPI_FAST_TRAINING_BACKEND:
             return self._openpi_fast_engine
+        if training_backend == OPENPI_PI05_TRAINING_BACKEND:
+            return self._openpi_pi05_engine
         return self._text_engine
 
     def _engine_for_session(self, session: Any) -> Any:
