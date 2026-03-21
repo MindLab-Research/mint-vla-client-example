@@ -84,6 +84,7 @@ class OpenPIPi05ActionSession:
         self._rng = jax.random.key(0)
 
     def _observation_from_payload(self, payload: dict[str, Any]):
+        jnp = self._jnp
         chunks = list(payload["observation"]["chunks"])
         image_chunks = [chunk for chunk in chunks if chunk["type"] == "image"]
         text_chunks = [chunk for chunk in chunks if chunk["type"] == "encoded_text"]
@@ -95,18 +96,21 @@ class OpenPIPi05ActionSession:
             raise ValueError("OpenPI pi0.5 action inference expects exactly one encoded_text chunk")
 
         images = {
-            name: _decode_image(chunk)[None, ...]
+            name: jnp.asarray(_decode_image(chunk)[None, ...], dtype=jnp.uint8)
             for name, chunk in zip(self._camera_layout, image_chunks, strict=True)
         }
-        image_mask = {name: np.asarray([True], dtype=np.bool_) for name in self._camera_layout}
+        image_mask = {name: jnp.asarray([True], dtype=jnp.bool_) for name in self._camera_layout}
 
         state = _tensor_to_numpy(payload["extra_inputs"]["state"], dtype=np.float32)
         if state.ndim != 1:
             state = state.reshape(-1)
-        state = _pad([float(x) for x in state.tolist()], self._action_dim)[None, ...]
+        state = jnp.asarray(
+            _pad([float(x) for x in state.tolist()], self._action_dim)[None, ...],
+            dtype=jnp.float32,
+        )
 
-        prompt_tokens = np.asarray(text_chunks[0]["tokens"], dtype=np.int32)[None, ...]
-        prompt_mask = np.ones_like(prompt_tokens, dtype=np.bool_)
+        prompt_tokens = jnp.asarray(text_chunks[0]["tokens"], dtype=jnp.int32)[None, ...]
+        prompt_mask = jnp.ones_like(prompt_tokens, dtype=jnp.bool_)
 
         return self._openpi_model.Observation.from_dict(
             {
@@ -186,4 +190,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

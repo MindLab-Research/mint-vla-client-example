@@ -250,12 +250,13 @@ class OpenPIPi05WorkerSession:
         return optimizer_cfg.create(lr, weight_decay_mask=None)
 
     def _observation_from_payload(self, item: dict[str, Any]):
+        jnp = self._jnp
         images = {
-            key: np.expand_dims(_decode_image(value), axis=0)
+            key: jnp.asarray(np.expand_dims(_decode_image(value), axis=0), dtype=jnp.uint8)
             for key, value in dict(item["image_bytes"]).items()
         }
         image_mask = {
-            key: np.asarray([bool(value)], dtype=np.bool_)
+            key: jnp.asarray([bool(value)], dtype=jnp.bool_)
             for key, value in dict(item["image_mask"]).items()
         }
 
@@ -263,12 +264,12 @@ class OpenPIPi05WorkerSession:
             {
                 "image": images,
                 "image_mask": image_mask,
-                "state": np.asarray([item["state"]], dtype=np.float32),
-                "tokenized_prompt": np.asarray([item["tokenized_prompt"]], dtype=np.int32),
-                "tokenized_prompt_mask": np.asarray([item["tokenized_prompt_mask"]], dtype=np.bool_),
+                "state": jnp.asarray([item["state"]], dtype=jnp.float32),
+                "tokenized_prompt": jnp.asarray([item["tokenized_prompt"]], dtype=jnp.int32),
+                "tokenized_prompt_mask": jnp.asarray([item["tokenized_prompt_mask"]], dtype=jnp.bool_),
             }
         )
-        actions = np.asarray(item["actions"], dtype=np.float32)[None, ...]
+        actions = jnp.asarray(item["actions"], dtype=jnp.float32)[None, ...]
         return observation, actions
 
     def _grad_and_param_norm(self, model: Any, grads: Any) -> tuple[float, float]:
@@ -519,4 +520,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
