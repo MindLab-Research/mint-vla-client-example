@@ -44,9 +44,23 @@ def _ensure_ray_stubbed() -> None:
         ray_util = types.ModuleType("ray.util")
         ray_util.__spec__ = importlib.machinery.ModuleSpec("ray.util", loader=None)
         ray.util = ray_util  # type: ignore[attr-defined]
+    ray_sched = sys.modules.get("ray.util.scheduling_strategies")
+    if ray_sched is None:
+        ray_sched = types.ModuleType("ray.util.scheduling_strategies")
+        ray_sched.__spec__ = importlib.machinery.ModuleSpec(
+            "ray.util.scheduling_strategies", loader=None
+        )
+
+        class NodeAffinitySchedulingStrategy:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        ray_sched.NodeAffinitySchedulingStrategy = NodeAffinitySchedulingStrategy  # type: ignore[attr-defined]
 
     _install_stub("ray", ray)
     _install_stub("ray.util", ray_util)
+    _install_stub("ray.util.scheduling_strategies", ray_sched)
 
 
 def _ensure_peft_stubbed() -> None:
@@ -122,7 +136,7 @@ def test_ray_kill_verify_absent_polls_until_lookup_fails(monkeypatch):
 
     monkeypatch.setattr(ray_kill.ray, "kill", lambda actor, no_restart=True: kill_calls.append((actor, no_restart)))
     monkeypatch.setattr(ray_kill.ray, "get_actor", fake_get_actor)
-    monkeypatch.setattr(ray_kill, "_remove_placement_group_for_actor_name", lambda _actor_name: None)
+    monkeypatch.setattr(ray_kill, "_remove_placement_group_for_actor_name", lambda _actor_name, _namespace: None)
     monkeypatch.setattr(ray_kill.time, "sleep", lambda _s: None)
 
     actor = object()

@@ -172,6 +172,9 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
         "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
         "PYTHONPATH": pythonpath,
     }
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is not None:
+        out["RAY_ADDRESS"] = ray_address
     config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
     if config_path is not None:
         out["TINKER_CONFIG_PATH"] = config_path
@@ -185,6 +188,18 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
     if extra:
         out.update(extra)
     return out
+
+def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, object]:
+    runtime_env: dict[str, object] = {
+        "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
+    }
+    py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
+    if py_modules_csv:
+        runtime_env["py_modules"] = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
+    working_dir = _env_nonempty(os.environ, "MINT_RAY_WORKING_DIR")
+    if working_dir:
+        runtime_env["working_dir"] = working_dir
+    return runtime_env
 
 
 def preferred_vllm_python_executable() -> str | None:

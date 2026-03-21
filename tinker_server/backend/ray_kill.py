@@ -8,6 +8,8 @@ from typing import Any
 
 import ray
 
+from .ray_placement_groups import remove_named_placement_group
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_VERIFY_TIMEOUT_S = 10.0
@@ -44,26 +46,18 @@ def _verify_named_actor_absent(
             )
         time.sleep(poll_interval_s)
 
-def _remove_placement_group_for_actor_name(actor_name: str | None) -> None:
+def _remove_placement_group_for_actor_name(actor_name: str | None, namespace: str | None) -> None:
     if not actor_name:
         return
 
     pg_name = f"{actor_name}_pg"
     try:
-        from ray.util import get_placement_group, remove_placement_group
-    except Exception:
-        return
-
-    try:
-        pg = get_placement_group(pg_name)
-    except Exception:
-        return
-
-    try:
-        remove_placement_group(pg)
-        logger.warning(f"[ray.kill] removed placement_group={pg_name}")
+        removed = remove_named_placement_group(pg_name, namespace=namespace)
     except Exception as e:
         logger.warning(f"[ray.kill] failed remove placement_group={pg_name}: {type(e).__name__}: {e}")
+        return
+    if removed:
+        logger.warning(f"[ray.kill] removed placement_group={pg_name}")
 
 
 def kill(
@@ -97,7 +91,7 @@ def kill(
     else:
         ray.kill(actor, no_restart=no_restart)
 
-    _remove_placement_group_for_actor_name(actor_name)
+    _remove_placement_group_for_actor_name(actor_name, namespace)
     if verify_absent:
         if not actor_name or not namespace:
             raise ValueError("verify_absent=True requires actor_name and namespace")

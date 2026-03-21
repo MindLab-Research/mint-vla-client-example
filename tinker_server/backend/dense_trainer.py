@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import ray
 
 from . import ray_kill
+from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .resource_pool import ActorType, get_resource_pool
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
@@ -108,14 +109,26 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
 def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> ray.util.placement_group.PlacementGroup:
     """Ensure a detached 1-GPU placement group exists for this actor."""
     pg_name = _pg_name(actor_name)
+    bundle = {"GPU": 1, "CPU": 1}
+    preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
+    if preferred_ip:
+        bundle[f"node:{preferred_ip}"] = 0.001
+        logger.info("Dense trainer pin model=%s node_ip=%s", model_key or base_model, preferred_ip)
     try:
-        pg = ray.util.get_placement_group(pg_name)
+        pg = get_named_placement_group(
+            pg_name,
+            namespace=PERSISTENT_DENSE_NAMESPACE,
+            expected_bundles=[bundle],
+        )
+    except PlacementGroupMismatchError as e:
+        ray.util.remove_placement_group(e.pg)
+        pg = ray.util.placement_group(
+            [bundle],
+            strategy="PACK",
+            name=pg_name,
+            lifetime="detached",
+        )
     except Exception:
-        bundle = {"GPU": 1, "CPU": 1}
-        preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
-        if preferred_ip:
-            bundle[f"node:{preferred_ip}"] = 0.001
-            logger.info("Dense trainer pin model=%s node_ip=%s", model_key or base_model, preferred_ip)
         pg = ray.util.placement_group(
             [bundle],
             strategy="PACK",
@@ -129,13 +142,19 @@ def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str
 def _remove_pg(actor_name: str) -> None:
     pg_name = _pg_name(actor_name)
     try:
-        pg = ray.util.get_placement_group(pg_name)
+        pg = get_named_placement_group(pg_name, namespace=PERSISTENT_DENSE_NAMESPACE)
     except Exception:
         return
     try:
         ray.util.remove_placement_group(pg)
+        logger.warning("[dense_trainer] removed placement_group=%s actor_name=%s", pg_name, actor_name)
     except Exception:
-        pass
+        logger.warning(
+            "[dense_trainer] failed remove placement_group=%s actor_name=%s",
+            pg_name,
+            actor_name,
+            exc_info=True,
+        )
 
 
 def clear_dense_trainer_session(session_id: str) -> int:
