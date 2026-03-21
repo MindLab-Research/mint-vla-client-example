@@ -51,7 +51,7 @@ That fits language models and could be stretched for `pi0-fast`, but it is the w
 Recommendation:
 
 - add `ActionSamplingClient`
-- add `create_action_sampling_session`
+- add `create_action_session`
 - add `act(...)`
 - return action tensors and diagnostics, not token sequences
 
@@ -255,7 +255,7 @@ This keeps training close to Tinker:
 
 Add a dedicated backend, for example:
 
-- `tinker_server/backend/openpi_flow_training.py`
+- `tinker_server/backend/openpi_pi05_training.py`
 
 Responsibilities:
 
@@ -277,7 +277,7 @@ Flow inference needs its own serving path.
 
 Recommended API shape:
 
-- `create_action_sampling_session(...)`
+- `create_action_session(...)`
 - `ActionSamplingClient.act(...)`
 - result contains:
   - `actions`

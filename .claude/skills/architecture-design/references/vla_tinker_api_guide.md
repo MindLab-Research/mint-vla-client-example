@@ -2,7 +2,7 @@
 
 This document is for users who already know the OpenPI workflow and want to understand what Mint is trying to preserve and what it is trying to improve. The goal is not to replace OpenPI's model logic or claim that the original repo workflow is wrong. The goal is to expose the same model families through a service-style API that is easier to integrate into larger training and deployment systems.
 
-The code examples below describe the intended Mint/Tinker client surface. They are target API sketches, not a claim that every method shown here already exists in production.
+The code examples below describe the intended Mint client surface (Tinker-style). The user entrypoint is `import mint` (provided by `src/mindlab-toolkit`), which re-exports a Tinker-compatible client plus a Mint-owned action inference client.
 
 ## Why prefer a Tinker-style API
 
@@ -102,15 +102,19 @@ If `pi0-fast` and `pi0.5` are both exposed through the same Tinker-like client p
 from __future__ import annotations
 
 import numpy as np
-import tinker
-from tinker import types
+import mint
+
+types = mint.types
 
 
-service = tinker.ServiceClient(user_metadata={"project": "robot-pick-place"})
+service = mint.ServiceClient(base_url="REPLACE_WITH_BASE_URL", api_key="REPLACE_WITH_API_KEY")
 
 training_client = service.create_lora_training_client(
-    base_model="openpi/pi0-fast",
-    rank=32,
+    base_model="openpi/pi0-fast-libero-low-mem-finetune",
+    rank=16,
+    train_attn=True,
+    train_mlp=True,
+    train_unembed=True,
 )
 
 
@@ -131,10 +135,26 @@ def build_pi0_fast_datum(
             ]
         ),
         loss_fn_inputs={
-            "state": types.TensorData.from_numpy(state.astype(np.float32)),
-            "target_tokens": types.TensorData.from_numpy(target_action_tokens.astype(np.int64)),
-            "weights": types.TensorData.from_numpy(weights.astype(np.float32)),
-            "token_ar_mask": types.TensorData.from_numpy(token_ar_mask.astype(np.int64)),
+            "state": types.TensorData(
+                data=state.astype(np.float32).reshape(-1).tolist(),
+                shape=[int(state.size)],
+                dtype="float32",
+            ),
+            "target_tokens": types.TensorData(
+                data=target_action_tokens.astype(np.int64).reshape(-1).tolist(),
+                shape=[int(target_action_tokens.size)],
+                dtype="int64",
+            ),
+            "weights": types.TensorData(
+                data=weights.astype(np.float32).reshape(-1).tolist(),
+                shape=[int(weights.size)],
+                dtype="float32",
+            ),
+            "token_ar_mask": types.TensorData(
+                data=token_ar_mask.astype(np.int64).reshape(-1).tolist(),
+                shape=[int(token_ar_mask.size)],
+                dtype="int64",
+            ),
         },
     )
 
@@ -160,7 +180,8 @@ optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 fwdbwd_result = fwdbwd_future.result()
 optim_result = optim_future.result()
 
-action_client = training_client.save_weights_and_get_action_sampling_client()
+save_name = "pi0-fast-example"
+action_client = training_client.save_weights_and_get_action_sampling_client(save_name)
 
 action_result = action_client.act(
     observation=types.ModelInput(
@@ -172,11 +193,17 @@ action_result = action_client.act(
         ]
     ),
     extra_inputs={
-        "state": types.TensorData.from_numpy(np.zeros([8], dtype=np.float32)),
+        "state": types.TensorData(
+            data=np.zeros([8], dtype=np.float32).tolist(),
+            shape=[8],
+            dtype="float32",
+        ),
     },
 ).result()
 
-actions = action_result.actions.to_numpy()
+actions = np.asarray(action_result["actions"]["data"], dtype=np.float32).reshape(
+    action_result["actions"]["shape"]
+)
 ```
 
 ### Why this is a good fit
@@ -197,15 +224,19 @@ The main difference is that the backend interprets the target as action tokens i
 from __future__ import annotations
 
 import numpy as np
-import tinker
-from tinker import types
+import mint
+
+types = mint.types
 
 
-service = tinker.ServiceClient(user_metadata={"project": "robot-pick-place"})
+service = mint.ServiceClient(base_url="REPLACE_WITH_BASE_URL", api_key="REPLACE_WITH_API_KEY")
 
 training_client = service.create_lora_training_client(
-    base_model="openpi/pi0.5",
-    rank=32,
+    base_model="openpi/pi05-libero-low-mem-finetune",
+    rank=16,
+    train_attn=True,
+    train_mlp=True,
+    train_unembed=True,
 )
 
 
@@ -224,8 +255,16 @@ def build_pi05_flow_datum(
             ]
         ),
         loss_fn_inputs={
-            "state": types.TensorData.from_numpy(state.astype(np.float32)),
-            "actions": types.TensorData.from_numpy(target_actions.astype(np.float32)),
+            "state": types.TensorData(
+                data=state.astype(np.float32).reshape(-1).tolist(),
+                shape=[int(state.size)],
+                dtype="float32",
+            ),
+            "actions": types.TensorData(
+                data=target_actions.astype(np.float32).reshape(-1).tolist(),
+                shape=[int(target_actions.shape[0]), int(target_actions.shape[1])],
+                dtype="float32",
+            ),
         },
     )
 
@@ -249,7 +288,8 @@ optim_future = training_client.optim_step(types.AdamParams(learning_rate=1e-4))
 fwdbwd_result = fwdbwd_future.result()
 optim_result = optim_future.result()
 
-action_client = training_client.save_weights_and_get_action_sampling_client()
+save_name = "pi05-example"
+action_client = training_client.save_weights_and_get_action_sampling_client(save_name)
 
 action_result = action_client.act(
     observation=types.ModelInput(
@@ -261,14 +301,17 @@ action_result = action_client.act(
         ]
     ),
     extra_inputs={
-        "state": types.TensorData.from_numpy(np.zeros([8], dtype=np.float32)),
-    },
-    inference_config={
-        "num_steps": 10,
+        "state": types.TensorData(
+            data=np.zeros([8], dtype=np.float32).tolist(),
+            shape=[8],
+            dtype="float32",
+        ),
     },
 ).result()
 
-actions = action_result.actions.to_numpy()
+actions = np.asarray(action_result["actions"]["data"], dtype=np.float32).reshape(
+    action_result["actions"]["shape"]
+)
 ```
 
 ### Why this still feels like Tinker
