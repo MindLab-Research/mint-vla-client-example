@@ -14,6 +14,8 @@ from typing import Any
 
 from ..config import otel_env_vars
 
+_ACTOR_HANDLE = None
+
 
 async def _await_ray_ref(ref: Any) -> Any:
     if hasattr(ref, "__await__"):
@@ -51,10 +53,12 @@ def _actor_name() -> str:
 def _get_or_create_actor():
     import ray
 
+    global _ACTOR_HANDLE
     name = _actor_name()
     namespace = _ray_namespace()
     try:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
     except ValueError:
         pass
 
@@ -104,14 +108,16 @@ def _get_or_create_actor():
     )
 
     try:
-        return _GatewaySessionStoreActor.options(
+        _ACTOR_HANDLE = _GatewaySessionStoreActor.options(
             **options
         ).remote()
+        return _ACTOR_HANDLE
     except Exception as e:
         # Concurrency: another process may have created the detached actor after our initial
         # ray.get_actor(name) check but before this .remote() call.
         try:
-            return ray.get_actor(name, namespace=namespace)
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+            return _ACTOR_HANDLE
         except Exception:
             raise RuntimeError(
                 f"Failed to create detached gateway session store actor name={name!r} namespace={namespace!r}: "
@@ -134,6 +140,27 @@ def _ensure_ray_initialized() -> None:
         raise RuntimeError("Ray is not initialized after init_ray() for gateway session store")
 
 
+def _get_cached_actor_for_async_request_path():
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    if _ACTOR_HANDLE is None:
+        raise RuntimeError("Gateway session store actor is not ready on this API server")
+    return _ACTOR_HANDLE
+
+
+def ensure_ready() -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = ray.get(actor.list.remote())
+    if not isinstance(out, dict):
+        raise TypeError(f"Gateway session store returned non-dict: {type(out)}")
+
+
 def upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
     import ray
 
@@ -148,8 +175,7 @@ def upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, ba
 
 
 async def async_upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     await _await_ray_ref(
         actor.upsert_sampling_session.remote(
             sampling_session_id,
@@ -176,8 +202,7 @@ def get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
 
 
 async def async_get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     info = await _await_ray_ref(actor.get_sampling_session.remote(sampling_session_id))
     if not isinstance(info, dict):
         return None
@@ -199,8 +224,7 @@ def delete_sampling_session(sampling_session_id: str) -> None:
 
 
 async def async_delete_sampling_session(sampling_session_id: str) -> None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     await _await_ray_ref(actor.delete_sampling_session.remote(sampling_session_id))
 
 
@@ -234,8 +258,7 @@ async def async_upsert_training_model(
     base_model: str,
     owner_id: str | None = None,
 ) -> None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     await _await_ray_ref(
         actor.upsert_training_model.remote(
             model_id,
@@ -266,8 +289,7 @@ def get_training_model(model_id: str) -> tuple[str, str] | None:
 
 
 async def async_get_training_model(model_id: str) -> tuple[str, str] | None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     info = await _await_ray_ref(actor.get_training_model.remote(model_id))
     if not isinstance(info, dict):
         return None
@@ -305,8 +327,7 @@ def get_training_model_info(model_id: str) -> dict[str, str | None] | None:
 
 
 async def async_get_training_model_info(model_id: str) -> dict[str, str | None] | None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     info = await _await_ray_ref(actor.get_training_model.remote(model_id))
     if not isinstance(info, dict):
         return None
@@ -335,6 +356,5 @@ def delete_training_model(model_id: str) -> None:
 
 
 async def async_delete_training_model(model_id: str) -> None:
-    _ensure_ray_initialized()
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     await _await_ray_ref(actor.delete_training_model.remote(model_id))

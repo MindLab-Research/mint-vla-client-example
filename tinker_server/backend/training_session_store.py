@@ -19,6 +19,7 @@ from ..config import otel_env_vars
 
 
 logger = logging.getLogger(__name__)
+_ACTOR_HANDLE = None
 
 
 async def _await_ray_ref(ref: Any) -> Any:
@@ -57,10 +58,12 @@ def _actor_name() -> str:
 def _get_or_create_actor():
     import ray
 
+    global _ACTOR_HANDLE
     name = _actor_name()
     namespace = _ray_namespace()
     try:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
     except ValueError:
         pass
 
@@ -126,11 +129,34 @@ def _get_or_create_actor():
     )
 
     try:
-        return _TrainingSessionStoreActor.options(
+        _ACTOR_HANDLE = _TrainingSessionStoreActor.options(
             **options
         ).remote()
+        return _ACTOR_HANDLE
     except Exception:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
+
+
+def _get_cached_actor_for_async_request_path():
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    if _ACTOR_HANDLE is None:
+        raise RuntimeError("Training session store actor is not ready on this API server")
+    return _ACTOR_HANDLE
+
+
+def ensure_ready() -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = ray.get(actor.list.remote())
+    if not isinstance(out, list):
+        raise TypeError(f"Training session store returned non-list: {type(out)}")
 
 
 def upsert_training_session(info: dict[str, Any]) -> None:
@@ -202,11 +228,7 @@ def set_training_session_step(model_id: str, step: int) -> int:
 
 
 async def async_get_training_session_info(model_id: str) -> dict[str, Any] | None:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     out = await _await_ray_ref(actor.get.remote(model_id))
     if out is None:
         return None
@@ -243,11 +265,7 @@ def list_training_sessions() -> list[dict[str, Any]]:
 
 
 async def async_list_training_sessions() -> list[dict[str, Any]]:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     out = await _await_ray_ref(actor.list.remote())
     if not isinstance(out, list):
         raise TypeError(f"Training session store returned non-list: {type(out)}")

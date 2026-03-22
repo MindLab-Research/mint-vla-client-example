@@ -15,6 +15,7 @@ from typing import Any
 from ..config import otel_env_vars
 
 logger = logging.getLogger(__name__)
+_ACTOR_HANDLE = None
 
 
 async def _await_ray_ref(ref: Any) -> Any:
@@ -53,10 +54,12 @@ def _actor_name() -> str:
 def _get_or_create_actor():
     import ray
 
+    global _ACTOR_HANDLE
     name = _actor_name()
     namespace = _ray_namespace()
     try:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
     except ValueError:
         pass
 
@@ -151,11 +154,34 @@ def _get_or_create_actor():
     )
 
     try:
-        return _SessionIndexStore.options(
+        _ACTOR_HANDLE = _SessionIndexStore.options(
             **options
         ).remote()
+        return _ACTOR_HANDLE
     except Exception:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
+
+
+def _get_cached_actor_for_async_request_path():
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    if _ACTOR_HANDLE is None:
+        raise RuntimeError("Session index store actor is not ready on this API server")
+    return _ACTOR_HANDLE
+
+
+def ensure_ready() -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = ray.get(actor.list_sessions.remote())
+    if not isinstance(out, list):
+        raise TypeError(f"Session index store returned non-list: {type(out)}")
 
 
 def upsert_session_index(info: dict[str, Any]) -> None:
@@ -226,11 +252,7 @@ def get_session_index(session_id: str) -> dict[str, Any] | None:
 
 
 async def async_get_session_index(session_id: str) -> dict[str, Any] | None:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     out = await _await_ray_ref(actor.get_session.remote(session_id))
     if out is None:
         return None
@@ -249,11 +271,7 @@ def list_session_index() -> list[dict[str, Any]]:
 
 
 async def async_list_session_index() -> list[dict[str, Any]]:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     out = await _await_ray_ref(actor.list_sessions.remote())
     if not isinstance(out, list):
         raise TypeError(f"Session index store returned non-list: {type(out)}")
@@ -286,11 +304,7 @@ def get_sampler_index(sampler_id: str) -> dict[str, Any] | None:
 
 
 async def async_get_sampler_index(sampler_id: str) -> dict[str, Any] | None:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     out = await _await_ray_ref(actor.get_sampler.remote(sampler_id))
     if out is None:
         return None
@@ -309,11 +323,7 @@ def list_sampler_index() -> list[dict[str, Any]]:
 
 
 async def async_list_sampler_index() -> list[dict[str, Any]]:
-    import ray
-
-    if not ray.is_initialized():
-        raise RuntimeError("Ray not initialized")
-    actor = _get_or_create_actor()
+    actor = _get_cached_actor_for_async_request_path()
     out = await _await_ray_ref(actor.list_samplers.remote())
     if not isinstance(out, list):
         raise TypeError(f"Sampler index store returned non-list: {type(out)}")

@@ -725,6 +725,9 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
+    from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
+    from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
+    from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .checkpoints import (
         get_checkpoint_mirror_poll_s,
         get_checkpoint_reap_interval_s,
@@ -733,6 +736,9 @@ async def lifespan(app: FastAPI):
     )
 
     future_store.ensure_ready()
+    ensure_gateway_session_store_ready()
+    ensure_session_index_store_ready()
+    ensure_training_session_store_ready()
 
     # ==========================================================================
     # Cleanup: Kill stale actors from previous server runs

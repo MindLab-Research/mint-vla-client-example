@@ -907,10 +907,9 @@ class FutureStore:
         payload = None if meta is None else dict(meta)
         try:
             await _await_ray_ref(actor.mark_queued.remote(request_id=request_id, meta=payload))
-        except ray.exceptions.ActorDiedError:
+        except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            await _await_ray_ref(actor.mark_queued.remote(request_id=request_id, meta=payload))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
