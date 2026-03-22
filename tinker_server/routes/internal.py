@@ -235,7 +235,7 @@ async def admission_stats() -> dict:
 
     cap = None
     try:
-        cap = asdict(capacity_manager.snapshot(timeout_s=timeout_s))
+        cap = asdict(await capacity_manager.async_snapshot(timeout_s=timeout_s))
     except Exception as e:
         cap = {"error": f"{type(e).__name__}: {e}"}
 
@@ -249,13 +249,13 @@ async def admission_stats() -> dict:
 
     fs = None
     try:
-        fs = future_store.ensure_ready(timeout_s=timeout_s)
+        fs = await future_store.async_ensure_ready(timeout_s=timeout_s)
     except Exception as e:
         fs = {"error": f"{type(e).__name__}: {e}"}
 
     actors: dict = {}
     try:
-        actors["capacity_manager"] = {"rss_bytes": int(capacity_manager.rss_bytes(timeout_s=timeout_s))}
+        actors["capacity_manager"] = {"rss_bytes": int(await capacity_manager.async_rss_bytes(timeout_s=timeout_s))}
     except Exception as e:
         actors["capacity_manager"] = {"error": f"{type(e).__name__}: {e}"}
 
@@ -265,7 +265,7 @@ async def admission_stats() -> dict:
         actors["api_work_queue"] = {"error": f"{type(e).__name__}: {e}"}
 
     try:
-        actors["future_store"] = {"rss_bytes": int(future_store.rss_bytes(timeout_s=timeout_s))}
+        actors["future_store"] = {"rss_bytes": int(await future_store.async_rss_bytes(timeout_s=timeout_s))}
     except Exception as e:
         actors["future_store"] = {"error": f"{type(e).__name__}: {e}"}
 
@@ -725,7 +725,7 @@ async def work_queue_noop() -> dict:
     route_start_s = time.perf_counter()
     request_id = uuid.uuid4().hex
     request_json = b"{}"
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
@@ -738,9 +738,9 @@ async def work_queue_noop() -> dict:
 
     created = False
     try:
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "internal.noop"})
+        await future_store.async_mark_queued(request_id, meta={"op": "internal.noop"})
         await _enqueue_internal_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -755,7 +755,7 @@ async def work_queue_noop() -> dict:
             ),
         )
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue internal.noop: {e}")

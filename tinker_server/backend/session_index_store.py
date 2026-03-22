@@ -6,6 +6,8 @@ sessions and samplers across API server restarts.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import os
 from typing import Any
@@ -13,6 +15,23 @@ from typing import Any
 from ..config import otel_env_vars
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    if hasattr(ref, "__await__"):
+        return await ref
+
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, asyncio.Future):
+            return await fut
+        if isinstance(fut, concurrent.futures.Future):
+            return await asyncio.wrap_future(fut)
+        if hasattr(fut, "__await__"):
+            return await fut
+
+    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 def _ray_namespace() -> str:
@@ -206,6 +225,20 @@ def get_session_index(session_id: str) -> dict[str, Any] | None:
     return ray.get(actor.get_session.remote(session_id))
 
 
+async def async_get_session_index(session_id: str) -> dict[str, Any] | None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = await _await_ray_ref(actor.get_session.remote(session_id))
+    if out is None:
+        return None
+    if not isinstance(out, dict):
+        raise TypeError(f"Session index store returned non-dict: {type(out)}")
+    return out
+
+
 def list_session_index() -> list[dict[str, Any]]:
     import ray
 
@@ -213,6 +246,18 @@ def list_session_index() -> list[dict[str, Any]]:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.list_sessions.remote())
+
+
+async def async_list_session_index() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = await _await_ray_ref(actor.list_sessions.remote())
+    if not isinstance(out, list):
+        raise TypeError(f"Session index store returned non-list: {type(out)}")
+    return [dict(item) for item in out if isinstance(item, dict)]
 
 
 def upsert_sampler_index(info: dict[str, Any]) -> None:
@@ -240,6 +285,20 @@ def get_sampler_index(sampler_id: str) -> dict[str, Any] | None:
     return ray.get(actor.get_sampler.remote(sampler_id))
 
 
+async def async_get_sampler_index(sampler_id: str) -> dict[str, Any] | None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = await _await_ray_ref(actor.get_sampler.remote(sampler_id))
+    if out is None:
+        return None
+    if not isinstance(out, dict):
+        raise TypeError(f"Sampler index store returned non-dict: {type(out)}")
+    return out
+
+
 def list_sampler_index() -> list[dict[str, Any]]:
     import ray
 
@@ -247,3 +306,15 @@ def list_sampler_index() -> list[dict[str, Any]]:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.list_samplers.remote())
+
+
+async def async_list_sampler_index() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = await _await_ray_ref(actor.list_samplers.remote())
+    if not isinstance(out, list):
+        raise TypeError(f"Sampler index store returned non-list: {type(out)}")
+    return [dict(item) for item in out if isinstance(item, dict)]

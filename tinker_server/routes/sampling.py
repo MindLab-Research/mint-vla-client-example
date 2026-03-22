@@ -223,7 +223,7 @@ async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable)
                 logger.info(f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}")
                 return await task
             try:
-                status = future_store.get_status(request_id)
+                status = await future_store.async_get_status(request_id)
             except KeyError:
                 status = FutureStatus.PENDING
             now = time.monotonic()
@@ -572,9 +572,9 @@ async def asample(
     # Gateway forwarding: if this sampling_session_id was created upstream, proxy the
     # request and return a gateway-encoded request_id so /retrieve_future can route it.
     from ..gateway import (
+        async_remote_sampling_session,
         encode_request_id,
         forward_json,
-        remote_sampling_session,
         upstream_for_alias,
     )
 
@@ -587,7 +587,7 @@ async def asample(
     is_local = False
     if session_manager is not None:
         is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
-    remote = None if is_local else remote_sampling_session(session_id)
+    remote = None if is_local else await async_remote_sampling_session(session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -658,7 +658,7 @@ async def asample(
         )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import ApiWorkQueueThrottleError, api_work_queue
+    from ..backend.api_work_queue import ApiWorkQueueThrottleError, _unwrap_queue_throttle_error, api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_sampling_result_bytes
 
@@ -682,7 +682,7 @@ async def asample(
     if request.seq_id is not None:
         for attempt in range(2):
             try:
-                ensure = future_store.ensure_pending(
+                ensure = await future_store.async_ensure_pending(
                     request_id=request_id,
                     meta={"payload_hash": payload_hash},
                 )
@@ -704,7 +704,7 @@ async def asample(
                     detail="Duplicate seq_id with different request payload",
                 )
             try:
-                future_store.get_status(request_id)
+                await future_store.async_get_status(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
             except KeyError:
@@ -716,7 +716,7 @@ async def asample(
                 )
             return UntypedAPIFuture(request_id=request_id)
 
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_sampling_result_bytes(request),
@@ -740,9 +740,9 @@ async def asample(
     created = False
     try:
         if not created_pending:
-            future_store.create_with_id(request_id)
+            await future_store.async_create_with_id(request_id)
             created = True
-        future_store.mark_queued(
+        await future_store.async_mark_queued(
             request_id,
             meta={
                 "op": "sampling.asample",
@@ -770,7 +770,7 @@ async def asample(
             ),
         )
     except ApiWorkQueueThrottleError as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
                 future_store.forget(request_id)
@@ -787,7 +787,18 @@ async def asample(
         )
         raise HTTPException(status_code=429, detail=e.detail) from e
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        throttle_error = _unwrap_queue_throttle_error(e)
+        if throttle_error is not None:
+            await capacity_manager.async_release_all(request_id)
+            if created_pending:
+                try:
+                    future_store.forget(request_id)
+                except FutureStoreUnavailableError:
+                    raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+            elif created:
+                future_store.cleanup(request_id)
+            raise HTTPException(status_code=429, detail=throttle_error.detail) from e
+        await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
                 future_store.forget(request_id)
@@ -819,7 +830,7 @@ async def sample_once(
     user_id: str | None,
 ) -> SampledSequence:
     """Synchronously execute one sampling request using the multi-LoRA path."""
-    from ..gateway import forward_json, remote_sampling_session, upstream_for_alias
+    from ..gateway import async_remote_sampling_session, forward_json, upstream_for_alias
 
     if _should_backpressure(http_request):
         record_sampling_admission_metric(
@@ -832,7 +843,7 @@ async def sample_once(
     is_local = False
     if session_manager is not None:
         is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
-    remote = None if is_local else remote_sampling_session(session_id)
+    remote = None if is_local else await async_remote_sampling_session(session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1393,7 +1404,7 @@ async def _do_sample(
 
         except asyncio.CancelledError:
             await _abort_engine_request(engine, request_id)
-            future_store.fail(request_id, "sampling task cancelled")
+            await future_store.async_fail(request_id, "sampling task cancelled")
             logger.warning(
                 "[sampling.asample] canceled request_id=%s session_id=%s next_action=%s",
                 str(request_id),
@@ -1411,7 +1422,7 @@ async def _do_sample(
                 type(e).__name__,
                 "check_sampling_session_and_vllm_actor",
             )
-            future_store.fail(request_id, str(e))
+            await future_store.async_fail(request_id, str(e))
     finally:
         if resource_pool is not None and resource_pool_actor_name is not None:
             resource_pool.mark_inflight(resource_pool_actor_name, -1)
@@ -1433,9 +1444,9 @@ async def compute_logprobs(
     """
     route_start_s = time.perf_counter()
     from ..gateway import (
+        async_remote_sampling_session,
         encode_request_id,
         forward_json,
-        remote_sampling_session,
         upstream_for_alias,
     )
 
@@ -1444,7 +1455,7 @@ async def compute_logprobs(
         is_local = session_manager.is_multi_lora_session(request.sampling_session_id) or (
             session_manager.get_engine(request.sampling_session_id) is not None
         )
-    remote = None if is_local else remote_sampling_session(request.sampling_session_id)
+    remote = None if is_local else await async_remote_sampling_session(request.sampling_session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1511,7 +1522,7 @@ async def compute_logprobs(
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_compute_logprobs_result_bytes(request),
@@ -1529,9 +1540,9 @@ async def compute_logprobs(
 
     created = False
     try:
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
+        await future_store.async_mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
         base_model = session_manager.get_session_base_model(request.sampling_session_id) if session_manager is not None else None
         await _enqueue_sampling_request_with_trace(
             route_start_s=route_start_s,
@@ -1549,7 +1560,7 @@ async def compute_logprobs(
             ),
         )
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
@@ -1662,7 +1673,7 @@ async def _do_compute_logprobs(
             type(e).__name__,
             "check_sampling_session_and_token_length",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))
     finally:
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)

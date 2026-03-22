@@ -828,6 +828,21 @@ async def lifespan(app: FastAPI):
     await _prewarm_persistent_models(train_engine, multi_model_manager)
 
     # ==========================================================================
+    # OpenAI compat: preload tokenizers so request paths stay non-blocking
+    # ==========================================================================
+    try:
+        preload_failures = openai_compat.preload_supported_tokenizers()
+        if preload_failures:
+            logger.warning(
+                "OpenAI-compatible tokenizer preload incomplete: %s",
+                preload_failures,
+            )
+        else:
+            logger.info("OpenAI-compatible tokenizers preloaded")
+    except Exception as e:
+        logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+
+    # ==========================================================================
     # Issue #84: Admission control + API work queue workers + future reaper
     # ==========================================================================
     from .backend.api_work_queue import api_work_queue
@@ -1263,6 +1278,8 @@ async def lifespan(app: FastAPI):
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+
+    openai_compat.shutdown_tokenizer_executor()
 
     from .usage_store import close_usage_store
 

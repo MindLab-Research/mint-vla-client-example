@@ -46,7 +46,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
-        def try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
+        async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             self.calls.append(
                 {
                     "request_id": request_id,
@@ -56,7 +56,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
             )
             return {"ok": True}
 
-        def release_all(self, request_id: str) -> None:
+        async def async_release_all(self, request_id: str) -> None:
             return None
 
     class StubWorkQueue:
@@ -85,10 +85,10 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
             )
 
     class StubFutureStore:
-        def create_with_id(self, request_id: str) -> None:
+        async def async_create_with_id(self, request_id: str) -> None:
             return None
 
-        def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             return None
 
         def cleanup(self, request_id: str) -> None:
@@ -283,11 +283,11 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     )
 
     class StubCapacityManager:
-        def try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
+        async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
 
-        def release_all(self, request_id: str) -> None:
+        async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
     class StubWorkQueue:
@@ -316,10 +316,10 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
             )
 
     class StubFutureStore:
-        def create_with_id(self, request_id: str) -> None:
+        async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
-        def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             _ = (request_id, meta)
 
         def cleanup(self, request_id: str) -> None:

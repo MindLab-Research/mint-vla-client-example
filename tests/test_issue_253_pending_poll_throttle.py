@@ -11,11 +11,11 @@ class _StubFutureStore:
         self.status_calls = 0
         self.meta_calls = 0
 
-    def get_status(self, request_id: str) -> FutureStatus:
+    async def async_get_status(self, request_id: str) -> FutureStatus:
         self.status_calls += 1
         return FutureStatus.PENDING
 
-    def get_meta(self, request_id: str):
+    async def async_get_meta(self, request_id: str):
         self.meta_calls += 1
         return {}
 

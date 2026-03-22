@@ -22,12 +22,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request, is_admin_user_data
+from ..backend.async_ray_control import async_kill_named_actor
 from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..health_checks import public_healthz_response
 from ..model_access_control import can_access_model, get_access_denied_error
@@ -290,7 +290,7 @@ async def _create_sampling_session_impl(
 
     # Gateway forwarding: if base_model is configured as remote, proxy to upstream and
     # return upstream sampling_session_id (tracking it for subsequent asample routing).
-    from ..gateway import forward_json, register_remote_sampling_session, upstream_for_model
+    from ..gateway import async_register_remote_sampling_session, forward_json, upstream_for_model
 
     upstream = upstream_for_model(base_model)
     if upstream is not None:
@@ -317,7 +317,7 @@ async def _create_sampling_session_impl(
                 status_code=502, detail="Upstream create_sampling_session returned invalid sampling_session_id"
             )
 
-        register_remote_sampling_session(
+        await async_register_remote_sampling_session(
             sampling_session_id=sampling_session_id_remote,
             upstream_alias=upstream.alias,
             base_model=base_model,
@@ -468,7 +468,7 @@ async def ensure_sampling_session(
     parent_session_id: str | None = None,
 ) -> tuple[str, str]:
     """Ensure a sampling session exists for an OpenAI-compatible request."""
-    from ..gateway import remote_sampling_session
+    from ..gateway import async_remote_sampling_session
 
     request_kwargs: dict[str, str] = {
         "session_id": parent_session_id or str(uuid.uuid4()),
@@ -483,7 +483,7 @@ async def ensure_sampling_session(
     sampling_session_id = response.sampling_session_id
     base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
     if base_model is None:
-        remote = remote_sampling_session(sampling_session_id)
+        remote = await async_remote_sampling_session(sampling_session_id)
         if remote is not None:
             _, base_model = remote
 
@@ -500,9 +500,9 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
     request_user_data = _get_user_data(http_request)
     info = None
     try:
-        from ..backend.session_index_store import get_session_index
+        from ..backend.session_index_store import async_get_session_index
 
-        info = await run_in_threadpool(get_session_index, session_id)
+        info = await async_get_session_index(session_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
@@ -528,9 +528,9 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
     seen: set[str] = set()
 
     try:
-        from ..backend.session_index_store import list_session_index
+        from ..backend.session_index_store import async_list_session_index
 
-        infos = await run_in_threadpool(list_session_index)
+        infos = await async_list_session_index()
     except Exception as e:
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
@@ -566,9 +566,9 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
     request_user_data = _get_user_data(http_request)
     info = None
     try:
-        from ..backend.session_index_store import get_sampler_index
+        from ..backend.session_index_store import async_get_sampler_index
 
-        info = await run_in_threadpool(get_sampler_index, sampler_id)
+        info = await async_get_sampler_index(sampler_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
@@ -977,7 +977,7 @@ def _kill_exact_dense_actor(*, actor_name: str) -> int:
     return 1
 
 
-def _kill_dense_actors(base_model: str | None) -> int:
+async def _kill_dense_actors(base_model: str | None) -> int:
     from ..backend.resource_pool import ActorType, get_resource_pool
 
     pool = get_resource_pool()
@@ -988,39 +988,17 @@ def _kill_dense_actors(base_model: str | None) -> int:
     ]
 
     killed = 0
-    try:
-        import ray
-        from ..backend import ray_kill
-        from ..config import RAY_NAMESPACE
-        from ..ray_utils import init_ray
-
-        if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
-        for e in targets:
-            try:
-                actor = ray.get_actor(e.actor_name, namespace=e.namespace)
-                ray_kill.kill(
-                    actor,
-                    reason="dense_kill_by_api",
-                    actor_name=e.actor_name,
-                    namespace=e.namespace,
-                    base_model=e.base_model,
-                    no_restart=True,
-                )
-            except Exception:
-                pass
-            pool.unregister(e.actor_name)
-            try:
-                pg = ray.util.get_placement_group(f"{e.actor_name}_pg")
-                ray.util.remove_placement_group(pg)
-            except Exception:
-                pass
-            killed += 1
-    except Exception:
-        for e in targets:
-            pool.unregister(e.actor_name)
-            killed += 1
+    for e in targets:
+        try:
+            await async_kill_named_actor(
+                e.actor_name,
+                e.namespace,
+                base_model=e.base_model,
+            )
+        except Exception:
+            pass
+        pool.unregister(e.actor_name)
+        killed += 1
     return killed
 
 
@@ -1077,7 +1055,7 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
             killed_by_type["megatron"] = 1 if kill_megatron_actor(None) else 0
 
     if t in ("dense", "all"):
-        killed_by_type["dense"] = _kill_dense_actors(model_name if t == "dense" else None)
+        killed_by_type["dense"] = await _kill_dense_actors(model_name if t == "dense" else None)
 
     if t not in ("vllm", "megatron", "dense", "all"):
         raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")

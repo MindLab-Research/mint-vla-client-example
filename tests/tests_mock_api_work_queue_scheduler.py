@@ -46,16 +46,14 @@ def _install_ray_stub(monkeypatch) -> None:
 
 
 def _load_api_work_queue_module(monkeypatch):
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-env")
+    monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     _install_ray_stub(monkeypatch)
-    import tinker_server.config as config_mod
+    import tinker_server.config as config_module
     import tinker_server.backend.api_work_queue as api_work_queue
 
-    monkeypatch.setattr(config_mod, "PFS_PYTHONPATH", "")
-    monkeypatch.setattr(
-        config_mod,
-        "actor_runtime_env_vars",
-        lambda *, pythonpath, extra=None: {"PYTHONPATH": pythonpath, **(extra or {})},
-    )
+    importlib.reload(config_module)
     return importlib.reload(api_work_queue)
 
 

@@ -19,10 +19,10 @@ class _StubFutureStore:
     def __init__(self, meta: dict):
         self._meta = dict(meta)
 
-    def get_status(self, request_id: str) -> FutureStatus:
+    async def async_get_status(self, request_id: str) -> FutureStatus:
         return FutureStatus.PENDING
 
-    def get_meta(self, request_id: str):
+    async def async_get_meta(self, request_id: str):
         return dict(self._meta)
 
 
@@ -184,7 +184,10 @@ def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
         )
 
     monkeypatch.setattr(gateway, "forward_json", _forward_json)
-    monkeypatch.setattr(gateway, "maybe_register_sampling_session_from_retrieve_future", lambda **kwargs: None)
+    async def _register_sampling_session(**kwargs):
+        return None
+
+    monkeypatch.setattr(gateway, "async_maybe_register_sampling_session_from_retrieve_future", _register_sampling_session)
 
     body = FutureRetrieveRequest(request_id="gw:upstream-a:encoded-xyz")
     response = _response_stub()
@@ -213,7 +216,10 @@ def test_issue_182_gateway_request_id_overrides_upstream_200(monkeypatch):
         )
 
     monkeypatch.setattr(gateway, "forward_json", _forward_json)
-    monkeypatch.setattr(gateway, "maybe_register_sampling_session_from_retrieve_future", lambda **kwargs: None)
+    async def _register_sampling_session(**kwargs):
+        return None
+
+    monkeypatch.setattr(gateway, "async_maybe_register_sampling_session_from_retrieve_future", _register_sampling_session)
 
     body = FutureRetrieveRequest(request_id="gw:upstream-a:encoded-xyz")
     response = _response_stub()

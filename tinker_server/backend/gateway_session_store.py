@@ -7,10 +7,29 @@ This supports recovery after API server restarts when acting as a gateway/router
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import os
 from typing import Any
 
 from ..config import otel_env_vars
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    if hasattr(ref, "__await__"):
+        return await ref
+
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, asyncio.Future):
+            return await fut
+        if isinstance(fut, concurrent.futures.Future):
+            return await asyncio.wrap_future(fut)
+        if hasattr(fut, "__await__"):
+            return await fut
+
+    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 def _ray_namespace() -> str:
@@ -128,6 +147,17 @@ def upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, ba
     )
 
 
+async def async_upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    await _await_ray_ref(
+        actor.upsert_sampling_session.remote(
+            sampling_session_id,
+            {"upstream_alias": upstream_alias, "base_model": base_model},
+        )
+    )
+
+
 def get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
     import ray
 
@@ -145,12 +175,33 @@ def get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
     return upstream_alias, base_model
 
 
+async def async_get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    info = await _await_ray_ref(actor.get_sampling_session.remote(sampling_session_id))
+    if not isinstance(info, dict):
+        return None
+    upstream_alias = info.get("upstream_alias")
+    base_model = info.get("base_model")
+    if not isinstance(upstream_alias, str) or not isinstance(base_model, str):
+        return None
+    if not upstream_alias or not base_model:
+        return None
+    return upstream_alias, base_model
+
+
 def delete_sampling_session(sampling_session_id: str) -> None:
     import ray
 
     _ensure_ray_initialized()
     actor = _get_or_create_actor()
     ray.get(actor.delete_sampling_session.remote(sampling_session_id))
+
+
+async def async_delete_sampling_session(sampling_session_id: str) -> None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    await _await_ray_ref(actor.delete_sampling_session.remote(sampling_session_id))
 
 
 def upsert_training_model(
@@ -176,12 +227,48 @@ def upsert_training_model(
     )
 
 
+async def async_upsert_training_model(
+    *,
+    model_id: str,
+    upstream_alias: str,
+    base_model: str,
+    owner_id: str | None = None,
+) -> None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    await _await_ray_ref(
+        actor.upsert_training_model.remote(
+            model_id,
+            {
+                "upstream_alias": upstream_alias,
+                "base_model": base_model,
+                "owner_id": owner_id,
+            },
+        )
+    )
+
+
 def get_training_model(model_id: str) -> tuple[str, str] | None:
     import ray
 
     _ensure_ray_initialized()
     actor = _get_or_create_actor()
     info = ray.get(actor.get_training_model.remote(model_id))
+    if not isinstance(info, dict):
+        return None
+    upstream_alias = info.get("upstream_alias")
+    base_model = info.get("base_model")
+    if not isinstance(upstream_alias, str) or not isinstance(base_model, str):
+        return None
+    if not upstream_alias or not base_model:
+        return None
+    return upstream_alias, base_model
+
+
+async def async_get_training_model(model_id: str) -> tuple[str, str] | None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    info = await _await_ray_ref(actor.get_training_model.remote(model_id))
     if not isinstance(info, dict):
         return None
     upstream_alias = info.get("upstream_alias")
@@ -217,9 +304,37 @@ def get_training_model_info(model_id: str) -> dict[str, str | None] | None:
     }
 
 
+async def async_get_training_model_info(model_id: str) -> dict[str, str | None] | None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    info = await _await_ray_ref(actor.get_training_model.remote(model_id))
+    if not isinstance(info, dict):
+        return None
+    upstream_alias = info.get("upstream_alias")
+    base_model = info.get("base_model")
+    owner_id = info.get("owner_id")
+    if not isinstance(upstream_alias, str) or not isinstance(base_model, str):
+        return None
+    if owner_id is not None and not isinstance(owner_id, str):
+        return None
+    if not upstream_alias or not base_model:
+        return None
+    return {
+        "upstream_alias": upstream_alias,
+        "base_model": base_model,
+        "owner_id": owner_id,
+    }
+
+
 def delete_training_model(model_id: str) -> None:
     import ray
 
     _ensure_ray_initialized()
     actor = _get_or_create_actor()
     ray.get(actor.delete_training_model.remote(model_id))
+
+
+async def async_delete_training_model(model_id: str) -> None:
+    _ensure_ray_initialized()
+    actor = _get_or_create_actor()
+    await _await_ray_ref(actor.delete_training_model.remote(model_id))

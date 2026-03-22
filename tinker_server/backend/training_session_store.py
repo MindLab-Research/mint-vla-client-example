@@ -8,6 +8,8 @@ This supports recovery after API server restarts:
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import os
 import time
@@ -17,6 +19,23 @@ from ..config import otel_env_vars
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    if hasattr(ref, "__await__"):
+        return await ref
+
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, asyncio.Future):
+            return await fut
+        if isinstance(fut, concurrent.futures.Future):
+            return await asyncio.wrap_future(fut)
+        if hasattr(fut, "__await__"):
+            return await fut
+
+    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 def _ray_namespace() -> str:
@@ -182,6 +201,20 @@ def set_training_session_step(model_id: str, step: int) -> int:
     return int(ray.get(actor.set_step.remote(model_id, int(step))))
 
 
+async def async_get_training_session_info(model_id: str) -> dict[str, Any] | None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = await _await_ray_ref(actor.get.remote(model_id))
+    if out is None:
+        return None
+    if not isinstance(out, dict):
+        raise TypeError(f"Training session store returned non-dict: {type(out)}")
+    return out
+
+
 def set_training_session_step_best_effort(model_id: str, step: int) -> None:
     import ray
 
@@ -207,3 +240,15 @@ def list_training_sessions() -> list[dict[str, Any]]:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.list.remote())
+
+
+async def async_list_training_sessions() -> list[dict[str, Any]]:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = await _await_ray_ref(actor.list.remote())
+    if not isinstance(out, list):
+        raise TypeError(f"Training session store returned non-list: {type(out)}")
+    return [dict(item) for item in out if isinstance(item, dict)]

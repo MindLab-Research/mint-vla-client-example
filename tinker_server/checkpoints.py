@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import os
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 import fcntl
@@ -364,6 +366,50 @@ def create_checkpoint_archive(checkpoint_dir: str, archive_path: str) -> None:
 
     with tarfile.open(archive_path, "w:gz") as tf:
         tf.add(checkpoint_dir, arcname=root, recursive=True)
+
+
+def build_gateway_proxy_archive_path() -> str:
+    archive_dir = os.path.join(get_runtime_checkpoints_dir(), "gateway_proxy_archives")
+    os.makedirs(archive_dir, exist_ok=True)
+    return os.path.join(archive_dir, f"gateway_ckpt_proxy_{uuid.uuid4().hex}.tar.gz")
+
+
+@lru_cache(maxsize=1)
+def _create_checkpoint_archive_remote():
+    import ray
+
+    @ray.remote(num_cpus=1)
+    def _task(checkpoint_dir: str, archive_path: str) -> str:
+        create_checkpoint_archive(checkpoint_dir, archive_path)
+        return archive_path
+
+    return _task
+
+
+async def async_create_checkpoint_archive(
+    checkpoint_dir: str,
+    archive_path: str,
+    *,
+    timeout_s: float = 600.0,
+) -> None:
+    from .backend.async_ray_control import _await_ray_ref, _ensure_ray_initialized
+
+    import ray
+
+    if not os.path.isdir(checkpoint_dir):
+        raise ValueError(f"Checkpoint dir is not a directory: {checkpoint_dir}")
+
+    archive_dir = os.path.dirname(os.path.abspath(archive_path))
+    if archive_dir:
+        os.makedirs(archive_dir, exist_ok=True)
+
+    _ensure_ray_initialized()
+    ref = _create_checkpoint_archive_remote().remote(str(checkpoint_dir), str(archive_path))
+    try:
+        await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+    except asyncio.TimeoutError:
+        ray.cancel(ref, force=True)
+        raise
 
 
 def _iter_metadata_paths(

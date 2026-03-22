@@ -1,0 +1,879 @@
+from __future__ import annotations
+
+import sys
+import types
+from types import SimpleNamespace
+from concurrent.futures import Future
+
+import anyio
+import pytest
+
+from tinker_server.backend.future_store import FutureStatus
+from tinker_server.models.types import (
+    AdamParams,
+    FutureRetrieveRequest,
+    ModelInput,
+    OptimStepRequest,
+    SampleRequest,
+    SamplingParams,
+)
+from tinker_server.routes import futures as futures_route
+from tinker_server.routes import internal as internal_route
+from tinker_server.routes import sampling as sampling_route
+from tinker_server.routes import service as service_route
+from tinker_server.routes import training as training_route
+
+
+@pytest.fixture(autouse=True)
+def _reset_retrieve_future_caches(monkeypatch):
+    monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
+    monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
+
+
+def _request_stub(user_id: str = "admin"):
+    return SimpleNamespace(state=SimpleNamespace(user_data={"user_id": user_id}), headers={})
+
+
+def _response_stub():
+    return SimpleNamespace(status_code=200, headers={})
+
+
+class _AsyncOnlyPendingFutureStore:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    async def async_get_status(self, request_id: str) -> FutureStatus:
+        self.calls.append(("async_get_status", request_id))
+        return FutureStatus.PENDING
+
+    async def async_get_meta(self, request_id: str):
+        self.calls.append(("async_get_meta", request_id))
+        return {"queue_state": "queued", "stage": "queued", "op": "sampling.asample"}
+
+    def get_status(self, request_id: str) -> FutureStatus:
+        raise AssertionError("sync get_status should not be used on request path")
+
+    def get_meta(self, request_id: str):
+        raise AssertionError("sync get_meta should not be used on request path")
+
+
+class _AsyncOnlyTerminalFutureStore:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self.cleanup_calls: list[str] = []
+
+    async def async_get_status(self, request_id: str) -> FutureStatus:
+        self.calls.append(("async_get_status", request_id))
+        return FutureStatus.DONE
+
+    async def async_get_result(self, request_id: str):
+        self.calls.append(("async_get_result", request_id))
+        return {"ok": request_id}
+
+    async def async_get_error(self, request_id: str):
+        self.calls.append(("async_get_error", request_id))
+        return None
+
+    def cleanup(self, request_id: str) -> None:
+        self.cleanup_calls.append(request_id)
+
+    def get_status(self, request_id: str) -> FutureStatus:
+        raise AssertionError("sync get_status should not be used on request path")
+
+    def get_result(self, request_id: str):
+        raise AssertionError("sync get_result should not be used on request path")
+
+    def get_error(self, request_id: str):
+        raise AssertionError("sync get_error should not be used on request path")
+
+
+class _AsyncOnlyUnknownFutureStore:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    async def async_get_status(self, request_id: str) -> FutureStatus:
+        self.calls.append(("async_get_status", request_id))
+        raise KeyError(request_id)
+
+    async def async_debug_snapshot(self, *, timeout_s: float = 10.0):
+        self.calls.append(("async_debug_snapshot", str(timeout_s)))
+        return {"status": "debug"}
+
+    def debug_snapshot(self):
+        raise AssertionError("sync debug_snapshot should not be used on request path")
+
+
+class _StubApiWorkQueue:
+    async def find_position(self, request_id: str) -> dict:
+        return {"found": True, "position": 0, "depth": 1}
+
+    async def get_eta_state(self, op: str | None) -> dict:
+        return {"ema_exec_s": 2.0}
+
+    async def stats(self, timeout_s: float = 10.0) -> dict:
+        _ = timeout_s
+        return {"depth": 0}
+
+    async def rss_bytes(self, timeout_s: float = 10.0) -> int:
+        _ = timeout_s
+        return 123
+
+
+class _AsyncOnlySamplingFutureStore:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self.marked: list[str] = []
+
+    async def async_ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
+        self.calls.append(("async_ensure_pending", request_id))
+        return {"created": True, "meta": None}
+
+    async def async_create_with_id(self, request_id: str) -> str:
+        self.calls.append(("async_create_with_id", request_id))
+        return request_id
+
+    async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        self.calls.append(("async_mark_queued", request_id))
+        self.marked.append(request_id)
+
+    def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        self.marked.append(request_id)
+
+    def cleanup(self, request_id: str) -> None:
+        return None
+
+    def forget(self, request_id: str) -> None:
+        return None
+
+    def ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
+        raise AssertionError("sync ensure_pending should not be used on request path")
+
+    def create_with_id(self, request_id: str) -> str:
+        raise AssertionError("sync create_with_id should not be used on request path")
+
+
+class _AsyncOnlyTrainingFutureStore:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self.marked: list[str] = []
+        self.cleaned: list[str] = []
+
+    async def async_create_with_id(self, request_id: str) -> str:
+        self.calls.append(("async_create_with_id", request_id))
+        return request_id
+
+    async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        self.calls.append(("async_mark_queued", request_id))
+        self.marked.append(request_id)
+
+    def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        self.marked.append(request_id)
+
+    def cleanup(self, request_id: str) -> None:
+        self.cleaned.append(request_id)
+
+    def create_with_id(self, request_id: str) -> str:
+        raise AssertionError("sync create_with_id should not be used on request path")
+
+
+class _AsyncOnlyCapacityManager:
+    def __init__(self):
+        self.calls: list[tuple[str, int, int]] = []
+        self.released: list[str] = []
+
+    async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
+        self.calls.append((request_id, int(queue_bytes), int(object_store_bytes)))
+        return {"ok": True}
+
+    async def async_release_all(self, request_id: str) -> None:
+        self.released.append(request_id)
+
+    def release_all(self, request_id: str) -> None:
+        self.released.append(request_id)
+
+    def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+        raise AssertionError("sync try_reserve should not be used on request path")
+
+
+class _RecordingQueue:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def enqueue(self, **kwargs):
+        self.calls.append(dict(kwargs))
+
+
+class _RecordingTrainingManager:
+    def __init__(self):
+        self.sessions: dict[str, object] = {}
+        self.create_calls: list[dict[str, object]] = []
+        self.deleted: list[str] = []
+
+    def get_session(self, model_id: str):
+        return self.sessions.get(model_id)
+
+    def create_session(self, **kwargs):
+        session = SimpleNamespace(
+            model_id=kwargs["model_id"],
+            session_id=kwargs["session_id"],
+            model_seq_id=kwargs["model_seq_id"],
+            base_model=kwargs["base_model"],
+            lora_config=kwargs["lora_config"],
+            rollout_correction_config=kwargs["rollout_correction_config"],
+            user_metadata=kwargs["user_metadata"],
+            user_id=kwargs["user_id"],
+            learning_rate=kwargs["learning_rate"],
+            current_step=0,
+            is_active=False,
+            created_at="",
+            backend="peft",
+        )
+        self.create_calls.append(dict(kwargs))
+        self.sessions[kwargs["model_id"]] = session
+        return session
+
+    def delete_session(self, model_id: str) -> bool:
+        self.deleted.append(model_id)
+        return self.sessions.pop(model_id, None) is not None
+
+
+class _SamplingSessionManager:
+    def is_multi_lora_session(self, _session_id: str) -> bool:
+        return False
+
+    def get_engine(self, _session_id: str):
+        return object()
+
+
+class _AsyncOnlyAdmissionCapacityManager:
+    async def async_snapshot(self, timeout_s: float = 10.0):
+        from tinker_server.backend.capacity_manager import CapacitySnapshot
+
+        _ = timeout_s
+        return CapacitySnapshot(
+            queue_bytes_budget=1,
+            queue_bytes_reserved=2,
+            object_store_bytes_reserved=3,
+            object_store_free_bytes=4,
+            rejects_total=5,
+            reserves_total=6,
+        )
+
+    async def async_rss_bytes(self, timeout_s: float = 10.0) -> int:
+        _ = timeout_s
+        return 111
+
+    def snapshot(self, timeout_s: float = 10.0):
+        raise AssertionError("sync snapshot should not be used on request path")
+
+    def rss_bytes(self, timeout_s: float = 10.0):
+        raise AssertionError("sync rss_bytes should not be used on request path")
+
+
+class _AsyncOnlyAdmissionFutureStore:
+    async def async_ensure_ready(self, timeout_s: float = 10.0):
+        _ = timeout_s
+        return {"pending": 0}
+
+    async def async_rss_bytes(self, timeout_s: float = 10.0) -> int:
+        _ = timeout_s
+        return 222
+
+    def ensure_ready(self, timeout_s: float = 10.0):
+        raise AssertionError("sync ensure_ready should not be used on request path")
+
+    def rss_bytes(self, timeout_s: float = 10.0):
+        raise AssertionError("sync rss_bytes should not be used on request path")
+
+
+def test_issue_360_retrieve_future_pending_uses_async_store_calls(monkeypatch):
+    store = _AsyncOnlyPendingFutureStore()
+    monkeypatch.setattr(futures_route, "future_store", store)
+    import tinker_server.backend.api_work_queue as wq
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue())
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+
+    body = FutureRetrieveRequest(request_id="rid_pending_async")
+    response = _response_stub()
+    payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), response)
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert ("async_get_status", "rid_pending_async") in store.calls
+    assert ("async_get_meta", "rid_pending_async") in store.calls
+
+
+def test_issue_360_retrieve_future_terminal_uses_async_result(monkeypatch):
+    store = _AsyncOnlyTerminalFutureStore()
+    monkeypatch.setattr(futures_route, "future_store", store)
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: False  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+
+    body = FutureRetrieveRequest(request_id="rid_done_async")
+    response = _response_stub()
+    payload = anyio.run(futures_route.retrieve_future, body, _request_stub(), response)
+
+    assert payload == {"ok": "rid_done_async"}
+    assert ("async_get_status", "rid_done_async") in store.calls
+    assert ("async_get_result", "rid_done_async") in store.calls
+    assert store.cleanup_calls == ["rid_done_async"]
+
+
+def test_issue_360_retrieve_future_unknown_admin_uses_async_debug_snapshot(monkeypatch):
+    from fastapi import HTTPException
+
+    store = _AsyncOnlyUnknownFutureStore()
+    monkeypatch.setattr(futures_route, "future_store", store)
+
+    body = FutureRetrieveRequest(request_id="rid_unknown_async")
+    response = _response_stub()
+
+    with pytest.raises(HTTPException) as exc:
+        anyio.run(futures_route.retrieve_future, body, _request_stub(), response)
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail["future_store"] == {"status": "debug"}
+    assert ("async_get_status", "rid_unknown_async") in store.calls
+    assert any(name == "async_debug_snapshot" for name, _value in store.calls)
+
+
+def test_issue_360_asample_admission_uses_async_capacity_and_future(monkeypatch):
+    fs = _AsyncOnlySamplingFutureStore()
+    cap = _AsyncOnlyCapacityManager()
+    q = _RecordingQueue()
+
+    monkeypatch.setattr(sampling_route, "session_manager", _SamplingSessionManager())
+    monkeypatch.setattr(sampling_route, "future_store", fs)
+
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.result_size_estimator as rse
+
+    monkeypatch.setattr(cm, "capacity_manager", cap)
+    monkeypatch.setattr(awq, "api_work_queue", q)
+    monkeypatch.setattr(rse, "estimate_sampling_result_bytes", lambda _req: 0)
+
+    req = SampleRequest(
+        sampling_session_id="sess_async",
+        seq_id=1,
+        num_samples=1,
+        prompt=ModelInput.from_ints([1, 2, 3]),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    out = anyio.run(sampling_route.asample, req, _request_stub("user-a"))
+
+    assert isinstance(out.request_id, str) and out.request_id
+    assert len(cap.calls) == 1
+    assert any(name == "async_ensure_pending" for name, _rid in fs.calls)
+    assert len(q.calls) == 1
+
+
+def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
+    import importlib
+
+    wq = importlib.import_module("tinker_server.backend.api_work_queue")
+    cm = importlib.import_module("tinker_server.backend.capacity_manager")
+    fs = importlib.import_module("tinker_server.backend.future_store")
+    rp = importlib.import_module("tinker_server.backend.resource_pool")
+
+    monkeypatch.setattr(cm, "capacity_manager", _AsyncOnlyAdmissionCapacityManager())
+    monkeypatch.setattr(fs, "future_store", _AsyncOnlyAdmissionFutureStore())
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue())
+    monkeypatch.setattr(
+        rp,
+        "get_resource_pool",
+        lambda: SimpleNamespace(rss_snapshot=lambda timeout_s=10.0: {"rss_bytes": 333}),
+    )
+
+    payload = anyio.run(internal_route.admission_stats)
+
+    assert payload["capacity"]["queue_bytes_budget"] == 1
+    assert payload["future_store"]["pending"] == 0
+    assert payload["actors"]["capacity_manager"]["rss_bytes"] == 111
+    assert payload["actors"]["api_work_queue"]["rss_bytes"] == 123
+    assert payload["actors"]["future_store"]["rss_bytes"] == 222
+
+
+def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(monkeypatch):
+    fs = _AsyncOnlyTrainingFutureStore()
+    cap = _AsyncOnlyCapacityManager()
+    q = _RecordingQueue()
+
+    session = SimpleNamespace(backend="peft", base_model="Qwen/Qwen3-0.6B")
+    async def _restore_training_session(_mid):
+        return None
+
+    monkeypatch.setattr(training_route, "future_store", fs)
+    monkeypatch.setattr(training_route, "training_manager", SimpleNamespace(get_session=lambda _mid: session))
+    monkeypatch.setattr(training_route, "training_engine", object())
+    monkeypatch.setattr(training_route, "_restore_training_session", _restore_training_session)
+
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.result_size_estimator as rse
+
+    monkeypatch.setattr(cm, "capacity_manager", cap)
+    monkeypatch.setattr(awq, "api_work_queue", q)
+    monkeypatch.setattr(rse, "estimate_small_result_bytes", lambda: 0)
+
+    req = OptimStepRequest(
+        model_id="run-360",
+        adam_params=AdamParams(learning_rate=1e-4),
+    )
+    out = anyio.run(training_route.optim_step, req, _request_stub("user-a"))
+
+    assert isinstance(out.request_id, str) and out.request_id
+    assert len(cap.calls) == 1
+    assert any(name == "async_create_with_id" for name, _rid in fs.calls)
+    assert len(q.calls) == 1
+
+
+def test_issue_360_service_get_session_uses_async_index_store(monkeypatch):
+    import tinker_server.backend.session_index_store as sis
+
+    def _sync_get_session_index(_session_id: str):
+        raise AssertionError("sync get_session_index should not be used on request path")
+
+    async def _async_get_session_index(session_id: str):
+        return {
+            "session_id": session_id,
+            "training_run_ids": ["run-360"],
+            "sampler_ids": ["sampler-360"],
+            "user_id": "admin",
+        }
+
+    monkeypatch.setattr(sis, "get_session_index", _sync_get_session_index)
+    monkeypatch.setattr(sis, "async_get_session_index", _async_get_session_index)
+    monkeypatch.setattr(service_route, "sessions", {})
+
+    out = anyio.run(service_route.get_session, "sess-360", _request_stub("admin"))
+
+    assert out.training_run_ids == ["run-360"]
+    assert out.sampler_ids == ["sampler-360"]
+
+
+def test_issue_360_service_list_sessions_uses_async_index_store(monkeypatch):
+    import tinker_server.backend.session_index_store as sis
+
+    def _sync_list_session_index():
+        raise AssertionError("sync list_session_index should not be used on request path")
+
+    async def _async_list_session_index():
+        return [
+            {
+                "session_id": "sess-360-b",
+                "created_at": "2026-03-21T00:00:02",
+                "user_id": "admin",
+            },
+            {
+                "session_id": "sess-360-a",
+                "created_at": "2026-03-21T00:00:01",
+                "user_id": "admin",
+            },
+        ]
+
+    monkeypatch.setattr(sis, "list_session_index", _sync_list_session_index)
+    monkeypatch.setattr(sis, "async_list_session_index", _async_list_session_index)
+    monkeypatch.setattr(service_route, "sessions", {})
+
+    out = anyio.run(service_route.list_sessions, 20, 0, _request_stub("admin"))
+
+    assert out.sessions == ["sess-360-b", "sess-360-a"]
+
+
+def test_issue_360_training_run_metadata_uses_async_store(monkeypatch):
+    import tinker_server.backend.training_session_store as tss
+
+    def _sync_get_training_session_info(_model_id: str):
+        raise AssertionError("sync get_training_session_info should not be used on request path")
+
+    async def _async_get_training_session_info(model_id: str):
+        return {
+            "model_id": model_id,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "user_id": "admin",
+            "created_at": "2026-03-21T00:00:00",
+            "model_seq_id": 1,
+        }
+
+    monkeypatch.setattr(tss, "get_training_session_info", _sync_get_training_session_info)
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+    monkeypatch.setattr(training_route, "training_manager", None)
+
+    out = anyio.run(training_route.get_training_run, "run-360", _request_stub("admin"))
+
+    assert out.training_run_id == "run-360"
+    assert out.base_model == "Qwen/Qwen3-0.6B"
+
+
+class _TrainingManagerStub:
+    def __init__(self):
+        self.sessions: dict[str, SimpleNamespace] = {}
+        self.deleted: list[str] = []
+
+    def get_session(self, model_id: str):
+        return self.sessions.get(model_id)
+
+    def create_session(self, **kwargs):
+        session = SimpleNamespace(
+            model_id=kwargs["model_id"],
+            session_id=kwargs["session_id"],
+            model_seq_id=kwargs["model_seq_id"],
+            base_model=kwargs["base_model"],
+            lora_config=kwargs.get("lora_config"),
+            rollout_correction_config=kwargs.get("rollout_correction_config"),
+            user_metadata=kwargs.get("user_metadata") or {},
+            user_id=kwargs.get("user_id"),
+            learning_rate=kwargs.get("learning_rate", 1e-4),
+            backend="peft",
+            created_at="",
+            current_step=0,
+            is_active=False,
+        )
+        self.sessions[kwargs["model_id"]] = session
+        return session
+
+    def delete_session(self, model_id: str) -> bool:
+        self.deleted.append(model_id)
+        return self.sessions.pop(model_id, None) is not None
+
+
+def _patch_restore_training_info(monkeypatch, info: dict):
+    import tinker_server.backend.training_session_store as tss
+
+    async def _async_get_training_session_info(_model_id: str):
+        return dict(info)
+
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+
+
+def test_issue_360_restore_training_session_binds_async_lookup_actor(monkeypatch):
+    manager = _TrainingManagerStub()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+    worker = object()
+
+    _patch_restore_training_info(
+        monkeypatch,
+        {
+            "model_id": "run-restore-hit",
+            "session_id": "sess-restore-hit",
+            "model_seq_id": 3,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "actor_name": "trainer-a",
+            "namespace": "ns-a",
+            "current_step": 7,
+        },
+    )
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+    monkeypatch.setattr(training_route, "_find_actor_handle", lambda *_args, **_kwargs: None)
+
+    async def _async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 5.0):
+        _ = timeout_s
+        assert actor_name == "trainer-a"
+        assert namespace == "ns-a"
+        return worker
+
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+
+    restored = anyio.run(training_route._restore_training_session, "run-restore-hit")
+
+    assert restored is manager.sessions["run-restore-hit"]
+    assert restored.current_step == 7
+    assert engine._workers["run-restore-hit"] is worker
+    assert engine._resource_pool_actor_names["run-restore-hit"] == "trainer-a"
+    assert manager.deleted == []
+
+
+def test_issue_360_restore_training_session_rolls_back_created_session_on_lookup_miss(monkeypatch):
+    manager = _TrainingManagerStub()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+
+    _patch_restore_training_info(
+        monkeypatch,
+        {
+            "model_id": "run-restore-miss",
+            "session_id": "sess-restore-miss",
+            "model_seq_id": 4,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "actor_name": "trainer-missing",
+            "namespace": "ns-missing",
+        },
+    )
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+    monkeypatch.setattr(training_route, "_find_actor_handle", lambda *_args, **_kwargs: None)
+
+    async def _async_lookup_actor_handle(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+
+    restored = anyio.run(training_route._restore_training_session, "run-restore-miss")
+
+    assert restored is None
+    assert "run-restore-miss" not in manager.sessions
+    assert manager.deleted == ["run-restore-miss"]
+    assert engine._workers == {}
+    assert engine._resource_pool_actor_names == {}
+
+
+def test_issue_360_restore_training_session_without_actor_name_keeps_session_semantics(monkeypatch):
+    manager = _TrainingManagerStub()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+
+    _patch_restore_training_info(
+        monkeypatch,
+        {
+            "model_id": "run-restore-no-actor",
+            "session_id": "sess-restore-no-actor",
+            "model_seq_id": 5,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "peft",
+            "current_step": 9,
+        },
+    )
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+
+    async def _unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("actor lookup should not run when actor_name is absent")
+
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _unexpected_lookup)
+
+    restored = anyio.run(training_route._restore_training_session, "run-restore-no-actor")
+
+    assert restored is manager.sessions["run-restore-no-actor"]
+    assert restored.current_step == 9
+    assert manager.deleted == []
+    assert engine._workers == {}
+    assert engine._resource_pool_actor_names == {}
+
+
+def test_issue_360_restore_training_session_reuses_resource_pool_handle(monkeypatch):
+    manager = _RecordingTrainingManager()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+    worker = object()
+
+    async def _async_get_training_session_info(model_id: str):
+        return {
+            "model_id": model_id,
+            "session_id": "sess-restore",
+            "model_seq_id": 7,
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "user_metadata": {"owner": "u1"},
+            "user_id": "u1",
+            "learning_rate": 2e-4,
+            "backend": "megatron",
+            "created_at": "2026-03-21T00:00:00",
+            "current_step": 9,
+            "actor_name": "trainer-actor",
+            "namespace": "ns-restore",
+        }
+
+    async def _async_lookup_actor_handle(_actor_name: str, _namespace: str, *, timeout_s: float = 5.0):
+        _ = timeout_s
+        raise AssertionError("async actor lookup should not run when a ResourcePool handle is available")
+
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+    monkeypatch.setattr(training_route, "_find_actor_handle", lambda actor_name, namespace: worker)
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+    import tinker_server.backend.training_session_store as tss
+
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+
+    session = anyio.run(training_route._restore_training_session, "run-restore")
+
+    assert session is manager.sessions["run-restore"]
+    assert session.backend == "megatron"
+    assert session.current_step == 9
+    assert session.is_active is True
+    assert engine._workers["run-restore"] is worker
+    assert engine._resource_pool_actor_names["run-restore"] == "trainer-actor"
+
+
+def test_issue_360_restore_training_session_falls_back_to_async_actor_lookup(monkeypatch):
+    manager = _RecordingTrainingManager()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+    worker = object()
+    lookup_calls: list[tuple[str, str, float]] = []
+
+    async def _async_get_training_session_info(model_id: str):
+        return {
+            "model_id": model_id,
+            "session_id": "sess-restore",
+            "model_seq_id": 1,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "user_metadata": {},
+            "user_id": "u1",
+            "learning_rate": 1e-4,
+            "backend": "peft",
+            "created_at": "2026-03-21T00:00:00",
+            "current_step": 3,
+            "actor_name": "trainer-actor",
+            "namespace": "ns-restore",
+        }
+
+    async def _async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 5.0):
+        lookup_calls.append((actor_name, namespace, timeout_s))
+        return worker
+
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+    monkeypatch.setattr(training_route, "_find_actor_handle", lambda actor_name, namespace: None)
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+    import tinker_server.backend.training_session_store as tss
+
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+
+    session = anyio.run(training_route._restore_training_session, "run-restore")
+
+    assert session is manager.sessions["run-restore"]
+    assert lookup_calls == [("trainer-actor", "ns-restore", 5.0)]
+    assert engine._workers["run-restore"] is worker
+    assert engine._resource_pool_actor_names["run-restore"] == "trainer-actor"
+
+
+def test_issue_360_restore_training_session_missing_actor_returns_none(monkeypatch):
+    manager = _RecordingTrainingManager()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+
+    async def _async_get_training_session_info(model_id: str):
+        return {
+            "model_id": model_id,
+            "session_id": "sess-restore",
+            "model_seq_id": 1,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "user_metadata": {},
+            "user_id": "u1",
+            "learning_rate": 1e-4,
+            "backend": "peft",
+            "created_at": "2026-03-21T00:00:00",
+            "current_step": 3,
+            "actor_name": "trainer-actor",
+            "namespace": "ns-restore",
+        }
+
+    async def _async_lookup_actor_handle(_actor_name: str, _namespace: str, *, timeout_s: float = 5.0):
+        _ = timeout_s
+        raise RuntimeError("actor lookup failed")
+
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+    monkeypatch.setattr(training_route, "_find_actor_handle", lambda actor_name, namespace: None)
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+    import tinker_server.backend.training_session_store as tss
+
+    monkeypatch.setattr(tss, "async_get_training_session_info", _async_get_training_session_info)
+
+    session = anyio.run(training_route._restore_training_session, "run-restore")
+
+    assert session is None
+    assert "run-restore" not in manager.sessions
+    assert manager.deleted == ["run-restore"]
+    assert engine._workers == {}
+    assert engine._resource_pool_actor_names == {}
+
+
+def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monkeypatch):
+    unregister_calls: list[str] = []
+    kill_calls: list[tuple[str, str, str | None]] = []
+
+    async def _async_kill_named_actor(actor_name: str, namespace: str, *, base_model: str | None, timeout_s: float = 10.0):
+        _ = timeout_s
+        kill_calls.append((actor_name, namespace, base_model))
+        return True
+
+    pool = SimpleNamespace(
+        iter_entries=lambda: [
+            SimpleNamespace(
+                actor_type="dense",
+                actor_name="dense-a",
+                namespace="ns-dense",
+                base_model="Qwen/Qwen3-0.6B",
+                actor_handle=None,
+            )
+        ],
+        unregister=lambda actor_name: unregister_calls.append(actor_name),
+    )
+
+    import tinker_server.backend.resource_pool as rp
+
+    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
+    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
+
+    killed = anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
+
+    assert killed == 1
+    assert kill_calls == [("dense-a", "ns-dense", "Qwen/Qwen3-0.6B")]
+    assert unregister_calls == ["dense-a"]
+
+
+class _AwaitableObjectRef:
+    def __init__(self, *, result=None, error: Exception | None = None):
+        self._result = result
+        self._error = error
+
+    def __await__(self):
+        async def _run():
+            if self._error is not None:
+                raise self._error
+            return self._result
+
+        return _run().__await__()
+
+    def future(self):
+        fut = Future()
+        if self._error is not None:
+            fut.set_exception(self._error)
+        else:
+            fut.set_result(self._result)
+        return fut
+
+
+class _RemoteCall:
+    def __init__(self, *, result=None, error: Exception | None = None):
+        self._result = result
+        self._error = error
+
+    def remote(self, *args, **kwargs):
+        return _AwaitableObjectRef(result=self._result, error=self._error)
+
+
+def test_issue_360_future_store_async_get_status_backend_api(monkeypatch):
+    import importlib
+
+    fs_module = importlib.import_module("tinker_server.backend.future_store")
+
+    store = fs_module.FutureStore()
+    assert hasattr(store, "async_get_status"), "FutureStore must expose async_get_status for request paths"
+
+    actor = SimpleNamespace(get_status=_RemoteCall(result="done"))
+    monkeypatch.setattr(store, "_get_ray_actor", lambda: actor)
+
+    ray_mod = types.ModuleType("ray")
+
+    class _ActorDiedError(Exception):
+        pass
+
+    class _RayTaskError(Exception):
+        def __init__(self, message: str, *, cause: Exception | None = None):
+            super().__init__(message)
+            self.cause = cause
+
+    ray_mod.exceptions = SimpleNamespace(
+        ActorDiedError=_ActorDiedError,
+        RayTaskError=_RayTaskError,
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+
+    out = anyio.run(store.async_get_status, "rid_backend_async")
+    assert out == FutureStatus.DONE

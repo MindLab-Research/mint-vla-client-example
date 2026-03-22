@@ -21,13 +21,13 @@ class _StubSamplingSessionManager:
 
 
 class _StubFutureStore:
-    def create_with_id(self, _request_id: str):
+    async def async_create_with_id(self, _request_id: str):
         return None
 
-    def mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
+    async def async_mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
         _ = meta
 
-    def ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
+    async def async_ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
         _ = (request_id, meta)
         return {"created": True, "meta": None}
 
@@ -39,11 +39,11 @@ class _StubFutureStore:
 
 
 class _StubCapacityManager:
-    def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+    async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
         _ = (request_id, queue_bytes, object_store_bytes)
         return {"ok": True}
 
-    def release_all(self, _request_id: str) -> None:
+    async def async_release_all(self, _request_id: str) -> None:
         return None
 
 

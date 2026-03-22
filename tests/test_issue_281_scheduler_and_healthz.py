@@ -108,16 +108,33 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
+    async def _async_create_with_id(_request_id):
+        return None
+
+    async def _async_mark_queued(_request_id, meta=None):
+        _ = meta
+        return None
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_release_all(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    async def _restore_training_session(_model_id):
+        return None
+
+    monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_create_with_id,
+            async_mark_queued=_async_mark_queued,
             cleanup=lambda _request_id: None,
         ),
     )
@@ -126,8 +143,8 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_release_all,
         ),
     )
 
@@ -220,15 +237,32 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
+    async def _async_create_with_id(_request_id):
+        return None
+
+    async def _async_mark_queued(_request_id, meta=None):
+        _ = meta
+        return None
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_release_all(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    async def _restore_training_session(_model_id):
+        return None
+
+    monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_create_with_id,
+            async_mark_queued=_async_mark_queued,
             cleanup=lambda _request_id: None,
         ),
     )
@@ -237,8 +271,8 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_release_all,
         ),
     )
     monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
@@ -732,6 +766,108 @@ async def test_issue_281_internal_deep_healthz_pending_pg_is_observation_not_fai
     assert payload["status"] == "ready"
     assert payload["ray_observation"]["reason"] == "pending_placement_groups"
     assert payload["ray_observation"]["pending_pg_names"] == ["pg-a"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_healthz_ray_connect_failure_is_503(monkeypatch) -> None:
+    from tinker_server.routes import service
+
+    _install_ray_stub(monkeypatch)
+
+    async def _raise_connect_error(*, timeout_s: float):
+        _ = timeout_s
+        raise RuntimeError("ray disconnected")
+
+    monkeypatch.setattr(service, "async_pending_gpu_pg_observation", _raise_connect_error)
+
+    response = await service.healthz()
+
+    assert response.status_code == 503
+    assert response.body
+    assert b"ray_unavailable" in response.body
+
+
+@pytest.mark.anyio
+async def test_issue_281_healthz_uninitialized_ray_is_503(monkeypatch) -> None:
+    from tinker_server.routes import service
+
+    ray = types.ModuleType("ray")
+    ray.is_initialized = lambda: False  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+    response = await service.healthz()
+
+    assert response.status_code == 503
+    assert b"ray_unavailable" in response.body
+
+
+@pytest.mark.anyio
+async def test_issue_281_kill_dense_actors_uses_named_actor_helper(monkeypatch) -> None:
+    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.routes import service
+
+    killed: list[tuple[str, str, str | None]] = []
+    unregistered: list[str] = []
+
+    async def _fake_kill(actor_name: str, namespace: str, *, base_model: str | None, timeout_s: float = 10.0):
+        _ = timeout_s
+        killed.append((actor_name, namespace, base_model))
+        return True
+
+    pool = SimpleNamespace(
+        iter_entries=lambda: [
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-a",
+                namespace="ns-a",
+                base_model="model-a",
+                actor_handle=None,
+            )
+        ],
+        unregister=lambda actor_name: unregistered.append(actor_name),
+    )
+
+    monkeypatch.setattr(service, "async_kill_named_actor", _fake_kill)
+    monkeypatch.setattr("tinker_server.backend.resource_pool.get_resource_pool", lambda: pool)
+
+    killed_count = await service._kill_dense_actors("model-a")
+
+    assert killed_count == 1
+    assert killed == [("dense-a", "ns-a", "model-a")]
+    assert unregistered == ["dense-a"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_kill_dense_actors_keeps_best_effort_unregister(monkeypatch) -> None:
+    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.routes import service
+
+    unregistered: list[str] = []
+
+    async def _fake_kill(actor_name: str, namespace: str, *, base_model: str | None, timeout_s: float = 10.0):
+        _ = (actor_name, namespace, base_model, timeout_s)
+        raise RuntimeError("kill failed")
+
+    pool = SimpleNamespace(
+        iter_entries=lambda: [
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-b",
+                namespace="ns-b",
+                base_model="model-b",
+                actor_handle=None,
+            )
+        ],
+        unregister=lambda actor_name: unregistered.append(actor_name),
+    )
+
+    monkeypatch.setattr(service, "async_kill_named_actor", _fake_kill)
+    monkeypatch.setattr("tinker_server.backend.resource_pool.get_resource_pool", lambda: pool)
+
+    killed_count = await service._kill_dense_actors("model-b")
+
+    assert killed_count == 1
+    assert unregistered == ["dense-b"]
 
 
 def test_issue_281_http_route_label_prefers_route_template() -> None:
