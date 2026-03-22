@@ -1591,14 +1591,56 @@ class VerlTrainingEngine:
         actor_name = self._actor_name_for_session(session)
         if not actor_name:
             return
-        volatile_sessions = self._actor_volatile_sessions.setdefault(actor_name, set())
         self._actor_loaded_sessions[actor_name] = session.model_id
         if op in {"forward_backward", "optim_step", "train_step"}:
-            volatile_sessions.add(session.model_id)
+            self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
         if op == "save_weights":
+            volatile_sessions = self._actor_volatile_sessions.get(actor_name)
+            if volatile_sessions is None:
+                return
             volatile_sessions.discard(session.model_id)
             if not volatile_sessions:
                 self._actor_volatile_sessions.pop(actor_name, None)
+
+    def _megatron_op_requires_fail_closed_after_actor_death(self, op: str) -> bool:
+        return op in {
+            "forward_backward",
+            "optim_step",
+            "train_step",
+            "save_weights",
+            "save_lora_weights_for_sampler",
+            "load_weights",
+        }
+
+    def _megatron_missing_actor_recovery_error(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> str | None:
+        if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
+            return None
+        if op == "load_weights":
+            return None
+        from .megatron_distributed import MegatronSessionStateManager
+
+        session_manager = MegatronSessionStateManager()
+        if not session_manager.session_exists(session.model_id):
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, but the session "
+                "has no persisted Megatron session cache. The request was not retried because "
+                "that would recreate blank in-memory state. Recreate or reload the session from "
+                "a checkpoint before continuing."
+            )
+        meta = session_manager.get_metadata(session.model_id)
+        if not isinstance(meta, dict):
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, and the session "
+                "cache is missing session_metadata.json. Reload the session from an explicit "
+                "checkpoint before continuing."
+            )
+        return None
 
     async def _recycle_worker_after_failure(
         self,
@@ -1606,6 +1648,7 @@ class VerlTrainingEngine:
         *,
         op: str,
         cause: BaseException,
+        request_started: bool = False,
     ) -> ray.actor.ActorHandle:
         actor_name = self._actor_name_for_session(session)
         lost_session_ids = []
@@ -1622,6 +1665,27 @@ class VerlTrainingEngine:
             )
             for lost_session_id in lost_session_ids:
                 self._poisoned_sessions[lost_session_id] = lost_state_error
+        elif session.backend == "megatron":
+            missing_actor_error = self._megatron_missing_actor_recovery_error(
+                session,
+                op=op,
+                cause=cause,
+            )
+            if missing_actor_error is not None:
+                lost_state_error = missing_actor_error
+                self._poisoned_sessions[session.model_id] = lost_state_error
+            if (
+                lost_state_error is None
+                and request_started
+                and self._megatron_op_requires_fail_closed_after_actor_death(op)
+            ):
+                lost_state_error = (
+                    f"[{session.model_id}] megatron actor died during op={op}. "
+                    "The request was not retried because the operation may have partially "
+                    "executed before the crash. Reload the session from a checkpoint before "
+                    "continuing."
+                )
+                self._poisoned_sessions[session.model_id] = lost_state_error
         if session.backend == "megatron":
             worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
         else:
@@ -1649,6 +1713,108 @@ class VerlTrainingEngine:
                 return base_model, requested_model
             return self.default_base_model, requested_model
         return requested_model, requested_model
+
+    def _build_megatron_distributed_config(
+        self,
+        *,
+        requested_model: str | None,
+        base_model: str | None,
+    ):
+        from .megatron_distributed import DistributedConfig
+        from .model_registry import get_model_config, get_training_parallelism
+
+        cfg = get_model_config(requested_model or base_model or "")
+        train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(
+            requested_model or base_model or ""
+        )
+        return DistributedConfig(
+            tensor_parallel_size=train_tp,
+            pipeline_parallel_size=train_pp,
+            expert_parallel_size=train_ep,
+            context_parallel_size=train_cp,
+            expert_tensor_parallel_size=train_etp,
+            use_fp8=bool(getattr(cfg, "train_use_fp8", False)),
+            router_replay_mode=server_config.router_replay_mode,
+        )
+
+    async def _rebind_megatron_worker(
+        self,
+        session: "TrainingSession",
+        *,
+        reason: str,
+        allow_create: bool = True,
+    ) -> ray.actor.ActorHandle:
+        from .megatron_distributed import (
+            PERSISTENT_NAMESPACE,
+            _make_megatron_actor_name,
+            async_get_or_create_megatron_worker_group,
+        )
+        from .model_registry import is_persistent_model
+        from .resource_pool import ActorType, get_resource_pool
+
+        base_model, requested_model = self._resolve_session_base_model(session)
+        actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
+        lora_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        distributed_config = self._build_megatron_distributed_config(
+            requested_model=requested_model,
+            base_model=base_model,
+        )
+        if allow_create:
+            worker = await async_get_or_create_megatron_worker_group(
+                base_model=base_model,
+                lora_rank=lora_rank,
+                learning_rate=session.learning_rate,
+                distributed_config=distributed_config,
+                session_id=session.model_id,
+            )
+        else:
+            try:
+                worker = await asyncio.to_thread(
+                    ray.get_actor,
+                    actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                )
+            except ValueError as e:
+                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+        ready_timeout_s = (
+            float(server_config.training_actor_ready_timeout_s)
+            if server_config.training_actor_ready_timeout_s is not None
+            else 3600.0
+        )
+        try:
+            await self._await_with_keepalive(
+                worker.__ray_ready__.remote(),
+                session,
+                interval_s=30.0,
+                timeout_s=ready_timeout_s,
+            )
+        except Exception as e:
+            if self._is_dead_actor_error(e):
+                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+            raise
+        get_resource_pool().register(
+            actor_name=actor_name,
+            actor_type=ActorType.MEGATRON,
+            num_gpus=distributed_config.world_size,
+            actor_handle=worker,
+            namespace=PERSISTENT_NAMESPACE,
+            base_model=base_model or requested_model or "",
+            session_id=session.model_id,
+            protected=is_persistent_model(base_model or requested_model or ""),
+        )
+        get_resource_pool().mark_ready(actor_name)
+        self._resource_pool_actor_names[session.model_id] = actor_name
+        self._workers[session.model_id] = worker
+        self._touch_actor(session)
+        session.backend = "megatron"
+        session.is_active = True
+        logger.warning(
+            "[%s] megatron worker rebound without recycle actor=%s reason=%s",
+            session.model_id,
+            actor_name,
+            reason,
+        )
+        return worker
 
     async def _get_actor_recycle_lock(self, actor_name: str) -> asyncio.Lock:
         async with self._megatron_recycle_locks_guard:
@@ -1817,6 +1983,22 @@ class VerlTrainingEngine:
         lock = await self._get_actor_recycle_lock(actor_name)
         async with lock:
             existing = self._workers.get(session.model_id)
+            if existing is None:
+                try:
+                    return await self._rebind_megatron_worker(
+                        session,
+                        reason=f"{op}:missing_worker",
+                    )
+                except Exception as reconnect_error:
+                    logger.warning(
+                        "[%s] megatron_rebind_failed op=%s actor=%s reason=%s error_type=%s error=%s",
+                        session.model_id,
+                        op,
+                        actor_name,
+                        type(cause).__name__,
+                        type(reconnect_error).__name__,
+                        reconnect_error,
+                    )
             if existing is not None:
                 try:
                     await asyncio.to_thread(ray.get, existing.get_diagnostics.remote(), timeout=10)
@@ -2035,7 +2217,12 @@ class VerlTrainingEngine:
                     attempts,
                     type(e).__name__,
                 )
-                worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
+                worker = await self._recycle_worker_after_failure(
+                    session,
+                    op=op,
+                    cause=e,
+                    request_started=True,
+                )
                 await self._log_worker_request_context(
                     session,
                     worker,
@@ -2085,6 +2272,12 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers.get(model_id)
         if worker is None:
+            if session.backend == "megatron":
+                return await self._rebind_megatron_worker(
+                    session,
+                    reason=f"{op}:missing_worker",
+                    allow_create=allow_recover,
+                )
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
@@ -2328,7 +2521,7 @@ class VerlTrainingEngine:
         Args:
             session: TrainingSession with configuration.
         """
-        from .megatron_distributed import async_get_or_create_megatron_worker_group, DistributedConfig
+        from .megatron_distributed import async_get_or_create_megatron_worker_group
         from .model_registry import get_model_config
 
         model_id = session.model_id
@@ -2363,23 +2556,21 @@ class VerlTrainingEngine:
 
         if use_megatron:
             import asyncio
-            # MoE models need tensor/expert parallelism from model registry
-            from .model_registry import get_training_parallelism, get_model_config
-
-            # Get model-specific parallelism and FP8 config from registry
-            cfg = get_model_config(requested_model or base_model or "")
-            train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(requested_model or base_model or "")
-            use_fp8 = bool(getattr(cfg, "train_use_fp8", False))
-            distributed_config = DistributedConfig(
-                tensor_parallel_size=train_tp,
-                pipeline_parallel_size=train_pp,
-                expert_parallel_size=train_ep,
-                context_parallel_size=train_cp,
-                expert_tensor_parallel_size=train_etp,
-                use_fp8=use_fp8,
-                router_replay_mode=server_config.router_replay_mode,
+            distributed_config = self._build_megatron_distributed_config(
+                requested_model=requested_model,
+                base_model=base_model,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, lora_rank={lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
+            logger.info(
+                f"[{model_id}] Creating MegatronWorkerGroup for MoE model "
+                f"(base={base_model}, lora_rank={lora_rank}, "
+                f"TP={distributed_config.tensor_parallel_size}, "
+                f"PP={distributed_config.pipeline_parallel_size}, "
+                f"EP={distributed_config.expert_parallel_size}, "
+                f"CP={distributed_config.context_parallel_size}, "
+                f"ETP={distributed_config.expert_tensor_parallel_size}, "
+                f"world_size={distributed_config.world_size}, "
+                f"fp8={distributed_config.use_fp8})"
+            )
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -3188,7 +3379,7 @@ class VerlTrainingEngine:
         worker = await self._get_live_worker(
             session,
             op="load_weights",
-            allow_recover=(session.backend == "peft"),
+            allow_recover=True,
         )
 
         if session.backend == "megatron":
