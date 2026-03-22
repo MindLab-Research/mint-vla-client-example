@@ -130,10 +130,36 @@ def _kill_named_actor_remote():
     return _task
 
 
+@lru_cache(maxsize=1)
+def _placement_group_table_remote():
+    import ray
+
+    @ray.remote(num_cpus=0)
+    def _task() -> dict[str, Any]:
+        # Keep this in a Ray task so the API-server event loop never blocks on
+        # Ray control-plane calls like placement_group_table().
+        try:
+            tbl = ray.util.placement_group_table()
+        except Exception:
+            return {}
+        return {} if not isinstance(tbl, dict) else tbl
+
+    return _task
+
+
 async def async_pending_gpu_pg_observation(*, timeout_s: float) -> dict[str, Any] | None:
     _ensure_ray_initialized()
     ref = _pending_gpu_pg_observation_remote().remote()
     return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+
+
+async def async_placement_group_table(*, timeout_s: float = 5.0) -> dict[str, Any]:
+    _ensure_ray_initialized()
+    ref = _placement_group_table_remote().remote()
+    out = await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
+    if not isinstance(out, dict):
+        raise TypeError(f"placement_group_table returned non-dict: {type(out)}")
+    return out
 
 
 async def async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 5.0):

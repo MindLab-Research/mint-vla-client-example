@@ -27,7 +27,11 @@ from pydantic import BaseModel
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request, is_admin_user_data
-from ..backend.async_ray_control import async_kill_named_actor
+from ..backend.async_ray_control import (
+    async_kill_named_actor,
+    async_pending_gpu_pg_observation,
+    async_placement_group_table,
+)
 from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..health_checks import public_healthz_response
 from ..model_access_control import can_access_model, get_access_denied_error
@@ -781,14 +785,29 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Admin access required")
 
 
-def _augment_with_placement_groups(actors: list[dict]) -> None:
+async def _augment_with_placement_groups(actors: list[dict]) -> None:
     try:
         import ray
-        from ..config import RAY_NAMESPACE
-        from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            return
+
+        # Offload PG inspection into a Ray task so we never block the API event loop
+        # with synchronous control-plane calls.
+        timeout_s = float(os.environ.get("MINT_ACTORS_PG_TABLE_TIMEOUT_S", "2.0"))
+        try:
+            tbl = await async_placement_group_table(timeout_s=timeout_s)
+        except asyncio.TimeoutError:
+            return
+        except Exception:
+            return
+
+        by_name: dict[str, dict] = {}
+        for info in tbl.values():
+            if isinstance(info, dict):
+                name = info.get("name")
+                if isinstance(name, str) and name:
+                    by_name[name] = info
 
         for a in actors:
             name = a.get("actor_name")
@@ -796,12 +815,19 @@ def _augment_with_placement_groups(actors: list[dict]) -> None:
                 continue
             pg_name = f"{name}_pg"
             try:
-                pg = ray.util.get_placement_group(pg_name)
-                bundles = getattr(pg, "bundle_specs", None)
-                if isinstance(bundles, list):
-                    a["pg_name"] = pg_name
-                    a["pg_bundle_count"] = len(bundles)
-                    a["pg_total_gpus"] = sum(int(b.get("GPU", 0) or 0) for b in bundles if isinstance(b, dict))
+                info = by_name.get(pg_name)
+                if not isinstance(info, dict):
+                    continue
+                bundles = info.get("bundles") or {}
+                if not isinstance(bundles, dict):
+                    continue
+                total_gpu = 0
+                for bundle in bundles.values():
+                    if isinstance(bundle, dict):
+                        total_gpu += int(bundle.get("GPU", 0) or 0)
+                a["pg_name"] = pg_name
+                a["pg_bundle_count"] = len(bundles)
+                a["pg_total_gpus"] = int(total_gpu)
             except Exception:
                 continue
     except Exception:
@@ -836,7 +862,7 @@ async def list_actors(
     if model_name is not None:
         actors = [a for a in actors if a.get("base_model") == model_name]
 
-    _augment_with_placement_groups(actors)
+    await _augment_with_placement_groups(actors)
     return {"actors": actors, "total_gpus_used": pool.total_gpus_used()}
 
 
