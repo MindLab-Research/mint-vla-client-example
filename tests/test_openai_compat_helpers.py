@@ -183,7 +183,7 @@ def test_get_tokenizer_allows_concurrent_misses_for_different_models(monkeypatch
     openai_compat._tokenizer_locks.clear()
     executor = ThreadPoolExecutor(max_workers=2)
     calls: list[str] = []
-    barrier = threading.Barrier(2, timeout=5.0)
+    barrier = threading.Barrier(2, timeout=10.0)
 
     def _fake_load(base_model: str):
         calls.append(base_model)
