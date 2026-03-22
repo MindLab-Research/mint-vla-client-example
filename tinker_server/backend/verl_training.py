@@ -1595,6 +1595,8 @@ class VerlTrainingEngine:
         if op in {"forward_backward", "optim_step", "train_step"}:
             self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
         if op == "save_weights":
+            if session.backend == "megatron":
+                return
             volatile_sessions = self._actor_volatile_sessions.get(actor_name)
             if volatile_sessions is None:
                 return
@@ -1621,11 +1623,37 @@ class VerlTrainingEngine:
     ) -> str | None:
         if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
             return None
-        if op == "load_weights":
-            return None
-        from .megatron_distributed import MegatronSessionStateManager
+        from .megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
 
         session_manager = MegatronSessionStateManager()
+        actor_name = self._actor_name_for_session(session)
+        if actor_name is None:
+            base_model, requested_model = self._resolve_megatron_base_model(session)
+            actor_name = _make_megatron_actor_name(
+                base_model or requested_model or session.base_model or ""
+            )
+        dirty_sessions = session_manager.list_actor_only_state_sessions(actor_name)
+        if op == "load_weights":
+            dirty_siblings = [session_id for session_id in dirty_sessions if session_id != session.model_id]
+            if dirty_siblings:
+                joined = ", ".join(dirty_siblings)
+                return (
+                    f"[{session.model_id}] megatron actor was missing before op={op}, but sibling "
+                    f"session(s) {joined} still had actor-only training state that was never fully "
+                    "persisted. The shared actor was not recreated because that would discard those "
+                    "sessions. Reload or clear the affected sibling session(s) explicitly before "
+                    "continuing."
+                )
+            return None
+        if dirty_sessions:
+            joined = ", ".join(dirty_sessions)
+            return (
+                f"[{session.model_id}] megatron actor was missing before op={op}, but session(s) "
+                f"{joined} still had actor-only training state that was never fully persisted. "
+                "The request was not retried because recreating the shared actor would hide that "
+                "rollback. Reload the affected session(s) from an explicit checkpoint before "
+                "continuing."
+            )
         if not session_manager.session_exists(session.model_id):
             return (
                 f"[{session.model_id}] megatron actor was missing before op={op}, but the session "
@@ -1652,8 +1680,14 @@ class VerlTrainingEngine:
     ) -> ray.actor.ActorHandle:
         actor_name = self._actor_name_for_session(session)
         lost_session_ids = []
+        sibling_model_ids: list[str] = []
         if actor_name is not None:
             lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
+            sibling_model_ids = [
+                model_id
+                for model_id, existing_actor_name in self._resource_pool_actor_names.items()
+                if existing_actor_name == actor_name
+            ]
         lost_state_error = None
         if session.backend == "megatron" and lost_session_ids:
             joined = ", ".join(lost_session_ids)
@@ -1686,7 +1720,10 @@ class VerlTrainingEngine:
                     "continuing."
                 )
                 self._poisoned_sessions[session.model_id] = lost_state_error
-        if session.backend == "megatron":
+        if session.backend == "megatron" and lost_state_error is not None:
+            for model_id in sibling_model_ids:
+                self._workers.pop(model_id, None)
+        elif session.backend == "megatron":
             worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
         else:
             worker = await self._recycle_dense_actor(session, op=op, cause=cause)
@@ -1713,6 +1750,19 @@ class VerlTrainingEngine:
                 return base_model, requested_model
             return self.default_base_model, requested_model
         return requested_model, requested_model
+
+    def _resolve_megatron_base_model(self, session: "TrainingSession") -> tuple[str, str]:
+        requested_model = session.base_model or self.default_base_model
+        if not requested_model:
+            raise RuntimeError(f"[{session.model_id}] missing Megatron base model")
+        if requested_model.startswith("/"):
+            return requested_model, requested_model
+        base_model = self._resolve_hf_model_path(requested_model)
+        if base_model:
+            return base_model, requested_model
+        raise RuntimeError(
+            f"[{session.model_id}] could not resolve Megatron base model {requested_model!r} to a local path"
+        )
 
     def _build_megatron_distributed_config(
         self,
@@ -1752,7 +1802,7 @@ class VerlTrainingEngine:
         from .model_registry import is_persistent_model
         from .resource_pool import ActorType, get_resource_pool
 
-        base_model, requested_model = self._resolve_session_base_model(session)
+        base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
         lora_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
         distributed_config = self._build_megatron_distributed_config(
@@ -1976,7 +2026,7 @@ class VerlTrainingEngine:
     ) -> ray.actor.ActorHandle:
         from .megatron_distributed import _make_megatron_actor_name, kill_megatron_actor
 
-        base_model, requested_model = self._resolve_session_base_model(session)
+        base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = self._resource_pool_actor_names.get(session.model_id)
         if actor_name is None:
             actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
@@ -2276,7 +2326,7 @@ class VerlTrainingEngine:
                 return await self._rebind_megatron_worker(
                     session,
                     reason=f"{op}:missing_worker",
-                    allow_create=allow_recover,
+                    allow_create=False,
                 )
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
@@ -2543,7 +2593,11 @@ class VerlTrainingEngine:
             if base_model:
                 logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
             else:
-                # Fall back to default (works for dense models on same architecture)
+                if use_megatron:
+                    raise RuntimeError(
+                        f"[{model_id}] could not resolve Megatron base model {requested_model!r} to a local path"
+                    )
+                # Fall back to default only for dense models on the same architecture.
                 base_model = self.default_base_model
                 logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
         else:
@@ -3376,11 +3430,20 @@ class VerlTrainingEngine:
             load_optimizer: Whether to restore optimizer state.
         """
         model_id = session.model_id
-        worker = await self._get_live_worker(
-            session,
-            op="load_weights",
-            allow_recover=True,
-        )
+        try:
+            worker = await self._get_live_worker(
+                session,
+                op="load_weights",
+                allow_recover=(session.backend == "peft"),
+            )
+        except RuntimeError as e:
+            if "missing worker" not in str(e):
+                raise
+            worker = await self._recycle_worker_after_failure(
+                session,
+                op="load_weights",
+                cause=e,
+            )
 
         if session.backend == "megatron":
             ready_timeout_s = (
@@ -3453,6 +3516,7 @@ class VerlTrainingEngine:
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
                     actual_rank=actual_rank,
+                    actor_only_state_dirty=bool(load_optimizer),
                 ),
                 timeout=30,
             )

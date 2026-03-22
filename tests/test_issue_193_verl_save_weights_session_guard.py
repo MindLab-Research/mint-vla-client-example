@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ pytest.importorskip("ray")
 
 import ray
 
+from tinker_server.backend.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
 from tinker_server.backend.training_session_manager import TrainingSession
 from tinker_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
 
@@ -715,6 +717,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
                 "step_count": 5,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": None,
+                "actor_only_state_dirty": False,
             },
         )
     ]
@@ -777,6 +780,7 @@ def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatc
                 "step_count": 9,
                 "learning_rate": pytest.approx(2e-4),
                 "actual_rank": 7,
+                "actor_only_state_dirty": True,
             },
         )
     ]
@@ -848,6 +852,7 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
                 "step_count": 6,
                 "learning_rate": pytest.approx(4e-4),
                 "actual_rank": 3,
+                "actor_only_state_dirty": True,
             },
         )
     ]
@@ -891,7 +896,7 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
 
     asyncio.run(_run())
 
-    assert get_live_calls[0] == ("load_weights", True)
+    assert get_live_calls[0] == ("load_weights", False)
     assert get_live_calls[-1] == ("load_weights", False)
     assert len(get_live_calls) == 3
     assert worker.mark_session_loaded.calls == [
@@ -901,9 +906,63 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
                 "step_count": 4,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": 6,
+                "actor_only_state_dirty": True,
             },
         )
     ]
+
+
+def test_issue_193_megatron_load_weights_missing_actor_with_dirty_sibling_fails_closed(monkeypatch):
+    engine = VerlTrainingEngine()
+    monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
+    model_id = "model_issue_193_megatron_load_missing_actor_dirty_sibling"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_load_missing_actor_dirty_sibling",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    async def fake_rebind(rebind_session, *, reason, allow_create=True):
+        assert rebind_session is session
+        if not allow_create:
+            raise RuntimeError(f"[{model_id}] missing worker for backend=megatron")
+        return object()
+
+    async def fake_recycle(*_args, **_kwargs):
+        return object()
+
+    class _SiblingDirtySessionManager:
+        def list_actor_only_state_sessions(self, actor_name):
+            return [model_id, "model_issue_193_dirty_sibling"]
+
+        def session_exists(self, session_id):
+            assert session_id == model_id
+            return True
+
+        def get_metadata(self, session_id):
+            assert session_id == model_id
+            return {"step": 1, "lr": 1e-4}
+
+    monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _SiblingDirtySessionManager,
+    )
+
+    async def _run():
+        await engine.load_weights(
+            session=session,
+            load_path="/tmp/issue_193_megatron_load_missing_actor_dirty_sibling",
+            load_optimizer=True,
+        )
+
+    with pytest.raises(RuntimeError, match="dirty_sibling"):
+        asyncio.run(_run())
+
+    assert model_id in engine._poisoned_sessions
 
 
 def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memory(monkeypatch):
@@ -955,7 +1014,7 @@ def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memor
         asyncio.run(_run())
 
     assert keepalive_calls == [dead_worker]
-    assert recycle_calls == [("optim_step", "ActorDiedError")]
+    assert recycle_calls == []
     assert "Reload the lost session from a checkpoint before continuing." in engine._poisoned_sessions[model_id]
 
 
@@ -1055,7 +1114,7 @@ def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_d
     with pytest.raises(RuntimeError, match="session\\(s\\) model_issue_193_megatron_session_a"):
         asyncio.run(_run())
 
-    assert recycle_calls == [(session_b.model_id, "forward")]
+    assert recycle_calls == []
     assert engine._actor_volatile_sessions.get(actor_name) is None
     assert session_a.model_id in engine._poisoned_sessions
 
@@ -1259,6 +1318,25 @@ def test_issue_193_megatron_sampler_save_does_not_clear_volatile_train_state(mon
 
     engine._note_successful_worker_call(session, op="forward_backward")
     engine._note_successful_worker_call(session, op="save_lora_weights_for_sampler")
+
+    assert engine._actor_volatile_sessions[actor_name] == {model_id}
+
+
+def test_issue_193_megatron_save_weights_does_not_clear_volatile_train_state():
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_193_megatron_actor_only_marker"
+    actor_name = "shared-megatron-actor"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_actor_only_marker",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+    engine._resource_pool_actor_names[model_id] = actor_name
+
+    engine._note_successful_worker_call(session, op="forward_backward")
+    engine._note_successful_worker_call(session, op="save_weights")
 
     assert engine._actor_volatile_sessions[actor_name] == {model_id}
 
@@ -1468,6 +1546,7 @@ def test_issue_193_megatron_missing_worker_with_live_state_still_fails_closed(mo
 
 def test_issue_193_megatron_missing_actor_without_cache_fails_closed(monkeypatch):
     engine = VerlTrainingEngine()
+    monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
     model_id = "model_issue_193_megatron_missing_actor_no_cache"
     session = TrainingSession(
         model_id=model_id,
@@ -1487,6 +1566,9 @@ def test_issue_193_megatron_missing_actor_without_cache_fails_closed(monkeypatch
         return object()
 
     class _MissingCacheSessionManager:
+        def list_actor_only_state_sessions(self, actor_name):
+            return []
+
         def session_exists(self, session_id):
             assert session_id == model_id
             return False
@@ -1512,11 +1594,386 @@ def test_issue_193_megatron_missing_actor_without_cache_fails_closed(monkeypatch
     with pytest.raises(RuntimeError, match="has no persisted Megatron session cache"):
         asyncio.run(_run())
 
-    assert rebind_calls == [
-        ("forward:missing_worker", False),
-        ("forward:missing_worker", True),
-    ]
+    assert rebind_calls == [("forward:missing_worker", False)]
     assert model_id in engine._poisoned_sessions
+
+
+def test_issue_193_megatron_missing_actor_invalid_session_metadata_fails_closed(monkeypatch):
+    engine = VerlTrainingEngine()
+    monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
+    model_id = "model_issue_193_megatron_missing_actor_invalid_meta"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_missing_actor_invalid_meta",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    rebind_calls: list[tuple[str, bool]] = []
+
+    async def fake_rebind(rebind_session, *, reason, allow_create=True):
+        assert rebind_session is session
+        rebind_calls.append((reason, allow_create))
+        if not allow_create:
+            raise RuntimeError(f"[{model_id}] missing worker for backend=megatron")
+        return object()
+
+    class _InvalidMetaSessionManager:
+        def list_actor_only_state_sessions(self, actor_name):
+            return []
+
+        def session_exists(self, session_id):
+            assert session_id == model_id
+            return True
+
+        def get_metadata(self, session_id):
+            assert session_id == model_id
+            return None
+
+    monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _InvalidMetaSessionManager,
+    )
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    async def _run():
+        await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward",
+            submit_fn=lambda worker: worker,
+        )
+
+    with pytest.raises(RuntimeError, match="missing session_metadata.json"):
+        asyncio.run(_run())
+
+    assert rebind_calls == [("forward:missing_worker", False)]
+    assert model_id in engine._poisoned_sessions
+
+
+def test_issue_193_megatron_missing_actor_with_persisted_dirty_marker_fails_closed(monkeypatch):
+    engine = VerlTrainingEngine()
+    monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
+    model_id = "model_issue_193_megatron_missing_actor_dirty_marker"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_missing_actor_dirty_marker",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    rebind_calls: list[tuple[str, bool]] = []
+
+    async def fake_rebind(rebind_session, *, reason, allow_create=True):
+        assert rebind_session is session
+        rebind_calls.append((reason, allow_create))
+        if not allow_create:
+            raise RuntimeError(f"[{model_id}] missing worker for backend=megatron")
+        return object()
+
+    async def fake_recycle(*_args, **_kwargs):
+        return object()
+
+    class _DirtySessionManager:
+        def list_actor_only_state_sessions(self, actor_name):
+            return [model_id]
+
+        def session_exists(self, session_id):
+            assert session_id == model_id
+            return True
+
+        def get_metadata(self, session_id):
+            assert session_id == model_id
+            return {"step": 7, "lr": 1e-4}
+
+    monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _DirtySessionManager,
+    )
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    async def _run():
+        await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward",
+            submit_fn=lambda worker: worker,
+        )
+
+    with pytest.raises(RuntimeError, match="actor-only training state that was never fully persisted"):
+        asyncio.run(_run())
+
+    assert rebind_calls == [("forward:missing_worker", False)]
+    assert model_id in engine._poisoned_sessions
+
+
+def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkeypatch):
+    engine = VerlTrainingEngine()
+    monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
+    model_id = "model_issue_193_megatron_missing_actor_clean_session"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_193_megatron_missing_actor_clean_session",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+
+    async def fake_rebind(rebind_session, *, reason, allow_create=True):
+        assert rebind_session is session
+        if not allow_create:
+            raise RuntimeError(f"[{model_id}] missing worker for backend=megatron")
+        return object()
+
+    async def fake_recycle(*_args, **_kwargs):
+        return object()
+
+    class _SiblingDirtySessionManager:
+        def list_actor_only_state_sessions(self, actor_name):
+            return ["model_issue_193_megatron_dirty_sibling"]
+
+        def session_exists(self, session_id):
+            assert session_id == model_id
+            return True
+
+        def get_metadata(self, session_id):
+            assert session_id == model_id
+            return {"step": 2, "lr": 2e-4}
+
+    monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
+    monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
+    monkeypatch.setattr(
+        "tinker_server.backend.megatron_distributed.MegatronSessionStateManager",
+        _SiblingDirtySessionManager,
+    )
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    async def _run():
+        await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward",
+            submit_fn=lambda worker: worker,
+        )
+
+    with pytest.raises(RuntimeError, match="dirty_sibling"):
+        asyncio.run(_run())
+
+    assert model_id in engine._poisoned_sessions
+
+
+def test_issue_193_actor_only_state_marker_corruption_fails_closed(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+    session_path = Path(manager.get_session_path("session_issue_193_corrupt_marker"))
+    session_path.mkdir(parents=True, exist_ok=True)
+    (session_path / "actor_only_state.json").write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Failed to read actor_only_state marker"):
+        manager.list_actor_only_state_sessions("megatron_qwen3_30b_a3b_instruct_2507")
+
+
+def test_issue_193_session_metadata_cache_does_not_mask_disk_corruption(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+    session_id = "session_issue_193_corrupt_metadata"
+    manager.save_metadata(session_id, step=3, lr=1e-4, actual_rank=8)
+    metadata_path = Path(manager.get_session_path(session_id)) / "session_metadata.json"
+    metadata_path.write_text("{not-json", encoding="utf-8")
+
+    assert manager.get_metadata(session_id) is None
+
+
+@pytest.mark.parametrize(
+    "lr_value",
+    [True, float("nan"), float("inf")],
+    ids=["bool", "nan", "inf"],
+)
+def test_issue_193_session_metadata_rejects_nonfinite_or_bool_lr(tmp_path: Path, lr_value):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path))
+    session_id = "session_issue_193_bad_lr_metadata"
+    session_path = Path(manager.get_session_path(session_id))
+    session_path.mkdir(parents=True, exist_ok=True)
+    metadata_path = session_path / "session_metadata.json"
+    metadata_path.write_text(
+        json.dumps({"step": 1, "lr": lr_value, "actual_rank": 8}),
+        encoding="utf-8",
+    )
+
+    assert manager.get_metadata(session_id) is None
+
+
+def test_issue_193_megatron_dirty_noncurrent_session_fails_before_swap(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_current"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group.workers = []
+    group._session_manager = SimpleNamespace(
+        session_exists=lambda session_id: session_id == "session_target",
+        has_actor_only_state=lambda session_id: session_id == "session_target",
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._get_lora_weight_norm = lambda: 0.0
+    group._get_lora_weight_checksum = lambda: "0"
+    group._get_base_weight_checksum = lambda: "0"
+    group._get_buffer_checksum = lambda: "0"
+    group._get_optimizer_param_counts = lambda: {}
+    group._swap_session_on_workers = lambda session_id: (_ for _ in ()).throw(
+        AssertionError("dirty target session must fail before swap")
+    )
+    group.save_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("dirty target session must fail before saving outgoing session")
+    )
+    group.reinit_lora_weights = lambda *args, **kwargs: None
+    group.reset_expert_bias = lambda *args, **kwargs: None
+
+    with pytest.raises(RuntimeError, match="actor-only training state"):
+        group._ensure_session_loaded("session_target")
+
+
+def test_issue_193_megatron_dirty_noncurrent_session_without_adapter_cache_fails_before_swap():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_current"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group.workers = []
+    group._session_manager = SimpleNamespace(
+        session_exists=lambda session_id: False,
+        has_actor_only_state=lambda session_id: session_id == "session_target",
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group._get_lora_weight_norm = lambda: 0.0
+    group._get_lora_weight_checksum = lambda: "0"
+    group._get_base_weight_checksum = lambda: "0"
+    group._get_buffer_checksum = lambda: "0"
+    group._get_optimizer_param_counts = lambda: {}
+    group._swap_session_on_workers = lambda session_id: (_ for _ in ()).throw(
+        AssertionError("dirty target session must fail before swap")
+    )
+    group.save_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("dirty target session must fail before saving outgoing session")
+    )
+    group.reinit_lora_weights = lambda *args, **kwargs: None
+    group.reset_expert_bias = lambda *args, **kwargs: None
+
+    with pytest.raises(RuntimeError, match="actor-only training state"):
+        group._ensure_session_loaded("session_target")
+
+
+def test_issue_193_megatron_invalid_noncurrent_metadata_fails_before_swap():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_current"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group.workers = []
+    group._session_manager = SimpleNamespace(
+        session_exists=lambda session_id: session_id == "session_target",
+        has_actor_only_state=lambda session_id: False,
+        get_metadata=lambda session_id: None,
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group._get_lora_weight_norm = lambda: 0.0
+    group._get_lora_weight_checksum = lambda: "0"
+    group._get_base_weight_checksum = lambda: "0"
+    group._get_buffer_checksum = lambda: "0"
+    group._get_optimizer_param_counts = lambda: {}
+    group._swap_session_on_workers = lambda session_id: (_ for _ in ()).throw(
+        AssertionError("invalid metadata must fail before swap")
+    )
+    group.save_adapter_state = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("invalid metadata must fail before saving outgoing session")
+    )
+    group.reinit_lora_weights = lambda *args, **kwargs: None
+    group.reset_expert_bias = lambda *args, **kwargs: None
+
+    with pytest.raises(RuntimeError, match="missing session_metadata.json"):
+        group._ensure_session_loaded("session_target")
+
+
+def test_issue_193_megatron_current_session_corruption_fails_closed():
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = "session_current"
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group.workers = []
+    group._session_manager = SimpleNamespace(
+        has_actor_only_state=lambda session_id: (_ for _ in ()).throw(
+            RuntimeError("Failed to read actor_only_state marker")
+        ),
+        session_exists=lambda session_id: True,
+        get_metadata=lambda session_id: {"step": 1, "lr": 1e-4, "actual_rank": 8},
+    )
+    group._bind_traceparent = lambda traceparent: None
+
+    with pytest.raises(RuntimeError, match="Failed to read actor_only_state marker"):
+        group._ensure_session_loaded("session_current")
+
+
+def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_actor(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    group._current_session = None
+    group.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._session_unknown_due_to_partial_swap = False
+    swap_calls: list[str] = []
+    clear_calls: list[str] = []
+
+    class _FakeWorker:
+        class clear_session_state:
+            @staticmethod
+            def remote(session_id, traceparent=None):
+                clear_calls.append(session_id)
+                return object()
+
+    group.workers = [_FakeWorker()]
+    group._session_manager = SimpleNamespace(
+        get_session_path=lambda session_id: f"/tmp/{session_id}",
+        has_actor_only_state=lambda session_id: (_ for _ in ()).throw(
+            AssertionError("explicit checkpoint prepare must not consult target dirty marker")
+        ),
+    )
+    group._bind_traceparent = lambda traceparent: None
+    group._swap_session_on_workers = lambda session_id: swap_calls.append(session_id)
+    monkeypatch.setattr(ray, "get", lambda refs, timeout=None: None)
+
+    group._prepare_session_for_explicit_load("session_target")
+
+    assert clear_calls == ["session_target"]
+    assert swap_calls == ["session_target"]
+    assert group._current_session == "session_target"
+
+
+def test_issue_193_megatron_resolution_never_falls_back_to_default_base_model():
+    engine = VerlTrainingEngine()
+    engine.default_base_model = "/tmp/wrong-default"
+    session = TrainingSession(
+        model_id="model_issue_193_megatron_resolution_strict",
+        session_id="session_issue_193_megatron_resolution_strict",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="megatron",
+    )
+    engine._resolve_hf_model_path = lambda requested_model: None
+
+    with pytest.raises(RuntimeError, match="could not resolve Megatron base model"):
+        engine._resolve_megatron_base_model(session)
 
 
 def test_issue_193_megatron_midcall_mutating_op_fails_closed_even_when_actor_was_clean(monkeypatch):
@@ -1709,6 +2166,7 @@ def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_
                 "step_count": 12,
                 "learning_rate": pytest.approx(9e-5),
                 "actual_rank": None,
+                "actor_only_state_dirty": True,
             },
         )
     ]
