@@ -409,6 +409,11 @@ async def async_create_checkpoint_archive(
         await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
     except asyncio.TimeoutError:
         ray.cancel(ref, force=True)
+        try:
+            if os.path.exists(archive_path):
+                os.remove(archive_path)
+        except Exception:
+            pass
         raise
 
 

@@ -31,10 +31,10 @@ class _StubFutureStore:
         _ = (request_id, meta)
         return {"created": True, "meta": None}
 
-    def cleanup(self, _request_id: str) -> None:
+    async def async_cleanup(self, _request_id: str) -> None:
         return None
 
-    def forget(self, _request_id: str) -> None:
+    async def async_forget(self, _request_id: str) -> None:
         return None
 
 

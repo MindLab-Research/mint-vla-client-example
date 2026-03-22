@@ -24,7 +24,7 @@ class _StubFutureStore:
     async def async_get_error(self, request_id: str):
         return self._error
 
-    def cleanup(self, request_id: str) -> None:
+    async def async_cleanup(self, request_id: str) -> None:
         self.cleanup_calls.append(request_id)
 
 

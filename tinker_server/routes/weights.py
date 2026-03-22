@@ -526,7 +526,7 @@ async def save_weights(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -651,7 +651,7 @@ async def save_state(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1159,7 +1159,7 @@ async def load_state(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)

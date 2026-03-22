@@ -91,7 +91,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
         async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             return None
 
-        def cleanup(self, request_id: str) -> None:
+        async def async_cleanup(self, request_id: str) -> None:
             return None
 
     stub_capacity = StubCapacityManager()
@@ -322,7 +322,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             _ = (request_id, meta)
 
-        def cleanup(self, request_id: str) -> None:
+        async def async_cleanup(self, request_id: str) -> None:
             _ = request_id
 
     class StubSession:

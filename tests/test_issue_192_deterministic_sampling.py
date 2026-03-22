@@ -88,10 +88,10 @@ class _StubFutureStore:
             return "PENDING"
         raise KeyError(f"Unknown request_id: {request_id}")
 
-    def cleanup(self, _request_id: str) -> None:
+    async def async_cleanup(self, _request_id: str) -> None:
         return None
 
-    def forget(self, request_id: str) -> None:
+    async def async_forget(self, request_id: str) -> None:
         self.forgotten.append(request_id)
         self.pending.pop(request_id, None)
 

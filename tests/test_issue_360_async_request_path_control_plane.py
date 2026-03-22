@@ -74,7 +74,7 @@ class _AsyncOnlyTerminalFutureStore:
         self.calls.append(("async_get_error", request_id))
         return None
 
-    def cleanup(self, request_id: str) -> None:
+    async def async_cleanup(self, request_id: str) -> None:
         self.cleanup_calls.append(request_id)
 
     def get_status(self, request_id: str) -> FutureStatus:
@@ -624,6 +624,63 @@ def test_issue_360_restore_training_session_rolls_back_created_session_on_lookup
     assert engine._resource_pool_actor_names == {}
 
 
+def test_issue_360_restore_training_session_rolls_back_existing_session_on_lookup_miss(monkeypatch):
+    manager = _TrainingManagerStub()
+    engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
+
+    # Pre-existing local session should not be mutated when restore misses.
+    existing = manager.create_session(
+        model_id="run-restore-existing-miss",
+        session_id="sess-local",
+        model_seq_id=9,
+        base_model="Qwen/Qwen3-0.6B",
+        lora_config=None,
+        rollout_correction_config=None,
+        user_metadata={},
+        user_id="admin",
+        learning_rate=1e-4,
+    )
+    existing.backend = "peft"
+    existing.created_at = "local-created"
+    existing.current_step = 123
+    existing.is_active = False
+
+    _patch_restore_training_info(
+        monkeypatch,
+        {
+            "model_id": "run-restore-existing-miss",
+            "session_id": "sess-remote",
+            "model_seq_id": 10,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "backend": "megatron",
+            "actor_name": "trainer-missing",
+            "namespace": "ns-missing",
+            "current_step": 7,
+            "created_at": "remote-created",
+        },
+    )
+    monkeypatch.setattr(training_route, "training_manager", manager)
+    monkeypatch.setattr(training_route, "training_engine", engine)
+    monkeypatch.setattr(training_route, "_find_actor_handle", lambda *_args, **_kwargs: None)
+
+    async def _async_lookup_actor_handle(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(training_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+
+    restored = anyio.run(training_route._restore_training_session, "run-restore-existing-miss")
+
+    assert restored is None
+    assert manager.deleted == []
+    assert manager.sessions["run-restore-existing-miss"] is existing
+    assert existing.backend == "peft"
+    assert existing.created_at == "local-created"
+    assert existing.current_step == 123
+    assert existing.is_active is False
+    assert engine._workers == {}
+    assert engine._resource_pool_actor_names == {}
+
+
 def test_issue_360_restore_training_session_without_actor_name_keeps_session_semantics(monkeypatch):
     manager = _TrainingManagerStub()
     engine = SimpleNamespace(_workers={}, _resource_pool_actor_names={})
@@ -857,9 +914,10 @@ def test_issue_360_future_store_async_get_status_backend_api(monkeypatch):
     assert hasattr(store, "async_get_status"), "FutureStore must expose async_get_status for request paths"
 
     actor = SimpleNamespace(get_status=_RemoteCall(result="done"))
-    monkeypatch.setattr(store, "_get_ray_actor", lambda: actor)
+    store._ray_actor = actor
 
     ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
 
     class _ActorDiedError(Exception):
         pass

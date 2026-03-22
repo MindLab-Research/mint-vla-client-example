@@ -1161,6 +1161,21 @@ class ApiWorkQueueClient:
         self._execution_serial_states: dict[str, _ExecutionSerialState] = {}
         self._execution_serial_states_guard = asyncio.Lock()
 
+    def _get_cached_ray_actor_for_async_request_path(self):
+        try:
+            import ray
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            raise ApiWorkQueueUnavailableError("Ray not initialized")
+
+        if self._ray_actor is None:
+            raise ApiWorkQueueUnavailableError(
+                "Detached Ray ApiWorkQueue actor is not ready on this API server"
+            )
+        return self._ray_actor
+
     def _get_ray_actor(self):
         try:
             import ray
@@ -1303,6 +1318,19 @@ class ApiWorkQueueClient:
 
             raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
 
+    def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            out = ray.get(actor.stats.remote(), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise ApiWorkQueueUnavailableError("Detached Ray ApiWorkQueue actor died") from e
+        if not isinstance(out, dict):
+            raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(out)}")
+        return out
+
     def set_executor(self, op: str, executor: Executor) -> None:
         self._executors[str(op)] = executor
 
@@ -1404,7 +1432,7 @@ class ApiWorkQueueClient:
     ) -> None:
         import ray
 
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         tracer = get_otel_tracer()
         producer_job_id = None
         try:
@@ -1520,7 +1548,7 @@ class ApiWorkQueueClient:
         )
 
     async def find_position(self, request_id: str) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.find_position.remote(request_id=str(request_id))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
@@ -1533,7 +1561,7 @@ class ApiWorkQueueClient:
         await self._await_ray_ref(ref, timeout_s=5.0)
 
     async def get_eta_state(self, op: str | None) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.get_eta_state.remote(None if op is None else str(op))
         result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
@@ -2067,12 +2095,12 @@ class ApiWorkQueueClient:
                     await _finalize_request_slot(item.request_id)
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.stats.remote()
         return await self._await_ray_ref(ref, timeout_s=float(timeout_s))
 
     async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-        actor = await self._get_ray_actor_async()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.get_rss_bytes.remote()
         v = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
         return int(v)

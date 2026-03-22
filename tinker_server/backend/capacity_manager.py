@@ -226,6 +226,21 @@ class CapacityManager:
     def __init__(self) -> None:
         self._ray_actor = None
 
+    def _get_cached_ray_actor_for_async_request_path(self):
+        try:
+            import ray
+        except Exception as e:
+            raise CapacityManagerUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            raise CapacityManagerUnavailableError("Ray not initialized")
+
+        if self._ray_actor is None:
+            raise CapacityManagerUnavailableError(
+                "Detached Ray CapacityManager actor is not ready on this API server"
+            )
+        return self._ray_actor
+
     def _get_ray_actor(self):
         try:
             import ray
@@ -260,6 +275,9 @@ class CapacityManager:
             self._ray_actor = None
             raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
 
+    def ensure_ready(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
+        return self.snapshot(timeout_s=timeout_s)
+
     async def async_try_reserve(
         self,
         request_id: str,
@@ -267,7 +285,7 @@ class CapacityManager:
         queue_bytes: int,
         object_store_bytes: int,
     ) -> dict[str, Any]:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -287,7 +305,7 @@ class CapacityManager:
         return out
 
     async def async_release_queue(self, request_id: str) -> None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -296,7 +314,7 @@ class CapacityManager:
             self._ray_actor = None
 
     async def async_release_object_store(self, request_id: str) -> None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -305,7 +323,7 @@ class CapacityManager:
             self._ray_actor = None
 
     async def async_release_all(self, request_id: str) -> None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -361,7 +379,7 @@ class CapacityManager:
         )
 
     async def async_snapshot(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -392,7 +410,7 @@ class CapacityManager:
         return int(v)
 
     async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:

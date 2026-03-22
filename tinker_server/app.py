@@ -866,6 +866,9 @@ async def lifespan(app: FastAPI):
         InterpolateCheckpointsRequest,
     )
 
+    capacity_manager.ensure_ready()
+    api_work_queue.ensure_ready()
+
     async def _exec_sampling_asample(item):
         async def _run():
             logger.info(

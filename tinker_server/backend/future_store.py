@@ -689,6 +689,21 @@ class FutureStore:
     def __init__(self) -> None:
         self._ray_actor = None
 
+    def _get_cached_ray_actor_for_async_request_path(self):
+        try:
+            import ray
+        except Exception as e:
+            raise FutureStoreUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            raise FutureStoreUnavailableError("Ray not initialized")
+
+        if self._ray_actor is None:
+            raise FutureStoreUnavailableError(
+                "Detached Ray FutureStore actor is not ready on this API server"
+            )
+        return self._ray_actor
+
     def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         """Fail fast if Ray or the detached FutureStore actor is unavailable."""
         actor = self._get_ray_actor()
@@ -698,7 +713,7 @@ class FutureStore:
 
     async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
         """Async variant of ensure_ready for request/control-plane paths."""
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -722,7 +737,7 @@ class FutureStore:
         return int(v)
 
     async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -803,10 +818,9 @@ class FutureStore:
                 out["ray_address"] = _require_ray_address()
                 return out
 
-            try:
-                actor = ray.get_actor(_ray_future_store_actor_name(), namespace=_ray_namespace())
-            except Exception as e:
-                out["ray_actor_get_error"] = f"{type(e).__name__}: {e}"
+            actor = self._ray_actor
+            if actor is None:
+                out["ray_actor_get_error"] = "actor_handle_not_cached"
                 return out
 
             try:
@@ -838,7 +852,7 @@ class FutureStore:
         return str(request_id)
 
     async def async_create_with_id(self, request_id: str) -> str:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
 
         import ray
 
@@ -861,7 +875,7 @@ class FutureStore:
             raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         payload = None if meta is None else dict(meta)
@@ -887,7 +901,7 @@ class FutureStore:
             actor.mark_queued.remote(request_id=request_id, meta=payload)
 
     async def async_mark_queued(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         payload = None if meta is None else dict(meta)
@@ -910,7 +924,7 @@ class FutureStore:
             actor.mark_running.remote(request_id=request_id, meta=None if meta is None else dict(meta))
 
     async def async_mark_running(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         payload = None if meta is None else dict(meta)
@@ -918,8 +932,7 @@ class FutureStore:
             await _await_ray_ref(actor.mark_running.remote(request_id=request_id, meta=payload))
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            await _await_ray_ref(actor.mark_running.remote(request_id=request_id, meta=payload))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from None
 
     def update_meta(self, request_id: str, meta: dict[str, Any] | None = None) -> None:
         actor = self._get_ray_actor()
@@ -973,7 +986,7 @@ class FutureStore:
             pass
 
     async def async_fail(self, request_id: str, error: str) -> None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         import ray
 
         try:
@@ -1039,7 +1052,7 @@ class FutureStore:
         return FutureStatus(status)
 
     async def async_get_status(self, request_id: str) -> FutureStatus:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
 
         import ray
 
@@ -1078,7 +1091,7 @@ class FutureStore:
             raise
 
     async def async_get_result(self, request_id: str) -> Any:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
 
         import ray
 
@@ -1131,7 +1144,7 @@ class FutureStore:
             raise
 
     async def async_get_error(self, request_id: str) -> str | None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
 
         import ray
 
@@ -1210,7 +1223,7 @@ class FutureStore:
             return ray.get(actor.get_meta.remote(request_id=request_id))
 
     async def async_get_meta(self, request_id: str) -> dict[str, Any] | None:
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
 
         import ray
 
@@ -1218,14 +1231,23 @@ class FutureStore:
             out = await _await_ray_ref(actor.get_meta.remote(request_id=request_id))
         except ray.exceptions.ActorDiedError:
             self._ray_actor = None
-            actor = self._get_ray_actor()
-            out = await _await_ray_ref(actor.get_meta.remote(request_id=request_id))
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from None
 
         if out is None:
             return None
         if not isinstance(out, dict):
             raise TypeError(f"FutureStore.get_meta returned non-dict: {type(out)}")
         return out
+
+    async def async_forget(self, request_id: str) -> None:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            await _await_ray_ref(actor.forget.remote(request_id=request_id))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def cleanup(self, request_id: str) -> None:
         actor = self._get_ray_actor()
@@ -1237,6 +1259,16 @@ class FutureStore:
             self._ray_actor = None
             actor = self._get_ray_actor()
             actor.cleanup.remote(request_id=request_id)
+
+    async def async_cleanup(self, request_id: str) -> None:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            await _await_ray_ref(actor.cleanup.remote(request_id=request_id))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
 
     def fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
         actor = self._get_ray_actor()

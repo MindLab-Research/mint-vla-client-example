@@ -757,7 +757,7 @@ async def work_queue_noop() -> dict:
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue internal.noop: {e}")
 
     return {"request_id": request_id}

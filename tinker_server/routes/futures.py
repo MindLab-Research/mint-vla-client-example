@@ -530,7 +530,7 @@ async def retrieve_future(
         except Exception:
             pass
         try:
-            future_store.cleanup(body.request_id)
+            await future_store.async_cleanup(body.request_id)
         except Exception:
             pass
         return payload
@@ -550,7 +550,7 @@ async def retrieve_future(
         except Exception:
             pass
         try:
-            future_store.cleanup(body.request_id)
+            await future_store.async_cleanup(body.request_id)
         except Exception:
             pass
         return result

@@ -13,6 +13,11 @@ class _StubFutureStore:
         return None
 
 
+class _StubCapacityManager:
+    def ensure_ready(self) -> None:
+        return None
+
+
 class _StubSessionManager:
     def __init__(self, **_kwargs):
         self.multi_model_manager = None
@@ -40,6 +45,9 @@ class _StubTrainingEngine:
 class _StubApiWorkQueue:
     def __init__(self):
         self._executors: dict[str, object] = {}
+
+    def ensure_ready(self) -> None:
+        return None
 
     def set_executor(self, op: str, executor) -> None:
         self._executors[str(op)] = executor
@@ -72,6 +80,7 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setattr(app_module.config, "api_work_queue_num_workers", 1)
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
@@ -82,6 +91,7 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setitem(sys.modules, "tinker_server.backend.verl_training", verl_training_module)
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
     monkeypatch.setattr(verl_training_module, "VerlTrainingEngine", _StubTrainingEngine)

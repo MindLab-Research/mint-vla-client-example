@@ -208,6 +208,7 @@ async def _restore_training_session(model_id: str):
 
         session = training_manager.get_session(model_id)
         created_session = False
+        original_session_state = None
         if session is None:
             session = training_manager.create_session(
                 model_id=model_id,
@@ -221,6 +222,13 @@ async def _restore_training_session(model_id: str):
                 learning_rate=float(info.get("learning_rate", 1e-4)),
             )
             created_session = True
+        else:
+            original_session_state = {
+                "backend": session.backend,
+                "created_at": session.created_at,
+                "current_step": session.current_step,
+                "is_active": session.is_active,
+            }
 
         session.backend = str(info.get("backend", session.backend))
         last_activity_set = False
@@ -263,6 +271,11 @@ async def _restore_training_session(model_id: str):
             if worker is None:
                 if created_session:
                     training_manager.delete_session(model_id)
+                elif original_session_state is not None:
+                    session.backend = original_session_state["backend"]
+                    session.created_at = original_session_state["created_at"]
+                    session.current_step = original_session_state["current_step"]
+                    session.is_active = original_session_state["is_active"]
                 return None
             getattr(training_engine, "_workers", {})[model_id] = worker
             getattr(training_engine, "_resource_pool_actor_names", {})[model_id] = actor_name
@@ -936,7 +949,7 @@ async def create_model(
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         if webhook_url and user_id:
             send_task_event(
                 webhook_url=webhook_url,
@@ -1315,7 +1328,7 @@ async def create_model_from_state(
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue create_model_from_state request: {e}"
         )
@@ -1614,7 +1627,7 @@ async def forward_backward(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward_backward request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1846,7 +1859,7 @@ async def train_step(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue train_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -2074,7 +2087,7 @@ async def forward(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -2294,7 +2307,7 @@ async def optim_step(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue optim_step request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -2615,7 +2628,7 @@ async def save_weights_for_sampler(
             training_manager.mark_inflight(request.model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue save_weights_for_sampler request: {e}"
         )

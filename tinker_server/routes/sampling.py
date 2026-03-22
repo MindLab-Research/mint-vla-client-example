@@ -724,7 +724,7 @@ async def asample(
     if not bool(reserve.get("ok")):
         if created_pending:
             try:
-                future_store.forget(request_id)
+                await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         record_sampling_admission_metric(
@@ -773,11 +773,11 @@ async def asample(
         await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
-                future_store.forget(request_id)
+                await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         elif created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         detail = e.detail if isinstance(e.detail, dict) else {}
         record_sampling_admission_metric(
             route=_ASAMPLE_ROUTE,
@@ -792,20 +792,20 @@ async def asample(
             await capacity_manager.async_release_all(request_id)
             if created_pending:
                 try:
-                    future_store.forget(request_id)
+                    await future_store.async_forget(request_id)
                 except FutureStoreUnavailableError:
                     raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
             elif created:
-                future_store.cleanup(request_id)
+                await future_store.async_cleanup(request_id)
             raise HTTPException(status_code=429, detail=throttle_error.detail) from e
         await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
-                future_store.forget(request_id)
+                await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         elif created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
     record_sampling_admission_metric(
@@ -1562,7 +1562,7 @@ async def compute_logprobs(
     except Exception as e:
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
 
     record_sampling_admission_metric(

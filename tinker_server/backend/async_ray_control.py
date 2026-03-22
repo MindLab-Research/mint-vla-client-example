@@ -29,10 +29,10 @@ def _ensure_ray_initialized() -> None:
     if ray.is_initialized():
         return
 
-    from ..config import RAY_NAMESPACE
-    from ..ray_utils import init_ray
-
-    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    # Do not attempt to init/reconnect Ray on HTTP request paths. Startup is
+    # responsible for initializing the Ray client; request paths should fail
+    # fast when Ray is unavailable.
+    raise RuntimeError("Ray is not initialized")
 
 
 @lru_cache(maxsize=1)
@@ -131,6 +131,7 @@ def _kill_named_actor_remote():
 
 
 async def async_pending_gpu_pg_observation(*, timeout_s: float) -> dict[str, Any] | None:
+    _ensure_ray_initialized()
     ref = _pending_gpu_pg_observation_remote().remote()
     return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
 
