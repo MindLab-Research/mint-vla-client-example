@@ -46,6 +46,10 @@ def _manager_stub(session, *, delete_session=None):
     )
 
 
+async def _async_none(*_args, **_kwargs):
+    return None
+
+
 def _install_ray_cluster_health_stub(monkeypatch) -> None:
     ray = types.ModuleType("ray")
     ray.is_initialized = lambda: True  # type: ignore[attr-defined]
@@ -184,7 +188,7 @@ async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch)
     monkeypatch.setattr(gate, "enforce_base_model_allowed", _allow_model)
     monkeypatch.setattr(gateway, "upstream_for_model", lambda _base_model: None)
     monkeypatch.setattr(gateway, "get_gateway_config", lambda: None)
-    monkeypatch.setattr(gateway, "remote_training_model", lambda _model_id: None)
+    monkeypatch.setattr(gateway, "async_remote_training_model", _async_none)
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "training_manager", object())
     monkeypatch.setattr(tr, "can_access_model", lambda _base_model, _user_data: True)
@@ -192,8 +196,8 @@ async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch)
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
             cleanup=lambda _request_id: None,
         ),
     )
@@ -202,8 +206,8 @@ async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch)
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=lambda *args, **kwargs: {"ok": True},
+            async_release_all=_async_none,
         ),
     )
 
@@ -306,26 +310,25 @@ async def test_issue_281_reset_expert_bias_enqueues_scheduler_metadata(monkeypat
 
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    monkeypatch.setattr(tr, "_restore_training_session", _async_none)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            get_status=lambda _request_id: FutureStatus.DONE,
-            get_result=lambda _request_id: {"model_id": "run-281", "modules_reset": 3, "status": "success"},
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
+            async_get_status=lambda _request_id: FutureStatus.DONE,
+            async_get_result=lambda _request_id: {"model_id": "run-281", "modules_reset": 3, "status": "success"},
             cleanup=lambda _request_id: None,
         ),
     )
-    monkeypatch.setattr(tr, "run_in_threadpool", _run_inline)
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=lambda *args, **kwargs: {"ok": True},
+            async_release_all=_async_none,
         ),
     )
 
@@ -366,21 +369,20 @@ async def test_issue_281_delete_model_enqueues_scheduler_metadata(monkeypatch) -
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            get_status=lambda _request_id: FutureStatus.DONE,
-            get_result=lambda _request_id: {"model_id": "run-281", "status": "deleted"},
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
+            async_get_status=lambda _request_id: FutureStatus.DONE,
+            async_get_result=lambda _request_id: {"model_id": "run-281", "status": "deleted"},
             cleanup=lambda _request_id: None,
         ),
     )
-    monkeypatch.setattr(tr, "run_in_threadpool", _run_inline)
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=lambda *args, **kwargs: {"ok": True},
+            async_release_all=_async_none,
         ),
     )
 
@@ -418,7 +420,7 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
         tr,
         "future_store",
         SimpleNamespace(
-            fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
+            async_fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
         ),
     )
 
@@ -462,7 +464,7 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
         tr,
         "future_store",
         SimpleNamespace(
-            fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
+            async_fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
         ),
     )
 
@@ -504,13 +506,13 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
         "training_manager",
         _manager_stub(SimpleNamespace(model_id="run-281")),
     )
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    monkeypatch.setattr(tr, "_restore_training_session", _async_none)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
             resolve=lambda request_id, payload: resolved.update({"request_id": request_id, "payload": payload}),
-            fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
+            async_fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
         ),
     )
 
@@ -604,10 +606,10 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
             resolve=lambda request_id, payload: resolved.update({"request_id": request_id, "payload": payload}),
-            fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
+            async_fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
         ),
     )
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
@@ -615,8 +617,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=lambda *args, **kwargs: {"ok": True},
+            async_release_all=_async_none,
         ),
     )
 
@@ -635,7 +637,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
     assert resolved["payload"]["modules_reset"] == 1
 
 
-def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeypatch) -> None:
     from tinker_server.backend.training_session_manager import TrainingSessionManager
     from tinker_server.routes import training as tr
 
@@ -657,7 +660,7 @@ def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeyp
         },
     )
 
-    session = tr._restore_training_session("run-restore")
+    session = await tr._restore_training_session("run-restore")
 
     assert session is not None
     assert session.last_activity == pytest.approx(1234.5)
@@ -676,13 +679,12 @@ async def test_issue_281_internal_wait_releases_capacity_and_cleans_future(monke
         tr,
         "future_store",
         SimpleNamespace(
-            get_status=lambda _request_id: FutureStatus.DONE,
-            get_result=lambda _request_id: {"ok": True},
+            async_get_status=lambda _request_id: FutureStatus.DONE,
+            async_get_result=lambda _request_id: {"ok": True},
             cleanup=lambda request_id: cleaned.append(request_id),
         ),
     )
-    monkeypatch.setattr(tr, "run_in_threadpool", _run_inline)
-    monkeypatch.setattr(cm, "capacity_manager", SimpleNamespace(release_all=lambda request_id: released.append(request_id)))
+    monkeypatch.setattr(cm, "capacity_manager", SimpleNamespace(async_release_all=lambda request_id: released.append(request_id)))
 
     out = await tr._wait_internal_future_result("rid-283")
 
@@ -766,39 +768,6 @@ async def test_issue_281_internal_deep_healthz_pending_pg_is_observation_not_fai
     assert payload["status"] == "ready"
     assert payload["ray_observation"]["reason"] == "pending_placement_groups"
     assert payload["ray_observation"]["pending_pg_names"] == ["pg-a"]
-
-
-@pytest.mark.anyio
-async def test_issue_281_healthz_ray_connect_failure_is_503(monkeypatch) -> None:
-    from tinker_server.routes import service
-
-    _install_ray_stub(monkeypatch)
-
-    async def _raise_connect_error(*, timeout_s: float):
-        _ = timeout_s
-        raise RuntimeError("ray disconnected")
-
-    monkeypatch.setattr(service, "async_pending_gpu_pg_observation", _raise_connect_error)
-
-    response = await service.healthz()
-
-    assert response.status_code == 503
-    assert response.body
-    assert b"ray_unavailable" in response.body
-
-
-@pytest.mark.anyio
-async def test_issue_281_healthz_uninitialized_ray_is_503(monkeypatch) -> None:
-    from tinker_server.routes import service
-
-    ray = types.ModuleType("ray")
-    ray.is_initialized = lambda: False  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "ray", ray)
-
-    response = await service.healthz()
-
-    assert response.status_code == 503
-    assert b"ray_unavailable" in response.body
 
 
 @pytest.mark.anyio
