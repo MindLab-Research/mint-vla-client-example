@@ -6521,7 +6521,7 @@ class MegatronWorkerGroup:
             "loss_fn_output_type": "logprob_extractor",
             "loss_fn_outputs": loss_fn_outputs,
             "metrics": metrics,
-            "log_probs": None,
+            "log_probs": log_probs,
         }
 
     def forward_backward_reverse_kl(
