@@ -28,7 +28,7 @@ description: |
 >
 > If you find yourself guessing or trial-and-error debugging basic infrastructure, **STOP and re-read this skill**.
 >
-> Note: `GET /api/v1/healthz` can return `503` when Ray has pending GPU placement-group demand (capacity degraded).
+> Note: `GET /api/v1/healthz` is the cheap public API-worker health endpoint. For costly Ray / placement-group diagnostics, use the internal deep health surface instead of expecting `healthz` to reflect cluster capacity.
 
 > **CRITICAL: RESTART SERVER AFTER CODE CHANGES**
 >
@@ -111,12 +111,99 @@ Reason:
 Do not pip-install packages until you have first verified that the API-host
 runtime env root matches the intended PFS environment.
 
+## Canonical Runtime Baseline
+
+For long-running dev validation, merge-gate work, or any dev server bring-up:
+
+- Do **not** assemble the server environment from scratch.
+- Start from the authoritative prod runtime baseline:
+  [configs/prod_volcano.env.sh](/home/yiwen/tinker_project/tinker-server/configs/prod_volcano.env.sh)
+- Then override **only** the dev-specific values that must differ.
+
+Hard rule:
+- If you are typing a long list of `export ...` lines by hand, you are probably doing it wrong.
+- The default move is:
+  1. `cd /root/tinker_project/tinker-server`
+  2. `. ./configs/prod_volcano.env.sh`
+  3. override the minimum required dev values
+  4. run `scripts/run_server.py`
+
+Required dev overrides after sourcing `configs/prod_volcano.env.sh`:
+
+- `TINKER_PORT=8000`
+- `TINKER_LOG_FILE=/tmp/tinker_server.log`
+- `TINKER_USAGE_LOG_DIR` to a dev-safe path
+- `RAY_ADDRESS` for the current dev head
+- `PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server`
+- `MINT_VLLM_CHILD_PYTHON_EXECUTABLE=/vePFS-Mindverse/share/code/$USER/tinker-server/scripts/vllm_worker_python.py`
+- `TINKER_RAY_NAMESPACE` and `MINT_RAY_NAMESPACE` to a fresh per-run namespace
+- `MINT_PERSISTENT_MODELS` if you need a reduced dev prewarm set
+- `USE_MBRIDGE_LORA_EXPORT=1` when validating Megatron LoRA sampler export / vLLM hot-load behavior
+
+## Pin Override Discipline
+
+If you source `configs/prod_volcano.env.sh` and then target a different worker slice, you must override **all** relevant pinning variables together.
+
+Do not override only one of them.
+
+When moving from prod topology to a dev slice, update all of:
+
+- `MINT_DENSE_MODEL_NODE_IPS_JSON`
+- `MINT_MODEL_NODE_IPS_JSON`
+- `MINT_VLLM_MODEL_NODE_IPS_JSON`
+- `MINT_MEGATRON_MODEL_NODE_IPS_JSON`
+- `MINT_VLLM_PINNED_NODE_IP_JSON`
+
+If one of these still points at prod IPs, the run is contaminated even if the others are correct.
+
+For exact-split 30B dev validation:
+
+- pin Megatron training to one assigned worker
+- pin 30B vLLM to a different assigned worker
+- do not let both compete for the same 8-GPU node unless that is explicitly the scenario under test
+
+## Readiness Gate
+
+Before starting any real test run:
+
+- `run_server.py` must still be alive
+- `curl http://localhost:8000/api/v1/healthz` must return a valid response body
+- do not treat a TCP accept followed by `connection reset by peer` as healthy
+- do not start merge-gate items while startup prewarm is still in flight
+
+If startup prewarm is enabled:
+
+- wait for prewarm completion or prewarm failure
+- only then treat the server as ready for validation
+
+## Retry Gate
+
+The placement-group check is not one-time setup. It is a gate before **every** retry.
+
+Before each retry:
+
+1. List all non-REMOVED placement groups cluster-wide.
+2. Filter to the assigned node slice.
+3. Remove **all** owned stale PGs on that slice by PG id taken directly from `placement_group_table()`.
+4. Re-check the PG table.
+5. Only then check physical GPU occupancy.
+6. Only then retry actor creation or server restart.
+
+Hard rule:
+
+- If a retry happens without a fresh PG-table check, that retry is invalid.
+- Actor kills and `nvidia-smi` do **not** replace the PG check.
+- A node can look free physically and still be blocked logically by stale PGs.
+- Stale PG removal must use the PG id from `placement_group_table()`. Do not bounce to other removal methods.
+- Do **not** scope PG cleanup to the model you currently care about. The cleanup scope is the entire assigned slice.
+- A server restart is itself a placement event because startup prewarm can place actors. Clear stale PGs for startup surfaces too, not just for the scenario you intend to run next.
+
 ## Placement Group Hygiene Is Mandatory
 
 Before any new actor placement attempt on mint-dev:
 
 1. List all non-REMOVED placement groups cluster-wide.
-2. If any owned stale or pending PG can reserve the target GPUs, remove it first.
+2. If any owned stale or pending PG can reserve GPUs on the assigned slice, remove it first.
 3. Only after that, check physical GPU occupancy on the target nodes.
 4. Only after both checks pass, start the server or actor.
 
@@ -124,6 +211,40 @@ Hard rule:
 - Do not treat physically idle GPUs as sufficient evidence.
 - A stale PG is a real blocker even when every GPU shows `2 MiB`.
 - Do not retry placement until the stale PG is gone.
+- The placement-group table is the oracle. Do not override it with weaker signals.
+- The cleanup target is the whole assigned slice, not the currently investigated model.
+- If you are about to restart the server, you must assume startup prewarm may place dense trainers, Megatron actors, vLLM actors, and control-plane actors. Clear stale PGs for all of them first.
+
+Oracle precedence for placement debugging:
+
+1. `placement_group_table()` filtered to the target node slice
+2. actor state / named actor lookups
+3. physical GPU occupancy (`nvidia-smi`)
+
+If these disagree, the higher item wins.
+
+In particular:
+
+- `get_placement_group(name)` failing is **not** proof that the stale reservation is gone.
+- `ray.get_actor(...)` failing is **not** proof that the stale reservation is gone.
+- `nvidia-smi` showing `2 MiB` is **not** proof that the stale reservation is gone.
+- If `placement_group_table()` still shows a non-REMOVED PG on the target nodes, the node is still blocked. Stop there and remove the PG before doing anything else.
+
+Removal method:
+
+1. Dump `placement_group_table()`.
+2. Copy the exact PG id for the stale entry from that table.
+3. Remove that PG by id.
+4. Dump `placement_group_table()` again and verify the entry is gone.
+
+Hard bans:
+
+- Do **not** use `get_placement_group(name)` as the cleanup path.
+- Do **not** treat actor kills as PG cleanup.
+- Do **not** retry placement because a name lookup failed.
+- Do **not** invent alternate cleanup methods while the PG table still shows the stale entry.
+- Do **not** clear only the PGs for the item you plan to run next.
+- Do **not** restart the server while any owned stale PG remains anywhere on the assigned slice.
 
 Exact check pattern:
 
@@ -147,7 +268,33 @@ print(json.dumps(rows, indent=2))
 PY'
 ```
 
+Exact removal pattern:
+
+```bash
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
+import os
+import ray
+from ray.util.placement_group import PlacementGroup, placement_group_table, remove_placement_group
+
+TARGET_PG_ID = "replace_with_pgid_from_table"
+
+ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
+pg = PlacementGroup(ray._raylet.PlacementGroupID.from_hex(TARGET_PG_ID))
+remove_placement_group(pg)
+print(f"remove_requested {TARGET_PG_ID}")
+print(placement_group_table().get(TARGET_PG_ID, {}))
+PY'
+```
+
 If a stale PG is yours, remove it before any retry.
+
+Additional hard rule:
+
+- Repeat this check before **every** retry, not just once at the beginning.
+- If a previous attempt failed, assume stale PGs may have been left behind until you prove otherwise.
+- After **any** failed retry, go back to step 1 and re-enumerate the PG table before interpreting the failure.
+- Never perform two consecutive large-model retries without a fresh PG-table dump in between.
+- If you find yourself reasoning from memory about whether a PG is gone, stop and dump the table again.
 
 ---
 

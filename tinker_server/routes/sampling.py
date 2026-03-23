@@ -21,7 +21,13 @@ from fastapi import APIRouter, HTTPException, Request
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import classify_failure_reason, run_async_with_otel_span, set_request_id
+from ..logging_context import (
+    classify_failure_reason,
+    get_otel_tracer,
+    record_sampling_admission_metric,
+    run_async_with_otel_span,
+    set_request_id,
+)
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
@@ -63,6 +69,10 @@ _coalesced_abort_aliases: dict[str, str] = {}
 _lora_load_locks_guard = asyncio.Lock()
 _lora_load_locks: dict[str, asyncio.Lock] = {}
 
+_ASAMPLE_ROUTE = "/api/v1/asample"
+_COMPUTE_LOGPROBS_ROUTE = "/api/v1/compute_logprobs"
+_SAMPLE_ONCE_ROUTE = "sample_once"
+
 
 async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
     async with _lora_load_locks_guard:
@@ -73,6 +83,16 @@ async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
         return lock
 
 
+async def _drop_lora_load_lock(session_id: str) -> None:
+    async with _lora_load_locks_guard:
+        _lora_load_locks.pop(session_id, None)
+
+
+async def _lora_load_lock_count() -> int:
+    async with _lora_load_locks_guard:
+        return len(_lora_load_locks)
+
+
 def _resolve_billing_model(session_id: str) -> str:
     if session_manager is None:
         return session_id
@@ -81,6 +101,47 @@ def _resolve_billing_model(session_id: str) -> str:
 
 def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> str:
     return f"model={model},route={route},dimension={dimension}"
+
+
+async def _enqueue_sampling_request_with_trace(
+    *,
+    route_start_s: float,
+    request_id: str,
+    op: str,
+    enqueue_coro,
+    session_id: str | None = None,
+    base_model: str | None = None,
+) -> None:
+    tracer = get_otel_tracer()
+    future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
+    if tracer is None:
+        await enqueue_coro
+        return
+
+    with tracer.start_as_current_span(f"{op}.enqueue") as span:
+        span.set_attribute("component", "routes.sampling")
+        span.set_attribute("op", str(op))
+        span.set_attribute("request_id", str(request_id))
+        if session_id:
+            span.set_attribute("sampling_session_id", str(session_id))
+        if base_model:
+            span.set_attribute("base_model", str(base_model))
+        span.add_event(
+            "future_store_ready",
+            {
+                "elapsed_ms": round(future_ready_elapsed_ms, 3),
+                "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
+            },
+        )
+        enqueue_start_s = time.perf_counter()
+        await enqueue_coro
+        span.add_event(
+            "enqueue_done",
+            {
+                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
+                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+            },
+        )
 
 
 async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
@@ -507,6 +568,7 @@ async def asample(
     The request is processed in the background. Use /retrieve_future
     with the returned request_id to get results.
     """
+    route_start_s = time.perf_counter()
     # Gateway forwarding: if this sampling_session_id was created upstream, proxy the
     # request and return a gateway-encoded request_id so /retrieve_future can route it.
     from ..gateway import (
@@ -589,6 +651,11 @@ async def asample(
 
     global _inflight_sample_tasks
     if _should_backpressure(http_request):
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="server_overloaded",
+        )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
     from ..backend.api_work_queue import ApiWorkQueueThrottleError, api_work_queue
@@ -660,6 +727,11 @@ async def asample(
                 future_store.forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="capacity_rejected",
+        )
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -679,15 +751,23 @@ async def asample(
                 "stage": "queued",
             },
         )
-        await api_work_queue.enqueue(
+        base_model = session_manager.get_session_base_model(session_id) if session_manager is not None else None
+        await _enqueue_sampling_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="sampling.asample",
-            request_json=request_json,
-            user_id=user_id,
-            apikey_id=apikey_id,
-            throttle_principal=throttle_principal,
-            webhook_url=None,
-            extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            session_id=session_id,
+            base_model=base_model,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="sampling.asample",
+                request_json=request_json,
+                user_id=user_id,
+                apikey_id=apikey_id,
+                throttle_principal=throttle_principal,
+                webhook_url=None,
+                extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            ),
         )
     except ApiWorkQueueThrottleError as e:
         capacity_manager.release_all(request_id)
@@ -698,6 +778,13 @@ async def asample(
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         elif created:
             future_store.cleanup(request_id)
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="queue_throttled",
+            scope=detail.get("scope") if isinstance(detail, dict) else None,
+        )
         raise HTTPException(status_code=429, detail=e.detail) from e
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -710,6 +797,12 @@ async def asample(
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
+    record_sampling_admission_metric(
+        route=_ASAMPLE_ROUTE,
+        decision="accepted",
+        reason="queued",
+        scope=throttle_scope,
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -729,6 +822,11 @@ async def sample_once(
     from ..gateway import forward_json, remote_sampling_session, upstream_for_alias
 
     if _should_backpressure(http_request):
+        record_sampling_admission_metric(
+            route=_SAMPLE_ONCE_ROUTE,
+            decision="rejected",
+            reason="server_overloaded",
+        )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
 
     is_local = False
@@ -1333,6 +1431,7 @@ async def compute_logprobs(
     - logprobs[0] is None (first token has no conditioning context)
     - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
     """
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1394,10 +1493,14 @@ async def compute_logprobs(
                     f"{type(e).__name__}: {e}"
                 ),
             )
-        if len(token_ids) > max_model_len:
+        total_len = len(token_ids) + 1
+        if total_len > max_model_len:
             raise HTTPException(
                 status_code=400,
-                detail=f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} for model {base_model}",
+                detail=(
+                    f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                    f"for model {base_model}"
+                ),
             )
 
     user_id = _get_user_id(http_request)
@@ -1414,6 +1517,11 @@ async def compute_logprobs(
         object_store_bytes=estimate_compute_logprobs_result_bytes(request),
     )
     if not bool(reserve.get("ok")):
+        record_sampling_admission_metric(
+            route=_COMPUTE_LOGPROBS_ROUTE,
+            decision="rejected",
+            reason="capacity_rejected",
+        )
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -1424,13 +1532,21 @@ async def compute_logprobs(
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
-        await api_work_queue.enqueue(
+        base_model = session_manager.get_session_base_model(request.sampling_session_id) if session_manager is not None else None
+        await _enqueue_sampling_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="sampling.compute_logprobs",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            session_id=request.sampling_session_id,
+            base_model=base_model,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="sampling.compute_logprobs",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            ),
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1438,6 +1554,11 @@ async def compute_logprobs(
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
 
+    record_sampling_admission_metric(
+        route=_COMPUTE_LOGPROBS_ROUTE,
+        decision="accepted",
+        reason="queued",
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -1457,45 +1578,55 @@ async def _do_compute_logprobs(
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
         session_manager.mark_session_inflight(session_id, +1)
+        base_model = session_manager.get_session_base_model(session_id)
 
-        # Check if session uses multi-LoRA mode (includes base model sessions)
-        is_multi_lora = session_manager.is_multi_lora_session(session_id)
-        if is_multi_lora:
-            base_model = session_manager.get_session_base_model(session_id)
-            if not base_model:
-                raise RuntimeError(f"Session {session_id!r} missing base_model")
-            from ..backend.model_registry import get_model_config
+        async def _compute_logprobs_action():
+            # Check if session uses multi-LoRA mode (includes base model sessions)
+            is_multi_lora = session_manager.is_multi_lora_session(session_id)
+            if is_multi_lora:
+                if not base_model:
+                    raise RuntimeError(f"Session {session_id!r} missing base_model")
+                from ..backend.model_registry import get_model_config
 
-            max_model_len = int(get_model_config(base_model).max_model_len)
-            if len(token_ids) > max_model_len:
-                raise ValueError(
-                    f"Prompt length {len(token_ids)} exceeds max_model_len {max_model_len} "
-                    f"for model {base_model}"
+                max_model_len = int(get_model_config(base_model).max_model_len)
+                total_len = len(token_ids) + 1
+                if total_len > max_model_len:
+                    raise ValueError(
+                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    )
+
+            if is_multi_lora:
+                multi_lora_engine = await session_manager.get_engine_for_session(session_id)
+                if multi_lora_engine is None:
+                    raise RuntimeError(f"No engine found for session {session_id}")
+                await _ensure_session_lora_loaded(multi_lora_engine, session_id)
+                return await multi_lora_engine.compute_logprobs(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=request_id,
                 )
 
-        if is_multi_lora:
-            # Multi-LoRA mode: handles both LoRA and base model sessions
-            # Get engine for this session's model (dynamically creates if needed)
-            multi_lora_engine = await session_manager.get_engine_for_session(session_id)
-            if multi_lora_engine is None:
-                raise RuntimeError(f"No engine found for session {session_id}")
-            await _ensure_session_lora_loaded(multi_lora_engine, session_id)
-
-            logprobs = await multi_lora_engine.compute_logprobs(
-                sampling_session_id=session_id,
-                prompt_ids=token_ids,
-                request_id=request_id,
-            )
-        else:
-            # Legacy mode: per-session engine
             engine = session_manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
-
-            logprobs = await engine.compute_logprobs(
+            return await engine.compute_logprobs(
                 prompt_ids=token_ids,
                 request_id=request_id,
             )
+
+        logprobs = await run_async_with_otel_span(
+            "sampling.compute_logprobs.execute",
+            _compute_logprobs_action,
+            component="routes.sampling",
+            op="sampling.compute_logprobs",
+            request_id=str(request_id),
+            attributes={
+                "sampling_session_id": str(session_id),
+                "base_model": str(base_model) if base_model else None,
+                "prompt_tokens": int(len(token_ids)),
+            },
+        )
 
         logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)

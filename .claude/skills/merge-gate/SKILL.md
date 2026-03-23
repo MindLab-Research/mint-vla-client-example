@@ -1,616 +1,414 @@
 ---
 name: merge-gate
 description: |
-  Merge gate validation before merging develop to main.
+  Dev-server validation slate for tinker-server before release or risky merges.
 
-  Use for: pre-merge testing, release validation, comprehensive functional tests.
+  Use for: explicit scenario selection against a real dev server, GPU-aware regression coverage,
+  integrated training/control-plane validation, and iterative fix-and-rerun workflows.
 
-  Triggers: "merge gate", "pre-merge", "ready to merge", "validate for release"
+  Triggers: "merge gate", "pre-merge", "validate for release", "run selected gate items"
 
-  This skill runs a curated test suite to verify code is production-ready.
-  All tests must pass before merge is allowed.
+  This skill is not a deterministic PASS/FAIL gate. It runs explicitly selected scenario items,
+  gathers evidence, classifies failures, and co-iterates the server and the scenario runners.
 ---
 
-# Merge Gate Validation
+# merge-gate
 
-## Overview
+## Intent
 
-The merge gate validates that code on `develop` is ready to merge to `main`. It runs comprehensive tests covering Dense/MoE SFT+RL and API behavior. A DPO test exists but is skipped until server-side DPO is implemented.
+This skill validates `develop` against a real dev server by running selected scenario items.
 
-**Location:** `.claude/skills/merge-gate/tests/`
+The unit of work is a **scenario item**, not a pytest file and not a fixed phase.
+Each merge-gate session must explicitly select which scenario items to run.
 
----
+The purpose is to reveal server behavior under realistic training and control-plane workflows:
 
-## GPU Requirements
+- training algorithms
+- checkpoint and resume continuity
+- session interleaving and loss spikes
+- create-model queueing and admission control
+- actor lifecycle and idle cleanup
+- memory-retention and max-context transition failures
+- opt-in architecture-specific coverage
 
-### Per-Model Requirements
+This skill does **not** define a rigid merge blocker. It defines a disciplined validation loop.
 
-| Model | vLLM GPUs | Megatron GPUs | Total |
-|-------|-----------|---------------|-------|
-| Qwen3-0.6B (Dense) | 1 | 1 | 2 |
-| Qwen3-30B-A3B (MoE) | 4 (TP=4) | 4 (TP=4, EP=1) | 8 |
-| Moonlight-16B-A3B (MLA) | 4 (TP=4) | 4 (TP=1, EP=4) | 8 |
+## Hard Rules
 
-**Note**: Qwen3-30B uses TP=4 for both vLLM and Megatron. Moonlight uses DeepSeekV3 MLA; merge gate targets 4 GPUs for training and 4 GPUs for vLLM.
+- Dev only. Use `mint-dev` conventions and target the dev server, not prod.
+- Selection is required every time. If the user does not name scenario items, stop and ask which items to run. Do not invent defaults.
+- No unit tests. Every selected item must hit a real dev server.
+- Pytest is allowed only as an integration harness. The scenario still has to exercise the live server.
+- Every catalog item in this skill must be runnable today. Do not list placeholders in the active catalog.
+- Active merge-gate scenarios must be listed and curated in this `SKILL.md`, not only implied by scattered scripts or tests elsewhere in the repo.
+- For any selected item that produces a convergence curve or trajectory, you must generate the curve artifact, inspect it visually, and present that visual assessment to the user.
+- Do not judge convergence with fixed numeric thresholds like "final loss < 0.8x initial loss" or similar ratio gates. Those thresholds are not valid evidence of healthy learning behavior.
+- No deterministic PASS/FAIL gate language. Report observed behavior and remaining risk.
+- Distinguish:
+  - `server_issue`: the scenario is valid and the server/runtime failed.
+  - `test_issue`: the scenario runner, oracle, or expectations are wrong or stale.
+  - `skill_issue`: the catalog metadata, GPU accounting, sequencing, or workflow text is wrong.
+- GPU-based deselection is automatic and explicit. If a selected item needs more free GPUs than currently available, mark it `deselected_for_gpu` and report the required vs observed budget.
+- No Feishu posting in this workflow.
+- Do not talk about "all tests passed therefore merge allowed". That is not the contract.
 
-### Full Merge Gate Procedure
+## Non-goals
 
-The merge gate runs in **three phases** with different cluster configurations:
+- No local-only correctness checks as merge-gate coverage.
+- No pure unit-test suites.
+- No hidden profile system. Selection is by explicit item id every session.
+- No silent fallback from a missing scenario to a weaker substitute.
 
-**Phase 1: Functional Tests (8 GPUs - one 8-GPU worker)**
-1. Start cluster with 8 GPUs
-2. Run functional tests: Dense SFT/RL/API, MoE SFT/RL/API, Moonlight SFT/transfer/RL-smoke, Stress
-3. Do not manually kill actors between tests; ResourcePool eviction is part of the system under test
+## Environment
 
-**Phase 2: LRU Eviction Test (8 GPUs - one 8-GPU worker)**
-1. Run LRU eviction test with MINT_MIN_ACTOR_AGE=0 and a small MINT_SESSION_IDLE_TIMEOUT (to make eviction observable during the test run)
-2. Tests Dense → MoE → Dense switches with eviction
-3. Requires an observed eviction event (actor inventory changes), not just request completion
+- Primary target: dev server via `http://localhost:8000` through the `mint-dev` tunnel.
+- Use `mint-dev` for server operations.
+- Use `volcano-cluster` when GPU capacity or worker topology must change.
+- Never manually sync code; Unison is the sync mechanism.
 
-**Phase 3: Multitenancy + Admission Control (8 GPUs - one 8-GPU worker)**
-1. Run backpressure/admission tests: `.claude/skills/merge-gate/tests/test_admission_control.py`
-2. Verifies 429 under flood and that retries can be admitted after load drops
-3. Verifies PEFT + Megatron trainer requests queue instead of killing/restarting actors
+## Artifacts
 
-Phase 3 requires enabling sampling backpressure by starting the server with
-`TINKER_MAX_INFLIGHT_SAMPLE_TASKS` set smaller than the API work queue worker
-count (for example `TINKER_MAX_INFLIGHT_SAMPLE_TASKS=16` with
-`TINKER_API_WORK_QUEUE_NUM_WORKERS=32`).
+Write artifacts under:
 
-Use the **volcano-cluster** skill to manage workers.
+- `results/merge-gate/<timestamp>/`
 
----
+Recommended structure:
 
-## Pre-flight Checklist
+- `manifest.json`
+- `session_notes.md`
+- `items/<item_id>/stdout.log`
+- `items/<item_id>/stderr.log`
+- `items/<item_id>/summary.json`
+- `items/<item_id>/classification.json`
+- `items/<item_id>/artifacts/`
 
-Before running merge gate, complete these steps from **mint-dev** and **volcano-cluster** skills:
+`manifest.json` should capture:
 
-### 1. Verify Unison Daemon
+- selected item ids
+- deselected item ids and reasons
+- observed free GPU budget before each item
+- server revision / git sha
+- server target
+- rerun history
 
-```bash
-pgrep -af "unison.*volcano-tinker" || echo "START: unison volcano-tinker -repeat watch"
-```
+## Single Source Of Truth
 
-### 2. Verify Cluster Has Sufficient GPUs
+The canonical active merge-gate catalog is the human-readable catalog in this `SKILL.md`.
 
-```bash
-ssh mint-dev 'python3 << "PYEOF"
-import ray
-ray.init(address="auto", ignore_reinit_error=True)
-r = ray.available_resources()
-t = ray.cluster_resources()
-gpu_avail = r.get("GPU", 0)
-gpu_total = t.get("GPU", 0)
-print(f"GPUs: {gpu_avail:.0f} / {gpu_total:.0f}")
+Rules:
 
-# Check for stale actors (vLLM actors are named tinker_vllm_{model_name})
-actors = ray.util.list_named_actors(all_namespaces=True)
-for a in actors:
-    name = a["name"]
-    if name.startswith("tinker_vllm_") or name.startswith("megatron_"):
-        print(f"{name}: ALIVE (may need to kill)")
+- A scenario is not part of active merge-gate coverage unless it appears in the runnable catalog below.
+- If a useful repro script exists elsewhere in the repo, that is fine, but it still must be curated into this `SKILL.md` before it counts as merge-gate coverage.
+- The human-readable catalog is the operator-facing source of truth. Keep it current and explicit.
 
-# Warning if insufficient
-if gpu_total < 8:
-    print(f"WARNING: Full merge gate needs 8 GPUs, have {gpu_total:.0f}")
-elif gpu_avail < 4:
-    print(f"WARNING: {gpu_total - gpu_avail:.0f} GPUs in use by actors")
-    print("  Actors will be reused - this is expected behavior")
-PYEOF'
-```
+## Selection Contract
 
-### 3. Add Workers for Merge Gate (via volcano-cluster skill)
+Every merge-gate session must specify scenario item ids explicitly.
 
-Merge gate requires 8 GPUs (one 8-GPU worker):
+Allowed forms:
 
-```bash
-# Check current workers
-volc ml_task list --output json | jq '.[] | select(.Status=="Running") | {name: .Name}'
+- "run merge gate: `rl_sanity_dense_0p6b`, `resume_training_moe_30b`, `admission_control_backpressure`"
+- "select only `sdpo_moe_30b` and `transition_sequence_235b_max_context`"
+- "run all currently selected items except Moonlight"
 
-# If no worker running, add an 8-GPU worker
-volc ml_task submit -c .claude/skills/volcano-cluster/configs/mint-dev-worker.yaml --output json
-```
+If the user says only "run merge gate" with no items:
 
-See **volcano-cluster** skill for detailed worker management commands.
+- do not pick a default slate
+- do not infer a profile
+- ask for explicit item ids
 
-### 4. Kill Stale Actors (Optional)
+Recommended operator behavior:
 
-```bash
-# Kill Megatron (frees 8 GPUs)
-curl -X POST http://localhost:8000/api/v1/kill_megatron
+- If sanity items are selected, run them first.
+- If sanity items are not selected, state that clearly in the run manifest.
 
-# Kill vLLM (frees 1-4 GPUs)
-curl -X POST http://localhost:8000/api/v1/kill_vllm
+## GPU Accounting
 
-# Kill all actors
-curl -X POST http://localhost:8000/api/v1/kill_all_actors
+`gpu_required` means the minimum free GPU budget required before starting the scenario.
 
-# Check status
-curl -s http://localhost:8000/api/v1/megatron_status | jq
-curl -s http://localhost:8000/api/v1/vllm_status | jq
-```
+Interpretation:
 
-### 5. Verify Server Health
+- It is a conservative lower bound for the selected dev topology.
+- It is not a promise that the scenario will fit under all fragmentation or placement states.
+- If the free budget is below `gpu_required`, the item is not run.
+
+Minimum preflight evidence:
+
+- dev server `healthz`
+- current actor inventory
+- current free GPU count
+
+When possible, use both:
+
+- server-facing actor visibility
+- Ray free and total GPU visibility on the dev cluster
+
+If these disagree, report the disagreement instead of inventing a single truth.
+
+## Execution Loop
+
+For each selected item:
+
+1. Re-check free GPUs and actor state.
+2. If GPU budget is insufficient, mark the item `deselected_for_gpu` and continue.
+3. Run the item's configured runner against the real dev server.
+4. Save raw artifacts.
+5. Summarize the observed behavior in plain terms.
+6. On failure, classify the failure as `server_issue`, `test_issue`, or `skill_issue`.
+7. If a fix is applied, rerun:
+   - the affected item
+   - and any selected sanity items that cover the same surface
+
+Do not escalate a single failed scenario into "merge blocked" without saying what was actually observed.
+
+## Taxonomy
+
+Suggested scenario categories:
+
+- `sanity`
+  - short RL-loop probes that tell you whether the dev server is fundamentally alive
+- `training_algorithm`
+  - DPO, SDPO, RL, SFT
+- `checkpoint_resume`
+  - save/load/resume trajectory fidelity
+- `concurrency_isolation`
+  - interleaving, loss spikes, same-session ordering, multi-session correctness
+- `server_control_plane`
+  - admission control, queueing, actor lifecycle, create-model contention
+- `heavyweight_capacity`
+  - max-context, large-model, or expensive cluster-stress scenarios
+- `opt_in_architecture`
+  - Moonlight or other non-core architecture coverage
+
+Categories are organizational only. None of them are "secondary" by definition.
+
+## Runnable Scenario Catalog
+
+Every item below is runnable now and tied either to a related issue/PR or to a current live integration surface.
+
+### Sanity
+
+| id | provenance | model | gpu_required | runner | reveals |
+|---|---|---|---:|---|---|
+| `rl_sanity_dense_0p6b` | sanity-check workflow | `Qwen/Qwen3-0.6B` | 2 | `MINT_TEST_EXPERIMENT_ROOT=results/merge-gate/<ts>/rl_sanity_dense_0p6b python .claude/skills/sanity-check/mint_rl_test_long.py --model Qwen/Qwen3-0.6B --num-rl-steps=1 --batch-size=2 --group-size=4 --max-tokens=128` | Basic dense train, sample, save, and future retrieval path on the real dev server. |
+| `rl_sanity_moe_30b` | sanity-check workflow | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `MINT_TEST_EXPERIMENT_ROOT=results/merge-gate/<ts>/rl_sanity_moe_30b python .claude/skills/sanity-check/mint_rl_test_long.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --num-rl-steps=1 --batch-size=2 --group-size=4 --max-tokens=128` | Basic Megatron plus vLLM health on the real dev server. |
+
+### Training Algorithm
+
+| id | provenance | model | gpu_required | runner | reveals |
+|---|---|---|---:|---|---|
+| `sft_dense_0p6b` | existing merge-gate dense SFT coverage | `Qwen/Qwen3-0.6B` | 1 | `python -m pytest .claude/skills/merge-gate/tests/test_dense_sft.py::TestDenseSFT::test_pig_latin_training -v -s` | Low-cost dense supervised training behavior. |
+| `sft_moe_30b` | existing merge-gate MoE SFT coverage | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `python -m pytest .claude/skills/merge-gate/tests/test_moe_sft.py::TestMoESFT::test_moe_sft_training -v -s` | Low-cost MoE supervised training path without relying on the RL loop. |
+| `dpo_dense_0p6b` | current DPO path on dev | `Qwen/Qwen3-0.6B` | 2 | `python -m pytest .claude/skills/merge-gate/tests/test_dense_dpo.py::TestDenseDPO::test_dpo_training -v -s` | Dense DPO loss path and preference-margin behavior on the live server. |
+| `dpo_moe_30b` | current MoE DPO path | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `python scripts/tools/verify_convergence_matrix.py --models Qwen/Qwen3-30B-A3B-Instruct-2507 --loss-fns dpo --seeds 1 --steps 3 --output-dir results/merge-gate/<ts>/dpo_moe_30b` | MoE DPO path on the real server using the cookbook preference-pair dataset. |
+| `sdpo_dense_0p6b` | PR 375 | `Qwen/Qwen3-0.6B` | 2 | `python scripts/tools/mintx_sdpo_train.py --base-url http://localhost:8000 --api-key dummy --model Qwen/Qwen3-0.6B --output-dir results/merge-gate/<ts>/sdpo_dense_0p6b --steps 4 --train-batch-size 4 --eval-size 16 --train-size 64 --probe-size 8 --max-tokens 32` | MintX reverse-KL and checkpoint interpolation path on a small dense model. |
+| `sdpo_moe_30b` | PR 375 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `python scripts/tools/mintx_sdpo_train.py --base-url http://localhost:8000 --api-key dummy --model Qwen/Qwen3-30B-A3B-Instruct-2507 --output-dir results/merge-gate/<ts>/sdpo_moe_30b --steps 4 --train-batch-size 4 --eval-size 16 --train-size 64 --probe-size 8 --max-tokens 32` | MintX reverse-KL path on the 30B MoE training stack. |
+
+### Checkpoint and Resume
+
+| id | provenance | model | gpu_required | runner | reveals |
+|---|---|---|---:|---|---|
+| `resume_training_dense_0p6b` | PR 315 contract generalized to dense | `Qwen/Qwen3-0.6B` | 1 | `TINKER_MODEL=Qwen/Qwen3-0.6B python scripts/tools/reproduce_issue_315_resume_training.py` | `save_state` plus `create_model_from_state(..., load_optimizer=true)` preserves training continuity instead of spiking back to fresh-session behavior. |
+| `resume_training_moe_30b` | PR 315 and issue 283 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `TINKER_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 python scripts/tools/reproduce_issue_315_resume_training.py` | Megatron resume continuity with optimizer restore on the live 30B path. |
+
+### Concurrency and Isolation
+
+| id | provenance | model | gpu_required | runner | reveals |
+|---|---|---|---:|---|---|
+| `session_switch_continuity_dense_0p6b` | issue 44 | `Qwen/Qwen3-0.6B` | 1 | `python scripts/tools/issue44.py concurrent --model Qwen/Qwen3-0.6B --steps 5 --batch-size 4 --learning-rate 1e-4` | Interleaved A/B dense training behaves like independent runs instead of corrupting session state. |
+| `interleaved_loss_spike_dense_0p6b` | issues 193 and 194 | `Qwen/Qwen3-0.6B` | 1 | `python scripts/tools/reproduce_issue_193_194_high_load.py --model Qwen/Qwen3-0.6B --steps 8 --batch-size 8 --background-models 2 --output-dir results/merge-gate/<ts>/issue193_194_dense` | Same-session `forward_backward -> optim_step` ordering under load does not invert or trigger a loss spike. |
+| `interleaved_loss_spike_moe_30b` | PR 350 built on issues 193 and 194 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `python scripts/tools/reproduce_issue_193_194_high_load.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --steps 8 --batch-size 8 --background-models 2 --output-dir results/merge-gate/<ts>/issue193_194_moe` | Shared 30B Megatron trainer under session-switch load does not reproduce the old correlated loss-spike signature. |
+| `transition_sequence_moe_30b` | PR 370 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 8 | `TINKER_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 python scripts/tools/reproduce_issue_370_transition_sequence.py` | PR 370 transition sequence `A forward_backward -> B forward -> A optim_step` completes on a shared Megatron actor without retention-induced failure. |
+| `transition_sequence_235b_max_context` | PR 370 heavy variant | `Qwen/Qwen3-235B-A22B-Instruct-2507` | 32 | `TINKER_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507 python scripts/tools/reproduce_issue_370_transition_sequence.py` | 235B max-context transition sequence `A forward_backward -> B forward -> A optim_step` does not OOM or fail on the shared Megatron path. |
+
+### Server Control Plane
+
+| id | provenance | model | gpu_required | runner | reveals |
+|---|---|---|---:|---|---|
+| `admission_control_backpressure` | current admission-control regression coverage | `N/A` | 0 | `python -m pytest .claude/skills/merge-gate/tests/test_admission_control.py::TestAdmissionControl::test_flood_rejected_429_no_capacity_leak_and_retry_works -v -s` | Oversized or flooded requests are rejected with stable capacity accounting and recovery after load drops. |
+| `trainer_request_queueing_dense` | issue 230 style timeout avoidance | `Qwen/Qwen3-0.6B` | 1 | `python -m pytest .claude/skills/merge-gate/tests/test_admission_control.py::TestTrainerQueuing::test_competing_create_model_waits_dense_trainer -v -s` | Competing dense `create_model` requests queue instead of timing out and killing the actor. |
+| `trainer_request_queueing_moe` | issue 230 plus scheduler and healthz hardening | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 4 | `python -m pytest .claude/skills/merge-gate/tests/test_admission_control.py::TestTrainerQueuing::test_competing_create_model_waits_megatron_trainer -v -s` | Competing Megatron `create_model` requests queue instead of timing out and killing the actor. |
+| `session_idle_cleanup_dense_0p6b` | issue 356 | `Qwen/Qwen3-0.6B` | 1 | `TINKER_MODEL=Qwen/Qwen3-0.6B python scripts/tools/reproduce_issue_356.py` | Idle training sessions are automatically cleaned up instead of persisting forever. Server precondition: dev server started with a short `MINT_TRAINING_INACTIVITY_TIMEOUT` such as `60`. |
+| `rapid_session_creation` | existing stress coverage | `Qwen/Qwen3-0.6B` | 1 | `python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_rapid_session_creation -v -s` | Fast create-model churn does not corrupt session management. |
+| `actor_eviction_recycle` | existing eviction sentry | `mixed` | 16 | `python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_mixed_model_lru_eviction -v -s` | Actor replacement and eviction remain observable and correct under pressure. |
+
+### Opt-in Architecture
+
+| id | provenance | model | gpu_required | runner | reveals |
+|---|---|---|---:|---|---|
+| `moonlight_sft` | existing Moonlight coverage | `moonshotai/Moonlight-16B-A3B-Instruct` | 8 | `python -m pytest .claude/skills/merge-gate/tests/test_moonlight_sft.py::TestMoonlight::test_moonlight_sft_training -v -s` | Moonlight supervised training path. Opt-in only. |
+| `moonlight_lora_transfer` | existing Moonlight coverage | `moonshotai/Moonlight-16B-A3B-Instruct` | 8 | `python -m pytest .claude/skills/merge-gate/tests/test_moonlight_sft.py::TestMoonlight::test_moonlight_lora_transfer -v -s` | Moonlight train -> export -> sample path. Opt-in only. |
+| `moonlight_rl` | existing Moonlight coverage | `moonshotai/Moonlight-16B-A3B-Instruct` | 8 | `python -m pytest .claude/skills/merge-gate/tests/test_moonlight_sft.py::TestMoonlight::test_moonlight_rl_smoke -v -s` | Moonlight RL smoke path. Opt-in only. |
+
+## Catalog Discipline
+
+Only items in the catalog above count as active merge-gate scenarios.
+
+If a future idea has no runner yet:
+
+- it is not part of the active catalog
+- do not present it as selectable
+- implement a runner first, then add it to the catalog
+
+If a future idea already has a repro script elsewhere in the repo:
+
+- do not treat that script alone as merge-gate coverage
+- add a curated entry to the runnable catalog in this `SKILL.md`
+
+## Preflight Procedure
+
+Before any selected item runs:
+
+1. Confirm dev targeting.
+2. Confirm server health.
+3. Confirm Unison is healthy.
+4. Inspect current actor inventory.
+5. Inspect current free and total GPUs.
+6. Build a session manifest:
+   - `selected`
+   - `deselected_for_gpu`
+   - `not_selected`
+
+Suggested preflight evidence:
 
 ```bash
 curl -s http://localhost:8000/api/v1/healthz
+curl -s http://localhost:8000/api/v1/actors
 ```
 
----
-
-## Test Suite
-
-### Phase 1: Dense Model Tests (Qwen3-0.6B)
-
-| Test | Description | Pass Criteria | Duration |
-|------|-------------|---------------|----------|
-| **dense_sft** | Pig Latin translation (from tinker_test.ipynb) | Report emitted; no API errors; no NaN/Inf | 3 min |
-| **dense_rl** | Arithmetic RL with PPO loss | Report emitted; no API errors; no NaN/Inf | 3 min |
-| **dense_dpo** | DPO on preference pairs | SKIP (DPO loss not implemented) | 0 |
-| **dense_api** | Sampling, logprobs, checkpoint | All API operations succeed | 2 min |
-
-### Phase 2: MoE Model Tests (Qwen3-30B-A3B-Instruct-2507)
-
-| Test | Description | Pass Criteria | Duration |
-|------|-------------|---------------|----------|
-| **moe_sft** | SFT with train_step endpoint | Report emitted; no API errors; no NaN/Inf | 5 min |
-| **moe_rl** | RL with importance_sampling | Report emitted; no API errors; no NaN/Inf | 5 min |
-| **moe_api** | Sampling from trained weights | Generation works | 3 min |
-
-### Phase 2.5: Moonlight Tests (moonshotai/Moonlight-16B-A3B-Instruct)
-
-**Targets 8 GPUs (4 vLLM + 4 Megatron).** Tests DeepSeekV3 MLA (Multi-Latent Attention) architecture.
-
-| Test | Description | Pass Criteria | Duration |
-|------|-------------|---------------|----------|
-| **moonlight_sft** | SFT with MLA attention | Report emitted; no API errors; no NaN/Inf | 5 min |
-| **moonlight_lora_transfer** | Train → Extract → vLLM Load → Generate | Full pipeline succeeds | 3 min |
-| **moonlight_rl** | Full RL loop: sample → reward → train | Report emitted; no API errors; no NaN/Inf | 3 min |
-
-### Phase 3: Stress, Multi-Tenant, and Long Context Tests
-
-| Test | Description | Pass Criteria | Duration |
-|------|-------------|---------------|----------|
-| **stress** | 5 concurrent clients with different configs | All complete without deadlock | 5 min |
-| **interleaved_sessions** | A → B → A session switching | Loss continuity preserved | 3 min |
-| **rapid_session_creation** | 5 sessions in quick succession | All create successfully | 1 min |
-| **admission_control_backpressure** | Flood oversized requests (no Ray work) | Rejected with 429; capacity/actors unchanged; next request succeeds | 1 min |
-| **trainer_request_queueing** | Competing requests against same trainer | Dense+MoE requests complete; trainer actor not restarted | 3 min |
-| **mixed_model_lru_eviction** | Dense → MoE → Dense | Graceful actor replacement | 5 min |
-| **moe_long_context_inference** | MoE inference at 38K tokens (near 40K limit) | Generates output without OOM | 5 min |
-| **moe_long_context_training** | MoE training at 38K tokens (near 40K limit) | Loss computed without OOM | 8 min |
-
-### Supported Model Variants
-
-The system supports multiple model variants. All variants of the same base model share vLLM/Megatron actors:
-
-| Model | Type | GPUs | Backend | Status |
-|-------|------|------|---------|--------|
-| `Qwen/Qwen3-0.6B` | Dense | 1 | PEFT/vLLM | Primary test target (Phase 1) |
-| `Qwen/Qwen3-4B` | Dense | 1 | PEFT/vLLM | Medium dense model |
-| `Qwen/Qwen3-8B` | Dense | 1 | PEFT/vLLM | Large dense model |
-| `Qwen/Qwen3-30B-A3B-Instruct-2507` | MoE | 4 (TP=4) | Megatron/vLLM | Primary MoE test target |
-| `Qwen/Qwen3-30B-A3B` | MoE | 4 (TP=4) | Megatron/vLLM | Base model variant |
-| `Qwen/Qwen3-30B-A3B-Base` | MoE | 4 (TP=4) | Megatron/vLLM | Pre-training base |
-| `moonshotai/Moonlight-16B-A3B-Instruct` | MLA | 8 (4+4) | Megatron/vLLM | DeepSeekV3 MLA architecture |
-
-**Quick test with Qwen3-0.6B** (faster iteration, smaller footprint):
-```bash
-# Useful for rapid development testing
-TINKER_BASE_URL=http://localhost:8000 \
-python scripts/tools/smoke.py dense-train
-```
-
-Stress test configurations (using Qwen3 models):
-- Client 1: Qwen3-0.6B, SFT, rank=16
-- Client 2: Qwen3-0.6B, RL, rank=32
-- Client 3: Qwen3-4B, SFT, rank=64
-- Client 4: Qwen3-8B, SFT, rank=32
-- Client 5: Qwen3-0.6B, SFT, rank=16
+If deeper GPU accounting is needed, use the `mint-dev` workflow and the cluster Python that matches the dev Ray runtime.
 
----
-
-## Running the Tests
+## Runner Guidance
 
-> **CRITICAL: Tests Run LOCALLY, Not on Server**
->
-> All pytest commands run on your LOCAL machine (which has internet access for tokenizer downloads).
-> Tests connect to the server via SSH tunnel (localhost:8000 -> mint-dev:8000).
->
-> **Do NOT:**
-> - Run pytest on the server (no internet for tokenizer downloads)
-> - Set `HF_HUB_OFFLINE=1` or `HF_HOME=/vePFS-...` for test scripts
->
-> **Server commands** (ssh mint-dev '...') set HF_HUB_OFFLINE because the server has no internet.
-> **Test commands** (python -m pytest) run locally and download tokenizers from HuggingFace Hub.
+The skill speaks in scenario ids, but execution may use either:
 
-### Complete Merge Gate
+- a dedicated Python script under `scripts/tools/`
+- a pytest integration target under `.claude/skills/merge-gate/tests/`
+- a vendored real-loop script such as `.claude/skills/sanity-check/mint_rl_test_long.py`
 
-```bash
-# Run from LOCAL machine (has internet for tokenizer downloads)
-# Ensure SSH tunnel is active: ssh -f -N -L 8000:localhost:8000 mint-dev
-cd /path/to/tinker-server-prod
+Pytest-backed items are acceptable only because they hit the real dev server.
 
-# Run all functional tests (do NOT kill actors between)
-TINKER_BASE_URL=http://localhost:8000 \
-python -m pytest .claude/skills/merge-gate/tests/ -v --tb=short
-```
+When a scenario runner exists in more than one form:
 
-### Run with LRU Eviction Testing
+- prefer the most realistic real-loop runner
+- prefer dedicated repro scripts over generic matrix scripts
+- prefer generic scripts only when they are still concrete, runnable, and scenario-specific enough to reveal the intended behavior
 
-To test LRU eviction with immediate actor replacement:
+For convergence-style items, the runner must leave behind enough information to inspect the learning trajectory, such as:
 
-```bash
-# Restart server with MINT_MIN_ACTOR_AGE=0 to enable immediate eviction
-# (Production uses 300s to prevent thrashing; 0 for fast testing)
-ssh mint-dev 'pkill -f "run_server" && sleep 2 && cd /root/tinker_project/tinker-server && \
-  nohup bash -c "PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
-  HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-  PYTHONDONTWRITEBYTECODE=1 MINT_MIN_ACTOR_AGE=0 \
-  python scripts/run_server.py" >> /tmp/tinker_server.log 2>&1 &'
- 
+- plotted loss or reward curves
+- per-step metrics CSV or JSON
+- saved images referenced in the session report
 
-# Wait for server to start
-sleep 10 && curl http://localhost:8000/api/v1/healthz
+If a convergence-style runner does not currently emit a curve, fix the runner before treating it as merge-gate evidence.
 
-# Run LRU eviction test
-TINKER_BASE_URL=http://localhost:8000 \
-python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_mixed_model_lru_eviction -v -s
-```
+## Convergence Assessment
 
-### Quick Validation (Dense Only)
+For any item whose main evidence is a training trajectory, such as SFT, DPO, SDPO, RL, resume continuity, or loss-spike regression:
 
-```bash
-# Only 2 GPUs needed
-python -m pytest .claude/skills/merge-gate/tests/test_dense_*.py -v
-```
+- plot the curve
+- inspect it visually
+- describe the curve to the user in plain language
 
-### Individual Tests
+Minimum acceptable visual discussion:
 
-```bash
-# Single test with detailed output
-python -m pytest .claude/skills/merge-gate/tests/test_dense_sft.py -v -s
-```
+- overall shape
+- whether there are abrupt spikes, resets, plateaus, or divergence
+- whether the post-resume or post-interleave segment looks continuous with the pre-event segment
 
----
+Unacceptable judgments:
 
-## Test Details
+- "final loss is below some fixed fraction of initial loss"
+- "the average is lower so it passed"
+- "the threshold says this is good"
 
-### Dense SFT (Pig Latin)
+The correct question is whether the curve shape matches the intended behavior of the scenario.
 
-Based on official tinker_test.ipynb. Teaches model to translate English to Pig Latin:
+## Classification Discipline
 
-```
-Input: "banana split"
-Output: "anana-bay plit-say"
-```
+Every failure should end with one primary classification:
 
-Training data: 7 examples, 10 iterations, lr=1e-4
-Expected: Loss 2.45 → 0.58 (~76% reduction)
+- `server_issue`
+  - examples:
+    - actor dies
+    - queueing policy regresses
+    - checkpoint resume diverges
+    - max-context transition OOMs unexpectedly
+- `test_issue`
+  - examples:
+    - stale dataset
+    - wrong expectation
+    - flaky oracle
+    - runner assumes an old API contract
+- `skill_issue`
+  - examples:
+    - wrong GPU requirement metadata
+    - wrong sequencing
+    - missing preflight invariant
+    - stale catalog entry or wrong scenario provenance
 
-### Dense RL (Arithmetic)
+Do not collapse these into a single "merge gate failed" statement.
 
-Based on tinker_cookbook math_rl recipe. Model generates arithmetic answers:
+## Reporting
 
-```
-Input: "What is 5 + 3?"
-Output: "8"
-Reward: +1 if correct, 0 otherwise
-```
+At the end of a session, report:
 
-Uses PPO loss with advantage normalization.
-Expected: Positive reward improvement, ratio near 1.0
+- selected items
+- deselected items and reasons
+- items not selected
+- observed free GPU budget
+- per-item outcome
+- per-item classification if failed
+- what changed in the server or runner during the session
+- what was rerun
+- what remains unresolved
 
-### Dense DPO
+The report should read like an evidence summary, not a pass/fail verdict.
 
-Preference optimization on constructed pairs:
-
-```
-Prompt: "Explain briefly"
-Chosen: "Short answer."
-Rejected: "Very long verbose answer with unnecessary details..."
-```
-
-SKIP: DPO loss is not implemented server-side; `test_dense_dpo.py` is marked skipped.
-
-### MoE SFT
-
-Uses `train_step` endpoint (combined forward_backward + optim_step in single train_mode context) required for MoE with offloading.
-
-Training: Random token sequences, 10 iterations
-Expected: Loss decreases, non-zero gradients
-
-### MoE RL
-
-Importance sampling loss on MoE model.
-Expected: Gradients flow through MoE layers, ratio metrics valid
-
-### Stress Test
-
-Simulates concurrent cookbook clients:
-- Creates 5 sessions in parallel
-- Each runs 3 training iterations
-- Different LoRA ranks (16, 32, 64)
-- Tests request serialization and session isolation
-
-### Multi-Tenant Concurrency Test (Interleaved Sessions)
-
-Tests stateless trainer architecture by interleaving sessions:
-
-```
-Session A: iter1 → iter2 → (switch to B) → iter3 → iter4
-Session B:                   iter1 → iter2
-```
-
-**This is CRITICAL for production use.** Multiple users switching between sessions must maintain correct state.
-
-**What to verify:**
-1. Session A's loss continues decreasing after switch (no state reset)
-2. Session B trains independently with different loss trajectory
-3. No weight contamination between sessions
-
-**Expected curve behavior:**
-```
-Session A: 6.42 → 0.18 → [B] → 0.009 → 0.0001  (continues from 0.18, not reset)
-Session B: 10.57 → 0.42                        (independent trajectory)
-```
-
-**Run the interleaved sessions test:**
-```bash
-TINKER_BASE_URL=http://localhost:8000 \
-python -m pytest .claude/skills/merge-gate/tests/test_stress.py::TestStress::test_interleaved_sessions -v -s
-```
-
----
-
-## Interpreting Results
-
-### CRITICAL: Visual Curve Inspection Required
-
-**The agent MUST visually inspect training curves, not just rely on pytest pass/fail.**
-
-Test scripts generate training curve plots in `.claude/skills/merge-gate/results/`:
-- `dense_sft_pig_latin_YYYYMMDD_HHMMSS.png`
-- `dense_sft_pig_latin_YYYYMMDD_HHMMSS.json`
-
-**What to check in training curves:**
-
-1. **Monotonic decrease**: Loss should generally decrease, not oscillate wildly
-2. **No spikes**: Sudden loss increases indicate training instability
-3. **No plateau**: Loss should continue decreasing, not flatten prematurely
-4. **Reasonable range**: Initial loss ~2-10, final loss ~0.01-0.5 for converged training
-
-**Example of healthy vs problematic curves:**
-
-```
-HEALTHY:                       PROBLEMATIC:
-Loss                           Loss
-│ ╲                            │ ╱╲
-│  ╲                           │╱  ╲ ╱╲
-│   ╲_                         │    ╳  ╲___
-│     ╲_                       │
-│       ╲___                   │
-└──────────── Iter             └──────────── Iter
-  (smooth decrease)              (spikes, then plateau)
-```
-
-**How to view plots:**
-```bash
-# From local machine (plots saved to remote server)
-ssh mint-dev 'ls /root/tinker_project/tinker-server/.claude/skills/merge-gate/results/*.png'
-
-# Copy plots locally for viewing
-rsync -av mint-dev:/root/tinker_project/tinker-server/.claude/skills/merge-gate/results/ /tmp/merge-gate-results/
-
-# Or view JSON data directly
-cat .claude/skills/merge-gate/results/dense_sft_pig_latin_*.json | jq .losses
-```
-
-### All Pass
-
-```
-========================= test session starts ==========================
-collected 8 items
-
-test_dense_sft.py::test_pig_latin_training PASSED
-test_dense_rl.py::test_arithmetic_rl PASSED
-test_dense_dpo.py::test_dpo_training PASSED
-test_dense_api.py::test_sampling_and_logprobs PASSED
-test_moe_sft.py::test_moe_sft_training PASSED
-test_moe_rl.py::test_moe_rl_training PASSED
-test_moe_api.py::test_moe_sampling PASSED
-test_stress.py::test_concurrent_clients PASSED
-
-========================= 8 passed in 1823.45s =========================
-```
-
-**IMPORTANT**: Even when all tests pass, visually inspect the training curves to ensure they show expected learning behavior.
-
-### Failure
-
-```
-test_dense_sft.py::test_pig_latin_training FAILED
-
-    AssertionError: Loss did not decrease enough: 2.45 -> 2.10 (14% < 70% required)
-```
-
-Check:
-1. Optimizer state reset between sessions? (Issue 6c)
-2. LoRA weights being updated?
-3. Server logs for errors
-
----
-
-## After Tests Pass
-
-### 1. Review Diff
-
-```bash
-git diff main..develop --stat
-git log main..develop --oneline
-```
-
-### 2. Draft PR Body
-
-The PR body should include:
-- Summary of changes since last merge
-- Test results (all 8 tests passed)
-- Any known issues or limitations
-
-Example:
+Minimum acceptable shape:
 
 ```markdown
-## Summary
-
-This PR merges develop to main with the following changes:
-- Fixed optimizer state reset between sessions (Issue 6c)
-- Added MoE expert parallelism support
-- Improved weight sync performance (60s → 0.7s)
-
-## Test Results
-
-Merge gate passed (2025-12-15):
-- Dense SFT: PASS (loss 2.45 → 0.52, 79% reduction)
-- Dense RL: PASS (reward +0.23, ratio 1.02)
-- Dense DPO: SKIP (DPO loss not implemented)
-- Dense API: PASS
-- MoE SFT: PASS (loss 0.48 → 0.28, 42% reduction)
-- MoE RL: PASS
-- MoE API: PASS
-- Stress: PASS (5/5 clients)
-
-## Files Changed
-
-- `megatron_distributed.py`: optimizer state handling
-- `verl_training.py`: MoE parallelism config
-- `session_manager.py`: hot reload optimization
+- selected: rl_sanity_dense_0p6b, resume_training_moe_30b, admission_control_backpressure
+- deselected_for_gpu: transition_sequence_235b_max_context (required=32, observed_free=16)
+- rl_sanity_dense_0p6b: observed stable RL loop on dev; classification=ok
+- resume_training_moe_30b: resumed loss spiked above pre-save baseline; classification=server_issue
+- admission_control_backpressure: runner expected outdated internal payload field; classification=test_issue
+- changes during session: patched server queue accounting; reran rl_sanity_dense_0p6b plus admission_control_backpressure
 ```
 
-### 3. Generate Changelog and Create Tag (requires user approval)
+For convergence-style items, the report must also include a curve summary, for example:
 
-**Do NOT auto-create.** The agent should:
+```markdown
+- resume_training_moe_30b: curve inspected visually. Post-resume loss stayed on the same descending trajectory as the pre-save segment; no reset-to-fresh-session spike was observed. Artifact: `results/merge-gate/<ts>/resume_training_moe_30b/...`
+```
 
-1. Find the previous nightly tag
-2. Analyze commits since that tag
-3. **Summarize changes into categories** (not raw git log)
-4. Present summary to user for approval
-5. Create tag with summarized changelog
+## Release Boundary
+
+This skill is about validation only.
+
+Tag creation, nightly publishing, and release PR mechanics are separate actions and should happen only when explicitly requested.
+
+Do not imply that running merge-gate automatically creates a release artifact.
+
+If the user explicitly asks for release mechanics after merge-gate work, keep the following workflow in this skill:
+
+- review `origin/main..origin/develop`
+- summarize changes into a human-readable changelog
+- create an annotated nightly tag named `nightly_YYYYMMDD`
+- push the tag
+- open a `develop -> main` PR with the summarized release body
+
+Hard rules for that release flow:
+
+- Do not create a tag or PR without explicit user confirmation for that step.
+- The tag message and PR body should summarize user-facing changes, not dump a raw commit list.
+- If merge-gate was skipped or only partially run, state that explicitly in the tag message and PR body.
+- If validation found unresolved issues, do not hide them in the release summary.
+
+Useful commands for the explicit release step:
 
 ```bash
-# Find the most recent nightly tag
 PREV_TAG=$(git tag -l 'nightly_*' --sort=-creatordate | head -1)
-echo "Previous tag: $PREV_TAG"
-
-# Show raw commits for agent to summarize
-git log $PREV_TAG..HEAD --oneline --no-merges
+git log "$PREV_TAG"..HEAD --oneline --no-merges
+git diff origin/main..origin/develop --stat
 ```
-
-**Agent must summarize commits into a user-facing changelog:**
-
-- Include API changes, bug fixes, new features
-- Exclude internal housekeeping (skill updates, test changes, docs)
-
-```
-- Fix Tinker API endpoint alignment (/save_weights + /save_state)
-- Add auth bypass for dev mode (no API key required)
-```
-
-**After user approval:**
-
-```bash
-TODAY=$(date +%Y%m%d)
-
-# Create tag with summarized message (agent writes TAG_MSG)
-git tag -d nightly_$TODAY 2>/dev/null || true
-git push origin :refs/tags/nightly_$TODAY 2>/dev/null || true
-git tag -a nightly_$TODAY -m "$TAG_MSG"
-git push origin nightly_$TODAY
-```
-
-### 4. Create PR
-
-```bash
-gh pr create --base main --head develop --title "Release: <version>" --body-file /tmp/pr_body.md
-```
-
----
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Pre-flight fails: 0 GPUs | Kill stale actors (see mint-dev skill section 6) |
-| Pre-flight fails: cluster disconnected | Verify head reachable without starting a local raylet: `ssh mint-dev "ray status --address='<IP>:6379'"` |
-| Dense tests timeout | Check server logs, restart server |
-| MoE tests fail to start | Need 8 GPUs (TP=4), add worker via volcano-cluster |
-| MoE tests OOM | Kill vLLM, restart with fresh actor |
-| Stress test deadlock | Session isolation issue, check logs |
-| Loss not decreasing | Optimizer state bug, check Issue 6c fix |
-| MoE LoRA not loading in vLLM | MLP modules filtered out (vLLM limitation), only attention LoRA supported |
-
----
-
-## Error Analysis Protocol
-
-**CRITICAL: When errors occur, use sequential thinking to carefully distinguish between implementation issues and test suite issues.**
-
-### Step-by-Step Analysis
-
-When a test fails, follow this protocol:
-
-1. **Identify the failure point**: What exact error message? What operation failed?
-
-2. **Check if it's an infrastructure issue**:
-   - Connection timeout → Server down? Network issue?
-   - GPU OOM → Need to kill stale actors?
-   - Resource unavailable → Cluster has insufficient GPUs?
-
-3. **Check if it's a test design issue**:
-   - High correlation flagged as "shared state" but initial/final losses are different → Task too easy, not a bug
-   - Loss didn't decrease enough → Is the threshold realistic? Is the training data appropriate?
-   - Test timeout → Is the timeout reasonable for this operation?
-
-4. **Check if it's an implementation bug**:
-   - CUDA memory corruption → Code accessing GPU tensors outside correct context?
-   - Gradients zero or NaN → Loss function or gradient flow issue?
-   - Session state contamination → State management bug?
-
-### Example Analysis with Sequential Thinking
-
-```
-Observation: MoE test shows correlation=0.927, flagged as "possible shared state"
-
-Step 1: Check initial losses
-- Session A: 0.9713
-- Session B: 1.0810
-- DIFFERENT → Sessions started independently ✓
-
-Step 2: Check final losses
-- Session A: 0.2361
-- Session B: 0.1386
-- DIFFERENT → Sessions ended independently ✓
-
-Step 3: Check reduction rates
-- Session A: 75.7%
-- Session B: 87.2%
-- DIFFERENT → Learning at different rates ✓
-
-Conclusion: NOT a shared state bug. High correlation is because both sessions
-successfully learned similar tasks. The anomaly detection correctly flagged
-a pattern worth reviewing, but analysis shows implementation is correct.
-```
-
-### When to Suspect Implementation Bug
-
-- Initial losses are **identical** across sessions (should differ with different seeds)
-- One session's update immediately affects another session's loss
-- CUDA errors when switching between sessions
-- Gradients are zero when they should have values
-- Loss is NaN or Inf
-
-### When to Suspect Test Design Issue
-
-- High correlation but initial/final losses differ (task too easy)
-- Loss doesn't decrease but training runs without error (data or hyperparameters)
-- Timeout on operation that normally succeeds (timeout too short)
-- Anomaly flagged but pattern matches expected behavior

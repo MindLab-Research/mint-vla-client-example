@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from tinker_server.runtime_env import (
     build_runtime_pythonpath,
     checkout_runtime_env_layout,
     runtime_env_layout,
+    validate_runtime_env_layout,
 )
 
 
@@ -23,6 +25,7 @@ def _materialize_runtime_env(root: Path) -> None:
         "runtime_env": {
             "site_packages_dir": "site-packages",
             "source_dir": "src",
+            "base_python_dir": "base-python",
             "host_venv_dir": "host-venv",
         },
         "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]["sources"],
@@ -30,6 +33,7 @@ def _materialize_runtime_env(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
+    Path(layout.base_python_root).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:
         Path(entry).mkdir(parents=True, exist_ok=True)
     for entry in layout.host_pythonpath_entries:
@@ -77,6 +81,7 @@ def test_build_runtime_pythonpath_does_not_require_host_python(tmp_path):
         "runtime_env": {
             "site_packages_dir": "site-packages",
             "source_dir": "src",
+            "base_python_dir": "base-python",
             "host_venv_dir": "host-venv",
         },
         "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]["sources"],
@@ -178,6 +183,7 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
         "runtime_env": {
             "site_packages_dir": "site-packages",
             "source_dir": "src",
+            "base_python_dir": "base-python",
             "host_venv_dir": "host-venv",
         },
         "sources": [
@@ -200,9 +206,18 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
         str(env_root / "site-packages"),
         str(env_root / "src" / "CustomSource" / "src"),
     ]
+    assert layout.base_python_root == str(env_root / "base-python")
     assert list(layout.host_pythonpath_entries) == [
         str(env_root / "src" / "HostOnlySource"),
     ]
+
+
+def test_validate_runtime_env_layout_requires_base_python_when_host_python_required(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    shutil.rmtree(env_root / "base-python")
+    with pytest.raises(RuntimeError, match="missing="):
+        validate_runtime_env_layout(str(env_root), require_host_python=True)
 
 
 def test_runtime_env_layout_requires_manifest(tmp_path):

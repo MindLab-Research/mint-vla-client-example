@@ -13,6 +13,7 @@ This project has multiple identifiers that look similar but have different owner
   - Created by `POST /api/v1/create_model` (training routes).
   - Tracks a training session in server memory (`tinker_server/backend/training_session_manager.py`).
   - The actual trainable weights/optimizer live in Ray actors (backend-dependent).
+  - Automatically cleaned up after idle timeout (`MINT_TRAINING_INACTIVITY_TIMEOUT`, default 3600s).
 
 - `sampling_session_id`
   - Created by `POST /api/v1/create_sampling_session`.

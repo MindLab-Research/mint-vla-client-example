@@ -356,6 +356,11 @@ class SessionManager:
                     except Exception as e:
                         logger.warning(f"Failed to remove multi-LoRA session {session_id} from engine: {e}")
 
+            # Drop per-session sampling locks only after teardown has finished.
+            from ..routes.sampling import _drop_lora_load_lock
+
+            await _drop_lora_load_lock(session_id)
+
             if info.adapter_path:
                 import os
                 import shutil
@@ -406,6 +411,31 @@ class SessionManager:
     def list_sessions(self) -> list[str]:
         """List all active session IDs."""
         return list(self._sessions.keys())
+
+    def observability_snapshot(self) -> dict[str, int]:
+        total = len(self._sessions)
+        multi_lora = 0
+        base_model = 0
+        lora_loaded = 0
+        inflight = 0
+
+        for info in self._sessions.values():
+            if info.uses_multi_lora:
+                multi_lora += 1
+            if info.uses_base_model:
+                base_model += 1
+            if info.lora_loaded and not info.uses_base_model:
+                lora_loaded += 1
+            if info.inflight_requests > 0:
+                inflight += 1
+
+        return {
+            "sampling_sessions_total": total,
+            "sampling_sessions_multi_lora": multi_lora,
+            "sampling_sessions_base_model": base_model,
+            "sampling_sessions_lora_loaded": lora_loaded,
+            "sampling_sessions_inflight": inflight,
+        }
 
     # =========================================================================
     # Multi-LoRA Mode Methods (Multi-Model Support)
@@ -594,6 +624,7 @@ class SessionManager:
             uses_multi_lora=True,
             uses_base_model=True,
             base_model=base_model,
+            lora_loaded=False,
         )
         logger.info(f"Registered base model session {session_id} (model={base_model})")
 

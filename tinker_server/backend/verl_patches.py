@@ -15,6 +15,8 @@ Then unpad output from 192→128 after attention.
 """
 
 import logging
+from functools import wraps
+
 import torch
 
 logger = logging.getLogger(__name__)
@@ -639,6 +641,126 @@ def _apply_te_triton_get_int_dtype_patch() -> None:
     print("[VERL_PATCH] Patched transformer_engine triton permutation _compare_and_swap (no core.get_int_dtype)")
 
 
+def _apply_megatron_checkpoint_cleanup_patch() -> None:
+    """Patch Megatron checkpoint backward to clear recompute tensors after grads are extracted."""
+    try:
+        from megatron.core.tensor_parallel import random as tp_random
+    except Exception as e:
+        logger.warning(
+            "Could not import megatron.core.tensor_parallel.random; skipping checkpoint cleanup patch: %s",
+            e,
+        )
+        return
+
+    if getattr(tp_random, "_tinker_checkpoint_cleanup_patched", False):
+        return
+
+    def _clear_many(*values) -> None:
+        try:
+            from transformer_engine.pytorch.utils import clear_tensor_data
+        except Exception:
+            clear_tensor_data = None
+        for value in values:
+            if isinstance(value, (list, tuple)):
+                _clear_many(*value)
+                continue
+            if not torch.is_tensor(value):
+                continue
+            try:
+                if clear_tensor_data is not None:
+                    clear_tensor_data(value)
+                else:
+                    value.data = torch.empty(0, dtype=value.dtype, device=value.device)
+            except Exception:
+                pass
+
+    original_checkpoint_backward = tp_random.CheckpointFunction.backward
+
+    @staticmethod
+    @wraps(original_checkpoint_backward)
+    def patched_checkpoint_backward(ctx, *args):
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), please use .backward() if possible"
+            )
+
+        inputs = ctx.saved_tensors
+        if ctx.distribute_saved_activations:
+            tp_random.safely_set_viewless_tensor_data(
+                inputs[0],
+                tp_random.gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape),
+            )
+
+        detached_inputs = ()
+        outputs = ()
+        try:
+            with tp_random._fork_rng():
+                tp_random._set_all_rng_states(*ctx.rng_states)
+                detached_inputs = tp_random.detach_variable(inputs)
+                with torch.enable_grad():
+                    outputs = ctx.run_function(*detached_inputs)
+
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+
+            # Preserve upstream backward semantics exactly, then clean up afterward.
+            # PR 370's first version added extra filtering here, which changed the
+            # effective backward graph before any cleanup happened.
+            outputs, args = zip(
+                *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
+            )
+            torch.autograd.backward(outputs, args)
+            grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs)
+            return (None, None) + grads
+        finally:
+            _clear_many(*detached_inputs, *inputs, *outputs)
+            for value in detached_inputs:
+                if torch.is_tensor(value):
+                    try:
+                        value.grad = None
+                    except Exception:
+                        pass
+            for attr, value in (
+                ("run_function", None),
+                ("rng_states", None),
+                ("input_0_shape", None),
+                ("distribute_saved_activations", False),
+            ):
+                try:
+                    setattr(ctx, attr, value)
+                except Exception:
+                    pass
+
+    tp_random.CheckpointFunction.backward = patched_checkpoint_backward
+
+    original_without_output_backward = tp_random.CheckpointWithoutOutputFunction.backward
+
+    @staticmethod
+    @wraps(original_without_output_backward)
+    def patched_without_output_backward(ctx, *args):
+        try:
+            return original_without_output_backward(ctx, *args)
+        finally:
+            _clear_many(
+                *(getattr(ctx, "saved_tensors", ()) or ()),
+                *(getattr(ctx, "inputs", ()) or ()),
+                *(getattr(ctx, "outputs", ()) or ()),
+            )
+            for attr, value in (
+                ("inputs", None),
+                ("outputs", None),
+                ("fp8_recipe", None),
+            ):
+                try:
+                    setattr(ctx, attr, value)
+                except Exception:
+                    pass
+
+    tp_random.CheckpointWithoutOutputFunction.backward = patched_without_output_backward
+    tp_random._tinker_checkpoint_cleanup_patched = True  # type: ignore[attr-defined]
+    logger.info("Applied Megatron checkpoint backward cleanup patch")
+
+
 def _enable_megatron_determinism(seed: int = 42):
     """Enable full determinism for Megatron/TransformerEngine.
 
@@ -752,7 +874,7 @@ def apply_verl_patches():
 
     _apply_megatron_router_expert_bias_no_stack_patch()
     _apply_te_triton_get_int_dtype_patch()
-
+    _apply_megatron_checkpoint_cleanup_patch()
     # Apply external label patch first (fixes last-token logprob issue)
     _apply_external_label_patch()
     _apply_rope_thd_cp_len_clamp_patch()

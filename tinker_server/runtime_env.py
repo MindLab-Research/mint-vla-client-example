@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover
 DEFAULT_HF_MODULES_PATH = "/vePFS-Mindverse/share/huggingface/modules"
 DEFAULT_SITE_PACKAGES_DIRNAME = "site-packages"
 DEFAULT_SOURCE_DIRNAME = "src"
+DEFAULT_BASE_PYTHON_DIRNAME = "base-python"
 DEFAULT_HOST_VENV_DIRNAME = "host-venv"
 
 
@@ -51,6 +52,8 @@ class RuntimeEnvLayout:
     root: str
     site_packages: str
     source_root: str
+    base_python_root: str
+    host_venv_root: str
     pythonpath_entries: tuple[str, ...]
     host_pythonpath_entries: tuple[str, ...]
     host_python: str
@@ -60,6 +63,7 @@ class RuntimeEnvLayout:
 class RuntimeEnvSettings:
     site_packages_dir: str
     source_dir: str
+    base_python_dir: str
     host_venv_dir: str
     sources: tuple[tuple[str, tuple[str, ...]], ...]
     host_sources: tuple[tuple[str, tuple[str, ...]], ...]
@@ -91,6 +95,7 @@ def _settings_from_runtime_metadata(runtime: Mapping[str, object], sources: Sequ
     return RuntimeEnvSettings(
         site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
         source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
+        base_python_dir=str(runtime.get("base_python_dir", DEFAULT_BASE_PYTHON_DIRNAME)),
         host_venv_dir=str(runtime.get("host_venv_dir", DEFAULT_HOST_VENV_DIRNAME)),
         sources=_dedupe(shared_entries),
         host_sources=_dedupe(host_entries),
@@ -124,6 +129,8 @@ def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings) -> Runtim
     root = os.path.abspath(env_root)
     source_root = os.path.join(root, settings.source_dir)
     site_packages = os.path.join(root, settings.site_packages_dir)
+    base_python_root = os.path.join(root, settings.base_python_dir)
+    host_venv_root = os.path.join(root, settings.host_venv_dir)
     entries = [site_packages]
     for repo_name, rel_parts in settings.sources:
         entries.append(os.path.join(source_root, repo_name, *rel_parts))
@@ -131,11 +138,13 @@ def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings) -> Runtim
         os.path.join(source_root, repo_name, *rel_parts)
         for repo_name, rel_parts in settings.host_sources
     ]
-    host_python = os.path.join(root, settings.host_venv_dir, "bin", "python")
+    host_python = os.path.join(host_venv_root, "bin", "python")
     return RuntimeEnvLayout(
         root=root,
         site_packages=site_packages,
         source_root=source_root,
+        base_python_root=base_python_root,
+        host_venv_root=host_venv_root,
         pythonpath_entries=tuple(entries),
         host_pythonpath_entries=tuple(host_entries),
         host_python=host_python,
@@ -154,7 +163,14 @@ def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = Tr
     layout = runtime_env_layout(env_root)
     required = [layout.site_packages, *layout.pythonpath_entries[1:]]
     if require_host_python:
-        required.extend([layout.host_python, *layout.host_pythonpath_entries])
+        required.extend(
+            [
+                layout.base_python_root,
+                layout.host_venv_root,
+                layout.host_python,
+                *layout.host_pythonpath_entries,
+            ]
+        )
     missing = [path for path in required if not Path(path).exists()]
     if missing:
         raise RuntimeError(

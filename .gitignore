@@ -243,3 +243,7 @@ scripts/wip/
 *_ANALYSIS.md
 *_REPORT.md
 REFLECTION_*.md
+
+# Frontend package managers
+node_modules/
+.pnpm-store/

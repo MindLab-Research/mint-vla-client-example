@@ -74,6 +74,54 @@ def _require_ray_address() -> str:
     return require_ray_address()
 
 
+def _is_training_step_op(op: Any) -> bool:
+    return str(op or "") in {"training.optim_step", "training.train_step"}
+
+
+def _extract_training_step(result: Any) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    step = metrics.get("step")
+    if isinstance(step, bool):
+        return None
+    if isinstance(step, int):
+        return int(step)
+    if isinstance(step, float) and step.is_integer():
+        return int(step)
+    return None
+
+
+def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any:
+    if not isinstance(meta, dict) or not _is_training_step_op(meta.get("op")):
+        return result
+    model_id = meta.get("model_id")
+    if not model_id:
+        return result
+
+    try:
+        from .training_session_store import (
+            bump_training_session_step_best_effort,
+            set_training_session_step_best_effort,
+        )
+
+        step = _extract_training_step(result)
+        if step is None:
+            bump_training_session_step_best_effort(str(model_id))
+            return result
+
+        set_training_session_step_best_effort(str(model_id), int(step))
+        if isinstance(result, dict):
+            metrics = result.get("metrics")
+            if isinstance(metrics, dict):
+                metrics["step"] = int(step)
+        return result
+    except Exception:
+        return result
+
+
 def _get_or_create_ray_actor():
     import ray
 
@@ -115,6 +163,8 @@ def _get_or_create_ray_actor():
             self._queue_timeout_s = float(queue_ttl_s)
             self._result_ttl_s = float(done_ttl_s)
             self._tombstone_ttl_s = float(tombstone_ttl_s)
+            self._timeout_counts: dict[str, int] = {"queue": 0, "execution": 0}
+            self._timeout_counts_by_op: dict[str, dict[str, int]] = {}
 
         def _op_from_meta(self, meta: dict[str, Any] | None) -> str | None:
             if not isinstance(meta, dict):
@@ -187,6 +237,37 @@ def _get_or_create_ray_actor():
                 "refs_count": len(self._refs),
             }
 
+        def _record_timeout(self, request_id: str, *, kind: str) -> None:
+            from ..logging_context import record_future_store_timeout_metric
+
+            timeout_kind = str(kind).strip() or "unknown"
+            self._timeout_counts[timeout_kind] = int(self._timeout_counts.get(timeout_kind, 0)) + 1
+            op = self._request_op(request_id)
+            bucket = self._timeout_counts_by_op.setdefault(op, {"queue": 0, "execution": 0})
+            bucket[timeout_kind] = int(bucket.get(timeout_kind, 0)) + 1
+            record_future_store_timeout_metric(kind=timeout_kind, op=op)
+
+        def _timeout_stats(self) -> dict[str, Any]:
+            queue_count = int(self._timeout_counts.get("queue", 0))
+            execution_count = int(self._timeout_counts.get("execution", 0))
+            by_op: dict[str, dict[str, int]] = {}
+            for op, bucket in sorted(self._timeout_counts_by_op.items()):
+                if not isinstance(bucket, dict):
+                    continue
+                queue_op = int(bucket.get("queue", 0))
+                execution_op = int(bucket.get("execution", 0))
+                by_op[op] = {
+                    "queue": queue_op,
+                    "execution": execution_op,
+                    "total": queue_op + execution_op,
+                }
+            return {
+                "queue": queue_count,
+                "execution": execution_count,
+                "total": queue_count + execution_count,
+                "by_op": by_op,
+            }
+
         def get_rss_bytes(self) -> int:
             with open("/proc/self/statm", encoding="utf-8") as f:
                 parts = f.read().strip().split()
@@ -213,6 +294,7 @@ def _get_or_create_ray_actor():
                 "by_op": self._stats_by_op(),
                 "age_stats": self._age_stats(),
                 "payload_stats": self._payload_stats(),
+                "timeout_counts": self._timeout_stats(),
             }
 
         def _prune(self) -> dict[str, list[str]]:
@@ -235,6 +317,7 @@ def _get_or_create_ray_actor():
                         self._done_at[rid] = now
                         self._queued_at.pop(rid, None)
                         self._running_at.pop(rid, None)
+                        self._record_timeout(rid, kind="queue")
                         timed_out.append(rid)
 
             # Execution timeout applies only once RUNNING begins.
@@ -247,6 +330,7 @@ def _get_or_create_ray_actor():
                         self._errors[rid] = "execution timeout"
                         self._done_at[rid] = now
                         self._running_at.pop(rid, None)
+                        self._record_timeout(rid, kind="execution")
                         timed_out.append(rid)
 
             # Result retention TTL: DONE/FAILED become EXPIRED tombstones.
@@ -386,6 +470,13 @@ def _get_or_create_ray_actor():
 
         def resolve(self, request_id: str, result: Any) -> None:
             self._prune()
+            if (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            ):
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
             self._update_op_from_meta(request_id, self._meta.get(request_id))
@@ -397,6 +488,13 @@ def _get_or_create_ray_actor():
 
         def resolve_ref(self, request_id: str, ref: Any) -> None:
             self._prune()
+            if (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            ):
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
             self._result_refs[request_id] = ref
@@ -404,6 +502,13 @@ def _get_or_create_ray_actor():
 
         def fail(self, request_id: str, error: str) -> None:
             self._prune()
+            if (
+                request_id in self._result_refs
+                or request_id in self._errors
+                or request_id in self._expired_at
+                or request_id in self._retrieved_at
+            ):
+                return
             self._pending.discard(request_id)
             self._refs.pop(request_id, None)
             self._update_op_from_meta(request_id, self._meta.get(request_id))
@@ -432,21 +537,7 @@ def _get_or_create_ray_actor():
                     self._update_op_from_meta(request_id, meta)
                     try:
                         result = ray.get(ref)
-                        if isinstance(meta, dict) and meta.get("op") == "optim_step":
-                            model_id = meta.get("model_id")
-                            if model_id and isinstance(result, dict):
-                                try:
-                                    from .training_session_store import _get_or_create_actor  # type: ignore
-
-                                    store = _get_or_create_actor()
-                                    step = ray.get(store.bump_step.remote(str(model_id)))
-                                    metrics = result.get("metrics")
-                                    if not isinstance(metrics, dict):
-                                        metrics = {}
-                                        result["metrics"] = metrics
-                                    metrics["step"] = int(step)
-                                except Exception:
-                                    pass
+                        result = _sync_training_session_step(meta, result)
                         self._result_refs[request_id] = ray.put(result)
                         self._done_at[request_id] = time.time()
                         self._refs.pop(request_id, None)
@@ -512,6 +603,32 @@ def _get_or_create_ray_actor():
                 failed.append(str(request_id))
             return failed
 
+        def fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
+            self._prune()
+            target_model_id = str(model_id).strip()
+            if not target_model_id:
+                return []
+            now = time.time()
+            message = str(error)
+            failed: list[str] = []
+            for request_id in list(self._pending):
+                meta = self._meta.get(request_id)
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("model_id") or "").strip() != target_model_id:
+                    continue
+                op = self._op_from_meta(meta) or ""
+                if not op.startswith("training."):
+                    continue
+                self._pending.discard(request_id)
+                self._refs.pop(request_id, None)
+                self._update_op_from_meta(request_id, meta)
+                self._meta.pop(request_id, None)
+                self._errors[request_id] = message
+                self._done_at[request_id] = now
+                failed.append(str(request_id))
+            return failed
+
         def forget(self, request_id: str) -> None:
             self._forget(request_id)
 
@@ -525,14 +642,17 @@ def _get_or_create_ray_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            options["resources"] = {"node:__internal_head__": 0.001}
+    except Exception:
+        pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
-    options["runtime_env"] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=PFS_PYTHONPATH,
-            extra=actor_otel_env,
-        )
-    }
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=actor_otel_env,
+    )
 
     try:
         return _RayFutureStoreActor.options(
@@ -699,6 +819,8 @@ class FutureStore:
         import ray
 
         try:
+            meta = ray.get(actor.get_meta.remote(request_id=request_id))
+            result = _sync_training_session_step(meta, result)
             ref = ray.put(result)
             actor.resolve_ref.remote(request_id=request_id, ref=ref)
         except ray.exceptions.ActorDiedError as e:
@@ -720,6 +842,38 @@ class FutureStore:
             capacity_manager.release_object_store(request_id)
         except Exception:
             pass
+
+    def fail_training_requests_for_model(self, model_id: str, error: str) -> list[str]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            failed = ray.get(
+                actor.fail_training_requests_for_model.remote(
+                    model_id=str(model_id),
+                    error=str(error),
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+
+        if not isinstance(failed, list):
+            raise TypeError("FutureStore.fail_training_requests_for_model returned non-list")
+
+        failed_ids = [str(request_id) for request_id in failed]
+        if not failed_ids:
+            return []
+
+        try:
+            from .capacity_manager import capacity_manager
+
+            for request_id in failed_ids:
+                capacity_manager.release_all(request_id)
+        except Exception:
+            pass
+
+        return failed_ids
 
     def get_status(self, request_id: str) -> FutureStatus:
         actor = self._get_ray_actor()

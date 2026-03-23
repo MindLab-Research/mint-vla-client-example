@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from ..config import otel_env_vars
@@ -71,6 +72,20 @@ def _get_or_create_actor():
             s["current_step"] = int(s.get("current_step", 0)) + 1
             return int(s["current_step"])
 
+        def set_step(self, model_id: str, step: int) -> int:
+            s = self._sessions.get(model_id)
+            if s is None:
+                return int(step)
+            s["current_step"] = max(int(s.get("current_step", 0)), int(step))
+            return int(s["current_step"])
+
+        def set_last_activity(self, model_id: str, last_activity: float) -> float | None:
+            s = self._sessions.get(model_id)
+            if s is None:
+                return None
+            s["last_activity"] = float(last_activity)
+            return float(s["last_activity"])
+
         def list(self) -> list[dict[str, Any]]:
             return list(self._sessions.values())
 
@@ -79,14 +94,17 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            options["resources"] = {"node:__internal_head__": 0.001}
+    except Exception:
+        pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
-    options["runtime_env"] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=PFS_PYTHONPATH,
-            extra=actor_otel_env,
-        )
-    }
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=actor_otel_env,
+    )
 
     try:
         return _TrainingSessionStoreActor.options(
@@ -104,6 +122,7 @@ def upsert_training_session(info: dict[str, Any]) -> None:
         return
     payload = dict(info)
     payload.setdefault("current_step", 0)
+    payload.setdefault("last_activity", time.time())
     try:
         actor = _get_or_create_actor()
         actor.upsert.remote(str(payload.get("model_id", "")), payload)
@@ -124,6 +143,18 @@ def delete_training_session(model_id: str) -> None:
         logger.warning("Training session store write failed: delete: %s", e)
 
 
+def set_training_session_last_activity(model_id: str, last_activity: float) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    try:
+        actor = _get_or_create_actor()
+        actor.set_last_activity.remote(model_id, float(last_activity))
+    except Exception as e:
+        logger.debug("Training session store write failed: last_activity: %s", e)
+
+
 def get_training_session_info(model_id: str) -> dict[str, Any] | None:
     import ray
 
@@ -131,6 +162,42 @@ def get_training_session_info(model_id: str) -> dict[str, Any] | None:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.get.remote(model_id))
+
+
+def bump_training_session_step(model_id: str) -> int:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return int(ray.get(actor.bump_step.remote(model_id)))
+
+
+def set_training_session_step(model_id: str, step: int) -> int:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return int(ray.get(actor.set_step.remote(model_id, int(step))))
+
+
+def set_training_session_step_best_effort(model_id: str, step: int) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    actor.set_step.remote(model_id, int(step))
+
+
+def bump_training_session_step_best_effort(model_id: str) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    actor.bump_step.remote(model_id)
 
 
 def list_training_sessions() -> list[dict[str, Any]]:

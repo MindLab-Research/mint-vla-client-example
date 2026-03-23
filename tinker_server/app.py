@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .auth_identity import get_apikey_id as get_request_apikey_id
+from .auth_identity import get_request_observability_context
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
 from .backend.future_store import FutureStoreUnavailableError
@@ -23,6 +25,7 @@ from .health_state import clear_startup_degraded_state, set_startup_degraded_sta
 from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
 from .logging_context import (
     classify_failure_reason,
+    bind_request_trace_context,
     ensure_trace_id,
     extract_trace_id_from_traceparent,
     get_trace_id,
@@ -32,7 +35,7 @@ from .logging_context import (
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import futures, internal, openai_compat, sampling, service, training, weights
+from .routes import futures, internal, mint, openai_compat, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
@@ -796,7 +799,9 @@ async def lifespan(app: FastAPI):
     from .backend.training_session_manager import TrainingSessionManager
     from .backend.verl_training import VerlTrainingEngine
 
-    train_manager = TrainingSessionManager()
+    train_manager = TrainingSessionManager(
+        inactivity_timeout=config.training_inactivity_timeout_s,
+    )
     train_engine = VerlTrainingEngine()
     await train_engine.initialize()
 
@@ -804,11 +809,16 @@ async def lifespan(app: FastAPI):
     training.training_manager = train_manager
     training.training_engine = train_engine
     training.inference_manager = inference_manager  # For ephemeral save flow
+    mint.training_manager = train_manager
+    mint.training_engine = train_engine
 
     # Weights router also needs training components and inference manager
     weights.training_manager = train_manager
     weights.training_engine = train_engine
     weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
+
+    # Start background cleanup task for idle training sessions
+    await train_manager.start_cleanup_task(train_engine)
 
     logger.info("Training components initialized")
 
@@ -830,10 +840,15 @@ async def lifespan(app: FastAPI):
         ForwardBackwardRequest,
         LoadStateRequest,
         OptimStepRequest,
+        ResetExpertBiasRequest,
         SampleRequest,
         SaveStateRequest,
         SaveWeightsForSamplerRequest,
         TrainStepRequest,
+    )
+    from .models.mint_types import (
+        ForwardBackwardReverseKLRequest,
+        InterpolateCheckpointsRequest,
     )
 
     async def _exec_sampling_asample(item):
@@ -1002,6 +1017,37 @@ async def lifespan(app: FastAPI):
             attributes={"queue.stage": "queue.stage.training.optim_step"},
         )
 
+    async def _exec_training_reset_expert_bias(item):
+        async def _run():
+            req = ResetExpertBiasRequest.model_validate_json(item.request_json)
+            await training._do_reset_expert_bias(item.request_id, req)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.reset_expert_bias",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.reset_expert_bias"},
+        )
+
+    async def _exec_training_delete_model(item):
+        async def _run():
+            payload = json.loads(item.request_json.decode("utf-8"))
+            model_id = payload.get("model_id")
+            if not isinstance(model_id, str) or not model_id:
+                raise ValueError("training.delete_model missing model_id")
+            await training._do_delete_model(item.request_id, model_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.delete_model",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.delete_model"},
+        )
+
     async def _exec_weights_save_weights(item):
         async def _run():
             req = SaveStateRequest.model_validate_json(item.request_json)
@@ -1078,6 +1124,34 @@ async def lifespan(app: FastAPI):
             attributes={"queue.stage": "queue.stage.internal.noop"},
         )
 
+    async def _exec_mint_interpolate_checkpoints(item):
+        async def _run():
+            req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
+            await mint._do_interpolate_checkpoints(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.mint.interpolate_checkpoints",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.interpolate_checkpoints"},
+        )
+
+    async def _exec_mint_forward_backward_reverse_kl(item):
+        async def _run():
+            req = ForwardBackwardReverseKLRequest.model_validate_json(item.request_json)
+            await mint._do_forward_backward_reverse_kl(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.mint.forward_backward_reverse_kl",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
+        )
+
     api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
     api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
     api_work_queue.set_executor("training.create_model", _exec_training_create_model)
@@ -1087,10 +1161,14 @@ async def lifespan(app: FastAPI):
     api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
     api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
     api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
+    api_work_queue.set_executor("training.reset_expert_bias", _exec_training_reset_expert_bias)
+    api_work_queue.set_executor("training.delete_model", _exec_training_delete_model)
     api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
     api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
     api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
     api_work_queue.set_executor("internal.noop", _exec_internal_noop)
+    api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
+    api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
 
     await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
 
@@ -1106,11 +1184,27 @@ async def lifespan(app: FastAPI):
 
     future_reaper_task = asyncio.create_task(_future_reaper_loop())
 
+    async def _stale_training_heartbeat_loop() -> None:
+        while True:
+            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+            try:
+                cleaned = await training.cleanup_stale_training_sessions_once()
+                if cleaned:
+                    logger.warning(
+                        "auto-terminated %d stale training session(s): %s",
+                        len(cleaned),
+                        cleaned,
+                    )
+            except Exception:
+                logger.exception("stale training heartbeat cleanup failed")
+
+    stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop())
+
     async def _checkpoint_reaper_loop() -> None:
         while True:
             await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
             try:
-                reaped = reap_runtime_checkpoints()
+                reaped = await asyncio.to_thread(reap_runtime_checkpoints)
                 total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
                 if total:
                     logger.info(
@@ -1146,10 +1240,12 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     future_reaper_task.cancel()
+    stale_training_heartbeat_task.cancel()
     checkpoint_reaper_task.cancel()
     checkpoint_mirror_task.cancel()
     await asyncio.gather(
         future_reaper_task,
+        stale_training_heartbeat_task,
         checkpoint_reaper_task,
         checkpoint_mirror_task,
         return_exceptions=True,
@@ -1247,15 +1343,37 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
     status_code = 500
     failure_error: Exception | None = None
 
+    def _request_obs() -> dict[str, str]:
+        return get_request_observability_context(request)
+
+    def _apply_http_identity_to_span(span) -> None:
+        for key, value in _request_obs().items():
+            span.set_attribute(f"mint.{key}", value)
+
     def _log_request_observation(elapsed_ms: float) -> None:
+        obs = _request_obs()
+        user_id = obs.get("user_id", "-")
+        user_role = obs.get("user_role", "-")
+        account_id = obs.get("account_id", "-")
+        apikey_id = obs.get("apikey_id", "-")
+        gateway_request_id = obs.get("gateway_request_id", "-")
+        gateway_session_id = obs.get("gateway_session_id", "-")
         if status_code >= 500:
             reason = classify_failure_reason(failure_error or RuntimeError(f"http_{status_code}"))
             logger.error(
-                "[http.request] failed method=%s route=%s status_code=%s elapsed_ms=%.3f failure_reason=%s error_type=%s next_action=%s",
+                "[http.request] failed method=%s route=%s status_code=%s elapsed_ms=%.3f "
+                "user_id=%s user_role=%s account_id=%s apikey_id=%s gateway_request_id=%s gateway_session_id=%s "
+                "failure_reason=%s error_type=%s next_action=%s",
                 method,
                 route,
                 int(status_code),
                 float(elapsed_ms),
+                user_id,
+                user_role,
+                account_id,
+                apikey_id,
+                gateway_request_id,
+                gateway_session_id,
                 reason,
                 type(failure_error).__name__ if failure_error is not None else "HTTPStatusError",
                 "check_logs_and_trace",
@@ -1263,19 +1381,33 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             return
         if status_code >= 400:
             logger.warning(
-                "[http.request] client_error method=%s route=%s status_code=%s elapsed_ms=%.3f",
+                "[http.request] client_error method=%s route=%s status_code=%s elapsed_ms=%.3f "
+                "user_id=%s user_role=%s account_id=%s apikey_id=%s gateway_request_id=%s gateway_session_id=%s",
                 method,
                 route,
                 int(status_code),
                 float(elapsed_ms),
+                user_id,
+                user_role,
+                account_id,
+                apikey_id,
+                gateway_request_id,
+                gateway_session_id,
             )
             return
         logger.info(
-            "[http.request] completed method=%s route=%s status_code=%s elapsed_ms=%.3f",
+            "[http.request] completed method=%s route=%s status_code=%s elapsed_ms=%.3f "
+            "user_id=%s user_role=%s account_id=%s apikey_id=%s gateway_request_id=%s gateway_session_id=%s",
             method,
             route,
             int(status_code),
             float(elapsed_ms),
+            user_id,
+            user_role,
+            account_id,
+            apikey_id,
+            gateway_request_id,
+            gateway_session_id,
         )
 
     # Skip OTel span and request logging for high-frequency polling endpoints.
@@ -1333,6 +1465,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             request.state.trace_id = trace_id
         span.set_attribute("http.method", method)
         span.set_attribute("http.route", route)
+        _apply_http_identity_to_span(span)
         error_recorded = False
 
         def _record_server_error(error: Exception, *, escaped: bool) -> None:
@@ -1348,6 +1481,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 span.update_name(f"{method} {route}")
             except Exception:
                 pass
+            _apply_http_identity_to_span(span)
             span.set_attribute("http.status_code", status_code)
             span.set_attribute("http.route", route)
             if status_code >= 500:
@@ -1375,6 +1509,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 span.update_name(f"{method} {route}")
             except Exception:
                 pass
+            _apply_http_identity_to_span(span)
             span.set_attribute("http.status_code", status_code)
             span.set_attribute("http.route", route)
             if status_code >= 500:
@@ -1410,6 +1545,9 @@ async def api_key_auth_middleware(request: Request, call_next):
         )
         request.state.trace_id = final_trace_id
         response.headers["X-Trace-Id"] = final_trace_id
+        apikey_id = get_request_apikey_id(request)
+        if apikey_id:
+            response.headers["X-MinT-Apikey-Id"] = apikey_id
         return response
 
     async def _next_with_trace():
@@ -1464,12 +1602,24 @@ async def api_key_auth_middleware(request: Request, call_next):
                 "account_id": auth_ctx.account_id,
                 "apikey_id": auth_ctx.apikey_id,
                 "request_id": auth_ctx.request_id,
+                "session_id": auth_ctx.session_id,
             }
-            return await _next_with_trace()
+            with bind_request_trace_context(
+                request_id=auth_ctx.request_id,
+                trace_id=trace_id,
+                user_id=auth_ctx.user_id,
+                user_role=auth_ctx.user_role,
+                account_id=auth_ctx.account_id,
+                apikey_id=auth_ctx.apikey_id,
+                gateway_request_id=auth_ctx.request_id,
+                gateway_session_id=auth_ctx.session_id,
+            ):
+                return await _next_with_trace()
 
         # Legacy auth disabled => dev mode pass-through.
         if not config.auth_enabled:
-            return await _next_with_trace()
+            with bind_request_trace_context(trace_id=trace_id):
+                return await _next_with_trace()
 
         api_key = request.headers.get("X-API-Key", "")
         if not api_key:
@@ -1484,7 +1634,12 @@ async def api_key_auth_middleware(request: Request, call_next):
 
         if config.validate_api_key(api_key):
             request.state.user_data = {"user_id": "admin", "user_role": "admin", "is_admin": True}
-            return await _next_with_trace()
+            with bind_request_trace_context(
+                trace_id=trace_id,
+                user_id="admin",
+                user_role="admin",
+            ):
+                return await _next_with_trace()
 
         if api_key.startswith("sk-") and config.token_secret_key:
             encryptor = get_token_encryptor()
@@ -1496,9 +1651,21 @@ async def api_key_auth_middleware(request: Request, call_next):
                     if "is_admin" not in user_data:
                         user_data["is_admin"] = user_data.get("user_role") == "admin"
                     request.state.user_data = user_data
-                    return await _next_with_trace()
+                    obs = get_request_observability_context(request)
+                    with bind_request_trace_context(
+                        request_id=obs.get("gateway_request_id"),
+                        trace_id=trace_id,
+                        user_id=obs.get("user_id"),
+                        user_role=obs.get("user_role"),
+                        account_id=obs.get("account_id"),
+                        apikey_id=obs.get("apikey_id"),
+                        gateway_request_id=obs.get("gateway_request_id"),
+                        gateway_session_id=obs.get("gateway_session_id"),
+                    ):
+                        return await _next_with_trace()
         return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid API key or token"}))
-    return await _next_with_trace()
+    with bind_request_trace_context(trace_id=trace_id):
+        return await _next_with_trace()
 
 
 # Register routes with API prefix
@@ -1507,6 +1674,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(mint.router, prefix="/api/v1/mint", tags=["mint"])
 app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 

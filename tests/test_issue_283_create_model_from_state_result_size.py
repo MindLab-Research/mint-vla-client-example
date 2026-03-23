@@ -128,6 +128,9 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
     assert stub_capacity.calls[0]["object_store_bytes"] == 256 * 1024
     assert len(stub_queue.calls) == 1
     assert stub_queue.calls[0]["op"] == "training.create_model_from_state"
+    assert stub_queue.calls[0]["extra"]["execution_serial_key"] == "training_session:s283_0"
+    assert stub_queue.calls[0]["extra"]["scheduler_session_key"] == "s283_0"
+    assert stub_queue.calls[0]["extra"]["training_op"] == "create_model_from_state"
     queued_payload = json.loads(stub_queue.calls[0]["request_json"].decode("utf-8"))
     assert queued_payload["state_path"] != f"tinker://{run_id}/weights/{ckpt_name}"
     assert queued_payload["state_path"].startswith(str(tmp_path))

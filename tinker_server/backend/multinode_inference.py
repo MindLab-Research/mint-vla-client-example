@@ -36,6 +36,7 @@ from tinker_server.runtime_env import join_pythonpath, sanitize_worker_pythonpat
 
 from . import ray_kill
 from .multinode_resources import compute_multinode_engine_resources
+from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .ray_keepalive import ray_get_with_resource_pool_keepalive
 from .volc_placement import (
     assert_node_ip_capacity,
@@ -252,6 +253,22 @@ def _raise_serializable_vllm_engine_error(
     # Same as _raise_serializable_vllm_error, but semantically used inside the vLLM Ray actor
     # to avoid propagating non-picklable vLLM exception objects back to the CPU driver.
     _raise_serializable_vllm_error(where=where, request_id=request_id, extra=extra)
+
+
+def _is_request_validation_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in (
+            "vllm_prompt_logprobs_add_request_failed",
+            "vllm_generate_add_request_failed",
+            "Prompt+max_tokens length",
+            "exceeds max_model_len",
+            "maximum model length",
+            "Prompt length (",
+            "model context limit",
+        )
+    )
 
 
 @dataclass
@@ -2067,7 +2084,10 @@ class MultiNodeInferenceEngine:
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
                 try:
-                    stale_pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
+                    stale_pg = get_named_placement_group(
+                        f"{self.actor_name}_pg",
+                        namespace=PERSISTENT_NAMESPACE,
+                    )
                 except Exception:
                     stale_pg = None
                 if stale_pg is not None:
@@ -2220,10 +2240,30 @@ class MultiNodeInferenceEngine:
             pg = None
             if distributed_executor_backend == "ray":
                 pg_name = f"{self.actor_name}_pg"
+                pg_bundles = resources.pg_bundles
                 try:
-                    pg = ray.util.get_placement_group(pg_name)
+                    pg = get_named_placement_group(
+                        pg_name,
+                        namespace=PERSISTENT_NAMESPACE,
+                        expected_bundles=pg_bundles,
+                    )
+                except PlacementGroupMismatchError as e:
+                    logger.warning(
+                        "Removing incompatible placement group for actor_name=%s: %s",
+                        self.actor_name,
+                        e,
+                    )
+                    ray.util.remove_placement_group(e.pg)
+                    pg = ray.util.placement_group(
+                        pg_bundles,
+                        # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
+                        # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
+                        # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
+                        strategy="PACK",
+                        name=pg_name,
+                        lifetime="detached",
+                    )
                 except Exception:
-                    pg_bundles = resources.pg_bundles
                     pg = ray.util.placement_group(
                         pg_bundles,
                         # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
@@ -2736,7 +2776,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed generate actor=%s request_id=%s sampling_session_id=%s prompt_len=%s max_tokens=%s",
                 self.actor_name,
@@ -2823,7 +2865,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed generate_many actor=%s request_id=%s sampling_session_id=%s prompt_len=%s num_samples=%s max_tokens=%s",
                 self.actor_name,
@@ -2896,7 +2940,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed compute_logprobs actor=%s request_id=%s sampling_session_id=%s prompt_len=%s",
                 self.actor_name,
