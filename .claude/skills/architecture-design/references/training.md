@@ -27,7 +27,15 @@ Training sessions (`model_id`) have a bounded lifecycle:
 - **Idle cleanup**: `TrainingSessionManager` runs a background task (every 60s) that evicts sessions inactive for longer than `MINT_TRAINING_INACTIVITY_TIMEOUT` (default 3600s / 1 hour).
 - **Server shutdown**: `shutdown_all()` cleans up all sessions.
 
-The idle cleanup mirrors the inference `SessionManager._cleanup_loop` pattern. Training operation routes (`_do_train_step`, `_do_forward_backward`, `_do_forward`, `_do_optim_step`, `_do_save_weights_for_sampler`, `_do_save_state`, `_do_save_weights`, `_do_load_state`) explicitly call `touch_session()` to update the session's `last_activity` timestamp. Read-only lookups (`GET /models/{model_id}`, `GET /training_runs`, existence checks) do NOT extend the idle deadline. When cleanup fires, it performs the full deletion flow:
+The idle cleanup mirrors the inference `SessionManager._cleanup_loop` pattern, including `inflight_ops` protection (analogous to `SessionInfo.inflight_requests`):
+
+- **HTTP handlers** call `touch_session()` before enqueue to cover queue delay.
+- **Background workers** (`_do_train_step`, `_do_forward_backward`, `_do_forward`, `_do_optim_step`, `_do_save_weights_for_sampler`, `_do_save_state`, `_do_save_weights`, `_do_load_state`) call `mark_inflight(+1)` at entry and `mark_inflight(-1)` in `finally` to protect long-running operations.
+- **`_do_create_model`** / **`_do_create_model_from_state`** call `mark_inflight(+1)` right after `create_session()` to protect during slow actor creation.
+- **Read-only lookups** (`GET /models/{model_id}`, `GET /training_runs`, existence checks) do NOT extend the idle deadline.
+- **`_restore_training_session`** sets `last_activity` to the original `created_at` timestamp (not current time) so restored sessions do not get a fresh idle window from read-only lookups.
+
+When cleanup fires, it skips sessions with `inflight_ops > 0`, then performs the full deletion flow:
 1. `engine.shutdown_session` (release GPU actor reference)
 2. `delete_session` (remove from in-memory manager)
 3. `delete_training_session` (remove from detached Ray store)

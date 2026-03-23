@@ -201,6 +201,15 @@ def _restore_training_session(model_id: str):
         created_at = info.get("created_at")
         if isinstance(created_at, str) and created_at:
             session.created_at = created_at
+            # Restored sessions must not get a fresh idle window from a
+            # read-only lookup.  Use the original creation time so truly
+            # stale sessions become cleanup-eligible immediately.
+            try:
+                session.last_activity = datetime.fromisoformat(created_at).timestamp()
+            except (ValueError, OSError):
+                session.last_activity = 0.0
+        else:
+            session.last_activity = 0.0
         try:
             session.current_step = int(info.get("current_step", session.current_step))
         except Exception:
@@ -578,6 +587,7 @@ async def _do_create_model(
 ) -> None:
     """Background task to create training model."""
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -605,6 +615,11 @@ async def _do_create_model(
             user_id=user_id,
         )
 
+        # Mark inflight immediately so the idle cleanup loop does not evict
+        # the session during the potentially slow actor creation below.
+        training_manager.mark_inflight(model_id, +1)
+        inflight_marked = True
+
         # Create Ray actor - if this fails, session will be cleaned up in except block
         await run_async_with_otel_span(
             "training.create_model.execute",
@@ -620,11 +635,6 @@ async def _do_create_model(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
-
-        # Actor creation may take minutes (DenseTrainerPool cold start,
-        # Megatron placement).  Touch activity so the idle cleanup loop
-        # does not evict the session while the actor was initialising.
-        training_manager.touch_session(model_id)
 
         try:
             from ..backend.training_session_store import upsert_training_session
@@ -717,6 +727,9 @@ async def _do_create_model(
                 model_name=request.base_model,
                 error=str(e),
             )
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(model_id, -1)
 
 
 # =============================================================================
@@ -929,6 +942,7 @@ async def _do_create_model_from_state(
     request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -960,6 +974,10 @@ async def _do_create_model_from_state(
             user_id=user_id,
         )
 
+        # Mark inflight immediately (same rationale as _do_create_model).
+        training_manager.mark_inflight(model_id, +1)
+        inflight_marked = True
+
         async def _create_and_restore_model():
             await training_engine.create_training_session(session)
             await training_engine.load_weights(
@@ -983,10 +1001,6 @@ async def _do_create_model_from_state(
                 "lora_rank": int(request.lora_config.rank) if request.lora_config is not None else None,
             },
         )
-
-        # Touch after potentially slow actor creation + checkpoint load
-        # (same rationale as _do_create_model).
-        training_manager.touch_session(model_id)
 
         try:
             from ..backend.training_session_store import upsert_training_session
@@ -1063,6 +1077,9 @@ async def _do_create_model_from_state(
         except Exception:
             pass
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(model_id, -1)
 
 
 # =============================================================================
@@ -1168,6 +1185,7 @@ async def forward_backward(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    training_manager.touch_session(request.model_id)
     created = False
     try:
         scheduler_extra = _build_training_scheduler_extra(
@@ -1218,6 +1236,7 @@ async def _do_forward_backward(
     """Background task for forward_backward."""
     # Restore request_id context for logging
     set_request_id(request_id)
+    inflight_marked = False
 
     try:
         if training_engine is None or training_manager is None:
@@ -1229,7 +1248,8 @@ async def _do_forward_backward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         max_model_len = _get_max_model_len(session.base_model)
         _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
         if max_seq_len > max_model_len:
@@ -1295,6 +1315,9 @@ async def _do_forward_backward(
             "check_training_session_and_batch_shape",
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1395,6 +1418,7 @@ async def train_step(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    training_manager.touch_session(request.model_id)
     created = False
     try:
         scheduler_extra = _build_training_scheduler_extra(
@@ -1440,6 +1464,7 @@ async def _do_train_step(
     gateway_auth: dict | None = None,
 ) -> None:
     """Background task for train_step."""
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -1451,7 +1476,8 @@ async def _do_train_step(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
@@ -1509,6 +1535,9 @@ async def _do_train_step(
             "check_training_session_and_actor",
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1615,6 +1644,7 @@ async def forward(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    training_manager.touch_session(request.model_id)
     created = False
     try:
         scheduler_extra = _build_training_scheduler_extra(
@@ -1659,6 +1689,7 @@ async def _do_forward(
     gateway_auth: dict | None = None,
 ) -> None:
     """Background task for forward."""
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -1670,7 +1701,8 @@ async def _do_forward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         token_count, _ = _compute_token_stats(request.forward_input.data)
         result = await run_async_with_otel_span(
             "training.forward.execute",
@@ -1716,6 +1748,9 @@ async def _do_forward(
             "check_training_session_and_input_tokens",
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1820,6 +1855,7 @@ async def optim_step(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    training_manager.touch_session(request.model_id)
     created = False
     try:
         scheduler_extra = _build_training_scheduler_extra(
@@ -1858,6 +1894,7 @@ async def optim_step(
 
 async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: str | None) -> None:
     """Background task for optim_step."""
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -1869,7 +1906,8 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
@@ -1903,6 +1941,9 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
             "check_training_session_and_optimizer_state",
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -2076,6 +2117,7 @@ async def save_weights_for_sampler(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    training_manager.touch_session(request.model_id)
     created = False
     try:
         scheduler_extra = _build_training_scheduler_extra(
@@ -2132,6 +2174,7 @@ async def _do_save_weights_for_sampler(
     - Named (path is not None): Save to persistent location, return path
     - Ephemeral (path is None): Use per-session inference engine for isolated concurrent access
     """
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -2143,7 +2186,8 @@ async def _do_save_weights_for_sampler(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path
@@ -2412,6 +2456,9 @@ async def _do_save_weights_for_sampler(
             "check_checkpoint_export_and_inference_registration",
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================

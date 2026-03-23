@@ -45,6 +45,7 @@ class TrainingSession:
     is_active: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     last_activity: float = field(default_factory=time.time)
+    inflight_ops: int = 0  # Prevent cleanup while requests are queued or running
     backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
 
     # Per-session inference engine for isolated concurrent access
@@ -179,11 +180,24 @@ class TrainingSessionManager:
     def touch_session(self, model_id: str) -> None:
         """Update last_activity timestamp for a session.
 
-        Called from training routes on each request to prevent idle cleanup.
+        Called from training HTTP handlers when accepting a request (before
+        enqueue) to prevent idle cleanup during queue delay.
         """
         session = self._sessions.get(model_id)
         if session is not None:
             session.last_activity = time.time()
+
+    def mark_inflight(self, model_id: str, delta: int) -> None:
+        """Mark a session as having in-flight work to prevent cleanup.
+
+        Called from _do_* background workers: +1 at start, -1 in finally.
+        Also refreshes last_activity so long-running operations (actor
+        creation, checkpoint load) do not trip the idle timeout.
+        """
+        session = self._sessions.get(model_id)
+        if session is not None:
+            session.last_activity = time.time()
+            session.inflight_ops = max(0, session.inflight_ops + delta)
 
     # =========================================================================
     # Background cleanup of idle training sessions
@@ -218,6 +232,7 @@ class TrainingSessionManager:
         inactive = [
             model_id
             for model_id, session in self._sessions.items()
+            if session.inflight_ops == 0
             if now - session.last_activity > self._inactivity_timeout
         ]
         for model_id in inactive:
@@ -244,9 +259,10 @@ class TrainingSessionManager:
         if session is None:
             return
 
-        # Re-check: session may have become active between candidate
-        # selection in _cleanup_inactive and this point (an intervening
-        # request calls touch_session, refreshing last_activity).
+        # Re-check: session may have acquired in-flight work or been touched
+        # between candidate selection in _cleanup_inactive and this point.
+        if session.inflight_ops > 0:
+            return
         if time.time() - session.last_activity <= self._inactivity_timeout:
             return
 

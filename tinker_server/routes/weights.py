@@ -489,6 +489,8 @@ async def save_weights(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    if training_manager is not None:
+        training_manager.touch_session(request.model_id)
     created = False
     try:
         future_store.create_with_id(request_id)
@@ -605,6 +607,8 @@ async def save_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    if training_manager is not None:
+        training_manager.touch_session(request.model_id)
     created = False
     try:
         future_store.create_with_id(request_id)
@@ -646,6 +650,7 @@ async def _do_save_state(
     Also registers the model for sampling via multi-LoRA engine.
     """
     session = None
+    inflight_marked = False
 
     try:
         set_request_id(request_id)
@@ -656,7 +661,8 @@ async def _do_save_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
             if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
@@ -805,6 +811,9 @@ async def _do_save_state(
                 model_name=failed_model_name,
                 error=str(e),
             )
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 async def _do_save_weights(
@@ -820,6 +829,7 @@ async def _do_save_weights(
     Also registers the model for sampling via multi-LoRA engine.
     """
     session = None
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -829,7 +839,8 @@ async def _do_save_weights(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
             if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\\\" in checkpoint_name:
@@ -968,6 +979,9 @@ async def _do_save_weights(
                 model_name=None,
                 error=str(e),
             )
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1109,6 +1123,8 @@ async def load_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
+    if training_manager is not None:
+        training_manager.touch_session(request.model_id)
     created = False
     try:
         future_store.create_with_id(request_id)
@@ -1140,6 +1156,7 @@ async def _do_load_state(
     request_id: str, request: LoadStateRequest, user_id: str | None
 ) -> None:
     """Background task to load state."""
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -1149,7 +1166,8 @@ async def _do_load_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        training_manager.touch_session(request.model_id)
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
@@ -1189,6 +1207,9 @@ async def _do_load_state(
             "check_checkpoint_contract_and_permissions",
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
