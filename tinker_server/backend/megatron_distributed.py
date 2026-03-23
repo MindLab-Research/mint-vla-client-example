@@ -2067,6 +2067,7 @@ class MegatronRankWorker:
             clip_frac_sum = 0.0
             ratio_mean_sum = 0.0
             n_ppo_results = 0
+            loss_sum_value = 0.0
             all_log_probs = []
             loss_fn_outputs = []
             per_sample_log_probs = None
@@ -2097,6 +2098,12 @@ class MegatronRankWorker:
                     if hasattr(tokens, "item"):
                         tokens = tokens.item()
                     num_tokens += int(tokens)
+
+                loss_sum_list = metrics.get("loss_sum", [])
+                for raw_loss_sum in loss_sum_list:
+                    if hasattr(raw_loss_sum, "item"):
+                        raw_loss_sum = raw_loss_sum.item()
+                    loss_sum_value += float(raw_loss_sum)
 
                 # Extract per-token log_probs from metrics (list of tensors)
                 log_probs_list = metrics.get("log_probs", [])
@@ -2249,6 +2256,7 @@ class MegatronRankWorker:
             routing_replay_items = int(valid_count) if routing_replay_enabled else 0
             result_dict = {
                 "loss_value": float(loss_value),
+                "loss_sum_value": float(loss_sum_value),
                 "num_tokens": int(num_tokens),
                 "clip_frac_sum": float(clip_frac_sum),
                 "ratio_mean_sum": float(ratio_mean_sum),
@@ -2344,6 +2352,7 @@ class MegatronRankWorker:
         if output_rank:
             valid_count = len(seq_lengths)
             loss_value = 0.0
+            loss_sum_value = 0.0
             num_tokens = 0
             all_log_probs = []
             loss_fn_outputs = []
@@ -2376,6 +2385,13 @@ class MegatronRankWorker:
                     if hasattr(tokens, "item"):
                         tokens = tokens.item()
                     num_tokens += int(tokens)
+
+                # Sum loss_sum from all micro-batches (raw pre-normalization sum)
+                loss_sum_list = metrics.get("loss_sum", [])
+                for raw_loss_sum in loss_sum_list:
+                    if hasattr(raw_loss_sum, "item"):
+                        raw_loss_sum = raw_loss_sum.item()
+                    loss_sum_value += float(raw_loss_sum)
 
                 # Extract per-token log_probs from metrics (list of tensors, one per micro-batch)
                 log_probs_list = metrics.get("log_probs", [])
@@ -2437,6 +2453,7 @@ class MegatronRankWorker:
 
             return {
                 "loss_value": float(loss_value),
+                "loss_sum_value": float(loss_sum_value),
                 "num_tokens": int(num_tokens),
                 "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
@@ -5826,7 +5843,9 @@ class MegatronWorkerGroup:
         if math.isnan(loss_value) or math.isinf(loss_value):
             raise ValueError(f"non-finite loss_value={loss_value!r}")
 
+        loss_sum = rank0_result.get("loss_sum_value", 0.0)
         metrics = {
+            "loss:sum": float(loss_sum),
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
@@ -6032,7 +6051,9 @@ class MegatronWorkerGroup:
                 raise ValueError(f"loss_fn_outputs[{i}].loss.data[0] non-finite: {v!r}")
         log_probs = rank0_result.get("log_probs")  # Per-token log_probs tensor
 
+        loss_sum = rank0_result.get("loss_sum_value", 0.0)
         metrics = {
+            "loss:sum": float(loss_sum),
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),

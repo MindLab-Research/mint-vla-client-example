@@ -2233,7 +2233,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
                 "base_model": str(session.base_model),
                 "backend": str(session.backend),
                 "learning_rate": float(lr) if lr is not None else None,
-                "seq_id": int(request.seq_id),
+                "seq_id": int(request.seq_id) if request.seq_id is not None else None,
             },
         )
         elapsed_s = time.time() - t0
