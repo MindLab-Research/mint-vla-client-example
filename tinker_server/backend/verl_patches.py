@@ -703,14 +703,13 @@ def _apply_megatron_checkpoint_cleanup_patch() -> None:
             if isinstance(outputs, torch.Tensor):
                 outputs = (outputs,)
 
-            filtered = [
-                (out, grad_arg)
-                for out, grad_arg in zip(outputs, args)
-                if torch.is_tensor(out) and out.requires_grad and grad_arg is not None
-            ]
-            if filtered:
-                backward_outputs, backward_args = zip(*filtered)
-                torch.autograd.backward(backward_outputs, backward_args)
+            # Preserve upstream backward semantics exactly, then clean up afterward.
+            # PR 370's first version added extra filtering here, which changed the
+            # effective backward graph before any cleanup happened.
+            outputs, args = zip(
+                *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
+            )
+            torch.autograd.backward(outputs, args)
             grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs)
             return (None, None) + grads
         finally:
@@ -876,7 +875,6 @@ def apply_verl_patches():
     _apply_megatron_router_expert_bias_no_stack_patch()
     _apply_te_triton_get_int_dtype_patch()
     _apply_megatron_checkpoint_cleanup_patch()
-
     # Apply external label patch first (fixes last-token logprob issue)
     _apply_external_label_patch()
     _apply_rope_thd_cp_len_clamp_patch()

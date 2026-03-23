@@ -94,6 +94,11 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            options["resources"] = {"node:__internal_head__": 0.001}
+    except Exception:
+        pass
     actor_otel_env = otel_env_vars()
     from ..config import PFS_PYTHONPATH, actor_runtime_env
     options["runtime_env"] = actor_runtime_env(
@@ -175,6 +180,24 @@ def set_training_session_step(model_id: str, step: int) -> int:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return int(ray.get(actor.set_step.remote(model_id, int(step))))
+
+
+def set_training_session_step_best_effort(model_id: str, step: int) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    actor.set_step.remote(model_id, int(step))
+
+
+def bump_training_session_step_best_effort(model_id: str) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    actor.bump_step.remote(model_id)
 
 
 def list_training_sessions() -> list[dict[str, Any]]:

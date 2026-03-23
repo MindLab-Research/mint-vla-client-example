@@ -1204,7 +1204,7 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
             try:
-                reaped = reap_runtime_checkpoints()
+                reaped = await asyncio.to_thread(reap_runtime_checkpoints)
                 total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
                 if total:
                     logger.info(

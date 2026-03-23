@@ -102,23 +102,21 @@ def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any
         return result
 
     try:
-        from .training_session_store import bump_training_session_step, set_training_session_step
+        from .training_session_store import (
+            bump_training_session_step_best_effort,
+            set_training_session_step_best_effort,
+        )
 
         step = _extract_training_step(result)
         if step is None:
-            step = int(bump_training_session_step(str(model_id)))
-            if isinstance(result, dict):
-                metrics = result.get("metrics")
-                if not isinstance(metrics, dict):
-                    metrics = {}
-                    result["metrics"] = metrics
+            bump_training_session_step_best_effort(str(model_id))
+            return result
+
+        set_training_session_step_best_effort(str(model_id), int(step))
+        if isinstance(result, dict):
+            metrics = result.get("metrics")
+            if isinstance(metrics, dict):
                 metrics["step"] = int(step)
-        else:
-            step = int(set_training_session_step(str(model_id), int(step)))
-            if isinstance(result, dict):
-                metrics = result.get("metrics")
-                if isinstance(metrics, dict):
-                    metrics["step"] = int(step)
         return result
     except Exception:
         return result
@@ -644,6 +642,11 @@ def _get_or_create_ray_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            options["resources"] = {"node:__internal_head__": 0.001}
+    except Exception:
+        pass
     actor_otel_env = otel_env_vars()
     from ..config import PFS_PYTHONPATH, actor_runtime_env
     options["runtime_env"] = actor_runtime_env(

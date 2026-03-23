@@ -408,7 +408,9 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
     try:
         from ..backend.training_session_store import list_training_sessions
 
-        infos = list_training_sessions()
+        # Detached store listing uses ray.get(). Keep that blocking call off the
+        # main event loop so stale-session cleanup cannot freeze the API server.
+        infos = await asyncio.to_thread(list_training_sessions)
     except Exception as e:
         logger.warning(
             "stale training cleanup skipped: failed to list detached training sessions: %s: %s",

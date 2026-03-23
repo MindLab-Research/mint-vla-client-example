@@ -4833,9 +4833,11 @@ class MegatronRankWorker:
         config = {
             "r": effective_rank,
             "lora_alpha": effective_rank * 2,
+            "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
             "base_model_name_or_path": self.base_model,
         }
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -4916,9 +4918,11 @@ class MegatronRankWorker:
         config = {
             "r": effective_rank,
             "lora_alpha": effective_rank * 2,
+            "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
             "base_model_name_or_path": self.base_model,
         }
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -7749,6 +7753,8 @@ def get_or_create_megatron_worker_group(
                 v = os.environ.get(k)
                 if v is not None:
                     runtime_env["env_vars"][k] = v
+            from .volc_placement import list_node_ips_for_resource_queue
+
             explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
             megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
             if explicit_node_ips_csv:
@@ -7756,8 +7762,6 @@ def get_or_create_megatron_worker_group(
             elif not megatron_node_pin_json:
                 volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
                 if volc_rq:
-                    from .volc_placement import list_node_ips_for_resource_queue
-
                     node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
                     if not node_ips:
                         raise RuntimeError(
