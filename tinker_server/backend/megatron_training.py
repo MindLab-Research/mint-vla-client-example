@@ -863,21 +863,23 @@ def create_vocab_parallel_logits_extractor_fn() -> Callable:
     def extractor(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         log_probs = model_output.get("log_probs")
         vocab_parallel_logits = model_output.get("vocab_parallel_logits")
-        if log_probs is None or vocab_parallel_logits is None:
-            raise ValueError("model_output missing log_probs or vocab_parallel_logits")
+        if vocab_parallel_logits is None:
+            raise ValueError("model_output missing required vocab_parallel_logits")
 
-        if hasattr(log_probs, "values"):
-            log_probs_flat = log_probs.values()
-        else:
-            log_probs_flat = log_probs
+        log_probs_flat = None
+        if log_probs is not None:
+            if getattr(log_probs, "is_nested", False):
+                log_probs_flat = log_probs.values()
+            else:
+                log_probs_flat = log_probs
 
-        if hasattr(vocab_parallel_logits, "values"):
+        if getattr(vocab_parallel_logits, "is_nested", False):
             local_logits = vocab_parallel_logits.values()
         else:
             local_logits = vocab_parallel_logits
 
         loss_mask = data.get("loss_mask")
-        if loss_mask is not None and hasattr(loss_mask, "values"):
+        if loss_mask is not None and getattr(loss_mask, "is_nested", False):
             loss_mask_flat = loss_mask.values()
         elif loss_mask is not None:
             loss_mask_flat = loss_mask
@@ -887,9 +889,10 @@ def create_vocab_parallel_logits_extractor_fn() -> Callable:
         metrics = {
             "loss": 0.0,
             "num_tokens": int(loss_mask_flat.float().sum().item()),
-            "log_probs": log_probs_flat.detach().cpu(),
             "vocab_parallel_logits": local_logits.detach(),
         }
+        if log_probs_flat is not None:
+            metrics["log_probs"] = log_probs_flat.detach().cpu()
         return local_logits.new_zeros(()), metrics
 
     return extractor
