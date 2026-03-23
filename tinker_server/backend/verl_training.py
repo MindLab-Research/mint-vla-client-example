@@ -3046,50 +3046,65 @@ class VerlTrainingEngine:
             except Exception:
                 reference_actual_rank = None
 
-            logger.info(
-                f"[{model_id}] reverse_kl prime reference session start: "
-                f"ref_session_id={ref_session_id} actual_rank={reference_actual_rank}"
-            )
-            await asyncio.to_thread(
-                ray.get,
-                worker.prime_session_checkpoint.remote(
-                    ref_session_id,
-                    request.reference_model_path,
-                    step_count=0,
-                    learning_rate=0.0,
-                    actual_rank=reference_actual_rank,
-                ),
-            )
-            logger.info(f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}")
-            logger.info(f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}")
-            reference_chunks = await asyncio.to_thread(
-                ray.get,
-                worker.forward_reference_full_log_probs.remote(
-                    data_items=reference_items,
-                    temperature=float(request.temperature),
-                    session_id=ref_session_id,
+            try:
+                logger.info(
+                    f"[{model_id}] reverse_kl prime reference session start: "
+                    f"ref_session_id={ref_session_id} actual_rank={reference_actual_rank}"
+                )
+                await asyncio.to_thread(
+                    ray.get,
+                    worker.prime_session_checkpoint.remote(
+                        ref_session_id,
+                        request.reference_model_path,
+                        step_count=0,
+                        learning_rate=0.0,
+                        actual_rank=reference_actual_rank,
+                    ),
+                )
+                logger.info(f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}")
+                logger.info(f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}")
+                reference_chunks = await asyncio.to_thread(
+                    ray.get,
+                    worker.forward_reference_full_log_probs.remote(
+                        data_items=reference_items,
+                        temperature=float(request.temperature),
+                        session_id=ref_session_id,
+                        traceparent=traceparent,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    ),
+                )
+                logger.info(
+                    f"[{model_id}] reverse_kl reference forward done: ref_session_id={ref_session_id} "
+                    f"chunks={len(reference_chunks) if isinstance(reference_chunks, list) else 'unknown'}"
+                )
+                logger.info(f"[{model_id}] reverse_kl student backward start")
+                pending = worker.forward_backward_reverse_kl.remote(
+                    data_items,
+                    None,
+                    float(request.temperature),
+                    session.model_id,
                     traceparent=traceparent,
                     train_attn=train_attn,
                     train_mlp=train_mlp,
                     train_unembed=train_unembed,
-                ),
-            )
-            logger.info(
-                f"[{model_id}] reverse_kl reference forward done: ref_session_id={ref_session_id} "
-                f"chunks={len(reference_chunks) if isinstance(reference_chunks, list) else 'unknown'}"
-            )
-            logger.info(f"[{model_id}] reverse_kl student backward start")
-            pending = worker.forward_backward_reverse_kl.remote(
-                data_items,
-                None,
-                float(request.temperature),
-                session.model_id,
-                traceparent=traceparent,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-                reference_full_log_prob_chunks=reference_chunks,
-            )
+                    reference_full_log_prob_chunks=reference_chunks,
+                )
+                result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            finally:
+                try:
+                    await asyncio.to_thread(
+                        ray.get,
+                        worker.delete_session.remote(ref_session_id, traceparent=traceparent),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] reverse_kl reference session cleanup failed: ref_session_id=%s",
+                        model_id,
+                        ref_session_id,
+                        exc_info=True,
+                    )
         else:
             pending = worker.forward_backward_reverse_kl.remote(
                 data_items,
@@ -3098,8 +3113,7 @@ class VerlTrainingEngine:
                 session.model_id,
                 traceparent=traceparent,
             )
-
-        result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
         session.accumulated_gradients += 1
         logger.info(f"[{model_id}] forward_backward_reverse_kl completed")
         return result

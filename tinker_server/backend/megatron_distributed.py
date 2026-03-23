@@ -7507,6 +7507,20 @@ class MegatronWorkerGroup:
             "actual_rank": actual_rank,
         }
 
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        traceparent: str | None = None,
+    ) -> dict:
+        self._bind_traceparent(traceparent)
+        ray.get([w.clear_session_state.remote(session_id, traceparent=traceparent) for w in self.workers])
+        deleted = self._session_manager.delete_session(session_id)
+        if self._current_session == session_id:
+            self._current_session = None
+            self._session_unknown_due_to_partial_swap = False
+        return {"status": "ok", "session_id": session_id, "deleted": bool(deleted)}
+
     def get_session_info(self) -> dict:
         """Get current session info.
 
