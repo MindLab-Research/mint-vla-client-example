@@ -5989,9 +5989,12 @@ class MegatronWorkerGroup:
             session_id,
             op="forward",
         )
-        self._prepare_session_for_explicit_load(
+        self._ensure_session_loaded(
             effective_session_id,
             traceparent=traceparent,
+            train_attn=True,
+            train_mlp=True,
+            train_unembed=True,
         )
 
         # Send raw data_items to workers (TensorDict created locally on each worker
@@ -6086,12 +6089,9 @@ class MegatronWorkerGroup:
             session_id,
             op="optim_step",
         )
-        self._ensure_session_loaded(
+        self._prepare_session_for_explicit_load(
             effective_session_id,
             traceparent=traceparent,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
         )
         t1 = time.perf_counter() if timing else 0.0
 
@@ -6426,12 +6426,9 @@ class MegatronWorkerGroup:
                     "Optimizer restore requested, but optimizer shard(s) not found: "
                     + ", ".join(missing)
                 )
-        self._ensure_session_loaded(
+        self._prepare_session_for_explicit_load(
             effective_session_id,
             traceparent=traceparent,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
         )
 
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")

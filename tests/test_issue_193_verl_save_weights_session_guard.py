@@ -1960,6 +1960,63 @@ def test_issue_193_megatron_explicit_load_prepare_allows_dirty_target_on_fresh_a
     assert group._current_session == "session_target"
 
 
+def test_issue_193_megatron_forward_uses_ensure_session_loaded(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    ensure_calls: list[str] = []
+
+    class _FakeWorker:
+        class forward:
+            @staticmethod
+            def remote(data_items, reset_bias, traceparent=None):
+                return {"loss_fn_outputs": [{"loss": {"data": [0.0]}}], "loss_value": 0.0, "num_tokens": 0}
+
+    group.workers = [_FakeWorker()]
+    group._bind_traceparent = lambda traceparent: None
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._ensure_session_loaded = lambda session_id, **kwargs: ensure_calls.append(session_id)
+    group._prepare_session_for_explicit_load = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("forward must not use explicit-load preparation")
+    )
+    monkeypatch.setattr(ray, "get", lambda futures, timeout=None: futures)
+
+    result = group.forward([{"x": 1}], session_id="session_target")
+
+    assert ensure_calls == ["session_target"]
+    assert result["loss_fn_outputs"][0]["loss"]["data"] == [0.0]
+
+
+def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path: Path):
+    group_cls = MegatronWorkerGroup.__ray_actor_class__
+    group = group_cls.__new__(group_cls)
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "mp_rank_00_000_000_adapter.pt").write_bytes(b"adapter")
+    (ckpt_dir / "adapter_config.json").write_text(json.dumps({"r": 8}), encoding="utf-8")
+    (ckpt_dir / "training_meta.json").write_text(
+        json.dumps({"current_step": 3, "learning_rate": 2e-4}),
+        encoding="utf-8",
+    )
+
+    prepare_calls: list[str] = []
+    group.workers = []
+    group._bind_traceparent = lambda traceparent: None
+    group._resolve_required_session_id = lambda session_id, op: session_id
+    group._prepare_session_for_explicit_load = lambda session_id, traceparent=None: prepare_calls.append(session_id)
+    group._ensure_session_loaded = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("load_checkpoint must not use ordinary ensure path")
+    )
+    group.load_adapter_state = lambda *args, **kwargs: {}
+    group.reset_optimizer = lambda *args, **kwargs: None
+    group._step_count = 0
+    group.learning_rate = 1e-4
+
+    result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="session_target")
+
+    assert prepare_calls == ["session_target"]
+    assert result["optimizer_reset"] is True
+
+
 def test_issue_193_megatron_resolution_never_falls_back_to_default_base_model():
     engine = VerlTrainingEngine()
     engine.default_base_model = "/tmp/wrong-default"
