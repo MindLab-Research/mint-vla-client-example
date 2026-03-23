@@ -356,19 +356,22 @@ async def retrieve_future(
         queue_depth = None
         estimated_wait_s = None
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
-        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
             "1",
             "true",
             "yes",
             "y",
+            "on",
         )
-        try:
-            pos = await api_work_queue.find_position(body.request_id)
-        except ApiWorkQueueUnavailableError as e:
-            raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
-        if not scheduler_enabled and isinstance(pos, dict):
+        pos = None
+        if status_field == "queued" and not scheduler_enabled:
+            try:
+                pos = await api_work_queue.find_position(body.request_id)
+            except ApiWorkQueueUnavailableError as e:
+                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
+        if isinstance(pos, dict):
             queue_depth = pos.get("depth")
             if status_field == "queued":
                 queue_position = pos.get("position")

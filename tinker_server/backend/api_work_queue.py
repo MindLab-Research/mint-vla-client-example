@@ -200,7 +200,9 @@ def _get_or_create_ray_actor():
             self._queued_asample_by_principal: dict[str, int] = {}
             self._queued_asample_by_apikey: dict[str, int] = {}
             self._queued_asample_request_state: dict[str, tuple[str | None, str | None, str | None]] = {}
-            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "0"))
+            self._scheduler_request_meta: dict[str, tuple[str, str, str]] = {}
+            self._scheduler_lease_consumer: dict[str, str] = {}
+            self._scheduler_enabled = self._to_bool(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
             self._scheduler_max_consecutive = max(
                 1,
                 int(os.environ.get("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")),
@@ -277,8 +279,22 @@ def _get_or_create_ray_actor():
                 else:
                     self._queued_asample_by_apikey.pop(apikey_id, None)
 
-        def finalize_request(self, request_id: str) -> None:
-            self._release_asample_slot(str(request_id))
+        async def finalize_request(self, request_id: str) -> None:
+            rid = str(request_id)
+            self._release_asample_slot(rid)
+            async with self._cv:
+                meta = self._scheduler_request_meta.pop(rid, None)
+                self._scheduler_lease_consumer.pop(rid, None)
+                if meta is None:
+                    return
+                domain, session_id, op = meta
+                state = self._sched_domains.get(domain)
+                if state is None:
+                    return
+                if state.get("leased_request_id") == rid:
+                    state["leased_request_id"] = None
+                    state["leased_session"] = None
+                self._cv.notify_all()
 
         def _mark_asample_leased_to_consumer(self, request_id: str, consumer_job_id: str | None) -> None:
             request_id = str(request_id)
@@ -303,6 +319,46 @@ def _get_or_create_ray_actor():
             for request_id in doomed:
                 self._release_asample_slot(request_id)
             return len(doomed)
+
+        def release_scheduler_leases(self, request_ids: list[str]) -> int:
+            doomed_ids = {str(request_id) for request_id in request_ids if str(request_id)}
+            if not doomed_ids:
+                return 0
+            released = 0
+            for state in self._sched_domains.values():
+                leased_request_id = state.get("leased_request_id")
+                if leased_request_id in doomed_ids:
+                    state["leased_request_id"] = None
+                    state["leased_session"] = None
+                    released += 1
+            for request_id in doomed_ids:
+                self._scheduler_lease_consumer.pop(request_id, None)
+            return released
+
+        def release_scheduler_leases_for_consumer(self, consumer_job_id: str | None) -> list[str]:
+            if consumer_job_id is None:
+                return []
+            doomed_ids = [
+                request_id
+                for request_id, leased_consumer in self._scheduler_lease_consumer.items()
+                if leased_consumer == str(consumer_job_id)
+            ]
+            self.release_scheduler_leases(doomed_ids)
+            for request_id in doomed_ids:
+                self._scheduler_request_meta.pop(str(request_id), None)
+            return [str(request_id) for request_id in doomed_ids]
+
+        def release_stale_scheduler_leases(self, active_consumer_job_id: str | None) -> list[str]:
+            active = None if active_consumer_job_id is None else str(active_consumer_job_id)
+            doomed_ids = [
+                request_id
+                for request_id, leased_consumer in self._scheduler_lease_consumer.items()
+                if leased_consumer and leased_consumer != active
+            ]
+            self.release_scheduler_leases(doomed_ids)
+            for request_id in doomed_ids:
+                self._scheduler_request_meta.pop(str(request_id), None)
+            return [str(request_id) for request_id in doomed_ids]
         def _to_bool(self, v: Any) -> bool:
             if isinstance(v, bool):
                 return v
@@ -366,6 +422,8 @@ def _get_or_create_ray_actor():
                 "current_session": None,
                 "last_session": None,
                 "consecutive_count": 0,
+                "leased_request_id": None,
+                "leased_session": None,
                 "stats": {
                     "picks": 0,
                     "switches": 0,
@@ -532,6 +590,8 @@ def _get_or_create_ray_actor():
         def _pick_scheduled_candidate(self, *, now: float) -> tuple[str, str, str] | None:
             best: tuple[float, str, str, str] | None = None
             for domain, state in self._sched_domains.items():
+                if state.get("leased_request_id") is not None:
+                    continue
                 chosen = self._choose_session_for_domain(domain, state, now=now)
                 if chosen is None:
                     continue
@@ -596,6 +656,9 @@ def _get_or_create_ray_actor():
                 state["consecutive_count"] = 0
             state["last_session"] = session_id
             state["last_pick_ts"] = float(now)
+            leased_request_id = str(item.get("request_id") or "")
+            state["leased_request_id"] = leased_request_id
+            state["leased_session"] = session_id
 
             return item
 
@@ -686,6 +749,11 @@ def _get_or_create_ray_actor():
                 is_sched, domain, session_id = self._scheduler_item_info(packed)
                 if is_sched:
                     self._enqueue_scheduled(packed, domain=domain, session_id=session_id)
+                    self._scheduler_request_meta[str(packed.get("request_id"))] = (
+                        str(domain),
+                        str(session_id),
+                        str(packed.get("op")),
+                    )
                 else:
                     self._items.append(packed)
                 self._enqueued += 1
@@ -859,6 +927,10 @@ def _get_or_create_ray_actor():
                         extra["execution_serial_epoch"] = self._execution_serial_epoch
                         extra["execution_serial_seq"] = next_seq
                     self._mark_asample_leased_to_consumer(item.get("request_id", ""), consumer_job_id)
+                    if scheduler_domain is not None:
+                        leased_request_id = str(item.get("request_id") or "")
+                        if leased_request_id:
+                            self._scheduler_lease_consumer[leased_request_id] = str(consumer_job_id)
                     break
 
                 self._dequeued += 1
@@ -1362,8 +1434,26 @@ class ApiWorkQueueClient:
         return result
 
     async def _reconcile_stale_running_requests(self, consumer_job_id: str) -> None:
+        import ray
+
         from .capacity_manager import capacity_manager
         from .future_store import FutureStoreUnavailableError, future_store
+
+        stale_leased_request_ids: list[str] = []
+        try:
+            actor = self._get_ray_actor()
+            ref = actor.release_stale_scheduler_leases.remote(str(consumer_job_id))
+            stale_leased_request_ids = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: ray.get(ref, timeout=30),
+            )
+        except Exception as e:
+            logger.warning(
+                "[api_work_queue] release_stale_scheduler_leases failed consumer_job_id=%s: %s: %s",
+                str(consumer_job_id),
+                type(e).__name__,
+                e,
+            )
 
         try:
             stale_request_ids = future_store.fail_stale_running_requests(
@@ -1387,10 +1477,32 @@ class ApiWorkQueueClient:
             )
             return
 
-        if not stale_request_ids:
+        stale_leased_request_ids = [str(request_id) for request_id in stale_leased_request_ids]
+        pending_leased_request_ids = [
+            request_id
+            for request_id in stale_leased_request_ids
+            if request_id not in set(stale_request_ids)
+        ]
+        for request_id in pending_leased_request_ids:
+            try:
+                future_store.fail(
+                    request_id,
+                    "api server restarted while request was dequeued before execution began",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[api_work_queue] future_store.fail failed for stale leased request_id=%s consumer_job_id=%s: %s: %s",
+                    str(request_id),
+                    str(consumer_job_id),
+                    type(e).__name__,
+                    e,
+                )
+
+        all_stale_request_ids = [*stale_request_ids, *pending_leased_request_ids]
+        if not all_stale_request_ids:
             return
 
-        for request_id in stale_request_ids:
+        for request_id in all_stale_request_ids:
             try:
                 capacity_manager.release_all(request_id)
             except Exception as e:
@@ -1402,9 +1514,9 @@ class ApiWorkQueueClient:
                     e,
                 )
         logger.warning(
-            "[api_work_queue] failed %d stale running requests for previous consumer generation: %s",
-            len(stale_request_ids),
-            stale_request_ids,
+            "[api_work_queue] failed %d stale request(s) for previous consumer generation: %s",
+            len(all_stale_request_ids),
+            all_stale_request_ids,
         )
 
     async def start_workers(self, *, num_workers: int) -> None:
