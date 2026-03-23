@@ -34,6 +34,9 @@ Trusted identity rules:
 - `X-Request-Id` alone must not trigger trusted-header mode.
 - Admin authorization should use `user_role == "admin"` (with `user_id == "admin"` kept only as legacy fallback).
 
+Outbound identity header:
+- When a validated request identity includes an API key id (`apikey_id` or legacy `key_id`), the server echoes it on responses as `X-MinT-Apikey-Id`.
+
 Privilege boundary:
 - `/api/v1/retrieve_future` hides detailed exception text unless the caller is privileged (admin role).
 

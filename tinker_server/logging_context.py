@@ -40,6 +40,20 @@ except Exception:
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 # Context variable to store current trace_id
 trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("trace_id", default=None)
+request_identity_var: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "request_identity",
+    default=None,
+)
+
+_UNSET = object()
+_REQUEST_IDENTITY_KEYS = (
+    "user_id",
+    "user_role",
+    "account_id",
+    "apikey_id",
+    "gateway_request_id",
+    "gateway_session_id",
+)
 
 _HEX_CHARS = frozenset("0123456789abcdef")
 _OTEL_ENABLED = False
@@ -90,6 +104,10 @@ class _ContextEnrichmentFilter(logging.Filter):
             record.request_id = get_request_id() or "-"
         if not hasattr(record, "trace_id"):
             record.trace_id = get_trace_id() or _get_current_otel_trace_id() or "-"
+        identity = get_request_identity_context()
+        for key in _REQUEST_IDENTITY_KEYS:
+            if not hasattr(record, key):
+                record.__dict__[key] = identity.get(key) or "-"
 
         current_hostname = getattr(record, "hostname", None)
         if not isinstance(current_hostname, str) or not current_hostname.strip():
@@ -137,6 +155,13 @@ def set_trace_id(trace_id: str | None) -> None:
 def get_trace_id() -> str | None:
     """Get the trace_id from the current context."""
     return _normalize_trace_id(trace_id_var.get())
+
+
+def get_request_identity_context() -> dict[str, str]:
+    raw = request_identity_var.get()
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, str) and v}
 
 
 def generate_trace_id() -> str:
@@ -333,17 +358,42 @@ def bind_request_trace_context(
     *,
     request_id: str | None = None,
     trace_id: str | None = None,
+    user_id: str | None | object = _UNSET,
+    user_role: str | None | object = _UNSET,
+    account_id: str | None | object = _UNSET,
+    apikey_id: str | None | object = _UNSET,
+    gateway_request_id: str | None | object = _UNSET,
+    gateway_session_id: str | None | object = _UNSET,
 ) -> Iterator[None]:
     """Temporarily bind request/trace IDs and restore previous context on exit."""
     prev_request_id = get_request_id()
     prev_trace_id = get_trace_id()
+    prev_identity = get_request_identity_context()
     set_request_id(_normalize_context_id(request_id))
     set_trace_id(_normalize_context_id(trace_id))
+    next_identity = dict(prev_identity)
+    for key, value in (
+        ("user_id", user_id),
+        ("user_role", user_role),
+        ("account_id", account_id),
+        ("apikey_id", apikey_id),
+        ("gateway_request_id", gateway_request_id),
+        ("gateway_session_id", gateway_session_id),
+    ):
+        if value is _UNSET:
+            continue
+        normalized = _normalize_context_id(None if value is None else str(value))
+        if normalized is None:
+            next_identity.pop(key, None)
+        else:
+            next_identity[key] = normalized
+    request_identity_var.set(next_identity)
     try:
         yield
     finally:
         set_request_id(prev_request_id)
         set_trace_id(prev_trace_id)
+        request_identity_var.set(prev_identity or None)
 
 
 def log_with_bound_context(
@@ -413,6 +463,14 @@ def add_trace_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> d
     """Structlog processor to add trace_id to all log events."""
     trace_id = get_trace_id() or _get_current_otel_trace_id()
     event_dict["trace_id"] = trace_id if trace_id else "-"
+    return event_dict
+
+
+def add_request_identity_fields(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Structlog processor to add request identity fields to all log events."""
+    identity = get_request_identity_context()
+    for key in _REQUEST_IDENTITY_KEYS:
+        event_dict[key] = identity.get(key) or "-"
     return event_dict
 
 
@@ -680,7 +738,11 @@ def _configure_stdlib_logging(
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    fmt = "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s trace_id=%(trace_id)s %(message)s"
+    fmt = (
+        "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s trace_id=%(trace_id)s "
+        "user_id=%(user_id)s user_role=%(user_role)s account_id=%(account_id)s apikey_id=%(apikey_id)s "
+        "gateway_request_id=%(gateway_request_id)s gateway_session_id=%(gateway_session_id)s %(message)s"
+    )
     datefmt = "%Y-%m-%dT%H:%M:%S%z"
 
     context_filter = _ContextEnrichmentFilter()
@@ -736,6 +798,7 @@ def configure_logging() -> None:
         structlog.contextvars.merge_contextvars,
         add_request_id,
         add_trace_id,
+        add_request_identity_fields,
         add_hostname,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,

@@ -17,6 +17,7 @@ class GatewayAuthContext:
     account_id: str
     apikey_id: str
     request_id: str
+    session_id: str = ""
 
 
 _USER_ID_HEADERS = ("x-mint-user-id",)
@@ -24,6 +25,7 @@ _USER_ROLE_HEADERS = ("x-mint-user-role",)
 _ACCOUNT_ID_HEADERS = ("x-mint-account-id",)
 _APIKEY_ID_HEADERS = ("x-mint-apikey-id",)
 _REQUEST_ID_HEADERS = ("x-mint-request-id",)
+_SESSION_ID_HEADERS = ("x-mint-session-id",)
 _INTERNAL_TOKEN_HEADERS = ("x-internal-token",)
 _SUPPORTED_USER_ROLES = {"user", "admin"}
 
@@ -103,12 +105,14 @@ def extract_gateway_auth_context_from_headers(
         "X-MinT-Apikey-Id",
     )
     request_id = _require_header(headers, _REQUEST_ID_HEADERS, "X-MinT-Request-Id")
+    session_id = _get_first_header(headers, _SESSION_ID_HEADERS)
     return GatewayAuthContext(
         user_id=user_id,
         user_role=user_role,
         account_id=account_id,
         apikey_id=apikey_id,
         request_id=request_id,
+        session_id=session_id,
     )
 
 
@@ -137,6 +141,7 @@ def build_billing_auth_context(
             account_id=ctx.account_id,
             apikey_id=ctx.apikey_id,
             request_id=request_id,
+            session_id=ctx.session_id,
         )
 
     user_data = getattr(request.state, "user_data", None)
@@ -151,6 +156,7 @@ def build_billing_auth_context(
         or str(fallback_request_id or "").strip()
         or _get_first_header(_canonical_headers(dict(request.headers)), _REQUEST_ID_HEADERS)
     )
+    session_id = str(user_data.get("session_id") or "").strip()
 
     if not user_id or not apikey_id or not request_id:
         return None
@@ -164,6 +170,7 @@ def build_billing_auth_context(
             account_id=_validate_object_id(account_id, "account_id"),
             apikey_id=_validate_object_id(apikey_id, "apikey_id"),
             request_id=request_id,
+            session_id=session_id,
         )
     except HTTPException:
         return None
