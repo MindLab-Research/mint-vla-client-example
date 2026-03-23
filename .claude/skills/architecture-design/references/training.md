@@ -31,11 +31,12 @@ Training sessions (`model_id`) have a bounded lifecycle:
 
 The idle cleanup mirrors the inference `SessionManager._cleanup_loop` pattern, including `inflight_ops` protection (analogous to `SessionInfo.inflight_requests`):
 
-- **HTTP handlers** call `touch_session()` before enqueue to cover queue delay.
-- **Background workers** (`_do_train_step`, `_do_forward_backward`, `_do_forward`, `_do_optim_step`, `_do_save_weights_for_sampler`, `_do_save_state`, `_do_save_weights`, `_do_load_state`) call `mark_inflight(+1)` at entry and `mark_inflight(-1)` in `finally` to protect long-running operations.
+- **Queued HTTP handlers** call `mark_inflight(+1)` before enqueue so queue delay cannot race idle cleanup.
+- **Background workers** for queued existing-session operations release that claim with `mark_inflight(-1)` in `finally`, which also refreshes `last_activity` on completion.
 - **`_do_create_model`** / **`_do_create_model_from_state`** call `mark_inflight(+1)` right after `create_session()` to protect during slow actor creation.
+- **Session activity persistence**: `touch_session()` / `mark_inflight()` write `last_activity` into the detached training-session store so API restarts restore the real idle deadline instead of falling back to `created_at`.
 - **Read-only lookups** (`GET /models/{model_id}`, `GET /training_runs`, existence checks) do NOT extend the idle deadline.
-- **`_restore_training_session`** sets `last_activity` to the original `created_at` timestamp (not current time) so restored sessions do not get a fresh idle window from read-only lookups.
+- **`_restore_training_session`** restores persisted `last_activity` when present, and falls back to `created_at` only for older store entries that predate that field.
 
 When cleanup fires, it skips sessions with `inflight_ops > 0`, then performs the full deletion flow:
 1. `engine.shutdown_session` (release GPU actor reference)

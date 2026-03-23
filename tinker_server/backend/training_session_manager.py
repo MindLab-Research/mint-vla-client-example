@@ -177,6 +177,14 @@ class TrainingSessionManager:
         """Get total number of active sessions."""
         return len(self._sessions)
 
+    def _persist_last_activity(self, model_id: str, last_activity: float) -> None:
+        try:
+            from .training_session_store import set_training_session_last_activity
+
+            set_training_session_last_activity(model_id, last_activity)
+        except Exception:
+            pass
+
     def touch_session(self, model_id: str) -> None:
         """Update last_activity timestamp for a session.
 
@@ -186,6 +194,7 @@ class TrainingSessionManager:
         session = self._sessions.get(model_id)
         if session is not None:
             session.last_activity = time.time()
+            self._persist_last_activity(model_id, session.last_activity)
 
     def mark_inflight(self, model_id: str, delta: int) -> None:
         """Mark a session as having in-flight work to prevent cleanup.
@@ -198,6 +207,7 @@ class TrainingSessionManager:
         if session is not None:
             session.last_activity = time.time()
             session.inflight_ops = max(0, session.inflight_ops + delta)
+            self._persist_last_activity(model_id, session.last_activity)
 
     # =========================================================================
     # Background cleanup of idle training sessions

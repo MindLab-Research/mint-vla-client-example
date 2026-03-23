@@ -494,10 +494,12 @@ async def save_weights(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    if training_manager is not None:
-        training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        if training_manager is not None:
+            training_manager.mark_inflight(request.model_id, +1)
+            inflight_marked = True
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
@@ -519,6 +521,8 @@ async def save_weights(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -615,10 +619,12 @@ async def save_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    if training_manager is not None:
-        training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        if training_manager is not None:
+            training_manager.mark_inflight(request.model_id, +1)
+            inflight_marked = True
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
@@ -640,6 +646,8 @@ async def save_state(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -667,13 +675,11 @@ async def _do_save_state(
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
             if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
@@ -845,13 +851,11 @@ async def _do_save_weights(
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
             if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\\\" in checkpoint_name:
@@ -1134,10 +1138,12 @@ async def load_state(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    if training_manager is not None:
-        training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        if training_manager is not None:
+            training_manager.mark_inflight(request.model_id, +1)
+            inflight_marked = True
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
@@ -1156,6 +1162,8 @@ async def load_state(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -1173,13 +1181,11 @@ async def _do_load_state(
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from ..config import otel_env_vars
@@ -78,6 +79,13 @@ def _get_or_create_actor():
             s["current_step"] = max(int(s.get("current_step", 0)), int(step))
             return int(s["current_step"])
 
+        def set_last_activity(self, model_id: str, last_activity: float) -> float | None:
+            s = self._sessions.get(model_id)
+            if s is None:
+                return None
+            s["last_activity"] = float(last_activity)
+            return float(s["last_activity"])
+
         def list(self) -> list[dict[str, Any]]:
             return list(self._sessions.values())
 
@@ -109,6 +117,7 @@ def upsert_training_session(info: dict[str, Any]) -> None:
         return
     payload = dict(info)
     payload.setdefault("current_step", 0)
+    payload.setdefault("last_activity", time.time())
     try:
         actor = _get_or_create_actor()
         actor.upsert.remote(str(payload.get("model_id", "")), payload)
@@ -127,6 +136,18 @@ def delete_training_session(model_id: str) -> None:
         actor.delete.remote(model_id)
     except Exception as e:
         logger.warning("Training session store write failed: delete: %s", e)
+
+
+def set_training_session_last_activity(model_id: str, last_activity: float) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    try:
+        actor = _get_or_create_actor()
+        actor.set_last_activity.remote(model_id, float(last_activity))
+    except Exception as e:
+        logger.debug("Training session store write failed: last_activity: %s", e)
 
 
 def get_training_session_info(model_id: str) -> dict[str, Any] | None:

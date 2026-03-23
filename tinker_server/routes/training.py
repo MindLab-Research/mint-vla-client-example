@@ -210,17 +210,27 @@ def _restore_training_session(model_id: str):
             )
 
         session.backend = str(info.get("backend", session.backend))
+        last_activity_set = False
+        try:
+            raw_last_activity = info.get("last_activity")
+            if raw_last_activity is not None:
+                session.last_activity = float(raw_last_activity)
+                last_activity_set = True
+        except (TypeError, ValueError, OverflowError):
+            last_activity_set = False
         created_at = info.get("created_at")
         if isinstance(created_at, str) and created_at:
             session.created_at = created_at
-            # Restored sessions must not get a fresh idle window from a
-            # read-only lookup.  Use the original creation time so truly
-            # stale sessions become cleanup-eligible immediately.
-            try:
-                session.last_activity = datetime.fromisoformat(created_at).timestamp()
-            except (ValueError, OSError):
-                session.last_activity = 0.0
-        else:
+            if not last_activity_set:
+                # Fall back to created_at for older store entries that predate
+                # persisted activity timestamps. This preserves fail-closed
+                # cleanup semantics without granting a fresh idle window.
+                try:
+                    session.last_activity = datetime.fromisoformat(created_at).timestamp()
+                    last_activity_set = True
+                except (ValueError, OSError):
+                    pass
+        if not last_activity_set:
             session.last_activity = 0.0
         try:
             session.current_step = int(info.get("current_step", session.current_step))
@@ -722,7 +732,11 @@ async def _enqueue_internal_serialized_model_op(
         )
 
     created = False
+    inflight_marked = False
     try:
+        if training_manager is not None:
+            training_manager.mark_inflight(model_id, +1)
+            inflight_marked = True
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": op, "model_id": model_id})
@@ -735,6 +749,8 @@ async def _enqueue_internal_serialized_model_op(
             extra=dict(extra),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -996,6 +1012,7 @@ async def _do_create_model(
                 "namespace": RAY_NAMESPACE,
                 "user_id": user_id,
                 "created_at": session.created_at,
+                "last_activity": session.last_activity,
             })
         except Exception as e:
             logger.warning("[create_model] training session store write failed: %s", e)
@@ -1375,6 +1392,7 @@ async def _do_create_model_from_state(
                 "namespace": RAY_NAMESPACE,
                 "user_id": user_id,
                 "created_at": session.created_at,
+                "last_activity": session.last_activity,
             })
         except Exception as e:
             logger.warning("[create_model_from_state] training session store write failed: %s", e)
@@ -1537,9 +1555,11 @@ async def forward_backward(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
             model_id=request.model_id,
@@ -1571,6 +1591,8 @@ async def forward_backward(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -1593,15 +1615,13 @@ async def _do_forward_backward(
     try:
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             session = _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         max_model_len = _get_max_model_len(session.base_model)
         _, max_seq_len = _compute_token_stats(request.forward_backward_input.data)
         if max_seq_len > max_model_len:
@@ -1770,9 +1790,11 @@ async def train_step(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
             model_id=request.model_id,
@@ -1801,6 +1823,8 @@ async def train_step(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -1821,15 +1845,13 @@ async def _do_train_step(
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             session = _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         batch = request.forward_backward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
@@ -1996,9 +2018,11 @@ async def forward(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
             model_id=request.model_id,
@@ -2027,6 +2051,8 @@ async def forward(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -2046,15 +2072,13 @@ async def _do_forward(
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             session = _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         batch = request.forward_input.data
         token_count, max_seq_len = _compute_token_stats(batch)
         t0 = time.time()
@@ -2216,9 +2240,11 @@ async def optim_step(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
             model_id=request.model_id,
@@ -2245,6 +2271,8 @@ async def optim_step(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -2260,15 +2288,13 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             session = _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         lr = request.adam_params.learning_rate if request.adam_params else None
         t0 = time.time()
         msg = f"[{session.model_id}] optim_step start request_id={request_id} lr={lr}"
@@ -2397,10 +2423,12 @@ async def _do_reset_expert_bias(
     request_id: str,
     request: ResetExpertBiasRequest,
 ) -> None:
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
@@ -2427,6 +2455,9 @@ async def _do_reset_expert_bias(
             e,
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -2525,9 +2556,11 @@ async def save_weights_for_sampler(
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
         )
 
-    training_manager.touch_session(request.model_id)
     created = False
+    inflight_marked = False
     try:
+        training_manager.mark_inflight(request.model_id, +1)
+        inflight_marked = True
         scheduler_extra = _build_training_scheduler_extra(
             session=session,
             model_id=request.model_id,
@@ -2559,6 +2592,8 @@ async def save_weights_for_sampler(
             ),
         )
     except Exception as e:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(request.model_id, -1)
         capacity_manager.release_all(request_id)
         if created:
             future_store.cleanup(request_id)
@@ -2587,15 +2622,13 @@ async def _do_save_weights_for_sampler(
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(request.model_id)
         if session is None:
             session = _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
-
-        training_manager.mark_inflight(request.model_id, +1)
-        inflight_marked = True
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path
@@ -3125,10 +3158,12 @@ async def delete_model(model_id: str):
 
 
 async def _do_delete_model(request_id: str, model_id: str) -> None:
+    inflight_marked = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
+        inflight_marked = True
 
         session = training_manager.get_session(model_id)
         if session is not None:
@@ -3158,6 +3193,9 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
             e,
         )
         future_store.fail(request_id, str(e))
+    finally:
+        if inflight_marked and training_manager is not None:
+            training_manager.mark_inflight(model_id, -1)
 
 
 @router.get("/models/{model_id}/tokenizer")
