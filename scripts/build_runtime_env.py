@@ -308,6 +308,19 @@ def _write_host_source_version_files(pyproject: dict[str, Any], env_root: Path) 
                 ),
                 encoding="utf-8",
             )
+        egg_info = source_root / source["name"] / f"{package_name.replace('-', '_')}.egg-info"
+        if egg_info.exists():
+            (egg_info / "PKG-INFO").write_text(
+                "\n".join(
+                    [
+                        "Metadata-Version: 2.1",
+                        f"Name: {package_name}",
+                        f"Version: {package_version}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
 
 def _write_host_wrappers(env_root: Path, host_python: Path) -> None:
