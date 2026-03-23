@@ -166,6 +166,25 @@ def _create_model() -> tuple[str, str]:
     return model_id, str(backend)
 
 
+def _forward(model_id: str, datum: dict[str, Any]) -> dict[str, Any]:
+    result = _post_json(
+        "/api/v1/forward",
+        {
+            "model_id": model_id,
+            "forward_input": {
+                "data": [datum],
+                "loss_fn": "cross_entropy",
+                "loss_fn_config": {},
+            },
+        },
+        timeout_s=REQUEST_TIMEOUT_S,
+    )
+    result = _await_maybe_async(result, timeout_s=FWDBWD_TIMEOUT_S)
+    if "error" in result:
+        raise RuntimeError(f"forward failed: {result.get('error')!r}")
+    return result
+
+
 def _forward_backward(model_id: str, datum: dict[str, Any], *, loss_fn: str) -> dict[str, Any]:
     result = _post_json(
         "/api/v1/forward_backward",
@@ -253,6 +272,10 @@ def _verify_cross_entropy(model_id: str) -> None:
     if loss_mean == 0.0:
         raise RuntimeError(f"cross_entropy returned suspicious loss:mean=0.0 metrics={metrics!r}")
 
+    # Verify loss:sum / num_tokens:sum ≈ loss:mean (contract consistency)
+    expected_mean = loss_sum / num_tokens
+    _assert_close("cross_entropy loss:sum/num_tokens vs loss:mean", loss_mean, expected_mean)
+
     print(
         "cross_entropy ok "
         f"loss_sum={loss_sum:.6f} expected_sum={expected_sum:.6f} loss_mean={loss_mean:.6f} num_tokens={num_tokens:.0f}",
@@ -296,11 +319,35 @@ def _verify_importance_sampling(model_id: str) -> None:
     print(f"optim_step ok grad_norm={float(grad_norm):.6f} step={step_value!r}", flush=True)
 
 
+def _verify_forward(model_id: str) -> None:
+    """Verify forward (read-only) also returns loss:sum."""
+    datum, weights = _make_cross_entropy_datum()
+    result = _forward(model_id, datum)
+    metrics = _require_metrics(result)
+
+    loss_sum = _require_metric(metrics, "loss:sum")
+    loss_mean = _require_metric(metrics, "loss:mean")
+    num_tokens = _require_metric(metrics, "num_tokens:sum")
+
+    if num_tokens <= 0:
+        raise RuntimeError(f"forward returned invalid num_tokens:sum={num_tokens}")
+    # loss:sum must be > 0 for random-init LoRA on non-trivial input
+    if loss_sum <= 0:
+        raise RuntimeError(f"forward returned suspicious loss:sum={loss_sum} (expected > 0)")
+
+    print(
+        "forward ok "
+        f"loss_sum={loss_sum:.6f} loss_mean={loss_mean:.6f} num_tokens={num_tokens:.0f}",
+        flush=True,
+    )
+
+
 def main() -> int:
     model_id: str | None = None
     try:
         model_id, _backend = _create_model()
         _verify_cross_entropy(model_id)
+        _verify_forward(model_id)
         _verify_importance_sampling(model_id)
         print("PASS issue #343 reproduction/verification", flush=True)
         return 0
