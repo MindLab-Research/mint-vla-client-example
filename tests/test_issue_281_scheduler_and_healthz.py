@@ -38,6 +38,14 @@ def _install_ray_stub(monkeypatch, *, available: dict | None = None, total: dict
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
+def _manager_stub(session, *, delete_session=None):
+    return SimpleNamespace(
+        get_session=lambda _model_id: session,
+        mark_inflight=lambda *_args, **_kwargs: None,
+        delete_session=delete_session or (lambda _model_id: None),
+    )
+
+
 def _install_ray_cluster_health_stub(monkeypatch) -> None:
     ray = types.ModuleType("ray")
     ray.is_initialized = lambda: True  # type: ignore[attr-defined]
@@ -100,7 +108,7 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
+    monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
@@ -212,7 +220,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
+    monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
     monkeypatch.setattr(
@@ -262,7 +270,7 @@ async def test_issue_281_reset_expert_bias_enqueues_scheduler_metadata(monkeypat
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
+    monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
     monkeypatch.setattr(
@@ -318,7 +326,7 @@ async def test_issue_281_delete_model_enqueues_scheduler_metadata(monkeypatch) -
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
+    monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(
         tr,
@@ -460,7 +468,7 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
     monkeypatch.setattr(
         tr,
         "training_manager",
-        SimpleNamespace(get_session=lambda _model_id: SimpleNamespace(model_id="run-281")),
+        _manager_stub(SimpleNamespace(model_id="run-281")),
     )
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
     monkeypatch.setattr(
@@ -485,6 +493,7 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
 
 @pytest.mark.anyio
 async def test_issue_281_do_delete_model_shutdowns_then_resolves(monkeypatch) -> None:
+    _install_ray_stub(monkeypatch)
     import tinker_server.backend.resource_pool as resource_pool
     import tinker_server.backend.training_session_store as training_session_store
     from tinker_server.routes import training as tr
@@ -509,10 +518,7 @@ async def test_issue_281_do_delete_model_shutdowns_then_resolves(monkeypatch) ->
     monkeypatch.setattr(
         tr,
         "training_manager",
-        SimpleNamespace(
-            get_session=lambda _model_id: session,
-            delete_session=lambda model_id: calls["delete_session"].append(model_id),
-        ),
+        _manager_stub(session, delete_session=lambda model_id: calls["delete_session"].append(model_id)),
     )
     monkeypatch.setattr(training_session_store, "delete_training_session", lambda model_id: calls["delete_store"].append(model_id))
     monkeypatch.setattr(
@@ -538,6 +544,90 @@ async def test_issue_281_do_delete_model_shutdowns_then_resolves(monkeypatch) ->
     assert resolved["request_id"] == "rid-282"
     assert resolved["payload"] == {"model_id": "run-281", "status": "deleted"}
     assert "error" not in resolved
+
+
+@pytest.mark.anyio
+async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_finishes(monkeypatch) -> None:
+    import tinker_server.backend.api_work_queue as awq
+    import tinker_server.backend.capacity_manager as cm
+    from tinker_server.backend.training_session_manager import TrainingSessionManager
+    from tinker_server.models.types import ResetExpertBiasRequest
+    from tinker_server.routes import training as tr
+
+    manager = TrainingSessionManager()
+    manager.create_session("run-281", "sess-281", 0, "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    resolved: dict = {}
+
+    async def _fake_enqueue(**_kwargs):
+        return None
+
+    async def _fake_reset(_session):
+        return {"modules_reset": 1}
+
+    monkeypatch.setattr(tr, "training_manager", manager)
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(reset_expert_bias=_fake_reset))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(
+            create_with_id=lambda _request_id: None,
+            mark_queued=lambda _request_id, meta=None: None,
+            resolve=lambda request_id, payload: resolved.update({"request_id": request_id, "payload": payload}),
+            fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
+        ),
+    )
+    monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
+    monkeypatch.setattr(
+        cm,
+        "capacity_manager",
+        SimpleNamespace(
+            try_reserve=lambda *args, **kwargs: {"ok": True},
+            release_all=lambda *_args, **_kwargs: None,
+        ),
+    )
+
+    request_id = await tr._enqueue_internal_serialized_model_op(
+        model_id="run-281",
+        op="training.reset_expert_bias",
+        request_json=b"{}",
+        extra={},
+    )
+    assert manager.get_session("run-281").inflight_ops == 1
+
+    await tr._do_reset_expert_bias(request_id, ResetExpertBiasRequest(model_id="run-281"))
+
+    assert manager.get_session("run-281").inflight_ops == 0
+    assert resolved["request_id"] == request_id
+    assert resolved["payload"]["modules_reset"] == 1
+
+
+def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeypatch) -> None:
+    from tinker_server.backend.training_session_manager import TrainingSessionManager
+    from tinker_server.routes import training as tr
+
+    _install_ray_stub(monkeypatch)
+    manager = TrainingSessionManager()
+    monkeypatch.setattr(tr, "training_manager", manager)
+    monkeypatch.setattr(tr, "training_engine", SimpleNamespace(_workers={}, _resource_pool_actor_names={}))
+    monkeypatch.setattr(
+        "tinker_server.backend.training_session_store.get_training_session_info",
+        lambda _model_id: {
+            "model_id": "run-restore",
+            "session_id": "sess-restore",
+            "model_seq_id": 0,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "learning_rate": 1e-4,
+            "backend": "peft",
+            "created_at": "2026-03-20T10:00:00",
+            "last_activity": 1234.5,
+        },
+    )
+
+    session = tr._restore_training_session("run-restore")
+
+    assert session is not None
+    assert session.last_activity == pytest.approx(1234.5)
+    assert session.created_at == "2026-03-20T10:00:00"
 
 
 @pytest.mark.anyio

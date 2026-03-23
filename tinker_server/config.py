@@ -333,6 +333,7 @@ class ServerConfig:
     api_work_queue_reap_interval_s: float = 5.0
 
     # Training settings (backend/verl_training.py)
+    training_inactivity_timeout_s: int = 3600
     training_force_grad_checkpointing: bool = True
     training_enable_sdp: bool = True
     training_megatron_create_timeout_s: float = 1800.0
@@ -623,6 +624,11 @@ class ServerConfig:
                 5.0,
             ),
             # Training settings
+            training_inactivity_timeout_s=_pick_int(
+                "MINT_TRAINING_INACTIVITY_TIMEOUT",
+                file_training.inactivity_timeout_s if file_training is not None else None,
+                3600,
+            ),
             training_force_grad_checkpointing=_pick_bool(
                 "TINKER_FORCE_GRAD_CHECKPOINTING",
                 file_training.force_grad_checkpointing if file_training is not None else None,
