@@ -320,7 +320,7 @@ def _verify_importance_sampling(model_id: str) -> None:
 
 
 def _verify_forward(model_id: str) -> None:
-    """Verify forward (read-only) also returns loss:sum."""
+    """Verify forward (read-only) returns numerically consistent loss metrics."""
     datum, weights = _make_cross_entropy_datum()
     result = _forward(model_id, datum)
     metrics = _require_metrics(result)
@@ -328,16 +328,20 @@ def _verify_forward(model_id: str) -> None:
     loss_sum = _require_metric(metrics, "loss:sum")
     loss_mean = _require_metric(metrics, "loss:mean")
     num_tokens = _require_metric(metrics, "num_tokens:sum")
+    logprobs = _extract_logprobs(result)
+
+    expected_sum = -sum(lp * wt for lp, wt in zip(logprobs, weights))
+    _assert_close("forward loss:sum", loss_sum, expected_sum)
 
     if num_tokens <= 0:
         raise RuntimeError(f"forward returned invalid num_tokens:sum={num_tokens}")
-    # loss:sum must be > 0 for random-init LoRA on non-trivial input
-    if loss_sum <= 0:
-        raise RuntimeError(f"forward returned suspicious loss:sum={loss_sum} (expected > 0)")
+    expected_mean = loss_sum / num_tokens
+    _assert_close("forward loss:sum/num_tokens vs loss:mean", loss_mean, expected_mean)
 
     print(
         "forward ok "
-        f"loss_sum={loss_sum:.6f} loss_mean={loss_mean:.6f} num_tokens={num_tokens:.0f}",
+        f"loss_sum={loss_sum:.6f} expected_sum={expected_sum:.6f} "
+        f"loss_mean={loss_mean:.6f} num_tokens={num_tokens:.0f}",
         flush=True,
     )
 
