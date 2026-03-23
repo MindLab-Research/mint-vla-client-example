@@ -6,6 +6,7 @@ Each training session gets a dedicated TrainingWorker Ray actor with its own GPU
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -937,6 +938,119 @@ class TrainingWorker:
                 "num_tokens:sum": float(total_tokens),
             },
         }
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict],
+        reference_checkpoint_path: str,
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+    ) -> dict:
+        """Forward/backward for Mint reverse-KL distillation against a fixed reference checkpoint."""
+        self._bind_traceparent(traceparent)
+        torch = _get_torch()
+        self._touch()
+
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature!r}")
+        if session_id:
+            self._ensure_session_loaded(session_id)
+
+        from .mintx_ops import (
+            build_scoring_sequence,
+            compute_teacher_log_probs_cpu,
+            parse_reverse_kl_item,
+            reverse_kl_from_teacher_log_probs,
+            temporary_adapter_snapshot_dir,
+        )
+
+        block_size = int(os.environ.get("MINT_REVERSE_KL_VOCAB_BLOCK", "4096"))
+        student_batches = [parse_reverse_kl_item(item, input_key="student_input") for item in data_items]
+        reference_batches = [parse_reverse_kl_item(item, input_key="reference_input") for item in data_items]
+
+        teacher_log_probs_cpu: list[torch.Tensor] = []
+        prev_training = self.model.training
+        try:
+            with temporary_adapter_snapshot_dir("mintx_dense_ref_") as snapshot_dir:
+                self.save_adapter_state(snapshot_dir)
+                try:
+                    self.model.eval()
+                    self.load_adapter_state(reference_checkpoint_path)
+                    with torch.no_grad():
+                        for batch in reference_batches:
+                            scoring_input, completion_start = build_scoring_sequence(
+                                batch.prefix_tokens,
+                                batch.completion_tokens,
+                            )
+                            input_ids_t = torch.tensor(
+                                [scoring_input], dtype=torch.long, device=self.device
+                            )
+                            logits = self.model(input_ids=input_ids_t).logits.squeeze(0)
+                            completion_logits = logits[
+                                completion_start: completion_start + len(batch.completion_tokens)
+                            ]
+                            teacher_log_probs_cpu.append(
+                                compute_teacher_log_probs_cpu(
+                                    completion_logits,
+                                    temperature=temperature,
+                                    block_size=block_size,
+                                )
+                            )
+                finally:
+                    self.load_adapter_state(snapshot_dir)
+
+            self.model.train()
+            outputs = []
+            total_loss = 0.0
+            total_tokens = 0.0
+            for batch, teacher_log_probs in zip(student_batches, teacher_log_probs_cpu, strict=True):
+                scoring_input, completion_start = build_scoring_sequence(
+                    batch.prefix_tokens,
+                    batch.completion_tokens,
+                )
+                input_ids_t = torch.tensor([scoring_input], dtype=torch.long, device=self.device)
+                logits = self.model(input_ids=input_ids_t).logits.squeeze(0)
+                completion_logits = logits[
+                    completion_start: completion_start + len(batch.completion_tokens)
+                ]
+                token_kl = reverse_kl_from_teacher_log_probs(
+                    completion_logits,
+                    teacher_log_probs,
+                    temperature=temperature,
+                    block_size=block_size,
+                )
+                weights_t = torch.tensor(batch.weights, dtype=torch.float32, device=self.device)
+                loss = (token_kl * weights_t).sum()
+                loss.backward()
+                outputs.append(
+                    {
+                        "loss": {
+                            "data": [float(loss.detach().item())],
+                            "shape": [1],
+                            "dtype": "float32",
+                        }
+                    }
+                )
+                total_loss += float(loss.detach().item())
+                total_tokens += float((weights_t != 0).sum().item())
+
+            avg_loss = total_loss / max(total_tokens, 1.0)
+            return {
+                "outputs": outputs,
+                "metrics": {
+                    "loss:mean": float(avg_loss),
+                    "reverse_kl:mean": float(avg_loss),
+                    "num_samples:sum": float(len(outputs)),
+                    "num_tokens:sum": float(total_tokens),
+                },
+                "type": "mint_forward_backward_reverse_kl",
+            }
+        finally:
+            if prev_training:
+                self.model.train()
+            else:
+                self.model.eval()
 
     def get_tokenizer_info(self) -> dict:
         """Return tokenizer configuration for client use.
@@ -2871,6 +2985,137 @@ class VerlTrainingEngine:
         session.accumulated_gradients += 1
 
         logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
+        return result
+
+    async def forward_backward_reverse_kl(
+        self,
+        session: TrainingSession,
+        request: Any,
+    ) -> dict:
+        """Remote call to worker for Mint reverse-KL forward/backward."""
+        model_id = session.model_id
+        worker = await self._get_live_worker(session, op="forward_backward_reverse_kl")
+        self._touch_actor(session)
+
+        data_items = [item.model_dump() for item in request.data]
+        from .mintx_ops import build_scoring_sequence, parse_reverse_kl_item
+
+        reference_items = []
+        for item in data_items:
+            batch = parse_reverse_kl_item(item, input_key="reference_input")
+            scoring_input, completion_start = build_scoring_sequence(
+                batch.prefix_tokens,
+                batch.completion_tokens,
+            )
+            full_targets = scoring_input[1:] + [int(batch.completion_tokens[-1])]
+            full_weights = [0.0] * completion_start + [float(x) for x in batch.weights]
+            reference_items.append(
+                {
+                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": scoring_input}]},
+                    "loss_fn_inputs": {
+                        "target_tokens": {
+                            "data": full_targets,
+                            "shape": [len(full_targets)],
+                            "dtype": "int64",
+                        },
+                        "weights": {
+                            "data": full_weights,
+                            "shape": [len(full_weights)],
+                            "dtype": "float32",
+                        },
+                    },
+                }
+            )
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        traceparent = get_current_traceparent()
+
+        if session.backend == "megatron":
+            import hashlib
+
+
+            ref_session_id = f"mintx_ref_{hashlib.md5(request.reference_model_path.encode('utf-8')).hexdigest()[:16]}"
+            reference_actual_rank = None
+            try:
+                with open(os.path.join(request.reference_model_path, "adapter_config.json"), encoding="utf-8") as f:
+                    ref_cfg = json.load(f)
+                if isinstance(ref_cfg.get("r"), int):
+                    reference_actual_rank = int(ref_cfg["r"])
+            except Exception:
+                reference_actual_rank = None
+
+            try:
+                logger.info(
+                    f"[{model_id}] reverse_kl prime reference session start: "
+                    f"ref_session_id={ref_session_id} actual_rank={reference_actual_rank}"
+                )
+                await asyncio.to_thread(
+                    ray.get,
+                    worker.prime_session_checkpoint.remote(
+                        ref_session_id,
+                        request.reference_model_path,
+                        step_count=0,
+                        learning_rate=0.0,
+                        actual_rank=reference_actual_rank,
+                    ),
+                )
+                logger.info(f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}")
+                logger.info(f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}")
+                reference_chunks = await asyncio.to_thread(
+                    ray.get,
+                    worker.forward_reference_full_log_probs.remote(
+                        data_items=reference_items,
+                        temperature=float(request.temperature),
+                        session_id=ref_session_id,
+                        traceparent=traceparent,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    ),
+                )
+                logger.info(
+                    f"[{model_id}] reverse_kl reference forward done: ref_session_id={ref_session_id} "
+                    f"chunks={len(reference_chunks) if isinstance(reference_chunks, list) else 'unknown'}"
+                )
+                logger.info(f"[{model_id}] reverse_kl student backward start")
+                pending = worker.forward_backward_reverse_kl.remote(
+                    data_items,
+                    None,
+                    float(request.temperature),
+                    session.model_id,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                    reference_full_log_prob_chunks=reference_chunks,
+                )
+                result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+            finally:
+                try:
+                    await asyncio.to_thread(
+                        ray.get,
+                        worker.delete_session.remote(ref_session_id, traceparent=traceparent),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] reverse_kl reference session cleanup failed: ref_session_id=%s",
+                        model_id,
+                        ref_session_id,
+                        exc_info=True,
+                    )
+        else:
+            pending = worker.forward_backward_reverse_kl.remote(
+                data_items,
+                request.reference_model_path,
+                float(request.temperature),
+                session.model_id,
+                traceparent=traceparent,
+            )
+            result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+        session.accumulated_gradients += 1
+        logger.info(f"[{model_id}] forward_backward_reverse_kl completed")
         return result
 
     async def forward(
