@@ -272,7 +272,9 @@ def _verify_cross_entropy(model_id: str) -> None:
     if loss_mean == 0.0:
         raise RuntimeError(f"cross_entropy returned suspicious loss:mean=0.0 metrics={metrics!r}")
 
-    # Verify loss:sum / num_tokens:sum ≈ loss:mean (contract consistency)
+    # Current project-standard Megatron runs use dp=1, so loss:mean should match
+    # loss:sum / num_tokens:sum here. If dp>1 is introduced later, validate
+    # loss:sum directly instead of assuming this identity.
     expected_mean = loss_sum / num_tokens
     _assert_close("cross_entropy loss:sum/num_tokens vs loss:mean", loss_mean, expected_mean)
 
@@ -335,6 +337,7 @@ def _verify_forward(model_id: str) -> None:
 
     if num_tokens <= 0:
         raise RuntimeError(f"forward returned invalid num_tokens:sum={num_tokens}")
+    # Same dp=1 scope note as _verify_cross_entropy above.
     expected_mean = loss_sum / num_tokens
     _assert_close("forward loss:sum/num_tokens vs loss:mean", loss_mean, expected_mean)
 
