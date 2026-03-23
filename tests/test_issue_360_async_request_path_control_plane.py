@@ -11,11 +11,17 @@ import pytest
 from tinker_server.backend.future_store import FutureStatus
 from tinker_server.models.types import (
     AdamParams,
+    ForwardBackwardInput,
+    ForwardBackwardRequest,
+    ForwardRequest,
     FutureRetrieveRequest,
+    GetInfoRequest,
     ModelInput,
     OptimStepRequest,
     SampleRequest,
+    SaveWeightsForSamplerRequest,
     SamplingParams,
+    TrainStepRequest,
 )
 from tinker_server.routes import futures as futures_route
 from tinker_server.routes import internal as internal_route
@@ -36,6 +42,87 @@ def _request_stub(user_id: str = "admin"):
 
 def _response_stub():
     return SimpleNamespace(status_code=200, headers={})
+
+
+class _GatewayResponse:
+    def __init__(self, payload: dict, *, status_code: int = 200, text: str = ""):
+        self._payload = dict(payload)
+        self.status_code = status_code
+        self.text = text
+
+    def json(self) -> dict:
+        return dict(self._payload)
+
+
+def _patch_training_route_remote_fallback(monkeypatch) -> None:
+    async def _restore_training_session(_model_id: str):
+        return None
+
+    monkeypatch.setattr(training_route, "training_manager", SimpleNamespace(get_session=lambda _model_id: None))
+    monkeypatch.setattr(training_route, "training_engine", object())
+    monkeypatch.setattr(training_route, "_restore_training_session", _restore_training_session)
+    monkeypatch.setattr(training_route, "can_access_model", lambda _base_model, _user_data: True)
+
+
+def _install_gateway_forward_stubs(
+    monkeypatch,
+    *,
+    response_payload: dict,
+):
+    import tinker_server.gateway as gw
+
+    calls: dict[str, object] = {}
+
+    async def _fake_async_remote_training_model(model_id: str):
+        calls["async_remote_training_model"] = model_id
+        return ("upstream-a", "Qwen/Qwen3-0.6B")
+
+    def _unexpected_sync_remote_training_model(*_args, **_kwargs):
+        raise AssertionError("sync remote_training_model should not be used on async request path")
+
+    def _fake_upstream_for_alias(alias: str):
+        calls["upstream_alias"] = alias
+        return SimpleNamespace(alias=alias)
+
+    async def _fake_forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s, **_kwargs):
+        calls["forward_json"] = {
+            "upstream_alias": upstream.alias,
+            "method": method,
+            "path": path,
+            "incoming_headers": dict(incoming_headers),
+            "json_body": dict(json_body),
+            "timeout_s": timeout_s,
+        }
+        return _GatewayResponse(response_payload)
+
+    def _fake_encode_request_id(*, upstream_alias: str, upstream_request_id: str) -> str:
+        calls["encode_request_id"] = (upstream_alias, upstream_request_id)
+        return f"{upstream_alias}:{upstream_request_id}"
+
+    def _fake_register_pending_save_weights_for_sampler_future(
+        *,
+        upstream_alias: str,
+        upstream_request_id: str,
+        base_model: str,
+    ) -> None:
+        calls["register_pending_save_weights_for_sampler_future"] = (
+            upstream_alias,
+            upstream_request_id,
+            base_model,
+        )
+
+    monkeypatch.setattr(gw, "async_remote_training_model", _fake_async_remote_training_model)
+    monkeypatch.setattr(gw, "remote_training_model", _unexpected_sync_remote_training_model, raising=False)
+    monkeypatch.setattr(gw, "upstream_for_alias", _fake_upstream_for_alias)
+    monkeypatch.setattr(gw, "forward_json", _fake_forward_json)
+    monkeypatch.setattr(gw, "encode_request_id", _fake_encode_request_id)
+    monkeypatch.setattr(
+        gw,
+        "register_pending_save_weights_for_sampler_future",
+        _fake_register_pending_save_weights_for_sampler_future,
+        raising=False,
+    )
+    return calls
 
 
 class _AsyncOnlyPendingFutureStore:
@@ -408,7 +495,11 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
         return None
 
     monkeypatch.setattr(training_route, "future_store", fs)
-    monkeypatch.setattr(training_route, "training_manager", SimpleNamespace(get_session=lambda _mid: session))
+    monkeypatch.setattr(
+        training_route,
+        "training_manager",
+        SimpleNamespace(get_session=lambda _mid: session, mark_inflight=lambda *_args, **_kwargs: None),
+    )
     monkeypatch.setattr(training_route, "training_engine", object())
     monkeypatch.setattr(training_route, "_restore_training_session", _restore_training_session)
 
@@ -430,6 +521,127 @@ def test_issue_360_training_optim_step_admission_uses_async_capacity_and_future(
     assert len(cap.calls) == 1
     assert any(name == "async_create_with_id" for name, _rid in fs.calls)
     assert len(q.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("route_name", "request_factory", "expected_path", "response_payload", "expect_register"),
+    [
+        (
+            "forward_backward",
+            lambda: ForwardBackwardRequest(
+                model_id="run-remote",
+                seq_id=11,
+                forward_backward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+            ),
+            "/api/v1/forward_backward",
+            {"request_id": "upstream-rid"},
+            False,
+        ),
+        (
+            "train_step",
+            lambda: TrainStepRequest(
+                model_id="run-remote",
+                seq_id=12,
+                forward_backward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+                adam_params=AdamParams(learning_rate=1e-4),
+            ),
+            "/api/v1/train_step",
+            {"request_id": "upstream-rid"},
+            False,
+        ),
+        (
+            "forward",
+            lambda: ForwardRequest(
+                model_id="run-remote",
+                seq_id=13,
+                forward_input=ForwardBackwardInput(data=[], loss_fn="noop"),
+            ),
+            "/api/v1/forward",
+            {"request_id": "upstream-rid"},
+            False,
+        ),
+        (
+            "optim_step",
+            lambda: OptimStepRequest(
+                model_id="run-remote",
+                seq_id=14,
+                adam_params=AdamParams(learning_rate=1e-4),
+            ),
+            "/api/v1/optim_step",
+            {"request_id": "upstream-rid"},
+            False,
+        ),
+        (
+            "save_weights_for_sampler",
+            lambda: SaveWeightsForSamplerRequest(
+                model_id="run-remote",
+                seq_id=15,
+                path=None,
+            ),
+            "/api/v1/save_weights_for_sampler",
+            {"request_id": "upstream-rid"},
+            True,
+        ),
+        (
+            "get_info",
+            lambda: GetInfoRequest(model_id="run-remote"),
+            "/api/v1/get_info",
+            {
+                "model_id": "run-remote",
+                "model_data": {
+                    "arch": "QwenForCausalLM",
+                    "model_name": "Qwen/Qwen3-0.6B",
+                    "tokenizer_id": "Qwen/Qwen3-0.6B",
+                },
+                "model_name": "Qwen/Qwen3-0.6B",
+                "is_lora": True,
+                "lora_rank": 8,
+                "type": "get_info",
+            },
+            False,
+        ),
+    ],
+)
+def test_issue_360_training_remote_forwarding_uses_async_gateway_helpers(
+    monkeypatch,
+    route_name: str,
+    request_factory,
+    expected_path: str,
+    response_payload: dict,
+    expect_register: bool,
+):
+    _patch_training_route_remote_fallback(monkeypatch)
+    calls = _install_gateway_forward_stubs(monkeypatch, response_payload=response_payload)
+
+    route = getattr(training_route, route_name)
+    result = anyio.run(route, request_factory(), _request_stub("admin"))
+
+    assert calls["async_remote_training_model"] == "run-remote"
+    assert calls["upstream_alias"] == "upstream-a"
+
+    forward_call = calls["forward_json"]
+    assert forward_call["method"] == "POST"
+    assert forward_call["path"] == expected_path
+    assert forward_call["upstream_alias"] == "upstream-a"
+    assert forward_call["json_body"]["model_id"] == "run-remote"
+
+    if route_name == "get_info":
+        assert result.model_id == "run-remote"
+        assert result.model_name == "Qwen/Qwen3-0.6B"
+        assert result.lora_rank == 8
+        assert "encode_request_id" not in calls
+    else:
+        assert calls["encode_request_id"] == ("upstream-a", "upstream-rid")
+        assert result.request_id == "upstream-a:upstream-rid"
+
+    if expect_register:
+        assert calls["register_pending_save_weights_for_sampler_future"] == (
+            "upstream-a",
+            "upstream-rid",
+            "Qwen/Qwen3-0.6B",
+        )
+    else:
+        assert "register_pending_save_weights_for_sampler_future" not in calls
 
 
 def test_issue_360_service_get_session_uses_async_index_store(monkeypatch):

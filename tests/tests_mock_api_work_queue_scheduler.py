@@ -3,6 +3,7 @@ import importlib
 import importlib.machinery
 import json
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -70,7 +71,7 @@ def _materialize_runtime_env(root: Path) -> None:
 
 
 def _load_api_work_queue_module(monkeypatch):
-    runtime_root = Path("/tmp/runtime-env")
+    runtime_root = Path(tempfile.mkdtemp(prefix="mint-issue360-runtime-env-"))
     _materialize_runtime_env(runtime_root)
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(runtime_root))
     monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker")

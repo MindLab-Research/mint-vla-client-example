@@ -751,7 +751,8 @@ async def asample(
                 "stage": "queued",
             },
         )
-        base_model = session_manager.get_session_base_model(session_id) if session_manager is not None else None
+        get_session_base_model = getattr(session_manager, "get_session_base_model", None)
+        base_model = get_session_base_model(session_id) if callable(get_session_base_model) else None
         await _enqueue_sampling_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1543,7 +1544,12 @@ async def compute_logprobs(
         await future_store.async_create_with_id(request_id)
         created = True
         await future_store.async_mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
-        base_model = session_manager.get_session_base_model(request.sampling_session_id) if session_manager is not None else None
+        get_session_base_model = getattr(session_manager, "get_session_base_model", None)
+        base_model = (
+            get_session_base_model(request.sampling_session_id)
+            if callable(get_session_base_model)
+            else None
+        )
         await _enqueue_sampling_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
