@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -490,6 +491,17 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
 
+
+def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
+    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
+    match = re.search(hf_cache_pattern, base_model)
+    if match:
+        _org, model = match.groups()
+        model_name = model.lower().replace("-", "_").replace(".", "_")
+    else:
+        model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    return f"megatron_{model_name}"
+
 def _get_max_model_len(base_model: str | None) -> int:
     """Return the configured max_model_len for a supported model name.
 
@@ -565,7 +577,7 @@ def _build_training_scheduler_extra(
     training_op: str,
     seq_id: int | None = None,
 ) -> dict[str, Any]:
-    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -574,7 +586,10 @@ def _build_training_scheduler_extra(
     )
     backend = str(getattr(session, "backend", "") or "unknown")
     base_model = str(getattr(session, "base_model", "") or "")
-    domain_key = base_model if base_model else str(model_id)
+    if backend == "megatron" and base_model:
+        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
+    else:
+        domain_key = base_model if base_model else str(model_id)
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
         "scheduler_domain": f"{backend}:{domain_key}",
@@ -593,24 +608,24 @@ def _build_training_scheduler_extra(
             extra["seq_id"] = None
     return extra
 
-
-def _build_model_lifecycle_serial_extra(
+def _build_create_scheduler_extra(
     *,
-    model_id: str,
     base_model: str,
+    model_id: str,
     training_op: str,
 ) -> dict[str, Any]:
-    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    )
-    domain_key = base_model if base_model else str(model_id)
+    from ..backend.model_registry import get_model_config
+
+    if bool(get_model_config(base_model).is_moe):
+        backend = "megatron"
+        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
+    else:
+        backend = "peft"
+        domain_key = base_model
     return {
-        "scheduler_enabled": bool(enabled),
-        "scheduler_domain": f"lifecycle:{domain_key}",
+        "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower()
+        in ("1", "true", "yes", "y", "on"),
+        "scheduler_domain": f"{backend}:{domain_key}",
         "scheduler_session_key": str(model_id),
         "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
@@ -716,8 +731,6 @@ async def _enqueue_internal_serialized_model_op(
             future_store.cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue {op} request: {e}") from e
     return request_id
-
-
 # =============================================================================
 # create_model - async
 # =============================================================================
@@ -809,6 +822,11 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
+    scheduler_extra = _build_create_scheduler_extra(
+        base_model=request.base_model,
+        model_id=model_id,
+        training_op="create_model",
+    )
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
@@ -845,11 +863,7 @@ async def create_model(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra=_build_model_lifecycle_serial_extra(
-                    model_id=model_id,
-                    base_model=request.base_model,
-                    training_op="create_model",
-                ),
+                extra=scheduler_extra,
             ),
         )
         if webhook_url and user_id:
@@ -1205,6 +1219,11 @@ async def create_model_from_state(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    scheduler_extra = _build_create_scheduler_extra(
+        base_model=request.base_model,
+        model_id=model_id,
+        training_op="create_model_from_state",
+    )
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1236,11 +1255,7 @@ async def create_model_from_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
-                extra=_build_model_lifecycle_serial_extra(
-                    model_id=model_id,
-                    base_model=request.base_model,
-                    training_op="create_model_from_state",
-                ),
+                extra=scheduler_extra,
             ),
         )
     except Exception as e:
@@ -1996,7 +2011,13 @@ async def _do_forward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        token_count, _ = _compute_token_stats(request.forward_input.data)
+        batch = request.forward_input.data
+        token_count, max_seq_len = _compute_token_stats(batch)
+        t0 = time.time()
+        logger.info(
+            f"[{session.model_id}] forward start: "
+            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
+        )
         result = await run_async_with_otel_span(
             "training.forward.execute",
             lambda: training_engine.forward(session, request),
@@ -2007,11 +2028,14 @@ async def _do_forward(
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
                 "backend": str(session.backend),
-                "batch_size": int(len(request.forward_input.data)),
+                "batch_size": int(len(batch)),
                 "token_count": int(token_count),
+                "max_seq_len": int(max_seq_len),
                 "seq_id": int(request.seq_id) if request.seq_id is not None else None,
             },
         )
+        elapsed_s = time.time() - t0
+        logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -2209,7 +2233,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
                 "base_model": str(session.base_model),
                 "backend": str(session.backend),
                 "learning_rate": float(lr) if lr is not None else None,
-                "seq_id": int(request.seq_id),
+                "seq_id": int(request.seq_id) if request.seq_id is not None else None,
             },
         )
         elapsed_s = time.time() - t0

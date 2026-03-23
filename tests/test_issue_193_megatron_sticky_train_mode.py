@@ -69,6 +69,49 @@ class _FakeLRScheduler:
         self.lr_scale = state.get("lr_scale", 1.0)
 
 
+def test_issue_193_mark_session_loaded_persists_session_cache(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self._result = result
+
+        def remote(self, *args, **kwargs):
+            return self._result
+
+    group.workers = [type("W", (), {"mark_session_loaded": _RemoteMethod("ok")})()]
+    calls: list[tuple[str, object]] = []
+    group._session_manager = type(
+        "SessionMgr",
+        (),
+        {
+            "get_session_path": staticmethod(lambda session_id: f"/tmp/{session_id}"),
+            "save_metadata": staticmethod(
+                lambda session_id, step, lr, actual_rank: calls.append(
+                    ("meta", (session_id, step, lr, actual_rank))
+                )
+            ),
+        },
+    )()
+    group.save_adapter_state = lambda path: calls.append(("save", path))
+    group._current_session = None
+    group._step_count = 0
+    group.learning_rate = 0.0
+    group._actual_rank = None
+    group.lora_rank = 8
+
+    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: None)
+
+    out = group.mark_session_loaded("sess-mark", step_count=7, learning_rate=2e-4, actual_rank=4)
+
+    assert out == {"status": "ok", "session_id": "sess-mark"}
+    assert calls == [
+        ("save", "/tmp/sess-mark"),
+        ("meta", ("sess-mark", 7, 2e-4, 4)),
+    ]
+
+
 class _FakeInnerOptimizer:
     def __init__(self):
         self.state = {}

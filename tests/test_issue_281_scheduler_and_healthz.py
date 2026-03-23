@@ -239,7 +239,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     await tr.save_weights_for_sampler(req, _DummyRequest(user_id="owner-a"))
 
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "save_weights_for_sampler"
@@ -294,7 +294,7 @@ async def test_issue_281_reset_expert_bias_enqueues_scheduler_metadata(monkeypat
     assert out.status == "success"
     assert captured["op"] == "training.reset_expert_bias"
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "reset_expert_bias"
@@ -347,7 +347,7 @@ async def test_issue_281_delete_model_enqueues_scheduler_metadata(monkeypatch) -
     assert out == {"model_id": "run-281", "status": "deleted"}
     assert captured["op"] == "training.delete_model"
     assert captured["extra"]["scheduler_enabled"] is True
-    assert captured["extra"]["scheduler_domain"] == "megatron:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert captured["extra"]["scheduler_domain"] == "megatron:megatron_qwen3_30b_a3b_instruct_2507"
     assert captured["extra"]["scheduler_session_key"] == "run-281"
     assert captured["extra"]["execution_serial_key"] == "training_session:run-281"
     assert captured["extra"]["training_op"] == "delete_model"
