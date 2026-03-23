@@ -28,9 +28,11 @@ from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
 from ..auth_identity import is_admin_request, is_admin_user_data
 from ..backend.async_ray_control import (
+    _await_ray_ref,
     async_kill_named_actor,
-    async_pending_gpu_pg_observation,
+    async_lookup_actor_handle,
     async_placement_group_table,
+    is_actor_lookup_not_found,
 )
 from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..health_checks import public_healthz_response
@@ -884,16 +886,9 @@ def _remove_actor_pg(actor_name: str) -> None:
         pass
 
 
-def _kill_exact_vllm_actor(*, actor_name: str) -> int:
-    import ray
-
-    from ..backend import ray_kill
+async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
     from ..backend.multi_lora_engine import PERSISTENT_NAMESPACE
     from ..backend.resource_pool import ActorType, ResourcePoolStaleError, get_resource_pool
-    from ..ray_utils import init_ray
-
-    if not ray.is_initialized():
-        init_ray(namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     pool = get_resource_pool()
     entry = pool.get(actor_name)
@@ -902,18 +897,20 @@ def _kill_exact_vllm_actor(*, actor_name: str) -> int:
 
     namespace = entry.namespace if entry is not None else PERSISTENT_NAMESPACE
     try:
-        actor = ray.get_actor(actor_name, namespace=namespace)
-    except ValueError:
+        await async_lookup_actor_handle(actor_name, namespace)
+    except Exception as exc:
+        if not is_actor_lookup_not_found(exc):
+            raise
         pool.unregister(actor_name)
         _remove_actor_pg(actor_name)
         return 0
 
     try:
-        ray_kill.kill(
-            actor,
+        await async_kill_named_actor(
+            actor_name,
+            namespace,
+            base_model=entry.base_model if entry is not None else None,
             reason="vllm_kill_by_actor_name",
-            actor_name=actor_name,
-            namespace=namespace,
         )
     except ResourcePoolStaleError:
         raise
@@ -922,16 +919,9 @@ def _kill_exact_vllm_actor(*, actor_name: str) -> int:
     return 1
 
 
-def _kill_exact_megatron_actor(*, actor_name: str) -> int:
-    import ray
-
-    from ..backend import ray_kill
+async def _kill_exact_megatron_actor(*, actor_name: str) -> int:
     from ..backend.megatron_distributed import PERSISTENT_NAMESPACE
     from ..backend.resource_pool import ActorType, get_resource_pool
-    from ..ray_utils import init_ray
-
-    if not ray.is_initialized():
-        init_ray(namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     pool = get_resource_pool()
     entry = pool.get(actor_name)
@@ -940,23 +930,24 @@ def _kill_exact_megatron_actor(*, actor_name: str) -> int:
 
     namespace = entry.namespace if entry is not None else PERSISTENT_NAMESPACE
     try:
-        actor = ray.get_actor(actor_name, namespace=namespace)
-    except ValueError:
+        actor = await async_lookup_actor_handle(actor_name, namespace)
+    except Exception as exc:
+        if not is_actor_lookup_not_found(exc):
+            raise
         pool.unregister(actor_name)
         _remove_actor_pg(actor_name)
         return 0
 
     try:
         try:
-            ray.get(actor.shutdown.remote(), timeout=10)
+            await asyncio.wait_for(_await_ray_ref(actor.shutdown.remote()), timeout=10.0)
         except Exception:
             pass
-        ray_kill.kill(
-            actor,
+        await async_kill_named_actor(
+            actor_name,
+            namespace,
+            base_model=entry.base_model if entry is not None else None,
             reason="kill_megatron_actor_by_name",
-            actor_name=actor_name,
-            namespace=namespace,
-            no_restart=True,
             verify_absent=True,
         )
     finally:
@@ -965,7 +956,7 @@ def _kill_exact_megatron_actor(*, actor_name: str) -> int:
     return 1
 
 
-def _kill_exact_dense_actor(*, actor_name: str) -> int:
+async def _kill_exact_dense_actor(*, actor_name: str) -> int:
     from ..backend.resource_pool import ActorType, get_resource_pool
 
     pool = get_resource_pool()
@@ -976,24 +967,13 @@ def _kill_exact_dense_actor(*, actor_name: str) -> int:
         return 0
 
     try:
-        import ray
-
-        from ..backend import ray_kill
-        from ..config import RAY_NAMESPACE
-        from ..ray_utils import init_ray
-
-        if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
         try:
-            actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
-            ray_kill.kill(
-                actor,
-                reason="dense_kill_by_actor_name",
-                actor_name=entry.actor_name,
-                namespace=entry.namespace,
+            await async_lookup_actor_handle(entry.actor_name, entry.namespace)
+            await async_kill_named_actor(
+                entry.actor_name,
+                entry.namespace,
                 base_model=entry.base_model,
-                no_restart=True,
+                reason="dense_kill_by_actor_name",
             )
         except Exception:
             pass
@@ -1020,10 +1000,12 @@ async def _kill_dense_actors(base_model: str | None) -> int:
                 e.actor_name,
                 e.namespace,
                 base_model=e.base_model,
+                reason="dense_kill_by_api",
             )
         except Exception:
             pass
         pool.unregister(e.actor_name)
+        _remove_actor_pg(e.actor_name)
         killed += 1
     return killed
 
@@ -1046,13 +1028,13 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
             from ..backend.resource_pool import ResourcePoolStaleError
 
             try:
-                killed_by_type["vllm"] = _kill_exact_vllm_actor(actor_name=actor_name)
+                killed_by_type["vllm"] = await _kill_exact_vllm_actor(actor_name=actor_name)
             except ResourcePoolStaleError as e:
                 raise HTTPException(status_code=409, detail=str(e)) from e
         elif t == "megatron":
-            killed_by_type["megatron"] = _kill_exact_megatron_actor(actor_name=actor_name)
+            killed_by_type["megatron"] = await _kill_exact_megatron_actor(actor_name=actor_name)
         elif t == "dense":
-            killed_by_type["dense"] = _kill_exact_dense_actor(actor_name=actor_name)
+            killed_by_type["dense"] = await _kill_exact_dense_actor(actor_name=actor_name)
         else:
             raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
         return {

@@ -33,6 +33,12 @@ class _StubSessionManager:
 
 
 class _StubTrainingManager:
+    def __init__(self, *_args, **_kwargs):
+        return None
+
+    async def start_cleanup_task(self, _engine) -> None:
+        return None
+
     async def shutdown_all(self, _engine) -> None:
         return None
 

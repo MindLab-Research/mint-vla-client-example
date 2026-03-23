@@ -23,6 +23,17 @@ async def _await_ray_ref(ref: Any) -> Any:
     raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
+def is_actor_lookup_not_found(exc: Exception) -> bool:
+    candidate: Exception | None = exc
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            candidate = as_instanceof_cause()
+        except Exception:
+            candidate = exc
+    return isinstance(candidate, ValueError)
+
+
 def _ensure_ray_initialized() -> None:
     import ray
 
@@ -108,17 +119,24 @@ def _kill_named_actor_remote():
     import ray
 
     @ray.remote(num_cpus=0)
-    def _task(actor_name: str, namespace: str, base_model: str | None) -> bool:
+    def _task(
+        actor_name: str,
+        namespace: str,
+        base_model: str | None,
+        reason: str,
+        verify_absent: bool,
+    ) -> bool:
         from ..backend import ray_kill
 
         actor = ray.get_actor(actor_name, namespace=namespace)
         ray_kill.kill(
             actor,
-            reason="dense_kill_by_api",
+            reason=reason,
             actor_name=actor_name,
             namespace=namespace,
             base_model=base_model,
             no_restart=True,
+            verify_absent=verify_absent,
         )
         try:
             pg = ray.util.get_placement_group(f"{actor_name}_pg")
@@ -173,8 +191,16 @@ async def async_kill_named_actor(
     namespace: str,
     *,
     base_model: str | None,
+    reason: str = "kill_named_actor_by_api",
+    verify_absent: bool = False,
     timeout_s: float = 10.0,
 ) -> bool:
     _ensure_ray_initialized()
-    ref = _kill_named_actor_remote().remote(str(actor_name), str(namespace), base_model)
+    ref = _kill_named_actor_remote().remote(
+        str(actor_name),
+        str(namespace),
+        base_model,
+        str(reason),
+        bool(verify_absent),
+    )
     return bool(await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s)))

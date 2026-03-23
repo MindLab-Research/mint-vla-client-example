@@ -1055,8 +1055,16 @@ def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monke
     unregister_calls: list[str] = []
     kill_calls: list[tuple[str, str, str | None]] = []
 
-    async def _async_kill_named_actor(actor_name: str, namespace: str, *, base_model: str | None, timeout_s: float = 10.0):
-        _ = timeout_s
+    async def _async_kill_named_actor(
+        actor_name: str,
+        namespace: str,
+        *,
+        base_model: str | None,
+        reason: str,
+        timeout_s: float = 10.0,
+        verify_absent: bool = False,
+    ):
+        _ = (reason, timeout_s, verify_absent)
         kill_calls.append((actor_name, namespace, base_model))
         return True
 
@@ -1084,6 +1092,131 @@ def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monke
     assert killed == 1
     assert kill_calls == [("dense-a", "ns-dense", "Qwen/Qwen3-0.6B")]
     assert unregister_calls == ["dense-a"]
+
+
+def test_issue_360_kill_exact_vllm_actor_propagates_lookup_failures(monkeypatch):
+    unregister_calls: list[str] = []
+    removed_pgs: list[str] = []
+
+    pool = SimpleNamespace(
+        get=lambda actor_name: SimpleNamespace(
+            actor_type="vllm",
+            namespace="ns-vllm",
+            base_model="Qwen/Qwen3-0.6B",
+        ),
+        unregister=lambda actor_name: unregister_calls.append(actor_name),
+    )
+
+    async def _async_lookup_actor_handle(*_args, **_kwargs):
+        raise RuntimeError("ray unavailable")
+
+    import tinker_server.backend.resource_pool as rp
+
+    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(VLLM="vllm"))
+    monkeypatch.setattr(rp, "ResourcePoolStaleError", RuntimeError)
+    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    monkeypatch.setattr(service_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+    monkeypatch.setattr(service_route, "is_actor_lookup_not_found", lambda exc: False)
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
+
+    with pytest.raises(RuntimeError, match="ray unavailable"):
+        anyio.run(lambda: service_route._kill_exact_vllm_actor(actor_name="vllm-a"))
+
+    assert unregister_calls == []
+    assert removed_pgs == []
+
+
+def test_issue_360_kill_exact_megatron_actor_verifies_absence(monkeypatch):
+    unregister_calls: list[str] = []
+    removed_pgs: list[str] = []
+    kill_calls: list[dict] = []
+
+    class _ShutdownRemote:
+        def remote(self):
+            return _AwaitableObjectRef(result=None)
+
+    actor = SimpleNamespace(shutdown=_ShutdownRemote())
+    pool = SimpleNamespace(
+        get=lambda actor_name: SimpleNamespace(
+            actor_type="megatron",
+            namespace="ns-mega",
+            base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        ),
+        unregister=lambda actor_name: unregister_calls.append(actor_name),
+    )
+
+    async def _async_lookup_actor_handle(*_args, **_kwargs):
+        return actor
+
+    async def _async_kill_named_actor(actor_name: str, namespace: str, *, base_model: str | None, reason: str, verify_absent: bool, timeout_s: float = 10.0):
+        _ = timeout_s
+        kill_calls.append(
+            {
+                "actor_name": actor_name,
+                "namespace": namespace,
+                "base_model": base_model,
+                "reason": reason,
+                "verify_absent": verify_absent,
+            }
+        )
+        return True
+
+    import tinker_server.backend.resource_pool as rp
+
+    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(MEGATRON="megatron"))
+    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    monkeypatch.setattr(service_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+    monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
+
+    killed = anyio.run(lambda: service_route._kill_exact_megatron_actor(actor_name="mega-a"))
+
+    assert killed == 1
+    assert kill_calls == [
+        {
+            "actor_name": "mega-a",
+            "namespace": "ns-mega",
+            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "reason": "kill_megatron_actor_by_name",
+            "verify_absent": True,
+        }
+    ]
+    assert unregister_calls == ["mega-a"]
+    assert removed_pgs == ["mega-a"]
+
+
+def test_issue_360_kill_dense_actors_cleans_pg_when_async_kill_fails(monkeypatch):
+    unregister_calls: list[str] = []
+    removed_pgs: list[str] = []
+
+    async def _async_kill_named_actor(*_args, **_kwargs):
+        raise RuntimeError("kill failed")
+
+    pool = SimpleNamespace(
+        iter_entries=lambda: [
+            SimpleNamespace(
+                actor_type="dense",
+                actor_name="dense-fail",
+                namespace="ns-dense",
+                base_model="Qwen/Qwen3-0.6B",
+                actor_handle=None,
+            )
+        ],
+        unregister=lambda actor_name: unregister_calls.append(actor_name),
+    )
+
+    import tinker_server.backend.resource_pool as rp
+
+    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
+    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
+
+    killed = anyio.run(service_route._kill_dense_actors, "Qwen/Qwen3-0.6B")
+
+    assert killed == 1
+    assert unregister_calls == ["dense-fail"]
+    assert removed_pgs == ["dense-fail"]
 
 
 class _AwaitableObjectRef:

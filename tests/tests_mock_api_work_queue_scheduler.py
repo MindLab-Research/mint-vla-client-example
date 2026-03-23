@@ -73,6 +73,7 @@ def _materialize_runtime_env(root: Path) -> None:
 def _load_api_work_queue_module(monkeypatch):
     runtime_root = Path(tempfile.mkdtemp(prefix="mint-issue360-runtime-env-"))
     _materialize_runtime_env(runtime_root)
+    monkeypatch.setenv("RAY_ADDRESS", "auto")
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(runtime_root))
     monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker")
     monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf-modules")
@@ -454,10 +455,14 @@ def test_issue_324_reconcile_stale_running_requests_fails_pending_leased_request
             fail=lambda request_id, error: failed.append((request_id, error)),
         ),
     )
+
+    async def _async_release_all(request_id):
+        released.append(request_id)
+
     monkeypatch.setattr(
         capacity_manager_module,
         "capacity_manager",
-        types.SimpleNamespace(release_all=lambda request_id: released.append(request_id)),
+        types.SimpleNamespace(async_release_all=_async_release_all),
     )
 
     asyncio.run(client._reconcile_stale_running_requests("consumer-new"))

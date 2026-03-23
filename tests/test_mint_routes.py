@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -15,19 +14,19 @@ class _StubFutureStore:
         self.resolved: list[tuple[str, dict]] = []
         self.failed: list[tuple[str, str]] = []
 
-    def create_with_id(self, request_id: str) -> None:
+    async def async_create_with_id(self, request_id: str) -> None:
         self.created.append(request_id)
 
-    def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+    async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.queued.append((request_id, meta))
 
-    def cleanup(self, request_id: str) -> None:
+    async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
 
     def resolve(self, request_id: str, payload: dict) -> None:
         self.resolved.append((request_id, payload))
 
-    def fail(self, request_id: str, message: str) -> None:
+    async def async_fail(self, request_id: str, message: str) -> None:
         self.failed.append((request_id, message))
 
 
@@ -35,7 +34,7 @@ class _StubCapacityManager:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
+    async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
         self.calls.append(
             {
                 "request_id": request_id,
@@ -45,7 +44,7 @@ class _StubCapacityManager:
         )
         return {"ok": True}
 
-    def release_all(self, request_id: str) -> None:
+    async def async_release_all(self, request_id: str) -> None:
         return None
 
 

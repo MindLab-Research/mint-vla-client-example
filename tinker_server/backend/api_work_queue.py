@@ -1699,8 +1699,6 @@ class ApiWorkQueueClient:
         self._worker_tasks = [asyncio.create_task(self._worker_loop(i)) for i in range(n)]
 
     async def shutdown(self) -> None:
-        import ray
-
         self._running = False
         for t in self._worker_tasks:
             t.cancel()

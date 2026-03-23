@@ -739,7 +739,7 @@ async def _wait_internal_future_result(request_id: str) -> Any:
             raise RuntimeError(f"internal future reached unexpected terminal state={status.value} request_id={request_id}")
     finally:
         try:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         except Exception:
             pass
 
@@ -790,7 +790,7 @@ async def _enqueue_internal_serialized_model_op(
             training_manager.mark_inflight(model_id, -1)
         await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue {op} request: {e}") from e
     return request_id
 # =============================================================================

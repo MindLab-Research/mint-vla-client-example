@@ -798,6 +798,13 @@ async def asample(
                     raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
             elif created:
                 await future_store.async_cleanup(request_id)
+            detail = throttle_error.detail if isinstance(throttle_error.detail, dict) else {}
+            record_sampling_admission_metric(
+                route=_ASAMPLE_ROUTE,
+                decision="rejected",
+                reason="queue_throttled",
+                scope=detail.get("scope") if isinstance(detail, dict) else None,
+            )
             raise HTTPException(status_code=429, detail=throttle_error.detail) from e
         await capacity_manager.async_release_all(request_id)
         if created_pending:

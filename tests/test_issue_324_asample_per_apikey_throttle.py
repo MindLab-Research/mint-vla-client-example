@@ -130,7 +130,7 @@ def test_issue_324_compute_logprobs_records_capacity_rejection_metric(monkeypatc
     metric_calls: list[dict] = []
 
     class _RejectingCapacityManager:
-        def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+        async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": False, "queue_bytes": 123, "object_store_bytes": 456}
 

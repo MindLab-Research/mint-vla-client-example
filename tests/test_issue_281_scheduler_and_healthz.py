@@ -265,6 +265,16 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
         _ = (args, kwargs)
         return {"ok": True}
 
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "modules_reset": 3, "status": "success"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
     async def _async_create_with_id(_request_id):
         return None
 
@@ -331,6 +341,16 @@ async def test_issue_281_reset_expert_bias_enqueues_scheduler_metadata(monkeypat
 
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
+
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "modules_reset": 3, "status": "success"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
 
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
@@ -696,9 +716,9 @@ async def test_issue_281_restore_training_session_uses_persisted_last_activity(m
     manager = TrainingSessionManager()
     monkeypatch.setattr(tr, "training_manager", manager)
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(_workers={}, _resource_pool_actor_names={}))
-    monkeypatch.setattr(
-        "tinker_server.backend.training_session_store.async_get_training_session_info",
-        lambda _model_id: {
+
+    async def _async_get_training_session_info(_model_id):
+        return {
             "model_id": "run-restore",
             "session_id": "sess-restore",
             "model_seq_id": 0,
@@ -707,7 +727,11 @@ async def test_issue_281_restore_training_session_uses_persisted_last_activity(m
             "backend": "peft",
             "created_at": "2026-03-20T10:00:00",
             "last_activity": 1234.5,
-        },
+        }
+
+    monkeypatch.setattr(
+        "tinker_server.backend.training_session_store.async_get_training_session_info",
+        _async_get_training_session_info,
     )
 
     session = await tr._restore_training_session("run-restore")
@@ -740,7 +764,7 @@ async def test_issue_281_internal_wait_releases_capacity_and_cleans_future(monke
         SimpleNamespace(
             async_get_status=_async_get_status,
             async_get_result=_async_get_result,
-            cleanup=lambda request_id: cleaned.append(request_id),
+            async_cleanup=lambda request_id: cleaned.append(request_id),
         ),
     )
     monkeypatch.setattr(cm, "capacity_manager", SimpleNamespace(async_release_all=_async_release_all))
@@ -837,8 +861,16 @@ async def test_issue_281_kill_dense_actors_uses_named_actor_helper(monkeypatch) 
     killed: list[tuple[str, str, str | None]] = []
     unregistered: list[str] = []
 
-    async def _fake_kill(actor_name: str, namespace: str, *, base_model: str | None, timeout_s: float = 10.0):
-        _ = timeout_s
+    async def _fake_kill(
+        actor_name: str,
+        namespace: str,
+        *,
+        base_model: str | None,
+        reason: str,
+        timeout_s: float = 10.0,
+        verify_absent: bool = False,
+    ):
+        _ = (reason, timeout_s, verify_absent)
         killed.append((actor_name, namespace, base_model))
         return True
 

@@ -585,9 +585,11 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
             "TINKER_CONFIG_PATH": str(cfg),
         },
     )
     data = json.loads(out.stdout)
+    assert data["RAY_ADDRESS"] == "ray://cfg-test"
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
     assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
