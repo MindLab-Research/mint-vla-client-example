@@ -32,6 +32,73 @@ def get_user_role_from_user_data(user_data: dict | None) -> str | None:
     return None
 
 
+def get_apikey_id(request: Request) -> str | None:
+    user_data = get_user_data(request)
+    if user_data:
+        apikey_id = user_data.get("apikey_id") or user_data.get("key_id")
+        if apikey_id is not None:
+            value = str(apikey_id).strip()
+            if value:
+                return value
+    return None
+
+
+def get_account_id(request: Request) -> str | None:
+    user_data = get_user_data(request)
+    if user_data:
+        account_id = user_data.get("account_id")
+        if account_id is not None:
+            value = str(account_id).strip()
+            if value:
+                return value
+    return None
+
+
+def get_gateway_request_id(request: Request) -> str | None:
+    user_data = get_user_data(request)
+    if user_data:
+        request_id = user_data.get("request_id")
+        if request_id is not None:
+            value = str(request_id).strip()
+            if value:
+                return value
+    return None
+
+
+def get_gateway_session_id(request: Request) -> str | None:
+    user_data = get_user_data(request)
+    if user_data:
+        session_id = user_data.get("session_id")
+        if session_id is not None:
+            value = str(session_id).strip()
+            if value:
+                return value
+    return None
+
+
+def get_request_observability_context(request: Request) -> dict[str, str]:
+    out: dict[str, str] = {}
+    user_id = get_user_id(request)
+    if user_id:
+        out["user_id"] = user_id
+    user_role = get_user_role_from_user_data(get_user_data(request))
+    if user_role:
+        out["user_role"] = user_role
+    account_id = get_account_id(request)
+    if account_id:
+        out["account_id"] = account_id
+    apikey_id = get_apikey_id(request)
+    if apikey_id:
+        out["apikey_id"] = apikey_id
+    gateway_request_id = get_gateway_request_id(request)
+    if gateway_request_id:
+        out["gateway_request_id"] = gateway_request_id
+    gateway_session_id = get_gateway_session_id(request)
+    if gateway_session_id:
+        out["gateway_session_id"] = gateway_session_id
+    return out
+
+
 def is_admin_user_data(user_data: dict | None) -> bool:
     role = get_user_role_from_user_data(user_data)
     return role == "admin"

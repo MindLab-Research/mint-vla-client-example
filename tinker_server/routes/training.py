@@ -19,8 +19,11 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -40,7 +43,7 @@ from ..logging_context import (
     set_request_id,
 )
 
-from ..backend.future_store import future_store
+from ..backend.future_store import FutureStatus, future_store
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
     begin_async_checkpoint_mirror,
@@ -108,6 +111,15 @@ def _get_user_id(request: Request) -> str | None:
 
 def _build_training_usage_label(*, model: str, route: str) -> str:
     return f"model={model},route={route},dimension=train"
+
+
+def _training_heartbeat_stale_timeout_s() -> float:
+    raw = os.environ.get("MINT_TRAINING_HEARTBEAT_STALE_S", "300")
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        logger.warning("Invalid MINT_TRAINING_HEARTBEAT_STALE_S=%r; defaulting to 300s", raw)
+        return 300.0
 
 
 async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
@@ -266,6 +278,185 @@ def _session_info_from_live(session) -> dict:
     }
 
 
+async def _best_effort_delete_training_session(
+    model_id: str,
+    *,
+    reason: str,
+    allow_actor_shutdown: bool,
+) -> bool:
+    if training_engine is None or training_manager is None:
+        return False
+
+    try:
+        failed_request_ids = future_store.fail_training_requests_for_model(
+            model_id,
+            f"Training session terminated due to {reason}",
+        )
+        if failed_request_ids:
+            logger.warning(
+                "[%s] failed pending training futures during stale cleanup (%s): request_ids=%s",
+                model_id,
+                reason,
+                failed_request_ids,
+            )
+    except Exception as e:
+        logger.warning(
+            "[%s] stale training cleanup aborted because pending future fail failed (%s): %s: %s",
+            model_id,
+            reason,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+    session = training_manager.get_session(model_id)
+    restored = False
+    if session is None:
+        session = _restore_training_session(model_id)
+        restored = session is not None
+
+    shutdown_attempted = False
+    if session is not None:
+        if allow_actor_shutdown:
+            try:
+                shutdown_attempted = True
+                await training_engine.shutdown_session(session)
+            except Exception as e:
+                logger.warning(
+                    "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
+                    model_id,
+                    reason,
+                    type(e).__name__,
+                    e,
+                )
+        else:
+            logger.warning(
+                "[%s] skipping actor shutdown during stale training cleanup (%s); "
+                "restored=%s allow_actor_shutdown=%s",
+                model_id,
+                reason,
+                restored,
+                allow_actor_shutdown,
+            )
+            worker = getattr(training_engine, "_workers", {}).get(model_id)
+            delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+            if delete_session is not None:
+                try:
+                    import ray
+
+                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
+                        model_id,
+                        reason,
+                        type(e).__name__,
+                        e,
+                    )
+            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
+            getattr(training_engine, "_workers", {}).pop(model_id, None)
+            session.is_active = False
+
+    try:
+        training_manager.delete_session(model_id)
+    except Exception:
+        pass
+
+    try:
+        from ..backend.training_session_store import delete_training_session
+
+        delete_training_session(model_id)
+    except Exception as e:
+        logger.warning(
+            "[%s] best-effort stale training cleanup store delete failed (%s): %s: %s",
+            model_id,
+            reason,
+            type(e).__name__,
+            e,
+        )
+
+    try:
+        from ..backend.resource_pool import get_resource_pool
+
+        get_resource_pool().clear_session(model_id)
+    except Exception:
+        pass
+
+    return session is not None or shutdown_attempted
+
+
+async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = None) -> list[str]:
+    if stale_after_s is None:
+        stale_after_s = _training_heartbeat_stale_timeout_s()
+    if stale_after_s <= 0:
+        return []
+    if training_engine is None or training_manager is None:
+        return []
+
+    from ..backend.session_heartbeat_store import session_heartbeat_store
+
+    try:
+        from ..backend.training_session_store import list_training_sessions
+
+        infos = list_training_sessions()
+    except Exception as e:
+        logger.warning(
+            "stale training cleanup skipped: failed to list detached training sessions: %s: %s",
+            type(e).__name__,
+            e,
+        )
+        return []
+
+    cleaned: list[str] = []
+    actor_refcounts: dict[str, int] = {}
+    for info in infos:
+        if not isinstance(info, dict):
+            continue
+        actor_name = str(info.get("actor_name") or "").strip()
+        if actor_name:
+            actor_refcounts[actor_name] = actor_refcounts.get(actor_name, 0) + 1
+
+    for info in infos:
+        if not isinstance(info, dict):
+            continue
+        model_id = str(info.get("model_id") or "").strip()
+        session_id = str(info.get("session_id") or "").strip()
+        actor_name = str(info.get("actor_name") or "").strip()
+        if not model_id or not session_id:
+            continue
+        if not session_heartbeat_store.is_stale(session_id, float(stale_after_s)):
+            continue
+        try:
+            allow_actor_shutdown = bool(actor_name) and actor_refcounts.get(actor_name, 0) <= 1
+            deleted = await _best_effort_delete_training_session(
+                model_id,
+                reason=f"stale heartbeat (> {float(stale_after_s):.1f}s)",
+                allow_actor_shutdown=allow_actor_shutdown,
+            )
+            if not deleted:
+                continue
+            cleaned.append(model_id)
+            logger.warning(
+                "[%s] auto-terminated stale training session: session_id=%s stale_after_s=%.1f "
+                "allow_actor_shutdown=%s actor_name=%s actor_refcount=%s",
+                model_id,
+                session_id,
+                float(stale_after_s),
+                allow_actor_shutdown,
+                actor_name or "<unknown>",
+                actor_refcounts.get(actor_name, 0) if actor_name else 0,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] stale training cleanup failed for session_id=%s: %s: %s",
+                model_id,
+                session_id,
+                type(e).__name__,
+                e,
+            )
+    return cleaned
+
+
 def _training_run_from_info(info: dict) -> TrainingRun:
     lora_cfg = info.get("lora_config")
     lora_rank = None
@@ -308,6 +499,17 @@ def _compute_token_stats(data: list[Datum]) -> tuple[int, int]:
         if seq_len > max_seq_len:
             max_seq_len = seq_len
     return total_tokens, max_seq_len
+
+
+def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
+    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
+    match = re.search(hf_cache_pattern, base_model)
+    if match:
+        _org, model = match.groups()
+        model_name = model.lower().replace("-", "_").replace(".", "_")
+    else:
+        model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    return f"megatron_{model_name}"
 
 def _get_max_model_len(base_model: str | None) -> int:
     """Return the configured max_model_len for a supported model name.
@@ -384,7 +586,7 @@ def _build_training_scheduler_extra(
     training_op: str,
     seq_id: int | None = None,
 ) -> dict[str, Any]:
-    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+    enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -393,13 +595,19 @@ def _build_training_scheduler_extra(
     )
     backend = str(getattr(session, "backend", "") or "unknown")
     base_model = str(getattr(session, "base_model", "") or "")
-    domain_key = base_model if base_model else str(model_id)
+    if backend == "megatron" and base_model:
+        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
+    else:
+        domain_key = base_model if base_model else str(model_id)
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
         "scheduler_domain": f"{backend}:{domain_key}",
         # Scheduler session key is model_id (server-side training session identity),
         # not the user-provided create_model session_id string.
         "scheduler_session_key": str(model_id),
+        # Always serialize model-bound training ops by server-side training session identity,
+        # regardless of whether the scheduler feature flag is enabled.
+        "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
     }
     if seq_id is not None:
@@ -409,7 +617,129 @@ def _build_training_scheduler_extra(
             extra["seq_id"] = None
     return extra
 
+def _build_create_scheduler_extra(
+    *,
+    base_model: str,
+    model_id: str,
+    training_op: str,
+) -> dict[str, Any]:
+    from ..backend.model_registry import get_model_config
 
+    if bool(get_model_config(base_model).is_moe):
+        backend = "megatron"
+        domain_key = _normalize_megatron_scheduler_domain_key(base_model)
+    else:
+        backend = "peft"
+        domain_key = base_model
+    return {
+        "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower()
+        in ("1", "true", "yes", "y", "on"),
+        "scheduler_domain": f"{backend}:{domain_key}",
+        "scheduler_session_key": str(model_id),
+        "execution_serial_key": f"training_session:{model_id}",
+        "training_op": str(training_op),
+    }
+
+
+def _sync_route_wait_timeout_s() -> float:
+    try:
+        return max(1.0, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_TIMEOUT_S", "3600")).strip()))
+    except Exception:
+        return 3600.0
+
+
+def _sync_route_wait_poll_interval_s() -> float:
+    try:
+        return max(0.01, float(str(os.environ.get("MINT_SYNC_ROUTE_WAIT_POLL_INTERVAL_S", "0.2")).strip()))
+    except Exception:
+        return 0.2
+
+
+async def _wait_internal_future_result(request_id: str) -> Any:
+    deadline = time.perf_counter() + _sync_route_wait_timeout_s()
+    poll_interval_s = _sync_route_wait_poll_interval_s()
+    try:
+        while True:
+            status = await run_in_threadpool(future_store.get_status, request_id)
+            if status == FutureStatus.PENDING:
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for internal future request_id={request_id}")
+                await asyncio.sleep(poll_interval_s)
+                continue
+            if status == FutureStatus.DONE:
+                try:
+                    from ..backend.capacity_manager import capacity_manager
+
+                    await run_in_threadpool(capacity_manager.release_all, request_id)
+                except Exception:
+                    pass
+                return await run_in_threadpool(future_store.get_result, request_id)
+            if status == FutureStatus.FAILED:
+                err = await run_in_threadpool(future_store.get_error, request_id)
+                try:
+                    from ..backend.capacity_manager import capacity_manager
+
+                    await run_in_threadpool(capacity_manager.release_all, request_id)
+                except Exception:
+                    pass
+                raise RuntimeError(str(err or f"internal queued op failed request_id={request_id}"))
+            try:
+                from ..backend.capacity_manager import capacity_manager
+
+                await run_in_threadpool(capacity_manager.release_all, request_id)
+            except Exception:
+                pass
+            raise RuntimeError(f"internal future reached unexpected terminal state={status.value} request_id={request_id}")
+    finally:
+        try:
+            await run_in_threadpool(future_store.cleanup, request_id)
+        except Exception:
+            pass
+
+
+async def _enqueue_internal_serialized_model_op(
+    *,
+    model_id: str,
+    op: str,
+    request_json: bytes,
+    extra: dict[str, Any],
+    user_id: str | None = None,
+) -> str:
+    from ..backend.api_work_queue import api_work_queue
+    from ..backend.capacity_manager import capacity_manager
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    request_id = uuid.uuid4().hex
+    reserve = capacity_manager.try_reserve(
+        request_id,
+        queue_bytes=len(request_json),
+        object_store_bytes=estimate_small_result_bytes(),
+    )
+    if not bool(reserve.get("ok")):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
+        )
+
+    created = False
+    try:
+        future_store.create_with_id(request_id)
+        created = True
+        future_store.mark_queued(request_id, meta={"op": op, "model_id": model_id})
+        await api_work_queue.enqueue(
+            request_id=request_id,
+            op=op,
+            request_json=request_json,
+            user_id=user_id,
+            webhook_url=None,
+            extra=dict(extra),
+        )
+    except Exception as e:
+        capacity_manager.release_all(request_id)
+        if created:
+            future_store.cleanup(request_id)
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue {op} request: {e}") from e
+    return request_id
 # =============================================================================
 # create_model - async
 # =============================================================================
@@ -501,6 +831,11 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
+    scheduler_extra = _build_create_scheduler_extra(
+        base_model=request.base_model,
+        model_id=model_id,
+        training_op="create_model",
+    )
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
@@ -524,7 +859,7 @@ async def create_model(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "training.create_model"})
+        future_store.mark_queued(request_id, meta={"op": "training.create_model", "model_id": model_id})
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -537,6 +872,7 @@ async def create_model(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
+                extra=scheduler_extra,
             ),
         )
         if webhook_url and user_id:
@@ -588,6 +924,7 @@ async def _do_create_model(
     """Background task to create training model."""
     model_id = _generate_model_id(request.session_id, request.model_seq_id)
     inflight_marked = False
+    session_created = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
@@ -596,8 +933,9 @@ async def _do_create_model(
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
         if existing is not None:
-            # Clean up stale session and retry
-            logger.warning(f"[{model_id}] Cleaning up stale session from previous attempt")
+            if bool(getattr(existing, "is_active", False)):
+                raise RuntimeError(f"Model '{model_id}' already exists")
+            logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
             await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
@@ -614,6 +952,7 @@ async def _do_create_model(
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
+        session_created = True
 
         # Mark inflight immediately so the idle cleanup loop does not evict
         # the session during the potentially slow actor creation below.
@@ -651,6 +990,7 @@ async def _do_create_model(
                 else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
+                "current_step": session.current_step,
                 "backend": session.backend,
                 "actor_name": actor_name,
                 "namespace": RAY_NAMESPACE,
@@ -703,7 +1043,7 @@ async def _do_create_model(
             "check_training_session_and_actor",
         )
         # Clean up session if it was created
-        if training_manager and training_manager.get_session(model_id):
+        if session_created and training_manager and training_manager.get_session(model_id):
             training_manager.delete_session(model_id)
         # If session tracking was updated in ResourcePool during a partially-failed
         # create_training_session, clear it to avoid pinning actors as non-idle.
@@ -897,6 +1237,11 @@ async def create_model_from_state(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    scheduler_extra = _build_create_scheduler_extra(
+        base_model=request.base_model,
+        model_id=model_id,
+        training_op="create_model_from_state",
+    )
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -912,7 +1257,10 @@ async def create_model_from_state(
     try:
         future_store.create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "training.create_model_from_state"})
+        future_store.mark_queued(
+            request_id,
+            meta={"op": "training.create_model_from_state", "model_id": model_id},
+        )
         await _enqueue_training_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -925,6 +1273,7 @@ async def create_model_from_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
+                extra=scheduler_extra,
             ),
         )
     except Exception as e:
@@ -942,13 +1291,13 @@ async def _do_create_model_from_state(
     request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
+    model_id = _generate_model_id(request.session_id, request.model_seq_id)
     inflight_marked = False
+    session_created = False
     try:
         set_request_id(request_id)
         if training_engine is None or training_manager is None:
             raise RuntimeError("Training engine not initialized")
-
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
         # Queue-time validation hands the background worker a concrete local path.
         load_path = request.state_path
@@ -956,7 +1305,9 @@ async def _do_create_model_from_state(
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
         if existing is not None:
-            logger.warning(f"[{model_id}] Cleaning up stale session from previous attempt")
+            if bool(getattr(existing, "is_active", False)):
+                raise RuntimeError(f"Model '{model_id}' already exists")
+            logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
             await training_engine.shutdown_session(existing)
             training_manager.delete_session(model_id)
 
@@ -973,6 +1324,7 @@ async def _do_create_model_from_state(
             user_metadata=request.user_metadata,
             user_id=user_id,
         )
+        session_created = True
 
         # Mark inflight immediately (same rationale as _do_create_model).
         training_manager.mark_inflight(model_id, +1)
@@ -1017,6 +1369,7 @@ async def _do_create_model_from_state(
                 else None,
                 "user_metadata": request.user_metadata or {},
                 "learning_rate": session.learning_rate,
+                "current_step": session.current_step,
                 "backend": session.backend,
                 "actor_name": actor_name,
                 "namespace": RAY_NAMESPACE,
@@ -1061,8 +1414,7 @@ async def _do_create_model_from_state(
             "check_checkpoint_path_and_training_actor",
         )
         # Clean up session if it was created
-        model_id = _generate_model_id(request.session_id, request.model_seq_id)
-        if training_manager and training_manager.get_session(model_id):
+        if session_created and training_manager and training_manager.get_session(model_id):
             try:
                 session = training_manager.get_session(model_id)
                 if session:
@@ -1703,7 +2055,13 @@ async def _do_forward(
 
         training_manager.mark_inflight(request.model_id, +1)
         inflight_marked = True
-        token_count, _ = _compute_token_stats(request.forward_input.data)
+        batch = request.forward_input.data
+        token_count, max_seq_len = _compute_token_stats(batch)
+        t0 = time.time()
+        logger.info(
+            f"[{session.model_id}] forward start: "
+            f"backend={session.backend} batch={len(batch)} tokens={token_count} max_len={max_seq_len}"
+        )
         result = await run_async_with_otel_span(
             "training.forward.execute",
             lambda: training_engine.forward(session, request),
@@ -1714,11 +2072,14 @@ async def _do_forward(
                 "model_id": str(request.model_id),
                 "base_model": str(session.base_model),
                 "backend": str(session.backend),
-                "batch_size": int(len(request.forward_input.data)),
+                "batch_size": int(len(batch)),
                 "token_count": int(token_count),
+                "max_seq_len": int(max_seq_len),
                 "seq_id": int(request.seq_id) if request.seq_id is not None else None,
             },
         )
+        elapsed_s = time.time() - t0
+        logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
         if gateway_auth:
             auth_ctx = GatewayAuthContext(**gateway_auth)
             await _persist_usage_events(
@@ -1923,7 +2284,7 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
                 "base_model": str(session.base_model),
                 "backend": str(session.backend),
                 "learning_rate": float(lr) if lr is not None else None,
-                "seq_id": int(request.seq_id),
+                "seq_id": int(request.seq_id) if request.seq_id is not None else None,
             },
         )
         elapsed_s = time.time() - t0
@@ -2010,15 +2371,62 @@ async def reset_expert_bias(
         )
 
     try:
-        result = await training_engine.reset_expert_bias(session)
-        return ResetExpertBiasResponse(
+        request_id = await _enqueue_internal_serialized_model_op(
             model_id=request.model_id,
-            modules_reset=result.get("modules_reset", 0),
-            status="success" if result.get("modules_reset", 0) > 0 else "not_applicable",
+            op="training.reset_expert_bias",
+            request_json=request.model_dump_json().encode("utf-8"),
+            extra=_build_training_scheduler_extra(
+                session=session,
+                model_id=request.model_id,
+                training_op="reset_expert_bias",
+            ),
+            user_id=_get_user_id(http_request),
         )
+        payload = await _wait_internal_future_result(request_id)
+        return ResetExpertBiasResponse.model_validate(payload)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"[reset_expert_bias] Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _do_reset_expert_bias(
+    request_id: str,
+    request: ResetExpertBiasRequest,
+) -> None:
+    try:
+        set_request_id(request_id)
+        if training_engine is None or training_manager is None:
+            raise RuntimeError("Training engine not initialized")
+
+        session = training_manager.get_session(request.model_id)
+        if session is None:
+            session = _restore_training_session(request.model_id)
+        if session is None:
+            raise RuntimeError(f"Model '{request.model_id}' not found")
+
+        result = await training_engine.reset_expert_bias(session)
+        modules_reset = int(result.get("modules_reset", 0) or 0)
+        future_store.resolve(
+            request_id,
+            ResetExpertBiasResponse(
+                model_id=request.model_id,
+                modules_reset=modules_reset,
+                status="success" if modules_reset > 0 else "not_applicable",
+            ).model_dump(),
+        )
+    except Exception as e:
+        logger.exception(
+            "[training.reset_expert_bias] failed request_id=%s model_id=%s error_type=%s error=%s",
+            str(request_id),
+            str(request.model_id),
+            type(e).__name__,
+            e,
+        )
+        future_store.fail(request_id, str(e))
 
 
 # =============================================================================
@@ -2694,24 +3102,62 @@ async def delete_model(model_id: str):
             status_code=404, detail=f"Model '{model_id}' not found"
         )
 
-    await training_engine.shutdown_session(session)
-    training_manager.delete_session(model_id)
+    request_id = await _enqueue_internal_serialized_model_op(
+        model_id=model_id,
+        op="training.delete_model",
+        request_json=json.dumps({"model_id": model_id}).encode("utf-8"),
+        extra=_build_training_scheduler_extra(
+            session=session,
+            model_id=model_id,
+            training_op="delete_model",
+        ),
+        user_id=session.user_id,
+    )
     try:
-        from ..backend.training_session_store import delete_training_session
+        return await _wait_internal_future_result(request_id)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[training.delete_model] Failed model_id=%s error=%s", str(model_id), e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
-        delete_training_session(model_id)
-    except Exception:
-        pass
-    # Clear ResourcePool session tracking even if shutdown_session couldn't find a worker
-    # (e.g., deletion races with create_training_session still in-flight).
+
+async def _do_delete_model(request_id: str, model_id: str) -> None:
     try:
-        from ..backend.resource_pool import get_resource_pool
+        set_request_id(request_id)
+        if training_engine is None or training_manager is None:
+            raise RuntimeError("Training engine not initialized")
 
-        get_resource_pool().clear_session(model_id)
-    except Exception:
-        pass
+        session = training_manager.get_session(model_id)
+        if session is not None:
+            await training_engine.shutdown_session(session)
+            training_manager.delete_session(model_id)
 
-    return {"model_id": model_id, "status": "deleted"}
+        try:
+            from ..backend.training_session_store import delete_training_session
+
+            delete_training_session(model_id)
+        except Exception:
+            pass
+        try:
+            from ..backend.resource_pool import get_resource_pool
+
+            get_resource_pool().clear_session(model_id)
+        except Exception:
+            pass
+
+        future_store.resolve(request_id, {"model_id": model_id, "status": "deleted"})
+    except Exception as e:
+        logger.exception(
+            "[training.delete_model] failed request_id=%s model_id=%s error_type=%s error=%s",
+            str(request_id),
+            str(model_id),
+            type(e).__name__,
+            e,
+        )
+        future_store.fail(request_id, str(e))
 
 
 @router.get("/models/{model_id}/tokenizer")

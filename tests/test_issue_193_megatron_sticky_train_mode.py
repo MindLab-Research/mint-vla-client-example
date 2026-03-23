@@ -33,6 +33,7 @@ class _FakeEngine:
     def __init__(self, state: dict):
         self._state = state
         self.optimizer = None  # Needed by optim_step debug code
+        self.lr_scheduler = _FakeLRScheduler()
 
     def train_mode(self):
         return _FakeTrainMode(self._state)
@@ -47,6 +48,106 @@ class _FakeEngine:
 
     def lr_scheduler_step(self):
         return 1e-4
+
+    def _build_lr_scheduler(self):
+        return _FakeLRScheduler()
+
+
+class _FakeLRScheduler:
+    def __init__(self):
+        self.last_epoch = 0
+        self.lr_scale = 1.0
+
+    def state_dict(self):
+        return {
+            "last_epoch": self.last_epoch,
+            "lr_scale": self.lr_scale,
+        }
+
+    def load_state_dict(self, state):
+        self.last_epoch = state.get("last_epoch", 0)
+        self.lr_scale = state.get("lr_scale", 1.0)
+
+
+def test_issue_193_mark_session_loaded_persists_session_cache(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self._result = result
+
+        def remote(self, *args, **kwargs):
+            return self._result
+
+    group.workers = [type("W", (), {"mark_session_loaded": _RemoteMethod("ok")})()]
+    calls: list[tuple[str, object]] = []
+    group._session_manager = type(
+        "SessionMgr",
+        (),
+        {
+            "get_session_path": staticmethod(lambda session_id: f"/tmp/{session_id}"),
+            "save_metadata": staticmethod(
+                lambda session_id, step, lr, actual_rank: calls.append(
+                    ("meta", (session_id, step, lr, actual_rank))
+                )
+            ),
+        },
+    )()
+    group.save_adapter_state = lambda path: calls.append(("save", path))
+    group._current_session = None
+    group._step_count = 0
+    group.learning_rate = 0.0
+    group._actual_rank = None
+    group.lora_rank = 8
+
+    monkeypatch.setattr(sys.modules[MegatronWorkerGroup.__module__].ray, "get", lambda refs: None)
+
+    out = group.mark_session_loaded("sess-mark", step_count=7, learning_rate=2e-4, actual_rank=4)
+
+    assert out == {"status": "ok", "session_id": "sess-mark"}
+    assert calls == [
+        ("save", "/tmp/sess-mark"),
+        ("meta", ("sess-mark", 7, 2e-4, 4)),
+    ]
+
+
+class _FakeInnerOptimizer:
+    def __init__(self):
+        self.state = {}
+        self.param_groups = [{"params": [], "lr": 1.0}]
+        self.load_calls = 0
+
+    def state_dict(self):
+        return {
+            "state": {"param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}},
+            "param_groups": [{"params": [0], "lr": self.param_groups[0]["lr"]}],
+        }
+
+    def load_state_dict(self, state_dict):
+        self.load_calls += 1
+        self.state = state_dict["state"]
+        self.param_groups = state_dict["param_groups"]
+
+
+class _FakeMegatronOptimizerWrapper:
+    def __init__(self):
+        self.optimizer = _FakeInnerOptimizer()
+        self.wrapper_counter = 0
+        self.grad_scaler = {"scale": 1.0}
+        self.load_calls = 0
+
+    def state_dict(self):
+        return {
+            "optimizer": {"param_groups": [{"lr": self.optimizer.param_groups[0]["lr"]}]},
+            "grad_scaler": {"scale": self.grad_scaler["scale"]},
+            "wrapper_counter": self.wrapper_counter,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.load_calls += 1
+        self.wrapper_counter = state_dict["wrapper_counter"]
+        self.grad_scaler = state_dict["grad_scaler"]
 
 
 def _make_worker(
@@ -488,6 +589,164 @@ def test_issue_193_swap_session_does_not_restore_sentinel(monkeypatch):
 
     # Verify sentinel was NOT passed to _restore_gradients
     assert not restore_called["received_sentinel"]
+
+
+def test_issue_193_swap_session_restores_lr_scheduler_state(monkeypatch):
+    worker, _ = _make_worker(monkeypatch)
+
+    worker._capture_gradients = lambda: []  # type: ignore[method-assign]
+    worker._restore_gradients = lambda grads: None  # type: ignore[method-assign]
+    worker._capture_optimizer_state = lambda: {}  # type: ignore[method-assign]
+    worker._restore_optimizer_state = lambda state: None  # type: ignore[method-assign]
+    worker._reset_optimizer_state = lambda: worker._reset_lr_scheduler()  # type: ignore[method-assign]
+    worker.engine.optimizer_zero_grad = lambda: None  # type: ignore[method-assign]
+
+    worker._current_session_id = "s1"
+    worker.engine.lr_scheduler.last_epoch = 7
+    worker.engine.lr_scheduler.lr_scale = 0.25
+
+    worker.swap_session_state("s2")
+
+    assert worker._session_lr_scheduler_states["s1"] == {
+        "last_epoch": 7,
+        "lr_scale": 0.25,
+    }
+    assert worker.engine.lr_scheduler.last_epoch == 0
+    assert worker.engine.lr_scheduler.lr_scale == 1.0
+
+    worker.engine.lr_scheduler.last_epoch = 3
+    worker.engine.lr_scheduler.lr_scale = 0.75
+
+    worker.swap_session_state("s1")
+
+    assert worker.engine.lr_scheduler.last_epoch == 7
+    assert worker.engine.lr_scheduler.lr_scale == 0.25
+
+
+def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
+    worker, _ = _make_worker(monkeypatch)
+    worker.engine.optimizer = _FakeMegatronOptimizerWrapper()
+
+    worker.engine.optimizer.wrapper_counter = 11
+    worker.engine.optimizer.grad_scaler["scale"] = 7.5
+    worker.engine.optimizer.optimizer.param_groups[0]["lr"] = 0.123
+
+    snapshot = worker._capture_optimizer_state()
+
+    worker.engine.optimizer.wrapper_counter = 99
+    worker.engine.optimizer.grad_scaler["scale"] = 42.0
+    worker.engine.optimizer.optimizer.state = {"corrupted": True}
+    worker.engine.optimizer.optimizer.param_groups = [{"params": [123], "lr": 9.9}]
+
+    worker._restore_optimizer_state(snapshot)
+
+    assert worker.engine.optimizer.load_calls == 1
+    assert worker.engine.optimizer.optimizer.load_calls == 1
+    assert worker.engine.optimizer.wrapper_counter == 11
+    assert worker.engine.optimizer.grad_scaler == {"scale": 7.5}
+    assert worker.engine.optimizer.optimizer.state == {
+        "param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}
+    }
+    assert worker.engine.optimizer.optimizer.param_groups == [{"params": [0], "lr": 0.123}]
+
+
+def test_issue_193_clear_session_state_clears_lr_scheduler_cache(monkeypatch):
+    worker, _ = _make_worker(monkeypatch)
+
+    worker._session_lr_scheduler_states["s1"] = {"last_epoch": 9}
+
+    worker.clear_session_state("s1")
+
+    assert "s1" not in worker._session_lr_scheduler_states
+
+
+def test_issue_193_save_adapter_state_persists_expert_bias(tmp_path, monkeypatch):
+    import types
+
+    import torch
+
+    worker, _ = _make_worker(monkeypatch)
+
+    class _Router(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.tensor([1.5, -0.5], dtype=torch.float32))
+
+    class _Chunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router = _Router()
+
+    chunk = _Chunk()
+    worker.engine.module = [chunk]
+
+    fake_peft = types.ModuleType("verl.utils.megatron_peft_utils")
+    fake_peft.get_adapter_state_dict = lambda module: {"adapter.weight": torch.tensor([3.0])}  # type: ignore[attr-defined]
+    fake_peft._get_rank_checkpoint_path = lambda checkpoint_path: str(tmp_path / "mp_rank_00")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", fake_peft)
+
+    worker.save_adapter_state(str(tmp_path))
+
+    payload = torch.load(tmp_path / "mp_rank_00_adapter.pt", map_location="cpu")
+    assert payload["expert_bias_state_dict"]["router"].tolist() == [1.5, -0.5]
+
+
+def test_issue_193_load_adapter_state_restores_expert_bias(tmp_path, monkeypatch):
+    import types
+
+    import torch
+
+    worker, _ = _make_worker(monkeypatch)
+
+    class _Router(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.tensor([9.0, 9.0], dtype=torch.float32))
+
+    class _Chunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router = _Router()
+
+    chunk = _Chunk()
+    worker.engine.module = [chunk]
+    worker._freeze_non_lora_params = lambda *_a, **_kw: None  # type: ignore[method-assign]
+    worker._zero_disabled_lora_params = lambda *_a, **_kw: None  # type: ignore[method-assign]
+
+    class _FakeOptimizer:
+        def __init__(self):
+            self.reload_calls = 0
+
+        def reload_model_params(self, state_dict=None):
+            self.reload_calls += 1
+
+    worker.engine.optimizer = _FakeOptimizer()
+
+    adapter_file = tmp_path / "mp_rank_00_adapter.pt"
+    torch.save(
+        {
+            "adapter_state_dict": {"adapter.weight": torch.tensor([3.0])},
+            "expert_bias_state_dict": {"router": torch.tensor([2.0, -1.0], dtype=torch.float32)},
+        },
+        adapter_file,
+    )
+
+    fake_peft = types.ModuleType("verl.utils.megatron_peft_utils")
+    fake_peft._get_rank_checkpoint_path = lambda checkpoint_path: str(tmp_path / "mp_rank_00")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", fake_peft)
+
+    fake_utils = types.ModuleType("verl.utils.megatron_utils")
+    fake_utils.unwrap_model = lambda model: model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_utils", fake_utils)
+
+    fake_lora_utils = types.ModuleType("tinker_server.backend.lora_utils")
+    fake_lora_utils.pad_lora_state_dict = lambda state, *_args, **_kwargs: state  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tinker_server.backend.lora_utils", fake_lora_utils)
+
+    worker.load_adapter_state(str(tmp_path))
+
+    assert chunk.router.expert_bias.tolist() == [2.0, -1.0]
+    assert worker.engine.optimizer.reload_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1424,6 +1683,67 @@ def _make_group_with_current_session(current_session: str | None = "s1"):
     group._current_session = current_session
     group._session_unknown_due_to_partial_swap = False
     return group
+
+
+def test_issue_193_existing_session_switch_does_not_reset_expert_bias(monkeypatch):
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "old-session"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 7
+    group.learning_rate = 1e-4
+    group._actual_rank = 8
+    group.lora_rank = 8
+    group._bind_traceparent = lambda _traceparent: None
+    group._swap_session_on_workers = lambda _sid: None
+    group._get_lora_weight_norm = lambda: 0.0
+    group._get_lora_weight_checksum = lambda: {}
+    group._get_base_weight_checksum = lambda: {}
+    group._get_buffer_checksum = lambda: {}
+    group._get_optimizer_param_counts = lambda: {}
+
+    calls = {"load": 0, "reset": 0, "reinit": 0}
+
+    class _SessionManager:
+        def get_session_path(self, session_id):
+            return f"/tmp/{session_id}"
+
+        def save_metadata(self, *args, **kwargs):
+            return None
+
+        def session_exists(self, session_id):
+            return session_id == "existing-session"
+
+        def get_metadata(self, session_id):
+            if session_id == "existing-session":
+                return {"step": 11, "lr": 3e-4, "actual_rank": 6}
+            return None
+
+    group._session_manager = _SessionManager()
+    group.save_adapter_state = lambda *args, **kwargs: {"status": "ok"}
+
+    def fake_load(*args, **kwargs):
+        calls["load"] += 1
+        return {"status": "ok"}
+
+    def fake_reset(*args, **kwargs):
+        calls["reset"] += 1
+        return {"reset_count": 1}
+
+    def fake_reinit(*args, **kwargs):
+        calls["reinit"] += 1
+        return {"status": "ok"}
+
+    group.load_adapter_state = fake_load
+    group.reset_expert_bias = fake_reset
+    group.reinit_lora_weights = fake_reinit
+
+    group._ensure_session_loaded("existing-session")
+
+    assert calls == {"load": 1, "reset": 0, "reinit": 0}
+    assert group._step_count == 11
+    assert group.learning_rate == pytest.approx(3e-4)
+    assert group._actual_rank == 6
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,11 @@ def _get_webhook_url(request: Request) -> str | None:
         return user_data.get("webhook_url")
     return None
 
+def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -> dict:
+    payload = {} if extra is None else dict(extra)
+    payload["execution_serial_key"] = f"training_session:{model_id}"
+    return payload
+
 
 async def _enqueue_weights_request_with_trace(
     *,
@@ -507,7 +512,10 @@ async def save_weights(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=_build_execution_serial_extra(
+                    model_id=request.model_id,
+                    extra={"prefer_tinker": bool(prefer_tinker)},
+                ),
             ),
         )
     except Exception as e:
@@ -625,7 +633,10 @@ async def save_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=webhook_url,
-                extra={"prefer_tinker": bool(prefer_tinker)},
+                extra=_build_execution_serial_extra(
+                    model_id=request.model_id,
+                    extra={"prefer_tinker": bool(prefer_tinker)},
+                ),
             ),
         )
     except Exception as e:
@@ -1141,6 +1152,7 @@ async def load_state(
                 request_json=request_json,
                 user_id=user_id,
                 webhook_url=None,
+                extra=_build_execution_serial_extra(model_id=request.model_id),
             ),
         )
     except Exception as e:
