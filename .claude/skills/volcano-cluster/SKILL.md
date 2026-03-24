@@ -219,8 +219,12 @@ PY
 
 1. **Submit head:**
    ```bash
-   ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /vePFS-Mindverse/share/code/tinker-server/.claude/skills/volcano-cluster/configs/mint-dev-head.yaml --output json'
+   tmp=/tmp/mint-dev-head.yaml
+   cp .claude/skills/volcano-cluster/configs/mint-dev-head.yaml "$tmp"
+   ssh mint-dev 'cat > /tmp/mint-dev-head.yaml' < "$tmp"
+   ssh mint-dev 'export PATH=/root/.volc/bin:$PATH; /root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-head.yaml --output json'
    ```
+   Do not assume the shared PFS copy of the template is current. Submit the checked-in local template you are actually reviewing.
 
 2. **Get head IP from logs:**
    ```bash
@@ -240,14 +244,20 @@ PY
    ssh mint-dev '/root/.volc/bin/volc ml_task submit -c /tmp/mint-dev-worker.yaml --output json'
    ```
 
-5. **DO NOT run `ray start` on `mint-dev`:**
-   - `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
-   - Use `ray.init(address=...)` in Python or Ray CLI commands that connect to the head without starting a local node.
+5. **Join `mint-dev` as a zero-resource Ray driver node before any `ray.init(...)` or API-server startup:**
+   - After a fresh dev-cluster rebuild, direct `ray.init(address=...)` from `mint-dev` can fail with local `node_ip_address.json` / missing-local-raylet errors.
+   - The working pattern is to attach `mint-dev` to the rebuilt head with **zero CPUs and zero GPUs**, so it is not a schedulable compute node.
+   - Do **not** use `hostname -I | awk '{print $1}'` for the API-host IP. Derive the source IP from the route to the head.
 
    ```bash
-   ssh mint-dev "ray status --address='<RAY_HEAD_IP>:6379'"
-   ssh mint-dev "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
+   ssh mint-dev "python3 - <<'PY'\nimport socket\ns=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.connect(('<RAY_HEAD_IP>', 6379))\nprint(s.getsockname()[0])\ns.close()\nPY"
+   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray stop --force || true"
+   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray start --address='<RAY_HEAD_IP>:6379' --num-cpus=0 --num-gpus=0 --disable-usage-stats"
+   ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
    ```
+   For API-host server startup after this attach, also export:
+   - `MINT_RAY_NODE_IP_ADDRESS=<route-derived API IP>`
+   - `MINT_RAY_TEMP_DIR=/tmp/<fresh-ray-temp-dir>`
 
 ### Production Cluster
 
