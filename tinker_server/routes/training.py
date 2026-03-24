@@ -313,6 +313,9 @@ def _build_training_scheduler_extra(
     )
     backend = str(getattr(session, "backend", "") or "unknown")
     base_model = str(getattr(session, "base_model", "") or "")
+    openpi_train_step = training_op == "train_step" and backend in {"openpi_fast", "openpi_pi05"}
+    if openpi_train_step:
+        enabled = True
     domain_key = base_model if base_model else str(model_id)
     extra: dict[str, Any] = {
         "scheduler_enabled": bool(enabled),
@@ -322,6 +325,9 @@ def _build_training_scheduler_extra(
         "scheduler_session_key": str(model_id),
         "training_op": str(training_op),
     }
+    if openpi_train_step:
+        extra["scheduler_fairness"] = "rr"
+        extra["scheduler_max_consecutive"] = 1
     if seq_id is not None:
         try:
             extra["seq_id"] = int(seq_id)

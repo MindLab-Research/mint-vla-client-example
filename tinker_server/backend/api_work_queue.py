@@ -145,6 +145,26 @@ def _get_or_create_ray_actor():
                 return False, "", ""
             return True, domain, session_id
 
+        def _scheduler_domain_policy(self, item: dict[str, Any]) -> tuple[str | None, int | None]:
+            extra = item.get("extra")
+            if not isinstance(extra, dict):
+                return None, None
+            fairness_raw = extra.get("scheduler_fairness")
+            fairness: str | None = None
+            if fairness_raw is not None:
+                fairness = str(fairness_raw).strip().lower()
+                if fairness not in ("oldest", "rr"):
+                    raise ValueError(f"invalid scheduler_fairness override: {fairness_raw!r}")
+            max_consecutive_raw = extra.get("scheduler_max_consecutive")
+            max_consecutive: int | None = None
+            if max_consecutive_raw is not None:
+                max_consecutive = int(max_consecutive_raw)
+                if max_consecutive < 1:
+                    raise ValueError(
+                        f"scheduler_max_consecutive override must be >= 1, got {max_consecutive_raw!r}"
+                    )
+            return fairness, max_consecutive
+
         def _get_domain_state(self, domain: str) -> dict[str, Any]:
             from collections import deque
 
@@ -158,6 +178,8 @@ def _get_or_create_ray_actor():
                 "current_session": None,
                 "last_session": None,
                 "consecutive_count": 0,
+                "scheduler_fairness_override": None,
+                "scheduler_max_consecutive_override": None,
                 "stats": {
                     "picks": 0,
                     "switches": 0,
@@ -219,6 +241,25 @@ def _get_or_create_ray_actor():
             from collections import deque
 
             state = self._get_domain_state(domain)
+            fairness, max_consecutive = self._scheduler_domain_policy(item)
+            current_fairness = state.get("scheduler_fairness_override")
+            if fairness is not None:
+                if current_fairness is None:
+                    state["scheduler_fairness_override"] = fairness
+                elif current_fairness != fairness:
+                    raise RuntimeError(
+                        "scheduler fairness override conflict: "
+                        f"domain={domain!r} existing={current_fairness!r} incoming={fairness!r}"
+                    )
+            current_max_consecutive = state.get("scheduler_max_consecutive_override")
+            if max_consecutive is not None:
+                if current_max_consecutive is None:
+                    state["scheduler_max_consecutive_override"] = max_consecutive
+                elif int(current_max_consecutive) != int(max_consecutive):
+                    raise RuntimeError(
+                        "scheduler max_consecutive override conflict: "
+                        f"domain={domain!r} existing={current_max_consecutive!r} incoming={max_consecutive!r}"
+                    )
             queues_by_session = state["queues_by_session"]
             q = queues_by_session.get(session_id)
             if q is None:
@@ -287,6 +328,11 @@ def _get_or_create_ray_actor():
             if not rr_order:
                 return None
 
+            fairness = str(state.get("scheduler_fairness_override") or self._scheduler_fairness)
+            max_consecutive = int(
+                state.get("scheduler_max_consecutive_override") or self._scheduler_max_consecutive
+            )
+
             if self._scheduler_starvation_s > 0:
                 chosen_starved_sid: str | None = None
                 max_wait = self._scheduler_starvation_s
@@ -306,12 +352,12 @@ def _get_or_create_ray_actor():
                 isinstance(current, str)
                 and current
                 and queues_by_session.get(current)
-                and int(state.get("consecutive_count", 0)) < int(self._scheduler_max_consecutive)
+                and int(state.get("consecutive_count", 0)) < int(max_consecutive)
             ):
                 return current, "sticky"
 
             avoid = current if isinstance(current, str) and current and len(rr_order) > 1 else None
-            if self._scheduler_fairness == "oldest":
+            if fairness == "oldest":
                 sid = self._pick_oldest_session(state, now=now, avoid=avoid)
                 reason = "fairness_oldest"
             else:
@@ -406,6 +452,12 @@ def _get_or_create_ray_actor():
                 domains[str(domain)] = {
                     "current_session": state.get("current_session"),
                     "consecutive_count": int(state.get("consecutive_count", 0)),
+                    "scheduler_fairness": str(
+                        state.get("scheduler_fairness_override") or self._scheduler_fairness
+                    ),
+                    "scheduler_max_consecutive": int(
+                        state.get("scheduler_max_consecutive_override") or self._scheduler_max_consecutive
+                    ),
                     "queue_depths": queue_depths,
                     "ready_rr": [str(x) for x in list(state.get("ready_rr", []))],
                     "stats": {

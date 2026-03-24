@@ -57,6 +57,8 @@ def _item(
     domain: str,
     session_key: str | None = None,
     legacy_session_id: str | None = None,
+    scheduler_fairness: str | None = None,
+    scheduler_max_consecutive: int | None = None,
     created_at: float = 0.0,
 ) -> dict:
     extra = {
@@ -67,6 +69,10 @@ def _item(
         extra["scheduler_session_key"] = session_key
     if legacy_session_id is not None:
         extra["session_id"] = legacy_session_id
+    if scheduler_fairness is not None:
+        extra["scheduler_fairness"] = scheduler_fairness
+    if scheduler_max_consecutive is not None:
+        extra["scheduler_max_consecutive"] = scheduler_max_consecutive
     return {
         "request_id": request_id,
         "op": "training.forward_backward",
@@ -164,3 +170,55 @@ def test_mock_scheduler_accepts_new_and_legacy_session_key_fields(monkeypatch):
     sessions = {_session_key_from_item(x) for x in out}
 
     assert sessions == {"new-key-A", "legacy-key-B"}
+
+
+def test_mock_scheduler_honors_domain_policy_overrides(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_STARVATION_S", "1000000000000")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    t0 = 10000000000.0
+    items = [
+        _item(
+            "r1",
+            domain="openpi",
+            session_key="A",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 1.0,
+        ),
+        _item(
+            "r2",
+            domain="openpi",
+            session_key="B",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 2.0,
+        ),
+        _item(
+            "r3",
+            domain="openpi",
+            session_key="A",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 3.0,
+        ),
+        _item(
+            "r4",
+            domain="openpi",
+            session_key="B",
+            scheduler_fairness="rr",
+            scheduler_max_consecutive=1,
+            created_at=t0 + 4.0,
+        ),
+    ]
+    asyncio.run(_enqueue_many(actor, items))
+    out = asyncio.run(_dequeue_many(actor, 4))
+    sessions = [_session_key_from_item(x) for x in out]
+
+    assert sessions == ["A", "B", "A", "B"]
