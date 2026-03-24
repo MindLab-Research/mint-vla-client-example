@@ -5504,8 +5504,6 @@ class MegatronWorkerGroup:
 
     Creates placement group, spawns workers, routes API calls.
     This is the Tinker API surface for MoE training.
-
-    This is a Ray actor (num_gpus=0) to match MegatronTrainingWorker interface.
     """
 
     def __init__(
