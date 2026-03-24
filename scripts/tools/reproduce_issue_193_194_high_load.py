@@ -364,7 +364,7 @@ def _background_worker(
             _delete_model(base_url=base_url, headers=headers, model_id=model_id, timeout_s=timeout_s)
 
 
-def _detect_ordering_inversions(records: list[CompletionRecord]) -> list[str]:
+def _detect_ordering_inversions(records: list[CompletionRecord], *, min_inversion_gap_s: float) -> list[str]:
     by_step: dict[int, dict[str, CompletionRecord]] = {}
     for rec in records:
         by_step.setdefault(rec.seq_id, {})[rec.op] = rec
@@ -375,17 +375,29 @@ def _detect_ordering_inversions(records: list[CompletionRecord]) -> list[str]:
         fb = ops.get("forward_backward")
         opt = ops.get("optim_step")
         save = ops.get("save_weights_for_sampler")
-        if fb is not None and opt is not None and opt.completed_at_s < fb.completed_at_s:
+        if (
+            fb is not None
+            and opt is not None
+            and (fb.completed_at_s - opt.completed_at_s) > float(min_inversion_gap_s)
+        ):
             findings.append(
                 f"seq={seq_id}: optim_step completed before forward_backward "
                 f"(opt={opt.completed_at_s:.3f}, fb={fb.completed_at_s:.3f})"
             )
-        if opt is not None and save is not None and save.completed_at_s < opt.completed_at_s:
+        if (
+            opt is not None
+            and save is not None
+            and (opt.completed_at_s - save.completed_at_s) > float(min_inversion_gap_s)
+        ):
             findings.append(
                 f"seq={seq_id}: save_weights_for_sampler completed before optim_step "
                 f"(save={save.completed_at_s:.3f}, opt={opt.completed_at_s:.3f})"
             )
-        if fb is not None and save is not None and save.completed_at_s < fb.completed_at_s:
+        if (
+            fb is not None
+            and save is not None
+            and (fb.completed_at_s - save.completed_at_s) > float(min_inversion_gap_s)
+        ):
             findings.append(
                 f"seq={seq_id}: save_weights_for_sampler completed before forward_backward "
                 f"(save={save.completed_at_s:.3f}, fb={fb.completed_at_s:.3f})"
@@ -434,6 +446,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dispatch-gap-s", type=float, default=float(os.environ.get("TINKER_DISPATCH_GAP_S", "0.0")))
     parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("TINKER_TIMEOUT_S", "3600")))
     parser.add_argument("--poll-interval-s", type=float, default=float(os.environ.get("TINKER_POLL_INTERVAL_S", "2.0")))
+    parser.add_argument(
+        "--ordering-tolerance-s",
+        type=float,
+        default=float(os.environ.get("TINKER_ORDERING_TOLERANCE_S", "2.0")),
+    )
     parser.add_argument("--baseline-window", type=int, default=int(os.environ.get("TINKER_BASELINE_WINDOW", "3")))
     parser.add_argument("--loss-spike-factor", type=float, default=float(os.environ.get("TINKER_LOSS_SPIKE_FACTOR", "3.0")))
     parser.add_argument("--loss-spike-abs", type=float, default=float(os.environ.get("TINKER_LOSS_SPIKE_ABS", "0.5")))
@@ -602,7 +619,10 @@ def main() -> int:
             _delete_model(base_url=base_url, headers=headers, model_id=target_model_id, timeout_s=float(args.timeout_s))
 
     completions_sorted = sorted(completions, key=lambda rec: rec.completed_at_s)
-    ordering_findings = _detect_ordering_inversions(completions_sorted)
+    ordering_findings = _detect_ordering_inversions(
+        completions_sorted,
+        min_inversion_gap_s=float(args.ordering_tolerance_s),
+    )
     spike_findings = _detect_loss_spikes(
         completions_sorted,
         baseline_window=int(args.baseline_window),

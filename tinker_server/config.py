@@ -181,6 +181,8 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
     for key in (
         "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
         "TINKER_ACTOR_LD_LIBRARY_PATH",
+        "MINT_SFT_DIAG_FAIL",
+        "MINT_REVERSE_KL_DIAG_FAIL",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:

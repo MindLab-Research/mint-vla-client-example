@@ -1464,7 +1464,7 @@ class MultiModelInferenceManager:
                                     "Cached multi-node vLLM engine for %s has no live named actor, recreating",
                                     model_name,
                                 )
-                                del self._engines[model_name]
+                                self._engines.pop(model_name, None)
                             else:
                                 logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
                                 return engine
@@ -1485,7 +1485,7 @@ class MultiModelInferenceManager:
                         logger.warning(
                             f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
                         )
-                        del self._engines[model_name]
+                        self._engines.pop(model_name, None)
                     except ray.exceptions.GetTimeoutError:
                         # Actor tasks can queue behind long-running generations/logprobs.
                         # A short timeout here is not evidence of death.
@@ -1498,10 +1498,10 @@ class MultiModelInferenceManager:
                         logger.warning(
                             f"Cached vLLM engine for {model_name} has dead actor, recreating"
                         )
-                        del self._engines[model_name]
+                        self._engines.pop(model_name, None)
                 else:
                     # Engine has no actor handle, remove stale entry
-                    del self._engines[model_name]
+                    self._engines.pop(model_name, None)
 
             # Get model config for parallelism settings
             from tinker_server.backend.model_registry import get_model_config

@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -33,8 +34,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from huggingface_hub import snapshot_download
 import requests
+import tinker
+import torch
+import torch.nn.functional as F
 from dotenv import load_dotenv
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 DEFAULT_MODELS = ["Qwen/Qwen3-4B-Instruct-2507"]
 DEFAULT_LOSS_FNS = ["cross_entropy", "ppo", "importance_sampling"]
@@ -93,6 +99,11 @@ def _headers(args: argparse.Namespace) -> dict[str, str]:
     if api_key:
         return {"X-API-Key": api_key}
     return {}
+
+
+def _sdk_api_key(headers: dict[str, str]) -> str:
+    api_key = headers.get("X-API-Key") or "dummy"
+    return api_key if api_key.startswith("tml-") else f"tml-{api_key}"
 
 
 def _get(url: str, headers: dict[str, str], timeout_s: float = 10.0) -> dict[str, Any]:
@@ -169,12 +180,80 @@ def _model_input(tokens: list[int]) -> dict[str, Any]:
     return {
         "chunks": [
             {
-                "encoded_text": {
-                    "tokens": tokens,
-                    "type": "tokens",
-                }
+                "type": "encoded_text",
+                "tokens": tokens,
             }
         ]
+    }
+
+
+def _load_tokenizer(model: str) -> Any:
+    try:
+        return AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    except ValueError as e:
+        if "Tokenizer class TokenizersBackend does not exist" not in str(e):
+            raise
+
+    snapshot_dir = Path(
+        snapshot_download(
+            model,
+            allow_patterns=["tokenizer.json", "tokenizer_config.json"],
+            local_files_only=False,
+        )
+    )
+    tokenizer_json = snapshot_dir / "tokenizer.json"
+    tokenizer_config = snapshot_dir / "tokenizer_config.json"
+    if not tokenizer_json.exists() or not tokenizer_config.exists():
+        raise ValueError(
+            f"{model}: expected tokenizer.json and tokenizer_config.json for TokenizersBackend loader"
+        )
+
+    config = json.loads(tokenizer_config.read_text())
+    if config.get("backend") != "tokenizers" or config.get("tokenizer_class") != "TokenizersBackend":
+        raise ValueError(f"{model}: unsupported tokenizer config for TokenizersBackend loader")
+
+    model_max_length = config.get("model_max_length")
+    return PreTrainedTokenizerFast(
+        tokenizer_file=str(tokenizer_json),
+        eos_token=config.get("eos_token"),
+        pad_token=config.get("pad_token") or config.get("eos_token"),
+        model_max_length=int(model_max_length) if model_max_length is not None else None,
+        padding_side=str(config.get("padding_side") or "right"),
+        clean_up_tokenization_spaces=bool(config.get("clean_up_tokenization_spaces", False)),
+        additional_special_tokens=list(config.get("extra_special_tokens") or []),
+    )
+
+
+def _hhh_parse_conversation(text: str) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    parts = re.split(r"(Human:|Assistant:)", text)
+    if parts and not parts[0].strip():
+        parts = parts[1:]
+    for i in range(0, len(parts), 2):
+        if i + 1 >= len(parts):
+            continue
+        delimiter = parts[i].strip()
+        content = parts[i + 1].strip()
+        if delimiter == "Human:":
+            messages.append({"role": "user", "content": content})
+        elif delimiter == "Assistant:":
+            messages.append({"role": "assistant", "content": content})
+    return messages
+
+
+def _hhh_example_to_dpo_row(example: dict[str, Any]) -> dict[str, Any] | None:
+    chosen = _hhh_parse_conversation(example["chosen"])
+    rejected = _hhh_parse_conversation(example["rejected"])
+    if len(chosen) != len(rejected):
+        return None
+    match = [a == b for a, b in zip(chosen, rejected, strict=True)]
+    if match != [True] * (len(match) - 1) + [False]:
+        return None
+    return {
+        "prompt_conversation": chosen[:-1],
+        "completion_A": [chosen[-1]],
+        "completion_B": [rejected[-1]],
+        "label": "A",
     }
 
 
@@ -423,17 +502,40 @@ def make_rl_data(
     return data, rewards
 
 
+def _make_dpo_datum(
+    input_tokens: list[int],
+    target_tokens: list[int],
+    weights: list[float],
+) -> tinker.types.Datum:
+    return tinker.types.Datum(
+        model_input=tinker.types.ModelInput.from_ints(input_tokens),
+        loss_fn_inputs={
+            "target_tokens": tinker.types.TensorData(
+                data=list(target_tokens),
+                shape=[len(target_tokens)],
+                dtype="int64",
+            ),
+            "weights": tinker.types.TensorData(
+                data=list(weights),
+                shape=[len(weights)],
+                dtype="float32",
+            ),
+        },
+    )
+
+
 def make_dpo_data(
     tokenizer: Any,
     dpo_dataset: Any,
     seed: int,
     batch_idx: int,
     batch_size: int = DPO_BATCH_SIZE,
-) -> list[dict]:
-    """Generate DPO training data from preference pairs."""
+) -> tuple[list[tinker.types.Datum], list[tinker.types.ModelInput]]:
+    """Generate DPO training data and full sequences for the custom-loss path."""
     random.seed(seed)
 
-    data: list[dict[str, Any]] = []
+    data: list[tinker.types.Datum] = []
+    full_sequences: list[tinker.types.ModelInput] = []
     batch_start = batch_idx * batch_size
     batch_end = min(batch_start + batch_size, len(dpo_dataset))
 
@@ -506,26 +608,38 @@ def make_dpo_data(
         rejected_target = rejected_tokens[1:]
         rejected_target_weights = rejected_weights[1:]
 
-        data.append(
-            {
-                "model_input": _model_input(chosen_input),
-                "loss_fn_inputs": {
-                    "target_tokens": _tensor(chosen_target, "int64"),
-                    "weights": _tensor(chosen_target_weights, "float32"),
-                },
-            }
-        )
-        data.append(
-            {
-                "model_input": _model_input(rejected_input),
-                "loss_fn_inputs": {
-                    "target_tokens": _tensor(rejected_target, "int64"),
-                    "weights": _tensor(rejected_target_weights, "float32"),
-                },
-            }
-        )
+        data.append(_make_dpo_datum(chosen_input, chosen_target, chosen_target_weights))
+        data.append(_make_dpo_datum(rejected_input, rejected_target, rejected_target_weights))
+        full_sequences.append(tinker.types.ModelInput.from_ints(chosen_tokens))
+        full_sequences.append(tinker.types.ModelInput.from_ints(rejected_tokens))
 
-    return data
+    return data, full_sequences
+
+
+def compute_dpo_loss(
+    chosen_logprobs: list[torch.Tensor],
+    rejected_logprobs: list[torch.Tensor],
+    chosen_ref_logprobs: list[torch.Tensor],
+    rejected_ref_logprobs: list[torch.Tensor],
+    dpo_beta: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    chosen_log_ratio = torch.stack(
+        [lp - rlp for lp, rlp in zip(chosen_logprobs, chosen_ref_logprobs, strict=True)]
+    )
+    rejected_log_ratio = torch.stack(
+        [lp - rlp for lp, rlp in zip(rejected_logprobs, rejected_ref_logprobs, strict=True)]
+    )
+    losses = -F.logsigmoid(dpo_beta * (chosen_log_ratio - rejected_log_ratio))
+    loss = losses.mean()
+    chosen_rewards = dpo_beta * chosen_log_ratio
+    rejected_rewards = dpo_beta * rejected_log_ratio
+    return loss, {
+        "dpo_loss": float(loss.item()),
+        "accuracy": float((chosen_log_ratio > rejected_log_ratio).float().mean().item()),
+        "margin": float((chosen_rewards - rejected_rewards).mean().item()),
+        "chosen_reward": float(chosen_rewards.mean().item()),
+        "rejected_reward": float(rejected_rewards.mean().item()),
+    }
 
 
 def _save_checkpoint(
@@ -543,8 +657,27 @@ def _save_checkpoint(
     if error:
         data["error"] = error
 
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(v) for v in value]
+        if hasattr(value, "model_dump"):
+            return _json_safe(value.model_dump())
+        if hasattr(value, "data") and hasattr(value, "shape") and hasattr(value, "dtype"):
+            return {
+                "data": _json_safe(value.data),
+                "shape": _json_safe(value.shape),
+                "dtype": str(value.dtype),
+            }
+        return repr(value)
+
     with open(output_file, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(_json_safe(data), f, indent=2)
 
 
 def run_training(
@@ -594,23 +727,40 @@ def run_training(
         else:
             learning_rate = RL_LEARNING_RATE
 
-        session_id = f"verify_matrix_{seed}_{int(time.time())}"
-        create_payload = {
-            "session_id": session_id,
-            "model_seq_id": 1,
-            "base_model": model,
-            "lora_config": {"rank": LORA_RANK},
-            "learning_rate": learning_rate,
-        }
+        training_client = None
+        reference_client = None
 
-        print(f"[{_ts()}] Creating session (lr={learning_rate})...", flush=True)
-        resp = _post(f"{base_url}/api/v1/create_model", headers, create_payload, timeout_s=300.0)
-        result = _poll_future(base_url, headers, resp["request_id"], timeout_s=300.0)
+        if loss_fn == "dpo":
+            print(f"[{_ts()}] Creating DPO training client (lr={learning_rate})...", flush=True)
+            service_client = tinker.ServiceClient(
+                base_url=base_url,
+                api_key=_sdk_api_key(headers),
+            )
+            training_client = service_client.create_lora_training_client(
+                base_model=model,
+                rank=LORA_RANK,
+            )
+            reference_client = training_client.save_weights_and_get_sampling_client("reference")
+            model_id = str(training_client.model_id)
+        else:
+            session_id = f"verify_matrix_{seed}_{int(time.time())}"
+            create_payload = {
+                "session_id": session_id,
+                "model_seq_id": 1,
+                "base_model": model,
+                "lora_config": {"rank": LORA_RANK},
+                "learning_rate": learning_rate,
+            }
 
-        if "error" in result:
-            raise RuntimeError(f"Session creation failed: {result['error']}")
+            print(f"[{_ts()}] Creating session (lr={learning_rate})...", flush=True)
+            resp = _post(f"{base_url}/api/v1/create_model", headers, create_payload, timeout_s=300.0)
+            result = _poll_future(base_url, headers, resp["request_id"], timeout_s=300.0)
 
-        model_id = result["model_id"]
+            if "error" in result:
+                raise RuntimeError(f"Session creation failed: {result['error']}")
+
+            model_id = result["model_id"]
+
         print(f"[{_ts()}] Session created: model_id={model_id}", flush=True)
 
         if loss_fn in ("ppo", "importance_sampling"):
@@ -630,7 +780,9 @@ def run_training(
             elif loss_fn == "dpo":
                 if dpo_dataset is None:
                     raise ValueError("dpo_dataset is required for dpo loss")
-                data = make_dpo_data(tokenizer, dpo_dataset, seed, step)
+                if training_client is None or reference_client is None:
+                    raise RuntimeError("DPO path requires initialized training/reference clients")
+                data, full_sequences = make_dpo_data(tokenizer, dpo_dataset, seed, step)
             else:
                 if rl_dataset is None:
                     raise ValueError("rl_dataset is required for RL loss functions")
@@ -645,41 +797,103 @@ def run_training(
                     loss_fn,
                 )
 
-            fb_payload: dict[str, Any] = {
-                "model_id": model_id,
-                "forward_backward_input": {
-                    "data": data,
-                    "loss_fn": loss_fn,
-                },
-            }
-            if loss_fn in ("ppo", "importance_sampling"):
-                fb_payload["forward_backward_input"]["loss_fn_config"] = {"clip_ratio": 0.2}
-            elif loss_fn == "dpo":
-                fb_payload["forward_backward_input"]["loss_fn_config"] = {"beta": DPO_BETA}
+            if loss_fn == "dpo":
+                all_ref_logprob_seqs = [
+                    torch.tensor(reference_client.compute_logprobs(seq).result()[1:])
+                    for seq in full_sequences
+                ]
+                chosen_data = [datum for idx, datum in enumerate(data) if idx % 2 == 0]
+                rejected_data = [datum for idx, datum in enumerate(data) if idx % 2 == 1]
+                chosen_ref_logprob_seqs = [all_ref_logprob_seqs[idx] for idx in range(0, len(data), 2)]
+                rejected_ref_logprob_seqs = [all_ref_logprob_seqs[idx] for idx in range(1, len(data), 2)]
 
-            print(f"[{_ts()}] Step {step + 1}/{steps}: forward_backward...", flush=True)
-            resp = _post(f"{base_url}/api/v1/forward_backward", headers, fb_payload, timeout_s=120.0)
-            fb_result = _poll_future(base_url, headers, resp["request_id"], timeout_s=300.0)
+                def dpo_loss_fn(
+                    batch: list[tinker.types.Datum], logprobs_list: list[torch.Tensor]
+                ) -> tuple[torch.Tensor, dict[str, float]]:
+                    chosen_logprob_seqs = [logprobs_list[idx] for idx in range(0, len(batch), 2)]
+                    rejected_logprob_seqs = [logprobs_list[idx] for idx in range(1, len(batch), 2)]
+                    chosen_logprobs: list[torch.Tensor] = []
+                    rejected_logprobs: list[torch.Tensor] = []
+                    chosen_ref_logprobs: list[torch.Tensor] = []
+                    rejected_ref_logprobs: list[torch.Tensor] = []
 
-            if "error" in fb_result:
-                raise RuntimeError(f"forward_backward failed: {fb_result['error']}")
+                    for idx in range(len(chosen_data)):
+                        chosen_weights = torch.tensor(chosen_data[idx].loss_fn_inputs["weights"].data)
+                        chosen_logprobs.append(
+                            torch.dot(chosen_logprob_seqs[idx].float(), chosen_weights.float())
+                        )
+                        chosen_ref_logprobs.append(
+                            torch.dot(chosen_ref_logprob_seqs[idx].float(), chosen_weights.float())
+                        )
 
-            optim_payload = {
-                "model_id": model_id,
-                "adam_params": {
-                    "learning_rate": learning_rate,
-                    "beta1": ADAM_BETA1,
-                    "beta2": ADAM_BETA2,
-                    "eps": ADAM_EPS,
-                },
-            }
+                        rejected_weights = torch.tensor(rejected_data[idx].loss_fn_inputs["weights"].data)
+                        rejected_logprobs.append(
+                            torch.dot(rejected_logprob_seqs[idx].float(), rejected_weights.float())
+                        )
+                        rejected_ref_logprobs.append(
+                            torch.dot(rejected_ref_logprob_seqs[idx].float(), rejected_weights.float())
+                        )
 
-            print(f"[{_ts()}] Step {step + 1}/{steps}: optim_step...", flush=True)
-            resp = _post(f"{base_url}/api/v1/optim_step", headers, optim_payload, timeout_s=60.0)
-            optim_result = _poll_future(base_url, headers, resp["request_id"], timeout_s=60.0)
+                    return compute_dpo_loss(
+                        chosen_logprobs=chosen_logprobs,
+                        rejected_logprobs=rejected_logprobs,
+                        chosen_ref_logprobs=chosen_ref_logprobs,
+                        rejected_ref_logprobs=rejected_ref_logprobs,
+                        dpo_beta=DPO_BETA,
+                    )
 
-            if "error" in optim_result:
-                raise RuntimeError(f"optim_step failed: {optim_result['error']}")
+                print(f"[{_ts()}] Step {step + 1}/{steps}: forward_backward_custom...", flush=True)
+                backward_result = training_client.forward_backward_custom(data, dpo_loss_fn).result()
+                fb_result = {
+                    "metrics": dict(backward_result.metrics),
+                    "loss_fn_outputs": list(backward_result.loss_fn_outputs),
+                }
+                print(f"[{_ts()}] Step {step + 1}/{steps}: optim_step...", flush=True)
+                optim_output = training_client.optim_step(
+                    tinker.AdamParams(
+                        learning_rate=learning_rate,
+                        beta1=ADAM_BETA1,
+                        beta2=ADAM_BETA2,
+                        eps=ADAM_EPS,
+                    )
+                ).result()
+                optim_result = {
+                    "metrics": dict(optim_output.metrics),
+                }
+            else:
+                fb_payload: dict[str, Any] = {
+                    "model_id": model_id,
+                    "forward_backward_input": {
+                        "data": data,
+                        "loss_fn": loss_fn,
+                    },
+                }
+                if loss_fn in ("ppo", "importance_sampling"):
+                    fb_payload["forward_backward_input"]["loss_fn_config"] = {"clip_ratio": 0.2}
+
+                print(f"[{_ts()}] Step {step + 1}/{steps}: forward_backward...", flush=True)
+                resp = _post(f"{base_url}/api/v1/forward_backward", headers, fb_payload, timeout_s=120.0)
+                fb_result = _poll_future(base_url, headers, resp["request_id"], timeout_s=300.0)
+
+                if "error" in fb_result:
+                    raise RuntimeError(f"forward_backward failed: {fb_result['error']}")
+
+                optim_payload = {
+                    "model_id": model_id,
+                    "adam_params": {
+                        "learning_rate": learning_rate,
+                        "beta1": ADAM_BETA1,
+                        "beta2": ADAM_BETA2,
+                        "eps": ADAM_EPS,
+                    },
+                }
+
+                print(f"[{_ts()}] Step {step + 1}/{steps}: optim_step...", flush=True)
+                resp = _post(f"{base_url}/api/v1/optim_step", headers, optim_payload, timeout_s=60.0)
+                optim_result = _poll_future(base_url, headers, resp["request_id"], timeout_s=60.0)
+
+                if "error" in optim_result:
+                    raise RuntimeError(f"optim_step failed: {optim_result['error']}")
 
             step_metrics: dict[str, Any] = {
                 "step": step + 1,
@@ -690,7 +904,10 @@ def run_training(
                 "loss_fn_outputs": fb_result.get("loss_fn_outputs", []),
             }
 
-            loss = fb_result.get("metrics", {}).get("loss:mean", None)
+            if loss_fn == "dpo":
+                loss = fb_result.get("metrics", {}).get("dpo_loss", None)
+            else:
+                loss = fb_result.get("metrics", {}).get("loss:mean", None)
             grad_norm = optim_result.get("metrics", {}).get("grad_norm:last", None)
 
             reward_mean = None
@@ -724,8 +941,15 @@ def run_training(
             metrics.append(step_metrics)
 
             metadata["learning_rate"] = learning_rate
-            metadata["batch_size"] = SFT_BATCH_SIZE if loss_fn == "cross_entropy" else RL_BATCH_SIZE
-            metadata["max_tokens"] = SFT_MAX_TOKENS if loss_fn == "cross_entropy" else RL_MAX_TOKENS
+            if loss_fn == "cross_entropy":
+                metadata["batch_size"] = SFT_BATCH_SIZE
+                metadata["max_tokens"] = SFT_MAX_TOKENS
+            elif loss_fn == "dpo":
+                metadata["batch_size"] = DPO_BATCH_SIZE
+                metadata["max_tokens"] = DPO_MAX_TOKENS
+            else:
+                metadata["batch_size"] = RL_BATCH_SIZE
+                metadata["max_tokens"] = RL_MAX_TOKENS
 
             _save_checkpoint(output_file, "in_progress", metadata, metrics)
 
@@ -737,8 +961,15 @@ def run_training(
         total_time = time.time() - start_time
 
         metadata["learning_rate"] = learning_rate
-        metadata["batch_size"] = SFT_BATCH_SIZE if loss_fn == "cross_entropy" else RL_BATCH_SIZE
-        metadata["max_tokens"] = SFT_MAX_TOKENS if loss_fn == "cross_entropy" else RL_MAX_TOKENS
+        if loss_fn == "cross_entropy":
+            metadata["batch_size"] = SFT_BATCH_SIZE
+            metadata["max_tokens"] = SFT_MAX_TOKENS
+        elif loss_fn == "dpo":
+            metadata["batch_size"] = DPO_BATCH_SIZE
+            metadata["max_tokens"] = DPO_MAX_TOKENS
+        else:
+            metadata["batch_size"] = RL_BATCH_SIZE
+            metadata["max_tokens"] = RL_MAX_TOKENS
         metadata["total_time_s"] = total_time
 
         _save_checkpoint(output_file, "success", metadata, metrics)
@@ -1196,28 +1427,23 @@ def main() -> int:
     if "dpo" in args.loss_fns:
         try:
             import datasets
-            import json as _json
 
-            print("\nLoading DPO preference pairs dataset...")
-
-            dpo_pairs_file = (
-                Path(__file__).parent.parent.parent
-                / "tinker-cookbook"
-                / "scripts"
-                / "dpo_pairs_200.jsonl"
-            )
-            if not dpo_pairs_file.exists():
-                raise FileNotFoundError(f"DPO pairs file not found: {dpo_pairs_file}")
+            print("\nLoading DPO preference pairs dataset from Anthropic/hh-rlhf...")
+            dataset_dict = datasets.load_dataset("Anthropic/hh-rlhf")
+            train_dataset = dataset_dict["train"].shuffle(seed=42)
 
             dpo_data = []
-            with open(dpo_pairs_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    dpo_data.append(_json.loads(line))
+            for example in train_dataset:
+                row = _hhh_example_to_dpo_row(example)
+                if row is None:
+                    continue
+                dpo_data.append(row)
+                if len(dpo_data) >= 200:
+                    break
+            if not dpo_data:
+                raise ValueError("No valid DPO comparison rows extracted from Anthropic/hh-rlhf")
 
-            dpo_dataset = datasets.Dataset.from_list(dpo_data).shuffle(seed=42)
+            dpo_dataset = datasets.Dataset.from_list(dpo_data)
             print(f"Loaded {len(dpo_dataset)} DPO preference pairs")
         except Exception as e:
             print(f"ERROR: Failed to load DPO dataset: {e}")
@@ -1228,10 +1454,8 @@ def main() -> int:
 
     for model in args.models:
         try:
-            from transformers import AutoTokenizer
-
             print(f"\nLoading tokenizer for {model}...")
-            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+            tokenizer = _load_tokenizer(model)
 
             for loss_fn in args.loss_fns:
                 if loss_fn == "cross_entropy" and sft_dataset is None:

@@ -376,6 +376,45 @@ def vocab_parallel_cross_entropy_against_log_q(
     return _VocabParallelCrossEntropyAgainstLogQ.apply(vocab_parallel_logits, teacher_log_probs)
 
 
+class _VocabParallelReverseKLAgainstLogQ(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits: torch.Tensor, teacher_log_probs: torch.Tensor) -> torch.Tensor:
+        from megatron.core import parallel_state as mpu
+
+        logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
+        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=mpu.get_tensor_model_parallel_group())
+        normalized = vocab_parallel_logits - logits_max
+        exp_logits = normalized.exp()
+        sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=mpu.get_tensor_model_parallel_group())
+        softmax = exp_logits / sum_exp
+        student_log_probs = normalized - sum_exp.log()
+
+        entropy = -(softmax * student_log_probs).sum(dim=-1)
+        dist.all_reduce(entropy, op=dist.ReduceOp.SUM, group=mpu.get_tensor_model_parallel_group())
+
+        cross_entropy = -(softmax * teacher_log_probs).sum(dim=-1)
+        dist.all_reduce(cross_entropy, op=dist.ReduceOp.SUM, group=mpu.get_tensor_model_parallel_group())
+
+        token_kl = cross_entropy - entropy
+        ctx.save_for_backward(softmax, student_log_probs, teacher_log_probs, token_kl)
+        return token_kl
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        softmax, student_log_probs, teacher_log_probs, token_kl = ctx.saved_tensors
+        grad = softmax * (student_log_probs - teacher_log_probs - token_kl.unsqueeze(dim=-1))
+        grad = grad * grad_output.unsqueeze(dim=-1)
+        return grad, None
+
+
+def vocab_parallel_reverse_kl_against_log_q(
+    vocab_parallel_logits: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    return _VocabParallelReverseKLAgainstLogQ.apply(vocab_parallel_logits, teacher_log_probs)
+
+
 def vocab_parallel_log_probs_from_logits_no_grad(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     from megatron.core import parallel_state as mpu
 

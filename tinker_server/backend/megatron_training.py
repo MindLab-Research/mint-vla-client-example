@@ -449,6 +449,14 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
     Returns:
         Loss function compatible with verl's forward_backward_batch.
     """
+    def _flatten_rows(tensor: torch.Tensor) -> torch.Tensor:
+        if getattr(tensor, "is_nested", False):
+            rows = [row for row in tensor.unbind()]
+            if not rows:
+                return torch.empty((0,), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat(rows, dim=0)
+        return tensor
+
     def sft_loss_with_logprobs(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """SFT cross-entropy loss that also returns log_probs for metrics.
 
@@ -460,25 +468,48 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         Returns:
             Tuple of (loss_tensor, metrics_dict_with_logprobs)
         """
-        log_probs = model_output.get("log_probs")
+        packed_present = "packed_log_probs" in model_output
+        log_probs = model_output.get("packed_log_probs")
+        if log_probs is None:
+            log_probs = model_output.get("log_probs")
 
         if log_probs is None:
             raise ValueError("model_output missing required log_probs")
 
-        # Handle NestedTensor format from verl (NO_PADDING mode)
-        if hasattr(log_probs, 'values'):
-            log_probs_flat = log_probs.values()
-        else:
-            log_probs_flat = log_probs
+        # Prefer the packed non-nested tensor emitted by the patched Megatron
+        # forward step. Falling back to nested .values() keeps older paths alive,
+        # but the packed tensor avoids nested autograd edges on the SFT path.
+        log_probs_flat = _flatten_rows(log_probs)
 
         # Get loss_mask to identify which tokens contribute to loss
         loss_mask = data.get("loss_mask")
-        if loss_mask is not None and hasattr(loss_mask, 'values'):
-            loss_mask_flat = loss_mask.values()
-        elif loss_mask is not None:
-            loss_mask_flat = loss_mask
+        if loss_mask is not None:
+            loss_mask_flat = _flatten_rows(loss_mask)
         else:
             raise ValueError("data missing required loss_mask")
+
+        logger.info(
+            "[sft_loss_with_logprobs] packed_present=%s log_probs_type=%s log_probs_flat_type=%s "
+            "loss_mask_type=%s loss_mask_flat_type=%s",
+            packed_present,
+            type(log_probs).__name__,
+            type(log_probs_flat).__name__,
+            type(loss_mask).__name__ if loss_mask is not None else None,
+            type(loss_mask_flat).__name__,
+        )
+        if os.environ.get("MINT_SFT_DIAG_FAIL", "0") == "1":
+            raise RuntimeError(
+                "SFT_DIAG "
+                f"packed_present={packed_present} "
+                f"log_probs_type={type(log_probs).__name__} "
+                f"log_probs_is_nested={getattr(log_probs, 'is_nested', False)} "
+                f"log_probs_flat_type={type(log_probs_flat).__name__} "
+                f"log_probs_flat_is_nested={getattr(log_probs_flat, 'is_nested', False)} "
+                f"loss_mask_type={type(loss_mask).__name__ if loss_mask is not None else None} "
+                f"loss_mask_is_nested={getattr(loss_mask, 'is_nested', False) if loss_mask is not None else None} "
+                f"loss_mask_flat_type={type(loss_mask_flat).__name__} "
+                f"loss_mask_flat_is_nested={getattr(loss_mask_flat, 'is_nested', False)}"
+            )
 
         use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
         if not use_external_label:
@@ -513,8 +544,8 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         log_probs_cpu = log_probs_flat.detach().cpu()
 
         metrics = {
-            "loss": nll.detach(),
-            "loss_sum": loss_sum.detach(),
+            "loss": nll.detach().item() if hasattr(nll, "item") else float(nll),
+            "loss_sum": loss_sum.detach().item() if hasattr(loss_sum, "item") else float(loss_sum),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
         }
 
@@ -542,9 +573,9 @@ def create_ppo_loss_fn(
     import math
     import torch.nn.functional as F
     from verl.trainer.config import RolloutCorrectionConfig
+    from verl.trainer.ppo.core_algos import agg_loss
     from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_rejection_mask
     from verl.workers.config import ActorConfig, PolicyLossConfig
-    from verl.workers.utils.losses import ppo_loss as verl_ppo_loss, _slice_response_from_unpad_output
 
     clip_ratio = float(epsilon)
     clip_ratio_c = 1e6 if math.isinf(clip_ratio) else 3.0
@@ -645,13 +676,60 @@ def create_ppo_loss_fn(
 
         raise ValueError(f"Invalid bypass_mode loss_type: {loss_type!r}")
 
+    def _slice_response_log_probs(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
+        prompt_ids = data["prompts"]
+        response_ids = data["responses"]
+        attention_mask = data["attention_mask"]
+
+        if prompt_ids.is_nested:
+            prompt_lens = prompt_ids.offsets().diff()
+            response_lens = response_ids.offsets().diff()
+            max_response_len = int(response_lens.max().item()) if response_lens.numel() else 0
+        else:
+            assert not attention_mask.is_nested
+            prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+            response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+            max_response_len = int(response_ids.shape[1])
+
+        rows = []
+        if tensor.is_nested:
+            for row_idx, (prompt_len, response_len) in enumerate(zip(prompt_lens, response_lens, strict=True)):
+                prompt_len_i = int(prompt_len.item()) if hasattr(prompt_len, "item") else int(prompt_len)
+                response_len_i = int(response_len.item()) if hasattr(response_len, "item") else int(response_len)
+                start = max(prompt_len_i - 1, 0)
+                end = start + response_len_i
+                row = tensor[row_idx][start:end]
+                pad_size = max_response_len - response_len_i
+                if pad_size > 0:
+                    row = F.pad(row, (0, pad_size))
+                rows.append(row)
+        else:
+            values = tensor
+            sequence_lens = prompt_lens + response_lens
+            sequence_offsets = sequence_lens.cumsum(dim=0)
+            assert sequence_offsets[-1].item() == values.shape[0]
+            for response_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
+                response_len_i = int(response_len.item()) if hasattr(response_len, "item") else int(response_len)
+                seq_offset_i = int(seq_offset.item()) if hasattr(seq_offset, "item") else int(seq_offset)
+                pad_size = max_response_len - response_len_i
+                row = values[seq_offset_i - response_len_i - 1 : seq_offset_i - 1]
+                if pad_size > 0:
+                    row = F.pad(row, (0, pad_size))
+                rows.append(row)
+
+        if not rows:
+            return torch.empty((0, 0), dtype=tensor.dtype, device=tensor.device)
+        return torch.stack(rows, dim=0)
+
     def ppo_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """PPO clipped objective loss via verl's implementation.
 
         Returns:
             Tuple of (loss_tensor, metrics_dict)
         """
-        response_log_probs = _slice_response_from_unpad_output(model_output["log_probs"], data)
+        response_log_probs = model_output.get("response_log_probs")
+        if response_log_probs is None:
+            response_log_probs = _slice_response_log_probs(model_output["log_probs"], data)
         target_len = response_log_probs.shape[1] if response_log_probs.dim() > 1 else response_log_probs.numel()
 
         old_log_probs = data["old_log_probs"]
@@ -673,12 +751,6 @@ def create_ppo_loss_fn(
         advantages = _pad_or_trunc(advantages, target_len, pad_value=0.0)
         response_mask = _pad_or_trunc(response_mask, target_len, pad_value=0.0)
 
-        data["old_log_probs"] = old_log_probs
-        data["advantages"] = advantages
-        data["response_mask"] = response_mask
-
-        loss, _ = verl_ppo_loss(actor_config, model_output, data, dp_group=dp_group)
-
         response_mask_bool = response_mask.to(bool)
         loss_mode = actor_config.policy_loss.get("loss_mode", "vanilla") if hasattr(actor_config, "policy_loss") else "vanilla"
         if loss_mode == "bypass_mode":
@@ -699,6 +771,15 @@ def create_ppo_loss_fn(
             effective_mask_bool = response_mask_bool
 
         effective_mask_float = effective_mask_bool.float()
+        loss = agg_loss(
+            loss_mat=pg_losses,
+            loss_mask=effective_mask_float,
+            loss_agg_mode=actor_config.loss_agg_mode,
+            dp_size=data["dp_size"],
+            batch_num_tokens=data["batch_num_tokens"],
+            global_batch_size=data["global_batch_size"],
+            loss_scale_factor=actor_config.loss_scale_factor,
+        )
         num_tokens = effective_mask_float.sum()
         denom = num_tokens.clamp(min=1) if hasattr(num_tokens, "clamp") else max(num_tokens, 1)
         clipped = ((ratio < 1 - clip_ratio) | (ratio > 1 + clip_ratio)).float()
@@ -910,59 +991,78 @@ def create_reverse_kl_loss_fn(
 
     import torch.distributed as dist
     from megatron.core import parallel_state as mpu
+    from .mintx_ops import vocab_parallel_reverse_kl_against_log_q
 
     if temperature <= 0:
         raise ValueError(f"temperature must be positive, got {temperature!r}")
 
+    def _flatten_rows(tensor: torch.Tensor) -> torch.Tensor:
+        if getattr(tensor, "is_nested", False):
+            rows = [row for row in tensor.unbind()]
+            if not rows:
+                return torch.empty((0,), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat(rows, dim=0)
+        return tensor
 
     def reverse_kl_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
-        student_logits = model_output.get("vocab_parallel_logits")
+        packed_student_logits = model_output.get("packed_vocab_parallel_logits")
+        raw_student_logits = model_output.get("vocab_parallel_logits")
+        if packed_student_logits is None:
+            raise ValueError(
+                "reverse_kl requires packed_vocab_parallel_logits; "
+                f"model_output keys={sorted(model_output.keys())}"
+            )
+        student_logits = packed_student_logits
         student_token_log_probs = model_output.get("log_probs")
         teacher_log_probs = reference_log_probs if reference_log_probs is not None else data.get("reference_log_probs")
         loss_mask = data.get("loss_mask")
 
-        if student_logits is None or teacher_log_probs is None or loss_mask is None:
+        if teacher_log_probs is None or loss_mask is None:
             raise ValueError("reverse_kl requires vocab_parallel_logits, reference_log_probs, and loss_mask")
 
-        if getattr(student_logits, "is_nested", False):
-            student_logits = student_logits.values()
-        if student_token_log_probs is not None and getattr(student_token_log_probs, "is_nested", False):
-            student_token_log_probs = student_token_log_probs.values()
-        if getattr(teacher_log_probs, "is_nested", False):
-            teacher_log_probs = teacher_log_probs.values()
-        if getattr(loss_mask, "is_nested", False):
-            loss_mask = loss_mask.values()
+        logger.info(
+            "reverse_kl loss inputs packed_logits=%s raw_logits_nested=%s raw_logits_type=%s packed_logits_shape=%s raw_logits_shape=%s",
+            packed_student_logits is not None,
+            getattr(raw_student_logits, "is_nested", False) if raw_student_logits is not None else None,
+            type(raw_student_logits).__name__ if raw_student_logits is not None else None,
+            list(packed_student_logits.shape) if hasattr(packed_student_logits, "shape") else None,
+            list(raw_student_logits.shape) if hasattr(raw_student_logits, "shape") else None,
+        )
+
+        student_logits = _flatten_rows(student_logits)
+        if student_token_log_probs is not None:
+            student_token_log_probs = _flatten_rows(student_token_log_probs)
+        teacher_log_probs = _flatten_rows(teacher_log_probs)
+        loss_mask = _flatten_rows(loss_mask)
+        if os.environ.get("MINT_REVERSE_KL_DIAG_FAIL", "0") == "1":
+            raise RuntimeError(
+                "REVERSE_KL_DIAG "
+                f"student_logits_type={type(student_logits).__name__} "
+                f"student_logits_is_nested={getattr(student_logits, 'is_nested', False)} "
+                f"student_token_log_probs_type={type(student_token_log_probs).__name__ if student_token_log_probs is not None else None} "
+                f"student_token_log_probs_is_nested={getattr(student_token_log_probs, 'is_nested', False) if student_token_log_probs is not None else None} "
+                f"teacher_log_probs_type={type(teacher_log_probs).__name__} "
+                f"teacher_log_probs_is_nested={getattr(teacher_log_probs, 'is_nested', False)} "
+                f"loss_mask_type={type(loss_mask).__name__} "
+                f"loss_mask_is_nested={getattr(loss_mask, 'is_nested', False)}"
+            )
         if hasattr(teacher_log_probs, "device") and teacher_log_probs.device != student_logits.device:
             teacher_log_probs = teacher_log_probs.to(device=student_logits.device, dtype=torch.float32)
 
-        mask_bool = loss_mask != 0
-        student_logits = student_logits[mask_bool]
-        selected_weights = loss_mask.float()[mask_bool]
+        selected_idx = (loss_mask != 0).nonzero(as_tuple=False).squeeze(-1)
+        student_logits = student_logits.index_select(0, selected_idx)
+        selected_weights = loss_mask.float().index_select(0, selected_idx)
 
         if student_token_log_probs is not None:
-            student_token_log_probs = student_token_log_probs[mask_bool]
+            student_token_log_probs = student_token_log_probs.index_select(0, selected_idx)
 
         if student_logits.shape != teacher_log_probs.shape:
             raise ValueError(
                 f"student logits shape {tuple(student_logits.shape)} != teacher log-probs shape {tuple(teacher_log_probs.shape)}"
             )
 
-        tp_group = mpu.get_tensor_model_parallel_group()
-        logits_max = student_logits.max(dim=-1, keepdim=True).values
-        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
-        normalized = student_logits - logits_max
-        exp_logits = normalized.exp()
-        sum_exp = exp_logits.sum(dim=-1, keepdim=True)
-        dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
-        student_probs = exp_logits / sum_exp
-        student_log_probs_full = normalized - sum_exp.log()
-
-        entropy = -(student_probs * student_log_probs_full).sum(dim=-1)
-        dist.all_reduce(entropy, op=dist.ReduceOp.SUM, group=tp_group)
-
-        cross_entropy = -(student_probs * teacher_log_probs).sum(dim=-1)
-        dist.all_reduce(cross_entropy, op=dist.ReduceOp.SUM, group=tp_group)
-        token_kl = (cross_entropy - entropy) * (float(temperature) * float(temperature))
+        token_kl = vocab_parallel_reverse_kl_against_log_q(student_logits, teacher_log_probs)
+        token_kl = token_kl * (float(temperature) * float(temperature))
         weighted_kl = token_kl * selected_weights
         num_tokens = selected_weights.sum()
 

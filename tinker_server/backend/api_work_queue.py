@@ -1113,20 +1113,12 @@ def _get_or_create_ray_actor():
                 f"queue actor {actor_name} unresponsive (restarting?)"
             )
         logger.warning(
-            "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); killing stale actor and recreating",
+            "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); reusing existing actor",
             actor_name,
             probe_timeout_s,
         )
         if actor is not None:
-            try:
-                ray.kill(actor, no_restart=True)
-            except Exception as kill_e:
-                logger.warning(
-                    "[api_work_queue] failed to kill stale actor %s after probe timeout (%s: %s); will try recreate",
-                    actor_name,
-                    type(kill_e).__name__,
-                    kill_e,
-                )
+            return actor
     except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
         logger.warning(
             "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
@@ -1256,20 +1248,13 @@ class ApiWorkQueueClient:
                     f"queue actor {actor_name} unresponsive (restarting?)"
                 )
             logger.warning(
-                "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); killing stale actor and recreating",
+                "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); reusing existing actor",
                 actor_name,
                 probe_timeout_s,
             )
             if actor is not None:
-                try:
-                    ray.kill(actor, no_restart=True)
-                except Exception as kill_e:
-                    logger.warning(
-                        "[api_work_queue] failed to kill stale actor %s after probe timeout (%s: %s); will try recreate",
-                        actor_name,
-                        type(kill_e).__name__,
-                        kill_e,
-                    )
+                self._ray_actor = actor
+                return actor
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
             logger.warning(
                 "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",

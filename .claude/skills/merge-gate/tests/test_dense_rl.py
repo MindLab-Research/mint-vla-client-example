@@ -14,6 +14,7 @@ from .conftest import (
     create_session,
     forward_backward,
     optim_step,
+    save_weights_for_sampler,
     save_weights,
     sample,
 )
@@ -93,6 +94,7 @@ class TestDenseRL:
         session_id, model_id = create_session(DENSE_MODEL, lora_rank=32, lr=lr)
 
         save_weights(model_id, name="dense_rl_init")
+        sampling_session_id = save_weights_for_sampler(model_id)
 
         session = SessionData(
             session_id=session_id,
@@ -105,7 +107,7 @@ class TestDenseRL:
         for i in range(num_iterations):
             t0 = time.time()
 
-            rollouts = generate_rollouts(tokenizer, model_id, ARITHMETIC_PROBLEMS)
+            rollouts = generate_rollouts(tokenizer, sampling_session_id, ARITHMETIC_PROBLEMS)
             if not rollouts:
                 continue
 
@@ -134,6 +136,7 @@ class TestDenseRL:
             grad_norm = float(grad_norm) if grad_norm is not None else None
 
             save_weights(model_id, name=f"dense_rl_iter_{i+1}")
+            sampling_session_id = save_weights_for_sampler(model_id)
 
             session.add_iteration(
                 iteration=i + 1,

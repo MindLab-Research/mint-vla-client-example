@@ -27,6 +27,13 @@ import ray
 # to ensure CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
 # (tensordict imports torch internally)
 
+# Fresh Ray worker processes can inherit cluster-level NVTE_* defaults that
+# conflict with Megatron's chosen attention backend during model construction.
+# Unset them on module import so Megatron can choose the backend cleanly.
+os.environ.pop("NVTE_FUSED_ATTN", None)
+os.environ.pop("NVTE_UNFUSED_ATTN", None)
+os.environ.pop("NVTE_FLASH_ATTN", None)
+
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from ..logging_context import (
@@ -1209,6 +1216,16 @@ class MegatronRankWorker:
             del self._session_lr_scheduler_states[session_id]
         logger.debug(f"[Rank {self.rank}] Cleared state for session {session_id}")
 
+    def has_session_state_cached(self, session_id: str) -> bool:
+        """Whether this live worker still has the session's actor-only state in memory."""
+        if self._current_session_id == session_id:
+            return True
+        return (
+            session_id in self._session_gradients
+            and session_id in self._session_optimizer_states
+            and session_id in self._session_lr_scheduler_states
+        )
+
     def mark_session_loaded(self, session_id: str) -> None:
         """Record that a checkpoint-loaded session is now active on this rank."""
         self._current_session_id = session_id
@@ -1303,6 +1320,21 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+        # Fresh Ray worker processes can inherit cluster-level NVTE_* defaults
+        # that conflict with Megatron's chosen attention backend. Unset them
+        # inside the worker process before any Megatron/TE model construction
+        # and let Megatron decide the backend-specific expectation itself.
+        os.environ.pop("NVTE_FUSED_ATTN", None)
+        os.environ.pop("NVTE_UNFUSED_ATTN", None)
+        os.environ.pop("NVTE_FLASH_ATTN", None)
+        print(
+            f"[Rank {self.rank}] NVTE env normalized pre-import: "
+            f"FUSED={os.environ.get('NVTE_FUSED_ATTN')!r} "
+            f"UNFUSED={os.environ.get('NVTE_UNFUSED_ATTN')!r} "
+            f"FLASH={os.environ.get('NVTE_FLASH_ATTN')!r}",
+            flush=True,
+        )
+
         # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
         # This must happen before FlashAttention code is loaded to take effect
         # Without this, consecutive forward passes differ by ~0.46 nats
@@ -1654,6 +1686,13 @@ class MegatronRankWorker:
             checkpoint_config=checkpoint_config,
         )
 
+        print(
+            f"[Rank {self.rank}] NVTE env before engine.initialize: "
+            f"FUSED={os.environ.get('NVTE_FUSED_ATTN')!r} "
+            f"UNFUSED={os.environ.get('NVTE_UNFUSED_ATTN')!r} "
+            f"FLASH={os.environ.get('NVTE_FLASH_ATTN')!r}",
+            flush=True,
+        )
 
         self.engine.initialize()
         logger.info(f"[Rank {self.rank}] MegatronEngineWithLMHead initialized")
@@ -1984,11 +2023,12 @@ class MegatronRankWorker:
                 extra=f"items={len(data_items)} loss_fn={loss_fn}",
             )
             try:
-                result = self.engine.forward_backward_batch(
-                    data=data,
-                    loss_function=loss_function,
-                    forward_only=False,
-                )
+                with torch.autograd.set_detect_anomaly(True):
+                    result = self.engine.forward_backward_batch(
+                        data=data,
+                        loss_function=loss_function,
+                        forward_only=False,
+                    )
             finally:
                 self._stop_slow_op_watchdog(watchdog)
             forward_backward_batch_ms = (time.perf_counter() - t_fb0) * 1000.0
@@ -2605,38 +2645,38 @@ class MegatronRankWorker:
                 raise FileNotFoundError(f"Reference adapter checkpoint not found: {adapter_file}")
             checkpoint = torch.load(adapter_file, map_location="cpu")
             reference_adapter_state = checkpoint.get("adapter_state_dict", {})
-            try:
-                self._restore_adapter_state_dict(
-                    reference_adapter_state,
-                    actual_rank=reference_actual_rank,
-                    trainer_rank=self.lora_rank,
-                    train_attn=train_attn,
-                    train_mlp=train_mlp,
-                    train_unembed=train_unembed,
-                )
-                extractor = create_vocab_parallel_logits_extractor_fn()
-                with self.engine.eval_mode():
+            with self.engine.eval_mode():
+                try:
+                    self._restore_adapter_state_dict(
+                        reference_adapter_state,
+                        actual_rank=reference_actual_rank,
+                        trainer_rank=self.lora_rank,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    )
+                    extractor = create_vocab_parallel_logits_extractor_fn()
                     with torch.no_grad():
                         reference_result = self.engine.forward_backward_batch(
                             data=reference_data,
                             loss_function=extractor,
                             forward_only=True,
                         )
-                reference_model_output = reference_result.get("model_output", {})
-                reference_local_logits = reference_model_output.get("vocab_parallel_logits")
-                if reference_local_logits is None:
-                    raise ValueError("reference forward missing vocab_parallel_logits")
-                if hasattr(reference_local_logits, "values"):
-                    reference_local_logits = reference_local_logits.values()
-                reference_log_probs = vocab_parallel_log_probs_from_logits_no_grad(reference_local_logits)
-            finally:
-                self._restore_adapter_state_dict(
-                    current_adapter_state,
-                    trainer_rank=self.lora_rank,
-                    train_attn=train_attn,
-                    train_mlp=train_mlp,
-                    train_unembed=train_unembed,
-                )
+                    reference_model_output = reference_result.get("model_output", {})
+                    reference_local_logits = reference_model_output.get("vocab_parallel_logits")
+                    if reference_local_logits is None:
+                        raise ValueError("reference forward missing vocab_parallel_logits")
+                    if hasattr(reference_local_logits, "values"):
+                        reference_local_logits = reference_local_logits.values()
+                    reference_log_probs = vocab_parallel_log_probs_from_logits_no_grad(reference_local_logits)
+                finally:
+                    self._restore_adapter_state_dict(
+                        current_adapter_state,
+                        trainer_rank=self.lora_rank,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    )
 
             reference_loss_mask = reference_data["loss_mask"]
             if hasattr(reference_loss_mask, "values"):
@@ -5041,25 +5081,28 @@ class MegatronRankWorker:
             for key, value in adapter_state.items()
         }
 
-        with self.engine.eval_mode():
-            model = self.engine.module
-            if isinstance(model, list):
-                model = model[0]
-            unwrapped = unwrap_model(model)
-            if isinstance(unwrapped, list):
-                unwrapped = unwrapped[0]
+        # The caller must hold the desired engine context. Re-entering
+        # eval_mode() here offloads Megatron DDP param storage on exit, which
+        # can leave zero-sized storage just before a caller refreshes optimizer
+        # master params from the restored model weights.
+        model = self.engine.module
+        if isinstance(model, list):
+            model = model[0]
+        unwrapped = unwrap_model(model)
+        if isinstance(unwrapped, list):
+            unwrapped = unwrapped[0]
 
-            _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
-            if unexpected:
-                logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
+        _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
+        if unexpected:
+            logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
 
-            train_attn = True if train_attn is None else bool(train_attn)
-            train_mlp = True if train_mlp is None else bool(train_mlp)
-            train_unembed = True if train_unembed is None else bool(train_unembed)
-            self._freeze_non_lora_params(unwrapped)
-            self._zero_disabled_lora_params(
-                unwrapped, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
-            )
+        train_attn = True if train_attn is None else bool(train_attn)
+        train_mlp = True if train_mlp is None else bool(train_mlp)
+        train_unembed = True if train_unembed is None else bool(train_unembed)
+        self._freeze_non_lora_params(unwrapped)
+        self._zero_disabled_lora_params(
+            unwrapped, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+        )
 
     def load_adapter_state(
         self,
@@ -5487,8 +5530,11 @@ class MegatronSessionStateManager:
         import shutil
         session_path = self.get_session_path(session_id)
         deleted = False
-        if os.path.exists(session_path):
-            shutil.rmtree(session_path)
+        if os.path.lexists(session_path):
+            if os.path.islink(session_path) or os.path.isfile(session_path):
+                os.unlink(session_path)
+            else:
+                shutil.rmtree(session_path)
             deleted = True
         if session_id in self._session_metadata:
             del self._session_metadata[session_id]
@@ -5793,9 +5839,13 @@ class MegatronWorkerGroup:
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
-                # Allow TE DotProductAttention backends; Megatron flash attention asserts these are 0.
-                "NVTE_FUSED_ATTN": "0" if is_mla else "1",
-                "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
+                # GPU worker images can inherit cluster-level NVTE_* defaults.
+                # Fresh 30B Megatron bring-up currently selects flash attention,
+                # which asserts fused/unfused toggles are unset or 0. Override
+                # the inherited defaults explicitly so fresh workers do not see
+                # NVTE_FUSED_ATTN=1 / NVTE_UNFUSED_ATTN=1 from outside this repo.
+                "NVTE_FUSED_ATTN": "0",
+                "NVTE_UNFUSED_ATTN": "0",
                 **otel_env_vars(),
                 },
             ),
@@ -5973,6 +6023,20 @@ class MegatronWorkerGroup:
             raise
         logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
 
+    def _session_state_cached_on_workers(self, session_id: str) -> bool:
+        """Whether every live worker still has actor-only state for this session in memory."""
+        try:
+            states = ray.get([w.has_session_state_cached.remote(session_id) for w in self.workers])
+        except Exception as e:
+            logger.warning(
+                "[MegatronWorkerGroup] Failed to query cached session state for %s: %s: %s",
+                session_id,
+                type(e).__name__,
+                e,
+            )
+            return False
+        return all(bool(state) for state in states)
+
     def _ensure_session_loaded(
         self,
         session_id: str | None,
@@ -6043,9 +6107,14 @@ class MegatronWorkerGroup:
             logger.debug(f"[MegatronWorkerGroup] Session {session_id} already loaded")
             return
         if has_actor_only_state:
-            raise RuntimeError(
-                f"Session cache for {session_id} still has actor-only training state; "
-                "reload it from an explicit checkpoint before continuing."
+            if not self._session_state_cached_on_workers(session_id):
+                raise RuntimeError(
+                    f"Session cache for {session_id} still has actor-only training state; "
+                    "reload it from an explicit checkpoint before continuing."
+                )
+            logger.info(
+                "[MegatronWorkerGroup] Session %s has actor-only marker but state is still cached in-memory on all workers; continuing with live session swap",
+                session_id,
             )
         if session_exists:
             prevalidated_meta = self._session_manager.get_metadata(session_id)
@@ -7780,12 +7849,40 @@ def get_or_create_megatron_worker_group(
 
             # Create detached Ray actor with per-model name
             try:
-                actor = MegatronWorkerGroup.options(
-                    name=actor_name,
-                    namespace=PERSISTENT_NAMESPACE,
-                    lifetime="detached",
-                    runtime_env=runtime_env,
-                ).remote(
+                actor_options = {
+                    "name": actor_name,
+                    "namespace": PERSISTENT_NAMESPACE,
+                    "lifetime": "detached",
+                    "runtime_env": runtime_env,
+                }
+                preferred_node_ips = _preferred_worker_node_ips_for_model(base_model)
+                if preferred_node_ips:
+                    pinned_node_ip = preferred_node_ips[0]
+                    node_map = {
+                        n.get("NodeManagerAddress"): n.get("NodeID")
+                        for n in ray.nodes()
+                        if n.get("Alive")
+                    }
+                    node_id = node_map.get(pinned_node_ip)
+                    if not node_id:
+                        raise RuntimeError(
+                            f"Requested pinned_node_ip={pinned_node_ip} for actor={actor_name} "
+                            "but no alive Ray node has that IP"
+                        )
+                    actor_options["resources"] = {f"node:{pinned_node_ip}": 0.001}
+                    actor_options["scheduling_strategy"] = (
+                        ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                            node_id,
+                            soft=False,
+                        )
+                    )
+                    logger.info(
+                        "Pinning detached manager actor=%s to node_ip=%s node_id=%s",
+                        actor_name,
+                        pinned_node_ip,
+                        node_id,
+                    )
+                actor = MegatronWorkerGroup.options(**actor_options).remote(
                     base_model=base_model,
                     lora_rank=lora_rank,
                     learning_rate=learning_rate,

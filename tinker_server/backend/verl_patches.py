@@ -242,6 +242,9 @@ def _apply_external_label_patch():
 
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        return_vocab_parallel_logits = tu.get_non_tensor_data(
+            batch, key="return_vocab_parallel_logits", default=False
+        )
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
@@ -279,18 +282,36 @@ def _apply_external_label_patch():
 
         forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
-        # Capture actual sequence lengths from input_ids (nested tensor) for padding mask.
-        # This is only meaningful on the THD/remove-padding path where logits are emitted as
-        # a single packed row before postprocess. On the BSHD path, postprocess_bshd_no_padding
-        # strips padding per sequence, so applying a concatenated valid_mask to one row is wrong.
+        # Capture per-sample lengths up front so we can derive response-token logprobs
+        # directly from the packed dense tensor before nested postprocess runs.
+        # On the THD/remove-padding path we also use these lengths to zero out
+        # alignment-only padded slots. On the BSHD path we must not apply the
+        # THD packed valid_mask because postprocess already strips padding per row.
         use_remove_padding = bool(self.engine_config.use_remove_padding)
-        actual_seq_lens = input_ids.offsets().diff().tolist()
+        if input_ids.is_nested:
+            actual_seq_lens = input_ids.offsets().diff().tolist()
+        else:
+            actual_seq_lens = batch["attention_mask"].sum(dim=1).tolist()
+        prompt_tensor = batch["prompts"]
+        if getattr(prompt_tensor, "is_nested", False):
+            prompt_lens = prompt_tensor.offsets().diff().tolist()
+        else:
+            prompt_lens = batch["attention_mask"][:, : prompt_tensor.shape[1]].sum(dim=1).tolist()
+        response_mask = batch.get("response_mask")
+        responses = batch.get("responses")
+        response_lens = response_mask.sum(dim=1).tolist() if response_mask is not None else []
+        max_response_len = responses.shape[1] if responses is not None else 0
+        response_log_probs_dense = None
+        packed_log_probs = None
+        packed_vocab_parallel_logits = None
         import os
         debug_enabled = os.environ.get("MINT_VERL_DIAGNOSTICS", "0") == "1"
 
         def logits_processor(logits, temperature, **label_kwargs):
             """Process logits to compute log_probs."""
+            nonlocal response_log_probs_dense, packed_log_probs, packed_vocab_parallel_logits
             import torch
+            import torch.nn.functional as F
             from megatron.core import parallel_state as mpu
 
             # Get label from either key
@@ -315,16 +336,19 @@ def _apply_external_label_patch():
             else:
                 logits_bak = logits
 
+            if return_vocab_parallel_logits:
+                ret["vocab_parallel_logits"] = logits_bak
+
             # Compute log_probs via cross-entropy
             log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            cp_size = mpu.get_context_parallel_world_size()
+            align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+            valid_mask = None
 
             if use_remove_padding:
                 # THD/remove-padding emits a single packed row before postprocess; zero out
                 # alignment-only padded slots so downstream metrics/loss ignore them.
-                tp_size = mpu.get_tensor_model_parallel_world_size()
-                cp_size = mpu.get_context_parallel_world_size()
-                align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-
                 padded_total_len = log_probs.shape[1]
                 valid_mask = torch.zeros(padded_total_len, dtype=torch.bool, device=log_probs.device)
 
@@ -361,6 +385,95 @@ def _apply_external_label_patch():
                 )
 
             ret["log_probs"] = log_probs
+            if log_probs.dim() == 1:
+                packed_log_probs = log_probs
+            elif log_probs.dim() == 2 and log_probs.shape[0] == len(actual_seq_lens):
+                packed_chunks = []
+                for row, actual_len in zip(log_probs, actual_seq_lens, strict=True):
+                    packed_chunks.append(row[: int(actual_len)])
+                if packed_chunks:
+                    packed_log_probs = torch.cat(packed_chunks, dim=0)
+            elif use_remove_padding and log_probs.dim() == 2 and log_probs.shape[0] == 1:
+                packed_chunks = []
+                packed_start = 0
+                for actual_len in actual_seq_lens:
+                    actual_len_i = int(actual_len)
+                    pad_size = (align_size - actual_len_i % align_size) % align_size
+                    packed_chunks.append(log_probs[0, packed_start : packed_start + actual_len_i])
+                    packed_start += actual_len_i + pad_size
+                if packed_chunks:
+                    packed_log_probs = torch.cat(packed_chunks, dim=0)
+            if return_vocab_parallel_logits and logits_bak.dim() == 3:
+                if logits_bak.shape[0] == len(actual_seq_lens):
+                    packed_logits_chunks = []
+                    for row, actual_len in zip(logits_bak, actual_seq_lens, strict=True):
+                        packed_logits_chunks.append(row[: int(actual_len), :])
+                    if packed_logits_chunks:
+                        packed_vocab_parallel_logits = torch.cat(packed_logits_chunks, dim=0)
+                elif use_remove_padding and valid_mask is not None and logits_bak.shape[0] == 1:
+                    packed_vocab_parallel_logits = logits_bak[0, valid_mask, :]
+            elif return_vocab_parallel_logits and logits_bak.dim() == 2:
+                packed_vocab_parallel_logits = logits_bak
+            if return_vocab_parallel_logits and packed_vocab_parallel_logits is None:
+                logger.info(
+                    "packed vocab logits missing logits_shape=%s actual_seq_lens=%s valid_mask_numel=%s valid_tokens=%s response_lens=%s",
+                    list(logits_bak.shape),
+                    [int(x) for x in actual_seq_lens],
+                    int(valid_mask.numel()) if valid_mask is not None else None,
+                    int(valid_mask.sum().item()) if valid_mask is not None else None,
+                    [int(x) for x in response_lens],
+                )
+            if cp_size == 1 and response_lens:
+                response_rows = []
+                row_debug = []
+                per_row_layout = (
+                    log_probs.dim() == 2
+                    and log_probs.shape[0] == len(response_lens)
+                )
+                packed_layout = use_remove_padding and log_probs.dim() == 2 and log_probs.shape[0] == 1
+                packed_start = 0
+                for row_idx, (prompt_len, response_len, actual_len) in enumerate(
+                    zip(prompt_lens, response_lens, actual_seq_lens, strict=True)
+                ):
+                    prompt_len_i = int(prompt_len)
+                    response_len_i = int(response_len)
+                    actual_len_i = int(actual_len)
+                    start = max(prompt_len_i - 1, 0)
+                    end = start + response_len_i
+                    if per_row_layout:
+                        row = log_probs[row_idx, start:end]
+                    elif packed_layout:
+                        row = log_probs[0, packed_start + start : packed_start + end]
+                    else:
+                        continue
+                    row_debug.append(
+                        {
+                            "row_idx": row_idx,
+                            "actual_len": actual_len_i,
+                            "prompt_len": prompt_len_i,
+                            "response_len": response_len_i,
+                            "per_row_layout": per_row_layout,
+                            "packed_layout": packed_layout,
+                            "log_probs_shape": list(log_probs.shape),
+                            "packed_start": packed_start,
+                            "start": start,
+                            "end": end,
+                            "row_numel": int(row.numel()),
+                        }
+                    )
+                    if max_response_len > response_len_i:
+                        row = F.pad(row, (0, max_response_len - response_len_i))
+                    response_rows.append(row)
+                    if packed_layout:
+                        pad_size = (align_size - actual_len_i % align_size) % align_size
+                        packed_start += actual_len_i + pad_size
+                row_lengths = [int(r.numel()) for r in response_rows]
+                if len(set(row_lengths)) > 1:
+                    raise RuntimeError(
+                        f"packed response_log_probs row mismatch row_lengths={row_lengths} row_debug={row_debug}"
+                    )
+                if response_rows:
+                    response_log_probs_dense = torch.stack(response_rows, dim=0)
             return ret
 
         logits_processor_args = {label_key: label, "temperature": temperature}
@@ -376,11 +489,73 @@ def _apply_external_label_patch():
             data_format="thd" if self.engine_config.use_remove_padding else "bshd",
         )
 
+        if isinstance(output, dict):
+            if response_log_probs_dense is not None:
+                output["response_log_probs"] = response_log_probs_dense
+            if packed_log_probs is not None:
+                output["packed_log_probs"] = packed_log_probs
+            if packed_vocab_parallel_logits is not None:
+                output["packed_vocab_parallel_logits"] = packed_vocab_parallel_logits
+
         return output, partial(postprocess_micro_batch_func, data=batch)
 
     MegatronEngineWithLMHead.forward_step = patched_forward_step
     print("[VERL_PATCH] Applied external label patch for MegatronEngineWithLMHead.forward_step")
     logger.info("Applied external label patch (fixes last-token logprob issue)")
+
+    try:
+        from verl.workers.engine import utils as verl_engine_utils
+        from verl.workers.engine.megatron import transformer_impl as verl_transformer_impl
+    except Exception as e:
+        logger.warning(
+            "Could not import verl.workers.engine.utils for packed logprob postprocess patch: %s",
+            e,
+        )
+        return
+
+    if not getattr(verl_engine_utils, "_tinker_packed_logprob_postprocess_patched", False):
+        original_postprocess_batch_func = verl_engine_utils.postprocess_batch_func
+
+        @wraps(original_postprocess_batch_func)
+        def patched_postprocess_batch_func(output_lst, indices, data):
+            packed_values = []
+            packed_vocab_logits = []
+            cleaned_output_lst = []
+            for micro_output in output_lst:
+                if not isinstance(micro_output, dict):
+                    cleaned_output_lst.append(micro_output)
+                    continue
+
+                micro_output_copy = dict(micro_output)
+                micro_model_output = micro_output_copy.get("model_output")
+                if isinstance(micro_model_output, dict):
+                    micro_model_output_copy = dict(micro_model_output)
+                    value = micro_model_output_copy.pop("packed_log_probs", None)
+                    if value is not None:
+                        packed_values.append(value.reshape(-1))
+                    packed_logits = micro_model_output_copy.pop("packed_vocab_parallel_logits", None)
+                    if packed_logits is not None:
+                        packed_vocab_logits.append(packed_logits)
+                    micro_output_copy["model_output"] = micro_model_output_copy
+                cleaned_output_lst.append(micro_output_copy)
+
+            output = original_postprocess_batch_func(cleaned_output_lst, indices, data)
+            if not isinstance(output, dict):
+                return output
+            model_output = output.get("model_output")
+            if not isinstance(model_output, dict):
+                return output
+
+            if packed_values:
+                model_output["packed_log_probs"] = torch.cat(packed_values, dim=0)
+            if packed_vocab_logits:
+                model_output["packed_vocab_parallel_logits"] = torch.cat(packed_vocab_logits, dim=0)
+            return output
+
+        verl_engine_utils.postprocess_batch_func = patched_postprocess_batch_func
+        verl_transformer_impl.postprocess_batch_func = patched_postprocess_batch_func
+        verl_engine_utils._tinker_packed_logprob_postprocess_patched = True  # type: ignore[attr-defined]
+        logger.info("Applied packed logprob postprocess patch")
 
 
 def _apply_rope_thd_cp_len_clamp_patch() -> None:
@@ -733,11 +908,40 @@ def _apply_megatron_checkpoint_cleanup_patch() -> None:
             outputs, args = zip(
                 *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
             )
-            torch.autograd.backward(outputs, args)
+            try:
+                torch.autograd.backward(outputs, args)
+            except Exception:
+                def _describe(value):
+                    if isinstance(value, (list, tuple)):
+                        return [_describe(v) for v in value]
+                    if not torch.is_tensor(value):
+                        return {"type": type(value).__name__}
+                    return {
+                        "shape": list(value.shape),
+                        "numel": int(value.numel()),
+                        "dtype": str(value.dtype),
+                        "device": str(value.device),
+                        "requires_grad": bool(value.requires_grad),
+                        "grad_fn": type(value.grad_fn).__name__ if value.grad_fn is not None else None,
+                    }
+
+                logger.error(
+                    "CheckpointFunction.backward exception diag inputs=%s detached_inputs=%s outputs=%s args=%s",
+                    _describe(inputs),
+                    _describe(detached_inputs),
+                    _describe(outputs),
+                    _describe(args),
+                    exc_info=True,
+                )
+                raise
             grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs)
             return (None, None) + grads
         finally:
-            _clear_many(*detached_inputs, *inputs, *outputs)
+            # Upstream keeps ctx.saved_tensors intact until this autograd frame
+            # fully unwinds. Clearing the original saved inputs here can leave
+            # later gradient edges observing zero-sized storage. Only clear the
+            # detached recompute copies, which are local to this backward.
+            _clear_many(*detached_inputs)
             for value in detached_inputs:
                 if torch.is_tensor(value):
                     try:
@@ -764,15 +968,38 @@ def _apply_megatron_checkpoint_cleanup_patch() -> None:
     def patched_without_output_backward(ctx, *args):
         try:
             return original_without_output_backward(ctx, *args)
-        finally:
-            _clear_many(
-                *(getattr(ctx, "saved_tensors", ()) or ()),
-                *(getattr(ctx, "inputs", ()) or ()),
-                *(getattr(ctx, "outputs", ()) or ()),
+        except Exception:
+            def _describe(value):
+                if isinstance(value, (list, tuple)):
+                    return [_describe(v) for v in value]
+                if value is None:
+                    return None
+                if not torch.is_tensor(value):
+                    return {"type": type(value).__name__}
+                return {
+                    "shape": list(value.shape),
+                    "numel": int(value.numel()),
+                    "dtype": str(value.dtype),
+                    "device": str(value.device),
+                    "requires_grad": bool(value.requires_grad),
+                    "grad_fn": type(value.grad_fn).__name__ if value.grad_fn is not None else None,
+                }
+
+            logger.error(
+                "CheckpointWithoutOutputFunction.backward exception diag saved_tensors=%s inputs=%s outputs=%s args=%s",
+                _describe(getattr(ctx, "saved_tensors", ()) or ()),
+                _describe(getattr(ctx, "inputs", ()) or ()),
+                _describe(getattr(ctx, "outputs", ()) or ()),
+                _describe(args),
+                exc_info=True,
             )
+            raise
+        finally:
+            # Upstream releases these references by nulling ctx fields after the
+            # local backward returns. Do not eagerly zero their storage inside
+            # the autograd frame.
             for attr, value in (
                 ("inputs", None),
-                ("outputs", None),
                 ("fp8_recipe", None),
             ):
                 try:
@@ -783,6 +1010,156 @@ def _apply_megatron_checkpoint_cleanup_patch() -> None:
     tp_random.CheckpointWithoutOutputFunction.backward = patched_without_output_backward
     tp_random._tinker_checkpoint_cleanup_patched = True  # type: ignore[attr-defined]
     logger.info("Applied Megatron checkpoint backward cleanup patch")
+
+
+def _apply_megatron_backward_shape_diag_patch() -> None:
+    """Log exact tensor metadata when Megatron backward_step throws."""
+    try:
+        from megatron.core.pipeline_parallel import schedules
+    except Exception as e:
+        logger.warning(
+            "Could not import megatron.core.pipeline_parallel.schedules; skipping backward-step diag patch: %s",
+            e,
+        )
+        return
+
+    if getattr(schedules, "_tinker_backward_shape_diag_patched", False):
+        return
+
+    original_backward_step = schedules.backward_step
+
+    def _describe(value):
+        if isinstance(value, list):
+            return [_describe(v) for v in value]
+        if value is None:
+            return None
+        if not torch.is_tensor(value):
+            return {"type": type(value).__name__}
+        return {
+            "shape": list(value.shape),
+            "numel": int(value.numel()),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "requires_grad": bool(value.requires_grad),
+            "grad_fn": type(value.grad_fn).__name__ if value.grad_fn is not None else None,
+            "next_functions": [
+                type(fn[0]).__name__ if fn and fn[0] is not None else None
+                for fn in (getattr(value.grad_fn, "next_functions", ()) or ())[:8]
+            ],
+        }
+
+    @wraps(original_backward_step)
+    def patched_backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+        try:
+            with torch.autograd.set_detect_anomaly(True):
+                return original_backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        except Exception as e:
+            input_desc = _describe(input_tensor)
+            output_desc = _describe(output_tensor)
+            output_grad_desc = _describe(output_tensor_grad)
+            logger.error(
+                "Megatron backward_step exception diag model_type=%s input=%s output=%s output_grad=%s",
+                model_type,
+                input_desc,
+                output_desc,
+                output_grad_desc,
+                exc_info=True,
+            )
+            raise RuntimeError(
+                "Megatron backward_step exception diag "
+                f"model_type={model_type} input={input_desc} output={output_desc} "
+                f"output_grad={output_grad_desc} original={type(e).__name__}: {e}"
+            ) from e
+
+    schedules.backward_step = patched_backward_step
+    schedules._tinker_backward_shape_diag_patched = True  # type: ignore[attr-defined]
+    logger.info("Applied Megatron backward-step shape diag patch")
+
+
+def _apply_nested_no_padding_slice_patch() -> None:
+    """Avoid NestedGetValuesBackward on PPO/value response slicing."""
+    try:
+        from verl.workers.utils import losses as verl_losses
+        from verl.workers.utils import padding as verl_padding
+    except Exception as e:
+        logger.warning(
+            "Could not import verl loss/padding helpers; skipping nested slice patch: %s",
+            e,
+        )
+        return
+
+    if getattr(verl_losses, "_tinker_nested_no_padding_slice_patched", False):
+        return
+
+    def _slice_from_padded(tensor: torch.Tensor, data, *, max_response_len_default: int | None = None):
+        prompt_ids = data["prompts"]
+        response_ids = data["responses"]
+        attention_mask = data["attention_mask"]
+
+        if tensor.is_nested and prompt_ids.is_nested:
+            prompt_lens = prompt_ids.offsets().diff()
+            response_lens = response_ids.offsets().diff()
+            if max_response_len_default is None:
+                max_response_len = int(response_lens.max().item()) if response_lens.numel() else 0
+            else:
+                max_response_len = int(max_response_len_default)
+            rows = []
+            for row_idx, (prompt_len, response_len) in enumerate(zip(prompt_lens, response_lens, strict=True)):
+                prompt_len_i = int(prompt_len.item()) if hasattr(prompt_len, "item") else int(prompt_len)
+                response_len_i = int(response_len.item()) if hasattr(response_len, "item") else int(response_len)
+                start = max(prompt_len_i - 1, 0)
+                end = start + response_len_i
+                row_values = tensor[row_idx]
+                row = row_values[start:end]
+                pad_size = max_response_len - response_len_i
+                if pad_size > 0:
+                    row = F.pad(row, (0, pad_size))
+                rows.append(row)
+            if not rows:
+                return torch.empty((0, 0), dtype=tensor.dtype, device=tensor.device)
+            return torch.stack(rows, dim=0)
+
+        if prompt_ids.is_nested:
+            prompt_lens = prompt_ids.offsets().diff()
+            response_lens = response_ids.offsets().diff()
+            if max_response_len_default is None:
+                max_response_len = int(response_lens.max().item()) if response_lens.numel() else 0
+            else:
+                max_response_len = int(max_response_len_default)
+        else:
+            assert not attention_mask.is_nested
+            prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+            response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+            max_response_len = response_ids.shape[1]
+
+        padded = tensor.to_padded_tensor(0.0) if tensor.is_nested else tensor
+        rows = []
+        for row_idx, (prompt_len, response_len) in enumerate(zip(prompt_lens, response_lens, strict=True)):
+            prompt_len_i = int(prompt_len.item()) if hasattr(prompt_len, "item") else int(prompt_len)
+            response_len_i = int(response_len.item()) if hasattr(response_len, "item") else int(response_len)
+            start = max(prompt_len_i - 1, 0)
+            end = start + response_len_i
+            row = padded[row_idx, start:end]
+            pad_size = max_response_len - response_len_i
+            if pad_size > 0:
+                row = F.pad(row, (0, pad_size))
+            rows.append(row)
+        if not rows:
+            return torch.empty((0, 0), dtype=padded.dtype, device=padded.device)
+        return torch.stack(rows, dim=0)
+
+    def patched_slice_response_from_unpad_output(tensor: torch.Tensor, data) -> torch.Tensor:
+        return _slice_from_padded(tensor, data)
+
+    def patched_no_padding_2_padding(tensor: torch.Tensor, data) -> torch.Tensor:
+        max_response_len = tu.get_non_tensor_data(data=data, key="max_response_len", default=-1)
+        return _slice_from_padded(tensor, data, max_response_len_default=max_response_len)
+
+    verl_losses._slice_response_from_unpad_output = patched_slice_response_from_unpad_output
+    verl_padding.no_padding_2_padding = patched_no_padding_2_padding
+    verl_losses.no_padding_2_padding = patched_no_padding_2_padding
+    verl_losses._tinker_nested_no_padding_slice_patched = True  # type: ignore[attr-defined]
+    logger.info("Applied nested no-padding response slice patch")
 
 
 def _enable_megatron_determinism(seed: int = 42):
@@ -898,6 +1275,8 @@ def apply_verl_patches():
 
     _apply_megatron_router_expert_bias_no_stack_patch()
     _apply_te_triton_get_int_dtype_patch()
+    _apply_megatron_backward_shape_diag_patch()
+    _apply_nested_no_padding_slice_patch()
     _apply_megatron_checkpoint_cleanup_patch()
     # Apply external label patch first (fixes last-token logprob issue)
     _apply_external_label_patch()
