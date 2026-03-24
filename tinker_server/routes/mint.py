@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 import uuid
 
@@ -90,7 +89,7 @@ async def interpolate_checkpoints(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
@@ -103,9 +102,9 @@ async def interpolate_checkpoints(
 
     created = False
     try:
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(
+        await future_store.async_mark_queued(
             request_id,
             meta={"op": "mint.interpolate_checkpoints"},
         )
@@ -117,9 +116,9 @@ async def interpolate_checkpoints(
             webhook_url=None,
         )
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue interpolate_checkpoints request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -192,7 +191,7 @@ async def _do_interpolate_checkpoints(
             type(e).__name__,
             "check_source_checkpoints_and_coefficients",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))
 
 
 @router.post("/forward_backward_reverse_kl", response_model=UntypedAPIFuture)
@@ -239,7 +238,7 @@ async def forward_backward_reverse_kl(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
@@ -252,9 +251,9 @@ async def forward_backward_reverse_kl(
 
     created = False
     try:
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(
+        await future_store.async_mark_queued(
             request_id,
             meta={"op": "mint.forward_backward_reverse_kl", "model_id": request.model_id},
         )
@@ -266,9 +265,9 @@ async def forward_backward_reverse_kl(
             webhook_url=None,
         )
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue forward_backward_reverse_kl request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -322,4 +321,4 @@ async def _do_forward_backward_reverse_kl(
             type(e).__name__,
             "check_reference_checkpoint_and_reverse_kl_batch_shape",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 import time
@@ -54,7 +53,7 @@ class ApiWorkQueueThrottleError(RuntimeError):
         )
 
 
-def _unwrap_queue_throttle_error(exc: Exception) -> ApiWorkQueueThrottleError | None:
+def _unwrap_queue_throttle_error(exc: Exception) -> ApiWorkQueueThrottleError | Exception | None:
     candidate: Exception | None = exc
     as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
     if callable(as_instanceof_cause):
@@ -63,6 +62,9 @@ def _unwrap_queue_throttle_error(exc: Exception) -> ApiWorkQueueThrottleError | 
         except Exception:
             candidate = exc
     if isinstance(candidate, ApiWorkQueueThrottleError):
+        return candidate
+    detail = getattr(candidate, "detail", None)
+    if isinstance(detail, dict) and detail.get("code") == "sampling_principal_backpressure":
         return candidate
     return None
 
@@ -108,66 +110,10 @@ class _ExecutionSerialState:
 
 
 
-def _get_or_create_ray_actor():
+def _create_ray_actor():
     import ray
 
     actor_name = _ray_api_work_queue_actor_name()
-    probe_timeout_s = float(os.environ.get("MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S", "1.0"))
-    fail_fast_on_probe_timeout = (
-        os.environ.get("MINT_API_WORK_QUEUE_FAIL_FAST_ON_PROBE_TIMEOUT", "").strip().lower()
-        in ("1", "true", "yes", "y", "on")
-    )
-    try:
-        actor = ray.get_actor(actor_name, namespace=_ray_namespace())
-        # Quick liveness probe: if the actor is mid-restart, stats() will hang
-        # until Ray finishes re-initializing it. Use a short timeout so the
-        # request path fails fast with 503 instead of blocking.
-        ray.get(actor.stats.remote(), timeout=probe_timeout_s)
-        return actor
-    except ValueError:
-        logger.info("[api_work_queue] actor %s not found; creating", actor_name)
-    except ray.exceptions.GetTimeoutError:
-        if fail_fast_on_probe_timeout:
-            logger.warning(
-                "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
-                actor_name,
-                probe_timeout_s,
-            )
-            raise ApiWorkQueueUnavailableError(
-                f"queue actor {actor_name} unresponsive (restarting?)"
-            )
-        logger.warning(
-            "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); killing stale actor and recreating",
-            actor_name,
-            probe_timeout_s,
-        )
-        try:
-            ray.kill(actor, no_restart=True)
-        except Exception as kill_e:
-            logger.warning(
-                "[api_work_queue] failed to kill stale actor %s after probe timeout (%s: %s); will try recreate",
-                actor_name,
-                type(kill_e).__name__,
-                kill_e,
-            )
-    except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
-        logger.warning(
-            "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
-            actor_name,
-            type(e).__name__,
-            e,
-        )
-        raise ApiWorkQueueUnavailableError(
-            f"queue actor {actor_name} restarting ({type(e).__name__})"
-        ) from e
-    except Exception as e:
-        logger.warning(
-            "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
-            actor_name,
-            type(e).__name__,
-            e,
-        )
-
     max_concurrency = int(os.environ.get("MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY", "256"))
     max_restarts = int(os.environ.get("MINT_API_WORK_QUEUE_MAX_RESTARTS", "3"))
 
@@ -1137,6 +1083,71 @@ def _get_or_create_ray_actor():
     ).remote()
 
 
+def _get_or_create_ray_actor():
+    import ray
+
+    actor_name = _ray_api_work_queue_actor_name()
+    probe_timeout_s = float(os.environ.get("MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S", "1.0"))
+    fail_fast_on_probe_timeout = (
+        os.environ.get("MINT_API_WORK_QUEUE_FAIL_FAST_ON_PROBE_TIMEOUT", "").strip().lower()
+        in ("1", "true", "yes", "y", "on")
+    )
+    actor = None
+    try:
+        actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+        # Quick liveness probe: if the actor is mid-restart, stats() will hang
+        # until Ray finishes re-initializing it. Use a short timeout so the
+        # request path fails fast with 503 instead of blocking.
+        ray.get(actor.stats.remote(), timeout=probe_timeout_s)
+        return actor
+    except ValueError:
+        logger.info("[api_work_queue] actor %s not found; creating", actor_name)
+    except ray.exceptions.GetTimeoutError:
+        if fail_fast_on_probe_timeout:
+            logger.warning(
+                "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
+                actor_name,
+                probe_timeout_s,
+            )
+            raise ApiWorkQueueUnavailableError(
+                f"queue actor {actor_name} unresponsive (restarting?)"
+            )
+        logger.warning(
+            "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); killing stale actor and recreating",
+            actor_name,
+            probe_timeout_s,
+        )
+        if actor is not None:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception as kill_e:
+                logger.warning(
+                    "[api_work_queue] failed to kill stale actor %s after probe timeout (%s: %s); will try recreate",
+                    actor_name,
+                    type(kill_e).__name__,
+                    kill_e,
+                )
+    except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+        logger.warning(
+            "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
+            actor_name,
+            type(e).__name__,
+            e,
+        )
+        raise ApiWorkQueueUnavailableError(
+            f"queue actor {actor_name} restarting ({type(e).__name__})"
+        ) from e
+    except Exception as e:
+        logger.warning(
+            "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
+            actor_name,
+            type(e).__name__,
+            e,
+        )
+
+    return _create_ray_actor()
+
+
 Executor = Callable[[WorkItem], Awaitable[None]]
 
 
@@ -1146,10 +1157,24 @@ class ApiWorkQueueClient:
         self._executors: dict[str, Executor] = {}
         self._worker_tasks: list[Any] = []
         self._running = False
-        self._dequeue_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._consumer_job_id: str | None = None
         self._execution_serial_states: dict[str, _ExecutionSerialState] = {}
         self._execution_serial_states_guard = asyncio.Lock()
+
+    def _get_cached_ray_actor_for_async_request_path(self):
+        try:
+            import ray
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            raise ApiWorkQueueUnavailableError("Ray not initialized")
+
+        if self._ray_actor is None:
+            raise ApiWorkQueueUnavailableError(
+                "Detached Ray ApiWorkQueue actor is not ready on this API server"
+            )
+        return self._ray_actor
 
     def _get_ray_actor(self):
         try:
@@ -1180,6 +1205,131 @@ class ApiWorkQueueClient:
             except Exception as e:
                 raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
         return self._ray_actor
+
+    async def _get_ray_actor_async(self):
+        try:
+            import ray
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            try:
+                from ..ray_utils import init_ray
+
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
+            except Exception as e:
+                raise ApiWorkQueueUnavailableError("Ray not initialized (init_ray failed)") from e
+
+        if not ray.is_initialized():
+            raise ApiWorkQueueUnavailableError("Ray not initialized")
+
+        if self._ray_actor is not None:
+            try:
+                await self._await_ray_ref(self._ray_actor.stats.remote(), timeout_s=1.0)
+                return self._ray_actor
+            except Exception:
+                self._ray_actor = None
+
+        actor_name = _ray_api_work_queue_actor_name()
+        probe_timeout_s = float(os.environ.get("MINT_API_WORK_QUEUE_PROBE_TIMEOUT_S", "1.0"))
+        fail_fast_on_probe_timeout = (
+            os.environ.get("MINT_API_WORK_QUEUE_FAIL_FAST_ON_PROBE_TIMEOUT", "").strip().lower()
+            in ("1", "true", "yes", "y", "on")
+        )
+
+        actor = None
+        try:
+            actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            await self._await_ray_ref(actor.stats.remote(), timeout_s=probe_timeout_s)
+            self._ray_actor = actor
+            return actor
+        except ValueError:
+            logger.info("[api_work_queue] actor %s not found; creating", actor_name)
+        except ray.exceptions.GetTimeoutError:
+            if fail_fast_on_probe_timeout:
+                logger.warning(
+                    "[api_work_queue] actor %s alive but unresponsive (probe_timeout_s=%.2f); failing fast",
+                    actor_name,
+                    probe_timeout_s,
+                )
+                raise ApiWorkQueueUnavailableError(
+                    f"queue actor {actor_name} unresponsive (restarting?)"
+                )
+            logger.warning(
+                "[api_work_queue] actor %s probe timed out (probe_timeout_s=%.2f); killing stale actor and recreating",
+                actor_name,
+                probe_timeout_s,
+            )
+            if actor is not None:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as kill_e:
+                    logger.warning(
+                        "[api_work_queue] failed to kill stale actor %s after probe timeout (%s: %s); will try recreate",
+                        actor_name,
+                        type(kill_e).__name__,
+                        kill_e,
+                    )
+        except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError) as e:
+            logger.warning(
+                "[api_work_queue] actor %s dead (%s: %s); Ray auto-restart will recover",
+                actor_name,
+                type(e).__name__,
+                e,
+            )
+            raise ApiWorkQueueUnavailableError(
+                f"queue actor {actor_name} restarting ({type(e).__name__})"
+            ) from e
+        except Exception as e:
+            logger.warning(
+                "[api_work_queue] failed to fetch detached actor %s (%s: %s); creating",
+                actor_name,
+                type(e).__name__,
+                e,
+            )
+
+        try:
+            self._ray_actor = _create_ray_actor()
+        except Exception as e:
+            raise ApiWorkQueueUnavailableError("Failed to get/create detached Ray ApiWorkQueue actor") from e
+        return self._ray_actor
+
+    async def _await_ray_ref(self, ref: Any, *, timeout_s: float | None = None) -> Any:
+        """Await a Ray ObjectRef without threadpool bridges.
+
+        Prefer Ray's asyncio-compatible future() bridge so we can apply asyncio
+        timeout semantics without run_in_executor/to_thread.
+        """
+        awaitable: Any = ref
+        ref_future = getattr(ref, "future", None)
+        if callable(ref_future):
+            try:
+                awaitable = asyncio.wrap_future(ref_future())
+            except Exception:
+                awaitable = ref
+        try:
+            if timeout_s is None:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=float(timeout_s))
+        except asyncio.TimeoutError as e:
+            # Preserve the previous surface where timeout on ray.get(...) raised
+            # a Ray GetTimeoutError instead of asyncio.TimeoutError.
+            import ray
+
+            raise ray.exceptions.GetTimeoutError(f"timed out after {float(timeout_s):.3f}s") from e
+
+    def ensure_ready(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            out = ray.get(actor.stats.remote(), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise ApiWorkQueueUnavailableError("Detached Ray ApiWorkQueue actor died") from e
+        if not isinstance(out, dict):
+            raise TypeError(f"ApiWorkQueue.stats returned non-dict: {type(out)}")
+        return out
 
     def set_executor(self, op: str, executor: Executor) -> None:
         self._executors[str(op)] = executor
@@ -1282,7 +1432,7 @@ class ApiWorkQueueClient:
     ) -> None:
         import ray
 
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         tracer = get_otel_tracer()
         producer_job_id = None
         try:
@@ -1323,13 +1473,12 @@ class ApiWorkQueueClient:
             # Ensure enqueue succeeds, otherwise the request can remain pending forever
             # while capacity stays reserved.
             ref = actor.enqueue.remote(item, producer_job_id)
-            loop = asyncio.get_running_loop()
             enqueue_timeout_s = max(
                 10.0,
                 float(os.environ.get("MINT_API_WORK_QUEUE_ENQUEUE_TIMEOUT_S", "60.0")),
             )
             try:
-                result = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=enqueue_timeout_s))
+                result = await self._await_ray_ref(ref, timeout_s=enqueue_timeout_s)
             except Exception as e:
                 throttle_error = _unwrap_queue_throttle_error(e)
                 if throttle_error is not None:
@@ -1371,17 +1520,12 @@ class ApiWorkQueueClient:
                 raise
 
     async def _dequeue(self) -> WorkItem:
-        import ray
-
-        if self._dequeue_executor is None:
-            raise RuntimeError("ApiWorkQueueClient not started (dequeue executor missing)")
         if self._consumer_job_id is None:
             raise RuntimeError("ApiWorkQueueClient not started (consumer job id missing)")
 
-        actor = self._get_ray_actor()
+        actor = await self._get_ray_actor_async()
         ref = actor.dequeue.remote(self._consumer_job_id)
-        loop = asyncio.get_running_loop()
-        item = await loop.run_in_executor(self._dequeue_executor, ray.get, ref)
+        item = await self._await_ray_ref(ref)
         if not isinstance(item, dict):
             raise TypeError(f"ApiWorkQueue.dequeue returned non-dict: {type(item)}")
         if str(item.get("op")) == "__stale_consumer__":
@@ -1404,31 +1548,22 @@ class ApiWorkQueueClient:
         )
 
     async def find_position(self, request_id: str) -> dict[str, Any]:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.find_position.remote(request_id=str(request_id))
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+        result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
             raise TypeError(f"ApiWorkQueue.find_position returned non-dict: {type(result)}")
         return result
 
     async def record_execution_time(self, op: str, duration_s: float) -> None:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = await self._get_ray_actor_async()
         ref = actor.record_execution_time.remote(str(op), float(duration_s))
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+        await self._await_ray_ref(ref, timeout_s=5.0)
 
     async def get_eta_state(self, op: str | None) -> dict[str, Any]:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.get_eta_state.remote(None if op is None else str(op))
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+        result = await self._await_ray_ref(ref, timeout_s=5.0)
         if not isinstance(result, dict):
             raise TypeError(f"ApiWorkQueue.get_eta_state returned non-dict: {type(result)}")
         return result
@@ -1504,7 +1639,7 @@ class ApiWorkQueueClient:
 
         for request_id in all_stale_request_ids:
             try:
-                capacity_manager.release_all(request_id)
+                await capacity_manager.async_release_all(request_id)
             except Exception as e:
                 logger.warning(
                     "[api_work_queue] release_all failed for stale running request_id=%s consumer_job_id=%s: %s: %s",
@@ -1529,7 +1664,6 @@ class ApiWorkQueueClient:
         try:
             job_id = str(ray.get_runtime_context().get_job_id())
             self._consumer_job_id = job_id
-            loop = asyncio.get_running_loop()
             start_timeout_s = max(
                 10.0,
                 float(os.environ.get("MINT_API_WORK_QUEUE_START_TIMEOUT_S", "60.0")),
@@ -1537,9 +1671,9 @@ class ApiWorkQueueClient:
             last_error: Exception | None = None
             for attempt in range(1, 4):
                 try:
-                    actor = self._get_ray_actor()
+                    actor = await self._get_ray_actor_async()
                     ref = actor.set_active_job_id.remote(job_id)
-                    await loop.run_in_executor(None, lambda: ray.get(ref, timeout=start_timeout_s))
+                    await self._await_ray_ref(ref, timeout_s=start_timeout_s)
                     last_error = None
                     break
                 except Exception as e:
@@ -1562,15 +1696,9 @@ class ApiWorkQueueClient:
         n = int(num_workers)
         if n < 1:
             n = 1
-        self._dequeue_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=n,
-            thread_name_prefix="api_work_queue_dequeue",
-        )
         self._worker_tasks = [asyncio.create_task(self._worker_loop(i)) for i in range(n)]
 
     async def shutdown(self) -> None:
-        import ray
-
         self._running = False
         for t in self._worker_tasks:
             t.cancel()
@@ -1581,19 +1709,15 @@ class ApiWorkQueueClient:
         consumer_job_id = self._consumer_job_id
         if consumer_job_id is not None:
             try:
-                actor = self._get_ray_actor()
+                actor = await self._get_ray_actor_async()
             except Exception:
                 actor = None
         if actor is not None and consumer_job_id is not None:
             try:
                 ref = actor.clear_active_job_id_if_matches.remote(consumer_job_id)
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, lambda: ray.get(ref, timeout=5.0))
+                await self._await_ray_ref(ref, timeout_s=5.0)
             except Exception:
                 pass
-        if self._dequeue_executor is not None:
-            self._dequeue_executor.shutdown(wait=False, cancel_futures=True)
-            self._dequeue_executor = None
         self._consumer_job_id = None
 
     async def _worker_loop(self, worker_idx: int) -> None:
@@ -1673,7 +1797,7 @@ class ApiWorkQueueClient:
                     float(age_s),
                 )
             try:
-                capacity_manager.release_queue(item.request_id)
+                await capacity_manager.async_release_queue(item.request_id)
             except Exception as e:
                 # Do not fail open: the reservation leak will force 429 and surface via stats.
                 logger.error(
@@ -1690,11 +1814,11 @@ class ApiWorkQueueClient:
                 # queue-timeout), do not run the executor. This prevents a timed-out future from
                 # later being overwritten by a "successful" resolve.
                 try:
-                    status = future_store.get_status(item.request_id)
+                    status = await future_store.async_get_status(item.request_id)
                 except KeyError:
                     await _finalize_request_slot(item.request_id)
                     try:
-                        capacity_manager.release_all(item.request_id)
+                        await capacity_manager.async_release_all(item.request_id)
                     except Exception as e:
                         logger.error(
                             "[api_work_queue] release_all failed after unknown future (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1715,7 +1839,10 @@ class ApiWorkQueueClient:
                         e,
                     )
                     try:
-                        future_store.fail(item.request_id, f"internal error: future_store.get_status failed: {type(e).__name__}: {e}")
+                        await future_store.async_fail(
+                            item.request_id,
+                            f"internal error: future_store.get_status failed: {type(e).__name__}: {e}",
+                        )
                     except Exception as e2:
                         logger.error(
                             "[api_work_queue] future_store.fail failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1726,7 +1853,7 @@ class ApiWorkQueueClient:
                             e2,
                         )
                     try:
-                        capacity_manager.release_all(item.request_id)
+                        await capacity_manager.async_release_all(item.request_id)
                     except Exception as e2:
                         logger.error(
                             "[api_work_queue] release_all failed after get_status error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1749,7 +1876,7 @@ class ApiWorkQueueClient:
                             str(status),
                         )
                     try:
-                        capacity_manager.release_all(item.request_id)
+                        await capacity_manager.async_release_all(item.request_id)
                     except Exception as e:
                         logger.error(
                             "[api_work_queue] release_all failed after skip_non_pending (worker_idx=%s, request_id=%s, op=%s, status=%s): %s: %s",
@@ -1764,7 +1891,7 @@ class ApiWorkQueueClient:
                     continue
 
                 try:
-                    future_store.mark_running(
+                    await future_store.async_mark_running(
                         item.request_id,
                         meta={
                             "worker_idx": int(worker_idx),
@@ -1791,7 +1918,10 @@ class ApiWorkQueueClient:
                         e,
                     )
                     try:
-                        future_store.fail(item.request_id, f"internal error: future_store.mark_running failed: {type(e).__name__}: {e}")
+                        await future_store.async_fail(
+                            item.request_id,
+                            f"internal error: future_store.mark_running failed: {type(e).__name__}: {e}",
+                        )
                     except Exception as e2:
                         logger.error(
                             "[api_work_queue] future_store.fail failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1802,7 +1932,7 @@ class ApiWorkQueueClient:
                             e2,
                         )
                     try:
-                        capacity_manager.release_all(item.request_id)
+                        await capacity_manager.async_release_all(item.request_id)
                     except Exception as e2:
                         logger.error(
                             "[api_work_queue] release_all failed after mark_running error (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1814,6 +1944,7 @@ class ApiWorkQueueClient:
                         )
                     await _finalize_request_slot(item.request_id)
                     continue
+
                 if str(item.op) == "training.create_model":
                     logger.info(
                         "[api_work_queue] running request_id=%s op=%s worker_idx=%s",
@@ -1831,7 +1962,7 @@ class ApiWorkQueueClient:
                         int(worker_idx),
                     )
                     try:
-                        future_store.fail(item.request_id, f"unknown op: {item.op!r}")
+                        await future_store.async_fail(item.request_id, f"unknown op: {item.op!r}")
                     except Exception as e:
                         logger.error(
                             "[api_work_queue] future_store.fail failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1842,7 +1973,7 @@ class ApiWorkQueueClient:
                             e,
                         )
                     try:
-                        capacity_manager.release_object_store(item.request_id)
+                        await capacity_manager.async_release_object_store(item.request_id)
                     except Exception as e:
                         logger.error(
                             "[api_work_queue] release_object_store failed for unknown op (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1868,8 +1999,8 @@ class ApiWorkQueueClient:
                         await ex(item)
                     else:
                         try:
-                            from opentelemetry.trace import SpanKind, Status, StatusCode
                             from opentelemetry.propagate import extract
+                            from opentelemetry.trace import SpanKind, Status, StatusCode
                         except Exception:
                             # Best-effort: never block execution if OTel deps are unavailable.
                             await ex(item)
@@ -1906,7 +2037,7 @@ class ApiWorkQueueClient:
                     )
                     exec_elapsed = time.perf_counter() - exec_start
                     try:
-                        actor = self._get_ray_actor()
+                        actor = await self._get_ray_actor_async()
                         actor.record_execution_time.remote(str(item.op), float(exec_elapsed))
                     except Exception as e:
                         logger.warning(
@@ -1938,7 +2069,7 @@ class ApiWorkQueueClient:
                     )
                     # Ensure the future does not remain pending forever.
                     try:
-                        future_store.fail(item.request_id, f"executor failed: {e}")
+                        await future_store.async_fail(item.request_id, f"executor failed: {e}")
                     except Exception as e2:
                         logger.error(
                             "[api_work_queue] future_store.fail failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1949,7 +2080,7 @@ class ApiWorkQueueClient:
                             e2,
                         )
                     try:
-                        capacity_manager.release_object_store(item.request_id)
+                        await capacity_manager.async_release_object_store(item.request_id)
                     except Exception as e2:
                         logger.error(
                             "[api_work_queue] release_object_store failed after executor exception (worker_idx=%s, request_id=%s, op=%s): %s: %s",
@@ -1962,33 +2093,25 @@ class ApiWorkQueueClient:
                     await _finalize_request_slot(item.request_id)
 
     async def stats(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.stats.remote()
-        return ray.get(ref, timeout=float(timeout_s))
+        return await self._await_ray_ref(ref, timeout_s=float(timeout_s))
 
     async def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = self._get_cached_ray_actor_for_async_request_path()
         ref = actor.get_rss_bytes.remote()
-        v = ray.get(ref, timeout=float(timeout_s))
+        v = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
         return int(v)
 
     async def finalize_request(self, request_id: str, *, timeout_s: float = 10.0) -> None:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = await self._get_ray_actor_async()
         ref = actor.finalize_request.remote(str(request_id))
-        ray.get(ref, timeout=float(timeout_s))
+        await self._await_ray_ref(ref, timeout_s=float(timeout_s))
 
     async def debug_state(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
-        import ray
-
-        actor = self._get_ray_actor()
+        actor = await self._get_ray_actor_async()
         ref = actor.debug_state.remote()
-        v = ray.get(ref, timeout=float(timeout_s))
+        v = await self._await_ray_ref(ref, timeout_s=float(timeout_s))
         if not isinstance(v, dict):
             raise TypeError(f"ApiWorkQueue.debug_state returned non-dict: {type(v)}")
         return v

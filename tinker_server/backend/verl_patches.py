@@ -279,8 +279,11 @@ def _apply_external_label_patch():
 
         forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
-        # Capture actual sequence lengths from input_ids (nested tensor) for padding mask
-        # input_ids.offsets() gives cumulative lengths, diff() gives per-sequence lengths
+        # Capture actual sequence lengths from input_ids (nested tensor) for padding mask.
+        # This is only meaningful on the THD/remove-padding path where logits are emitted as
+        # a single packed row before postprocess. On the BSHD path, postprocess_bshd_no_padding
+        # strips padding per sequence, so applying a concatenated valid_mask to one row is wrong.
+        use_remove_padding = bool(self.engine_config.use_remove_padding)
         actual_seq_lens = input_ids.offsets().diff().tolist()
         import os
         debug_enabled = os.environ.get("MINT_VERL_DIAGNOSTICS", "0") == "1"
@@ -303,7 +306,7 @@ def _apply_external_label_patch():
             temperature[temperature <= 0] = 1e-8
             assert torch.all(temperature > 0).item(), f"temperature must be positive. Got {temperature}"
 
-            logits.div_(temperature.unsqueeze(dim=-1))
+            logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
             ret = {}
             if calculate_entropy:
                 logits_bak = logits.clone()
@@ -315,26 +318,47 @@ def _apply_external_label_patch():
             # Compute log_probs via cross-entropy
             log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
-            # Mask padded positions first
-            tp_size = mpu.get_tensor_model_parallel_world_size()
-            cp_size = mpu.get_context_parallel_world_size()
-            align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+            if use_remove_padding:
+                # THD/remove-padding emits a single packed row before postprocess; zero out
+                # alignment-only padded slots so downstream metrics/loss ignore them.
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                cp_size = mpu.get_context_parallel_world_size()
+                align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
 
-            padded_total_len = log_probs.shape[1]
-            valid_mask = torch.zeros(padded_total_len, dtype=torch.bool, device=log_probs.device)
+                padded_total_len = log_probs.shape[1]
+                valid_mask = torch.zeros(padded_total_len, dtype=torch.bool, device=log_probs.device)
 
-            cu_padded = 0
-            for actual_len in actual_seq_lens:
-                pad_size = (align_size - actual_len % align_size) % align_size
-                padded_len = actual_len + pad_size
-                valid_mask[cu_padded : cu_padded + actual_len] = True
-                cu_padded += padded_len // cp_size
+                cu_padded = 0
+                for actual_len in actual_seq_lens:
+                    pad_size = (align_size - actual_len % align_size) % align_size
+                    padded_len = actual_len + pad_size
+                    valid_mask[cu_padded : cu_padded + actual_len] = True
+                    cu_padded += padded_len // cp_size
 
-            n_valid = valid_mask.sum().item()
-            n_padded = padded_total_len - n_valid
+                n_valid = valid_mask.sum().item()
+                n_padded = padded_total_len - n_valid
+                if debug_enabled:
+                    logger.warning(
+                        "[VERL_DIAG] THD packed mask: use_remove_padding=%s logits_shape=%s "
+                        "seq_lens=%s padded_total_len=%s n_valid=%s n_padded=%s",
+                        use_remove_padding,
+                        tuple(log_probs.shape),
+                        actual_seq_lens,
+                        padded_total_len,
+                        n_valid,
+                        n_padded,
+                    )
 
-            if n_padded > 0:
-                log_probs[0, ~valid_mask] = 0.0
+                if n_padded > 0:
+                    log_probs[0, ~valid_mask] = 0.0
+            elif debug_enabled:
+                logger.warning(
+                    "[VERL_DIAG] BSHD path: skip packed valid_mask use_remove_padding=%s "
+                    "logits_shape=%s seq_lens=%s",
+                    use_remove_padding,
+                    tuple(log_probs.shape),
+                    actual_seq_lens,
+                )
 
             ret["log_probs"] = log_probs
             return ret

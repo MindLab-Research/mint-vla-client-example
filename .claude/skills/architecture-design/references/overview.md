@@ -12,8 +12,8 @@ The API surface follows the Tinker SDK expectations: create sessions and models,
 
 Contract implications:
 - Long-running work returns a `request_id` and is polled via `/api/v1/retrieve_future` (408 pending). This is the Tinker async protocol, not a server-specific choice.
-- `session_id`, `model_id`, and `sampling_session_id` are identifiers tracked in server memory. They are not durable storage for weights or optimizer state.
-- The server can restart while detached Ray actors remain alive, but in-process mappings are lost. This reduces server restart cost and increases reconciliation requirements.
+- `session_id`, `model_id`, and `sampling_session_id` are control-plane identifiers. Some live routing and engine bindings are in process, but minimal recovery metadata is also mirrored into detached Ray stores.
+- The server can restart while detached Ray actors remain alive. Fast in-process registries are still lost, but detached control-plane actors keep enough metadata for reconciliation and selected REST reads.
 
 ## Multi-LoRA inference: one base model, many adapters
 
@@ -29,6 +29,15 @@ Boundaries and tradeoffs:
 - Small and medium adapters go through the Ray object store. Very large MoE adapters use path-based loading on a shared filesystem to avoid serializing thousands of tensors.
 - Detached actors reduce warmup cost for repeated use but keep holding GPU memory until evicted.
 - Inference engine selection is per-model. Models that require Ray-distributed vLLM execution use `MultiNodeInferenceEngine` and add a CPU-only controller actor (no extra GPU reservation) (see `inference.md` and `placement-groups.md`).
+
+## Async request-path control plane
+
+Hot HTTP paths must not block the API event loop on synchronous Ray control-plane calls.
+
+- Request routes use async APIs on detached control-plane actors (`FutureStore`, `CapacityManager`, `ApiWorkQueue`, and the metadata stores) and await Ray refs directly.
+- Startup is responsible for initializing Ray and warming detached actor handles.
+- Request paths fail fast when Ray is unavailable; they must not call `init_ray()` or silently reconnect from inside a route.
+- Detached metadata-store handles can be reacquired by name if the cached handle dies, but request paths still do not create new Ray clients or hide hard Ray outages.
 
 ## Multi-tenant training: time-sliced state swap
 
@@ -87,7 +96,7 @@ Model access control is centralized and applied on session creation. The server 
 ## Non-goals
 
 Mint does not aim to:
-- persist session mappings across server restarts without explicit reconciliation
+- reconstruct in-process sampling adapter bindings across server restarts without explicit reconciliation
 - migrate training state across GPU nodes automatically
 - store full training state in the FastAPI process
 - support LoRA formats that merge adapter weights into base weights

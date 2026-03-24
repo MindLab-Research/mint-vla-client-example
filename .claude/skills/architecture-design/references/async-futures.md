@@ -42,6 +42,15 @@ Async endpoints must use the admission layer before creating futures:
 
 On admission failure, the API must return HTTP 429 with a structured overload reason (for example `queue_bytes_budget_exceeded` or `object_store_budget_exceeded`). Overload is explicit; the server must not allow unbounded backlog to grow until OOM.
 
+## Request-path async rules
+
+The request path uses native async Ray integration on hot control-plane operations:
+
+- Routes await Ray refs directly through async helpers instead of calling blocking `ray.get(...)`.
+- Request paths do not call `init_ray()` or attempt reconnection. Startup owns Ray initialization.
+- Startup warms cached detached-actor handles for the request-path stores.
+- If a cached detached-actor handle dies, the async helper may reacquire the actor by name once. This is a stale-handle recovery path, not permission for routes to bootstrap a new Ray client or hide a missing actor.
+
 ## Training queue scheduling (session-aware mode)
 
 The detached API work queue is still FIFO for untagged work. For training-session-bound requests, the training routes now tag scheduler metadata by default (`MINT_SCHEDULER_ENABLE` defaults to `1` unless explicitly disabled). The tagged route set includes:

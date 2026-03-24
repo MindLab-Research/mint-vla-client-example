@@ -32,9 +32,10 @@ from ..checkpoints import (
     CHECKPOINTS_DIR,
     MIRROR_STATUS_PENDING,
     begin_async_checkpoint_mirror,
+    build_gateway_proxy_archive_path,
     build_persistent_cache_dir,
     checkpoint_has_optimizer_state,
-    create_checkpoint_archive,
+    async_create_checkpoint_archive,
     ensure_checkpoint_path_allowed,
     get_persistent_cache_dir,
     get_persistent_checkpoints_dir,
@@ -273,9 +274,9 @@ async def _close_upstream_response(response, client) -> None:
 
 
 async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
-    from ..gateway import forward_json, remote_training_model_info, upstream_for_alias
+    from ..gateway import async_remote_training_model_info, forward_json, upstream_for_alias
 
-    remote = remote_training_model_info(model_id)
+    remote = await async_remote_training_model_info(model_id)
     if remote is None:
         return None
 
@@ -320,9 +321,9 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
 
 
 async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: str, request: Request, direct: bool):
-    from ..gateway import forward_request, remote_training_model_info, upstream_for_alias
+    from ..gateway import async_remote_training_model_info, forward_request, upstream_for_alias
 
-    remote = remote_training_model_info(model_id)
+    remote = await async_remote_training_model_info(model_id)
     if remote is None:
         return None
 
@@ -420,16 +421,16 @@ async def save_weights(
     """
     route_start_s = time.perf_counter()
     from ..gateway import (
+        async_remote_training_model,
         encode_request_id,
         forward_json,
-        remote_training_model,
         upstream_for_alias,
     )
 
     session = training_manager.get_session(request.model_id) if training_manager is not None else None
 
     if session is None:
-        remote = remote_training_model(request.model_id)
+        remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
             upstream = upstream_for_alias(upstream_alias)
@@ -483,7 +484,7 @@ async def save_weights(
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
 
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
@@ -500,9 +501,9 @@ async def save_weights(
         if training_manager is not None:
             training_manager.mark_inflight(request.model_id, +1)
             inflight_marked = True
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
+        await future_store.async_mark_queued(request_id, meta={"op": "weights.save_weights", "model_id": request.model_id})
         await _enqueue_weights_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -523,9 +524,9 @@ async def save_weights(
     except Exception as e:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -547,15 +548,15 @@ async def save_state(
     """
     route_start_s = time.perf_counter()
     from ..gateway import (
+        async_remote_training_model,
         encode_request_id,
         forward_json,
-        remote_training_model,
         upstream_for_alias,
     )
 
     session = training_manager.get_session(request.model_id) if training_manager is not None else None
     if session is None:
-        remote = remote_training_model(request.model_id)
+        remote = await async_remote_training_model(request.model_id)
         if remote is not None:
             upstream_alias, base_model = remote
             upstream = upstream_for_alias(upstream_alias)
@@ -608,7 +609,7 @@ async def save_state(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
@@ -625,9 +626,9 @@ async def save_state(
         if training_manager is not None:
             training_manager.mark_inflight(request.model_id, +1)
             inflight_marked = True
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
+        await future_store.async_mark_queued(request_id, meta={"op": "weights.save_state", "model_id": request.model_id})
         await _enqueue_weights_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -648,9 +649,9 @@ async def save_state(
     except Exception as e:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -696,7 +697,7 @@ async def _do_save_state(
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
         # Save training checkpoint on worker, returns path
-        abs_path = await run_async_with_otel_span(
+        await run_async_with_otel_span(
             "weights.save_state.execute",
             lambda: training_engine.save_weights(session, save_path),
             component="routes.weights",
@@ -771,10 +772,6 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        # Include state_dict metadata in response for verification (e.g., checking MLP modules)
-        # Keys are JSON-serializable, tensors are not
-        state_dict_keys = []  # state_dict not available in path-based flow
-
         future_store.resolve(request_id, {
             "checkpoint_id": checkpoint_name,
             "path": selected_path,
@@ -812,7 +809,7 @@ async def _do_save_state(
             type(e).__name__,
             "check_training_session_and_checkpoint_path",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))
 
         # 发送 failed 状态
         if webhook_url and user_id:
@@ -871,7 +868,7 @@ async def _do_save_weights(
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
 
-        abs_path = await run_async_with_otel_span(
+        await run_async_with_otel_span(
             "weights.save_weights.execute",
             lambda: training_engine.save_weights_for_sampler(
                 session=session,
@@ -980,7 +977,7 @@ async def _do_save_weights(
             type(e).__name__,
             "check_sampler_checkpoint_export",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))
 
         if webhook_url and user_id:
             failed_session_id = session.model_id if session is not None else request.model_id
@@ -1013,15 +1010,15 @@ async def load_state(
     """Load model state from checkpoint."""
     route_start_s = time.perf_counter()
     from ..gateway import (
+        async_remote_training_model,
         encode_request_id,
         forward_file,
         forward_json,
-        remote_training_model,
         upstream_for_alias,
     )
 
     session = training_manager.get_session(request.model_id) if training_manager is not None else None
-    remote = None if session is not None else remote_training_model(request.model_id)
+    remote = None if session is not None else await async_remote_training_model(request.model_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1042,14 +1039,10 @@ async def load_state(
             except PermissionError as e:
                 raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
-                import asyncio
-                import tempfile
-
                 proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
-                fd, tmp_archive = tempfile.mkstemp(prefix="gateway_ckpt_proxy_", suffix=".tar.gz")
-                os.close(fd)
+                tmp_archive = build_gateway_proxy_archive_path()
                 try:
-                    await asyncio.to_thread(create_checkpoint_archive, local_path, tmp_archive)
+                    await async_create_checkpoint_archive(local_path, tmp_archive, timeout_s=proxy_timeout_s)
                     upload_resp = await forward_file(
                         upstream=upstream,
                         path="/api/v1/checkpoints/upload",
@@ -1127,7 +1120,7 @@ async def load_state(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
@@ -1144,9 +1137,9 @@ async def load_state(
         if training_manager is not None:
             training_manager.mark_inflight(request.model_id, +1)
             inflight_marked = True
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
+        await future_store.async_mark_queued(request_id, meta={"op": "weights.load_state", "model_id": request.model_id})
         await _enqueue_weights_request_with_trace(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1164,9 +1157,9 @@ async def load_state(
     except Exception as e:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1224,7 +1217,7 @@ async def _do_load_state(
             type(e).__name__,
             "check_checkpoint_contract_and_permissions",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))
     finally:
         if inflight_marked and training_manager is not None:
             training_manager.mark_inflight(request.model_id, -1)

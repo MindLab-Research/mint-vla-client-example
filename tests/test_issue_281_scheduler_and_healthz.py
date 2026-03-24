@@ -46,6 +46,10 @@ def _manager_stub(session, *, delete_session=None):
     )
 
 
+async def _async_none(*_args, **_kwargs):
+    return None
+
+
 def _install_ray_cluster_health_stub(monkeypatch) -> None:
     ray = types.ModuleType("ray")
     ray.is_initialized = lambda: True  # type: ignore[attr-defined]
@@ -108,16 +112,43 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "modules_reset": 3, "status": "success"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_create_with_id(_request_id):
+        return None
+
+    async def _async_mark_queued(_request_id, meta=None):
+        _ = meta
+        return None
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_release_all(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    async def _restore_training_session(_model_id):
+        return None
+
+    monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_create_with_id,
+            async_mark_queued=_async_mark_queued,
             cleanup=lambda _request_id: None,
         ),
     )
@@ -126,8 +157,8 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_release_all,
         ),
     )
 
@@ -164,10 +195,14 @@ async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch)
     async def _allow_model(*, base_model, http_request):
         return base_model
 
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
     monkeypatch.setattr(gate, "enforce_base_model_allowed", _allow_model)
     monkeypatch.setattr(gateway, "upstream_for_model", lambda _base_model: None)
     monkeypatch.setattr(gateway, "get_gateway_config", lambda: None)
-    monkeypatch.setattr(gateway, "remote_training_model", lambda _model_id: None)
+    monkeypatch.setattr(gateway, "async_remote_training_model", _async_none)
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "training_manager", object())
     monkeypatch.setattr(tr, "can_access_model", lambda _base_model, _user_data: True)
@@ -175,8 +210,8 @@ async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch)
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
             cleanup=lambda _request_id: None,
         ),
     )
@@ -185,8 +220,8 @@ async def test_issue_281_create_model_enqueues_execution_serial_key(monkeypatch)
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_none,
         ),
     )
 
@@ -220,15 +255,52 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "modules_reset": 3, "status": "success"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "modules_reset": 3, "status": "success"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_create_with_id(_request_id):
+        return None
+
+    async def _async_mark_queued(_request_id, meta=None):
+        _ = meta
+        return None
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
+    async def _async_release_all(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    async def _restore_training_session(_model_id):
+        return None
+
+    monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_create_with_id,
+            async_mark_queued=_async_mark_queued,
             cleanup=lambda _request_id: None,
         ),
     )
@@ -237,8 +309,8 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_release_all,
         ),
     )
     monkeypatch.setattr(client_compat, "prefer_tinker_uri", lambda _request: True)
@@ -270,28 +342,37 @@ async def test_issue_281_reset_expert_bias_enqueues_scheduler_metadata(monkeypat
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "modules_reset": 3, "status": "success"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    monkeypatch.setattr(tr, "_restore_training_session", _async_none)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            get_status=lambda _request_id: FutureStatus.DONE,
-            get_result=lambda _request_id: {"model_id": "run-281", "modules_reset": 3, "status": "success"},
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
+            async_get_status=_async_get_status,
+            async_get_result=_async_get_result,
             cleanup=lambda _request_id: None,
         ),
     )
-    monkeypatch.setattr(tr, "run_in_threadpool", _run_inline)
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_none,
         ),
     )
 
@@ -326,27 +407,36 @@ async def test_issue_281_delete_model_enqueues_scheduler_metadata(monkeypatch) -
     async def _fake_enqueue(**kwargs):
         captured.update(kwargs)
 
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"model_id": "run-281", "status": "deleted"}
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
     monkeypatch.setattr(tr, "training_manager", _manager_stub(session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
-            get_status=lambda _request_id: FutureStatus.DONE,
-            get_result=lambda _request_id: {"model_id": "run-281", "status": "deleted"},
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
+            async_get_status=_async_get_status,
+            async_get_result=_async_get_result,
             cleanup=lambda _request_id: None,
         ),
     )
-    monkeypatch.setattr(tr, "run_in_threadpool", _run_inline)
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
     monkeypatch.setattr(
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_none,
         ),
     )
 
@@ -371,6 +461,9 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
 
     existing = SimpleNamespace(is_active=True)
 
+    async def _async_fail(request_id, error):
+        failed.update({"request_id": request_id, "error": error})
+
     monkeypatch.setattr(
         tr,
         "training_manager",
@@ -384,7 +477,7 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
         tr,
         "future_store",
         SimpleNamespace(
-            fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
+            async_fail=_async_fail,
         ),
     )
 
@@ -415,6 +508,9 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
 
     existing = SimpleNamespace(is_active=True)
 
+    async def _async_fail(request_id, error):
+        failed.update({"request_id": request_id, "error": error})
+
     monkeypatch.setattr(
         tr,
         "training_manager",
@@ -428,7 +524,7 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
         tr,
         "future_store",
         SimpleNamespace(
-            fail=lambda request_id, error: failed.update({"request_id": request_id, "error": error}),
+            async_fail=_async_fail,
         ),
     )
 
@@ -460,6 +556,9 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
     async def _fake_reset(_session):
         return {"modules_reset": 2}
 
+    async def _async_fail(request_id, error):
+        resolved.update({"failed_request_id": request_id, "error": error})
+
     monkeypatch.setattr(
         tr,
         "training_engine",
@@ -470,13 +569,13 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
         "training_manager",
         _manager_stub(SimpleNamespace(model_id="run-281")),
     )
-    monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    monkeypatch.setattr(tr, "_restore_training_session", _async_none)
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
             resolve=lambda request_id, payload: resolved.update({"request_id": request_id, "payload": payload}),
-            fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
+            async_fail=_async_fail,
         ),
     )
 
@@ -564,16 +663,23 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
     async def _fake_reset(_session):
         return {"modules_reset": 1}
 
+    async def _async_fail(request_id, error):
+        resolved.update({"failed_request_id": request_id, "error": error})
+
+    async def _async_try_reserve(*args, **kwargs):
+        _ = (args, kwargs)
+        return {"ok": True}
+
     monkeypatch.setattr(tr, "training_manager", manager)
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(reset_expert_bias=_fake_reset))
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            create_with_id=lambda _request_id: None,
-            mark_queued=lambda _request_id, meta=None: None,
+            async_create_with_id=_async_none,
+            async_mark_queued=_async_none,
             resolve=lambda request_id, payload: resolved.update({"request_id": request_id, "payload": payload}),
-            fail=lambda request_id, error: resolved.update({"failed_request_id": request_id, "error": error}),
+            async_fail=_async_fail,
         ),
     )
     monkeypatch.setattr(awq, "api_work_queue", SimpleNamespace(enqueue=_fake_enqueue))
@@ -581,8 +687,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         cm,
         "capacity_manager",
         SimpleNamespace(
-            try_reserve=lambda *args, **kwargs: {"ok": True},
-            release_all=lambda *_args, **_kwargs: None,
+            async_try_reserve=_async_try_reserve,
+            async_release_all=_async_none,
         ),
     )
 
@@ -601,7 +707,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
     assert resolved["payload"]["modules_reset"] == 1
 
 
-def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeypatch) -> None:
     from tinker_server.backend.training_session_manager import TrainingSessionManager
     from tinker_server.routes import training as tr
 
@@ -609,9 +716,9 @@ def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeyp
     manager = TrainingSessionManager()
     monkeypatch.setattr(tr, "training_manager", manager)
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(_workers={}, _resource_pool_actor_names={}))
-    monkeypatch.setattr(
-        "tinker_server.backend.training_session_store.get_training_session_info",
-        lambda _model_id: {
+
+    async def _async_get_training_session_info(_model_id):
+        return {
             "model_id": "run-restore",
             "session_id": "sess-restore",
             "model_seq_id": 0,
@@ -620,10 +727,14 @@ def test_issue_281_restore_training_session_uses_persisted_last_activity(monkeyp
             "backend": "peft",
             "created_at": "2026-03-20T10:00:00",
             "last_activity": 1234.5,
-        },
+        }
+
+    monkeypatch.setattr(
+        "tinker_server.backend.training_session_store.async_get_training_session_info",
+        _async_get_training_session_info,
     )
 
-    session = tr._restore_training_session("run-restore")
+    session = await tr._restore_training_session("run-restore")
 
     assert session is not None
     assert session.last_activity == pytest.approx(1234.5)
@@ -638,17 +749,25 @@ async def test_issue_281_internal_wait_releases_capacity_and_cleans_future(monke
     released: list[str] = []
     cleaned: list[str] = []
 
+    async def _async_get_status(_request_id):
+        return FutureStatus.DONE
+
+    async def _async_get_result(_request_id):
+        return {"ok": True}
+
+    async def _async_release_all(request_id):
+        released.append(request_id)
+
     monkeypatch.setattr(
         tr,
         "future_store",
         SimpleNamespace(
-            get_status=lambda _request_id: FutureStatus.DONE,
-            get_result=lambda _request_id: {"ok": True},
-            cleanup=lambda request_id: cleaned.append(request_id),
+            async_get_status=_async_get_status,
+            async_get_result=_async_get_result,
+            async_cleanup=lambda request_id: cleaned.append(request_id),
         ),
     )
-    monkeypatch.setattr(tr, "run_in_threadpool", _run_inline)
-    monkeypatch.setattr(cm, "capacity_manager", SimpleNamespace(release_all=lambda request_id: released.append(request_id)))
+    monkeypatch.setattr(cm, "capacity_manager", SimpleNamespace(async_release_all=_async_release_all))
 
     out = await tr._wait_internal_future_result("rid-283")
 
@@ -732,6 +851,84 @@ async def test_issue_281_internal_deep_healthz_pending_pg_is_observation_not_fai
     assert payload["status"] == "ready"
     assert payload["ray_observation"]["reason"] == "pending_placement_groups"
     assert payload["ray_observation"]["pending_pg_names"] == ["pg-a"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_kill_dense_actors_uses_named_actor_helper(monkeypatch) -> None:
+    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.routes import service
+
+    killed: list[tuple[str, str, str | None]] = []
+    unregistered: list[str] = []
+
+    async def _fake_kill(
+        actor_name: str,
+        namespace: str,
+        *,
+        actor_handle=None,
+        base_model: str | None,
+        reason: str,
+        timeout_s: float = 10.0,
+        verify_absent: bool = False,
+    ):
+        _ = (actor_handle, reason, timeout_s, verify_absent)
+        killed.append((actor_name, namespace, base_model))
+        return True
+
+    pool = SimpleNamespace(
+        iter_entries=lambda: [
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-a",
+                namespace="ns-a",
+                base_model="model-a",
+                actor_handle=None,
+            )
+        ],
+        unregister=lambda actor_name: unregistered.append(actor_name),
+    )
+
+    monkeypatch.setattr(service, "async_kill_named_actor", _fake_kill)
+    monkeypatch.setattr("tinker_server.backend.resource_pool.get_resource_pool", lambda: pool)
+
+    killed_count = await service._kill_dense_actors("model-a")
+
+    assert killed_count == 1
+    assert killed == [("dense-a", "ns-a", "model-a")]
+    assert unregistered == ["dense-a"]
+
+
+@pytest.mark.anyio
+async def test_issue_281_kill_dense_actors_keeps_best_effort_unregister(monkeypatch) -> None:
+    from tinker_server.backend.resource_pool import ActorType
+    from tinker_server.routes import service
+
+    unregistered: list[str] = []
+
+    async def _fake_kill(actor_name: str, namespace: str, *, base_model: str | None, timeout_s: float = 10.0):
+        _ = (actor_name, namespace, base_model, timeout_s)
+        raise RuntimeError("kill failed")
+
+    pool = SimpleNamespace(
+        iter_entries=lambda: [
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-b",
+                namespace="ns-b",
+                base_model="model-b",
+                actor_handle=None,
+            )
+        ],
+        unregister=lambda actor_name: unregistered.append(actor_name),
+    )
+
+    monkeypatch.setattr(service, "async_kill_named_actor", _fake_kill)
+    monkeypatch.setattr("tinker_server.backend.resource_pool.get_resource_pool", lambda: pool)
+
+    killed_count = await service._kill_dense_actors("model-b")
+
+    assert killed_count == 1
+    assert unregistered == ["dense-b"]
 
 
 def test_issue_281_http_route_label_prefers_route_template() -> None:

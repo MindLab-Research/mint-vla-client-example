@@ -385,7 +385,19 @@ API server:
 - `FutureStore`
 - in-process sampling mappings
 
-These are all process-memory state and are lost on API restart.
+Only the first and third items above are process-memory state and lost on API restart. `FutureStore` itself is a detached Ray actor.
+
+More precisely:
+
+- Lost on API restart:
+  - `TrainingSessionManager`
+  - in-process sampling mappings
+  - other API-host registries and live actor bindings
+- Preserved in detached control-plane actors:
+  - `FutureStore`
+  - training-session recovery metadata used by `_restore_training_session(...)`
+
+That preserved metadata is enough for request polling and some routing recovery, but it is not a durable training-state checkpoint. Backend actor memory and in-process session bindings can still be lost independently.
 
 So "session isolation" and "durable resume" are related but separate concerns.
 
