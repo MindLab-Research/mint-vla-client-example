@@ -12,6 +12,7 @@ import os
 import threading
 import logging
 import json
+import re
 from dataclasses import dataclass
 
 import ray
@@ -67,8 +68,14 @@ def _make_actor_name(*, model_key: str, max_rank: int) -> str:
     return f"{PERSISTENT_DENSE_ACTOR_PREFIX}{model_name}_maxr{int(max_rank)}"
 
 
+def _sanitize_pg_component(value: str | None) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or "default"
+
+
 def _pg_name(actor_name: str) -> str:
-    return f"{actor_name}_pg"
+    return f"{actor_name}_{_sanitize_pg_component(PERSISTENT_DENSE_NAMESPACE)}_pg"
 
 
 def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) -> str | None:

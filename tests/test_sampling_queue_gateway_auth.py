@@ -13,6 +13,11 @@ class _StubFutureStore:
         return None
 
 
+class _StubCapacityManager:
+    def ensure_ready(self) -> None:
+        return None
+
+
 class _StubSessionManager:
     def __init__(self, **_kwargs):
         self.multi_model_manager = None
@@ -28,6 +33,12 @@ class _StubSessionManager:
 
 
 class _StubTrainingManager:
+    def __init__(self, *_args, **_kwargs):
+        return None
+
+    async def start_cleanup_task(self, _engine) -> None:
+        return None
+
     async def shutdown_all(self, _engine) -> None:
         return None
 
@@ -40,6 +51,9 @@ class _StubTrainingEngine:
 class _StubApiWorkQueue:
     def __init__(self):
         self._executors: dict[str, object] = {}
+
+    def ensure_ready(self) -> None:
+        return None
 
     def set_executor(self, op: str, executor) -> None:
         self._executors[str(op)] = executor
@@ -72,8 +86,12 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setattr(app_module.config, "api_work_queue_num_workers", 1)
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
+    session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
+    training_session_store_module = importlib.import_module("tinker_server.backend.training_session_store")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
@@ -82,8 +100,12 @@ def test_sampling_queue_executor_forwards_gateway_auth(monkeypatch):
     monkeypatch.setitem(sys.modules, "tinker_server.backend.verl_training", verl_training_module)
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
+    monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
+    monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(verl_training_module, "VerlTrainingEngine", _StubTrainingEngine)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})

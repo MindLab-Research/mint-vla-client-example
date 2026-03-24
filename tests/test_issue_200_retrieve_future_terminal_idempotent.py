@@ -15,16 +15,16 @@ class _StubFutureStore:
         self._error = "error:default" if error is self._UNSET else error
         self.cleanup_calls: list[str] = []
 
-    def get_status(self, request_id: str) -> FutureStatus:
+    async def async_get_status(self, request_id: str) -> FutureStatus:
         return self._status
 
-    def get_result(self, request_id: str):
+    async def async_get_result(self, request_id: str):
         return self._result
 
-    def get_error(self, request_id: str):
+    async def async_get_error(self, request_id: str):
         return self._error
 
-    def cleanup(self, request_id: str) -> None:
+    async def async_cleanup(self, request_id: str) -> None:
         self.cleanup_calls.append(request_id)
 
 

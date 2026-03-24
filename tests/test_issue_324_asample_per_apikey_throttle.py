@@ -21,29 +21,29 @@ class _StubSamplingSessionManager:
 
 
 class _StubFutureStore:
-    def create_with_id(self, _request_id: str):
+    async def async_create_with_id(self, _request_id: str):
         return None
 
-    def mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
+    async def async_mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
         _ = meta
 
-    def ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
+    async def async_ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
         _ = (request_id, meta)
         return {"created": True, "meta": None}
 
-    def cleanup(self, _request_id: str) -> None:
+    async def async_cleanup(self, _request_id: str) -> None:
         return None
 
-    def forget(self, _request_id: str) -> None:
+    async def async_forget(self, _request_id: str) -> None:
         return None
 
 
 class _StubCapacityManager:
-    def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+    async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
         _ = (request_id, queue_bytes, object_store_bytes)
         return {"ok": True}
 
-    def release_all(self, _request_id: str) -> None:
+    async def async_release_all(self, _request_id: str) -> None:
         return None
 
 
@@ -130,7 +130,7 @@ def test_issue_324_compute_logprobs_records_capacity_rejection_metric(monkeypatc
     metric_calls: list[dict] = []
 
     class _RejectingCapacityManager:
-        def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+        async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": False, "queue_bytes": 123, "object_store_bytes": 456}
 

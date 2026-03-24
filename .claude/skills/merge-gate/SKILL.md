@@ -392,7 +392,8 @@ Do not imply that running merge-gate automatically creates a release artifact.
 
 If the user explicitly asks for release mechanics after merge-gate work, keep the following workflow in this skill:
 
-- review `origin/main..origin/develop`
+- resolve the real previous nightly tag
+- review the actual code/content changes since that nightly
 - summarize changes into a human-readable changelog
 - create an annotated nightly tag named `nightly_YYYYMMDD`
 - push the tag
@@ -401,14 +402,42 @@ If the user explicitly asks for release mechanics after merge-gate work, keep th
 Hard rules for that release flow:
 
 - Do not create a tag or PR without explicit user confirmation for that step.
-- The tag message and PR body should summarize user-facing changes, not dump a raw commit list.
+- Resolve the real previous nightly tag from the actual available tags. Never guess from one naming convention.
+- Always check both nightly naming conventions: `nightly-*` and `nightly_*`.
+- Prefer the newest real nightly by tag date / remote truth, not whatever one local grep happens to return first.
+- Read the actual diff content before writing the tag message or PR body.
+- Do not write filler like "included recent upstream changes", "various fixes", "multiple improvements", or any other umbrella phrase that avoids naming the substance.
+- A raw commit list is not acceptable, and a hand-wavy summary is not acceptable.
+- Every top-level bullet in the tag message and PR body must map to concrete inspected changes in the diff range.
+- If a bullet cannot be backed by specific inspected changes, delete it.
 - If merge-gate was skipped or only partially run, state that explicitly in the tag message and PR body.
 - If validation found unresolved issues, do not hide them in the release summary.
 
 Useful commands for the explicit release step:
 
 ```bash
-PREV_TAG=$(git tag -l 'nightly_*' --sort=-creatordate | head -1)
+git tag -l 'nightly-*' --sort=-creatordate
+git tag -l 'nightly_*' --sort=-creatordate
+git ls-remote --tags origin 'nightly*'
 git log "$PREV_TAG"..HEAD --oneline --no-merges
-git diff origin/main..origin/develop --stat
+git diff --stat "$PREV_TAG"..HEAD
 ```
+
+Required release-summary method:
+
+1. Resolve `PREV_TAG` from the real latest nightly tag after checking both naming schemes and remote tags.
+2. Inspect all of:
+   - `git log --oneline --no-merges "$PREV_TAG"..HEAD`
+   - `git log --merges --oneline "$PREV_TAG"..HEAD`
+   - `git diff --stat "$PREV_TAG"..HEAD`
+   - targeted file diffs for every major changed area
+3. Identify the real changed areas from the diff itself.
+   Example categories:
+   - training/runtime correctness
+   - serving/routing
+   - observability
+   - developer/runbook/ops surface
+4. Write the summary from those real changed areas.
+   Each bullet must say what changed in plain language and why it matters.
+5. If the diff is large, read more and write more.
+   Diff size never justifies vagueness.

@@ -31,6 +31,66 @@ class _DummyRequest:
         self.url = _DummyURL(url_path)
 
 
+def test_issue_218_async_checkpoint_archive_delegates_to_ray_helper(tmp_path, monkeypatch):
+    import tinker_server.checkpoints as checkpoints
+
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    archive_path = tmp_path / "out.tar.gz"
+    seen: dict[str, object] = {}
+
+    class _FakeRemote:
+        def remote(self, checkpoint_dir: str, archive: str):
+            seen["remote_args"] = (checkpoint_dir, archive)
+            return "fake-ref"
+
+    monkeypatch.setattr(checkpoints, "_create_checkpoint_archive_remote", lambda: _FakeRemote())
+    monkeypatch.setattr("tinker_server.backend.async_ray_control._ensure_ray_initialized", lambda: seen.setdefault("init", True))
+
+    async def _fake_await_ray_ref(ref):
+        seen["ref"] = ref
+        Path(archive_path).write_bytes(b"archive")
+        return str(archive_path)
+
+    monkeypatch.setattr("tinker_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
+
+    asyncio.run(checkpoints.async_create_checkpoint_archive(str(ckpt_dir), str(archive_path), timeout_s=12.5))
+
+    assert seen["remote_args"] == (str(ckpt_dir), str(archive_path))
+    assert seen["ref"] == "fake-ref"
+    assert archive_path.exists()
+
+
+def test_issue_218_async_checkpoint_archive_cancels_ray_task_on_timeout(tmp_path, monkeypatch):
+    import pytest
+
+    import tinker_server.checkpoints as checkpoints
+
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    archive_path = tmp_path / "out-timeout.tar.gz"
+    cancelled: list[tuple[object, bool]] = []
+
+    class _FakeRemote:
+        def remote(self, checkpoint_dir: str, archive: str):
+            _ = (checkpoint_dir, archive)
+            return "timeout-ref"
+
+    monkeypatch.setattr(checkpoints, "_create_checkpoint_archive_remote", lambda: _FakeRemote())
+    monkeypatch.setattr("tinker_server.backend.async_ray_control._ensure_ray_initialized", lambda: None)
+
+    async def _fake_await_ray_ref(_ref):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr("tinker_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
+    monkeypatch.setattr("ray.cancel", lambda ref, force=False: cancelled.append((ref, force)))
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(checkpoints.async_create_checkpoint_archive(str(ckpt_dir), str(archive_path), timeout_s=0.01))
+
+    assert cancelled == [("timeout-ref", True)]
+
+
 def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(tmp_path, monkeypatch):
     import tinker_server.gateway as gw
     from tinker_server.gateway import Upstream
@@ -47,11 +107,11 @@ def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(
 
     archive_called = []
 
-    def _fake_create_archive(checkpoint_dir: str, archive_path: str) -> None:
-        archive_called.append((checkpoint_dir, archive_path))
+    async def _fake_async_create_archive(checkpoint_dir: str, archive_path: str, *, timeout_s: float = 600.0) -> None:
+        archive_called.append((checkpoint_dir, archive_path, timeout_s))
         Path(archive_path).write_bytes(b"fake")
 
-    monkeypatch.setattr(tr, "create_checkpoint_archive", _fake_create_archive)
+    monkeypatch.setattr(tr, "async_create_checkpoint_archive", _fake_async_create_archive)
 
     upstream = Upstream(alias="up", base_url="http://upstream.example", auth_mode="none")
     monkeypatch.setattr(gw, "upstream_for_model", lambda _model: upstream)
@@ -99,6 +159,7 @@ def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(
 
     assert gw.decode_request_id(out.request_id) == ("up", "rid")
     assert archive_called and archive_called[0][0] == str(ckpt_dir)
+    assert archive_called[0][2] == 600.0
 
 
 def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, monkeypatch):
@@ -115,14 +176,17 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
 
     archive_called = []
 
-    def _fake_create_archive(checkpoint_dir: str, archive_path: str) -> None:
-        archive_called.append((checkpoint_dir, archive_path))
+    async def _fake_async_create_archive(checkpoint_dir: str, archive_path: str, *, timeout_s: float = 600.0) -> None:
+        archive_called.append((checkpoint_dir, archive_path, timeout_s))
         Path(archive_path).write_bytes(b"fake")
 
-    monkeypatch.setattr(wt, "create_checkpoint_archive", _fake_create_archive)
+    monkeypatch.setattr(wt, "async_create_checkpoint_archive", _fake_async_create_archive)
 
     upstream = Upstream(alias="up", base_url="http://upstream.example", auth_mode="none")
     monkeypatch.setattr(gw, "remote_training_model", lambda _model_id: ("up", "Qwen/Qwen3-30B-A3B-Instruct-2507"))
+    async def _fake_async_remote_training_model(_model_id: str):
+        return ("up", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    monkeypatch.setattr(gw, "async_remote_training_model", _fake_async_remote_training_model)
     monkeypatch.setattr(gw, "upstream_for_alias", lambda _alias: upstream)
 
     async def _fake_forward_file(*, upstream, path, incoming_headers, file_path, **_kwargs):
@@ -156,3 +220,4 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
 
     assert gw.decode_request_id(out.request_id) == ("up", "rid")
     assert archive_called and archive_called[0][0] == str(ckpt_dir)
+    assert archive_called[0][2] == 600.0

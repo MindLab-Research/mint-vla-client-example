@@ -725,6 +725,9 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
+    from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
+    from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
+    from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .checkpoints import (
         get_checkpoint_mirror_poll_s,
         get_checkpoint_reap_interval_s,
@@ -733,6 +736,9 @@ async def lifespan(app: FastAPI):
     )
 
     future_store.ensure_ready()
+    ensure_gateway_session_store_ready()
+    ensure_session_index_store_ready()
+    ensure_training_session_store_ready()
 
     # ==========================================================================
     # Cleanup: Kill stale actors from previous server runs
@@ -828,6 +834,21 @@ async def lifespan(app: FastAPI):
     await _prewarm_persistent_models(train_engine, multi_model_manager)
 
     # ==========================================================================
+    # OpenAI compat: preload tokenizers so request paths stay non-blocking
+    # ==========================================================================
+    try:
+        preload_failures = openai_compat.preload_supported_tokenizers()
+        if preload_failures:
+            logger.warning(
+                "OpenAI-compatible tokenizer preload incomplete: %s",
+                preload_failures,
+            )
+        else:
+            logger.info("OpenAI-compatible tokenizers preloaded")
+    except Exception as e:
+        logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+
+    # ==========================================================================
     # Issue #84: Admission control + API work queue workers + future reaper
     # ==========================================================================
     from .backend.api_work_queue import api_work_queue
@@ -850,6 +871,9 @@ async def lifespan(app: FastAPI):
         ForwardBackwardReverseKLRequest,
         InterpolateCheckpointsRequest,
     )
+
+    capacity_manager.ensure_ready()
+    api_work_queue.ensure_ready()
 
     async def _exec_sampling_asample(item):
         async def _run():
@@ -1263,6 +1287,8 @@ async def lifespan(app: FastAPI):
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+
+    openai_compat.shutdown_tokenizer_executor()
 
     from .usage_store import close_usage_store
 

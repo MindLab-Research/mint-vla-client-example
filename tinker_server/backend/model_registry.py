@@ -152,6 +152,18 @@ MODEL_CONFIGS = {
         max_lora_rank=64,
         gradient_checkpointing=True,  # Required for sequences >8000 tokens
     ),
+    "Qwen/Qwen3-4B-Thinking-2507": ModelConfig(
+        num_parameters=4.0,
+        is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
+        max_model_len=32768,  # 32K context
+        max_num_seqs=416,  # Same dense serving/training envelope as 4B instruct
+        max_num_batched_tokens=1024,
+        gpu_memory_utilization=0.90,
+        max_loras=12,
+        max_cpu_loras=120,
+        max_lora_rank=64,
+        gradient_checkpointing=True,  # Required for sequences >8000 tokens
+    ),
     "Qwen/Qwen3-8B": ModelConfig(
         num_parameters=8.0,
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
@@ -236,6 +248,22 @@ MODEL_CONFIGS = {
         gradient_checkpointing=True,
         vllm_engine="async",
         vllm_distributed_executor_backend="ray",
+    ),
+    "zai-org/GLM-5": ModelConfig(
+        num_parameters=355.0,
+        is_moe=True,
+        inference_tp=1,
+        inference_dp=1,
+        train_tp=4,
+        train_pp=1,
+        train_ep=8,
+        max_model_len=8192,
+        max_num_seqs=1,
+        max_num_batched_tokens=1024,
+        gpu_memory_utilization=0.90,
+        max_loras=0,
+        max_cpu_loras=0,
+        max_lora_rank=64,
     ),
     # Kimi K2 - 1.04T param MoE (384 experts × 61 layers, 8 active per token)
     # Architecture: hidden=7168, moe_intermediate=2048 per expert
@@ -562,8 +590,10 @@ def list_supported_models() -> list[str]:
 
     allowed = [
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-4B-Thinking-2507",
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-0.6B",
+        "zai-org/GLM-5",
         "moonshotai/Kimi-K2-Instruct",
         "moonshotai/Moonlight-16B-A3B-Instruct",
     ]

@@ -247,3 +247,4 @@ REFLECTION_*.md
 # Frontend package managers
 node_modules/
 .pnpm-store/
+.learnings/ERRORS.md

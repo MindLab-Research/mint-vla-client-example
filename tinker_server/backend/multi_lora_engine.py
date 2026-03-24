@@ -1308,6 +1308,7 @@ def _resolve_model_path(model_name: str) -> str:
         "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
         "Qwen/Qwen3-4B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/main",
+        "Qwen/Qwen3-4B-Thinking-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/main",
         # MoE models (all share same architecture, different checkpoints)
         "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
@@ -1464,7 +1465,7 @@ class MultiModelInferenceManager:
                                     "Cached multi-node vLLM engine for %s has no live named actor, recreating",
                                     model_name,
                                 )
-                                del self._engines[model_name]
+                                self._engines.pop(model_name, None)
                             else:
                                 logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
                                 return engine
@@ -1485,7 +1486,7 @@ class MultiModelInferenceManager:
                         logger.warning(
                             f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
                         )
-                        del self._engines[model_name]
+                        self._engines.pop(model_name, None)
                     except ray.exceptions.GetTimeoutError:
                         # Actor tasks can queue behind long-running generations/logprobs.
                         # A short timeout here is not evidence of death.
@@ -1498,10 +1499,10 @@ class MultiModelInferenceManager:
                         logger.warning(
                             f"Cached vLLM engine for {model_name} has dead actor, recreating"
                         )
-                        del self._engines[model_name]
+                        self._engines.pop(model_name, None)
                 else:
                     # Engine has no actor handle, remove stale entry
-                    del self._engines[model_name]
+                    self._engines.pop(model_name, None)
 
             # Get model config for parallelism settings
             from tinker_server.backend.model_registry import get_model_config

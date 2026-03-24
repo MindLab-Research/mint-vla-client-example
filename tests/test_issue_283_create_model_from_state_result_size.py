@@ -46,7 +46,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
-        def try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
+        async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             self.calls.append(
                 {
                     "request_id": request_id,
@@ -56,7 +56,7 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
             )
             return {"ok": True}
 
-        def release_all(self, request_id: str) -> None:
+        async def async_release_all(self, request_id: str) -> None:
             return None
 
     class StubWorkQueue:
@@ -85,13 +85,13 @@ def test_issue_283_create_model_from_state_uses_small_result_reservation(
             )
 
     class StubFutureStore:
-        def create_with_id(self, request_id: str) -> None:
+        async def async_create_with_id(self, request_id: str) -> None:
             return None
 
-        def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             return None
 
-        def cleanup(self, request_id: str) -> None:
+        async def async_cleanup(self, request_id: str) -> None:
             return None
 
     stub_capacity = StubCapacityManager()
@@ -184,14 +184,20 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
 
     class StubSession:
         def __init__(self) -> None:
+            self.model_id = "s283-bg_0"
             self.current_step = 11
             self.learning_rate = 1e-4
+            self.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
             self.backend = "megatron"
             self.created_at = "2026-03-13T00:00:00Z"
+            self.last_activity = 0.0
 
     class StubTrainingManager:
         def get_session(self, model_id: str):
             return None
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            _ = (model_id, delta)
 
         def delete_session(self, model_id: str) -> None:
             return None
@@ -220,7 +226,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
         def resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
 
-        def fail(self, request_id: str, error: str) -> None:
+        async def async_fail(self, request_id: str, error: str) -> None:
             raise AssertionError(f"unexpected fail({request_id}): {error}")
 
     stub_engine = StubTrainingEngine()
@@ -283,11 +289,11 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     )
 
     class StubCapacityManager:
-        def try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
+        async def async_try_reserve(self, request_id: str, *, queue_bytes: int, object_store_bytes: int) -> dict:
             _ = (request_id, queue_bytes, object_store_bytes)
             return {"ok": True}
 
-        def release_all(self, request_id: str) -> None:
+        async def async_release_all(self, request_id: str) -> None:
             _ = request_id
 
     class StubWorkQueue:
@@ -316,22 +322,27 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
             )
 
     class StubFutureStore:
-        def create_with_id(self, request_id: str) -> None:
+        async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
-        def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             _ = (request_id, meta)
 
-        def cleanup(self, request_id: str) -> None:
+        async def async_cleanup(self, request_id: str) -> None:
             _ = request_id
 
     class StubSession:
         model_id = "model-283"
+        base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        backend = "megatron"
 
     class StubTrainingManager:
         def get_session(self, model_id: str):
             _ = model_id
             return StubSession()
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            _ = (model_id, delta)
 
     stub_queue = StubWorkQueue()
 
@@ -390,10 +401,15 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
 
     class StubSession:
         model_id = "model-283"
+        base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        backend = "megatron"
 
     class StubTrainingManager:
         def get_session(self, model_id: str):
             return StubSession()
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            _ = (model_id, delta)
 
     class StubTrainingEngine:
         def __init__(self) -> None:
@@ -409,7 +425,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
         def resolve(self, request_id: str, payload: dict) -> None:
             self.resolved.append((request_id, payload))
 
-        def fail(self, request_id: str, error: str) -> None:
+        async def async_fail(self, request_id: str, error: str) -> None:
             raise AssertionError(f"unexpected fail({request_id}): {error}")
 
     stub_engine = StubTrainingEngine()

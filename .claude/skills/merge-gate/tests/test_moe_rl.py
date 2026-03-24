@@ -14,6 +14,7 @@ from .conftest import (
     create_session,
     forward_backward,
     optim_step,
+    save_weights_for_sampler,
     save_weights,
     sample,
 )
@@ -92,6 +93,7 @@ class TestMoERL:
         session_id, model_id = create_session(MOE_MODEL, lora_rank=32, lr=lr)
 
         save_weights(model_id, name="moe_rl_init")
+        sampling_session_id = save_weights_for_sampler(model_id)
 
         session = SessionData(
             session_id=session_id,
@@ -104,7 +106,7 @@ class TestMoERL:
         for i in range(num_iterations):
             t0 = time.time()
 
-            rollouts = generate_rollouts(moe_tokenizer, model_id, ARITHMETIC_PROBLEMS)
+            rollouts = generate_rollouts(moe_tokenizer, sampling_session_id, ARITHMETIC_PROBLEMS)
             if not rollouts:
                 continue
 
@@ -133,6 +135,7 @@ class TestMoERL:
             grad_norm = float(grad_norm) if grad_norm is not None else None
 
             save_weights(model_id, name=f"moe_rl_iter_{i+1}")
+            sampling_session_id = save_weights_for_sampler(model_id)
 
             session.add_iteration(
                 iteration=i + 1,

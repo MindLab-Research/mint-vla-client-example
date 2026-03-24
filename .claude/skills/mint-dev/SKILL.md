@@ -752,9 +752,10 @@ ssh mint-dev '/root/.volc/bin/volc ml_task list --output json --limit 200' | jq 
 ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' | grep "Local node IP"
 ```
 
-**DO NOT run `ray start` on `mint-dev`:**
-- `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
-- Use `ray.init(address=...)` in Python or use Ray CLI commands that connect to the head without starting a local node.
+**After a fresh dev-cluster rebuild, join `mint-dev` to the head as a zero-resource Ray node before any `ray.init(...)` or `scripts/run_server.py`:**
+- Direct `ray.init(address=...)` from `mint-dev` can fail with local `node_ip_address.json` / missing-local-raylet errors even when the head is healthy.
+- The working attach pattern is a local Ray node with `--num-cpus=0 --num-gpus=0`, so `mint-dev` remains a driver/API host and does not contribute schedulable compute.
+- Do not use `hostname -I | awk '{print $1}'` for `MINT_RAY_NODE_IP_ADDRESS`. Derive the API-host IP from the route to the head.
 
 **Placement-group hygiene before retrying a large actor:**
 - If exact nodes are physically idle but `healthz` reports pending placement groups, inspect the global placement-group table before any retry.
@@ -762,11 +763,20 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 - Do not treat idle GPUs as proof that Ray has no logical reservations.
 - If you have not listed non-REMOVED PGs yet, you are not ready to start a new actor.
 
-**Safe connectivity check (no local raylet):**
+**Correct attach and connectivity check:**
 ```bash
+ssh mint-dev "python3 - <<'PY'\nimport socket\ns=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.connect(('<RAY_HEAD_IP>', 6379))\nprint(s.getsockname()[0])\ns.close()\nPY"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray stop --force || true"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray start --address='<RAY_HEAD_IP>:6379' --num-cpus=0 --num-gpus=0 --disable-usage-stats"
 ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
-ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
+ssh mint-dev "export MINT_RAY_NODE_IP_ADDRESS='<API_IP_FROM_ROUTE_TO_HEAD>'; export MINT_RAY_TEMP_DIR=/tmp/ray_api_driver; cd /vePFS-Mindverse/share/code/$USER/tinker-server; /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nfrom tinker_server.ray_utils import init_ray\nimport ray\ninit_ray(address='<RAY_HEAD_IP>:6379', ignore_reinit_error=True)\nprint(ray.cluster_resources())\nray.shutdown()\nPY"
 ```
+
+**Canonical dev server bring-up after cluster rebuild:**
+- 1. Attach `mint-dev` to the head with zero resources using `ray start --address=... --num-cpus=0 --num-gpus=0`.
+- 2. Export `MINT_RAY_NODE_IP_ADDRESS` from the route-derived API IP and a fresh `MINT_RAY_TEMP_DIR`.
+- 3. Then start `scripts/run_server.py`.
+- 4. If `ray.init` fails before startup completes, stop and fix this attach step first. Do not thrash on server env, healthz, or training logic before the attach is correct.
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
 

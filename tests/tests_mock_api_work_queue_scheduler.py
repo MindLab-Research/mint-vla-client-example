@@ -1,8 +1,13 @@
 import asyncio
 import importlib
 import importlib.machinery
+import json
 import sys
+import tempfile
 import types
+from pathlib import Path
+
+import tomllib
 
 import pytest
 
@@ -45,17 +50,38 @@ def _install_ray_stub(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
+def _materialize_runtime_env(root: Path) -> None:
+    from tinker_server.runtime_env import checkout_runtime_env_layout
+
+    layout = checkout_runtime_env_layout(str(root))
+    runtime = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]
+    manifest = {
+        "runtime_env": {
+            "site_packages_dir": runtime.get("site_packages_dir", "site-packages"),
+            "source_dir": runtime.get("source_dir", "src"),
+            "host_venv_dir": runtime.get("host_venv_dir", "host-venv"),
+        },
+        "sources": runtime["sources"],
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
+    for entry in layout.pythonpath_entries[1:]:
+        Path(entry).mkdir(parents=True, exist_ok=True)
+
+
 def _load_api_work_queue_module(monkeypatch):
+    runtime_root = Path(tempfile.mkdtemp(prefix="mint-issue360-runtime-env-"))
+    _materialize_runtime_env(runtime_root)
+    monkeypatch.setenv("RAY_ADDRESS", "auto")
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(runtime_root))
+    monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     _install_ray_stub(monkeypatch)
-    import tinker_server.config as config_mod
+    import tinker_server.config as config_module
     import tinker_server.backend.api_work_queue as api_work_queue
 
-    monkeypatch.setattr(config_mod, "PFS_PYTHONPATH", "")
-    monkeypatch.setattr(
-        config_mod,
-        "actor_runtime_env_vars",
-        lambda *, pythonpath, extra=None: {"PYTHONPATH": pythonpath, **(extra or {})},
-    )
+    importlib.reload(config_module)
     return importlib.reload(api_work_queue)
 
 
@@ -429,10 +455,14 @@ def test_issue_324_reconcile_stale_running_requests_fails_pending_leased_request
             fail=lambda request_id, error: failed.append((request_id, error)),
         ),
     )
+
+    async def _async_release_all(request_id):
+        released.append(request_id)
+
     monkeypatch.setattr(
         capacity_manager_module,
         "capacity_manager",
-        types.SimpleNamespace(release_all=lambda request_id: released.append(request_id)),
+        types.SimpleNamespace(async_release_all=_async_release_all),
     )
 
     asyncio.run(client._reconcile_stale_running_requests("consumer-new"))
