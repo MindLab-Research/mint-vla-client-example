@@ -44,6 +44,20 @@ def _response_stub():
     return SimpleNamespace(status_code=200, headers={})
 
 
+def _install_minimal_ray_module(monkeypatch):
+    ray_mod = types.ModuleType("ray")
+    ray_mod.actor = SimpleNamespace(ActorHandle=object)
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    return ray_mod
+
+
+def _install_namespace_module(monkeypatch, module_name: str, namespace: str):
+    module = types.ModuleType(module_name)
+    module.PERSISTENT_NAMESPACE = namespace
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return module
+
+
 class _GatewayResponse:
     def __init__(self, payload: dict, *, status_code: int = 200, text: str = ""):
         self._payload = dict(payload)
@@ -465,6 +479,7 @@ def test_issue_360_internal_admission_stats_uses_async_store_calls(monkeypatch):
     wq = importlib.import_module("tinker_server.backend.api_work_queue")
     cm = importlib.import_module("tinker_server.backend.capacity_manager")
     fs = importlib.import_module("tinker_server.backend.future_store")
+    _install_minimal_ray_module(monkeypatch)
     rp = importlib.import_module("tinker_server.backend.resource_pool")
 
     monkeypatch.setattr(cm, "capacity_manager", _AsyncOnlyAdmissionCapacityManager())
@@ -1059,12 +1074,13 @@ def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monke
         actor_name: str,
         namespace: str,
         *,
+        actor_handle=None,
         base_model: str | None,
         reason: str,
         timeout_s: float = 10.0,
         verify_absent: bool = False,
     ):
-        _ = (reason, timeout_s, verify_absent)
+        _ = (actor_handle, reason, timeout_s, verify_absent)
         kill_calls.append((actor_name, namespace, base_model))
         return True
 
@@ -1081,6 +1097,7 @@ def test_issue_360_kill_dense_actors_uses_actor_name_without_cached_handle(monke
         unregister=lambda actor_name: unregister_calls.append(actor_name),
     )
 
+    _install_minimal_ray_module(monkeypatch)
     import tinker_server.backend.resource_pool as rp
 
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
@@ -1110,6 +1127,8 @@ def test_issue_360_kill_exact_vllm_actor_propagates_lookup_failures(monkeypatch)
     async def _async_lookup_actor_handle(*_args, **_kwargs):
         raise RuntimeError("ray unavailable")
 
+    _install_minimal_ray_module(monkeypatch)
+    _install_namespace_module(monkeypatch, "tinker_server.backend.multi_lora_engine", "ns-vllm")
     import tinker_server.backend.resource_pool as rp
 
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(VLLM="vllm"))
@@ -1148,12 +1167,13 @@ def test_issue_360_kill_exact_megatron_actor_verifies_absence(monkeypatch):
     async def _async_lookup_actor_handle(*_args, **_kwargs):
         return actor
 
-    async def _async_kill_named_actor(actor_name: str, namespace: str, *, base_model: str | None, reason: str, verify_absent: bool, timeout_s: float = 10.0):
+    async def _async_kill_named_actor(actor_name: str, namespace: str, *, actor_handle=None, base_model: str | None, reason: str, verify_absent: bool, timeout_s: float = 10.0):
         _ = timeout_s
         kill_calls.append(
             {
                 "actor_name": actor_name,
                 "namespace": namespace,
+                "actor_handle": actor_handle,
                 "base_model": base_model,
                 "reason": reason,
                 "verify_absent": verify_absent,
@@ -1161,6 +1181,8 @@ def test_issue_360_kill_exact_megatron_actor_verifies_absence(monkeypatch):
         )
         return True
 
+    _install_minimal_ray_module(monkeypatch)
+    _install_namespace_module(monkeypatch, "tinker_server.backend.megatron_distributed", "ns-mega")
     import tinker_server.backend.resource_pool as rp
 
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(MEGATRON="megatron"))
@@ -1176,6 +1198,7 @@ def test_issue_360_kill_exact_megatron_actor_verifies_absence(monkeypatch):
         {
             "actor_name": "mega-a",
             "namespace": "ns-mega",
+            "actor_handle": actor,
             "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "reason": "kill_megatron_actor_by_name",
             "verify_absent": True,
@@ -1205,6 +1228,7 @@ def test_issue_360_kill_dense_actors_cleans_pg_when_async_kill_fails(monkeypatch
         unregister=lambda actor_name: unregister_calls.append(actor_name),
     )
 
+    _install_minimal_ray_module(monkeypatch)
     import tinker_server.backend.resource_pool as rp
 
     monkeypatch.setattr(rp, "ActorType", SimpleNamespace(DENSE="dense"))
@@ -1217,6 +1241,64 @@ def test_issue_360_kill_dense_actors_cleans_pg_when_async_kill_fails(monkeypatch
     assert killed == 1
     assert unregister_calls == ["dense-fail"]
     assert removed_pgs == ["dense-fail"]
+
+
+def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(monkeypatch):
+    actor = object()
+    unregister_calls: list[str] = []
+    removed_pgs: list[str] = []
+    kill_calls: list[dict] = []
+
+    pool = SimpleNamespace(
+        get=lambda actor_name: SimpleNamespace(
+            actor_type="vllm",
+            namespace="ns-vllm",
+            base_model="Qwen/Qwen3-0.6B",
+        ),
+        unregister=lambda actor_name: unregister_calls.append(actor_name),
+    )
+
+    async def _async_lookup_actor_handle(*_args, **_kwargs):
+        return actor
+
+    async def _async_kill_named_actor(actor_name: str, namespace: str, *, actor_handle=None, base_model: str | None, reason: str, timeout_s: float = 10.0, verify_absent: bool = False):
+        _ = (timeout_s, verify_absent)
+        kill_calls.append(
+            {
+                "actor_name": actor_name,
+                "namespace": namespace,
+                "actor_handle": actor_handle,
+                "base_model": base_model,
+                "reason": reason,
+            }
+        )
+        return True
+
+    _install_minimal_ray_module(monkeypatch)
+    _install_namespace_module(monkeypatch, "tinker_server.backend.multi_lora_engine", "ns-vllm")
+    import tinker_server.backend.resource_pool as rp
+
+    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(VLLM="vllm"))
+    monkeypatch.setattr(rp, "ResourcePoolStaleError", RuntimeError)
+    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    monkeypatch.setattr(service_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
+    monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
+    monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
+
+    killed = anyio.run(lambda: service_route._kill_exact_vllm_actor(actor_name="vllm-a"))
+
+    assert killed == 1
+    assert kill_calls == [
+        {
+            "actor_name": "vllm-a",
+            "namespace": "ns-vllm",
+            "actor_handle": actor,
+            "base_model": "Qwen/Qwen3-0.6B",
+            "reason": "vllm_kill_by_actor_name",
+        }
+    ]
+    assert unregister_calls == ["vllm-a"]
+    assert removed_pgs == ["vllm-a"]
 
 
 class _AwaitableObjectRef:
@@ -1280,3 +1362,118 @@ def test_issue_360_future_store_async_get_status_backend_api(monkeypatch):
 
     out = anyio.run(store.async_get_status, "rid_backend_async")
     assert out == FutureStatus.DONE
+
+
+def test_issue_360_session_index_async_reacquires_dead_actor(monkeypatch):
+    import importlib
+
+    store_module = importlib.import_module("tinker_server.backend.session_index_store")
+
+    class _ActorDiedError(Exception):
+        pass
+
+    class _RayActorError(Exception):
+        pass
+
+    stale_actor = SimpleNamespace(get_session=_RemoteCall(error=_ActorDiedError("dead actor")))
+    recovered_actor = SimpleNamespace(get_session=_RemoteCall(result={"session_id": "sess-reacquired"}))
+    reacquire_calls: list[tuple[str, str]] = []
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.exceptions = SimpleNamespace(
+        ActorDiedError=_ActorDiedError,
+        RayActorError=_RayActorError,
+    )
+
+    def _get_actor(name: str, *, namespace: str):
+        reacquire_calls.append((name, namespace))
+        return recovered_actor
+
+    ray_mod.get_actor = _get_actor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    monkeypatch.setattr(store_module, "_ACTOR_HANDLE", stale_actor)
+
+    out = anyio.run(store_module.async_get_session_index, "sess-reacquired")
+
+    assert out == {"session_id": "sess-reacquired"}
+    assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
+    assert store_module._ACTOR_HANDLE is recovered_actor
+
+
+def test_issue_360_gateway_session_store_async_reacquires_dead_actor(monkeypatch):
+    import importlib
+
+    store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
+
+    class _ActorDiedError(Exception):
+        pass
+
+    class _RayActorError(Exception):
+        pass
+
+    stale_actor = SimpleNamespace(get_sampling_session=_RemoteCall(error=_ActorDiedError("dead actor")))
+    recovered_actor = SimpleNamespace(
+        get_sampling_session=_RemoteCall(
+            result={"upstream_alias": "up-a", "base_model": "Qwen/Qwen3-0.6B"}
+        )
+    )
+    reacquire_calls: list[tuple[str, str]] = []
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.exceptions = SimpleNamespace(
+        ActorDiedError=_ActorDiedError,
+        RayActorError=_RayActorError,
+    )
+
+    def _get_actor(name: str, *, namespace: str):
+        reacquire_calls.append((name, namespace))
+        return recovered_actor
+
+    ray_mod.get_actor = _get_actor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    monkeypatch.setattr(store_module, "_ACTOR_HANDLE", stale_actor)
+
+    out = anyio.run(store_module.async_get_sampling_session, "sampling-1")
+
+    assert out == ("up-a", "Qwen/Qwen3-0.6B")
+    assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
+    assert store_module._ACTOR_HANDLE is recovered_actor
+
+
+def test_issue_360_training_session_store_async_reacquires_dead_actor(monkeypatch):
+    import importlib
+
+    store_module = importlib.import_module("tinker_server.backend.training_session_store")
+
+    class _ActorDiedError(Exception):
+        pass
+
+    class _RayActorError(Exception):
+        pass
+
+    stale_actor = SimpleNamespace(get=_RemoteCall(error=_ActorDiedError("dead actor")))
+    recovered_actor = SimpleNamespace(get=_RemoteCall(result={"model_id": "run-reacquired"}))
+    reacquire_calls: list[tuple[str, str]] = []
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.exceptions = SimpleNamespace(
+        ActorDiedError=_ActorDiedError,
+        RayActorError=_RayActorError,
+    )
+
+    def _get_actor(name: str, *, namespace: str):
+        reacquire_calls.append((name, namespace))
+        return recovered_actor
+
+    ray_mod.get_actor = _get_actor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    monkeypatch.setattr(store_module, "_ACTOR_HANDLE", stale_actor)
+
+    out = anyio.run(store_module.async_get_training_session_info, "run-reacquired")
+
+    assert out == {"model_id": "run-reacquired"}
+    assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
+    assert store_module._ACTOR_HANDLE is recovered_actor

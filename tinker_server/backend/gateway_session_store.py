@@ -150,6 +150,46 @@ def _get_cached_actor_for_async_request_path():
     return _ACTOR_HANDLE
 
 
+async def _reacquire_actor_for_async_request_path():
+    import ray
+
+    global _ACTOR_HANDLE
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+
+    try:
+        _ACTOR_HANDLE = await asyncio.to_thread(
+            ray.get_actor,
+            _actor_name(),
+            namespace=_ray_namespace(),
+        )
+    except ValueError as e:
+        _ACTOR_HANDLE = None
+        raise RuntimeError("Gateway session store actor is not ready on this API server") from e
+    return _ACTOR_HANDLE
+
+
+async def _get_actor_for_async_request_path():
+    if _ACTOR_HANDLE is not None:
+        return _ACTOR_HANDLE
+    return await _reacquire_actor_for_async_request_path()
+
+
+async def _call_actor_for_async_request_path(remote_call):
+    import ray
+
+    global _ACTOR_HANDLE
+
+    actor = await _get_actor_for_async_request_path()
+    try:
+        return await _await_ray_ref(remote_call(actor))
+    except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError):
+        _ACTOR_HANDLE = None
+        actor = await _reacquire_actor_for_async_request_path()
+        return await _await_ray_ref(remote_call(actor))
+
+
 def ensure_ready() -> None:
     import ray
 
@@ -175,9 +215,8 @@ def upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, ba
 
 
 async def async_upsert_sampling_session(*, sampling_session_id: str, upstream_alias: str, base_model: str) -> None:
-    actor = _get_cached_actor_for_async_request_path()
-    await _await_ray_ref(
-        actor.upsert_sampling_session.remote(
+    await _call_actor_for_async_request_path(
+        lambda actor: actor.upsert_sampling_session.remote(
             sampling_session_id,
             {"upstream_alias": upstream_alias, "base_model": base_model},
         )
@@ -202,8 +241,9 @@ def get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
 
 
 async def async_get_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
-    actor = _get_cached_actor_for_async_request_path()
-    info = await _await_ray_ref(actor.get_sampling_session.remote(sampling_session_id))
+    info = await _call_actor_for_async_request_path(
+        lambda actor: actor.get_sampling_session.remote(sampling_session_id)
+    )
     if not isinstance(info, dict):
         return None
     upstream_alias = info.get("upstream_alias")
@@ -224,8 +264,9 @@ def delete_sampling_session(sampling_session_id: str) -> None:
 
 
 async def async_delete_sampling_session(sampling_session_id: str) -> None:
-    actor = _get_cached_actor_for_async_request_path()
-    await _await_ray_ref(actor.delete_sampling_session.remote(sampling_session_id))
+    await _call_actor_for_async_request_path(
+        lambda actor: actor.delete_sampling_session.remote(sampling_session_id)
+    )
 
 
 def upsert_training_model(
@@ -258,9 +299,8 @@ async def async_upsert_training_model(
     base_model: str,
     owner_id: str | None = None,
 ) -> None:
-    actor = _get_cached_actor_for_async_request_path()
-    await _await_ray_ref(
-        actor.upsert_training_model.remote(
+    await _call_actor_for_async_request_path(
+        lambda actor: actor.upsert_training_model.remote(
             model_id,
             {
                 "upstream_alias": upstream_alias,
@@ -289,8 +329,9 @@ def get_training_model(model_id: str) -> tuple[str, str] | None:
 
 
 async def async_get_training_model(model_id: str) -> tuple[str, str] | None:
-    actor = _get_cached_actor_for_async_request_path()
-    info = await _await_ray_ref(actor.get_training_model.remote(model_id))
+    info = await _call_actor_for_async_request_path(
+        lambda actor: actor.get_training_model.remote(model_id)
+    )
     if not isinstance(info, dict):
         return None
     upstream_alias = info.get("upstream_alias")
@@ -327,8 +368,9 @@ def get_training_model_info(model_id: str) -> dict[str, str | None] | None:
 
 
 async def async_get_training_model_info(model_id: str) -> dict[str, str | None] | None:
-    actor = _get_cached_actor_for_async_request_path()
-    info = await _await_ray_ref(actor.get_training_model.remote(model_id))
+    info = await _call_actor_for_async_request_path(
+        lambda actor: actor.get_training_model.remote(model_id)
+    )
     if not isinstance(info, dict):
         return None
     upstream_alias = info.get("upstream_alias")
@@ -356,5 +398,6 @@ def delete_training_model(model_id: str) -> None:
 
 
 async def async_delete_training_model(model_id: str) -> None:
-    actor = _get_cached_actor_for_async_request_path()
-    await _await_ray_ref(actor.delete_training_model.remote(model_id))
+    await _call_actor_for_async_request_path(
+        lambda actor: actor.delete_training_model.remote(model_id)
+    )

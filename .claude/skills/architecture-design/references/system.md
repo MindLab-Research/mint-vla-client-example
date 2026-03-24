@@ -23,17 +23,23 @@ Control-plane detached actors:
 - `tinker_future_store`: async future state and result refs (results stored in Ray object store).
 - `tinker_capacity_manager`: admission control for async backlog (queue bytes and object store bytes).
 - `tinker_api_work_queue`: stores request JSON for async operations; API workers dequeue and execute.
+- `tinker_session_index_store`: minimal session and sampler metadata for REST enumeration after API restart.
+- `tinker_training_session_store`: minimal training-session metadata used to recover routing to detached trainer actors.
+- `tinker_gateway_session_store`: routing metadata for upstream-created sampling sessions and training models when this server acts as a gateway.
 
 Implications:
-- A server restart loses in-process mappings (sessions, registries), but detached actors may still exist and hold GPU memory.
+- A server restart loses in-process mappings (live session registries, engine bindings, LoRA id mappings), but detached actors may still exist and hold GPU memory.
+- Some REST-visible metadata survives restart in detached control-plane stores even though the live engine/session objects do not.
 - Startup reconciliation is required to rediscover or kill these actors (`tinker_server/app.py:_cleanup_stale_actors`).
 - Changes to actor code require recreating the actor. Detached actors do not hot-reload.
+- Request paths should use async control-plane helpers and fail fast when Ray is unavailable instead of calling `init_ray()` from inside a route.
 
 ## Code map (where to look)
 
 - `tinker_server/app.py`
   - FastAPI startup/shutdown (lifespan), auth middleware, route registration.
   - Startup actor reconciliation: `_cleanup_stale_actors()` kills dead actors and registers alive detached actors with `ResourcePool`.
+  - Warms detached control-plane actors used on request paths (`FutureStore`, metadata stores, admission queue actors).
 
 - `tinker_server/routes/*`
   - HTTP endpoints. Most heavy work is delegated to backend modules.
@@ -41,6 +47,10 @@ Implications:
   - `training.py`: training control plane; uses `TrainingSessionManager` + training engine.
   - `weights.py`: save/load weights and checkpoints; bridges training to inference.
   - `futures.py`: `request_id` polling.
+
+- `tinker_server/backend/async_ray_control.py`
+  - Async wrappers for Ray control-plane operations that would otherwise block the FastAPI event loop.
+  - Used for actor lookup/kill and placement-group inspection on request paths.
 
 - `tinker_server/models/types.py`
   - Pydantic request/response models intended to match the Tinker API.

@@ -120,6 +120,7 @@ def _kill_named_actor_remote():
 
     @ray.remote(num_cpus=0)
     def _task(
+        actor: Any,
         actor_name: str,
         namespace: str,
         base_model: str | None,
@@ -128,7 +129,11 @@ def _kill_named_actor_remote():
     ) -> bool:
         from ..backend import ray_kill
 
-        actor = ray.get_actor(actor_name, namespace=namespace)
+        if actor is None:
+            try:
+                actor = ray.get_actor(actor_name, namespace=namespace)
+            except ValueError:
+                return False
         ray_kill.kill(
             actor,
             reason=reason,
@@ -190,6 +195,7 @@ async def async_kill_named_actor(
     actor_name: str,
     namespace: str,
     *,
+    actor_handle: Any | None = None,
     base_model: str | None,
     reason: str = "kill_named_actor_by_api",
     verify_absent: bool = False,
@@ -197,6 +203,7 @@ async def async_kill_named_actor(
 ) -> bool:
     _ensure_ray_initialized()
     ref = _kill_named_actor_remote().remote(
+        actor_handle,
         str(actor_name),
         str(namespace),
         base_model,

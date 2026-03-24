@@ -865,12 +865,13 @@ async def test_issue_281_kill_dense_actors_uses_named_actor_helper(monkeypatch) 
         actor_name: str,
         namespace: str,
         *,
+        actor_handle=None,
         base_model: str | None,
         reason: str,
         timeout_s: float = 10.0,
         verify_absent: bool = False,
     ):
-        _ = (reason, timeout_s, verify_absent)
+        _ = (actor_handle, reason, timeout_s, verify_absent)
         killed.append((actor_name, namespace, base_model))
         return True
 

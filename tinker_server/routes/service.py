@@ -897,7 +897,7 @@ async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
 
     namespace = entry.namespace if entry is not None else PERSISTENT_NAMESPACE
     try:
-        await async_lookup_actor_handle(actor_name, namespace)
+        actor = await async_lookup_actor_handle(actor_name, namespace)
     except Exception as exc:
         if not is_actor_lookup_not_found(exc):
             raise
@@ -909,6 +909,7 @@ async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
         await async_kill_named_actor(
             actor_name,
             namespace,
+            actor_handle=actor,
             base_model=entry.base_model if entry is not None else None,
             reason="vllm_kill_by_actor_name",
         )
@@ -946,6 +947,7 @@ async def _kill_exact_megatron_actor(*, actor_name: str) -> int:
         await async_kill_named_actor(
             actor_name,
             namespace,
+            actor_handle=actor,
             base_model=entry.base_model if entry is not None else None,
             reason="kill_megatron_actor_by_name",
             verify_absent=True,
@@ -972,6 +974,7 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
             await async_kill_named_actor(
                 entry.actor_name,
                 entry.namespace,
+                actor_handle=entry.actor_handle if entry.actor_handle is not None else None,
                 base_model=entry.base_model,
                 reason="dense_kill_by_actor_name",
             )
@@ -999,6 +1002,7 @@ async def _kill_dense_actors(base_model: str | None) -> int:
             await async_kill_named_actor(
                 e.actor_name,
                 e.namespace,
+                actor_handle=e.actor_handle if e.actor_handle is not None else None,
                 base_model=e.base_model,
                 reason="dense_kill_by_api",
             )

@@ -148,6 +148,46 @@ def _get_cached_actor_for_async_request_path():
     return _ACTOR_HANDLE
 
 
+async def _reacquire_actor_for_async_request_path():
+    import ray
+
+    global _ACTOR_HANDLE
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+
+    try:
+        _ACTOR_HANDLE = await asyncio.to_thread(
+            ray.get_actor,
+            _actor_name(),
+            namespace=_ray_namespace(),
+        )
+    except ValueError as e:
+        _ACTOR_HANDLE = None
+        raise RuntimeError("Training session store actor is not ready on this API server") from e
+    return _ACTOR_HANDLE
+
+
+async def _get_actor_for_async_request_path():
+    if _ACTOR_HANDLE is not None:
+        return _ACTOR_HANDLE
+    return await _reacquire_actor_for_async_request_path()
+
+
+async def _call_actor_for_async_request_path(remote_call):
+    import ray
+
+    global _ACTOR_HANDLE
+
+    actor = await _get_actor_for_async_request_path()
+    try:
+        return await _await_ray_ref(remote_call(actor))
+    except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError):
+        _ACTOR_HANDLE = None
+        actor = await _reacquire_actor_for_async_request_path()
+        return await _await_ray_ref(remote_call(actor))
+
+
 def ensure_ready() -> None:
     import ray
 
@@ -228,8 +268,9 @@ def set_training_session_step(model_id: str, step: int) -> int:
 
 
 async def async_get_training_session_info(model_id: str) -> dict[str, Any] | None:
-    actor = _get_cached_actor_for_async_request_path()
-    out = await _await_ray_ref(actor.get.remote(model_id))
+    out = await _call_actor_for_async_request_path(
+        lambda actor: actor.get.remote(model_id)
+    )
     if out is None:
         return None
     if not isinstance(out, dict):
@@ -265,8 +306,9 @@ def list_training_sessions() -> list[dict[str, Any]]:
 
 
 async def async_list_training_sessions() -> list[dict[str, Any]]:
-    actor = _get_cached_actor_for_async_request_path()
-    out = await _await_ray_ref(actor.list.remote())
+    out = await _call_actor_for_async_request_path(
+        lambda actor: actor.list.remote()
+    )
     if not isinstance(out, list):
         raise TypeError(f"Training session store returned non-list: {type(out)}")
     return [dict(item) for item in out if isinstance(item, dict)]
