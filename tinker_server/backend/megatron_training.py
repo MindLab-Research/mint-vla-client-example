@@ -340,7 +340,8 @@ def tinker_to_tensordict(
     # Add external labels if present (target_tokens with correct last token)
     # Key MUST NOT be "label" - verl applies torch.roll when key == "label"
     # Using "target" bypasses roll since need_roll=(k == "label") in model_forward.py
-    if has_external_labels and target_tokens_list:
+    disable_external_label = os.environ.get("MINT_DISABLE_EXTERNAL_LABEL", "0") == "1"
+    if has_external_labels and target_tokens_list and not disable_external_label:
         if has_full_external_labels and all(seq is not None for seq in target_tokens_list):
             target_tokens_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in target_tokens_list]
             td["target"] = torch.nested.as_nested_tensor(target_tokens_tensors, layout=torch.jagged)
@@ -354,6 +355,8 @@ def tinker_to_tensordict(
                 "[tinker_to_tensordict] Mixed target_tokens presence in batch; "
                 "skipping external labels to avoid TensorDict shape mismatch."
             )
+    elif has_external_labels and disable_external_label:
+        logger.warning("[tinker_to_tensordict] MINT_DISABLE_EXTERNAL_LABEL=1; forcing original rolled labels")
 
     require_r3 = (server_config.router_replay_mode == "R3")
     if require_r3:
