@@ -74,7 +74,7 @@ class OpenPIRayRuntimeActor:
             self._runtime = await OpenPIFastWorkerClient.start(self._spec)
         return self._runtime
 
-    async def __ray_ready__(self) -> dict[str, Any]:
+    async def ready_metadata(self) -> dict[str, Any]:
         await self._ensure_runtime()
         return self.describe()
 
@@ -160,7 +160,7 @@ class OpenPIRayRuntimeClient:
 
     async def ready(self) -> dict[str, Any]:
         metadata = await self._ray_get(
-            self._actor.__ray_ready__.remote(),
+            self._actor.ready_metadata.remote(),
             timeout_s=self._ready_timeout_s,
         )
         if not isinstance(metadata, dict):

@@ -14,6 +14,14 @@ def ray_log_to_driver_kwargs() -> dict[str, Any]:
     return {"log_to_driver": ray_log_to_driver_enabled()}
 
 
+def ray_client_working_dir() -> str | None:
+    addr = os.environ.get("RAY_ADDRESS", "").strip()
+    if not addr.startswith("ray://"):
+        return None
+    pfs_tinker_path = os.environ.get("PFS_TINKER_PATH", "").strip()
+    return pfs_tinker_path or None
+
+
 def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
@@ -27,6 +35,13 @@ def init_ray(**kwargs: Any) -> Any:
         current = kwargs.get("address")
         if current is None or current == "" or current == "auto":
             kwargs["address"] = addr
+
+    working_dir = ray_client_working_dir()
+    runtime_env = kwargs.get("runtime_env")
+    if working_dir and (runtime_env is None or isinstance(runtime_env, dict)):
+        payload = {} if runtime_env is None else dict(runtime_env)
+        payload.setdefault("working_dir", working_dir)
+        kwargs["runtime_env"] = payload
 
     for k, v in ray_log_to_driver_kwargs().items():
         kwargs.setdefault(k, v)

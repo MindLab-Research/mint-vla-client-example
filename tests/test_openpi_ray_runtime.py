@@ -98,3 +98,35 @@ def test_start_openpi_ray_runtime_passes_model_and_training_session_ids(monkeypa
     }
     assert actor_state["client_init"]["ready_timeout_s"] == 300.0
     assert actor_state["ready_called"] is True
+
+
+def test_openpi_ray_runtime_client_ready_uses_metadata_method(monkeypatch) -> None:
+    from tinker_server.backend.openpi_ray_runtime import OpenPIRayRuntimeClient
+
+    class _Method:
+        def __init__(self, value):
+            self._value = value
+
+        def remote(self):
+            return self._value
+
+    actor = SimpleNamespace(
+        __ray_ready__=_Method(True),
+        ready_metadata=_Method({"actor_id": "abc", "node_ip": "192.168.0.1"}),
+    )
+    client = OpenPIRayRuntimeClient(
+        actor=actor,
+        spec=_spec(),
+        session_id="session-1",
+        ready_timeout_s=30.0,
+    )
+
+    async def _fake_ray_get(ref, *, timeout_s):
+        return ref
+
+    monkeypatch.setattr(client, "_ray_get", _fake_ray_get)
+
+    metadata = asyncio.run(client.ready())
+
+    assert metadata == {"actor_id": "abc", "node_ip": "192.168.0.1"}
+    assert client.metadata == metadata
