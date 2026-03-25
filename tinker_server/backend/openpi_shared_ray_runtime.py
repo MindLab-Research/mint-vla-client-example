@@ -491,7 +491,7 @@ async def start_openpi_shared_ray_runtime(
         actor=entry.actor,
         actor_name=actor_name,
         spec=spec,
-        session_id=str(session.session_id),
+        session_id=str(session.model_id),
         ready_timeout_s=_actor_ready_timeout_s(spec),
     )
     metadata = await client.ready()
@@ -514,6 +514,10 @@ async def start_openpi_shared_ray_runtime(
         metadata={
             "pool_key": dict(pool_key),
             "worker_module": spec.worker_module,
+            "actor_id": metadata.get("actor_id"),
+            "node_ip": metadata.get("node_ip"),
+            "pid": metadata.get("pid"),
+            "cuda_visible_devices": metadata.get("cuda_visible_devices"),
         },
     )
     pool.mark_ready(actor_name)

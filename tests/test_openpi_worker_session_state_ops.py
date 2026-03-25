@@ -183,3 +183,93 @@ def test_worker_dispatch_accepts_session_state_ops() -> None:
     assert pi05_save == {"path": "session-b"}
     assert pi05_load == {"session_id": "session-b"}
     assert pi05_close is False
+
+
+def test_openpi_fast_worker_checkpoint_save_normalizes_step_zero() -> None:
+    calls: dict[str, object] = {}
+
+    class _FakeManager:
+        def wait_until_finished(self) -> None:
+            calls["waited"] = True
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    class _FakeCheckpoints:
+        def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            calls["checkpoint_path"] = checkpoint_path
+            calls["init"] = {
+                "keep_period": keep_period,
+                "overwrite": overwrite,
+                "resume": resume,
+            }
+            return _FakeManager(), False
+
+        def save_state(self, manager, state, data_loader, step):
+            calls["save"] = {
+                "manager": manager,
+                "state": state,
+                "data_loader": data_loader,
+                "step": step,
+            }
+
+    fake_session = SimpleNamespace(
+        _checkpoints=_FakeCheckpoints(),
+        _data_loader="loader",
+    )
+    state = SimpleNamespace(step=0)
+
+    fast_worker_module.OpenPIFastWorkerSession._save_train_state_checkpoint(
+        fake_session,
+        Path("/tmp/openpi-fast-session"),
+        state,
+    )
+
+    assert calls["save"]["step"] == 1
+    assert calls["waited"] is True
+    assert calls["closed"] is True
+
+
+def test_openpi_pi05_worker_checkpoint_save_normalizes_step_zero() -> None:
+    calls: dict[str, object] = {}
+
+    class _FakeManager:
+        def wait_until_finished(self) -> None:
+            calls["waited"] = True
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    class _FakeCheckpoints:
+        def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            calls["checkpoint_path"] = checkpoint_path
+            calls["init"] = {
+                "keep_period": keep_period,
+                "overwrite": overwrite,
+                "resume": resume,
+            }
+            return _FakeManager(), False
+
+        def save_state(self, manager, state, data_loader, step):
+            calls["save"] = {
+                "manager": manager,
+                "state": state,
+                "data_loader": data_loader,
+                "step": step,
+            }
+
+    fake_session = SimpleNamespace(
+        _checkpoints=_FakeCheckpoints(),
+        _data_loader="loader",
+    )
+    state = SimpleNamespace(step=0)
+
+    pi05_worker_module.OpenPIPi05WorkerSession._save_train_state_checkpoint(
+        fake_session,
+        Path("/tmp/openpi-pi05-session"),
+        state,
+    )
+
+    assert calls["save"]["step"] == 1
+    assert calls["waited"] is True
+    assert calls["closed"] is True

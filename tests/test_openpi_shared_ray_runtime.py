@@ -118,18 +118,151 @@ def test_start_openpi_shared_ray_runtime_reuses_actor_for_same_pool_key(monkeypa
         {
             "actor": "actor-1",
             "actor_name": state["client_inits"][0]["actor_name"],
-            "session_id": "session-a",
+            "session_id": "model-a",
             "ready_timeout_s": 300.0,
             "worker_module": "tinker_server.backend.openpi_fast_worker",
         },
         {
             "actor": "actor-1",
             "actor_name": state["client_inits"][0]["actor_name"],
-            "session_id": "session-b",
+            "session_id": "model-b",
             "ready_timeout_s": 300.0,
             "worker_module": "tinker_server.backend.openpi_fast_worker",
         },
     ]
+
+
+def test_start_openpi_shared_ray_runtime_registers_actor_metadata_in_resource_pool(monkeypatch) -> None:
+    from tinker_server.backend import openpi_shared_ray_runtime
+
+    state: dict[str, object] = {}
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            state["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            state["remote"] = kwargs
+            return "actor-1"
+
+    class _FakeClient:
+        def __init__(self, *, actor, actor_name, spec, session_id, ready_timeout_s):
+            _ = actor, actor_name, spec, session_id, ready_timeout_s
+
+        async def ready(self):
+            return {
+                "actor_id": "actor-123",
+                "node_id": "node-456",
+                "node_ip": "192.168.0.8",
+                "pid": 999,
+                "cuda_visible_devices": "0",
+                "current_session_id": None,
+            }
+
+        async def close(self):
+            return None
+
+    class _FakePool:
+        def register(self, **kwargs):
+            state["register"] = kwargs
+            return None
+
+        def mark_ready(self, actor_name):
+            state["mark_ready"] = actor_name
+
+        def touch(self, actor_name):
+            state["touch"] = actor_name
+
+    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+
+    session = _make_session("model-a", "session-a")
+    asyncio.run(
+        openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+            session=session,
+            spec=_spec(),
+            config_name="pi0_fast_libero_low_mem_finetune",
+            model_config=_model_config(),
+        )
+    )
+
+    register = state["register"]
+    assert register["actor_type"].value == "openpi"
+    assert register["node_id"] == "node-456"
+    assert register["metadata"]["worker_module"] == "tinker_server.backend.openpi_fast_worker"
+    assert register["metadata"]["actor_id"] == "actor-123"
+    assert register["metadata"]["node_ip"] == "192.168.0.8"
+    assert register["metadata"]["pid"] == 999
+    assert register["metadata"]["cuda_visible_devices"] == "0"
+
+
+def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(monkeypatch) -> None:
+    from tinker_server.backend import openpi_shared_ray_runtime
+
+    state: dict[str, object] = {"client_inits": []}
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            _ = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            _ = kwargs
+            return "actor-1"
+
+    class _FakeClient:
+        def __init__(self, *, actor, actor_name, spec, session_id, ready_timeout_s):
+            _ = actor, actor_name, spec, ready_timeout_s
+            state["client_inits"].append(session_id)
+
+        async def ready(self):
+            return {"actor_id": "actor-123"}
+
+        async def close(self):
+            return None
+
+    class _FakePool:
+        def register(self, **kwargs):
+            _ = kwargs
+            return None
+
+        def mark_ready(self, actor_name):
+            _ = actor_name
+
+        def touch(self, actor_name):
+            _ = actor_name
+
+    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_resource_pool", lambda: _FakePool())
+
+    session_a = _make_session("model-a", "shared-http-session")
+    session_b = _make_session("model-b", "shared-http-session")
+
+    asyncio.run(
+        openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+            session=session_a,
+            spec=_spec(),
+            config_name="pi0_fast_libero_low_mem_finetune",
+            model_config=_model_config(),
+        )
+    )
+    asyncio.run(
+        openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+            session=session_b,
+            spec=_spec(),
+            config_name="pi0_fast_libero_low_mem_finetune",
+            model_config=_model_config(),
+        )
+    )
+
+    assert state["client_inits"] == ["model-a", "model-b"]
 
 
 def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:

@@ -419,11 +419,12 @@ class OpenPIPi05WorkerSession:
             resume=False,
         )
         try:
+            checkpoint_step = max(1, _int_scalar(state.step))
             self._checkpoints.save_state(
                 manager,
                 state,
                 self._data_loader,
-                _int_scalar(state.step),
+                checkpoint_step,
             )
             manager.wait_until_finished()
         finally:

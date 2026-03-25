@@ -587,6 +587,8 @@ class ResourcePool:
             def _backend(e: ActorEntry) -> str:
                 if e.actor_type == ActorType.DENSE:
                     return "peft"
+                if e.actor_type == ActorType.OPENPI:
+                    return "openpi"
                 if e.actor_type == ActorType.MEGATRON:
                     return "megatron"
                 return "vllm"
