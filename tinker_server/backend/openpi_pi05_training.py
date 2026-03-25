@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import shutil
 import uuid
 from pathlib import Path
@@ -9,7 +10,10 @@ from typing import Any
 from ..models.types import AdamParams
 from .model_registry import ModelConfig, get_model_config
 from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
+from .openpi_ray_runtime import ensure_openpi_ray_initialized, start_openpi_ray_runtime
 
+
+logger = logging.getLogger(__name__)
 
 OPENPI_PI05_TRAINING_BACKEND = "openpi_pi05"
 OPENPI_PI05_LORA_RANK = 16
@@ -187,16 +191,16 @@ def build_openpi_pi05_action_observation_payload(
 
 
 async def _default_runtime_factory(*, session: Any, model_config: ModelConfig, config_name: str) -> Any:
-    del session, model_config, config_name
+    del model_config, config_name
     import dataclasses
 
-    from .openpi_fast_runtime import OpenPIFastRuntimeSpec, OpenPIFastWorkerClient
+    from .openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     spec = dataclasses.replace(
         OpenPIFastRuntimeSpec.from_env(),
         worker_module="tinker_server.backend.openpi_pi05_worker",
     )
-    return await OpenPIFastWorkerClient.start(spec)
+    return await start_openpi_ray_runtime(session=session, spec=spec)
 
 
 class OpenPIPi05TrainingEngine:
@@ -205,6 +209,7 @@ class OpenPIPi05TrainingEngine:
         self._runtime_clients: dict[str, Any] = {}
 
     async def initialize(self) -> None:
+        ensure_openpi_ray_initialized()
         return None
 
     def _runtime_for_session(self, session: Any) -> Any:
@@ -273,6 +278,17 @@ class OpenPIPi05TrainingEngine:
         self._runtime_clients[session.model_id] = client
         session.backend = OPENPI_PI05_TRAINING_BACKEND
         session.is_active = True
+        metadata = getattr(client, "metadata", None)
+        if isinstance(metadata, dict):
+            logger.info(
+                "[%s] OpenPI pi0.5 Ray runtime placed: actor_id=%s node_ip=%s cuda_visible_devices=%s pid=%s worker_module=%s",
+                session.model_id,
+                metadata.get("actor_id"),
+                metadata.get("node_ip"),
+                metadata.get("cuda_visible_devices"),
+                metadata.get("pid"),
+                metadata.get("worker_module"),
+            )
 
     async def forward_backward(self, session: Any, request: Any) -> dict[str, Any]:
         loss_fn = str(request.forward_backward_input.loss_fn)

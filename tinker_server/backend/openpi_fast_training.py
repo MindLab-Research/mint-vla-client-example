@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import shutil
 import uuid
 from pathlib import Path
@@ -9,7 +10,10 @@ from typing import Any, Awaitable, Callable
 from ..models.types import AdamParams
 from .model_registry import ModelConfig, get_model_config
 from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
+from .openpi_ray_runtime import ensure_openpi_ray_initialized, start_openpi_ray_runtime
 
+
+logger = logging.getLogger(__name__)
 
 OPENPI_FAST_TRAINING_BACKEND = "openpi_fast"
 OPENPI_FAST_LORA_RANK = 16
@@ -199,10 +203,13 @@ async def _default_runtime_factory(
     model_config: ModelConfig,
     config_name: str,
 ) -> Any:
-    del session, model_config, config_name
-    from .openpi_fast_runtime import OpenPIFastRuntimeSpec, OpenPIFastWorkerClient
+    del model_config, config_name
+    from .openpi_fast_runtime import OpenPIFastRuntimeSpec
 
-    return await OpenPIFastWorkerClient.start(OpenPIFastRuntimeSpec.from_env())
+    return await start_openpi_ray_runtime(
+        session=session,
+        spec=OpenPIFastRuntimeSpec.from_env(),
+    )
 
 
 class OpenPIFastTrainingEngine:
@@ -215,6 +222,7 @@ class OpenPIFastTrainingEngine:
         self._runtime_clients: dict[str, Any] = {}
 
     async def initialize(self) -> None:
+        ensure_openpi_ray_initialized()
         return None
 
     def _runtime_for_session(self, session: Any) -> Any:
@@ -288,6 +296,17 @@ class OpenPIFastTrainingEngine:
         self._runtime_clients[session.model_id] = client
         session.backend = OPENPI_FAST_TRAINING_BACKEND
         session.is_active = True
+        metadata = getattr(client, "metadata", None)
+        if isinstance(metadata, dict):
+            logger.info(
+                "[%s] OpenPI FAST Ray runtime placed: actor_id=%s node_ip=%s cuda_visible_devices=%s pid=%s worker_module=%s",
+                session.model_id,
+                metadata.get("actor_id"),
+                metadata.get("node_ip"),
+                metadata.get("cuda_visible_devices"),
+                metadata.get("pid"),
+                metadata.get("worker_module"),
+            )
 
     async def forward_backward(self, session: Any, request: Any) -> dict[str, Any]:
         loss_fn = str(request.forward_backward_input.loss_fn)

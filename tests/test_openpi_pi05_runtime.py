@@ -160,6 +160,50 @@ def test_openpi_pi05_engine_create_training_session_starts_runtime(monkeypatch) 
     assert factory.clients[0].calls[0][0] == "create_session"
 
 
+def test_openpi_pi05_default_runtime_factory_uses_ray_runtime(monkeypatch) -> None:
+    from tinker_server.backend.openpi_pi05_training import _default_runtime_factory
+
+    calls: list[dict[str, object]] = []
+
+    async def _fake_start_openpi_ray_runtime(*, session, spec):
+        calls.append(
+            {
+                "model_id": session.model_id,
+                "worker_module": spec.worker_module,
+            }
+        )
+        return "ray-runtime-client"
+
+    async def _unexpected_local_start(spec):
+        raise AssertionError(f"local subprocess path must not run: {spec.worker_module}")
+
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_pi05_training.start_openpi_ray_runtime",
+        _fake_start_openpi_ray_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "tinker_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        _unexpected_local_start,
+    )
+
+    runtime = asyncio.run(
+        _default_runtime_factory(
+            session=_make_session(),
+            model_config=_pi05_model_config(),
+            config_name="pi05_libero",
+        )
+    )
+
+    assert runtime == "ray-runtime-client"
+    assert calls == [
+        {
+            "model_id": "model-1",
+            "worker_module": "tinker_server.backend.openpi_pi05_worker",
+        }
+    ]
+
+
 def test_openpi_pi05_engine_forward_backward_builds_payload_and_updates_grad_state(monkeypatch) -> None:
     from tinker_server.backend.openpi_pi05_training import OpenPIPi05TrainingEngine
 
@@ -267,4 +311,3 @@ def test_openpi_pi05_engine_save_load_and_shutdown_delegate_to_runtime(monkeypat
         "load_weights",
         "shutdown",
     ]
-
