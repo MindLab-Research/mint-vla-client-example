@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from .openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
+from .openpi_session_state import OpenPISessionStateManager
 
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,9 @@ class OpenPIPi05WorkerSession:
 
         self._data_loader = _StaticDataLoader(
             self._config.data.create(self._config.assets_dirs, self._config.model)
+        )
+        self._session_state_manager = OpenPISessionStateManager(
+            Path(checkpoint_base_dir) / "_mint_session_state"
         )
 
         self._mesh = self._sharding_mod.make_mesh(self._config.fsdp_devices)
@@ -398,10 +402,18 @@ class OpenPIPi05WorkerSession:
             }
         }
 
-    def save_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
-        save_path = str(Path(payload["save_path"]).resolve())
+    def _session_state_signature(self) -> dict[str, Any]:
+        return {
+            "config_name": self._config_name,
+            "action_dim": self._action_dim,
+            "action_horizon": self._action_horizon,
+            "max_token_len": self._max_token_len,
+        }
+
+    def _save_train_state_checkpoint(self, path: Path, state: Any) -> None:
+        checkpoint_path = str(Path(path).resolve())
         manager, _ = self._checkpoints.initialize_checkpoint_dir(
-            save_path,
+            checkpoint_path,
             keep_period=None,
             overwrite=True,
             resume=False,
@@ -409,21 +421,20 @@ class OpenPIPi05WorkerSession:
         try:
             self._checkpoints.save_state(
                 manager,
-                self._state,
+                state,
                 self._data_loader,
-                _int_scalar(self._state.step),
+                _int_scalar(state.step),
             )
             manager.wait_until_finished()
         finally:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
-        return {"path": save_path, "current_step": _int_scalar(self._state.step)}
 
-    def load_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
-        load_path = str(Path(payload["load_path"]).resolve())
+    def _load_train_state_checkpoint(self, path: Path) -> Any:
+        checkpoint_path = str(Path(path).resolve())
         manager, resuming = self._checkpoints.initialize_checkpoint_dir(
-            load_path,
+            checkpoint_path,
             keep_period=None,
             overwrite=False,
             resume=True,
@@ -432,9 +443,9 @@ class OpenPIPi05WorkerSession:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
-            raise FileNotFoundError(f"OpenPI pi0.5 checkpoint has no saved steps: {load_path}")
+            raise FileNotFoundError(f"OpenPI pi0.5 checkpoint has no saved steps: {checkpoint_path}")
         try:
-            self._state = self._checkpoints.restore_state(
+            return self._checkpoints.restore_state(
                 manager,
                 self._state,
                 self._data_loader,
@@ -443,8 +454,53 @@ class OpenPIPi05WorkerSession:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
+
+    def save_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
+        save_path = str(Path(payload["save_path"]).resolve())
+        self._save_train_state_checkpoint(Path(save_path), self._state)
+        return {"path": save_path, "current_step": _int_scalar(self._state.step)}
+
+    def load_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
+        load_path = str(Path(payload["load_path"]).resolve())
+        self._state = self._load_train_state_checkpoint(Path(load_path))
         return {
             "current_step": _int_scalar(self._state.step),
+            "learning_rate": self._learning_rate,
+        }
+
+    def save_session_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload["session_id"])
+        path = self._session_state_manager.save_state(
+            session_id,
+            worker_module="tinker_server.backend.openpi_pi05_worker",
+            runtime_signature=self._session_state_signature(),
+            state=self._state,
+            rng=self._rng,
+            pending_grads=self._pending_grads,
+            learning_rate=self._learning_rate,
+            current_step=_int_scalar(self._state.step),
+            save_train_state_fn=self._save_train_state_checkpoint,
+        )
+        return {
+            "path": str(path),
+            "current_step": _int_scalar(self._state.step),
+            "learning_rate": self._learning_rate,
+        }
+
+    def load_session_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload["session_id"])
+        restored = self._session_state_manager.load_state(
+            session_id,
+            expected_worker_module="tinker_server.backend.openpi_pi05_worker",
+            expected_runtime_signature=self._session_state_signature(),
+            load_train_state_fn=self._load_train_state_checkpoint,
+        )
+        self._state = restored["state"]
+        self._rng = restored["rng"]
+        self._pending_grads = restored["pending_grads"]
+        self._learning_rate = restored["learning_rate"]
+        return {
+            "current_step": restored["current_step"],
             "learning_rate": self._learning_rate,
         }
 
@@ -470,6 +526,10 @@ def _dispatch(
         return session.save_weights(payload), False
     if op == "load_weights":
         return session.load_weights(payload), False
+    if op == "save_session_state":
+        return session.save_session_state(payload), False
+    if op == "load_session_state":
+        return session.load_session_state(payload), False
     if op == "shutdown":
         return session.shutdown(), True
 
