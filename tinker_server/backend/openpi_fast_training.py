@@ -10,7 +10,8 @@ from typing import Any, Awaitable, Callable
 from ..models.types import AdamParams
 from .model_registry import ModelConfig, get_model_config
 from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
-from .openpi_ray_runtime import ensure_openpi_ray_initialized, start_openpi_ray_runtime
+from .openpi_ray_runtime import ensure_openpi_ray_initialized
+from .openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
 
 
 logger = logging.getLogger(__name__)
@@ -203,12 +204,13 @@ async def _default_runtime_factory(
     model_config: ModelConfig,
     config_name: str,
 ) -> Any:
-    del model_config, config_name
     from .openpi_fast_runtime import OpenPIFastRuntimeSpec
 
-    return await start_openpi_ray_runtime(
+    return await start_openpi_shared_ray_runtime(
         session=session,
         spec=OpenPIFastRuntimeSpec.from_env(),
+        config_name=config_name,
+        model_config=model_config,
     )
 
 

@@ -10,7 +10,8 @@ from typing import Any
 from ..models.types import AdamParams
 from .model_registry import ModelConfig, get_model_config
 from .openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
-from .openpi_ray_runtime import ensure_openpi_ray_initialized, start_openpi_ray_runtime
+from .openpi_ray_runtime import ensure_openpi_ray_initialized
+from .openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
 
 
 logger = logging.getLogger(__name__)
@@ -191,7 +192,6 @@ def build_openpi_pi05_action_observation_payload(
 
 
 async def _default_runtime_factory(*, session: Any, model_config: ModelConfig, config_name: str) -> Any:
-    del model_config, config_name
     import dataclasses
 
     from .openpi_fast_runtime import OpenPIFastRuntimeSpec
@@ -200,7 +200,12 @@ async def _default_runtime_factory(*, session: Any, model_config: ModelConfig, c
         OpenPIFastRuntimeSpec.from_env(),
         worker_module="tinker_server.backend.openpi_pi05_worker",
     )
-    return await start_openpi_ray_runtime(session=session, spec=spec)
+    return await start_openpi_shared_ray_runtime(
+        session=session,
+        spec=spec,
+        config_name=config_name,
+        model_config=model_config,
+    )
 
 
 class OpenPIPi05TrainingEngine:

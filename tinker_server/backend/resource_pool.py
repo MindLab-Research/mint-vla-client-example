@@ -32,6 +32,7 @@ class ResourcePoolStaleError(RuntimeError):
 class ActorType(Enum):
     MEGATRON = "megatron"  # MoE training (8 GPUs)
     DENSE = "dense"        # Dense training (1 GPU)
+    OPENPI = "openpi"      # OpenPI shared training (1 GPU)
     VLLM = "vllm"          # Inference (1-4 GPUs)
 
 

@@ -167,27 +167,30 @@ def test_openpi_fast_engine_create_training_session_starts_runtime() -> None:
     assert factory.clients[0].calls[0][0] == "create_session"
 
 
-def test_openpi_fast_default_runtime_factory_uses_ray_runtime(monkeypatch) -> None:
+def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(monkeypatch) -> None:
     from tinker_server.backend.openpi_fast_training import _default_runtime_factory
 
     calls: list[dict[str, object]] = []
 
-    async def _fake_start_openpi_ray_runtime(*, session, spec):
+    async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config):
         calls.append(
             {
                 "model_id": session.model_id,
                 "worker_module": spec.worker_module,
                 "python_executable": spec.python_executable,
+                "config_name": config_name,
+                "action_dim": model_config.action_dim,
+                "action_horizon": model_config.action_horizon,
             }
         )
-        return "ray-runtime-client"
+        return "shared-ray-runtime-client"
 
     async def _unexpected_local_start(spec):
         raise AssertionError(f"local subprocess path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "tinker_server.backend.openpi_fast_training.start_openpi_ray_runtime",
-        _fake_start_openpi_ray_runtime,
+        "tinker_server.backend.openpi_fast_training.start_openpi_shared_ray_runtime",
+        _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
@@ -198,17 +201,20 @@ def test_openpi_fast_default_runtime_factory_uses_ray_runtime(monkeypatch) -> No
     runtime = asyncio.run(
         _default_runtime_factory(
             session=_make_session(),
-            model_config=SimpleNamespace(),
+            model_config=SimpleNamespace(action_dim=32, action_horizon=10),
             config_name="pi0_fast_libero_low_mem_finetune",
         )
     )
 
-    assert runtime == "ray-runtime-client"
+    assert runtime == "shared-ray-runtime-client"
     assert calls == [
         {
             "model_id": "model-1",
             "worker_module": "tinker_server.backend.openpi_fast_worker",
             "python_executable": os.environ.get("MINT_OPENPI_FAST_PYTHON") or os.sys.executable,
+            "config_name": "pi0_fast_libero_low_mem_finetune",
+            "action_dim": 32,
+            "action_horizon": 10,
         }
     ]
 
@@ -218,16 +224,16 @@ def test_openpi_fast_engine_create_training_session_surfaces_ray_start_failure_w
 ) -> None:
     from tinker_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
 
-    async def _failing_start_openpi_ray_runtime(*, session, spec):
-        _ = session, spec
+    async def _failing_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config):
+        _ = session, spec, config_name, model_config
         raise RuntimeError("ray actor start failed")
 
     async def _unexpected_local_start(spec):
         raise AssertionError(f"local subprocess fallback must stay disabled: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "tinker_server.backend.openpi_fast_training.start_openpi_ray_runtime",
-        _failing_start_openpi_ray_runtime,
+        "tinker_server.backend.openpi_fast_training.start_openpi_shared_ray_runtime",
+        _failing_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
