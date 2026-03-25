@@ -649,8 +649,6 @@ def create_ppo_loss_fn(
                 rollout_is_threshold=rollout_corr_config.get("rollout_is_threshold", 2.0),
                 rollout_rs=rollout_corr_config.get("rollout_rs", None),
                 rollout_rs_threshold=rollout_corr_config.get("rollout_rs_threshold", None),
-                rollout_rs_threshold_lower=rollout_corr_config.get("rollout_rs_threshold_lower", None),
-                rollout_token_veto_threshold=rollout_corr_config.get("rollout_token_veto_threshold", None),
                 rollout_is_batch_normalize=rollout_corr_config.get("rollout_is_batch_normalize", False),
             )
 
