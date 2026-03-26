@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import importlib.machinery
+import sys
+import types
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def _install_ray_stub(monkeypatch) -> None:
+    ray = types.ModuleType("ray")
+    ray.__spec__ = importlib.machinery.ModuleSpec("ray", loader=None)
+    ray.is_initialized = lambda: False  # type: ignore[attr-defined]
+    ray.actor = SimpleNamespace(ActorHandle=object)
+    ray.util = SimpleNamespace(
+        get_placement_group=lambda *_args, **_kwargs: None,
+        remove_placement_group=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+
+class _FakePool:
+    def __init__(self, *, actors: list[dict], entries: list[object]) -> None:
+        self._actors = list(actors)
+        self._entries = list(entries)
+        self.unregister_calls: list[str] = []
+
+    def list_actors(self) -> list[dict]:
+        return list(self._actors)
+
+    def total_gpus_used(self) -> int:
+        return 0
+
+    def iter_entries(self) -> list[object]:
+        return list(self._entries)
+
+    def unregister(self, actor_name: str) -> None:
+        self.unregister_calls.append(actor_name)
+
+
+def _build_client(monkeypatch, pool: _FakePool) -> TestClient:
+    from tinker_server.routes import service as service_routes
+    import tinker_server.backend.resource_pool as resource_pool
+
+    monkeypatch.setattr(service_routes, "_require_admin", lambda _request: None)
+    monkeypatch.setattr(resource_pool, "get_resource_pool", lambda: pool)
+
+    app = FastAPI()
+    app.include_router(service_routes.router, prefix="/api/v1")
+    return TestClient(app)
+
+
+def _raise_missing_ray_address(*_args, **_kwargs):
+    from tinker_server.ray_utils import MissingRayAddressError
+
+    raise MissingRayAddressError("RAY_ADDRESS must be set before initializing Ray")
+
+
+def test_list_actors_returns_503_when_ray_init_contract_fails(monkeypatch) -> None:
+    import tinker_server.ray_utils as ray_utils
+
+    _install_ray_stub(monkeypatch)
+    monkeypatch.setattr(ray_utils, "init_ray", _raise_missing_ray_address)
+
+    client = _build_client(
+        monkeypatch,
+        _FakePool(
+            actors=[{"actor_name": "dense-a", "actor_type": "dense", "base_model": "Qwen/Qwen3-0.6B"}],
+            entries=[],
+        ),
+    )
+
+    resp = client.get("/api/v1/actors")
+
+    assert resp.status_code == 503, resp.text
+    assert "RAY_ADDRESS must be set" in resp.text
+
+
+def test_kill_dense_actors_returns_503_without_unregistering_when_ray_init_fails(monkeypatch) -> None:
+    import tinker_server.ray_utils as ray_utils
+    from tinker_server.backend.resource_pool import ActorType
+
+    _install_ray_stub(monkeypatch)
+    monkeypatch.setattr(ray_utils, "init_ray", _raise_missing_ray_address)
+
+    pool = _FakePool(
+        actors=[],
+        entries=[
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-a",
+                namespace="ns",
+                base_model="Qwen/Qwen3-0.6B",
+            )
+        ],
+    )
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
+
+    assert resp.status_code == 503, resp.text
+    assert "RAY_ADDRESS must be set" in resp.text
+    assert pool.unregister_calls == []

@@ -967,8 +967,10 @@ def _augment_with_placement_groups(actors: list[dict]) -> None:
                     a["pg_total_gpus"] = sum(int(b.get("GPU", 0) or 0) for b in bundles if isinstance(b, dict))
             except Exception:
                 continue
-    except Exception:
-        return
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ray unavailable for actor inventory: {e}") from e
 
 
 @router.get("/actors")
@@ -1021,39 +1023,37 @@ def _kill_dense_actors(base_model: str | None) -> int:
     ]
 
     killed = 0
-    try:
-        import ray
-        from ..backend import ray_kill
-        from ..config import RAY_NAMESPACE
-        from ..ray_utils import init_ray
+    import ray
+    from ..backend import ray_kill
+    from ..config import RAY_NAMESPACE
+    from ..ray_utils import init_ray
 
-        if not ray.is_initialized():
-            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    if not ray.is_initialized():
+        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
-        for e in targets:
-            try:
-                actor = ray.get_actor(e.actor_name, namespace=e.namespace)
-                ray_kill.kill(
-                    actor,
-                    reason="dense_kill_by_api",
-                    actor_name=e.actor_name,
-                    namespace=e.namespace,
-                    base_model=e.base_model,
-                    no_restart=True,
-                )
-            except Exception:
-                pass
-            pool.unregister(e.actor_name)
-            try:
-                pg = ray.util.get_placement_group(f"{e.actor_name}_pg")
-                ray.util.remove_placement_group(pg)
-            except Exception:
-                pass
-            killed += 1
-    except Exception:
-        for e in targets:
+    for e in targets:
+        try:
+            actor = ray.get_actor(e.actor_name, namespace=e.namespace)
+        except ValueError:
             pool.unregister(e.actor_name)
             killed += 1
+            continue
+
+        ray_kill.kill(
+            actor,
+            reason="dense_kill_by_api",
+            actor_name=e.actor_name,
+            namespace=e.namespace,
+            base_model=e.base_model,
+            no_restart=True,
+        )
+        pool.unregister(e.actor_name)
+        try:
+            pg = ray.util.get_placement_group(f"{e.actor_name}_pg")
+            ray.util.remove_placement_group(pg)
+        except Exception:
+            pass
+        killed += 1
     return killed
 
 
@@ -1088,7 +1088,10 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
             killed_by_type["megatron"] = 1 if kill_megatron_actor(None) else 0
 
     if t in ("dense", "all"):
-        killed_by_type["dense"] = _kill_dense_actors(model_name if t == "dense" else None)
+        try:
+            killed_by_type["dense"] = _kill_dense_actors(model_name if t == "dense" else None)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Ray unavailable for dense actor kill: {e}") from e
 
     if t not in ("vllm", "megatron", "dense", "all"):
         raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
