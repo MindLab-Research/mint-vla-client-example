@@ -74,6 +74,37 @@ _COMPUTE_LOGPROBS_ROUTE = "/api/v1/compute_logprobs"
 _SAMPLE_ONCE_ROUTE = "sample_once"
 
 
+async def _normalize_sampling_request_session(
+    request: SampleRequest,
+    http_request: Request,
+) -> tuple[SampleRequest, str]:
+    if not request.needs_session_creation():
+        return request, request.get_session_id()
+
+    from .service import ensure_sampling_session
+
+    model_ref = request.model_path or request.base_model
+    if not isinstance(model_ref, str) or not model_ref:
+        raise HTTPException(
+            status_code=422,
+            detail="Exactly one selector must be provided: sampling_session_id/model_id, base_model, or model_path",
+        )
+
+    session_id, _base_model = await ensure_sampling_session(
+        model_path=model_ref,
+        http_request=http_request,
+    )
+    normalized = request.model_copy(
+        update={
+            "sampling_session_id": session_id,
+            "model_id": None,
+            "base_model": None,
+            "model_path": None,
+        }
+    )
+    return normalized, session_id
+
+
 async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
     async with _lora_load_locks_guard:
         lock = _lora_load_locks.get(session_id)
@@ -578,12 +609,13 @@ async def asample(
         upstream_for_alias,
     )
 
-    session_id = request.get_session_id()
-    if server_config.sampling_require_seq_id and request.seq_id is None:
+    uses_existing_session_selector = request.has_session_selector()
+    if server_config.sampling_require_seq_id and uses_existing_session_selector and request.seq_id is None:
         raise HTTPException(
             status_code=422,
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
+    request, session_id = await _normalize_sampling_request_session(request, http_request)
     is_local = False
     if session_manager is not None:
         is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
