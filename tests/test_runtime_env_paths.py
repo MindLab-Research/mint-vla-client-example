@@ -328,10 +328,12 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
             (
                 "import tinker_server.config as c; "
                 "import tinker_server.backend.gateway_session_store as g; "
+                "import tinker_server.backend.sampling_session_store as p; "
                 "import tinker_server.backend.session_index_store as s; "
                 "import tinker_server.backend.training_session_store as t; "
                 "print(c.RAY_NAMESPACE); "
                 "print(g._ray_namespace()); "
+                "print(p._ray_namespace()); "
                 "print(s._ray_namespace()); "
                 "print(t._ray_namespace())"
             ),
@@ -342,7 +344,7 @@ def test_detached_store_namespaces_respect_config_file(tmp_path):
         text=True,
         env=env,
     )
-    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
+    assert out.stdout.strip().splitlines() == ["cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns", "cfg_ns"]
 
 
 def test_config_import_fails_on_namespace_mismatch(tmp_path):

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 import ray
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,

@@ -200,8 +200,8 @@ async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
         if add_from_path is None:
             raise RuntimeError(f"Engine for session {session_id} does not support add_lora_for_session_from_path()")
 
-        await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
-        session_manager.mark_session_lora_loaded(session_id, True)
+        lora_int_id = await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
+        session_manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
 
 
 async def _register_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:

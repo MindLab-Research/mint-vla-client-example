@@ -282,7 +282,7 @@ async def admission_stats() -> dict:
         proc["rss_error"] = f"{type(e).__name__}: {e}"
 
     driver_state: dict = {
-        "sdk_sessions_fallback": int(len(service_route.sessions)),
+        "sdk_sessions_fallback": 0,
         "session_heartbeat_entries": int(session_heartbeat_store.size()),
     }
     try:

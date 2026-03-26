@@ -713,6 +713,27 @@ async def _prewarm_persistent_models(
     _raise_if_failures()
 
 
+async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
+    """Restore detached sampling-session metadata into SessionManager."""
+    from .backend.sampling_session_store import async_list_sampling_sessions
+
+    restored = 0
+    for info in await async_list_sampling_sessions():
+        try:
+            if inference_manager.restore_sampling_session(info):
+                restored += 1
+        except Exception as e:
+            logger.warning(
+                "Failed to restore sampling session %r from detached store: %s: %s",
+                info.get("session_id"),
+                type(e).__name__,
+                e,
+            )
+    if restored:
+        logger.info("Restored %s sampling session(s) from detached store", restored)
+    return restored
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager.
@@ -726,6 +747,7 @@ async def lifespan(app: FastAPI):
     clear_startup_degraded_state()
     from .backend.future_store import future_store
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
+    from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .checkpoints import (
@@ -737,6 +759,7 @@ async def lifespan(app: FastAPI):
 
     future_store.ensure_ready()
     ensure_gateway_session_store_ready()
+    ensure_sampling_session_store_ready()
     ensure_session_index_store_ready()
     ensure_training_session_store_ready()
 
@@ -797,6 +820,7 @@ async def lifespan(app: FastAPI):
 
     # Start background cleanup task
     await inference_manager.start_cleanup_task()
+    await _restore_sampling_sessions(inference_manager)
 
     logger.info("Inference session manager initialized")
 

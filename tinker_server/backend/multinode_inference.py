@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, preferred_torch_lib_dirs
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars, preferred_torch_lib_dirs
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import (
     get_current_traceparent,
@@ -417,6 +417,41 @@ class MultiNodeLoRARegistry:
         async with self._lock:
             slot = self._id_to_slot.get(lora_id)
             return slot.adapter_path if slot else None
+
+    async def restore_existing_session(
+        self,
+        sampling_session_id: str,
+        *,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Rehydrate an already-loaded LoRA mapping after API restart."""
+        async with self._lock:
+            existing_id = self._session_to_id.get(sampling_session_id)
+            if existing_id is not None:
+                return existing_id
+
+            lora_id = int(lora_int_id)
+            slot = self._id_to_slot.get(lora_id)
+            if slot is None:
+                slot = MultiNodeLoRASlot(
+                    lora_int_id=lora_id,
+                    sampling_session_id=sampling_session_id,
+                    adapter_path=str(adapter_path),
+                    session_ids={sampling_session_id},
+                )
+                self._id_to_slot[lora_id] = slot
+            else:
+                if str(slot.adapter_path) != str(adapter_path):
+                    raise ValueError(
+                        f"lora_int_id={lora_id} already mapped to adapter_path={slot.adapter_path}, "
+                        f"cannot restore adapter_path={adapter_path}"
+                    )
+                slot.session_ids.add(sampling_session_id)
+                slot.last_used = time.time()
+            self._session_to_id[sampling_session_id] = lora_id
+            self._next_id = max(self._next_id, lora_id + 1)
+            return lora_id
 
     async def remove_session(self, sampling_session_id: str) -> tuple[int | None, bool]:
         """Remove a session mapping and report whether engine unload is needed."""
@@ -3169,6 +3204,20 @@ class MultiNodeInferenceEngine:
             should_unload,
         )
         return True
+
+    async def restore_loaded_session(
+        self,
+        *,
+        sampling_session_id: str,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Restore a detached control-plane mapping for an already-loaded LoRA."""
+        return await self.registry.restore_existing_session(
+            sampling_session_id,
+            adapter_path=adapter_path,
+            lora_int_id=lora_int_id,
+        )
 
     async def shutdown(self, kill_actor: bool = False) -> None:
         """Disconnect from the engine."""

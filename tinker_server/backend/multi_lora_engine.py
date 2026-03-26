@@ -19,7 +19,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from tinker_server.backend.model_registry import get_model_config
-from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
+from tinker_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, otel_env_vars
 from tinker_server.config import config as server_config
 from tinker_server.logging_context import get_current_traceparent, run_async_with_otel_span
 from tinker_server.ray_utils import init_ray
@@ -1287,6 +1287,20 @@ class MultiLoRAInferenceEngine:
             should_unload,
         )
         return True
+
+    async def restore_loaded_session(
+        self,
+        *,
+        sampling_session_id: str,
+        adapter_path: str,
+        lora_int_id: int,
+    ) -> int:
+        """Restore a detached control-plane mapping for an already-loaded LoRA."""
+        return await self.registry.restore_existing_session(
+            sampling_session_id,
+            adapter_path=adapter_path,
+            lora_int_id=lora_int_id,
+        )
 
     async def shutdown(self, kill_actor: bool = False) -> None:
         """Disconnect from the engine (optionally kill the persistent actor).

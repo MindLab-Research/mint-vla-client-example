@@ -42,6 +42,7 @@ class SessionInfo:
     base_model: str | None = None  # Base model name for multi-model support
     adapter_path: str | None = None  # Optional (ephemeral) adapter directory to cleanup
     lora_loaded: bool = True  # For multi-LoRA sessions: whether LoRA is loaded into vLLM
+    lora_int_id: int | None = None  # Persisted multi-LoRA id for restart recovery
     inflight_requests: int = 0  # Prevent cleanup while requests are running
 
 
@@ -75,6 +76,31 @@ class SessionManager:
         self._cleanup_task: asyncio.Task | None = None
         self._shared_engine: VerlInferenceEngine | None = None
         self._shared_engine_lock = asyncio.Lock()
+
+    def _persist_sampling_session_info(self, session_id: str, info: SessionInfo) -> None:
+        if not info.uses_multi_lora:
+            return
+        try:
+            from .sampling_session_store import upsert_sampling_session
+
+            upsert_sampling_session(
+                {
+                    "session_id": session_id,
+                    "base_model": info.base_model,
+                    "lora_rank": int(info.lora_rank),
+                    "adapter_path": info.adapter_path,
+                    "lora_loaded": bool(info.lora_loaded),
+                    "lora_int_id": info.lora_int_id,
+                    "uses_base_model": bool(info.uses_base_model),
+                    "last_activity": float(info.last_activity),
+                }
+            )
+        except Exception as e:
+            logger.debug("Failed to persist sampling session %s: %s", session_id, e)
+
+    def _touch_info(self, session_id: str, info: SessionInfo) -> None:
+        info.last_activity = time.time()
+        self._persist_sampling_session_info(session_id, info)
 
     async def start_cleanup_task(self) -> None:
         """Start the background cleanup task."""
@@ -119,7 +145,7 @@ class SessionManager:
         info = self._sessions.get(session_id)
         if info is None:
             return
-        info.last_activity = time.time()
+        self._touch_info(session_id, info)
         info.inflight_requests = max(0, info.inflight_requests + delta)
 
     # =========================================================================
@@ -326,7 +352,7 @@ class SessionManager:
         info = self._sessions.get(session_id)
         if info is None:
             return None
-        info.last_activity = time.time()
+        self._touch_info(session_id, info)
         return info.engine
 
     async def end_session(self, session_id: str) -> bool:
@@ -344,6 +370,12 @@ class SessionManager:
         info = self._sessions.pop(session_id, None)
         if info is None:
             return False
+        try:
+            from .sampling_session_store import delete_sampling_session
+
+            delete_sampling_session(session_id)
+        except Exception as e:
+            logger.debug("Failed to delete sampling session %s from store: %s", session_id, e)
 
         if info.uses_multi_lora:
             # Best-effort: remove LoRA from vLLM and delete ephemeral adapter dir.
@@ -492,7 +524,7 @@ class SessionManager:
         """
         info = self._sessions.get(session_id)
         if info is not None:
-            info.last_activity = time.time()
+            self._touch_info(session_id, info)
         return info.base_model if info else None
 
     async def get_engine_for_session(self, session_id: str) -> "MultiLoRAInferenceEngine | None":
@@ -504,10 +536,16 @@ class SessionManager:
         Returns:
             MultiLoRAInferenceEngine for the session's model, or None if not found.
         """
-        base_model = self.get_session_base_model(session_id)
+        info = self._sessions.get(session_id)
+        if info is None:
+            return None
+        self._touch_info(session_id, info)
+        base_model = info.base_model
         if base_model is None:
             return None
-        return await self.get_engine_for_model(base_model)
+        engine = await self.get_engine_for_model(base_model)
+        await self._restore_loaded_lora_registration(session_id, info, engine)
+        return engine
 
     def register_multi_lora_session(
         self,
@@ -517,6 +555,9 @@ class SessionManager:
         adapter_path: str | None = None,
         *,
         lora_loaded: bool = True,
+        lora_int_id: int | None = None,
+        last_activity: float | None = None,
+        persist: bool = True,
     ) -> None:
         """Register a sampling session that uses the shared multi-LoRA engine.
 
@@ -537,14 +578,17 @@ class SessionManager:
 
         self._sessions[session_id] = SessionInfo(
             engine=None,  # No per-session engine
-            last_activity=time.time(),
+            last_activity=float(last_activity) if last_activity is not None else time.time(),
             lora_rank=lora_rank,
             is_shared=True,
             uses_multi_lora=True,
             base_model=base_model,
             adapter_path=adapter_path,
             lora_loaded=bool(lora_loaded),
+            lora_int_id=None if lora_int_id is None else int(lora_int_id),
         )
+        if persist:
+            self._persist_sampling_session_info(session_id, self._sessions[session_id])
         logger.info(
             f"Registered multi-LoRA session {session_id} (model={base_model}, lora_rank={lora_rank})"
         )
@@ -553,29 +597,45 @@ class SessionManager:
         info = self._sessions.get(session_id)
         if info is None:
             return None
-        info.last_activity = time.time()
+        self._touch_info(session_id, info)
         return int(info.lora_rank)
 
     def get_session_adapter_path(self, session_id: str) -> str | None:
         info = self._sessions.get(session_id)
         if info is None:
             return None
-        info.last_activity = time.time()
+        self._touch_info(session_id, info)
         return info.adapter_path
+
+    def get_session_lora_int_id(self, session_id: str) -> int | None:
+        info = self._sessions.get(session_id)
+        if info is None:
+            return None
+        self._touch_info(session_id, info)
+        return None if info.lora_int_id is None else int(info.lora_int_id)
 
     def is_session_lora_loaded(self, session_id: str) -> bool:
         info = self._sessions.get(session_id)
         if info is None:
             return False
-        info.last_activity = time.time()
+        self._touch_info(session_id, info)
         return bool(info.lora_loaded)
 
-    def mark_session_lora_loaded(self, session_id: str, loaded: bool = True) -> None:
+    def mark_session_lora_loaded(
+        self,
+        session_id: str,
+        loaded: bool = True,
+        *,
+        lora_int_id: int | None = None,
+    ) -> None:
         info = self._sessions.get(session_id)
         if info is None:
             return
-        info.last_activity = time.time()
+        self._touch_info(session_id, info)
         info.lora_loaded = bool(loaded)
+        if lora_int_id is not None:
+            info.lora_int_id = int(lora_int_id)
+        self._persist_sampling_session_info(session_id, info)
 
     def mark_model_lora_sessions_unloaded(self, base_model: str) -> int:
         """Invalidate multi-LoRA load state for sessions bound to a base model.
@@ -652,7 +712,69 @@ class SessionManager:
             base_model=base_model,
             lora_loaded=False,
         )
+        self._persist_sampling_session_info(session_id, self._sessions[session_id])
         logger.info(f"Registered base model session {session_id} (model={base_model})")
+
+    def restore_sampling_session(self, info: dict) -> bool:
+        """Restore a multi-LoRA sampling session from detached control-plane state."""
+        session_id = str(info.get("session_id") or "")
+        base_model = str(info.get("base_model") or "")
+        if not session_id or not base_model:
+            return False
+        if session_id in self._sessions:
+            return True
+
+        uses_base_model = bool(info.get("uses_base_model"))
+        last_activity = float(info.get("last_activity", time.time()))
+        if uses_base_model:
+            self._sessions[session_id] = SessionInfo(
+                engine=None,
+                last_activity=last_activity,
+                lora_rank=0,
+                is_shared=True,
+                uses_multi_lora=True,
+                uses_base_model=True,
+                base_model=base_model,
+                lora_loaded=False,
+            )
+            return True
+
+        self.register_multi_lora_session(
+            session_id=session_id,
+            base_model=base_model,
+            lora_rank=int(info.get("lora_rank") or 0),
+            adapter_path=info.get("adapter_path"),
+            lora_loaded=bool(info.get("lora_loaded")),
+            lora_int_id=info.get("lora_int_id"),
+            last_activity=last_activity,
+            persist=False,
+        )
+        return True
+
+    async def _restore_loaded_lora_registration(
+        self,
+        session_id: str,
+        info: SessionInfo,
+        engine: "MultiLoRAInferenceEngine",
+    ) -> None:
+        if not info.uses_multi_lora or info.uses_base_model or not info.lora_loaded:
+            return
+        if not info.adapter_path or info.lora_int_id is None:
+            return
+        existing_id = await engine.registry.get_lora_id(session_id)
+        if existing_id is not None:
+            info.lora_int_id = int(existing_id)
+            return
+        restore_loaded = getattr(engine, "restore_loaded_session", None)
+        if restore_loaded is None:
+            return
+        info.lora_int_id = int(
+            await restore_loaded(
+                sampling_session_id=session_id,
+                adapter_path=info.adapter_path,
+                lora_int_id=int(info.lora_int_id),
+            )
+        )
 
     async def ensure_multi_model_manager(self) -> "MultiModelInferenceManager":
         """Initialize multi-model manager if not already done.

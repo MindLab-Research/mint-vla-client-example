@@ -50,9 +50,11 @@ def test_detached_store_actors_use_tinker_ray_namespace(monkeypatch):
 
     future_store_mod = importlib.import_module("tinker_server.backend.future_store")
     gateway_session_store_mod = importlib.import_module("tinker_server.backend.gateway_session_store")
+    sampling_session_store_mod = importlib.import_module("tinker_server.backend.sampling_session_store")
     training_session_store_mod = importlib.import_module("tinker_server.backend.training_session_store")
 
     assert future_store_mod._ray_namespace() == "ns_tinker"
+    assert sampling_session_store_mod._ray_namespace() == "ns_tinker"
     assert training_session_store_mod._ray_namespace() == "ns_tinker"
     assert gateway_session_store_mod._ray_namespace() == "ns_tinker"
 

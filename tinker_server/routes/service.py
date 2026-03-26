@@ -58,9 +58,6 @@ if TYPE_CHECKING:
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# In-memory session storage
-sessions: dict[str, dict] = {}
-
 # Global session manager reference (set by app lifespan)
 session_manager: SessionManager | None = None
 
@@ -227,12 +224,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     """
     session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
-    sessions[session_id] = {
-        "tags": request.tags,
-        "metadata": request.user_metadata,
-        "user_id": user_id,
-        "created_at": datetime.now().isoformat(),
-    }
+    created_at = datetime.now().isoformat()
     try:
         from ..backend.session_index_store import upsert_session_index
 
@@ -242,7 +234,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
                 "training_run_ids": [],
                 "sampler_ids": [],
                 "user_id": user_id,
-                "created_at": sessions[session_id]["created_at"],
+                "created_at": created_at,
             }
         )
     except Exception as e:
@@ -520,10 +512,6 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
             sampler_ids=list(info.get("sampler_ids") or []),
         )
 
-    entry = sessions.get(session_id)
-    if entry and _user_visible(request_user_data, entry.get("user_id")):
-        return GetSessionResponse(training_run_ids=[], sampler_ids=[])
-
     raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
 
 
@@ -531,7 +519,6 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
 async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request = None) -> ListSessionsResponse:
     request_user_data = _get_user_data(http_request) if http_request else None
     entries: list[dict] = []
-    seen: set[str] = set()
 
     try:
         from ..backend.session_index_store import async_list_session_index
@@ -547,14 +534,6 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
         if not _user_visible(request_user_data, info.get("user_id")):
             continue
         entries.append({"session_id": sid, "created_at": info.get("created_at")})
-        seen.add(sid)
-
-    for sid, entry in sessions.items():
-        if sid in seen:
-            continue
-        if not _user_visible(request_user_data, entry.get("user_id")):
-            continue
-        entries.append({"session_id": sid, "created_at": entry.get("created_at")})
 
     entries.sort(key=lambda x: str(x.get("session_id") or ""))
     entries.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)

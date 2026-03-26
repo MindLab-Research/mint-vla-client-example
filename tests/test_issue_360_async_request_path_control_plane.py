@@ -675,7 +675,6 @@ def test_issue_360_service_get_session_uses_async_index_store(monkeypatch):
 
     monkeypatch.setattr(sis, "get_session_index", _sync_get_session_index)
     monkeypatch.setattr(sis, "async_get_session_index", _async_get_session_index)
-    monkeypatch.setattr(service_route, "sessions", {})
 
     out = anyio.run(service_route.get_session, "sess-360", _request_stub("admin"))
 
@@ -705,7 +704,6 @@ def test_issue_360_service_list_sessions_uses_async_index_store(monkeypatch):
 
     monkeypatch.setattr(sis, "list_session_index", _sync_list_session_index)
     monkeypatch.setattr(sis, "async_list_session_index", _async_list_session_index)
-    monkeypatch.setattr(service_route, "sessions", {})
 
     out = anyio.run(service_route.list_sessions, 20, 0, _request_stub("admin"))
 
@@ -1475,5 +1473,42 @@ def test_issue_360_training_session_store_async_reacquires_dead_actor(monkeypatc
     out = anyio.run(store_module.async_get_training_session_info, "run-reacquired")
 
     assert out == {"model_id": "run-reacquired"}
+    assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
+    assert store_module._ACTOR_HANDLE is recovered_actor
+
+
+def test_issue_360_sampling_session_store_async_reacquires_dead_actor(monkeypatch):
+    import importlib
+
+    store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
+
+    class _ActorDiedError(Exception):
+        pass
+
+    class _RayActorError(Exception):
+        pass
+
+    stale_actor = SimpleNamespace(get=_RemoteCall(error=_ActorDiedError("dead actor")))
+    recovered_actor = SimpleNamespace(get=_RemoteCall(result={"session_id": "sampling-reacquired"}))
+    reacquire_calls: list[tuple[str, str]] = []
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.is_initialized = lambda: True  # type: ignore[attr-defined]
+    ray_mod.exceptions = SimpleNamespace(
+        ActorDiedError=_ActorDiedError,
+        RayActorError=_RayActorError,
+    )
+
+    def _get_actor(name: str, *, namespace: str):
+        reacquire_calls.append((name, namespace))
+        return recovered_actor
+
+    ray_mod.get_actor = _get_actor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    monkeypatch.setattr(store_module, "_ACTOR_HANDLE", stale_actor)
+
+    out = anyio.run(store_module.async_get_sampling_session_info, "sampling-reacquired")
+
+    assert out == {"session_id": "sampling-reacquired"}
     assert reacquire_calls == [(store_module._actor_name(), store_module._ray_namespace())]
     assert store_module._ACTOR_HANDLE is recovered_actor

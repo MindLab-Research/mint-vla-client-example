@@ -88,11 +88,20 @@ class _StubSessionManager:
     def set_multi_model_manager(self, manager) -> None:
         self.multi_model_manager = manager
 
+    def restore_sampling_session(self, _info) -> bool:
+        return True
+
     async def shutdown_all(self) -> None:
         return None
 
 
 class _StubTrainingManager:
+    def __init__(self, *_args, **_kwargs):
+        return None
+
+    async def start_cleanup_task(self, _engine) -> None:
+        return None
+
     async def shutdown_all(self, _engine) -> None:
         return None
 
@@ -122,13 +131,18 @@ async def _noop_async(*_args, **_kwargs) -> None:
 
 def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
+    monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
     monkeypatch.setattr(app_module, "SessionManager", _StubSessionManager)
     monkeypatch.setattr(app_module.config, "enable_multi_lora", False)
     monkeypatch.setattr(app_module.config, "api_work_queue_num_workers", 1)
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
+    sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
+    session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
     training_session_manager_module = importlib.import_module("tinker_server.backend.training_session_manager")
+    training_session_store_module = importlib.import_module("tinker_server.backend.training_session_store")
     checkpoints_module = importlib.import_module("tinker_server.checkpoints")
     gateway_module = importlib.import_module("tinker_server.gateway")
     usage_store_module = importlib.import_module("tinker_server.usage_store")
@@ -139,7 +153,11 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
+    monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
+    monkeypatch.setattr(session_index_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(training_session_manager_module, "TrainingSessionManager", _StubTrainingManager)
+    monkeypatch.setattr(training_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_reap_interval_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "get_checkpoint_mirror_poll_s", lambda: 3600.0)
     monkeypatch.setattr(checkpoints_module, "reap_runtime_checkpoints", lambda: {})
