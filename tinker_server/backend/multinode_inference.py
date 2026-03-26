@@ -261,7 +261,9 @@ def _is_request_validation_error(exc: BaseException) -> bool:
         marker in text
         for marker in (
             "vllm_prompt_logprobs_add_request_failed",
+            "vllm_prompt_topk_add_request_failed",
             "vllm_generate_add_request_failed",
+            "Requested prompt logprobs of",
             "Prompt+max_tokens length",
             "exceeds max_model_len",
             "maximum model length",
@@ -3026,7 +3028,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed compute_topk actor=%s request_id=%s sampling_session_id=%s prompt_len=%s k=%s",
                 self.actor_name,
