@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from ..auth_identity import is_admin_request
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..futures_utils import pending_future_http_response
 from ..models.types import FutureRetrieveRequest
@@ -50,6 +51,24 @@ _RECENT_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_RECENT_MAX", "2048"))
 _RECENT: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
 _PENDING_HINTS_MAX = int(os.environ.get("MINT_RETRIEVE_FUTURE_PENDING_MAX", "8192"))
 _PENDING_HINTS: "OrderedDict[str, float]" = OrderedDict()
+
+
+def _cached_response(status_code: int, headers: dict[str, str], body: Any) -> dict[str, Any]:
+    return {
+        "__cached_status_code__": int(status_code),
+        "__cached_headers__": dict(headers),
+        "__cached_body__": body,
+    }
+
+
+def _apply_cached_response(cached: Any, response: Response) -> Any:
+    if not isinstance(cached, dict) or "__cached_body__" not in cached:
+        return cached
+    response.status_code = int(cached.get("__cached_status_code__", 200))
+    headers = cached.get("__cached_headers__", {})
+    if isinstance(headers, dict):
+        response.headers.update(headers)
+    return cached["__cached_body__"]
 
 
 def _recent_put(request_id: str, payload: Any) -> None:
@@ -128,8 +147,7 @@ def _is_privileged(request: Request) -> bool:
     from ..config import config as server_config
     if not server_config.auth_enabled:
         return True
-    user_data = getattr(request.state, "user_data", None)
-    return user_data is not None and user_data.get("user_id") == "admin"
+    return is_admin_request(request)
 
 
 @router.post("/retrieve_future")
@@ -157,6 +175,12 @@ async def retrieve_future(
 
     decoded = decode_request_id(body.request_id)
     if decoded is not None:
+        # Check cache first for gateway-routed futures
+        cached = _recent_get(body.request_id)
+        if cached is not None:
+            logger.info("[retrieve_future] request_id=%s gateway_cache_hit=true", body.request_id)
+            return _apply_cached_response(cached, response)
+
         upstream_alias, upstream_request_id = decoded
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
@@ -243,6 +267,15 @@ async def retrieve_future(
         if isinstance(payload, dict) and "request_id" in payload:
             payload = dict(payload)
             payload["request_id"] = body.request_id
+        if upstream_resp.status_code != 408:
+            _recent_put(
+                body.request_id,
+                _cached_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=payload,
+                ),
+            )
         return payload
 
     try:
@@ -457,7 +490,21 @@ async def retrieve_future(
         cached = _recent_get(body.request_id)
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
-            return cached
+            return _apply_cached_response(cached, response)
+        result = future_store.get_result(body.request_id)
+        if result is not None:
+            _recent_put(body.request_id, result)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=result", body.request_id)
+            return result
+        error = future_store.get_error(body.request_id)
+        if error is not None:
+            if _is_privileged(http_request):
+                payload = {"error": error, "category": "system"}
+            else:
+                payload = {"error": _public_error(error), "category": "system"}
+            _recent_put(body.request_id, payload)
+            logger.info("[retrieve_future] request_id=%s status=retrieved served=error_payload", body.request_id)
+            return payload
         logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:

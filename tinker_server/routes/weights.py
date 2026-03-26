@@ -15,19 +15,35 @@ import logging
 import os
 import shutil
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
+from ..auth_identity import get_user_data as _request_user_data
+from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request
 from ..backend.future_store import future_store
 from ..checkpoints import (
     CHECKPOINTS_DIR,
+    MIRROR_STATUS_PENDING,
+    begin_async_checkpoint_mirror,
+    build_persistent_cache_dir,
+    checkpoint_has_optimizer_state,
     create_checkpoint_archive,
+    ensure_checkpoint_path_allowed,
+    get_persistent_cache_dir,
+    get_persistent_checkpoints_dir,
+    get_persistent_search_roots,
+    materialize_persistent_checkpoint,
     resolve_checkpoint_path,
     safe_extract_checkpoint_archive,
     validate_checkpoint_dir,
+    validate_sampler_checkpoint_for_sampling,
+    write_checkpoint_metadata,
 )
 from ..models.types import (
     CheckpointInfo,
@@ -57,15 +73,12 @@ inference_manager: SessionManager | None = None  # For multi-LoRA sampling regis
 
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state."""
-    return getattr(request.state, "user_data", None)
+    return _request_user_data(request)
 
 
 def _get_user_id(request: Request) -> str | None:
     """Extract user_id from request state."""
-    user_data = _get_user_data(request)
-    if user_data:
-        return user_data.get("user_id")
-    return None
+    return _request_user_id(request)
 
 
 def _get_webhook_url(request: Request) -> str | None:
@@ -76,7 +89,7 @@ def _get_webhook_url(request: Request) -> str | None:
     return None
 
 
-def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
+def _resolve_mint_path(mint_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
     """Convert path identifier to filesystem path.
 
     Args:
@@ -89,12 +102,261 @@ def _resolve_mint_path(mint_uri: str, *, user_id: str | None) -> str:
     Returns:
         Filesystem path.
     """
-    return resolve_checkpoint_path(mint_uri, user_id=user_id)
+    resolved = resolve_checkpoint_path(mint_uri, user_id=user_id, is_admin=is_admin)
+    ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+    return materialize_persistent_checkpoint(resolved)
 
 
 def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     """Convert to mint://{model_id}/ URI (legacy format)."""
     return f"mint://{model_id}/{checkpoint_name}"
+
+
+def _checkpoint_rank(storage_tier: str | None) -> int:
+    if storage_tier == "persistent_tos":
+        return 2
+    if storage_tier == "persistent_cache":
+        return 1
+    return 0
+
+
+def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None, is_admin: bool = False) -> None:
+    if is_admin:
+        return
+    if request_user_id is None:
+        if owner_id is None:
+            return
+        raise HTTPException(status_code=403, detail="Access denied")
+    if owner_id == request_user_id:
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _persistent_owner_root(user_id: str | None) -> str:
+    return os.path.join(get_persistent_checkpoints_dir(), user_id or "anonymous")
+
+
+def _persistent_candidate_paths(
+    *,
+    model_id: str,
+    checkpoint_name: str,
+    user_id: str | None,
+    is_admin: bool = False,
+) -> list[str]:
+    candidates: list[str] = []
+    for root in get_persistent_search_roots(primary_root=CHECKPOINTS_DIR):
+        owner_dir = user_id or "anonymous"
+        candidates.extend(
+            [
+                os.path.join(root, owner_dir, model_id, checkpoint_name),
+                os.path.join(root, model_id, checkpoint_name),
+                os.path.join(root, owner_dir, checkpoint_name),
+            ]
+        )
+        if is_admin and os.path.isdir(root):
+            try:
+                for owner in os.listdir(root):
+                    candidates.append(os.path.join(root, owner, model_id, checkpoint_name))
+                    candidates.append(os.path.join(root, owner, checkpoint_name))
+            except OSError:
+                pass
+    # Preserve order while dropping duplicates.
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(path)
+    return out
+
+
+def _build_sdk_archive_redirect_response(
+    *,
+    request: Request,
+    user_id: str | None,
+    model_id: str,
+    checkpoint_id: str,
+) -> RedirectResponse:
+    from ..config import config
+    from ..download_tokens import make_archive_download_token
+    from starlette.datastructures import URL
+
+    secret = (config.token_secret_key or config.api_key or "").strip()
+
+    def _first_forwarded(value: str | None) -> str | None:
+        if not value:
+            return None
+        return value.split(",")[0].strip() or None
+
+    xf_proto = _first_forwarded(request.headers.get("x-forwarded-proto"))
+    xf_host = _first_forwarded(request.headers.get("x-forwarded-host"))
+    xf_port = _first_forwarded(request.headers.get("x-forwarded-port"))
+
+    scheme = xf_proto or request.url.scheme
+    host = xf_host or request.headers.get("host") or request.url.netloc
+    if xf_port and host and ":" not in host:
+        host = f"{host}:{xf_port}"
+
+    base = URL(f"{scheme}://{host}")
+    direct_url_obj = base.replace(path=request.url.path).include_query_params(direct="1")
+    if secret:
+        token, exp = make_archive_download_token(
+            secret=secret,
+            user_id=user_id,
+            model_id=model_id,
+            checkpoint_id=checkpoint_id,
+            ttl_s=15 * 60,
+        )
+        direct_url_obj = direct_url_obj.include_query_params(download_token=token)
+        expires = datetime.fromtimestamp(exp, tz=timezone.utc)
+    else:
+        expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return RedirectResponse(
+        url=str(direct_url_obj),
+        status_code=302,
+        headers={"Expires": expires_header},
+    )
+
+
+async def _close_upstream_response(response, client) -> None:
+    try:
+        await response.aclose()
+    finally:
+        await client.aclose()
+
+
+async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
+    from ..gateway import forward_json, remote_training_model_info, upstream_for_alias
+
+    remote = remote_training_model_info(model_id)
+    if remote is None:
+        return None
+
+    upstream_alias = str(remote.get("upstream_alias") or "")
+    base_model = str(remote.get("base_model") or "")
+    owner_id = remote.get("owner_id")
+    upstream = upstream_for_alias(upstream_alias)
+    if upstream is None:
+        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+    user_data = _get_user_data(request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    _require_checkpoint_owner(
+        request_user_id=_get_user_id(request),
+        owner_id=owner_id,
+        is_admin=is_admin_request(request),
+    )
+
+    try:
+        resp = await forward_json(
+            upstream=upstream,
+            method="GET",
+            path=request.url.path,
+            incoming_headers=dict(request.headers),
+            json_body=None,
+            timeout_s=30.0,
+        )
+    except Exception:
+        logger.exception("Upstream checkpoint list failed: %s", upstream_alias)
+        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint list failed")
+
+    if resp.status_code >= 400:
+        try:
+            payload = resp.json()
+        except Exception:
+            detail = resp.text
+        else:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return CheckpointsListResponse.model_validate(resp.json())
+
+
+async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: str, request: Request, direct: bool):
+    from ..gateway import forward_request, remote_training_model_info, upstream_for_alias
+
+    remote = remote_training_model_info(model_id)
+    if remote is None:
+        return None
+
+    upstream_alias = str(remote.get("upstream_alias") or "")
+    base_model = str(remote.get("base_model") or "")
+    owner_id = remote.get("owner_id")
+    upstream = upstream_for_alias(upstream_alias)
+    if upstream is None:
+        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+
+    user_data = _get_user_data(request)
+    if not can_access_model(base_model, user_data):
+        raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+    _require_checkpoint_owner(
+        request_user_id=_get_user_id(request),
+        owner_id=owner_id,
+        is_admin=is_admin_request(request),
+    )
+
+    params = dict(request.query_params)
+    if direct:
+        params["direct"] = "1"
+
+    try:
+        client, resp = await forward_request(
+            upstream=upstream,
+            method="GET",
+            path=request.url.path,
+            incoming_headers=dict(request.headers),
+            params=params,
+            timeout_s=600.0,
+            stream=True,
+        )
+    except Exception:
+        logger.exception("Upstream checkpoint archive failed: %s", upstream_alias)
+        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint archive failed")
+
+    if resp.status_code >= 400:
+        text = await resp.aread()
+        await _close_upstream_response(resp, client)
+        decoded = text.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(decoded)
+        except Exception:
+            detail = decoded
+        else:
+            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+
+    if resp.status_code in (301, 302, 303, 307, 308):
+        headers = {}
+        expires = resp.headers.get("expires")
+        if expires:
+            headers["Expires"] = expires
+        await _close_upstream_response(resp, client)
+        redirect = _build_sdk_archive_redirect_response(
+            request=request,
+            user_id=_get_user_id(request),
+            model_id=model_id,
+            checkpoint_id=checkpoint_id,
+        )
+        redirect.status_code = resp.status_code
+        redirect.headers.update(headers)
+        return redirect
+
+    response_headers = {}
+    for name in ("Content-Disposition", "Content-Length", "Expires"):
+        value = resp.headers.get(name)
+        if value:
+            response_headers[name] = value
+
+    return StreamingResponse(
+        resp.aiter_bytes(),
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+        headers=response_headers,
+        background=BackgroundTask(_close_upstream_response, resp, client),
+    )
 
 
 # =============================================================================
@@ -175,6 +437,7 @@ async def save_weights(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -329,7 +592,6 @@ async def _do_save_state(
     Storage schema: /checkpoints/{owner_id}/{model_id}/{checkpoint_name}/
     Also registers the model for sampling via multi-LoRA engine.
     """
-    import json
     session = None
 
     try:
@@ -348,8 +610,11 @@ async def _do_save_state(
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
-        owner_dir = user_id or "anonymous"
-        save_path = os.path.join(CHECKPOINTS_DIR, owner_dir, session.model_id, checkpoint_name)
+        save_path = build_persistent_cache_dir(
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
 
         logger.info(f"[{session.model_id}] Saving state to: {save_path}")
 
@@ -361,13 +626,17 @@ async def _do_save_state(
         # sync may not be complete yet. Create directory on API server to ensure it exists.
         os.makedirs(save_path, exist_ok=True)
 
-        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
-
         optimizer_present = bool(checkpoint_has_optimizer_state(save_path))
         if not optimizer_present:
             raise RuntimeError(
                 f"save_state must produce optimizer artifacts, but none found under: {save_path}"
             )
+        try:
+            validate_checkpoint_dir(save_path, checkpoint_type="training")
+        except ValueError as e:
+            raise RuntimeError(
+                f"save_state produced an invalid training checkpoint at {save_path}: {e}"
+            ) from e
 
         metadata = {
             "checkpoint_id": checkpoint_name,
@@ -380,36 +649,21 @@ async def _do_save_state(
             "optimizer_present": optimizer_present,
             "backend": session.backend,
             "type": "training",
+            "storage_tier": "persistent_cache",
+            "ttl_seconds": request.ttl_seconds,
         }
         write_checkpoint_metadata(save_path, metadata)
 
-        # Register for sampling via path-based loading (avoids tensor transfer OOM)
+        persistent_path = begin_async_checkpoint_mirror(
+            save_path,
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
+
+        # Sampling engines load checkpoints on demand via checkpoint_uri/create_sampling_session.
+        # Do not block save_state completion on vLLM engine creation or LoRA hot-load.
         sampling_registered = False
-        base_model = session.base_model
-        if inference_manager is not None and base_model is not None:
-            try:
-                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-
-                # Remove existing registration if any
-                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                if existing_lora_id is not None:
-                    await multi_lora_engine.remove_session(session.model_id)
-
-                # Path-based loading - vLLM loads directly from shared filesystem
-                await multi_lora_engine.add_lora_for_session_from_path(
-                    sampling_session_id=session.model_id,
-                    lora_path=abs_path,
-                )
-                try:
-                    inference_manager.register_multi_lora_session(
-                        session.model_id, base_model=base_model
-                    )
-                except ValueError:
-                    pass  # Already registered
-                sampling_registered = True
-                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
-            except Exception as reg_err:
-                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
         from ..client_compat import checkpoint_uri
 
@@ -437,6 +691,10 @@ async def _do_save_state(
             "mint_path": mint_path,
             "tinker_path": tinker_path,
             "filesystem_path": save_path,
+            "persistent_filesystem_path": persistent_path,
+            "mirror_status": MIRROR_STATUS_PENDING,
+            "storage_tier": "persistent_cache",
+            "mirror_error": None,
             "type": "save_weights",
             "sampling_registered": sampling_registered,
             "checkpoint_type": "training",
@@ -511,22 +769,22 @@ async def _do_save_weights(
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
 
-        owner_dir = user_id or "anonymous"
-        checkpoint_base_dir = os.path.join(CHECKPOINTS_DIR, owner_dir)
-        save_path = os.path.join(checkpoint_base_dir, session.model_id, checkpoint_name)
+        save_path = build_persistent_cache_dir(
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
 
         logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
 
         abs_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
-            checkpoint_base_dir=checkpoint_base_dir,
+            checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
             use_per_expert_lora=False,
         )
 
         os.makedirs(save_path, exist_ok=True)
-
-        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
 
         if checkpoint_has_optimizer_state(save_path):
             raise RuntimeError(
@@ -544,33 +802,21 @@ async def _do_save_weights(
             "optimizer_present": False,
             "backend": session.backend,
             "type": "sampler",
+            "storage_tier": "persistent_cache",
+            "ttl_seconds": request.ttl_seconds,
         }
         write_checkpoint_metadata(save_path, metadata)
 
+        persistent_path = begin_async_checkpoint_mirror(
+            save_path,
+            user_id=user_id,
+            model_id=session.model_id,
+            checkpoint_name=checkpoint_name,
+        )
+
+        # Keep save_weights completion scoped to checkpoint export + metadata publication.
+        # Sampler clients can load the returned checkpoint path on demand.
         sampling_registered = False
-        base_model = session.base_model
-        if inference_manager is not None and base_model is not None:
-            try:
-                multi_lora_engine = await inference_manager.get_engine_for_model(base_model)
-
-                existing_lora_id = await multi_lora_engine.registry.get_lora_id(session.model_id)
-                if existing_lora_id is not None:
-                    await multi_lora_engine.remove_session(session.model_id)
-
-                await multi_lora_engine.add_lora_for_session_from_path(
-                    sampling_session_id=session.model_id,
-                    lora_path=abs_path,
-                )
-                try:
-                    inference_manager.register_multi_lora_session(
-                        session.model_id, base_model=base_model
-                    )
-                except ValueError:
-                    pass
-                sampling_registered = True
-                logger.info(f"[{session.model_id}] Registered for sampling (path={abs_path})")
-            except Exception as reg_err:
-                logger.warning(f"[{session.model_id}] Could not register for sampling: {reg_err}")
 
         from ..client_compat import checkpoint_uri
 
@@ -596,6 +842,10 @@ async def _do_save_weights(
                 "mint_path": mint_path,
                 "tinker_path": tinker_path,
                 "filesystem_path": save_path,
+                "persistent_filesystem_path": persistent_path,
+                "mirror_status": MIRROR_STATUS_PENDING,
+                "storage_tier": "persistent_cache",
+                "mirror_error": None,
                 "type": "save_weights",
                 "sampling_registered": sampling_registered,
                 "checkpoint_type": "sampler",
@@ -675,15 +925,11 @@ async def load_state(
         incoming_headers = dict(http_request.headers)
         json_body = request.model_dump()
         if request.path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = resolve_checkpoint_path(request.path, user_id=user_id)
-            if user_id and user_id != "admin":
-                load_real = os.path.realpath(local_path)
-                checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-                allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-                if load_real.startswith(checkpoints_real + os.sep) and not (
-                    load_real == allowed_real or load_real.startswith(allowed_real + os.sep)
-                ):
-                    raise HTTPException(status_code=403, detail="Access denied")
+            local_path = resolve_checkpoint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+            try:
+                ensure_checkpoint_path_allowed(local_path, user_id=user_id, is_admin=is_admin_request(http_request))
+            except PermissionError as e:
+                raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
                 import asyncio
                 import tempfile
@@ -747,11 +993,12 @@ async def load_state(
         raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
 
     user_id = _get_user_id(http_request)
+    load_path = _resolve_mint_path(request.path, user_id=user_id, is_admin=is_admin_request(http_request))
+    request = request.model_copy(update={"path": load_path})
     if request.optimizer:
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            load_path = _resolve_mint_path(request.path, user_id=user_id)
             validate_checkpoint_load_contract(load_path, load_optimizer=True)
         except ValueError as e:
             raise HTTPException(
@@ -814,16 +1061,7 @@ async def _do_load_state(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        # Resolve path
-        load_path = _resolve_mint_path(request.path, user_id=user_id)
-        if user_id and user_id != "admin":
-            load_real = os.path.realpath(load_path)
-            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
-                allowed_real + os.sep
-            ):
-                raise PermissionError("Access denied")
+        load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
 
@@ -874,7 +1112,7 @@ async def upload_checkpoint_archive(
     owner_dir = user_id or "anonymous"
 
     checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
-    parent_dir = os.path.join(CHECKPOINTS_DIR, owner_dir)
+    parent_dir = os.path.join(get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)[0], owner_dir)
     final_dir = os.path.join(parent_dir, checkpoint_id)
     tmp_dir = final_dir + ".tmp"
     tmp_archive: str | None = None
@@ -974,9 +1212,9 @@ async def upload_checkpoint_archive(
             "optimizer_present": checkpoint_type == "training",
             "backend": None,
             "type": checkpoint_type,
+            "storage_tier": "persistent_tos",
         }
-        with open(os.path.join(tmp_dir, "metadata.json"), "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_checkpoint_metadata(tmp_dir, metadata)
 
         os.rename(tmp_dir, final_dir)
         return CheckpointUploadResponse(checkpoint_id=checkpoint_id, path=checkpoint_id)
@@ -1006,30 +1244,47 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
     Works for both active training sessions and saved checkpoints.
     Ownership verified via metadata.json (admin can access all).
     """
+    remote_response = await _forward_remote_checkpoint_route(model_id=model_id, request=request)
+    if remote_response is not None:
+        return remote_response
+
     user_id = _get_user_id(request)
     owner_dir = user_id or "anonymous"
     from ..client_compat import checkpoint_uri, prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(request)
 
-    candidate_paths: list[str] = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id),
-        os.path.join(CHECKPOINTS_DIR, model_id),  # legacy (pre user-scoping)
-    ]
-    if user_id == "admin":
-        candidate_paths = [os.path.join(CHECKPOINTS_DIR, model_id)]
-        try:
-            for owner in os.listdir(CHECKPOINTS_DIR):
-                candidate_paths.append(os.path.join(CHECKPOINTS_DIR, owner, model_id))
-        except OSError:
-            pass
+    persistent_roots = get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)
+    cache_root = get_persistent_cache_dir()
+
+    candidate_paths: list[str] = []
+    for root in [*persistent_roots, cache_root]:
+        candidate_paths.extend(
+            [
+                os.path.join(root, owner_dir, model_id),
+                os.path.join(root, model_id),
+            ]
+        )
+        if is_admin_request(request) and os.path.isdir(root):
+            try:
+                for owner in os.listdir(root):
+                    candidate_paths.append(os.path.join(root, owner, model_id))
+            except OSError:
+                pass
 
     if not any(os.path.exists(p) for p in candidate_paths):
         raise HTTPException(
             status_code=404, detail=f"No checkpoints found for model '{model_id}'"
         )
 
-    checkpoints = []
+    checkpoints_by_id: dict[str, tuple[int, CheckpointInfo]] = {}
+
+    def _store_checkpoint(info: CheckpointInfo) -> None:
+        rank = _checkpoint_rank(info.storage_tier)
+        current = checkpoints_by_id.get(info.checkpoint_id)
+        if current is None or rank >= current[0]:
+            checkpoints_by_id[info.checkpoint_id] = (rank, info)
+
     seen: set[str] = set()
     for checkpoints_path in candidate_paths:
         if not os.path.isdir(checkpoints_path):
@@ -1056,7 +1311,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
 
             if metadata.get("model_id") != model_id:
                 continue
-            if user_id != "admin" and metadata.get("owner_id") != user_id:
+            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
                 continue
 
             # Try to parse step from directory name
@@ -1071,6 +1326,16 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoint_type = metadata.get("checkpoint_type")
             if checkpoint_type not in ("training", "sampler"):
                 continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
+                continue
+            storage_tier = metadata.get("storage_tier")
+            mirror_status = metadata.get("mirror_status")
+            mirror_error = metadata.get("mirror_error")
 
             created_at = metadata.get("created_at") or created_at
             try:
@@ -1094,7 +1359,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 checkpoint_type=checkpoint_type,
             )
 
-            checkpoints.append(
+            _store_checkpoint(
                 CheckpointInfo(
                     checkpoint_id=checkpoint_id,
                     checkpoint_type=checkpoint_type,
@@ -1103,22 +1368,29 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                     path=path_uri,
                     step=step,
                     created_at=created_at,
+                    storage_tier=storage_tier,
+                    mirror_status=mirror_status,
+                    mirror_error=mirror_error,
                 )
             )
 
     # Also include uploaded checkpoints stored as /checkpoints/{owner}/{checkpoint_id}/ if metadata.model_id matches.
     owner_roots: list[str]
-    if user_id == "admin":
+    if is_admin_request(request):
         try:
-            owner_roots = [
-                os.path.join(CHECKPOINTS_DIR, d)
-                for d in os.listdir(CHECKPOINTS_DIR)
-                if os.path.isdir(os.path.join(CHECKPOINTS_DIR, d))
-            ]
+            owner_roots = []
+            for root in [*persistent_roots, cache_root]:
+                if not os.path.isdir(root):
+                    continue
+                owner_roots.extend(
+                    os.path.join(root, d)
+                    for d in os.listdir(root)
+                    if os.path.isdir(os.path.join(root, d))
+                )
         except OSError:
             owner_roots = []
     else:
-        owner_roots = [os.path.join(CHECKPOINTS_DIR, owner_dir)]
+        owner_roots = [os.path.join(root, owner_dir) for root in [*persistent_roots, cache_root]]
 
     for root in owner_roots:
         if not os.path.isdir(root):
@@ -1141,12 +1413,22 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 continue
             if metadata.get("model_id") != model_id:
                 continue
-            if user_id != "admin" and metadata.get("owner_id") != user_id:
+            if not is_admin_request(request) and metadata.get("owner_id") != user_id:
                 continue
             created_at = datetime.fromtimestamp(os.path.getctime(ckpt_path)).isoformat()
             checkpoint_type = metadata.get("checkpoint_type")
             if checkpoint_type not in ("training", "sampler"):
                 continue
+            try:
+                if checkpoint_type == "sampler":
+                    validate_sampler_checkpoint_for_sampling(ckpt_path)
+                else:
+                    validate_checkpoint_dir(ckpt_path, checkpoint_type=checkpoint_type)
+            except ValueError:
+                continue
+            storage_tier = metadata.get("storage_tier")
+            mirror_status = metadata.get("mirror_status")
+            mirror_error = metadata.get("mirror_error")
 
             created_at = metadata.get("created_at") or created_at
             try:
@@ -1169,7 +1451,7 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                 prefer_tinker=prefer_tinker,
                 checkpoint_type=checkpoint_type,
             )
-            checkpoints.append(
+            _store_checkpoint(
                 CheckpointInfo(
                     checkpoint_id=checkpoint_id,
                     checkpoint_type=checkpoint_type,
@@ -1178,10 +1460,14 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
                     path=path_uri,
                     step=None,
                     created_at=created_at,
+                    storage_tier=storage_tier,
+                    mirror_status=mirror_status,
+                    mirror_error=mirror_error,
                 )
             )
 
     # Sort by step (descending)
+    checkpoints = [item for _, item in checkpoints_by_id.values()]
     checkpoints.sort(key=lambda x: x.step or 0, reverse=True)
 
     return CheckpointsListResponse(
@@ -1212,23 +1498,14 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
     Ownership verified via metadata.json (admin can delete all).
     """
     user_id = _get_user_id(request)
-    owner_dir = user_id or "anonymous"
+
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_name),
-        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_name),  # legacy
-        os.path.join(
-            CHECKPOINTS_DIR, owner_dir, checkpoint_name
-        ),  # uploaded /checkpoints/{owner}/{ckpt_id}
-    ]
-    if user_id == "admin":
-        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_name))
-        try:
-            for owner in os.listdir(CHECKPOINTS_DIR):
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_name))
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_name))
-        except OSError:
-            pass
+    candidates = _persistent_candidate_paths(
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        user_id=user_id,
+        is_admin=is_admin_request(request),
+    )
 
     ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
     if ckpt_path is None:
@@ -1247,7 +1524,7 @@ async def delete_checkpoint(model_id: str, checkpoint_id: str, request: Request)
 
     if metadata.get("model_id") != model_id:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-    if user_id != "admin" and metadata.get("owner_id") != user_id:
+    if not is_admin_request(request) and metadata.get("owner_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
     if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
@@ -1279,45 +1556,74 @@ async def download_checkpoint_archive(
     """
     import subprocess
 
+    remote_response = await _forward_remote_checkpoint_archive(
+        model_id=model_id,
+        checkpoint_id=checkpoint_id,
+        request=request,
+        direct=direct,
+    )
+    if remote_response is not None:
+        return remote_response
+    from ..config import config
+    from ..download_tokens import verify_download_token
+
     user_id = _get_user_id(request)
-    owner_dir = user_id or "anonymous"
+    if user_id is None:
+        download_token = request.query_params.get("download_token")
+        secret = (config.token_secret_key or config.api_key or "").strip()
+        payload = verify_download_token(download_token or "", secret=secret)
+        if (
+            isinstance(payload, dict)
+            and payload.get("model_id") == model_id
+            and payload.get("checkpoint_id") == checkpoint_id
+        ):
+            user_id = payload.get("user_id")
+
     checkpoint_name, expected_type = _split_tinker_checkpoint_id(checkpoint_id)
-    candidates = [
-        os.path.join(CHECKPOINTS_DIR, owner_dir, model_id, checkpoint_name),
-        os.path.join(CHECKPOINTS_DIR, model_id, checkpoint_name),  # legacy
-        os.path.join(
-            CHECKPOINTS_DIR, owner_dir, checkpoint_name
-        ),  # uploaded /checkpoints/{owner}/{ckpt_id}
-    ]
-    if user_id == "admin":
-        candidates.append(os.path.join(CHECKPOINTS_DIR, checkpoint_name))
+    candidates = _persistent_candidate_paths(
+        model_id=model_id,
+        checkpoint_name=checkpoint_name,
+        user_id=user_id,
+        is_admin=is_admin_request(request),
+    )
+
+    # Prefer a candidate whose metadata matches the requested type.
+    # This avoids false 404s when both "training" and "sampler" checkpoints share the same name.
+    import json
+
+    existing = [p for p in candidates if os.path.isdir(p)]
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+
+    ckpt_path: str | None = None
+    metadata: dict | None = None
+    saw_unowned = False
+    saw_unreadable_metadata = False
+    for p in existing:
+        metadata_path = os.path.join(p, "metadata.json")
+        if not os.path.exists(metadata_path):
+            saw_unreadable_metadata = True
+            continue
         try:
-            for owner in os.listdir(CHECKPOINTS_DIR):
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, model_id, checkpoint_name))
-                candidates.append(os.path.join(CHECKPOINTS_DIR, owner, checkpoint_name))
-        except OSError:
-            pass
+            with open(metadata_path) as f:
+                md = json.load(f)
+        except Exception:
+            saw_unreadable_metadata = True
+            continue
+        if md.get("model_id") != model_id:
+            continue
+        if expected_type is not None and md.get("checkpoint_type") != expected_type:
+            continue
+        if not is_admin_request(request) and md.get("owner_id") != user_id:
+            saw_unowned = True
+            continue
+        ckpt_path = p
+        metadata = md
+        break
 
-    ckpt_path = next((p for p in candidates if os.path.isdir(p)), None)
-    if ckpt_path is None:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-
-    metadata_path = os.path.join(ckpt_path, "metadata.json")
-    if not os.path.exists(metadata_path):
-        raise HTTPException(status_code=403, detail="Access denied")
-    try:
-        import json
-
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-    except Exception:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if metadata.get("model_id") != model_id:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
-    if user_id != "admin" and metadata.get("owner_id") != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-    if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
+    if ckpt_path is None or metadata is None:
+        if saw_unowned or saw_unreadable_metadata:
+            raise HTTPException(status_code=403, detail="Access denied")
         raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
 
     # Tinker SDK expects this endpoint to respond with 302 + Location.
@@ -1326,28 +1632,11 @@ async def download_checkpoint_archive(
         from ..client_compat import is_tinker_sdk_user_agent
 
         if is_tinker_sdk_user_agent(request.headers.get("user-agent")):
-            from ..config import config
-            from ..download_tokens import make_archive_download_token
-
-            secret = (config.token_secret_key or config.api_key or "").strip()
-            direct_url_obj = request.url.include_query_params(direct="1")
-            if secret:
-                token, exp = make_archive_download_token(
-                    secret=secret,
-                    user_id=user_id,
-                    model_id=model_id,
-                    checkpoint_id=checkpoint_id,
-                    ttl_s=15 * 60,
-                )
-                direct_url_obj = direct_url_obj.include_query_params(download_token=token)
-                expires = datetime.fromtimestamp(exp, tz=timezone.utc)
-            else:
-                expires = datetime.now(timezone.utc) + timedelta(minutes=15)
-            expires_header = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
-            return RedirectResponse(
-                url=str(direct_url_obj),
-                status_code=302,
-                headers={"Expires": expires_header},
+            return _build_sdk_archive_redirect_response(
+                request=request,
+                user_id=user_id,
+                model_id=model_id,
+                checkpoint_id=checkpoint_id,
             )
 
     def stream_tar_gz():

@@ -1,6 +1,6 @@
 # Authentication and model access
 
-Auth is enforced in `tinker_server/app.py` middleware when either `TINKER_API_KEY` or `TINKER_TOKEN_SECRET_KEY` is set. If neither is set, auth is disabled (dev mode).
+Auth is enforced in `tinker_server/app.py` middleware for both `/api/v1/*` and `/internal/*` when either `TINKER_API_KEY` or `TINKER_TOKEN_SECRET_KEY` is set. If neither is set, legacy auth is disabled (dev mode), but forged gateway identity headers are still rejected unless internal gateway auth is configured correctly.
 
 ## API keys and identities
 
@@ -22,8 +22,20 @@ Headers supported:
 - `Authorization: sk-mint-...` (direct token)
 - `Authorization: sk-...` (legacy direct token)
 
+Gateway-forwarded trusted identity:
+- `X-MinT-User-Id`
+- `X-MinT-User-Role`
+- `X-MinT-Apikey-Id`
+- `X-MinT-Request-Id`
+- `X-Internal-Token`
+
+Trusted identity rules:
+- `X-MinT-*` headers are only accepted when `INTERNAL_API_TOKEN` is configured and `X-Internal-Token` matches.
+- `X-Request-Id` alone must not trigger trusted-header mode.
+- Admin authorization should use `user_role == "admin"` (with `user_id == "admin"` kept only as legacy fallback).
+
 Privilege boundary:
-- `/api/v1/retrieve_future` hides detailed exception text unless the caller is privileged (admin).
+- `/api/v1/retrieve_future` hides detailed exception text unless the caller is privileged (admin role).
 
 ## Model access control
 

@@ -1,7 +1,7 @@
 ---
 name: alpha-user-prod
 description: |
-  Alpha-user exploration against MinT production (https://mint.macaron.im).
+  Alpha-user exploration against MinT production (https://mint.macaron.im for international access; https://mint.macaron.xin for China access).
 
   Generates and runs new demos from the MinT/Tinker SDK contract (not limited to cookbook examples),
   maintains an internal roadmap + demo inventory (self-contained), triages failures (task vs client vs server vs missing feature),
@@ -51,7 +51,7 @@ Artifacts:
 - Store throwaway demo scripts under `scripts/wip/alpha_user_prod/` (gitignored by repo root).
 
 Production targeting:
-- Base URL: `https://mint.macaron.im` (set `MINT_BASE_URL` explicitly for every run)
+- Base URL: `https://mint.macaron.im` (international) or `https://mint.macaron.xin` (China) (set `MINT_BASE_URL` explicitly for every run)
 - Auth: `MINT_API_KEY` (required)
 
 ## Session protocol (run every time this skill triggers)
@@ -119,7 +119,7 @@ A "soft expectation" failing is not a server bug by itself. Only treat it as a b
 
 - Write a runnable script under `scripts/wip/alpha_user_prod/<demo_id>.py`.
 - Run it against production:
-  - Base URL: `https://mint.macaron.im`
+  - Base URL: `https://mint.macaron.im` (international) or `https://mint.macaron.xin` (China)
   - Auth: via `MINT_API_KEY` (or `TINKER_API_KEY` depending on the SDK alias used by the script).
 - Prefer `asyncio` + async SDK methods for concurrency and for exercising futures ordering semantics.
 - Emulate one or more "alpha users" as separate personas (independent sessions/clients) and interleave their requests.

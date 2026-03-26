@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import config as server_config
+from ..config import config as server_config, otel_env_vars
 
 
 class CapacityManagerUnavailableError(RuntimeError):
@@ -70,6 +70,9 @@ def _get_or_create_ray_actor():
     @ray.remote(num_cpus=0)
     class _RayCapacityManagerActor:
         def __init__(self, *, queue_bytes_budget: int) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
             self._queue_bytes_budget = int(queue_bytes_budget)
             self._queue_bytes_reserved = 0
             self._object_store_bytes_reserved = 0
@@ -182,8 +185,22 @@ def _get_or_create_ray_actor():
             self._object_store_released.discard(request_id)
             return {"ok": True}
 
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": _ray_namespace(),
+        "lifetime": "detached",
+        "get_if_exists": True,
+    }
+    actor_otel_env = otel_env_vars()
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
     return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
-        name=actor_name, namespace=_ray_namespace(), lifetime="detached", get_if_exists=True
+        **options
     ).remote(queue_bytes_budget=queue_bytes_budget)
 
 
@@ -200,10 +217,8 @@ class CapacityManager:
         if not ray.is_initialized():
             try:
                 from ..ray_utils import init_ray
-                from .future_store import _infer_ray_address  # type: ignore
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise CapacityManagerUnavailableError("Ray not initialized (init_ray failed)") from e
 

@@ -8,12 +8,10 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from .backend.api_work_queue import ApiWorkQueueUnavailableError
 from .backend.capacity_manager import CapacityManagerUnavailableError
@@ -22,6 +20,7 @@ from .backend.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
 from .config import config
 from .gateway import close_http_clients
 from .health_state import clear_startup_degraded_state, set_startup_degraded_state
+from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
 from .logging_context import (
     classify_failure_reason,
     ensure_trace_id,
@@ -29,22 +28,32 @@ from .logging_context import (
     get_trace_id,
     get_otel_tracer,
     record_http_server_metrics,
+    run_async_with_otel_span,
     set_trace_id,
 )
 from .ray_utils import init_ray
-from .routes import action_sampling, futures, internal, sampling, service, training, weights
+from .routes import action_sampling, futures, internal, openai_compat, sampling, service, training, weights
 from .token_encryptor import TokenEncryptor
 
 if TYPE_CHECKING:
     from .backend.multi_lora_engine import MultiModelInferenceManager
     from .backend.training_engine_router import TrainingEngineRouter
     from .backend.training_session_manager import TrainingSessionManager
+    from .backend.verl_training import VerlTrainingEngine
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _http_route_label(request: Request) -> str:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if isinstance(route_path, str) and route_path:
+        return route_path
+    return request.url.path
 
 
 async def _cleanup_stale_actors() -> None:
@@ -68,7 +77,6 @@ async def _cleanup_stale_actors() -> None:
 
         if not ray.is_initialized():
             init_ray(
-                address="auto",
                 namespace=PERSISTENT_NAMESPACE,
                 ignore_reinit_error=True,
             )
@@ -152,7 +160,7 @@ async def _cleanup_stale_actors() -> None:
                     if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                         actor_type = ActorType.VLLM
                         base_model = ""
-                        num_gpus = 1  # Fallback for unknown models
+                        num_gpus: int | None = None
                         if name.startswith("tinker_vllm_"):
                             model_part = name[len("tinker_vllm_"):]
                         else:
@@ -162,6 +170,11 @@ async def _cleanup_stale_actors() -> None:
                             base_model = model_name
                             num_gpus = cfg.total_gpus
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored vLLM actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     elif name.startswith("peft_trainer_"):
                         actor_type = ActorType.DENSE
                         num_gpus = 1
@@ -170,13 +183,12 @@ async def _cleanup_stale_actors() -> None:
                         # MegatronWorkerGroup actors: megatron_{model_name}
                         actor_type = ActorType.MEGATRON
                         base_model = ""
+                        num_gpus: int | None = None
                         model_part = name[len("megatron_"):]
                         model_name, cfg = _lookup_model_config(model_part)
                         if cfg is not None:
                             base_model = model_name
                             num_gpus = cfg.train_gpus
-                        else:
-                            num_gpus = 8  # Fallback for unknown models
 
                         # Prefer real world_size when actor is responsive.
                         try:
@@ -186,6 +198,11 @@ async def _cleanup_stale_actors() -> None:
                         except Exception:
                             pass
                         num_gpus = _pg_total_gpus(name) or num_gpus
+                        if num_gpus is None:
+                            logger.warning(
+                                f"Skipping restored Megatron actor with unknown GPU count: actor={name}"
+                            )
+                            continue
                     else:
                         logger.debug(f"Unknown actor type for {name}, skipping registration")
                         continue
@@ -243,7 +260,7 @@ async def _cleanup_stale_actors() -> None:
 
                         if name.startswith("tinker_vllm_") or name.startswith("multinode_vllm_"):
                             actor_type = ActorType.VLLM
-                            num_gpus = 1
+                            num_gpus: int | None = None
                             base_model = ""
                             if name.startswith("tinker_vllm_"):
                                 model_part = name[len("tinker_vllm_"):]
@@ -254,6 +271,11 @@ async def _cleanup_stale_actors() -> None:
                                 base_model = model_name
                                 num_gpus = cfg.total_gpus
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored vLLM actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         elif name.startswith("peft_trainer_"):
                             actor_type = ActorType.DENSE
                             num_gpus = 1
@@ -261,14 +283,18 @@ async def _cleanup_stale_actors() -> None:
                         elif name.startswith("megatron_"):
                             actor_type = ActorType.MEGATRON
                             base_model = ""
+                            num_gpus: int | None = None
                             model_part = name[len("megatron_"):]
                             model_name, cfg = _lookup_model_config(model_part)
                             if cfg is not None:
                                 base_model = model_name
                                 num_gpus = cfg.train_gpus
-                            else:
-                                num_gpus = 8
                             num_gpus = _pg_total_gpus(name) or num_gpus
+                            if num_gpus is None:
+                                logger.warning(
+                                    f"Skipping busy restored Megatron actor with unknown GPU count: actor={name}"
+                                )
+                                continue
                         else:
                             logger.debug(f"Unknown actor type for {name}, skipping registration")
                             continue
@@ -334,6 +360,15 @@ async def _prewarm_persistent_models(
 
     and marks them as ResourcePool protected to prevent LRU eviction.
     """
+    failures: list[str] = []
+
+    def _record_failure(stage: str, model_name: str, exc: Exception) -> None:
+        failures.append(f"{stage} failed model={model_name}: {type(exc).__name__}: {exc}")
+
+    def _raise_if_failures() -> None:
+        if failures:
+            raise RuntimeError("persistent prewarm failed:\n" + "\n".join(failures))
+
     models_csv = (config.prewarm_persistent_models_csv or "").strip()
     if not models_csv:
         logger.info("No persistent models configured (MINT_PERSISTENT_MODELS empty); skipping prewarm")
@@ -370,6 +405,51 @@ async def _prewarm_persistent_models(
                 pinned_vllm_node_ip = {str(k): str(v) for k, v in parsed.items()}
         except Exception:
             pinned_vllm_node_ip = {}
+
+    def _preferred_pg_node_id(pg_name: str, model_name: str) -> str | None:
+        preferred_ips: list[str] = []
+        for env_name in ("MINT_MEGATRON_MODEL_NODE_IPS_JSON", "MINT_MODEL_NODE_IPS_JSON"):
+            raw = os.environ.get(env_name, "").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            selected = None
+            for key in (model_name, model_name.lower()):
+                selected = data.get(key)
+                if selected is not None:
+                    break
+            if isinstance(selected, list):
+                preferred_ips.extend(str(ip).strip() for ip in selected if str(ip).strip())
+            if preferred_ips:
+                break
+
+        node_ip_by_id = {
+            str(n.get("NodeID") or ""): str(n.get("NodeManagerAddress") or "").strip()
+            for n in ray.nodes()
+            if n.get("Alive")
+        }
+        candidate_node_ids: list[str] = []
+        for info in ray.util.placement_group_table().values():
+            if info.get("state") != "CREATED" or info.get("name") != pg_name:
+                continue
+            bundles_to_node_id = info.get("bundles_to_node_id") or {}
+            for node_id in bundles_to_node_id.values():
+                node_id_str = str(node_id or "").strip()
+                if node_id_str:
+                    candidate_node_ids.append(node_id_str)
+        if not candidate_node_ids:
+            return None
+        if preferred_ips:
+            for node_id in candidate_node_ids:
+                if node_ip_by_id.get(node_id) in preferred_ips:
+                    return node_id
+            return None
+        return candidate_node_ids[0]
 
     logger.info(
         f"[prewarm] persistent models={models} train_lora_rank={lora_rank} train_lr={learning_rate} "
@@ -457,15 +537,7 @@ async def _prewarm_persistent_models(
                             node_id = None
                             deadline = time.monotonic() + 30.0
                             while time.monotonic() < deadline and not node_id:
-                                pg_table = ray.util.placement_group_table()
-                                for info in pg_table.values():
-                                    if info.get("state") != "CREATED":
-                                        continue
-                                    if info.get("name") != pg_name:
-                                        continue
-                                    node_id = (info.get("bundles_to_node_id") or {}).get(0)
-                                    if node_id:
-                                        break
+                                node_id = _preferred_pg_node_id(pg_name, model_name)
                                 if not node_id:
                                     await asyncio.sleep(0.5)
                             if node_id:
@@ -483,37 +555,31 @@ async def _prewarm_persistent_models(
                                 f"[prewarm] training pin_infer_to_pg_node failed model={model_name}: {pin_err}"
                             )
 
-                    async def _await_ready(
-                        actor=actor,
-                        actor_name=actor_name,
-                        model_name=model_name,
-                    ) -> None:
-                        try:
-                            await asyncio.to_thread(
-                                ray.get,
-                                actor.__ray_ready__.remote(),
-                                timeout=megatron_ready_timeout_s,
-                            )
-                            resource_pool.mark_ready(actor_name)
-                            logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
-                        except SystemExit as ready_err:
-                            if getattr(ready_err, "code", None) == 15:
-                                raise
-                            logger.warning(
-                                f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
-                            )
-                        except Exception as ready_err:
-                            logger.warning(
-                                f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
-                            )
-
-                    asyncio.create_task(_await_ready())
+                    try:
+                        await asyncio.to_thread(
+                            ray.get,
+                            actor.__ray_ready__.remote(),
+                            timeout=megatron_ready_timeout_s,
+                        )
+                        resource_pool.mark_ready(actor_name)
+                        logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
+                    except SystemExit as ready_err:
+                        if getattr(ready_err, "code", None) == 15:
+                            raise
+                        raise RuntimeError(
+                            f"[prewarm] training __ray_ready__ SystemExit model={model_name} actor={actor_name}: {ready_err}"
+                        ) from ready_err
+                    except Exception as ready_err:
+                        raise RuntimeError(
+                            f"[prewarm] training __ray_ready__ failed/timeout model={model_name} actor={actor_name}: {ready_err}"
+                        ) from ready_err
                 else:
                     # Defer dense pool creation until after multi-node vLLM inference is initialized,
                     # to avoid fragmenting the remaining 8-GPU nodes into 1-2 free GPUs each.
                     deferred_dense_training.append((model_name, base_model))
                     logger.info(f"[prewarm] training deferred model={model_name} backend=dense_pool")
             except Exception as e:
+                _record_failure("training", model_name, e)
                 logger.exception(f"[prewarm] training failed model={model_name}: {e}")
         else:
             logger.info(f"[prewarm] training skipped model={model_name} (MINT_PERSISTENT_PREWARM_TRAINING=0)")
@@ -530,9 +596,11 @@ async def _prewarm_persistent_models(
         # actors (e.g., Qwen3-30B TP=4) can be placed.
 
     if not prewarm_inference:
+        _raise_if_failures()
         return
 
     if multi_model_manager is None:
+        _raise_if_failures()
         return
 
     def _infer_gpus(model_name: str) -> int:
@@ -609,8 +677,10 @@ async def _prewarm_persistent_models(
         except SystemExit as e:
             if getattr(e, "code", None) == 15:
                 raise
+            _record_failure("inference", model_name, e)
             logger.exception(f"[prewarm] inference SystemExit model={model_name}: {e}")
         except Exception as e:
+            _record_failure("inference", model_name, e)
             logger.exception(f"[prewarm] inference failed model={model_name}: {e}")
 
     # -------------------------
@@ -636,7 +706,10 @@ async def _prewarm_persistent_models(
                 resource_pool.set_protected(actor_name, True)
                 logger.info(f"[prewarm] training ready+protected model={model_name} actor={actor_name}")
             except Exception as e:
+                _record_failure("training", model_name, e)
                 logger.exception(f"[prewarm] training failed model={model_name} backend=peft_trainer: {e}")
+
+    _raise_if_failures()
 
 
 @asynccontextmanager
@@ -651,6 +724,12 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     from .backend.future_store import future_store
+    from .checkpoints import (
+        get_checkpoint_mirror_poll_s,
+        get_checkpoint_reap_interval_s,
+        process_pending_checkpoint_mirrors,
+        reap_runtime_checkpoints,
+    )
 
     future_store.ensure_ready()
 
@@ -740,6 +819,11 @@ async def lifespan(app: FastAPI):
     logger.info("Training components initialized")
 
     # ==========================================================================
+    # Persistent actors: pre-create and protect at startup
+    # ==========================================================================
+    await _prewarm_persistent_models(train_engine, multi_model_manager)
+
+    # ==========================================================================
     # Issue #84: Admission control + API work queue workers + future reaper
     # ==========================================================================
     from .backend.api_work_queue import api_work_queue
@@ -759,84 +843,245 @@ async def lifespan(app: FastAPI):
     )
 
     async def _exec_sampling_asample(item):
-        logger.info(
-            "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
-            str(item.request_id),
+        async def _run():
+            logger.info(
+                "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
+                str(item.request_id),
+            )
+            req = SampleRequest.model_validate_json(item.request_json)
+            logger.info(
+                "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
+                str(item.request_id),
+            )
+            await sampling._do_sample(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.sampling.asample",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.sampling.asample"},
         )
-        req = SampleRequest.model_validate_json(item.request_json)
-        logger.info(
-            "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
-            str(item.request_id),
-        )
-        await sampling._do_sample(item.request_id, req, item.user_id)
 
     async def _exec_sampling_compute_logprobs(item):
-        req = ComputeLogprobsRequest.model_validate_json(item.request_json)
-        await sampling._do_compute_logprobs(item.request_id, req, item.user_id)
+        async def _run():
+            req = ComputeLogprobsRequest.model_validate_json(item.request_json)
+            await sampling._do_compute_logprobs(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.sampling.compute_logprobs",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.sampling.compute_logprobs"},
+        )
 
     async def _exec_training_create_model(item):
-        req = CreateModelRequest.model_validate_json(item.request_json)
-        await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+        async def _run():
+            req = CreateModelRequest.model_validate_json(item.request_json)
+            await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.create_model",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.create_model"},
+        )
 
     async def _exec_training_create_model_from_state(item):
-        req = CreateModelFromStateRequest.model_validate_json(item.request_json)
-        await training._do_create_model_from_state(item.request_id, req, item.user_id)
+        async def _run():
+            req = CreateModelFromStateRequest.model_validate_json(item.request_json)
+            await training._do_create_model_from_state(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.create_model_from_state",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.create_model_from_state"},
+        )
 
     async def _exec_training_train_step(item):
-        req = TrainStepRequest.model_validate_json(item.request_json)
-        await training._do_train_step(item.request_id, req, item.user_id)
+        async def _run():
+            req = TrainStepRequest.model_validate_json(item.request_json)
+            await training._do_train_step(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.train_step",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.train_step"},
+        )
 
     async def _exec_training_forward(item):
-        req = ForwardRequest.model_validate_json(item.request_json)
-        await training._do_forward(item.request_id, req)
+        async def _run():
+            req = ForwardRequest.model_validate_json(item.request_json)
+            await training._do_forward(
+                item.request_id,
+                req,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.forward",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.forward"},
+        )
 
     async def _exec_training_forward_backward(item):
-        req = ForwardBackwardRequest.model_validate_json(item.request_json)
-        await training._do_forward_backward(item.request_id, req, item.user_id)
+        async def _run():
+            req = ForwardBackwardRequest.model_validate_json(item.request_json)
+            await training._do_forward_backward(
+                item.request_id,
+                req,
+                item.user_id,
+                (item.extra or {}).get("gateway_auth"),
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.forward_backward",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.forward_backward"},
+        )
 
     async def _exec_training_save_weights_for_sampler(item):
-        req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
-        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        await training._do_save_weights_for_sampler(item.request_id, req, item.user_id, prefer_tinker)
+        async def _run():
+            req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
+            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+            is_admin = bool((item.extra or {}).get("is_admin"))
+            await training._do_save_weights_for_sampler(
+                item.request_id,
+                req,
+                item.user_id,
+                prefer_tinker,
+                is_admin,
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.training.save_weights_for_sampler",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.save_weights_for_sampler"},
+        )
 
     async def _exec_training_optim_step(item):
-        req = OptimStepRequest.model_validate_json(item.request_json)
-        await training._do_optim_step(item.request_id, req, item.user_id)
+        async def _run():
+            req = OptimStepRequest.model_validate_json(item.request_json)
+            await training._do_optim_step(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.training.optim_step",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.optim_step"},
+        )
 
     async def _exec_weights_save_weights(item):
-        req = SaveStateRequest.model_validate_json(item.request_json)
-        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
-        # This must produce a training checkpoint (weights + optimizer state).
-        await weights._do_save_state(
-            item.request_id,
-            req,
-            user_id=item.user_id,
-            webhook_url=item.webhook_url,
-            prefer_tinker=prefer_tinker,
+        async def _run():
+            req = SaveStateRequest.model_validate_json(item.request_json)
+            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+            # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
+            # This must produce a training checkpoint (weights + optimizer state).
+            await weights._do_save_state(
+                item.request_id,
+                req,
+                user_id=item.user_id,
+                webhook_url=item.webhook_url,
+                prefer_tinker=prefer_tinker,
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.weights.save_weights",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.weights.save_weights"},
         )
 
     async def _exec_weights_save_state(item):
-        req = SaveStateRequest.model_validate_json(item.request_json)
-        prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-        await weights._do_save_state(
-            item.request_id,
-            req,
-            user_id=item.user_id,
-            webhook_url=item.webhook_url,
-            prefer_tinker=prefer_tinker,
+        async def _run():
+            req = SaveStateRequest.model_validate_json(item.request_json)
+            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+            await weights._do_save_state(
+                item.request_id,
+                req,
+                user_id=item.user_id,
+                webhook_url=item.webhook_url,
+                prefer_tinker=prefer_tinker,
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.weights.save_state",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.weights.save_state"},
         )
 
     async def _exec_weights_load_state(item):
-        req = LoadStateRequest.model_validate_json(item.request_json)
-        await weights._do_load_state(item.request_id, req, item.user_id)
+        async def _run():
+            req = LoadStateRequest.model_validate_json(item.request_json)
+            await weights._do_load_state(item.request_id, req, item.user_id)
+
+        await run_async_with_otel_span(
+            "queue.stage.weights.load_state",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.weights.load_state"},
+        )
 
     async def _exec_internal_noop(item):
-        from .backend.future_store import future_store
+        async def _run():
+            from .backend.future_store import future_store
 
-        future_store.resolve(
-            str(item.request_id),
-            {"ok": True, "op": "internal.noop", "ts": time.time()},
+            future_store.resolve(
+                str(item.request_id),
+                {"ok": True, "op": "internal.noop", "ts": time.time()},
+            )
+
+        await run_async_with_otel_span(
+            "queue.stage.internal.noop",
+            _run,
+            component="api_work_queue",
+            op=str(item.op),
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.internal.noop"},
         )
 
     api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
@@ -867,10 +1112,39 @@ async def lifespan(app: FastAPI):
 
     future_reaper_task = asyncio.create_task(_future_reaper_loop())
 
-    # ==========================================================================
-    # Persistent actors: pre-create and protect at startup
-    # ==========================================================================
-    asyncio.create_task(_prewarm_persistent_models(train_engine, multi_model_manager))
+    async def _checkpoint_reaper_loop() -> None:
+        while True:
+            await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
+            try:
+                reaped = reap_runtime_checkpoints()
+                total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
+                if total:
+                    logger.info(
+                        "checkpoint reaper removed ephemeral=%s persistent_cache=%s persistent=%s",
+                        len(reaped["ephemeral"]),
+                        len(reaped["persistent_cache"]),
+                        len(reaped["persistent"]),
+                    )
+            except Exception:
+                logger.exception("checkpoint reaper failed")
+
+    checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
+
+    async def _checkpoint_mirror_loop() -> None:
+        while True:
+            try:
+                mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
+                if mirrored["mirrored"] or mirrored["failed"]:
+                    logger.info(
+                        "checkpoint mirror processed mirrored=%s failed=%s",
+                        len(mirrored["mirrored"]),
+                        len(mirrored["failed"]),
+                    )
+            except Exception:
+                logger.exception("checkpoint mirror loop failed")
+            await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+
+    checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
 
     yield
 
@@ -878,7 +1152,14 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # ==========================================================================
     future_reaper_task.cancel()
-    await asyncio.gather(future_reaper_task, return_exceptions=True)
+    checkpoint_reaper_task.cancel()
+    checkpoint_mirror_task.cancel()
+    await asyncio.gather(
+        future_reaper_task,
+        checkpoint_reaper_task,
+        checkpoint_mirror_task,
+        return_exceptions=True,
+    )
     await api_work_queue.shutdown()
     logger.info("Shutting down all sessions")
 
@@ -893,6 +1174,11 @@ async def lifespan(app: FastAPI):
     if multi_model_manager is not None:
         await multi_model_manager.shutdown_all()
         logger.info("Multi-model inference manager shutdown")
+
+    from .usage_store import close_usage_store
+
+    await close_usage_store()
+
 
     await close_http_clients()
 
@@ -932,6 +1218,20 @@ async def capacity_manager_unavailable_handler(_: Request, __: CapacityManagerUn
 # Paths that don't require authentication
 UNAUTHENTICATED_PATHS = {"/api/v1/healthz", "/"}
 
+# Paths excluded from OTel span creation (high-frequency polling endpoints).
+# Set MINT_OTEL_EXCLUDE_NONE=1 to disable exclusions and trace everything.
+_OTEL_EXCLUDE_NONE = os.environ.get("MINT_OTEL_EXCLUDE_NONE", "").strip().lower() in ("1", "true", "yes")
+_OTEL_EXCLUDED_PATHS: set[str] = set() if _OTEL_EXCLUDE_NONE else {
+    "/api/v1/retrieve_future",
+    "/api/v1/healthz",
+    "/api/v1/telemetry",
+    "/api/v1/session_heartbeat",
+    "/api/v1/internal/admission_stats",
+    "/internal/admission_stats",
+    "/api/v1/internal/metrics",
+    "/internal/metrics",
+}
+
 # Token encryptor for sk- token validation (initialized lazily)
 _token_encryptor: TokenEncryptor | None = None
 
@@ -949,7 +1249,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
     """Manual OTel instrumentation for HTTP server traces and metrics."""
     tracer = get_otel_tracer()
     method = request.method
-    route = request.url.path
+    route = _http_route_label(request)
     start_s = time.perf_counter()
     status_code = 500
     failure_error: Exception | None = None
@@ -985,7 +1285,10 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             float(elapsed_ms),
         )
 
-    if tracer is None:
+    # Skip OTel span and request logging for high-frequency polling endpoints.
+    # Metrics are still recorded; only traces and per-request log lines are suppressed.
+    _skip_otel = route in _OTEL_EXCLUDED_PATHS
+    if tracer is None or _skip_otel:
         try:
             response = await call_next(request)
             status_code = int(getattr(response, "status_code", 500))
@@ -994,6 +1297,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             failure_error = e
             raise
         finally:
+            route = _http_route_label(request)
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
                 method=method,
@@ -1001,7 +1305,8 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                 status_code=status_code,
                 duration_ms=elapsed_ms,
             )
-            _log_request_observation(elapsed_ms)
+            if not _skip_otel:
+                _log_request_observation(elapsed_ms)
 
     try:
         from opentelemetry.propagate import extract
@@ -1015,6 +1320,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
             failure_error = e
             raise
         finally:
+            route = _http_route_label(request)
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
                 method=method,
@@ -1043,8 +1349,14 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
 
         try:
             response = await call_next(request)
+            route = _http_route_label(request)
             status_code = int(getattr(response, "status_code", 500))
+            try:
+                span.update_name(f"{method} {route}")
+            except Exception:
+                pass
             span.set_attribute("http.status_code", status_code)
+            span.set_attribute("http.route", route)
             if status_code >= 500:
                 # FastAPI may convert errors into HTTP 5xx responses before they
                 # propagate here. Record a synthetic error so traces still include
@@ -1065,12 +1377,19 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
                     status_code = 500
             else:
                 status_code = 500
+            route = _http_route_label(request)
+            try:
+                span.update_name(f"{method} {route}")
+            except Exception:
+                pass
             span.set_attribute("http.status_code", status_code)
+            span.set_attribute("http.route", route)
             if status_code >= 500:
                 _record_server_error(e, escaped=True)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
             raise
         finally:
+            route = _http_route_label(request)
             elapsed_ms = (time.perf_counter() - start_s) * 1000.0
             record_http_server_metrics(
                 method=method,
@@ -1083,14 +1402,7 @@ async def otel_trace_metrics_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def api_key_auth_middleware(request: Request, call_next):
-    """Validate API key or sk- token from X-API-Key or Authorization header.
-
-    Supports two authentication methods (checked in order):
-    1. Hardcoded API key (TINKER_API_KEY) - direct string comparison
-    2. Encrypted sk- tokens (TINKER_TOKEN_SECRET_KEY) - AES decryption
-
-    If neither is configured, auth is disabled (dev mode).
-    """
+    """Validate gateway-forwarded auth headers (preferred) with legacy fallback."""
     path = request.url.path
     traceparent_trace_id = extract_trace_id_from_traceparent(request.headers.get("traceparent"))
     incoming_trace_id = traceparent_trace_id
@@ -1110,11 +1422,7 @@ async def api_key_auth_middleware(request: Request, call_next):
     async def _next_with_trace():
         return _with_trace(await call_next(request))
 
-    # Skip auth if no authentication configured (dev mode)
-    if not config.auth_enabled:
-        return await _next_with_trace()
-
-    # Skip auth for specific paths
+    # Skip auth for specific paths.
     if path in UNAUTHENTICATED_PATHS:
         return await _next_with_trace()
 
@@ -1146,42 +1454,58 @@ async def api_key_auth_middleware(request: Request, call_next):
             except Exception:
                 return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid download token"}))
 
-    # Try X-API-Key header first, then Authorization header
-    api_key = request.headers.get("X-API-Key", "")
-    if not api_key:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            api_key = auth_header[7:]
-        elif auth_header.startswith("sk-"):
-            # Support direct Authorization: sk-xxx format
-            api_key = auth_header
+    if path.startswith(("/api/v1/", "/internal/")):
+        if has_gateway_auth_headers(dict(request.headers)):
+            try:
+                auth_ctx = extract_gateway_auth_context(
+                    request,
+                    internal_api_token=config.internal_api_token,
+                )
+            except HTTPException as exc:
+                return _with_trace(JSONResponse(status_code=exc.status_code, content={"error": exc.detail}))
+            request.state.gateway_auth = auth_ctx
+            request.state.user_data = {
+                "user_id": auth_ctx.user_id,
+                "user_role": auth_ctx.user_role,
+                "is_admin": auth_ctx.user_role == "admin",
+                "account_id": auth_ctx.account_id,
+                "apikey_id": auth_ctx.apikey_id,
+                "request_id": auth_ctx.request_id,
+            }
+            return await _next_with_trace()
 
-    if not api_key:
-        return _with_trace(JSONResponse(
-            status_code=401,
-            content={"error": "Missing API key"},
-        ))
+        # Legacy auth disabled => dev mode pass-through.
+        if not config.auth_enabled:
+            return await _next_with_trace()
 
-    # Method 1: Check hardcoded API key (admin)
-    if config.validate_api_key(api_key):
-        # Admin key - assign special "admin" user_id for checkpoint ownership
-        request.state.user_data = {"user_id": "admin"}
-        return await _next_with_trace()
+        api_key = request.headers.get("X-API-Key", "")
+        if not api_key:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                api_key = auth_header[7:]
+            elif auth_header.startswith("sk-"):
+                api_key = auth_header
 
-    # Method 2: Try sk- token decryption
-    if api_key.startswith("sk-") and config.token_secret_key:
-        encryptor = get_token_encryptor()
-        if encryptor:
-            user_data = encryptor.decrypt_token(api_key)
-            if user_data is not None:
-                request.state.user_data = user_data
-                return await _next_with_trace()
+        if not api_key:
+            return _with_trace(JSONResponse(status_code=401, content={"error": "Missing API key"}))
 
-    # Neither method succeeded
-    return _with_trace(JSONResponse(
-        status_code=401,
-        content={"error": "Invalid API key or token"},
-    ))
+        if config.validate_api_key(api_key):
+            request.state.user_data = {"user_id": "admin", "user_role": "admin", "is_admin": True}
+            return await _next_with_trace()
+
+        if api_key.startswith("sk-") and config.token_secret_key:
+            encryptor = get_token_encryptor()
+            if encryptor:
+                user_data = encryptor.decrypt_token(api_key)
+                if user_data is not None:
+                    if "user_role" not in user_data:
+                        user_data["user_role"] = "admin" if user_data.get("user_id") == "admin" else "user"
+                    if "is_admin" not in user_data:
+                        user_data["is_admin"] = user_data.get("user_role") == "admin"
+                    request.state.user_data = user_data
+                    return await _next_with_trace()
+        return _with_trace(JSONResponse(status_code=401, content={"error": "Invalid API key or token"}))
+    return await _next_with_trace()
 
 
 # Register routes with API prefix
@@ -1191,6 +1515,7 @@ app.include_router(sampling.router, prefix="/api/v1", tags=["sampling"])
 app.include_router(futures.router, prefix="/api/v1", tags=["futures"])
 app.include_router(training.router, prefix="/api/v1", tags=["training"])
 app.include_router(weights.router, prefix="/api/v1", tags=["weights"])
+app.include_router(openai_compat.router, prefix="/oai/api/v1", tags=["openai-compat"])
 app.include_router(internal.router, prefix="/internal", tags=["internal"])
 
 @app.get("/")

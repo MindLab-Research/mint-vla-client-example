@@ -29,10 +29,26 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
+from ..auth_identity import get_user_data as _request_user_data
+from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request, is_admin_user_data
+from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import classify_failure_reason, set_request_id
 
 from ..backend.future_store import future_store
-from ..checkpoints import CHECKPOINTS_DIR, create_checkpoint_archive, resolve_checkpoint_path
+from ..checkpoints import (
+    MIRROR_STATUS_PENDING,
+    begin_async_checkpoint_mirror,
+    build_ephemeral_checkpoint_dir,
+    build_persistent_cache_dir,
+    checkpoint_has_optimizer_state,
+    create_checkpoint_archive,
+    ensure_checkpoint_path_allowed,
+    materialize_persistent_checkpoint,
+    resolve_checkpoint_path,
+    validate_sampler_checkpoint_for_sampling,
+    write_checkpoint_metadata,
+)
 from ..config import RAY_NAMESPACE
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -58,7 +74,7 @@ from ..models.types import (
     TrainStepRequest,
     UntypedAPIFuture,
 )
-from ..usage_logger import get_usage_logger
+from ..usage_store import UsageEvent, get_usage_store
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
@@ -77,15 +93,21 @@ inference_manager: SessionManager | None = None  # For ephemeral flow
 
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state (set by auth middleware)."""
-    return getattr(request.state, "user_data", None)
+    return _request_user_data(request)
 
 
 def _get_user_id(request: Request) -> str | None:
     """Extract user_id from request state (set by auth middleware)."""
-    user_data = _get_user_data(request)
-    if user_data:
-        return user_data.get("user_id")
-    return None
+    return _request_user_id(request)
+
+
+def _build_training_usage_label(*, model: str, route: str) -> str:
+    return f"model={model},route={route},dimension=train"
+
+
+async def _persist_usage_events(*, events: list[UsageEvent]) -> None:
+    usage_store = await get_usage_store()
+    await usage_store.write_events(events)
 
 
 def _get_webhook_url(request: Request) -> str | None:
@@ -413,6 +435,7 @@ async def create_model(
             model_id=model_id,
             upstream_alias=upstream.alias,
             base_model=request.base_model,
+            owner_id=user_id,
         )
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
@@ -440,6 +463,7 @@ async def create_model(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -638,24 +662,18 @@ async def _do_create_model(
 # create_model_from_state - async (composes create_model + load_state)
 # =============================================================================
 
-def _resolve_state_path(state_uri: str, *, user_id: str | None) -> str:
-    is_admin = user_id == "admin"
+def _resolve_state_path(state_uri: str, *, user_id: str | None, is_admin: bool = False) -> str:
     if not is_admin and not state_uri.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    resolved = resolve_checkpoint_path(state_uri, user_id=user_id)
+    resolved = resolve_checkpoint_path(state_uri, user_id=user_id, is_admin=is_admin)
     if state_uri.startswith("ckpt_") and resolved == state_uri:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
-    if not is_admin:
-        resolved_real = os.path.realpath(resolved)
-        checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-        if not resolved_real.startswith(checkpoints_real + os.sep):
-            raise HTTPException(status_code=403, detail="Access denied")
-        owner_dir = user_id or "anonymous"
-        allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, owner_dir))
-        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
-            raise HTTPException(status_code=403, detail="Access denied")
-    return resolved
+    try:
+        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return materialize_persistent_checkpoint(resolved)
 
 
 @router.post("/create_model_from_state", response_model=UntypedAPIFuture)
@@ -702,7 +720,7 @@ async def create_model_from_state(
         try:
             from ..checkpoints import validate_checkpoint_load_contract
 
-            local_path = _resolve_state_path(request.state_path, user_id=user_id)
+            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=is_admin_request(http_request))
             if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "metadata.json")):
                 validate_checkpoint_load_contract(local_path, load_optimizer=True)
         except ValueError as e:
@@ -723,7 +741,7 @@ async def create_model_from_state(
         _raise_if_local_model_id_exists(model_id)
         incoming_headers = dict(http_request.headers)
         if request.state_path.startswith(("tinker://", "mint://", "ckpt_")):
-            local_path = _resolve_state_path(request.state_path, user_id=user_id)
+            local_path = _resolve_state_path(request.state_path, user_id=user_id, is_admin=is_admin_request(http_request))
             if os.path.isdir(local_path):
                 import asyncio
                 import tempfile
@@ -778,6 +796,7 @@ async def create_model_from_state(
             model_id=model_id,
             upstream_alias=upstream.alias,
             base_model=request.base_model,
+            owner_id=user_id,
         )
         return UntypedAPIFuture(
             request_id=encode_request_id(upstream_alias=upstream.alias, upstream_request_id=upstream_request_id)
@@ -798,14 +817,23 @@ async def create_model_from_state(
 
     from ..backend.api_work_queue import api_work_queue
     from ..backend.capacity_manager import capacity_manager
-    from ..backend.result_size_estimator import estimate_forward_backward_result_bytes
+    from ..backend.result_size_estimator import estimate_small_result_bytes
+
+    resolved_state_path = _resolve_state_path(
+        request.state_path,
+        user_id=user_id,
+        is_admin=is_admin_request(http_request),
+    )
+    if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(resolved_state_path):
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {request.state_path}")
+    request = request.model_copy(update={"state_path": resolved_state_path})
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
-        object_store_bytes=estimate_forward_backward_result_bytes(request),
+        object_store_bytes=estimate_small_result_bytes(),
     )
     if not bool(reserve.get("ok")):
         raise HTTPException(
@@ -847,18 +875,8 @@ async def _do_create_model_from_state(
 
         model_id = _generate_model_id(request.session_id, request.model_seq_id)
 
-        # Resolve state path (before creating a session/actor)
-        load_path = _resolve_state_path(request.state_path, user_id=user_id)
-        if user_id and user_id != "admin":
-            load_real = os.path.realpath(load_path)
-            checkpoints_real = os.path.realpath(CHECKPOINTS_DIR)
-            allowed_real = os.path.realpath(os.path.join(CHECKPOINTS_DIR, user_id))
-            if load_real.startswith(checkpoints_real + os.sep) and not load_real.startswith(
-                allowed_real + os.sep
-            ):
-                raise PermissionError("Access denied")
-        if request.state_path.startswith(("tinker://", "mint://", "ckpt_")) and not os.path.isdir(load_path):
-            raise FileNotFoundError(f"Checkpoint not found: {request.state_path}")
+        # Queue-time validation hands the background worker a concrete local path.
+        load_path = request.state_path
 
         # Check if model already exists (from failed previous attempt)
         existing = training_manager.get_session(model_id)
@@ -986,6 +1004,8 @@ async def forward_backward(
         upstream_for_alias,
     )
 
+    user_id = _get_user_id(http_request)
+
     session = None
     if training_manager is not None:
         session = training_manager.get_session(request.model_id)
@@ -1051,6 +1071,7 @@ async def forward_backward(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
 
     # Set request_id in context for logging
     set_request_id(request_id)
@@ -1075,6 +1096,8 @@ async def forward_backward(
             training_op="forward_backward",
             seq_id=request.seq_id,
         )
+        if gateway_auth is not None:
+            scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(
@@ -1098,7 +1121,12 @@ async def forward_backward(
     return UntypedAPIFuture(request_id=request_id)
 
 
-async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest, user_id: str | None) -> None:
+async def _do_forward_backward(
+    request_id: str,
+    request: ForwardBackwardRequest,
+    user_id: str | None,
+    gateway_auth: dict | None = None,
+) -> None:
     """Background task for forward_backward."""
     # Restore request_id context for logging
     set_request_id(request_id)
@@ -1134,18 +1162,24 @@ async def _do_forward_backward(request_id: str, request: ForwardBackwardRequest,
         logger.info(
             f"[{session.model_id}] forward_backward done: elapsed_s={elapsed_s:.3f}"
         )
-        future_store.resolve(request_id, result)
-
-        # Log usage
-        if user_id:
-            get_usage_logger().log(
-                user_id=user_id,
-                operation_type="forward_backward",
-                model_name=session.base_model,
-                token_count=token_count,
-                session_id=session.model_id,
-                request_id=request_id,
+        if gateway_auth:
+            auth_ctx = GatewayAuthContext(**gateway_auth)
+            await _persist_usage_events(
+                events=[
+                    UsageEvent(
+                        account_id=auth_ctx.account_id,
+                        apikey_id=auth_ctx.apikey_id,
+                        charge_item="training",
+                        quantity=token_count,
+                        request_id=auth_ctx.request_id,
+                        label=_build_training_usage_label(
+                            model=session.base_model,
+                            route="training.forward_backward",
+                        ),
+                    )
+                ]
             )
+        future_store.resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -1244,6 +1278,7 @@ async def train_step(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1263,6 +1298,8 @@ async def train_step(
             training_op="train_step",
             seq_id=request.seq_id,
         )
+        if gateway_auth is not None:
+            scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.train_step", "model_id": request.model_id})
@@ -1284,7 +1321,10 @@ async def train_step(
 
 
 async def _do_train_step(
-    request_id: str, request: TrainStepRequest, user_id: str | None
+    request_id: str,
+    request: TrainStepRequest,
+    user_id: str | None,
+    gateway_auth: dict | None = None,
 ) -> None:
     """Background task for train_step."""
     try:
@@ -1310,18 +1350,24 @@ async def _do_train_step(
         elapsed_s = time.time() - t0
         msg = f"[{session.model_id}] train_step done request_id={request_id} elapsed_s={elapsed_s:.3f}"
         logger.info(msg)
-        future_store.resolve(request_id, result)
-
-        # Log usage
-        if user_id:
-            get_usage_logger().log(
-                user_id=user_id,
-                operation_type="train_step",
-                model_name=session.base_model,
-                token_count=token_count,
-                session_id=session.model_id,
-                request_id=request_id,
+        if gateway_auth:
+            auth_ctx = GatewayAuthContext(**gateway_auth)
+            await _persist_usage_events(
+                events=[
+                    UsageEvent(
+                        account_id=auth_ctx.account_id,
+                        apikey_id=auth_ctx.apikey_id,
+                        charge_item="training",
+                        quantity=token_count,
+                        request_id=auth_ctx.request_id,
+                        label=_build_training_usage_label(
+                            model=session.base_model,
+                            route="training.train_step",
+                        ),
+                    )
+                ]
             )
+        future_store.resolve(request_id, result)
 
     except Exception as e:
         logger.exception(
@@ -1425,6 +1471,8 @@ async def forward(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    gateway_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    user_id = _get_user_id(http_request)
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
@@ -1438,6 +1486,14 @@ async def forward(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="forward",
+            seq_id=request.seq_id,
+        )
+        if gateway_auth is not None:
+            scheduler_extra["gateway_auth"] = gateway_auth.__dict__
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.forward", "model_id": request.model_id})
@@ -1445,8 +1501,9 @@ async def forward(
             request_id=request_id,
             op="training.forward",
             request_json=request_json,
-            user_id=None,
+            user_id=user_id,
             webhook_url=None,
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1458,7 +1515,9 @@ async def forward(
 
 
 async def _do_forward(
-    request_id: str, request: ForwardRequest
+    request_id: str,
+    request: ForwardRequest,
+    gateway_auth: dict | None = None,
 ) -> None:
     """Background task for forward."""
     try:
@@ -1472,7 +1531,25 @@ async def _do_forward(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
+        token_count, _ = _compute_token_stats(request.forward_input.data)
         result = await training_engine.forward(session, request)
+        if gateway_auth:
+            auth_ctx = GatewayAuthContext(**gateway_auth)
+            await _persist_usage_events(
+                events=[
+                    UsageEvent(
+                        account_id=auth_ctx.account_id,
+                        apikey_id=auth_ctx.apikey_id,
+                        charge_item="training",
+                        quantity=token_count,
+                        request_id=auth_ctx.request_id,
+                        label=_build_training_usage_label(
+                            model=session.base_model,
+                            route="training.forward",
+                        ),
+                    )
+                ]
+            )
         future_store.resolve(request_id, result)
 
     except Exception as e:
@@ -1498,6 +1575,7 @@ async def optim_step(
     http_request: Request,
 ) -> UntypedAPIFuture:
     """Perform optimizer step to update weights."""
+    route_start_s = time.perf_counter()
     from ..gateway import (
         encode_request_id,
         forward_json,
@@ -1509,7 +1587,14 @@ async def optim_step(
     if training_manager is not None:
         session = training_manager.get_session(request.model_id)
         if session is None:
+            restore_start_s = time.perf_counter()
             session = _restore_training_session(request.model_id)
+            logger.info(
+                "[optim_step route] model_id=%s stage=restore_session elapsed_ms=%.3f restored=%s",
+                str(request.model_id),
+                (time.perf_counter() - restore_start_s) * 1000.0,
+                bool(session is not None),
+            )
 
     if session is None:
         remote = remote_training_model(request.model_id)
@@ -1562,10 +1647,18 @@ async def optim_step(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    reserve_start_s = time.perf_counter()
     reserve = capacity_manager.try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_small_result_bytes(),
+    )
+    logger.info(
+        "[optim_step route] request_id=%s model_id=%s stage=capacity_reserve elapsed_ms=%.3f ok=%s",
+        str(request_id),
+        str(request.model_id),
+        (time.perf_counter() - reserve_start_s) * 1000.0,
+        bool(reserve.get("ok")),
     )
     if not bool(reserve.get("ok")):
         raise HTTPException(
@@ -1581,9 +1674,17 @@ async def optim_step(
             training_op="optim_step",
             seq_id=request.seq_id,
         )
+        future_create_start_s = time.perf_counter()
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(request_id, meta={"op": "training.optim_step", "model_id": request.model_id})
+        logger.info(
+            "[optim_step route] request_id=%s model_id=%s stage=future_store_ready elapsed_ms=%.3f",
+            str(request_id),
+            str(request.model_id),
+            (time.perf_counter() - future_create_start_s) * 1000.0,
+        )
+        enqueue_start_s = time.perf_counter()
         await api_work_queue.enqueue(
             request_id=request_id,
             op="training.optim_step",
@@ -1591,6 +1692,13 @@ async def optim_step(
             user_id=user_id,
             webhook_url=None,
             extra=scheduler_extra,
+        )
+        logger.info(
+            "[optim_step route] request_id=%s model_id=%s stage=enqueue_done elapsed_ms=%.3f route_elapsed_ms=%.3f",
+            str(request_id),
+            str(request.model_id),
+            (time.perf_counter() - enqueue_start_s) * 1000.0,
+            (time.perf_counter() - route_start_s) * 1000.0,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1808,6 +1916,14 @@ async def save_weights_for_sampler(
 
     created = False
     try:
+        scheduler_extra = _build_training_scheduler_extra(
+            session=session,
+            model_id=request.model_id,
+            training_op="save_weights_for_sampler",
+            seq_id=request.seq_id,
+        )
+        scheduler_extra["prefer_tinker"] = bool(prefer_tinker)
+        scheduler_extra["is_admin"] = is_admin_request(http_request)
         future_store.create_with_id(request_id)
         created = True
         future_store.mark_queued(
@@ -1820,7 +1936,7 @@ async def save_weights_for_sampler(
             request_json=request_json,
             user_id=user_id,
             webhook_url=None,
-            extra={"prefer_tinker": bool(prefer_tinker)},
+            extra=scheduler_extra,
         )
     except Exception as e:
         capacity_manager.release_all(request_id)
@@ -1838,6 +1954,7 @@ async def _do_save_weights_for_sampler(
     request: SaveWeightsForSamplerRequest,
     user_id: str | None,
     prefer_tinker: bool,
+    is_admin: bool = False,
 ) -> None:
     """Background task for save_weights_for_sampler.
 
@@ -1856,19 +1973,23 @@ async def _do_save_weights_for_sampler(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        from ..checkpoints import get_checkpoints_dir
-
-        checkpoints_root = get_checkpoints_dir()
-        owner_dir = None if user_id == "admin" else (user_id or "anonymous")
-        checkpoint_dir = checkpoints_root if owner_dir is None else os.path.join(checkpoints_root, owner_dir)
-
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path
             checkpoint_name = request.path
+            save_path = build_persistent_cache_dir(
+                user_id=None if is_admin else user_id,
+                model_id=session.model_id,
+                checkpoint_name=checkpoint_name,
+            )
         else:
             # Ephemeral save - generate unique temp name
             checkpoint_name = f"_ephemeral_{uuid.uuid4().hex[:8]}"
+            save_path = build_ephemeral_checkpoint_dir(
+                user_id=None if is_admin else user_id,
+                model_id=session.model_id,
+                checkpoint_name=checkpoint_name,
+            )
 
         use_per_expert_lora = bool(request.use_per_expert_lora)
         train_mlp = bool(getattr(getattr(session, "lora_config", None), "train_mlp", False))
@@ -1892,17 +2013,24 @@ async def _do_save_weights_for_sampler(
         save_path = await training_engine.save_weights_for_sampler(
             session=session,
             checkpoint_name=checkpoint_name,
-            checkpoint_base_dir=checkpoint_dir,
+            checkpoint_base_dir=os.path.dirname(os.path.dirname(save_path)),
             use_per_expert_lora=use_per_expert_lora,
         )
-
-        from ..checkpoints import checkpoint_has_optimizer_state, write_checkpoint_metadata
 
         if checkpoint_has_optimizer_state(save_path):
             raise RuntimeError(
                 f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
             )
+        try:
+            validate_sampler_checkpoint_for_sampling(save_path)
+        except ValueError as e:
+            raise RuntimeError(
+                f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
+            ) from e
 
+        ttl_seconds = request.ttl_seconds
+        if request.path is None and ttl_seconds is None:
+            ttl_seconds = None
         write_checkpoint_metadata(
             save_path,
             {
@@ -1916,8 +2044,19 @@ async def _do_save_weights_for_sampler(
                 "optimizer_present": False,
                 "backend": session.backend,
                 "type": "sampler",
+                "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
+                "ttl_seconds": request.ttl_seconds,
             },
         )
+
+        persistent_path = None
+        if request.path is not None:
+            persistent_path = begin_async_checkpoint_mirror(
+                save_path,
+                user_id=None if is_admin else user_id,
+                model_id=session.model_id,
+                checkpoint_name=checkpoint_name,
+            )
 
         from ..client_compat import checkpoint_uri
 
@@ -1940,6 +2079,13 @@ async def _do_save_weights_for_sampler(
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
+            ).model_dump()
+            response.update(
+                filesystem_path=save_path,
+                persistent_filesystem_path=persistent_path,
+                mirror_status=MIRROR_STATUS_PENDING,
+                storage_tier="persistent_cache",
+                mirror_error=None,
             )
         else:
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
@@ -2068,9 +2214,9 @@ async def _do_save_weights_for_sampler(
             response = SaveWeightsForSamplerResponse(
                 path=None,  # Ephemeral - no path returned
                 sampling_session_id=sampling_session_id,
-            )
+            ).model_dump()
 
-        future_store.resolve(request_id, response.model_dump())
+        future_store.resolve(request_id, response)
 
     except Exception as e:
         logger.exception(
@@ -2089,17 +2235,18 @@ async def _do_save_weights_for_sampler(
 # =============================================================================
 
 
-def _owner_visible(request_user_id: str | None, owner: str | None) -> bool:
+def _owner_visible(request_user_data: dict | None, owner: str | None) -> bool:
+    request_user_id = str(request_user_data.get("user_id")) if request_user_data and request_user_data.get("user_id") else None
     if request_user_id is None:
         return True
-    if request_user_id == "admin":
+    if is_admin_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
 
 
 @router.get("/training_runs/{training_run_id}", response_model=TrainingRun)
 async def get_training_run(training_run_id: str, http_request: Request) -> TrainingRun:
-    request_user_id = _get_user_id(http_request)
+    request_user_data = _get_user_data(http_request)
     info = None
 
     if training_manager is not None:
@@ -2119,7 +2266,7 @@ async def get_training_run(training_run_id: str, http_request: Request) -> Train
     if not isinstance(info, dict):
         raise HTTPException(status_code=404, detail=f"Training run '{training_run_id}' not found")
 
-    if not _owner_visible(request_user_id, info.get("user_id")):
+    if not _owner_visible(request_user_data, info.get("user_id")):
         raise HTTPException(status_code=404, detail=f"Training run '{training_run_id}' not found")
 
     if "model_id" not in info:
@@ -2131,7 +2278,7 @@ async def get_training_run(training_run_id: str, http_request: Request) -> Train
 
 @router.get("/training_runs", response_model=TrainingRunsResponse)
 async def list_training_runs(limit: int = 20, offset: int = 0, http_request: Request = None) -> TrainingRunsResponse:
-    request_user_id = _get_user_id(http_request) if http_request else None
+    request_user_data = _get_user_data(http_request) if http_request else None
     infos_by_id: dict[str, dict] = {}
 
     if training_manager is not None:
@@ -2159,7 +2306,7 @@ async def list_training_runs(limit: int = 20, offset: int = 0, http_request: Req
         raise HTTPException(status_code=503, detail="Training session store unavailable") from e
 
     infos = [
-        info for info in infos_by_id.values() if _owner_visible(request_user_id, info.get("user_id"))
+        info for info in infos_by_id.values() if _owner_visible(request_user_data, info.get("user_id"))
     ]
 
     infos.sort(key=lambda x: str(x.get("model_id") or ""))

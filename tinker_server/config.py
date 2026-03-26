@@ -4,15 +4,32 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config_file import TinkerConfigFile
+
+from .runtime_env import (
+    DEFAULT_HF_MODULES_PATH,
+    build_runtime_pythonpath,
+    env_nonempty as _runtime_env_nonempty,
+)
+from .ray_utils import require_ray_address
 
 
 def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
-    v = environ.get(name)
-    if v is None:
-        return None
-    v = str(v).strip()
-    return v or None
+    return _runtime_env_nonempty(environ, name)
+
+
+def _resolve_env_or_config(name: str, env_value: str | None, file_value: str | None) -> str:
+    if env_value and file_value and env_value != file_value:
+        raise RuntimeError(
+            f"{name} mismatch between environment and config file: env={env_value!r} config={file_value!r}"
+        )
+    return env_value or file_value or ""
 
 
 def _parse_bool(s: str) -> bool:
@@ -42,6 +59,11 @@ _CONFIG_PATH, _CONFIG_FILE = _load_config_file_for_process(os.environ)
 # `TINKER_RAY_NAMESPACE` but accept the alias as a fallback.
 _env_ray_ns = _env_nonempty(os.environ, "TINKER_RAY_NAMESPACE") or _env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
 _file_ray_ns = _CONFIG_FILE.ray.namespace if _CONFIG_FILE is not None else None
+if _env_ray_ns and _file_ray_ns and _env_ray_ns != _file_ray_ns:
+    raise RuntimeError(
+        "Ray namespace mismatch between environment and config file: "
+        f"env={_env_ray_ns!r} config={_file_ray_ns!r}"
+    )
 RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 
 # PFS paths for Ray worker runtime_env
@@ -55,59 +77,22 @@ RAY_NAMESPACE = _env_ray_ns or _file_ray_ns or "tinker"
 # Historical default hard-coded `/vePFS-Mindverse/share/code/tinker-server-auth`, which breaks
 # non-volcano deployments (e.g. `tinker-server-aliyun`) by setting worker runtime_env PYTHONPATH
 # to a non-existent code directory.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _file_pfs_tinker_path = _CONFIG_FILE.paths.pfs_tinker_path if _CONFIG_FILE is not None else None
-PFS_TINKER_PATH = _env_nonempty(os.environ, "PFS_TINKER_PATH") or _file_pfs_tinker_path or _REPO_ROOT
-
-# PFS verl path with _mutable_fields patch for LoRA config assignment
-_file_pfs_verl_path = _CONFIG_FILE.paths.pfs_verl_path if _CONFIG_FILE is not None else None
-PFS_VERL_PATH = _env_nonempty(os.environ, "PFS_VERL_PATH") or _file_pfs_verl_path or "/vePFS-Mindverse/share/code/verl"
-
-# PFS vLLM 0.13.0 with raw logits dump instrumentation
-_file_pfs_vllm_path = _CONFIG_FILE.paths.pfs_vllm_path if _CONFIG_FILE is not None else None
-PFS_VLLM_PATH = (
-    _env_nonempty(os.environ, "PFS_VLLM_PATH") or _file_pfs_vllm_path or ""
+PFS_TINKER_PATH = _resolve_env_or_config(
+    "PFS_TINKER_PATH",
+    _env_nonempty(os.environ, "PFS_TINKER_PATH"),
+    _file_pfs_tinker_path,
 )
 
-# Some deployments rely on the in-image vLLM wheel (with compiled `vllm._C`).
-# Avoid shadowing it with an incomplete CPFS checkout that lacks the extension module.
-def _pfs_vllm_path_is_usable(path: str) -> bool:
-    if not path or not os.path.isdir(path):
-        return False
-    import glob
-
-    return bool(glob.glob(os.path.join(path, "vllm", "_C*.so")))
-
-PFS_VLLM_PATH_EFFECTIVE = PFS_VLLM_PATH if _pfs_vllm_path_is_usable(PFS_VLLM_PATH) else ""
-
-# PFS megatron-bridge path for MoE LoRA ETP fix (PR #1380)
-# Clone from: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-_file_pfs_megatron_bridge_path = _CONFIG_FILE.paths.pfs_megatron_bridge_path if _CONFIG_FILE is not None else None
-PFS_MEGATRON_BRIDGE_PATH = (
-    _env_nonempty(os.environ, "PFS_MEGATRON_BRIDGE_PATH")
-    or _file_pfs_megatron_bridge_path
-    or "/vePFS-Mindverse/share/code/megatron-bridge/src"
-)
-
-# HollowMan fork with export_adapter_weights API for LoRA export
-# Clone from: https://github.com/HollowMan6/Megatron-Bridge.git branch merged
-_file_pfs_megatron_bridge_hollowman_path = (
-    _CONFIG_FILE.paths.pfs_megatron_bridge_hollowman_path if _CONFIG_FILE is not None else None
-)
-PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH = (
-    _env_nonempty(os.environ, "PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH")
-    or _file_pfs_megatron_bridge_hollowman_path
-    or "/vePFS-Mindverse/share/code/megatron-bridge-hollowman/src"
-)
-
-# Toggle to use HollowMan fork of Megatron-Bridge (affects training forward pass)
-# Default: true - HollowMan fork fixes train-inference KL divergence (verified 2026-01-07)
-_file_use_hollowman = _CONFIG_FILE.megatron_bridge.use_hollowman_mbridge if _CONFIG_FILE is not None else None
-_env_use_hollowman = _env_nonempty(os.environ, "USE_HOLLOWMAN_MBRIDGE")
-USE_HOLLOWMAN_MBRIDGE = (
-    _parse_bool(_env_use_hollowman)
-    if _env_use_hollowman is not None
-    else (bool(_file_use_hollowman) if _file_use_hollowman is not None else True)
+# Canonical runtime env root. This contains:
+# - `site-packages/` for shared pure-Python runtime deps
+# - `src/Megatron-Bridge`, `src/verl`, `src/Megatron-LM` pinned source trees
+# - `host-venv/bin/python` as the thin host interpreter for API-server startup
+_file_pfs_runtime_env_root = _CONFIG_FILE.paths.pfs_runtime_env_root if _CONFIG_FILE is not None else None
+PFS_RUNTIME_ENV_ROOT = _resolve_env_or_config(
+    "PFS_RUNTIME_ENV_ROOT",
+    _env_nonempty(os.environ, "PFS_RUNTIME_ENV_ROOT"),
+    _file_pfs_runtime_env_root,
 )
 
 # Toggle to use Megatron-Bridge export_adapter_weights API instead of custom implementation
@@ -122,36 +107,140 @@ USE_MBRIDGE_LORA_EXPORT = (
 # HuggingFace modules path for trust_remote_code models (K2, etc.)
 # Custom model code is cached here when models are first loaded
 _file_pfs_hf_modules_path = _CONFIG_FILE.paths.pfs_hf_modules_path if _CONFIG_FILE is not None else None
-PFS_HF_MODULES_PATH = (
-    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH") or _file_pfs_hf_modules_path or "/vePFS-Mindverse/share/huggingface/modules"
+PFS_HF_MODULES_PATH = _resolve_env_or_config(
+    "PFS_HF_MODULES_PATH",
+    _env_nonempty(os.environ, "PFS_HF_MODULES_PATH"),
+    _file_pfs_hf_modules_path,
 )
 
-# PYTHONPATH for Ray actors - vLLM first (for instrumentation), then megatron-bridge, verl, tinker-server, HF modules
-# USE_HOLLOWMAN_MBRIDGE controls which megatron-bridge version is used
-def _join_pythonpath(*paths: str) -> str:
-    return ":".join([p for p in paths if p])
+def ensure_runtime_env_configured() -> str:
+    if not PFS_RUNTIME_ENV_ROOT:
+        raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
+    if not PFS_TINKER_PATH:
+        raise RuntimeError("PFS_TINKER_PATH must be set")
+    if not PFS_HF_MODULES_PATH:
+        raise RuntimeError("PFS_HF_MODULES_PATH must be set")
+    return PFS_RUNTIME_ENV_ROOT
 
-PFS_EXTRA_PYTHONPATH = os.environ.get("PFS_EXTRA_PYTHONPATH", "").strip()
-if not PFS_EXTRA_PYTHONPATH and _CONFIG_FILE is not None and _CONFIG_FILE.paths.pfs_extra_pythonpath:
-    PFS_EXTRA_PYTHONPATH = str(_CONFIG_FILE.paths.pfs_extra_pythonpath).strip()
 
-if USE_HOLLOWMAN_MBRIDGE:
-    PFS_PYTHONPATH = _join_pythonpath(
-        PFS_EXTRA_PYTHONPATH,
-        PFS_VLLM_PATH_EFFECTIVE,
-        PFS_MEGATRON_BRIDGE_HOLLOWMAN_PATH,
-        PFS_VERL_PATH,
-        PFS_TINKER_PATH,
-        PFS_HF_MODULES_PATH,
+PFS_PYTHONPATH = (
+    build_runtime_pythonpath(
+        env_root=PFS_RUNTIME_ENV_ROOT,
+        pfs_tinker_path=PFS_TINKER_PATH,
+        pfs_hf_modules_path=PFS_HF_MODULES_PATH,
     )
-else:
-    PFS_PYTHONPATH = _join_pythonpath(
-        PFS_EXTRA_PYTHONPATH,
-        PFS_VLLM_PATH_EFFECTIVE,
-        PFS_MEGATRON_BRIDGE_PATH,
-        PFS_VERL_PATH,
-        PFS_TINKER_PATH,
-        PFS_HF_MODULES_PATH,
+    if PFS_RUNTIME_ENV_ROOT and PFS_TINKER_PATH and PFS_HF_MODULES_PATH
+    else ""
+)
+
+# OTEL env vars forwarded into Ray actors so actor-side logging/tracing
+# can use the same collector/auth as the API server process.
+_OTEL_FORWARD_KEYS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    "OTEL_SERVICE_NAME",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_LOG_LEVEL",
+    "MINT_APMPLUS_APP_KEY",
+)
+
+
+def otel_env_vars() -> dict[str, str]:
+    """Return non-empty OTEL env vars for Ray runtime_env injection."""
+    out: dict[str, str] = {}
+    for k in _OTEL_FORWARD_KEYS:
+        v = _env_nonempty(os.environ, k)
+        if v is not None:
+            out[k] = v
+    # Support legacy alias used by some deployments' .env files.
+    app_key = _env_nonempty(os.environ, "MINT_APMPLUS_APP_KEY") or _env_nonempty(
+        os.environ, "OTEL_APMPLUS_APP_KEY"
+    )
+    if app_key is not None:
+        out["MINT_APMPLUS_APP_KEY"] = app_key
+    return out
+
+
+def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    ensure_runtime_env_configured()
+    out = {
+        "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
+        "PFS_TINKER_PATH": PFS_TINKER_PATH,
+        "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
+        "RAY_ADDRESS": require_ray_address(),
+        "TINKER_RAY_NAMESPACE": RAY_NAMESPACE,
+        "PYTHONPATH": pythonpath,
+    }
+    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is not None:
+        out["RAY_ADDRESS"] = ray_address
+    config_path = _env_nonempty(os.environ, "TINKER_CONFIG_PATH")
+    if config_path is not None:
+        out["TINKER_CONFIG_PATH"] = config_path
+    for key in (
+        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "TINKER_ACTOR_LD_LIBRARY_PATH",
+    ):
+        value = _env_nonempty(os.environ, key)
+        if value is not None:
+            out[key] = value
+    if extra:
+        out.update(extra)
+    return out
+
+
+def preferred_vllm_python_executable() -> str | None:
+    if PFS_TINKER_PATH:
+        candidate = Path(PFS_TINKER_PATH) / "scripts" / "vllm_worker_python.py"
+        if candidate.exists():
+            return str(candidate)
+    return _env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE")
+
+
+def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
+    """Return torch lib directories in priority order for this Python runtime."""
+    environ = os.environ if environ is None else environ
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    env_root = _env_nonempty(environ, "PFS_RUNTIME_ENV_ROOT") or PFS_RUNTIME_ENV_ROOT
+    candidates: list[str] = []
+    if env_root:
+        candidates.extend(
+            [
+                os.path.join(env_root, "host-venv", "lib", pyver, "site-packages", "torch", "lib"),
+                os.path.join(env_root, "site-packages", "torch", "lib"),
+            ]
+        )
+    candidates.append(f"/usr/local/lib/{pyver}/dist-packages/torch/lib")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen or not os.path.isdir(path):
+            continue
+        seen.add(norm)
+        out.append(path)
+    return out
+
+
+def actor_ld_library_path() -> str:
+    """Return the library path Ray actors should use on GPU workers.
+
+    Do not inherit the API host's LD_LIBRARY_PATH by default. The host may be a
+    CPU-only bootstrap environment with incompatible torch libs.
+    """
+    override = _env_nonempty(os.environ, "TINKER_ACTOR_LD_LIBRARY_PATH")
+    if override is not None:
+        return override
+    return ":".join(
+        [
+            *preferred_torch_lib_dirs(),
+            "/usr/local/cuda/compat/lib",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64",
+            "/usr/local/cuda/lib64",
+        ]
     )
 
 # When false (default), reject requests for base_model not in list_supported_models().
@@ -169,9 +258,21 @@ class ServerConfig:
     # Authentication
     api_key: str = ""  # Hardcoded API key (legacy). If set, accepts this key directly.
     token_secret_key: str = ""  # Secret for sk- token decryption. If set, accepts encrypted tokens.
+    internal_api_token: str = ""  # Shared token for trusting gateway-forwarded billing headers.
 
-    # Usage logging
-    usage_log_dir: str = "/tmp/tinker_usage"  # Directory to store usage logs
+    # Usage billing (Postgres only)
+    usage_log_dir: str = "/tmp/tinker_usage"  # deprecated, kept for compatibility
+    usage_backend: str = "postgres"  # postgres
+    usage_pg_dsn: str = ""  # Full PostgreSQL DSN (preferred)
+    usage_pg_host: str = ""
+    usage_pg_port: int = 5432
+    usage_pg_database: str = "mint_billing"
+    usage_pg_user: str = "mint_user"
+    usage_pg_password: str = ""
+    usage_pg_pool_min: int = 10
+    usage_pg_pool_max: int = 30
+    usage_write_timeout_ms: int = 2000
+    usage_pg_table: str = "billing.usage_event"
     skip_actor_cleanup: bool = False  # MINT_SKIP_ACTOR_CLEANUP
 
     # Model settings (no default model - clients specify per-request)
@@ -187,12 +288,14 @@ class ServerConfig:
     max_loras: int = 64  # GPU slots for concurrent LoRA adapters (~2.5GB for 64 rank-32 Qwen-7B)
     max_cpu_loras: int = 1024  # CPU cache for evicted adapters
     max_lora_rank: int = 64  # Maximum supported LoRA rank
+    vllm_attention_backend: str = "DUAL_CHUNK_FLASH_ATTN"
 
     # Sampling settings (routes/sampling.py)
     sampling_max_inflight_sample_tasks: int = 64
+    sampling_max_pending_asample_per_apikey: int = 64
     sampling_max_concurrent_samples_per_request: int = 8
     sampling_sample_coalesce: bool = True
-    sampling_sample_coalesce_window_ms: float = 2.0
+    sampling_sample_coalesce_window_ms: float = 50.0
     sampling_sample_coalesce_max_batch: int = 32
     sampling_sample_coalesce_max_samples: int = 16
     sampling_require_seq_id: bool = False
@@ -214,7 +317,7 @@ class ServerConfig:
     capacity_manager_actor_name: str = "tinker_capacity_manager"
     api_work_queue_actor_name: str = "tinker_api_work_queue"
     capacity_queue_bytes_budget: int = 512 * 1024 * 1024
-    api_work_queue_num_workers: int = 32
+    api_work_queue_num_workers: int = 128
     api_work_queue_reap_interval_s: float = 5.0
 
     # Training settings (backend/verl_training.py)
@@ -235,7 +338,7 @@ class ServerConfig:
 
     # Docs / internal paths
     doc_path: str | None = None  # MINT_DOC_PATH
-    checkpoint_dir: str = "/vePFS-Mindverse/share/code/tinker-server/checkpoints"  # TINKER_CHECKPOINT_DIR
+    checkpoint_dir: str = "/tos-mindverse/tinker_checkpoints"  # TINKER_CHECKPOINT_DIR
 
     # Config file (TINKER_CONFIG_PATH)
     config_path: str | None = None
@@ -298,8 +401,84 @@ class ServerConfig:
             port=_pick_int("TINKER_PORT", file_server.port if file_server is not None else None, 8000),
             api_key=api_key,
             token_secret_key=token_secret_key,
+            internal_api_token=_pick_str(
+                "INTERNAL_API_TOKEN",
+                file_server.internal_api_token if file_server is not None else None,
+                "",
+            ),
+            usage_backend=_pick_str(
+                "TINKER_USAGE_BACKEND",
+                file_server.usage_backend if file_server is not None else None,
+                "postgres",
+            ).lower(),
             usage_log_dir=_pick_str(
-                "TINKER_USAGE_LOG_DIR", file_server.usage_log_dir if file_server is not None else None, "/tmp/tinker_usage"
+                "TINKER_USAGE_LOG_DIR",
+                file_server.usage_log_dir if file_server is not None else None,
+                "/tmp/tinker_usage",
+            ),
+            usage_pg_dsn=(
+                _pick_str(
+                    "TINKER_USAGE_PG_DSN",
+                    file_server.usage_pg_dsn if file_server is not None else None,
+                    "",
+                )
+                or (
+                    (
+                        "postgresql://"
+                        f"{_pick_str('TINKER_USAGE_PG_USER', file_server.usage_pg_user if file_server is not None else None, 'mint_user')}:"
+                        f"{_pick_str('TINKER_USAGE_PG_PASSWORD', file_server.usage_pg_password if file_server is not None else None, '')}@"
+                        f"{_pick_str('TINKER_USAGE_PG_HOST', file_server.usage_pg_host if file_server is not None else None, '')}:"
+                        f"{_pick_int('TINKER_USAGE_PG_PORT', file_server.usage_pg_port if file_server is not None else None, 5432)}/"
+                        f"{_pick_str('TINKER_USAGE_PG_DATABASE', file_server.usage_pg_database if file_server is not None else None, 'mint_billing')}"
+                    )
+                    if _pick_str("TINKER_USAGE_PG_HOST", file_server.usage_pg_host if file_server is not None else None, "")
+                    else ""
+                )
+            ),
+            usage_pg_host=_pick_str(
+                "TINKER_USAGE_PG_HOST",
+                file_server.usage_pg_host if file_server is not None else None,
+                "",
+            ),
+            usage_pg_port=_pick_int(
+                "TINKER_USAGE_PG_PORT",
+                file_server.usage_pg_port if file_server is not None else None,
+                5432,
+            ),
+            usage_pg_database=_pick_str(
+                "TINKER_USAGE_PG_DATABASE",
+                file_server.usage_pg_database if file_server is not None else None,
+                "mint_billing",
+            ),
+            usage_pg_user=_pick_str(
+                "TINKER_USAGE_PG_USER",
+                file_server.usage_pg_user if file_server is not None else None,
+                "mint_user",
+            ),
+            usage_pg_password=_pick_str(
+                "TINKER_USAGE_PG_PASSWORD",
+                file_server.usage_pg_password if file_server is not None else None,
+                "",
+            ),
+            usage_pg_pool_min=_pick_int(
+                "TINKER_USAGE_PG_POOL_MIN",
+                file_server.usage_pg_pool_min if file_server is not None else None,
+                10,
+            ),
+            usage_pg_pool_max=_pick_int(
+                "TINKER_USAGE_PG_POOL_MAX",
+                file_server.usage_pg_pool_max if file_server is not None else None,
+                30,
+            ),
+            usage_write_timeout_ms=_pick_int(
+                "TINKER_USAGE_WRITE_TIMEOUT_MS",
+                file_server.usage_write_timeout_ms if file_server is not None else None,
+                2000,
+            ),
+            usage_pg_table=_pick_str(
+                "TINKER_USAGE_PG_TABLE",
+                file_server.usage_pg_table if file_server is not None else None,
+                "billing.usage_event",
             ),
             skip_actor_cleanup=_pick_bool(
                 "MINT_SKIP_ACTOR_CLEANUP", file_server.skip_actor_cleanup if file_server is not None else None, False
@@ -322,10 +501,20 @@ class ServerConfig:
                 "TINKER_MAX_CPU_LORAS", file_server.max_cpu_loras if file_server is not None else None, 1024
             ),
             max_lora_rank=_pick_int("TINKER_MAX_LORA_RANK", file_server.max_lora_rank if file_server is not None else None, 64),
+            vllm_attention_backend=_pick_str(
+                "TINKER_VLLM_ATTENTION_BACKEND",
+                file_server.vllm_attention_backend if file_server is not None else None,
+                "DUAL_CHUNK_FLASH_ATTN",
+            ),
             # Sampling settings
             sampling_max_inflight_sample_tasks=_pick_int(
                 "TINKER_MAX_INFLIGHT_SAMPLE_TASKS",
                 file_sampling.max_inflight_sample_tasks if file_sampling is not None else None,
+                64,
+            ),
+            sampling_max_pending_asample_per_apikey=_pick_int(
+                "TINKER_MAX_PENDING_ASAMPLE_PER_APIKEY",
+                getattr(file_sampling, "max_pending_asample_per_apikey", None) if file_sampling is not None else None,
                 64,
             ),
             sampling_max_concurrent_samples_per_request=_pick_int(
@@ -341,7 +530,7 @@ class ServerConfig:
             sampling_sample_coalesce_window_ms=_pick_float(
                 "TINKER_SAMPLE_COALESCE_WINDOW_MS",
                 file_sampling.sample_coalesce_window_ms if file_sampling is not None else None,
-                2.0,
+                50.0,
             ),
             sampling_sample_coalesce_max_batch=_pick_int(
                 "TINKER_SAMPLE_COALESCE_MAX_BATCH",
@@ -414,7 +603,7 @@ class ServerConfig:
             api_work_queue_num_workers=_pick_int(
                 "TINKER_API_WORK_QUEUE_NUM_WORKERS",
                 None,
-                32,
+                128,
             ),
             api_work_queue_reap_interval_s=_pick_float(
                 "TINKER_API_WORK_QUEUE_REAP_INTERVAL_S",

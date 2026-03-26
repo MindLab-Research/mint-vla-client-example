@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -14,7 +13,7 @@ from .config import config
 
 logger = logging.getLogger(__name__)
 
-OperationType = Literal["forward_backward", "sample_prefill", "sample_generation"]
+OperationType = Literal["forward_backward", "sample_prefill", "sample_generation", "train_step"]
 
 
 @dataclass

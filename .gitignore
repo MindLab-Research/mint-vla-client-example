@@ -148,6 +148,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.pydeps/
 .unison*
 
 # Spyder project settings

@@ -12,16 +12,22 @@ import logging
 import os
 from typing import Any
 
+from ..config import otel_env_vars
+
 
 logger = logging.getLogger(__name__)
 
 
 def _ray_namespace() -> str:
-    return (
-        os.environ.get("TINKER_RAY_NAMESPACE")
-        or os.environ.get("MINT_RAY_NAMESPACE")
-        or "tinker"
-    )
+    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    if env_ns:
+        return env_ns
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "tinker"
 
 
 def _actor_name() -> str:
@@ -41,6 +47,9 @@ def _get_or_create_actor():
     @ray.remote(num_cpus=0)
     class _TrainingSessionStoreActor:
         def __init__(self) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
             self._sessions: dict[str, dict[str, Any]] = {}
 
         def upsert(self, model_id: str, info: dict[str, Any]) -> None:
@@ -65,11 +74,23 @@ def _get_or_create_actor():
         def list(self) -> list[dict[str, Any]]:
             return list(self._sessions.values())
 
+    options: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "lifetime": "detached",
+    }
+    actor_otel_env = otel_env_vars()
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
+
     try:
         return _TrainingSessionStoreActor.options(
-            name=name,
-            namespace=namespace,
-            lifetime="detached",
+            **options
         ).remote()
     except Exception:
         return ray.get_actor(name, namespace=namespace)

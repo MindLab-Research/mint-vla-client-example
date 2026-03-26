@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 from types import SimpleNamespace
+
+
+def _reload_openpi_ray_runtime(monkeypatch):
+    import tinker_server.config as config
+
+    monkeypatch.setattr(config, "PFS_PYTHONPATH", "/runtime/site-packages:/repo:/hf")
+    import tinker_server.backend.openpi_ray_runtime as openpi_ray_runtime
+
+    return importlib.reload(openpi_ray_runtime)
 
 
 def _spec():
@@ -19,18 +29,18 @@ def _spec():
 
 
 def test_openpi_ray_runtime_env_vars_forward_mint_openpi_overrides(monkeypatch) -> None:
-    from tinker_server.backend.openpi_ray_runtime import _openpi_runtime_env_vars
+    openpi_ray_runtime = _reload_openpi_ray_runtime(monkeypatch)
 
     monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/fast-weights")
     monkeypatch.setenv("MINT_OPENPI_PI05_ASSETS_BASE_DIR", "/tmp/pi05-assets")
     monkeypatch.setenv("UNRELATED_ENV", "ignore-me")
 
-    env_vars = _openpi_runtime_env_vars()
+    env_vars = openpi_ray_runtime._openpi_runtime_env_vars()
 
     assert env_vars["MINT_OPENPI_FAST_WEIGHTS_PATH"] == "/tmp/fast-weights"
     assert env_vars["MINT_OPENPI_PI05_ASSETS_BASE_DIR"] == "/tmp/pi05-assets"
     assert "UNRELATED_ENV" not in env_vars
-    assert env_vars["PYTHONPATH"]
+    assert env_vars["PYTHONPATH"] == "/runtime/site-packages:/repo:/hf"
 
 
 def test_openpi_ray_actor_ready_timeout_defaults_to_extended_budget(monkeypatch) -> None:

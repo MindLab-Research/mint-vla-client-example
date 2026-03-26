@@ -12,6 +12,7 @@ propagated into vLLM worker processes.
 from __future__ import annotations
 
 import importlib.util
+import json
 import multiprocessing.spawn as _mp_spawn
 import os
 import sys
@@ -52,6 +53,130 @@ def _sanitize_paths(paths: list[str]) -> list[str]:
     return out
 
 
+def _sanitize_vllm_worker_pythonpath(raw: str | None) -> str:
+    if raw is None:
+        return ""
+    try:
+        from tinker_server.runtime_env import sanitize_worker_pythonpath
+
+        return sanitize_worker_pythonpath(
+            raw,
+            env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+        )
+    except Exception:
+        return ":".join(p for p in str(raw).split(":") if p)
+
+
+def _strip_host_only_sys_path_entries(paths: list[str]) -> list[str]:
+    env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT")
+    if not env_root:
+        return paths
+    try:
+        from tinker_server.runtime_env import host_only_pythonpath_entries
+
+        excluded = {
+            os.path.normcase(os.path.abspath(path))
+            for path in host_only_pythonpath_entries(env_root)
+        }
+    except Exception:
+        return paths
+    return [
+        path
+        for path in paths
+        if not path or os.path.normcase(os.path.abspath(path)) not in excluded
+    ]
+
+
+def _preferred_torch_lib_dirs() -> list[str]:
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    env_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
+    candidates: list[str] = []
+    if env_root:
+        candidates.extend(
+            [
+                os.path.join(env_root, "host-venv", "lib", pyver, "site-packages", "torch", "lib"),
+                os.path.join(env_root, "site-packages", "torch", "lib"),
+            ]
+        )
+    candidates.append(f"/usr/local/lib/{pyver}/dist-packages/torch/lib")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen or not os.path.isdir(path):
+            continue
+        seen.add(norm)
+        out.append(path)
+    return out
+
+
+def _patch_torch_ld_library_path() -> None:
+    preferred = _preferred_torch_lib_dirs()
+    if not preferred:
+        return
+
+    blocked = {
+        os.path.normcase("/usr/local/lib/python3.10/dist-packages/torch/lib"),
+        os.path.normcase("/usr/local/lib/python3.10/site-packages/torch/lib"),
+    }
+    current = [
+        p
+        for p in os.environ.get("LD_LIBRARY_PATH", "").split(":")
+        if p and os.path.normcase(os.path.abspath(p)) not in blocked
+    ]
+    os.environ["LD_LIBRARY_PATH"] = ":".join(_sanitize_paths([*preferred, *current]))
+
+
+def _patch_multiprocessing_executable() -> None:
+    try:
+        import multiprocessing
+
+        executable = os.environ.get("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "").strip() or sys.executable
+        if executable and os.path.exists(executable):
+            multiprocessing.set_executable(executable)
+    except Exception:
+        pass
+
+
+def _maybe_log_vllm_child_startup() -> None:
+    try:
+        import multiprocessing
+
+        proc_name = multiprocessing.current_process().name
+    except Exception:
+        proc_name = ""
+    if not proc_name.startswith(("EngineCore_", "VllmWorker", "SpawnProcess")):
+        return
+
+    payload: dict[str, object] = {
+        "proc_name": proc_name,
+        "python": sys.executable,
+        "sys_path_head": sys.path[:10],
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    }
+    try:
+        spec = importlib.util.find_spec("vllm")
+        payload["vllm_spec"] = getattr(spec, "origin", None)
+    except Exception as e:
+        payload["vllm_spec_error"] = repr(e)
+    try:
+        import vllm  # type: ignore
+
+        payload["vllm_file"] = getattr(vllm, "__file__", None)
+    except Exception as e:
+        payload["vllm_import_error"] = repr(e)
+    try:
+        import vllm._C as vllm_c  # type: ignore
+
+        payload["vllm_c_file"] = getattr(vllm_c, "__file__", None)
+    except Exception as e:
+        payload["vllm_c_import_error"] = repr(e)
+    print(f"[sitecustomize:vllm_child_startup] {json.dumps(payload, default=str)}", flush=True)
+
+
 def _patch_cv2_typing_shadow() -> None:
     """Prevent accidental import of `cv2/typing` as top-level `typing`.
 
@@ -63,16 +188,22 @@ def _patch_cv2_typing_shadow() -> None:
         return
 
     # 1) Clean current process paths.
-    sys.path[:] = _sanitize_paths(list(sys.path))
+    _patch_torch_ld_library_path()
+    _patch_multiprocessing_executable()
+    sanitized_pythonpath = _sanitize_vllm_worker_pythonpath(os.environ.get("PYTHONPATH"))
+    if sanitized_pythonpath:
+        os.environ["PYTHONPATH"] = sanitized_pythonpath
+    sys.path[:] = _sanitize_paths(_strip_host_only_sys_path_entries(list(sys.path)))
 
     raw_py = os.environ.get("PYTHONPATH", "")
     if raw_py:
         parts = [p.strip() for p in raw_py.split(":")]
-        os.environ["PYTHONPATH"] = ":".join(_sanitize_paths(parts))
+        os.environ["PYTHONPATH"] = ":".join(_sanitize_paths(_strip_host_only_sys_path_entries(parts)))
 
     # 2) Ensure multiprocessing spawn does not reintroduce bad paths.
     orig = _mp_spawn.get_preparation_data
     if not getattr(orig, "__mint_cv2_typing_patched__", False):
+
         def _mint_get_preparation_data(*args, **kwargs):
             data = orig(*args, **kwargs)
             raw = data.get("sys_path")
@@ -155,6 +286,142 @@ def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
         _patch_cls(cls)
 
 
+def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
+    """Bypass Ray compiled DAG for sample_tokens on PP=1 when explicitly enabled.
+
+    Keep the Ray backend and TP>1 placement, but avoid the compiled-DAG channel
+    path for the final execute_model/sample_tokens sequence. This is an
+    experiment-only escape hatch for cases where EngineCore wedges in
+    shared_memory_channel read/write during generation.
+    """
+
+    if not _env_flag("MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE", default=False):
+        return
+
+    import threading
+    from concurrent.futures import Future
+
+    import vllm.v1.executor.ray_executor as ray_exec_mod
+
+    cls = getattr(ray_exec_mod, "RayDistributedExecutor", None)
+    if cls is None:
+        raise RuntimeError("vLLM missing RayDistributedExecutor")
+
+    original = getattr(cls, "sample_tokens", None)
+    if original is None:
+        raise RuntimeError("vLLM RayDistributedExecutor missing sample_tokens")
+    if getattr(original, "_tinker_patched_no_compiled_dag_sample", False):
+        return
+
+    completed_none = getattr(ray_exec_mod, "COMPLETED_NONE_FUTURE")
+
+    def _run_plain_collective(self, grammar_output):  # type: ignore[no-untyped-def]
+        scheduler_output = self.scheduler_output
+        if scheduler_output is None:
+            return None
+
+        self.scheduler_output = None
+        execute_out = self.collective_rpc(
+            "execute_model",
+            args=(scheduler_output,),
+            non_block=False,
+        )
+        # For sampler models this should be None on each worker; keep the path
+        # strict instead of adding any fallback behavior.
+        if self.uses_sampler and scheduler_output.total_num_scheduled_tokens:
+            if any(x is not None for x in execute_out):
+                raise RuntimeError(
+                    "Ray executor no-compiled-dag sample expected execute_model "
+                    "to return only None before sample_tokens"
+                )
+
+        sample_out = self.collective_rpc(
+            "sample_tokens",
+            args=(grammar_output,),
+            non_block=False,
+        )
+        if self.has_connector:
+            if self.kv_output_aggregator is None:
+                raise RuntimeError(
+                    "Ray executor no-compiled-dag sample requires "
+                    "kv_output_aggregator when connector is enabled"
+                )
+            return self.kv_output_aggregator.aggregate(sample_out)
+        return sample_out[0]
+
+    def sample_tokens(self, grammar_output, non_block: bool = False):  # type: ignore[no-untyped-def]
+        if self.parallel_config.pipeline_parallel_size != 1:
+            return original(self, grammar_output, non_block=non_block)
+
+        if self.scheduler_output is None:
+            return completed_none if non_block else None
+
+        if not getattr(self, "_tinker_logged_no_cdag_sample", False):
+            print(
+                "[mint patch] RayDistributedExecutor.sample_tokens using "
+                "no-compiled-dag fallback",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._tinker_logged_no_cdag_sample = True
+
+        if not non_block:
+            return _run_plain_collective(self, grammar_output)
+
+        fut: Future = Future()
+
+        def _runner() -> None:
+            try:
+                fut.set_result(_run_plain_collective(self, grammar_output))
+            except BaseException as e:
+                fut.set_exception(e)
+
+        threading.Thread(
+            target=_runner,
+            name="mint-ray-no-cdag-sample",
+            daemon=True,
+        ).start()
+        return fut
+
+    sample_tokens._tinker_patched_no_compiled_dag_sample = True  # type: ignore[attr-defined]
+    cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
+
+
+def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
+    """Prevent vLLM Ray executor from silently starting a local Ray head.
+
+    In our server, multinode vLLM actors already run inside a managed Ray
+    cluster. If vLLM initializes its Ray executor with no address, Ray starts a
+    standalone local head inside EngineCore, which hides the real failure behind
+    a nested cluster. Fail closed unless `RAY_ADDRESS` is explicitly available.
+    """
+
+    import vllm.v1.executor.ray_executor as ray_exec_mod
+    import vllm.v1.executor.ray_utils as ray_utils_mod
+
+    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
+    if original is None:
+        raise RuntimeError("vLLM missing initialize_ray_cluster")
+    if getattr(original, "_tinker_patched_explicit_cluster_address", False):
+        return
+
+    def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
+        addr = ray_address
+        if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
+            env_addr = os.environ.get("RAY_ADDRESS", "").strip()
+            if not env_addr:
+                raise RuntimeError(
+                    "vLLM RayDistributedExecutor requires explicit RAY_ADDRESS; "
+                    "refusing to start nested local Ray inside EngineCore"
+                )
+            addr = env_addr
+        return original(parallel_config, ray_address=addr)
+
+    initialize_ray_cluster._tinker_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
+    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    ray_exec_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+
+
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
     """Avoid expensive dummy-LoRA warmup during profiling runs.
 
@@ -180,7 +447,9 @@ def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
 
     original = getattr(cls, "maybe_dummy_run_with_lora", None)
     if original is None:
-        raise RuntimeError("vLLM LoRAModelRunnerMixin missing maybe_dummy_run_with_lora")
+        raise RuntimeError(
+            "vLLM LoRAModelRunnerMixin missing maybe_dummy_run_with_lora"
+        )
     if getattr(original, "_tinker_patched_skip_dummy_inactive", False):
         return
     original_sig = inspect.signature(original)
@@ -250,26 +519,53 @@ def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
     if cls is None:
         raise RuntimeError("vLLM missing GPUModelRunner")
 
+    import inspect
+
     original = getattr(cls, "_dummy_run", None)
     if original is None:
         raise RuntimeError("vLLM GPUModelRunner missing _dummy_run")
     if getattr(original, "_tinker_patched_disable_profile_dummy_loras", False):
         return
+    try:
+        original_sig = inspect.signature(original)
+    except Exception:
+        original_sig = None
+
+    def _supports_kw(name: str) -> bool:
+        if original_sig is None:
+            return True
+        if name in original_sig.parameters:
+            return True
+        return any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in original_sig.parameters.values()
+        )
 
     def _dummy_run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         is_profile = bool(kwargs.get("is_profile", False))
         activate_lora = bool(kwargs.get("activate_lora", False))
-        if not is_profile and activate_lora:
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        num_experts = (
+            getattr(hf_config, "num_experts", 0) if hf_config is not None else 0
+        )
+        is_moe = bool(num_experts and int(num_experts) > 1)
+        if is_moe and not is_profile and activate_lora:
             return original(self, *args, **kwargs)
 
-        kwargs["num_active_loras"] = 0
+        if _supports_kw("num_active_loras"):
+            kwargs["num_active_loras"] = 0
+        else:
+            kwargs.pop("num_active_loras", None)
+        kwargs.pop("activate_lora", None)
         original_lora_config = getattr(self, "lora_config", None)
         old_bypass = os.environ.get("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP")
+        old_bypass_dense = os.environ.get("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP")
         try:
             if original_lora_config is not None:
                 self.maybe_remove_all_loras(original_lora_config)
             self.lora_config = None
             os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = "1"
+            os.environ["MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP"] = "1"
             return original(self, *args, **kwargs)
         finally:
             self.lora_config = original_lora_config
@@ -277,6 +573,12 @@ def _patch_vllm_profile_run_disable_dummy_active_loras() -> None:
                 os.environ.pop("MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP", None)
             else:
                 os.environ["MINT_VLLM_BYPASS_FUSED_MOE_LORA_OP"] = old_bypass
+            if old_bypass_dense is None:
+                os.environ.pop("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP", None)
+            else:
+                os.environ["MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP"] = (
+                    old_bypass_dense
+                )
 
     _dummy_run._tinker_patched_disable_profile_dummy_loras = True  # type: ignore[attr-defined]
     cls._dummy_run = _dummy_run  # type: ignore[method-assign]
@@ -333,6 +635,44 @@ def _patch_vllm_fused_moe_lora_profile_noop() -> None:
         if hasattr(punica_gpu, name):
             setattr(punica_gpu, name, _wrap_noop(getattr(punica_gpu, name)))
 
+    add_lora_embedding = getattr(punica_gpu, "PunicaWrapperGPU", None)
+    add_lora_embedding = getattr(add_lora_embedding, "add_lora_embedding", None)
+    if callable(add_lora_embedding) and not getattr(
+        add_lora_embedding, "_tinker_profile_noop", False
+    ):
+
+        def wrapped_add_lora_embedding(
+            self, y, x, lora_b_stacked, add_inputs=True, **kwargs
+        ):  # type: ignore[no-untyped-def]
+            if _env_flag("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP", default=False):
+                return None
+            return add_lora_embedding(
+                self, y, x, lora_b_stacked, add_inputs=add_inputs, **kwargs
+            )
+
+        wrapped_add_lora_embedding._tinker_profile_noop = True  # type: ignore[attr-defined]
+        punica_gpu.PunicaWrapperGPU.add_lora_embedding = wrapped_add_lora_embedding  # type: ignore[method-assign]
+
+    try:
+        vocab_layer_mod = importlib.import_module(
+            "vllm.lora.layers.vocal_parallel_embedding"
+        )
+        vocab_cls = getattr(vocab_layer_mod, "VocabParallelEmbeddingWithLoRA", None)
+        vocab_forward = getattr(vocab_cls, "forward", None)
+    except Exception:
+        return
+    if callable(vocab_forward) and not getattr(
+        vocab_forward, "_tinker_profile_noop", False
+    ):
+
+        def wrapped_vocab_forward(self, x):  # type: ignore[no-untyped-def]
+            if _env_flag("MINT_VLLM_BYPASS_DUMMY_LORA_EMBEDDING_OP", default=False):
+                return self.base_layer.forward(x)
+            return vocab_forward(self, x)
+
+        wrapped_vocab_forward._tinker_profile_noop = True  # type: ignore[attr-defined]
+        vocab_cls.forward = wrapped_vocab_forward  # type: ignore[method-assign]
+
 
 def _patch_vllm_profile_run_scope_bypass_fused_moe_lora() -> None:
     """Scope fused-MoE-LoRA bypass to vLLM startup profiling.
@@ -350,7 +690,9 @@ def _patch_vllm_profile_run_scope_bypass_fused_moe_lora() -> None:
         raise RuntimeError("vLLM missing GPUModelRunner")
 
     original = getattr(cls, "profile_run", None)
-    if not callable(original) or getattr(original, "_tinker_profile_scope_bypass", False):
+    if not callable(original) or getattr(
+        original, "_tinker_profile_scope_bypass", False
+    ):
         return
 
     def profile_run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -515,6 +857,7 @@ def _patch_vllm_device_memory_profiler_skip_exit_measure() -> None:
         self.final_memory = self.initial_memory
         self.consumed_memory = 0
         import gc
+
         gc.collect()
 
     __exit__._tinker_patched_skip_exit_measure = True  # type: ignore[attr-defined]
@@ -543,7 +886,9 @@ def _patch_vllm_skip_startup_memory_profile() -> None:
         raise RuntimeError("vLLM missing GPU Worker")
 
     original = getattr(cls, "determine_available_memory", None)
-    if not callable(original) or getattr(original, "_tinker_skip_startup_profile", False):
+    if not callable(original) or getattr(
+        original, "_tinker_skip_startup_profile", False
+    ):
         return
 
     def determine_available_memory(self):  # type: ignore[no-untyped-def]
@@ -737,7 +1082,9 @@ class _SparseShardTensor:
         self._tinker_sparse_shards = tuple(shard_tensors)
         self._tinker_shard_starts = tuple(int(x) for x in shard_starts)
         self._tinker_num_experts = int(num_experts)
-        self._tinker_scale_factors = None if scale_factors is None else tuple(float(x) for x in scale_factors)
+        self._tinker_scale_factors = (
+            None if scale_factors is None else tuple(float(x) for x in scale_factors)
+        )
         first = shard_tensors[0]
         self.shape = (len(shard_tensors),) + tuple(first.shape)
         self.device = first.device
@@ -805,10 +1152,10 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
             f"installed_vllm_version={getattr(vllm, '__version__', 'unknown')!r}"
         )
 
-    def pack_moe_sparse_ok(cls, loras, module_name: str, is_non_gated_moe: bool = False):  # type: ignore[no-untyped-def]
-        if loras and all(l is not None for l in loras):
-            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
-
+    def pack_moe_sparse_ok(
+        cls, loras, module_name: str, is_non_gated_moe: bool = False
+    ):  # type: ignore[no-untyped-def]
+        timing = _env_flag("MINT_VLLM_TIMING_SET_LORA", default=False)
         if not loras or (len(loras) % 3) != 0:
             raise RuntimeError(
                 f"Unexpected MoE LoRA pack_moe inputs for module={module_name!r}: len(loras)={len(loras)}"
@@ -818,15 +1165,129 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
 
         base_any = next((l for l in loras if l is not None), None)
         if base_any is None:
-            raise RuntimeError(f"MoE LoRA pack_moe got all-None loras for module={module_name!r}")
+            raise RuntimeError(
+                f"MoE LoRA pack_moe got all-None loras for module={module_name!r}"
+            )
         rank = int(getattr(base_any, "rank"))
         lora_alpha = int(getattr(base_any, "lora_alpha"))
 
-        base_w1 = next((loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None), None)
-        base_w2 = next((loras[i * 3 + 1] for i in range(n_experts) if loras[i * 3 + 1] is not None), None)
-        base_w3 = next((loras[i * 3 + 2] for i in range(n_experts) if loras[i * 3 + 2] is not None), None)
+        base_w1 = next(
+            (loras[i * 3] for i in range(n_experts) if loras[i * 3] is not None), None
+        )
+        base_w2 = next(
+            (
+                loras[i * 3 + 1]
+                for i in range(n_experts)
+                if loras[i * 3 + 1] is not None
+            ),
+            None,
+        )
+        base_w3 = next(
+            (
+                loras[i * 3 + 2]
+                for i in range(n_experts)
+                if loras[i * 3 + 2] is not None
+            ),
+            None,
+        )
         if base_w1 is None or base_w2 is None or base_w3 is None:
-            raise RuntimeError(f"MoE LoRA pack_moe missing base weight(s) for module={module_name!r}")
+            raise RuntimeError(
+                f"MoE LoRA pack_moe missing base weight(s) for module={module_name!r}"
+            )
+
+        def _same_lora(x, y):  # type: ignore[no-untyped-def]
+            def _first_value(t):  # type: ignore[no-untyped-def]
+                if int(t.numel()) == 0:
+                    return None
+                return t.reshape(-1)[0].item()
+
+            return (
+                int(getattr(x, "rank")) == int(getattr(y, "rank"))
+                and int(getattr(x, "lora_alpha")) == int(getattr(y, "lora_alpha"))
+                and float(getattr(x, "scaling", lora_alpha / rank))
+                == float(getattr(y, "scaling", lora_alpha / rank))
+                and tuple(x.lora_a.shape) == tuple(y.lora_a.shape)
+                and x.lora_a.dtype == y.lora_a.dtype
+                and tuple(x.lora_b.shape) == tuple(y.lora_b.shape)
+                and x.lora_b.dtype == y.lora_b.dtype
+                and _first_value(x.lora_a) == _first_value(y.lora_a)
+                and _first_value(x.lora_b) == _first_value(y.lora_b)
+            )
+
+        def _build_sparse_from_representatives(starts):  # type: ignore[no-untyped-def]
+            present_w1 = {eid: loras[eid * 3] for eid in starts}
+            present_w2 = {eid: loras[eid * 3 + 1] for eid in starts}
+            present_w3 = {eid: loras[eid * 3 + 2] for eid in starts}
+
+            def _shard_lora_a(present: dict[int, object]):  # type: ignore[no-untyped-def]
+                return _SparseShardTensor(
+                    tuple(present[start].lora_a for start in starts),  # type: ignore[index,attr-defined]
+                    tuple(starts),
+                    int(n_experts),
+                )
+
+            def _shard_lora_b(present: dict[int, object]):  # type: ignore[no-untyped-def]
+                return _SparseShardTensor(
+                    tuple(present[start].lora_b for start in starts),  # type: ignore[index,attr-defined]
+                    tuple(starts),
+                    int(n_experts),
+                    tuple(
+                        float(getattr(present[start], "scaling", lora_alpha / rank))  # type: ignore[index,attr-defined]
+                        for start in starts
+                    ),
+                )
+
+            return cls(
+                module_name,
+                rank,
+                [lora_alpha, lora_alpha, lora_alpha],
+                [
+                    _shard_lora_a(present_w1),
+                    _shard_lora_a(present_w2),
+                    _shard_lora_a(present_w3),
+                ],
+                [
+                    _shard_lora_b(present_w1),
+                    _shard_lora_b(present_w2),
+                    _shard_lora_b(present_w3),
+                ],
+                scaling=[1.0, 1.0, 1.0],
+            )
+
+        if all(l is not None for l in loras):
+            # Dense checkpoints can still be block-shared across contiguous expert
+            # ranges. If so, keep only one representative per contiguous block and
+            # reuse the sparse-shard set_lora path to avoid materializing the full
+            # [num_experts, ...] packed tensors.
+            t_detect0 = time.perf_counter() if timing else 0.0
+            shard_starts = [0]
+            rep_eid = 0
+            for eid in range(1, n_experts):
+                if not (
+                    _same_lora(loras[eid * 3], loras[rep_eid * 3])
+                    and _same_lora(loras[eid * 3 + 1], loras[rep_eid * 3 + 1])
+                    and _same_lora(loras[eid * 3 + 2], loras[rep_eid * 3 + 2])
+                ):
+                    shard_starts.append(eid)
+                    rep_eid = eid
+            t_detect1 = time.perf_counter() if timing else 0.0
+            if len(shard_starts) < n_experts:
+                t_build0 = time.perf_counter() if timing else 0.0
+                obj = _build_sparse_from_representatives(shard_starts)
+                t_build1 = time.perf_counter() if timing else 0.0
+                print(
+                    f"[vLLM dense pack_moe dedup] module={module_name} "
+                    f"n_experts={n_experts} reps={len(shard_starts)} starts={shard_starts}",
+                    flush=True,
+                )
+                if timing:
+                    print(
+                        f"[vLLM dense pack_moe dedup timing] module={module_name} "
+                        f"detect_s={t_detect1 - t_detect0:.6f} build_s={t_build1 - t_build0:.6f}",
+                        flush=True,
+                    )
+                return obj
+            return orig_fn(cls, loras, module_name, is_non_gated_moe=is_non_gated_moe)
 
         only_expert0 = True
         for eid in range(1, n_experts):
@@ -839,35 +1300,31 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                 break
 
         if only_expert0:
-            # Shared-expert export: avoid materializing [num_experts, ...] tensors.
-            #
-            # vLLM later calls `optimize()` (in-place scaling merge) on packed LoRA
-            # weights. `expand(...)` returns a view with overlapping storage, so
-            # in-place ops (e.g., `lora_b *= scaling`) crash with:
-            #   "unsupported operation: more than one element ... refers to a single
-            #    memory location"
-            #
-            # Keep the non-materialized representation, but pre-apply scaling
-            # out-of-place and mark scaling=1 so vLLM's in-place optimize is a no-op.
-            w1_lora_a = base_w1.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w1.lora_a.shape))
-            w2_lora_a = base_w2.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w2.lora_a.shape))
-            w3_lora_a = base_w3.lora_a.unsqueeze(0).expand((n_experts,) + tuple(base_w3.lora_a.shape))
-            w1_lora_b_base = base_w1.lora_b * float(getattr(base_w1, "scaling", lora_alpha / rank))
-            w2_lora_b_base = base_w2.lora_b * float(getattr(base_w2, "scaling", lora_alpha / rank))
-            w3_lora_b_base = base_w3.lora_b * float(getattr(base_w3, "scaling", lora_alpha / rank))
-            w1_lora_b = w1_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w1_lora_b_base.shape))
-            w2_lora_b = w2_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w2_lora_b_base.shape))
-            w3_lora_b = w3_lora_b_base.unsqueeze(0).expand((n_experts,) + tuple(w3_lora_b_base.shape))
-            packed_scaling = [1.0, 1.0, 1.0]
+            # Route single-expert exports through the sparse-shard path so
+            # fused_moe.set_lora consumes shard metadata instead of falling back
+            # to dense per-expert tensors.
+            return _build_sparse_from_representatives([0])
         else:
-            import torch
-
-            present_w1 = {eid: loras[eid * 3] for eid in range(n_experts) if loras[eid * 3] is not None}
-            present_w2 = {eid: loras[eid * 3 + 1] for eid in range(n_experts) if loras[eid * 3 + 1] is not None}
-            present_w3 = {eid: loras[eid * 3 + 2] for eid in range(n_experts) if loras[eid * 3 + 2] is not None}
+            present_w1 = {
+                eid: loras[eid * 3]
+                for eid in range(n_experts)
+                if loras[eid * 3] is not None
+            }
+            present_w2 = {
+                eid: loras[eid * 3 + 1]
+                for eid in range(n_experts)
+                if loras[eid * 3 + 1] is not None
+            }
+            present_w3 = {
+                eid: loras[eid * 3 + 2]
+                for eid in range(n_experts)
+                if loras[eid * 3 + 2] is not None
+            }
             present_eids = sorted(set(present_w1) | set(present_w2) | set(present_w3))
             if not present_eids:
-                raise RuntimeError(f"MoE LoRA pack_moe got no present experts for module={module_name!r}")
+                raise RuntimeError(
+                    f"MoE LoRA pack_moe got no present experts for module={module_name!r}"
+                )
             if set(present_w1) != set(present_w2) or set(present_w1) != set(present_w3):
                 raise RuntimeError(
                     "Sparse MoE LoRA adapter has inconsistent expert coverage across w1/w2/w3. "
@@ -895,44 +1352,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                     f"module={module_name!r} n_experts={n_experts} "
                     f"present_expert_ids={present_eids} expected_present_expert_ids={expected_starts}"
                 )
-
-            def _shard_lora_a(present: dict[int, object]):  # type: ignore[no-untyped-def]
-                return _SparseShardTensor(
-                    tuple(present[start].lora_a for start, _ in shard_spans),  # type: ignore[index,attr-defined]
-                    tuple(shard_starts),
-                    int(n_experts),
-                )
-
-            def _shard_lora_b(present: dict[int, object]):  # type: ignore[no-untyped-def]
-                return _SparseShardTensor(
-                    tuple(
-                        present[start].lora_b  # type: ignore[index,attr-defined]
-                        for start, _ in shard_spans
-                    ),
-                    tuple(shard_starts),
-                    int(n_experts),
-                    tuple(
-                        float(getattr(present[start], "scaling", lora_alpha / rank))  # type: ignore[index,attr-defined]
-                        for start, _ in shard_spans
-                    ),
-                )
-
-            w1_lora_a = _shard_lora_a(present_w1)
-            w2_lora_a = _shard_lora_a(present_w2)
-            w3_lora_a = _shard_lora_a(present_w3)
-            w1_lora_b = _shard_lora_b(present_w1)
-            w2_lora_b = _shard_lora_b(present_w2)
-            w3_lora_b = _shard_lora_b(present_w3)
-            packed_scaling = [1.0, 1.0, 1.0]
-
-        return cls(
-            module_name,
-            rank,
-            [lora_alpha, lora_alpha, lora_alpha],
-            [w1_lora_a, w2_lora_a, w3_lora_a],
-            [w1_lora_b, w2_lora_b, w3_lora_b],
-            scaling=packed_scaling,
-        )
+            return _build_sparse_from_representatives(shard_starts)
 
     pack_moe_sparse_ok.__mint_sparse_ok__ = True  # type: ignore[attr-defined]
     Packed.pack_moe = classmethod(pack_moe_sparse_ok)
@@ -941,7 +1361,9 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
 def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
     import vllm.lora.layers.fused_moe as fused_moe_mod  # type: ignore
 
-    def _get_spans(tensor: "torch.Tensor", num_experts: int) -> list[tuple[int, int]] | None:  # type: ignore[name-defined]
+    def _get_spans(
+        tensor: "torch.Tensor", num_experts: int
+    ) -> list[tuple[int, int]] | None:  # type: ignore[name-defined]
         starts = getattr(tensor, "_tinker_shard_starts", None)
         if starts is None:
             return None
@@ -949,9 +1371,13 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
         if not starts:
             raise RuntimeError("Sparse MoE shard metadata is empty")
         if starts[0] != 0:
-            raise RuntimeError(f"Sparse MoE shard metadata must start at expert 0: starts={starts}")
+            raise RuntimeError(
+                f"Sparse MoE shard metadata must start at expert 0: starts={starts}"
+            )
         if starts != sorted(starts):
-            raise RuntimeError(f"Sparse MoE shard metadata must be sorted: starts={starts}")
+            raise RuntimeError(
+                f"Sparse MoE shard metadata must be sorted: starts={starts}"
+            )
         if int(getattr(tensor, "_tinker_num_experts", num_experts)) != num_experts:
             raise RuntimeError(
                 "Sparse MoE shard metadata num_experts mismatch: "
@@ -972,7 +1398,12 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                 )
         return spans
 
-    def _copy_sparse(dst: "torch.Tensor", index: int, src: "torch.Tensor", spans: list[tuple[int, int]]) -> None:  # type: ignore[name-defined]
+    def _copy_sparse(
+        dst: "torch.Tensor",
+        index: int,
+        src: "torch.Tensor",
+        spans: list[tuple[int, int]],
+    ) -> None:  # type: ignore[name-defined]
         for rep_idx, (start, end) in enumerate(spans):
             expert_count = end - start
             if hasattr(src, "_tinker_sparse_shards"):
@@ -998,7 +1429,9 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                     f"rep.shape={tuple(rep.shape)} expert_count={expert_count} "
                     f"rep_idx={rep_idx} span=({start},{end})"
                 )
-            target_view = target[(slice(None),) + tuple(slice(0, dim) for dim in expanded.shape[1:])]
+            target_view = target[
+                (slice(None),) + tuple(slice(0, dim) for dim in expanded.shape[1:])
+            ]
             if tuple(target_view.shape) != tuple(expanded.shape):
                 raise RuntimeError(
                     "Sparse MoE target slice mismatch: "
@@ -1029,12 +1462,21 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             if spans is None:
                 return original(self, index, lora_a, lora_b)
 
+            module_tag = (
+                getattr(self, "prefix", None)
+                or getattr(getattr(self, "base_layer", None), "prefix", None)
+                or type(self).__name__
+            )
+
+            timing = _env_flag("MINT_VLLM_TIMING_SET_LORA", default=False)
+            t0 = time.perf_counter() if timing else 0.0
             self.reset_lora(index)
             self.adapter_enabled[index] = 1
 
             w1_lora_a, w2_lora_a, w3_lora_a = lora_a
             w1_lora_b, w2_lora_b, w3_lora_b = lora_b
 
+            t1 = time.perf_counter() if timing else 0.0
             sliced_w1_lora_a = _slice_sparse(
                 w1_lora_a,
                 self._slice_w13_a,
@@ -1065,13 +1507,38 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                 self._slice_w2_b,
                 reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
             )
+            t2 = time.perf_counter() if timing else 0.0
+            copy_times: list[tuple[str, float]] = []
 
-            _copy_sparse(self.w13_lora_a_stacked[0], index, sliced_w1_lora_a, spans)
-            _copy_sparse(self.w13_lora_a_stacked[1], index, sliced_w3_lora_a, spans)
-            _copy_sparse(self.w13_lora_b_stacked[0], index, sliced_w1_lora_b, spans)
-            _copy_sparse(self.w13_lora_b_stacked[1], index, sliced_w3_lora_b, spans)
-            _copy_sparse(self.w2_lora_a_stacked[0], index, sliced_w2_lora_a, spans)
-            _copy_sparse(self.w2_lora_b_stacked[0], index, sliced_w2_lora_b, spans)
+            def _timed_copy(name: str, dst, src):  # type: ignore[no-untyped-def]
+                c0 = time.perf_counter() if timing else 0.0
+                _copy_sparse(dst, index, src, spans)
+                c1 = time.perf_counter() if timing else 0.0
+                if timing:
+                    copy_times.append((name, c1 - c0))
+                    print(
+                        f"[vLLM sparse set_lora copy] module={module_tag} name={name} "
+                        f"reps={len(spans)} elapsed_s={c1 - c0:.6f}",
+                        flush=True,
+                    )
+
+            _timed_copy("w13_a_0", self.w13_lora_a_stacked[0], sliced_w1_lora_a)
+            _timed_copy("w13_a_1", self.w13_lora_a_stacked[1], sliced_w3_lora_a)
+            _timed_copy("w13_b_0", self.w13_lora_b_stacked[0], sliced_w1_lora_b)
+            _timed_copy("w13_b_1", self.w13_lora_b_stacked[1], sliced_w3_lora_b)
+            _timed_copy("w2_a_0", self.w2_lora_a_stacked[0], sliced_w2_lora_a)
+            _timed_copy("w2_b_0", self.w2_lora_b_stacked[0], sliced_w2_lora_b)
+            t3 = time.perf_counter() if timing else 0.0
+            if timing:
+                copy_breakdown = ",".join(
+                    f"{name}:{elapsed:.6f}" for name, elapsed in copy_times
+                )
+                print(
+                    f"[vLLM sparse set_lora timing] module={module_tag} reps={len(spans)} "
+                    f"slice_s={t2 - t1:.6f} copy_s={t3 - t2:.6f} total_s={t3 - t0:.6f} "
+                    f"copy_breakdown={copy_breakdown}",
+                    flush=True,
+                )
 
         set_lora._tinker_sparse_shards = True  # type: ignore[attr-defined]
         cls.set_lora = set_lora  # type: ignore[method-assign]
@@ -1093,6 +1560,14 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             if spans is None:
                 return original3d(self, index, lora_a, lora_b)
 
+            module_tag = (
+                getattr(self, "prefix", None)
+                or getattr(getattr(self, "base_layer", None), "prefix", None)
+                or type(self).__name__
+            )
+
+            timing = _env_flag("MINT_VLLM_TIMING_SET_LORA", default=False)
+            t0 = time.perf_counter() if timing else 0.0
             self.reset_lora(index)
             self.adapter_enabled[index] = 1
 
@@ -1102,9 +1577,14 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
             if not hasattr(w13_lora_a, "_tinker_sparse_shards"):
                 w13_lora_a = w13_lora_a.reshape(src_experts, -1, w13_lora_a.shape[-1])
                 w2_lora_a = w2_lora_a.reshape(src_experts, -1, w2_lora_a.shape[-1])
-                w13_lora_b = w13_lora_b.reshape(w13_lora_b.shape[0], src_experts, -1).permute(1, 0, 2)
-                w2_lora_b = w2_lora_b.reshape(w2_lora_b.shape[0], src_experts, -1).permute(1, 0, 2)
+                w13_lora_b = w13_lora_b.reshape(
+                    w13_lora_b.shape[0], src_experts, -1
+                ).permute(1, 0, 2)
+                w2_lora_b = w2_lora_b.reshape(
+                    w2_lora_b.shape[0], src_experts, -1
+                ).permute(1, 0, 2)
 
+            t1 = time.perf_counter() if timing else 0.0
             sliced_w13_lora_a = _slice_sparse(
                 w13_lora_a,
                 self._slice_w13_a,
@@ -1125,11 +1605,36 @@ def _patch_vllm_fused_moe_set_lora_sparse_shards() -> None:
                 self._slice_w2_b,
                 reshape_fn=lambda t: t.reshape(1, t.shape[0], t.shape[1]),
             )
+            t2 = time.perf_counter() if timing else 0.0
+            copy_times: list[tuple[str, float]] = []
 
-            _copy_sparse(self.w13_lora_a_stacked[0], index, sliced_w13_lora_a, spans)
-            _copy_sparse(self.w2_lora_a_stacked[0], index, sliced_w2_lora_a, spans)
-            _copy_sparse(self.w13_lora_b_stacked[0], index, sliced_w13_lora_b, spans)
-            _copy_sparse(self.w2_lora_b_stacked[0], index, sliced_w2_lora_b, spans)
+            def _timed_copy(name: str, dst, src):  # type: ignore[no-untyped-def]
+                c0 = time.perf_counter() if timing else 0.0
+                _copy_sparse(dst, index, src, spans)
+                c1 = time.perf_counter() if timing else 0.0
+                if timing:
+                    copy_times.append((name, c1 - c0))
+                    print(
+                        f"[vLLM sparse set_lora copy] module={module_tag} name={name} "
+                        f"reps={len(spans)} elapsed_s={c1 - c0:.6f}",
+                        flush=True,
+                    )
+
+            _timed_copy("w13_a_0", self.w13_lora_a_stacked[0], sliced_w13_lora_a)
+            _timed_copy("w2_a_0", self.w2_lora_a_stacked[0], sliced_w2_lora_a)
+            _timed_copy("w13_b_0", self.w13_lora_b_stacked[0], sliced_w13_lora_b)
+            _timed_copy("w2_b_0", self.w2_lora_b_stacked[0], sliced_w2_lora_b)
+            t3 = time.perf_counter() if timing else 0.0
+            if timing:
+                copy_breakdown = ",".join(
+                    f"{name}:{elapsed:.6f}" for name, elapsed in copy_times
+                )
+                print(
+                    f"[vLLM sparse set_lora timing] module={module_tag} reps={len(spans)} "
+                    f"slice_s={t2 - t1:.6f} copy_s={t3 - t2:.6f} total_s={t3 - t0:.6f} "
+                    f"copy_breakdown={copy_breakdown}",
+                    flush=True,
+                )
 
         set_lora_3d._tinker_sparse_shards = True  # type: ignore[attr-defined]
         cls3d.set_lora = set_lora_3d  # type: ignore[method-assign]
@@ -1238,7 +1743,10 @@ def _patch_vllm_lora_pin_memory_overlap_safe() -> None:
                 return orig_pin(t, *args, **kwargs)
             except RuntimeError as e:
                 msg = str(e)
-                if "more than one element of the written-to tensor refers to a single memory location" in msg:
+                if (
+                    "more than one element of the written-to tensor refers to a single memory location"
+                    in msg
+                ):
                     return t
                 raise
 
@@ -1277,9 +1785,12 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
         additional_vars=None,
         destination=None,
     ):
+        os.environ["PYTHONPATH"] = _sanitize_vllm_worker_pythonpath(os.environ.get("PYTHONPATH"))
         extra = {
             "PYTHONPATH",
+            "LD_LIBRARY_PATH",
             "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+            "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
             "VLLM_USE_V1",
             "MINT_VLLM_DISABLE_MOE_LORA_PACKING",
             "MINT_VLLM_FULLY_SHARDED_LORAS",
@@ -1298,6 +1809,50 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
 
     get_env_vars_to_copy._tinker_pythonpath_carryover = True  # type: ignore[attr-defined]
     ray_env.get_env_vars_to_copy = get_env_vars_to_copy  # type: ignore[method-assign]
+
+
+def _patch_ray_placement_group_bundle_cache() -> None:
+    """Handle Ray state payloads that omit `bundles` for direct PG lookup."""
+    try:
+        import importlib
+
+        pg_mod = importlib.import_module("ray.util.placement_group")
+    except Exception:
+        return
+
+    original = getattr(pg_mod, "_get_bundle_cache", None)
+    if not callable(original) or getattr(original, "_tinker_bundle_cache_patch", False):
+        return
+
+    def _normalize_pg_id(pg_id):  # type: ignore[no-untyped-def]
+        try:
+            return pg_id.hex()
+        except Exception:
+            return str(pg_id)
+
+    def _get_bundle_cache(pg_id):  # type: ignore[no-untyped-def]
+        worker = pg_mod.ray._private.worker.global_worker
+        worker.check_connected()
+
+        info = pg_mod.ray._private.state.state.placement_group_table(pg_id)
+        bundles = info.get("bundles")
+        if bundles is not None:
+            return list(bundles.values())
+
+        target = _normalize_pg_id(pg_id)
+        table = pg_mod.placement_group_table()
+        for key, candidate in table.items():
+            candidate_id = str(candidate.get("placement_group_id") or key)
+            if candidate_id == target and candidate.get("bundles") is not None:
+                return list(candidate["bundles"].values())
+
+        raise KeyError(
+            f"placement group {target} missing bundles in both direct and full table lookup: "
+            f"direct_keys={sorted(info.keys())}"
+        )
+
+    _get_bundle_cache._tinker_bundle_cache_patch = True  # type: ignore[attr-defined]
+    pg_mod._get_bundle_cache = _get_bundle_cache  # type: ignore[assignment]
 
 
 def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
@@ -1373,6 +1928,35 @@ def _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives() -> None:
     setattr(op, "_tinker_patched_fused_moe_lora_torch_dist_tp", True)
 
 
+def _patch_vllm_gpu_worker_kv_debug_info() -> None:
+    try:
+        import vllm.v1.worker.gpu_worker as gpu_worker_mod
+    except Exception:
+        return
+
+    cls = getattr(gpu_worker_mod, "Worker", None) or getattr(gpu_worker_mod, "GPUWorker", None)
+    if cls is None:
+        return
+
+    original = getattr(cls, "get_kv_debug_info", None)
+    if callable(original) and getattr(original, "_tinker_kv_debug_info", False):
+        return
+
+    def get_kv_debug_info(self):  # type: ignore[no-untyped-def]
+        kv_cfg = getattr(getattr(self, "model_runner", None), "kv_cache_config", None)
+        return {
+            "available_kv_cache_memory_bytes": int(getattr(self, "available_kv_cache_memory_bytes", 0) or 0),
+            "requested_memory_bytes": int(getattr(self, "requested_memory", 0) or 0),
+            "non_torch_memory_bytes": int(getattr(self, "non_torch_memory", 0) or 0),
+            "peak_activation_memory_bytes": int(getattr(self, "peak_activation_memory", 0) or 0),
+            "kv_cache_num_blocks": int(getattr(kv_cfg, "num_blocks", 0) or 0) if kv_cfg is not None else 0,
+            "kv_cache_groups": len(getattr(kv_cfg, "kv_cache_groups", []) or []) if kv_cfg is not None else 0,
+        }
+
+    get_kv_debug_info._tinker_kv_debug_info = True  # type: ignore[attr-defined]
+    cls.get_kv_debug_info = get_kv_debug_info  # type: ignore[method-assign]
+
+
 def _apply_vllm_worker_patches() -> None:
     if not _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False):
         return
@@ -1389,21 +1973,24 @@ def _apply_vllm_worker_patches() -> None:
         _patch_vllm_pack_moe_sparse_ok()
         _patch_vllm_fused_moe_set_lora_sparse_shards()
     _patch_vllm_lora_from_tensors_disable_pin_memory()
+    if _env_flag("MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE", default=False):
+        _patch_vllm_worker_lora_load_to_device()
     _patch_vllm_lora_optimize_overlap_safe()
     _patch_vllm_lora_pin_memory_overlap_safe()
+    _patch_vllm_ray_executor_use_explicit_cluster_address()
+    _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
+    _patch_vllm_gpu_worker_kv_debug_info()
+    # Keep worker/runtime LoRA fixes, but do not alter vLLM's native startup
+    # profiling path. Knob sizing depends on upstream accounting:
+    # `weights_memory + peak_activation_memory + non_torch_increase`.
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
         _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
-        _patch_vllm_skip_dummy_lora_setup_when_inactive()
-        _patch_vllm_profile_run_disable_dummy_active_loras()
-        _patch_vllm_fused_moe_lora_profile_noop()
-        _patch_vllm_profile_run_scope_bypass_fused_moe_lora()
-        if not _patch_vllm_invoke_fused_moe_kernel_startup_noop():
-            _patch_vllm_fused_moe_forward_startup_fake()
-        _patch_vllm_device_memory_profiler_skip_exit_measure()
-        _patch_vllm_skip_startup_memory_profile()
-        _patch_vllm_dummy_lora_weights_use_empty()
         _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
 
 
+_patch_torch_ld_library_path()
+_patch_multiprocessing_executable()
 _patch_cv2_typing_shadow()
+_patch_ray_placement_group_bundle_cache()
+_maybe_log_vllm_child_startup()
 _apply_vllm_worker_patches()

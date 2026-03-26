@@ -56,15 +56,39 @@ If user asks for development operations, **stop and invoke mint-dev skill instea
 |----------|-------|
 | SSH Host | `mint-prod-volcano` |
 | Port | 18000 |
-| External URL | `https://mint.macaron.im` |
+| External URL | `https://mint.macaron.im` (international), `https://mint.macaron.xin` (China) |
 | Code Directory | `tinker-server-auth` |
 | PFS Path | `/vePFS-Mindverse/share/code/tinker-server-auth` |
 | Ray Configs | `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`, `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` |
-| Prod GPU Queues | Prefer `a800-mindverse-C1` (`q-20251126180002-26lwz`) or `a800-mindverse-C2` (`q-20260203101340-www2h`). Do not hard-code; confirm availability or ask user before submitting workers. |
+| Prod GPU Queues | Volcano prod workers MUST be on `a800-mindverse-C1` (`q-20251126180002-26lwz`). Do not submit `mint-prod-worker` to C2. |
 | API Key | **Required** (`X-API-Key` header) |
 | Log File | `/tmp/tinker_server_auth.log` |
 
+## Production Topology (Authoritative)
+
+Cluster management:
+- Volcano: exactly 2 worker nodes named mint-prod-worker (16 GPUs).
+- Aliyun: exactly 3 worker nodes named mint-prod-worker (24 GPUs).
+- Volcano: prod workers MUST be submitted to queue C1 (`q-20251126180002-26lwz`), not C2.
+
+Model lineup:
+- Main gateway on volcano; volcano hosts 0.6B, 4B and 30B itself.
+- 235B on aliyun (public access address: http://123.57.26.97:18000/)
+- K2: will be routed, skip since not ready yet.
+
+Placement:
+- Main volcano: 30B vllm + 30B megatron on node 1; 0.6B vllm + 0.6B peft + 4B vllm + 4B peft on node 2.
+- Main aliyun: 235B vllm on node 1; 235B megatron on node 2+3.
+
+API host Ray driver precondition:
+- One-time setup only: if `mint-prod-volcano` has not yet joined the Ray cluster as a local 0-GPU node, `tinker-server-auth` startup can fail in `ray.init()`.
+- If already joined, do not repeat this step during normal deploy/restart.
+- One-time command:
+  `ssh mint-prod-volcano '/root/tinker_project/tinker-server-auth/.venv31213/bin/ray start --address=192.168.37.147:6379 --node-ip-address=192.168.47.239 --num-cpus=0 --num-gpus=0 --disable-usage-stats'`
+
 ## Queue Placement SOP (C1/C2)
+
+K2 is not in production service yet. Skip this section unless the task is explicitly K2 placement or K2 bringup.
 
 ### Queue IDs (prod)
 
@@ -135,13 +159,13 @@ curl -s -X POST -H "X-API-Key: $TINKER_API_KEY" -H "Content-Type: application/js
 
 Then recreate actors as needed and re-run placement checks above.
 
-**Reverse Proxy:** Port 18000 is automatically reverse-proxied by Azure Gateway at `https://mint.macaron.im`. No additional setup required.
+**Reverse Proxy:** Port 18000 is reverse-proxied by Azure Gateway at `https://mint.macaron.im` (international) and `https://mint.macaron.xin` (China). No additional setup required.
 
 **IMPORTANT:** All API calls (except `/api/v1/healthz` and `/`) require `X-API-Key` header.
 
 ---
 
-**Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. Set it explicitly before submitting any new prod worker tasks.
+**Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. For Volcano prod, set it to C1 (`q-20251126180002-26lwz`) and do not submit `mint-prod-worker` to C2.
 
 ## Finding the Server Process
 
@@ -283,24 +307,25 @@ export TINKER_TOKEN_SECRET_KEY=$TINKER_TOKEN_SECRET_KEY  # from .secrets.env
 export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/vePFS-Mindverse/share/tinker_checkpoints
 
-# Persistent actors (server startup prewarm; eviction-protected)
-# Configure these in `.secrets.env` and restart the server to apply.
-export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,moonshotai/Kimi-K2-Instruct"
-export MINT_PERSISTENT_TRAIN_LORA_RANK=16
-export MINT_PERSISTENT_TRAIN_LR=5e-5
-export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
-export MINT_MEGATRON_EVICT_PROTECTED=1  # allow full-cluster Megatron to preempt idle protected actors
+ # Persistent actors (server startup prewarm; eviction-protected)
+ # Configure these in `.secrets.env` and restart the server to apply.
+ export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507"
+ export MINT_PERSISTENT_TRAIN_LORA_RANK=16
+ export MINT_PERSISTENT_TRAIN_LR=5e-5
+ export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S=3600
+ export MINT_MEGATRON_EVICT_PROTECTED=1  # allow full-cluster Megatron to preempt idle protected actors
 ```
 
 ### Multi-target Model Routing (Gateway)
 
-Prod can run as a gateway/router that forwards selected base models to other tinker-server deployments.
+ Prod can run as a gateway/router that forwards selected base models to other tinker-server deployments.
 
-Deployment targets (current plan):
-- `mint-prod-volcano` (this server): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`, `moonshotai/Kimi-K2-Instruct`
-- `mint-prod-aliyun`: `Qwen/Qwen3-235B-A22B-Instruct-2507`
+ Deployment targets (current plan):
+ - `mint-prod-volcano` (this server): `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-30B-A3B-Instruct-2507`
+ - `mint-prod-aliyun`: `Qwen/Qwen3-235B-A22B-Instruct-2507`
+ - K2: planned to be routed; do not treat K2 as production-ready.
 
-Router config (set on `mint-prod-volcano` only):
+ Router config (set on `mint-prod-volcano` only):
 ```bash
 export TINKER_GATEWAY_CONFIG_JSON='
 {
@@ -583,7 +608,7 @@ Prod-specific values:
 
 > **CRITICAL: ALWAYS verify cluster has enough GPUs before starting or switching model actors.**
 
-### Official supported model lineup (0.6B, 4B, 30B, 235B)
+### Current production model lineup (Volcano gateway + Aliyun 235B)
 
 Production worker replica size: 8 GPUs (`.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml` runs `ray start --num-gpus=8`).
 
@@ -592,9 +617,7 @@ Production worker replica size: 8 GPUs (`.claude/skills/volcano-cluster/configs/
 | Qwen3-0.6B (Dense) | 1 | 1 | 2 | 1 |
 | Qwen3-4B (Dense) | 1 | 1 | 2 | 1 |
 | Qwen3-30B-A3B (MoE) | 4 | 4 | 8 | 1 |
-| Qwen3-235B-A22B (MoE) | 16 | 32 | 48 | 6 |
-
-**Full production lineup (all four models resident):** 60 GPUs total, so 8 worker replicas (64 GPUs) plus 1 head node.
+| Qwen3-235B-A22B (MoE) | 8 | 16 | 24 | 3 |
 
 ### GPU Requirements by Model
 
@@ -603,7 +626,7 @@ Production worker replica size: 8 GPUs (`.claude/skills/volcano-cluster/configs/
 | **Qwen3-0.6B (Dense)** | TP=1 → **1 GPU** | **1 GPU** | **2 GPUs** |
 | **Qwen3-4B (Dense)** | TP=1 → **1 GPU** | **1 GPU** | **2 GPUs** |
 | **Qwen3-30B-A3B (MoE)** | TP=4 → **4 GPUs** | TP=4, EP=1 → **4 GPUs** | **8 GPUs** |
-| **Qwen3-235B-A22B (MoE)** | TP=16 → **16 GPUs** | TP=4, EP=8 → **32 GPUs** | **48 GPUs** |
+| **Qwen3-235B-A22B (MoE)** | TP=8 → **8 GPUs** | **16 GPUs** | **24 GPUs** |
 
 ### Pre-flight Check (MANDATORY)
 

@@ -72,6 +72,85 @@ If user asks for production operations, **stop and invoke mint-prod skill instea
 
 ---
 
+## Python And PYTHONPATH Invariants
+
+For mint-dev operator work, use the canonical runtime-env host interpreter:
+
+```bash
+/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+```
+
+The canonical runtime root also provides a matching Ray CLI wrapper:
+
+```bash
+/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray --version
+```
+
+Do not use system Python for Ray inspection, actor probes, or server startup.
+The dev Ray cluster is running Python 3.12.13, and host-side `ray.init(...)`
+with the wrong interpreter will fail with version mismatch or import-path
+errors.
+
+For API-server startup, prefer a built runtime-env root plus its host interpreter:
+
+```bash
+python scripts/build_runtime_env.py --env-root /vePFS-Mindverse/share/code/mint-runtime-py31213
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
+export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
+export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py
+```
+
+Reason:
+- actor `runtime_env` and API-host bootstrap now share the same canonical dependency root
+- `scripts/run_server.py` bootstraps `PYTHONPATH` from `PFS_RUNTIME_ENV_ROOT`
+- `LD_LIBRARY_PATH` must be injected before process start so the host Python 3.12 torch libs win over any inherited Python 3.10 host path
+- repo-root-only startup still creates fake import failures
+
+Do not pip-install packages until you have first verified that the API-host
+runtime env root matches the intended PFS environment.
+
+## Placement Group Hygiene Is Mandatory
+
+Before any new actor placement attempt on mint-dev:
+
+1. List all non-REMOVED placement groups cluster-wide.
+2. If any owned stale or pending PG can reserve the target GPUs, remove it first.
+3. Only after that, check physical GPU occupancy on the target nodes.
+4. Only after both checks pass, start the server or actor.
+
+Hard rule:
+- Do not treat physically idle GPUs as sufficient evidence.
+- A stale PG is a real blocker even when every GPU shows `2 MiB`.
+- Do not retry placement until the stale PG is gone.
+
+Exact check pattern:
+
+```bash
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'\''PY'\'''
+import json
+import os
+import ray
+from ray.util.placement_group import placement_group_table
+ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
+rows = []
+for pgid, info in placement_group_table().items():
+    if info.get("state") != "REMOVED":
+        rows.append({
+            "id": pgid,
+            "name": info.get("name"),
+            "state": info.get("state"),
+            "stats": info.get("stats"),
+        })
+print(json.dumps(rows, indent=2))
+PY'
+```
+
+If a stale PG is yours, remove it before any retry.
+
+---
+
 **Worker queue selection:** `.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml` uses a `<GPU_QUEUE_ID>` placeholder. Set it explicitly before submitting any new dev worker tasks.
 
 ## Concurrent Dev Runs (Issue #83)
@@ -211,9 +290,13 @@ ssh mint-dev "rm -rf /root/tinker_project/tinker-server && \
 ```bash
 export HF_HUB_OFFLINE=1
 export HF_HOME=/vePFS-Mindverse/share/huggingface
+export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH=/root/tinker_project/tinker-server:$PYTHONPATH
 export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
+export PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213
+export TINKER_HOST_PYTHON=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+export TINKER_HOST_TORCH_LIB=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib
+export LD_LIBRARY_PATH=$TINKER_HOST_TORCH_LIB:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
 # For concurrent dev runs, set this to a unique value (example: tinker_$USER).
 # export TINKER_RAY_NAMESPACE=tinker
 # Also set this to the same value (used by detached metadata stores):
@@ -232,13 +315,15 @@ export PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server
 
 ```bash
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Stop Server
@@ -345,10 +430,10 @@ If none of the above changed: restart server only.
 
 ```bash
 # Kill vLLM actor for K2
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 try:
     ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
     actor = ray.get_actor(\"tinker_vllm_kimi-k2-thinking\", namespace=ns)
@@ -359,10 +444,10 @@ except ValueError as e:
 \""
 
 # Kill Megatron actor for K2
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 try:
     ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
     actor = ray.get_actor(\"megatron_kimi_k2_thinking\", namespace=ns)
@@ -373,10 +458,10 @@ except ValueError as e:
 \""
 
 # List all actors in current namespace (to find actor names)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 ns = os.environ[\"TINKER_RAY_NAMESPACE\"]
 actors = ray.util.list_named_actors(all_namespaces=True)
 for a in actors:
@@ -385,10 +470,10 @@ for a in actors:
 \""
 
 # Kill all dense trainer pool actors in current namespace (prefix match)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address='auto', ignore_reinit_error=True)
+ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 ns = os.environ['TINKER_RAY_NAMESPACE']
 actors = ray.util.list_named_actors(all_namespaces=True)
 killed = 0
@@ -407,10 +492,10 @@ print(f\"killed={killed} prefix='dense_trainer_pool_' namespace={ns}\")
 \""
 
 # Kill detached store actors in current namespace (name match)
-ssh mint-dev "TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "RAY_ADDRESS='${RAY_ADDRESS:?set explicit validated head:port first}' TINKER_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' MINT_RAY_NAMESPACE='${TINKER_RAY_NAMESPACE:?unset}' /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c \"
 import os
 import ray
-ray.init(address='auto', ignore_reinit_error=True)
+ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 ns = os.environ['TINKER_RAY_NAMESPACE']
 names = ['tinker_future_store', 'tinker_training_session_store', 'tinker_gateway_session_store']
 killed = 0
@@ -433,13 +518,15 @@ Use this after server-only code changes. If you killed any actors, restart the s
 ```bash
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 ```
 
 ### Restart after killing vLLM
@@ -450,13 +537,15 @@ Use this after vLLM actor code changes, OOM, or switching base model.
 curl -X POST http://localhost:8000/api/v1/kill_vllm
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 ```
 
@@ -468,13 +557,15 @@ Use this after Megatron actor code changes, OOM, or switching base model.
 curl -X POST http://localhost:8000/api/v1/kill_megatron
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 curl -s http://localhost:8000/api/v1/healthz
 ```
 
@@ -488,13 +579,15 @@ Note: `/api/v1/kill_all_actors` kills ResourcePool-tracked GPU actors (vLLM, Meg
 curl -X POST http://localhost:8000/api/v1/kill_all_actors
 ssh mint-dev 'pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true'
 ssh mint-dev "cd /root/tinker_project/tinker-server && nohup bash -c \
-  \"PYTHONPATH=/root/tinker_project/tinker-server:\$PYTHONPATH \
+  \"PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/code/mint-runtime-py31213 \
+   PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules \
    HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
    PYTHONDONTWRITEBYTECODE=1 \
    PFS_TINKER_PATH=/vePFS-Mindverse/share/code/$USER/tinker-server \
+   LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
    TINKER_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
    MINT_RAY_NAMESPACE=${TINKER_RAY_NAMESPACE:-tinker_$USER} \
-   python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
+   /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python scripts/run_server.py\" >> /tmp/tinker_server.log 2>&1 &"
 sleep 80 && curl -s http://localhost:8000/api/v1/healthz
 ```
 
@@ -516,10 +609,16 @@ ssh mint-dev '/root/.volc/bin/volc ml_task logs -t <head_task_id> -i worker_0' |
 - `mint-dev` is a driver/API host. Starting a local raylet makes it schedulable and can steal actor placement.
 - Use `ray.init(address=...)` in Python or use Ray CLI commands that connect to the head without starting a local node.
 
+**Placement-group hygiene before retrying a large actor:**
+- If exact nodes are physically idle but `healthz` reports pending placement groups, inspect the global placement-group table before any retry.
+- Remove only placement groups you own, by exact actor-name namespace match.
+- Do not treat idle GPUs as proof that Ray has no logical reservations.
+- If you have not listed non-REMOVED PGs yet, you are not ready to start a new actor.
+
 **Safe connectivity check (no local raylet):**
 ```bash
-ssh mint-dev "ray status --address='<RAY_HEAD_IP>:6379'"
-ssh mint-dev "python3 - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379'"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python - <<'PY'\nimport ray\nray.init(address='<RAY_HEAD_IP>:6379')\nprint(ray.cluster_resources())\nPY"
 ```
 
 **For cluster create/teardown, invoke the `volcano-cluster` skill.**
@@ -551,9 +650,9 @@ Before starting any MoE test, run:
 
 ```bash
 # Quick status command (MANDATORY before any work)
-ssh mint-dev 'python3 << "PYEOF"
+ssh mint-dev '/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python << "PYEOF"
 import ray
-ray.init(address="auto", ignore_reinit_error=True)
+ray.init(address="<RAY_HEAD_IP>:6379", ignore_reinit_error=True)
 r = ray.available_resources()
 t = ray.cluster_resources()
 gpu_avail = r.get("GPU", 0)
@@ -568,7 +667,7 @@ for a in actors:
 PYEOF'
 
 # Check pending placement groups (MUST be empty)
-ssh mint-dev "ray status 2>/dev/null | grep -A5 'Pending Demands'"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379' 2>/dev/null | grep -A5 'Pending Demands'"
 ```
 
 **Required for Qwen3-30B-A3B tests:** At least 8 available GPUs and no pending placement groups.
@@ -594,7 +693,7 @@ If placement groups are pending (blocking GPUs):
 # Kill vLLM actor (see "Kill Actors" section above for commands)
 
 # Verify resources freed
-ssh mint-dev "ray status 2>/dev/null | head -20"
+ssh mint-dev "/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray status --address='<RAY_HEAD_IP>:6379' 2>/dev/null | head -20"
 ```
 
 ---
@@ -656,10 +755,10 @@ TINKER_BASE_URL=http://localhost:8000 TINKER_TELEMETRY=0 python -m tinker_cookbo
 
 ```bash
 # List all actors - this shows actual names and states
-ssh mint-dev 'ray list actors 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray list actors --address "$RAY_ADDRESS" 2>&1 | grep -E "(vllm|megatron|Extended)" | head -20'
 
 # Or list with full details
-ssh mint-dev 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray list actors --address "$RAY_ADDRESS" --filter "state=ALIVE" 2>&1 | head -30'
 ```
 
 ### Check Specific Actor Status
@@ -668,9 +767,10 @@ ssh mint-dev 'ray list actors --filter "state=ALIVE" 2>&1 | head -30'
 # WRONG: Guessing actor name and concluding "DEAD" if not found
 # RIGHT: List first, then check with exact name from list
 
-ssh mint-dev 'python3 -c "
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python -c "
+import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+ray.init(address=os.environ[\"RAY_ADDRESS\"], ignore_reinit_error=True)
 
 # List actors first to get exact names
 actors = ray.util.list_named_actors(all_namespaces=True)
@@ -684,16 +784,16 @@ for a in actors:
 
 ```bash
 # Get actor ID from ray list actors output, then:
-ssh mint-dev 'ray logs actor --id <ACTOR_ID> --tail 100 2>&1'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray logs actor --address "$RAY_ADDRESS" --id <ACTOR_ID> --tail 100 2>&1'
 
 # Example with actual ID:
-ssh mint-dev 'ray logs actor --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray logs actor --address "$RAY_ADDRESS" --id 618fd2b45b4f8ac797dafdbd1e000000 --tail 100 2>&1'
 ```
 
 ### List Dead Actors (for crash investigation)
 
 ```bash
-ssh mint-dev 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
+ssh mint-dev 'RAY_ADDRESS="${RAY_ADDRESS:?set explicit validated head:port first}" /vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/ray list actors --address "$RAY_ADDRESS" --filter "state=DEAD" 2>&1 | head -30'
 ```
 
 ---
@@ -708,7 +808,7 @@ ssh mint-dev 'ray list actors --filter "state=DEAD" 2>&1 | head -30'
 | Can't connect | Check SSH tunnel, Ray cluster connection |
 | vLLM OOM | Kill vLLM actor, restart server |
 | Pending placement groups | Not enough GPUs. Kill stale actors (see section 6) |
-| MoE test hangs on startup | Check GPU availability first. Need 12 GPUs for 30B MoE |
+| MoE test hangs on startup | Check GPU availability first. Need 8 GPUs for 30B MoE |
 | Tokenizer download fails | Run test script locally, not on server (server has no internet) |
 | Actor lookup fails | **LIST actors first** (`ray list actors`), don't assume dead |
 

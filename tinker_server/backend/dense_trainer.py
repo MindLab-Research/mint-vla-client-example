@@ -11,11 +11,13 @@ from __future__ import annotations
 import os
 import threading
 import logging
+import json
 from dataclasses import dataclass
 
 import ray
 
 from . import ray_kill
+from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 from .resource_pool import ActorType, get_resource_pool
 from ..config import PFS_PYTHONPATH, RAY_NAMESPACE
 
@@ -69,14 +71,66 @@ def _pg_name(actor_name: str) -> str:
     return f"{actor_name}_pg"
 
 
-def _get_or_create_pg(actor_name: str) -> ray.util.placement_group.PlacementGroup:
+def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) -> str | None:
+    raw = os.environ.get("MINT_DENSE_MODEL_NODE_IPS_JSON", "").strip()
+    source = "MINT_DENSE_MODEL_NODE_IPS_JSON"
+    if not raw:
+        raw = os.environ.get("MINT_MODEL_NODE_IPS_JSON", "").strip()
+        source = "MINT_MODEL_NODE_IPS_JSON"
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.warning("%s is not valid JSON; ignoring", source)
+        return None
+    if not isinstance(data, dict):
+        logger.warning("%s must be a JSON object; ignoring", source)
+        return None
+
+    candidates = None
+    lookup_keys = []
+    for key in (model_key, base_model):
+        if not key:
+            continue
+        lookup_keys.extend((key, str(key).lower()))
+    for key in lookup_keys:
+        value = data.get(key)
+        if value is not None:
+            candidates = value
+            break
+    if not isinstance(candidates, list) or not candidates:
+        return None
+
+    ip = str(candidates[0]).strip()
+    return ip or None
+
+
+def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> ray.util.placement_group.PlacementGroup:
     """Ensure a detached 1-GPU placement group exists for this actor."""
     pg_name = _pg_name(actor_name)
+    bundle = {"GPU": 1, "CPU": 1}
+    preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
+    if preferred_ip:
+        bundle[f"node:{preferred_ip}"] = 0.001
+        logger.info("Dense trainer pin model=%s node_ip=%s", model_key or base_model, preferred_ip)
     try:
-        pg = ray.util.get_placement_group(pg_name)
+        pg = get_named_placement_group(
+            pg_name,
+            namespace=PERSISTENT_DENSE_NAMESPACE,
+            expected_bundles=[bundle],
+        )
+    except PlacementGroupMismatchError as e:
+        ray.util.remove_placement_group(e.pg)
+        pg = ray.util.placement_group(
+            [bundle],
+            strategy="PACK",
+            name=pg_name,
+            lifetime="detached",
+        )
     except Exception:
         pg = ray.util.placement_group(
-            [{"GPU": 1, "CPU": 1}],
+            [bundle],
             strategy="PACK",
             name=pg_name,
             lifetime="detached",
@@ -88,7 +142,7 @@ def _get_or_create_pg(actor_name: str) -> ray.util.placement_group.PlacementGrou
 def _remove_pg(actor_name: str) -> None:
     pg_name = _pg_name(actor_name)
     try:
-        pg = ray.util.get_placement_group(pg_name)
+        pg = get_named_placement_group(pg_name, namespace=PERSISTENT_DENSE_NAMESPACE)
     except Exception:
         return
     try:
@@ -181,17 +235,21 @@ def get_or_create_dense_trainer(
 
             if actor is None:
                 pool.ensure_gpus_available(DEFAULT_NUM_GPUS)
+                from ..config import actor_runtime_env_vars, otel_env_vars
                 runtime_env = {
-                    "env_vars": {
-                        "PYTHONPATH": PFS_PYTHONPATH_DENSE,
+                    "env_vars": actor_runtime_env_vars(
+                        pythonpath=PFS_PYTHONPATH_DENSE,
+                        extra={
                         "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                         "HF_HUB_OFFLINE": "1",
                         "TRANSFORMERS_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                    }
+                        **otel_env_vars(),
+                        },
+                    )
                 }
-                pg = _get_or_create_pg(actor_name)
+                pg = _get_or_create_pg(actor_name, model_key=name_key, base_model=base_model)
                 actor = training_worker_cls.options(
                     name=actor_name,
                     namespace=PERSISTENT_DENSE_NAMESPACE,

@@ -37,6 +37,7 @@ Entrypoint: |
     sleep 300
     exit 1
   fi
+  export RAY_HEAD_IP
   echo "Connecting to Ray head at ${RAY_HEAD_IP}:6379"
 
   # Note: Ray CLI crashes on startup; start Ray via Python internals.
@@ -66,7 +67,7 @@ Entrypoint: |
       time.sleep(3600)
   PY
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:15-sm80"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
 ResourceQueueID: "<GPU_QUEUE_ID>"  # Prod prefers a800-mindverse-C1 (q-20251126180002-26lwz) or C2 (q-20260203101340-www2h). Set explicitly before submit.
 Framework: "Custom"
 

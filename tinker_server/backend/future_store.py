@@ -17,7 +17,7 @@ import uuid
 from enum import Enum
 from typing import Any
 
-from ..config import config as server_config
+from ..config import config as server_config, otel_env_vars
 
 
 class FutureStoreUnavailableError(RuntimeError):
@@ -68,38 +68,10 @@ def _ray_future_tombstone_ttl_s() -> float:
     return float(getattr(server_config, "future_store_tombstone_ttl_s", 300.0))
 
 
-def _infer_ray_address() -> str | None:
-    """Infer Ray GCS address for remote clusters.
+def _require_ray_address() -> str:
+    from ..ray_utils import require_ray_address
 
-    Prefer explicit RAY_ADDRESS. Fall back to ray_head_ip.txt on shared storage
-    (Volcano writes the canonical head IP there).
-    """
-    addr = (os.environ.get("RAY_ADDRESS") or "").strip()
-    if addr:
-        return addr
-
-    candidates: list[str] = []
-    pfs_tinker_path = (os.environ.get("PFS_TINKER_PATH") or "").strip()
-    if pfs_tinker_path:
-        candidates.append(os.path.join(pfs_tinker_path, "ray_head_ip.txt"))
-    candidates.extend(
-        [
-            # Common prod/dev code roots on PFS
-            "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt",
-            "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt",
-            # Local repo fallback (useful for workstation tunnels)
-            os.path.join(os.getcwd(), "ray_head_ip.txt"),
-        ]
-    )
-
-    for p in candidates:
-        try:
-            ip = open(p, "r", encoding="utf-8").read().strip()
-        except OSError:
-            continue
-        if ip:
-            return f"{ip}:6379"
-    return None
+    return require_ray_address()
 
 
 def _get_or_create_ray_actor():
@@ -122,6 +94,9 @@ def _get_or_create_ray_actor():
         def __init__(
             self, ttl_s: float, queue_ttl_s: float, done_ttl_s: float, tombstone_ttl_s: float
         ) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
             self._pending: set[str] = set()
             self._result_refs: dict[str, Any] = {}
             self._errors: dict[str, str] = {}
@@ -505,16 +480,37 @@ def _get_or_create_ray_actor():
 
         def cleanup(self, request_id: str) -> None:
             self._pending.discard(request_id)
-            self._result_refs.pop(request_id, None)
-            self._errors.pop(request_id, None)
             self._refs.pop(request_id, None)
             self._meta.pop(request_id, None)
             self._created_at.pop(request_id, None)
             self._queued_at.pop(request_id, None)
             self._running_at.pop(request_id, None)
-            self._done_at.pop(request_id, None)
             self._expired_at.pop(request_id, None)
             self._retrieved_at[request_id] = time.time()
+
+        def fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
+            self._prune()
+            now = time.time()
+            active = str(active_consumer_job_id)
+            message = str(error)
+            failed: list[str] = []
+            for request_id in list(self._pending):
+                meta = self._meta.get(request_id)
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("queue_state") or "") != "running":
+                    continue
+                owner = str(meta.get("consumer_job_id") or "").strip()
+                if not owner or owner == active:
+                    continue
+                self._pending.discard(request_id)
+                self._refs.pop(request_id, None)
+                self._update_op_from_meta(request_id, meta)
+                self._meta.pop(request_id, None)
+                self._errors[request_id] = message
+                self._done_at[request_id] = now
+                failed.append(str(request_id))
+            return failed
 
         def forget(self, request_id: str) -> None:
             self._forget(request_id)
@@ -524,11 +520,23 @@ def _get_or_create_ray_actor():
             # release any external reservations.
             return self._prune()
 
+    options: dict[str, Any] = {
+        "name": actor_name,
+        "namespace": namespace,
+        "lifetime": "detached",
+    }
+    actor_otel_env = otel_env_vars()
+    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
+    options["runtime_env"] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra=actor_otel_env,
+        )
+    }
+
     try:
         return _RayFutureStoreActor.options(
-            name=actor_name,
-            namespace=namespace,
-            lifetime="detached",
+            **options
         ).remote(ttl_s, queue_ttl_s, done_ttl_s, tombstone_ttl_s)
     except Exception:
         # Race: another process may have created the actor between get_actor and create.
@@ -569,8 +577,7 @@ class FutureStore:
             try:
                 from ..ray_utils import init_ray
 
-                addr = _infer_ray_address()
-                init_ray(address=addr or "auto", namespace=_ray_namespace(), ignore_reinit_error=True)
+                init_ray(namespace=_ray_namespace(), ignore_reinit_error=True)
             except Exception as e:
                 raise FutureStoreUnavailableError("Ray not initialized (init_ray failed)") from e
 
@@ -597,7 +604,7 @@ class FutureStore:
 
             out["ray_initialized"] = bool(ray.is_initialized())
             if not ray.is_initialized():
-                out["ray_address_inferred"] = _infer_ray_address()
+                out["ray_address"] = _require_ray_address()
                 return out
 
             try:
@@ -856,6 +863,24 @@ class FutureStore:
             self._ray_actor = None
             actor = self._get_ray_actor()
             actor.cleanup.remote(request_id=request_id)
+
+    def fail_stale_running_requests(self, active_consumer_job_id: str, error: str) -> list[str]:
+        actor = self._get_ray_actor()
+        import ray
+
+        try:
+            out = ray.get(
+                actor.fail_stale_running_requests.remote(
+                    active_consumer_job_id=str(active_consumer_job_id),
+                    error=str(error),
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise FutureStoreUnavailableError("Detached Ray FutureStore actor died") from e
+        if not isinstance(out, list):
+            raise TypeError(f"FutureStore.fail_stale_running_requests returned non-list: {type(out)}")
+        return [str(x) for x in out]
 
 
 future_store = FutureStore()

@@ -27,6 +27,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ..auth_identity import get_user_data as _request_user_data
+from ..auth_identity import get_user_id as _request_user_id
+from ..auth_identity import is_admin_request, is_admin_user_data
 from ..backend.session_heartbeat_store import session_heartbeat_store
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -63,20 +66,18 @@ action_session_manager: object | None = None
 
 def _get_user_data(request: Request) -> dict | None:
     """Extract full user_data from request state (set by auth middleware)."""
-    return getattr(request.state, "user_data", None)
+    return _request_user_data(request)
 
 
 def _get_user_id(request: Request) -> str | None:
-    user_data = _get_user_data(request)
-    if user_data:
-        return user_data.get("user_id")
-    return None
+    return _request_user_id(request)
 
 
-def _user_visible(request_user_id: str | None, owner: str | None) -> bool:
+def _user_visible(request_user_data: dict | None, owner: str | None) -> bool:
+    request_user_id = str(request_user_data.get("user_id")) if request_user_data and request_user_data.get("user_id") else None
     if request_user_id is None:
         return True
-    if request_user_id == "admin":
+    if is_admin_user_data(request_user_data):
         return True
     return bool(owner) and owner == request_user_id
 
@@ -117,12 +118,9 @@ def _infer_base_model_from_checkpoint(model_path: str, *, user_id: str | None) -
 async def healthz() -> dict:
     """Health check endpoint.
 
-    Returns HTTP 503 when the server can connect to Ray but Ray has pending GPU
-    placement-group demand in the configured namespace. This indicates the API
-    surface may be healthy while Ray-backed workloads are capacity-degraded.
-
-    Also returns HTTP 503 when startup reconciliation recorded a degraded state
-    (e.g., actor cleanup/reconciliation failed).
+    Returns HTTP 503 only for startup degradation or Ray unavailability.
+    Queue pressure and slow Ray inspection are reported as observations on a
+    ready server rather than as readiness failures.
     """
     from ..health_state import get_startup_degraded_state
 
@@ -144,7 +142,7 @@ async def healthz() -> dict:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         def _pending_gpu_pg_names_in_namespace() -> list[str]:
             tbl = ray.util.placement_group_table()
@@ -190,28 +188,26 @@ async def healthz() -> dict:
                 timeout=healthz_ray_timeout_s,
             )
         except asyncio.TimeoutError:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "degraded",
+            return {
+                "status": "ready",
+                "ray_observation": {
                     "reason": "ray_healthz_timeout",
                     "timeout_s": healthz_ray_timeout_s,
                 },
-            )
+            }
         if pending_pg_names:
             ar = ray.available_resources()
             cr = ray.cluster_resources()
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "degraded",
+            return {
+                "status": "ready",
+                "ray_observation": {
                     "reason": "pending_placement_groups",
                     "pending_pg_count": len(pending_pg_names),
                     "pending_pg_names": pending_pg_names[:20],
                     "ray_gpu_available": float(ar.get("GPU", 0) or 0),
                     "ray_gpu_total": float(cr.get("GPU", 0) or 0),
                 },
-            )
+            }
 
         return {"status": "ready"}
     except Exception as e:
@@ -370,8 +366,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     return CreateSessionResponse(session_id=session_id)
 
 
-@router.post("/create_sampling_session")
-async def create_sampling_session(
+async def _create_sampling_session_impl(
     request: CreateSamplingSessionRequest,
     http_request: Request,
 ) -> CreateSamplingSessionResponse:
@@ -389,14 +384,13 @@ async def create_sampling_session(
 
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
-    adapter_path: str | None = None
-
-    # Determine base_model from request or infer from model_path
-    base_model = request.base_model
-    if not base_model and request.model_path:
-        # Try to infer base_model from adapter_config.json
-        adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
-        base_model = _infer_base_model_from_adapter(adapter_path)
+    # Determine base_model from request or infer from model_path.
+    base_model, adapter_path = _resolve_base_model_for_sampling_request(
+        base_model=request.base_model,
+        model_path=request.model_path,
+        user_id=user_id,
+        http_request=http_request,
+    )
 
     if not base_model:
         raise HTTPException(
@@ -455,7 +449,9 @@ async def create_sampling_session(
     if request.model_path:
         # Resolve adapter directory (file://, mint://, absolute path).
         if adapter_path is None:
-            adapter_path = _resolve_model_path(request.model_path, user_id=user_id)
+            adapter_path = _resolve_model_path(
+                request.model_path, user_id=user_id, http_request=http_request
+            )
 
         # Fast validation: ensure weights exist; loading happens on first /asample.
         weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
@@ -620,9 +616,51 @@ async def create_action_session(
     return CreateActionSessionResponse(action_session_id=str(action_session_id))
 
 
+@router.post("/create_sampling_session")
+async def create_sampling_session(
+    request: CreateSamplingSessionRequest,
+    http_request: Request,
+) -> CreateSamplingSessionResponse:
+    return await _create_sampling_session_impl(request, http_request)
+
+
+async def ensure_sampling_session(
+    *,
+    model_path: str,
+    http_request: Request,
+    parent_session_id: str | None = None,
+) -> tuple[str, str]:
+    """Ensure a sampling session exists for an OpenAI-compatible request."""
+    from ..gateway import remote_sampling_session
+
+    request_kwargs: dict[str, str] = {
+        "session_id": parent_session_id or str(uuid.uuid4()),
+    }
+    if model_path.startswith(("tinker://", "mint://", "ckpt_", "file://", "/")):
+        request_kwargs["model_path"] = model_path
+    else:
+        request_kwargs["base_model"] = model_path
+
+    sampling_request = CreateSamplingSessionRequest(**request_kwargs)
+    response = await create_sampling_session(sampling_request, http_request)
+    sampling_session_id = response.sampling_session_id
+    base_model = None if session_manager is None else session_manager.get_session_base_model(sampling_session_id)
+    if base_model is None:
+        remote = remote_sampling_session(sampling_session_id)
+        if remote is not None:
+            _, base_model = remote
+
+    if not base_model:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Sampling session {sampling_session_id!r} missing base_model after creation",
+        )
+    return sampling_session_id, base_model
+
+
 @router.get("/sessions/{session_id}", response_model=GetSessionResponse)
 async def get_session(session_id: str, http_request: Request) -> GetSessionResponse:
-    request_user_id = _get_user_id(http_request)
+    request_user_data = _get_user_data(http_request)
     info = None
     try:
         from ..backend.session_index_store import get_session_index
@@ -632,7 +670,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
     if isinstance(info, dict):
-        if not _user_visible(request_user_id, info.get("user_id")):
+        if not _user_visible(request_user_data, info.get("user_id")):
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
         return GetSessionResponse(
             training_run_ids=list(info.get("training_run_ids") or []),
@@ -640,7 +678,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
         )
 
     entry = sessions.get(session_id)
-    if entry and _user_visible(request_user_id, entry.get("user_id")):
+    if entry and _user_visible(request_user_data, entry.get("user_id")):
         return GetSessionResponse(training_run_ids=[], sampler_ids=[])
 
     raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
@@ -648,7 +686,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
 
 @router.get("/sessions", response_model=ListSessionsResponse)
 async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request = None) -> ListSessionsResponse:
-    request_user_id = _get_user_id(http_request) if http_request else None
+    request_user_data = _get_user_data(http_request) if http_request else None
     entries: list[dict] = []
     seen: set[str] = set()
 
@@ -663,7 +701,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
         sid = info.get("session_id")
         if not isinstance(sid, str) or not sid:
             continue
-        if not _user_visible(request_user_id, info.get("user_id")):
+        if not _user_visible(request_user_data, info.get("user_id")):
             continue
         entries.append({"session_id": sid, "created_at": info.get("created_at")})
         seen.add(sid)
@@ -671,7 +709,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
     for sid, entry in sessions.items():
         if sid in seen:
             continue
-        if not _user_visible(request_user_id, entry.get("user_id")):
+        if not _user_visible(request_user_data, entry.get("user_id")):
             continue
         entries.append({"session_id": sid, "created_at": entry.get("created_at")})
 
@@ -688,7 +726,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
 
 @router.get("/samplers/{sampler_id}", response_model=GetSamplerResponse)
 async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerResponse:
-    request_user_id = _get_user_id(http_request)
+    request_user_data = _get_user_data(http_request)
     info = None
     try:
         from ..backend.session_index_store import get_sampler_index
@@ -698,7 +736,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
     if isinstance(info, dict):
-        if not _user_visible(request_user_id, info.get("user_id")):
+        if not _user_visible(request_user_data, info.get("user_id")):
             raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
         base_model = info.get("base_model")
         if not base_model and session_manager is not None:
@@ -748,7 +786,9 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
     raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
 
 
-def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
+def _resolve_model_path(
+    model_path: str, *, user_id: str | None, http_request: Request
+) -> str:
     """Resolve model_path URI to filesystem path.
 
     Args:
@@ -757,26 +797,43 @@ def _resolve_model_path(model_path: str, *, user_id: str | None) -> str:
     Returns:
         Absolute filesystem path to adapter directory.
     """
-    from ..checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
+    from ..checkpoints import (
+        ensure_checkpoint_path_allowed,
+        materialize_persistent_checkpoint,
+        resolve_checkpoint_uri,
+    )
 
-    is_admin = user_id == "admin"
+    is_admin = is_admin_request(http_request)
     if not is_admin and not model_path.startswith(("tinker://", "mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    checkpoint_dir = get_checkpoints_dir()
-    resolved = resolve_checkpoint_uri(model_path, checkpoint_dir, user_id=user_id)
+    resolved = resolve_checkpoint_uri(model_path, "", user_id=user_id, is_admin=is_admin)
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
-    if not is_admin:
-        resolved_real = os.path.realpath(resolved)
-        checkpoints_real = os.path.realpath(checkpoint_dir)
-        if not resolved_real.startswith(checkpoints_real + os.sep):
-            raise HTTPException(status_code=403, detail="Access denied")
-        owner_dir = user_id or "anonymous"
-        allowed_real = os.path.realpath(os.path.join(checkpoint_dir, owner_dir))
-        if not (resolved_real == allowed_real or resolved_real.startswith(allowed_real + os.sep)):
-            raise HTTPException(status_code=403, detail="Access denied")
-    return resolved
+    try:
+        ensure_checkpoint_path_allowed(resolved, user_id=user_id, is_admin=is_admin)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return materialize_persistent_checkpoint(resolved)
+
+
+def _resolve_base_model_for_sampling_request(
+    *,
+    base_model: str | None,
+    model_path: str | None,
+    user_id: str | None,
+    http_request: Request,
+) -> tuple[str | None, str | None]:
+    """Return the effective base_model and resolved adapter path for a sampling request."""
+    adapter_path: str | None = None
+    if not base_model and model_path:
+        adapter_path = _resolve_model_path(
+            model_path,
+            user_id=user_id,
+            http_request=http_request,
+        )
+        base_model = _infer_base_model_from_adapter(adapter_path)
+    return base_model, adapter_path
 
 
 def _infer_base_model_from_adapter(adapter_path: str) -> str | None:
@@ -883,7 +940,7 @@ def _require_admin(request: Request) -> None:
     if not server_config.auth_enabled:
         return
     user_data = getattr(request.state, "user_data", None)
-    if not user_data or user_data.get("user_id") != "admin":
+    if not is_admin_user_data(user_data):
         raise HTTPException(status_code=403, detail="Admin access required")
 
 
@@ -894,7 +951,7 @@ def _augment_with_placement_groups(actors: list[dict]) -> None:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         for a in actors:
             name = a.get("actor_name")
@@ -971,7 +1028,7 @@ def _kill_dense_actors(base_model: str | None) -> int:
         from ..ray_utils import init_ray
 
         if not ray.is_initialized():
-            init_ray(address="auto", namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+            init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
         for e in targets:
             try:

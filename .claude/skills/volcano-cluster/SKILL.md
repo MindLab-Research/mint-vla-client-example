@@ -192,8 +192,8 @@ PY
 Conventions used by these configs:
 - Prod head: `mint-prod-head`
 - Prod workers: `mint-prod-worker*`
-- Dev head: `ray-head`
-- Dev workers: `ray-worker-*`
+- Dev head: `mint-dev-head`
+- Dev workers: `mint-dev-worker*`
 
 ### List Ray GPU nodes (no Volcano CLI required)
 

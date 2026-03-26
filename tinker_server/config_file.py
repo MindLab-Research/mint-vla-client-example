@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -18,7 +17,19 @@ class _ServerSection(BaseModel):
     host: str | None = None
     port: int | None = None
 
-    usage_log_dir: str | None = None
+    internal_api_token: str | None = None
+    usage_log_dir: str | None = None  # deprecated, kept for compatibility
+    usage_backend: str | None = None
+    usage_pg_dsn: str | None = None
+    usage_pg_host: str | None = None
+    usage_pg_port: int | None = None
+    usage_pg_database: str | None = None
+    usage_pg_user: str | None = None
+    usage_pg_password: str | None = None
+    usage_pg_pool_min: int | None = None
+    usage_pg_pool_max: int | None = None
+    usage_write_timeout_ms: int | None = None
+    usage_pg_table: str | None = None
     skip_actor_cleanup: bool | None = None
 
     tensor_parallel_size: int | None = None
@@ -31,6 +42,7 @@ class _ServerSection(BaseModel):
     max_loras: int | None = None
     max_cpu_loras: int | None = None
     max_lora_rank: int | None = None
+    vllm_attention_backend: str | None = None
 
 
 class _SamplingSection(BaseModel):
@@ -55,21 +67,14 @@ class _RaySection(BaseModel):
 class _PathsSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    pfs_runtime_env_root: str | None = None
     pfs_tinker_path: str | None = None
-    pfs_verl_path: str | None = None
-    pfs_vllm_path: str | None = None
-
-    pfs_megatron_bridge_path: str | None = None
-    pfs_megatron_bridge_hollowman_path: str | None = None
     pfs_hf_modules_path: str | None = None
-
-    pfs_extra_pythonpath: str | None = None
 
 
 class _MegatronBridgeSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    use_hollowman_mbridge: bool | None = None
     use_mbridge_lora_export: bool | None = None
 
 
