@@ -58,11 +58,16 @@ class SampledSequence(BaseModel):
 class SampleRequest(BaseModel):
     """Request to generate samples from the model.
 
-    Accepts either sampling_session_id or model_id for Tinker SDK compatibility.
+    Accepts exactly one selector family:
+    - `sampling_session_id` or `model_id`
+    - `base_model`
+    - `model_path`
     """
 
     sampling_session_id: str | None = None
     model_id: str | None = None  # Alias for sampling_session_id (Tinker SDK compat)
+    base_model: str | None = None
+    model_path: str | None = None
     seq_id: int | None = None
     num_samples: int
     prompt: ModelInput
@@ -70,6 +75,32 @@ class SampleRequest(BaseModel):
     prompt_logprobs: bool = False
     topk_prompt_logprobs: int = 0
     include_prompt_logprobs: bool = False  # Alias for prompt_logprobs (Tinker SDK compat)
+
+    @model_validator(mode="after")
+    def validate_selectors(self) -> "SampleRequest":
+        session_selector = self.sampling_session_id or self.model_id
+        if self.sampling_session_id and self.model_id and self.sampling_session_id != self.model_id:
+            raise ValueError("sampling_session_id and model_id must match when both are provided")
+        selector_count = sum(
+            [
+                bool(session_selector),
+                bool(self.base_model),
+                bool(self.model_path),
+            ]
+        )
+        if selector_count != 1:
+            raise ValueError(
+                "Exactly one selector must be provided: sampling_session_id/model_id, base_model, or model_path"
+            )
+        if self.seq_id is not None and not session_selector:
+            raise ValueError("seq_id requires sampling_session_id or model_id")
+        return self
+
+    def has_session_selector(self) -> bool:
+        return bool(self.sampling_session_id or self.model_id)
+
+    def needs_session_creation(self) -> bool:
+        return not self.has_session_selector()
 
     def get_session_id(self) -> str:
         """Get the session ID, preferring sampling_session_id over model_id."""
