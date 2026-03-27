@@ -84,6 +84,16 @@ def test_issue_187_openpi_training_checkpoint_dir_is_valid(tmp_path: Path) -> No
     validate_checkpoint_dir(str(ckpt), checkpoint_type="training")
 
 
+def test_issue_187_openpi_training_checkpoint_dir_rejects_empty_layout(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt_openpi_training_incomplete"
+    (ckpt / "1" / "params").mkdir(parents=True)
+    (ckpt / "1" / "assets").mkdir()
+    _touch(ckpt / "1" / "train_state" / "_METADATA")
+
+    with pytest.raises(ValueError, match="Missing LoRA weights in extracted checkpoint"):
+        validate_checkpoint_dir(str(ckpt), checkpoint_type="training")
+
+
 def test_issue_187_sampler_checkpoint_rejects_optimizer_restore(tmp_path: Path) -> None:
     ckpt = tmp_path / "ckpt_sampler"
     _touch(ckpt / "adapter_model.safetensors")

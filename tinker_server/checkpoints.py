@@ -152,9 +152,16 @@ def checkpoint_has_sampling_adapter_weights(path: str) -> bool:
     return os.path.exists(os.path.join(path, "adapter_model.safetensors"))
 
 
+def _checkpoint_has_openpi_norm_stats(root: Path) -> bool:
+    assets_root = root / "assets"
+    if not assets_root.is_dir():
+        return False
+    return any(path.is_file() for path in assets_root.glob("**/norm_stats.json"))
+
+
 def checkpoint_has_openpi_policy_weights(path: str) -> bool:
     root = Path(path)
-    return (root / "params").is_dir() and (root / "assets").is_dir()
+    return (root / "params" / "_METADATA").exists() and _checkpoint_has_openpi_norm_stats(root)
 
 
 def checkpoint_has_openpi_training_state(path: str) -> bool:
@@ -162,7 +169,7 @@ def checkpoint_has_openpi_training_state(path: str) -> bool:
     candidates = [
         child
         for child in root.iterdir()
-        if child.is_dir() and child.name.isdigit() and (child / "params").is_dir() and (child / "assets").is_dir()
+        if child.is_dir() and child.name.isdigit() and checkpoint_has_openpi_policy_weights(str(child))
     ]
     if not candidates:
         return False
@@ -335,24 +342,34 @@ def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
 def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None = None) -> None:
     has_lora = checkpoint_has_lora_weights(path)
     has_optimizer = checkpoint_has_optimizer_state(path)
+    has_openpi_sampler = checkpoint_has_openpi_policy_weights(path)
     has_openpi_training = checkpoint_has_openpi_training_state(path)
 
-    if not has_lora and not (checkpoint_type == "training" and has_openpi_training):
-        raise ValueError("Missing LoRA weights in extracted checkpoint")
-    if checkpoint_type == "training":
-        if not has_optimizer:
-            raise ValueError("Missing optimizer state in extracted checkpoint")
-    elif checkpoint_type == "sampler":
+    if checkpoint_type == "sampler":
+        if not has_lora and not has_openpi_sampler:
+            raise ValueError("Missing sampler weights in extracted checkpoint")
         if has_optimizer:
             raise ValueError("Sampler checkpoint must not include optimizer state")
-    else:
+        return
+
+    if checkpoint_type == "training":
+        if not has_lora and not has_openpi_training:
+            raise ValueError("Missing LoRA weights in extracted checkpoint")
         if not has_optimizer:
             raise ValueError("Missing optimizer state in extracted checkpoint")
+        return
+
+    if not has_lora and not has_openpi_training:
+        raise ValueError("Missing LoRA weights in extracted checkpoint")
+    if not has_optimizer:
+        raise ValueError("Missing optimizer state in extracted checkpoint")
 
 
 def validate_sampler_checkpoint_for_sampling(path: str) -> None:
     if not checkpoint_has_sampling_adapter_weights(path) and not checkpoint_has_openpi_policy_weights(path):
-        raise ValueError("Missing sampling weights: expected adapter_model.safetensors or params/ + assets/")
+        raise ValueError(
+            "Missing sampling weights: expected adapter_model.safetensors or OpenPI params/_METADATA with assets/**/norm_stats.json"
+        )
     if checkpoint_has_optimizer_state(path):
         raise ValueError("Sampler checkpoint must not include optimizer state")
     if checkpoint_has_openpi_policy_weights(path):
