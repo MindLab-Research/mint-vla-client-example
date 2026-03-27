@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -718,6 +719,11 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": None,
                 "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_megatron_load",
+                "optimizer_restored": False,
+                "train_attn": False,
+                "train_mlp": True,
+                "train_unembed": False,
             },
         )
     ]
@@ -780,7 +786,12 @@ def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatc
                 "step_count": 9,
                 "learning_rate": pytest.approx(2e-4),
                 "actual_rank": 7,
-                "actor_only_state_dirty": True,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_megatron_load_recycle",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]
@@ -852,7 +863,12 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
                 "step_count": 6,
                 "learning_rate": pytest.approx(4e-4),
                 "actual_rank": 3,
-                "actor_only_state_dirty": True,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_megatron_ready_recycle",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]
@@ -906,7 +922,12 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
                 "step_count": 4,
                 "learning_rate": pytest.approx(3e-4),
                 "actual_rank": 6,
-                "actor_only_state_dirty": True,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_megatron_load_missing_actor",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]
@@ -1766,9 +1787,8 @@ def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkey
 
 def test_issue_193_actor_only_state_marker_corruption_fails_closed(tmp_path: Path):
     manager = MegatronSessionStateManager(base_path=str(tmp_path))
-    session_path = Path(manager.get_session_path("session_issue_193_corrupt_marker"))
-    session_path.mkdir(parents=True, exist_ok=True)
-    (session_path / "actor_only_state.json").write_text("{not-json", encoding="utf-8")
+    marker_path = Path(manager._actor_only_state_path("session_issue_193_corrupt_marker"))
+    marker_path.write_text("{not-json", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="Failed to read actor_only_state marker"):
         manager.list_actor_only_state_sessions("megatron_qwen3_30b_a3b_instruct_2507")
@@ -1778,7 +1798,7 @@ def test_issue_193_session_metadata_cache_does_not_mask_disk_corruption(tmp_path
     manager = MegatronSessionStateManager(base_path=str(tmp_path))
     session_id = "session_issue_193_corrupt_metadata"
     manager.save_metadata(session_id, step=3, lr=1e-4, actual_rank=8)
-    metadata_path = Path(manager.get_session_path(session_id)) / "session_metadata.json"
+    metadata_path = Path(manager._metadata_path(session_id))
     metadata_path.write_text("{not-json", encoding="utf-8")
 
     assert manager.get_metadata(session_id) is None
@@ -1792,15 +1812,45 @@ def test_issue_193_session_metadata_cache_does_not_mask_disk_corruption(tmp_path
 def test_issue_193_session_metadata_rejects_nonfinite_or_bool_lr(tmp_path: Path, lr_value):
     manager = MegatronSessionStateManager(base_path=str(tmp_path))
     session_id = "session_issue_193_bad_lr_metadata"
-    session_path = Path(manager.get_session_path(session_id))
-    session_path.mkdir(parents=True, exist_ok=True)
-    metadata_path = session_path / "session_metadata.json"
+    metadata_path = Path(manager._metadata_path(session_id))
     metadata_path.write_text(
         json.dumps({"step": 1, "lr": lr_value, "actual_rank": 8}),
         encoding="utf-8",
     )
 
     assert manager.get_metadata(session_id) is None
+
+
+def test_issue_193_prime_session_uses_sidecars_and_detaches_on_dirty(tmp_path: Path):
+    manager = MegatronSessionStateManager(base_path=str(tmp_path / "sessions"))
+    checkpoint_dir = tmp_path / "checkpoint_source"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "mp_rank_00_adapter.pt").write_text("adapter", encoding="utf-8")
+
+    session_id = "session_issue_193_sidecar_detach"
+    session_path = Path(manager.prime_session(session_id, str(checkpoint_dir), step=3, lr=1e-4, actual_rank=8, optimizer_restored=False))
+    metadata_path = Path(manager._metadata_path(session_id))
+    marker_path = Path(manager._actor_only_state_path(session_id))
+
+    assert session_path.is_dir()
+    assert not session_path.is_symlink()
+    assert metadata_path.exists()
+    assert not (checkpoint_dir / "session_metadata.json").exists()
+    assert (checkpoint_dir / "mp_rank_00_adapter.pt").read_text(encoding="utf-8") == "adapter"
+    assert (session_path / "mp_rank_00_adapter.pt").read_text(encoding="utf-8") == "adapter"
+
+    manager.mark_actor_only_state(
+        session_id,
+        reason="forward_backward",
+        actor_name="megatron_qwen3_30b_a3b_instruct_2507",
+    )
+
+    assert session_path.exists()
+    assert session_path.is_dir()
+    assert not session_path.is_symlink()
+    assert marker_path.exists()
+    assert not (checkpoint_dir / "actor_only_state.json").exists()
+    assert manager.get_metadata(session_id)["checkpoint_path"] == os.path.realpath(checkpoint_dir)
 
 
 def test_issue_193_megatron_dirty_noncurrent_session_fails_before_swap(monkeypatch):
@@ -1999,6 +2049,8 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
     )
 
     prepare_calls: list[str] = []
+    load_adapter_calls: list[tuple[str, dict]] = []
+    reset_optimizer_calls: list[tuple[tuple, dict]] = []
     group.workers = []
     group._bind_traceparent = lambda traceparent: None
     group._resolve_required_session_id = lambda session_id, op: session_id
@@ -2006,14 +2058,33 @@ def test_issue_193_megatron_load_checkpoint_uses_explicit_load_prepare(tmp_path:
     group._ensure_session_loaded = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("load_checkpoint must not use ordinary ensure path")
     )
-    group.load_adapter_state = lambda *args, **kwargs: {}
-    group.reset_optimizer = lambda *args, **kwargs: None
+    group.load_adapter_state = lambda load_path, **kwargs: load_adapter_calls.append((load_path, kwargs)) or {}
+    group.reset_optimizer = lambda *args, **kwargs: reset_optimizer_calls.append((args, kwargs)) or None
     group._step_count = 0
     group.learning_rate = 1e-4
 
     result = group.load_checkpoint(str(ckpt_dir), load_optimizer=False, session_id="session_target")
 
     assert prepare_calls == ["session_target"]
+    assert load_adapter_calls == [
+        (
+            str(ckpt_dir),
+            {
+                "actual_rank": 8,
+                "traceparent": None,
+                "train_attn": None,
+                "train_mlp": None,
+                "train_unembed": None,
+                "reload_optimizer_model_params": False,
+            },
+        )
+    ]
+    assert reset_optimizer_calls == [
+        (
+            (2e-4,),
+            {"traceparent": None, "zero_grad_buffers": False},
+        )
+    ]
     assert result["optimizer_reset"] is True
 
 
@@ -2223,7 +2294,12 @@ def test_issue_193_megatron_load_weights_invalid_meta_marks_session_loaded_with_
                 "step_count": 12,
                 "learning_rate": pytest.approx(9e-5),
                 "actual_rank": None,
-                "actor_only_state_dirty": True,
+                "actor_only_state_dirty": False,
+                "checkpoint_path": "/tmp/issue_193_invalid_meta_megatron_load",
+                "optimizer_restored": True,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
             },
         )
     ]

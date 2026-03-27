@@ -2024,6 +2024,9 @@ class VerlTrainingEngine:
             or "rayactorerror" in text
             or "the actor died unexpectedly" in text
             or "worker process has died" in text
+            or "illegal memory access was encountered" in text
+            or "cuda context corrupted before" in text
+            or "cudaerrorillegaladdress" in text
         )
 
     @staticmethod
@@ -2149,6 +2152,12 @@ class VerlTrainingEngine:
         lock = await self._get_actor_recycle_lock(actor_name)
         async with lock:
             existing = self._workers.get(session.model_id)
+            cause_text = str(cause).lower()
+            cause_is_cuda_poison = (
+                "illegal memory access was encountered" in cause_text
+                or "cuda context corrupted before" in cause_text
+                or "cudaerrorillegaladdress" in cause_text
+            )
             if existing is None:
                 try:
                     return await self._rebind_megatron_worker(
@@ -2165,7 +2174,7 @@ class VerlTrainingEngine:
                         type(reconnect_error).__name__,
                         reconnect_error,
                     )
-            if existing is not None:
+            if existing is not None and not cause_is_cuda_poison:
                 try:
                     await asyncio.to_thread(ray.get, existing.get_diagnostics.remote(), timeout=10)
                     logger.warning(
@@ -2351,13 +2360,30 @@ class VerlTrainingEngine:
                 raise
             worker = await self._recycle_worker_after_failure(session, op=op, cause=e)
         self._touch_actor(session)
-        await self._log_worker_request_context(
-            session,
-            worker,
-            op=op,
-            stage="before_submit",
-            batch_stats=batch_stats,
-        )
+        try:
+            await self._log_worker_request_context(
+                session,
+                worker,
+                op=op,
+                stage="before_submit",
+                batch_stats=batch_stats,
+            )
+        except Exception as e:
+            if not self._is_dead_actor_error(e):
+                raise
+            worker = await self._recycle_worker_after_failure(
+                session,
+                op=op,
+                cause=e,
+                request_started=False,
+            )
+            await self._log_worker_request_context(
+                session,
+                worker,
+                op=op,
+                stage="after_recycle",
+                batch_stats=batch_stats,
+            )
         attempts = 0
         while True:
             try:
@@ -3763,7 +3789,12 @@ class VerlTrainingEngine:
                     step_count=session.current_step,
                     learning_rate=session.learning_rate,
                     actual_rank=actual_rank,
-                    actor_only_state_dirty=bool(load_optimizer),
+                    actor_only_state_dirty=False,
+                    checkpoint_path=load_path,
+                    optimizer_restored=bool(load_optimizer),
+                    train_attn=bool(kwargs["train_attn"]),
+                    train_mlp=bool(kwargs["train_mlp"]),
+                    train_unembed=bool(kwargs["train_unembed"]),
                 ),
                 timeout=30,
             )
