@@ -1,10 +1,9 @@
 # Ray GPU Worker - Development
 #
 # Before submitting:
-#   1. Get Ray head IP: volc ml_task logs -t <head_task_id> -i worker_0 | grep "Local node IP"
-#   2. Replace <RAY_HEAD_IP> below with the actual IP address
-#   3. Replace <GPU_QUEUE_ID> below with the desired GPU queue id (confirm in Volcano console)
-#   4. Adjust RoleReplicas as needed: N replicas = 8*N GPUs
+#   1. Ensure mint-dev-head is running and has written ray_head_ip.txt to PFS
+#   2. Replace <GPU_QUEUE_ID> below with the desired GPU queue id (confirm in Volcano console)
+#   3. Submit one 1-node task per worker for easier rescheduling
 #
 # Submit with: volc ml_task submit -c mint-dev-worker.yaml --output json
 
@@ -21,26 +20,84 @@ Entrypoint: |
   mkdir -p /root/tinker_project
   ln -s /vePFS-Mindverse/share/code/tinker-server /root/tinker_project/tinker-server
 
-  # Connect to Ray head - REPLACE <RAY_HEAD_IP> before submitting
+  # Connect to Ray head published by mint-dev-head.
   set -euo pipefail
   python3 - <<'PY'
+  import socket
   import time
 
   import ray
   from ray._private.node import Node
   from ray._private.parameter import RayParams
 
-  head = "<RAY_HEAD_IP>:6379"
+  HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server/ray_head_ip.txt"
+  CHECK_INTERVAL_S = 10
+
+
+  def _port_open(address: str) -> bool:
+      host, port_s = address.rsplit(":", 1)
+      sock = socket.socket()
+      sock.settimeout(2)
+      try:
+          sock.connect((host, int(port_s)))
+          return True
+      except OSError:
+          return False
+      finally:
+          sock.close()
+
+
+  def _read_head() -> str:
+      while True:
+          try:
+              with open(HEAD_IP_PATH) as f:
+                  ip = f.read().strip()
+          except FileNotFoundError:
+              ip = ""
+          if not ip:
+              print(f"mint-dev worker waiting for head IP file: {HEAD_IP_PATH}", flush=True)
+              time.sleep(5)
+              continue
+
+          head = f"{ip}:6379"
+          if _port_open(head):
+              return head
+
+          print(f"mint-dev worker sees head file {head}, but gcs port is not reachable yet", flush=True)
+          time.sleep(5)
+
+
   ip = ray.util.get_node_ip_address()
   print(f"Local node IP: {ip}", flush=True)
 
-  ray_params = RayParams(
-      gcs_address=head,
-      num_gpus=8,
-  )
-  node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
   while True:
-      time.sleep(3600)
+      head = _read_head()
+      print(f"mint-dev worker connecting to head: {head}", flush=True)
+      node = None
+      try:
+          ray_params = RayParams(
+              gcs_address=head,
+              num_gpus=8,
+          )
+          node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
+          while True:
+              if not _port_open(head):
+                  print(f"mint-dev worker lost head connectivity to {head}; restarting worker ray node", flush=True)
+                  break
+              dead = node.dead_processes()
+              if dead:
+                  print(f"mint-dev worker detected dead ray processes: {dead!r}; restarting worker ray node", flush=True)
+                  break
+              time.sleep(CHECK_INTERVAL_S)
+      except Exception as e:
+          print(f"mint-dev worker wrapper caught exception: {type(e).__name__}: {e}", flush=True)
+      finally:
+          if node is not None:
+              try:
+                  node.kill_all_processes(check_alive=False, allow_graceful=False, wait=True)
+              except Exception as e:
+                  print(f"mint-dev worker cleanup failed: {type(e).__name__}: {e}", flush=True)
+          time.sleep(5)
   PY
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
@@ -49,7 +106,7 @@ Framework: "Custom"
 
 TaskRoleSpecs:
     - RoleName: "worker"
-      RoleReplicas: 2  # 2 replicas = 16 GPUs. Adjust as needed.
+      RoleReplicas: 1  # Submit multiple 1-node tasks for easier rescheduling.
       Flavor: "ml.hpcpni2l.28xlarge"  # 8x A800 80GB (RDMA)
 
 # No timeout (0 = unlimited)
