@@ -34,10 +34,8 @@ class TrainingEngineRouter:
 
     async def initialize(self) -> None:
         await self._text_engine.initialize()
-        if hasattr(self._openpi_fast_engine, "initialize"):
-            await self._openpi_fast_engine.initialize()
-        if hasattr(self._openpi_pi05_engine, "initialize"):
-            await self._openpi_pi05_engine.initialize()
+        # Keep OpenPI startup on the request path. Sampling-only app startup should
+        # not require Ray/OpenPI env just because the router is present.
 
     def _resolve_hf_model_path(self, model_name: str) -> str | None:
         resolver = getattr(self._text_engine, "_resolve_hf_model_path", None)

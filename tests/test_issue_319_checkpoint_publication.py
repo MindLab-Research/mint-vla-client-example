@@ -165,6 +165,57 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
     assert not (ckpt_dir / "metadata.json").exists()
 
 
+@pytest.mark.anyio
+async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_metadata(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from tinker_server.models.types import SaveStateRequest
+    from tinker_server.routes import weights as wt
+
+    ckpt_dir = tmp_path / "training_openpi"
+    _touch(ckpt_dir / "1" / "params" / "_METADATA")
+    _touch(ckpt_dir / "1" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json")
+    _touch(ckpt_dir / "1" / "train_state" / "_METADATA")
+
+    resolved: dict[str, object] = {}
+
+    async def _fake_save_weights(_session, _save_path):
+        return str(ckpt_dir)
+
+    def _resolve(request_id: str, payload: dict[str, object]) -> None:
+        resolved["request_id"] = request_id
+        resolved["payload"] = payload
+
+    monkeypatch.setattr(
+        wt,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: SimpleNamespace(
+                model_id="run-319-openpi",
+                base_model="openpi/pi0-fast-libero-low-mem-finetune",
+                current_step=7,
+                backend="openpi_fast",
+            )
+        ),
+    )
+    monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
+    monkeypatch.setattr(wt, "future_store", SimpleNamespace(resolve=_resolve, fail=lambda *_args: None))
+    monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(wt, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None)
+    request = SaveStateRequest(model_id="run-319-openpi", path="training-openpi")
+    await wt._do_save_state(
+        request_id="req-319-training-openpi",
+        request=request,
+        user_id="owner-a",
+        webhook_url=None,
+        prefer_tinker=False,
+    )
+
+    assert resolved["request_id"] == "req-319-training-openpi"
+    metadata_path = ckpt_dir / "metadata.json"
+    assert metadata_path.exists()
+
+
 def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
     from tinker_server.checkpoints import write_checkpoint_metadata
     from tinker_server.routes import weights as wt

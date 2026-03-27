@@ -152,6 +152,24 @@ def checkpoint_has_sampling_adapter_weights(path: str) -> bool:
     return os.path.exists(os.path.join(path, "adapter_model.safetensors"))
 
 
+def checkpoint_has_openpi_policy_weights(path: str) -> bool:
+    root = Path(path)
+    return (root / "params").is_dir() and (root / "assets").is_dir()
+
+
+def checkpoint_has_openpi_training_state(path: str) -> bool:
+    root = Path(path)
+    candidates = [
+        child
+        for child in root.iterdir()
+        if child.is_dir() and child.name.isdigit() and (child / "params").is_dir() and (child / "assets").is_dir()
+    ]
+    if not candidates:
+        return False
+    latest = max(candidates, key=lambda child: int(child.name))
+    return (latest / "train_state" / "_METADATA").exists()
+
+
 def checkpoint_has_optimizer_state(path: str) -> bool:
     return (
         os.path.exists(os.path.join(path, "optimizer.pt"))
@@ -317,8 +335,9 @@ def safe_extract_checkpoint_archive(archive_path: str, dest_dir: str) -> None:
 def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None = None) -> None:
     has_lora = checkpoint_has_lora_weights(path)
     has_optimizer = checkpoint_has_optimizer_state(path)
+    has_openpi_training = checkpoint_has_openpi_training_state(path)
 
-    if not has_lora:
+    if not has_lora and not (checkpoint_type == "training" and has_openpi_training):
         raise ValueError("Missing LoRA weights in extracted checkpoint")
     if checkpoint_type == "training":
         if not has_optimizer:
@@ -332,10 +351,12 @@ def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None
 
 
 def validate_sampler_checkpoint_for_sampling(path: str) -> None:
-    if not checkpoint_has_sampling_adapter_weights(path):
-        raise ValueError("Missing adapter_model.safetensors for sampling")
+    if not checkpoint_has_sampling_adapter_weights(path) and not checkpoint_has_openpi_policy_weights(path):
+        raise ValueError("Missing sampling weights: expected adapter_model.safetensors or params/ + assets/")
     if checkpoint_has_optimizer_state(path):
         raise ValueError("Sampler checkpoint must not include optimizer state")
+    if checkpoint_has_openpi_policy_weights(path):
+        return
     try:
         from safetensors import safe_open
 

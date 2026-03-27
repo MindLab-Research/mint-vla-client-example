@@ -5,6 +5,7 @@ import pytest
 
 from tinker_server.checkpoints import (
     checkpoint_has_optimizer_state,
+    validate_checkpoint_dir,
     validate_checkpoint_load_contract,
     write_checkpoint_metadata,
 )
@@ -72,6 +73,15 @@ def test_issue_187_orbax_training_checkpoint_allows_optimizer_restore(tmp_path: 
     )
     assert checkpoint_type == "training"
     assert optimizer_present is True
+
+
+def test_issue_187_openpi_training_checkpoint_dir_is_valid(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt_openpi_training"
+    _touch(ckpt / "1" / "params" / "_METADATA")
+    _touch(ckpt / "1" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json")
+    _touch(ckpt / "1" / "train_state" / "_METADATA")
+
+    validate_checkpoint_dir(str(ckpt), checkpoint_type="training")
 
 
 def test_issue_187_sampler_checkpoint_rejects_optimizer_restore(tmp_path: Path) -> None:
