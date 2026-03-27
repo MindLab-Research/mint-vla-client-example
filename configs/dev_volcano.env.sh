@@ -22,8 +22,7 @@ export PFS_HF_MODULES_PATH=/vePFS-Mindverse/share/huggingface/modules
 export LD_LIBRARY_PATH=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
 
 # ── Ray ────────────────────────────────────────────────────────────────────────
-export RAY_ADDRESS=192.168.37.185:6379
-export MINT_RAY_NODE_IP_ADDRESS=192.168.32.124
+export RAY_ADDRESS=192.168.38.143:6379
 
 # ── Namespace (CUSTOMIZE THIS) ─────────────────────────────────────────────────
 # Use a unique namespace to avoid conflicts with other developers.
