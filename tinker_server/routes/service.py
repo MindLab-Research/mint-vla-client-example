@@ -937,10 +937,17 @@ class KillActorsRequest(BaseModel):
     actor_name: str | None = None  # optional exact actor target
 
 
-def _remove_actor_pg(actor_name: str) -> None:
-    from ..backend.ray_placement_groups import remove_named_placement_group
+def _remove_actor_pg(actor_name: str, *, namespace: str | None = None) -> None:
+    from ..backend.ray_placement_groups import get_named_placement_group
+    import ray
 
-    remove_named_placement_group(f"{actor_name}_pg")
+    try:
+        pg = get_named_placement_group(f"{actor_name}_pg", namespace=namespace)
+    except Exception as exc:
+        if isinstance(exc, ValueError) and "not found" in str(exc).lower():
+            return
+        raise
+    ray.util.remove_placement_group(pg)
 
 
 async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
@@ -1030,8 +1037,8 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
     except Exception as exc:
         if not is_actor_lookup_not_found(exc):
             raise
+        _remove_actor_pg(entry.actor_name, namespace=entry.namespace)
         pool.unregister(entry.actor_name)
-        _remove_actor_pg(entry.actor_name)
         return 0
 
     await async_kill_named_actor(
@@ -1041,8 +1048,8 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
         base_model=entry.base_model,
         reason="dense_kill_by_actor_name",
     )
+    _remove_actor_pg(entry.actor_name, namespace=entry.namespace)
     pool.unregister(entry.actor_name)
-    _remove_actor_pg(entry.actor_name)
     return 1
 
 
@@ -1072,8 +1079,8 @@ async def _kill_dense_actors(base_model: str | None) -> int:
             base_model=e.base_model,
             reason="dense_kill_by_api",
         )
+        _remove_actor_pg(e.actor_name, namespace=e.namespace)
         pool.unregister(e.actor_name)
-        _remove_actor_pg(e.actor_name)
         killed += 1
     return killed
 
