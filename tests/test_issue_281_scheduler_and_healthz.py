@@ -591,14 +591,14 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
 
 
 @pytest.mark.anyio
-async def test_issue_281_do_delete_model_shutdowns_then_resolves(monkeypatch) -> None:
+async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> None:
     _install_ray_stub(monkeypatch)
     import tinker_server.backend.resource_pool as resource_pool
     import tinker_server.backend.training_session_store as training_session_store
     from tinker_server.routes import training as tr
 
     calls: dict[str, list] = {
-        "shutdown": [],
+        "engine_delete": [],
         "delete_session": [],
         "delete_store": [],
         "clear_session": [],
@@ -606,13 +606,13 @@ async def test_issue_281_do_delete_model_shutdowns_then_resolves(monkeypatch) ->
     resolved: dict = {}
     session = SimpleNamespace(model_id="run-281")
 
-    async def _fake_shutdown(target_session):
-        calls["shutdown"].append(target_session)
+    async def _fake_delete(target_session):
+        calls["engine_delete"].append(target_session)
 
     monkeypatch.setattr(
         tr,
         "training_engine",
-        SimpleNamespace(shutdown_session=_fake_shutdown),
+        SimpleNamespace(delete_session=_fake_delete),
     )
     monkeypatch.setattr(
         tr,
@@ -636,7 +636,7 @@ async def test_issue_281_do_delete_model_shutdowns_then_resolves(monkeypatch) ->
 
     await tr._do_delete_model("rid-282", "run-281")
 
-    assert calls["shutdown"] == [session]
+    assert calls["engine_delete"] == [session]
     assert calls["delete_session"] == ["run-281"]
     assert calls["delete_store"] == ["run-281"]
     assert calls["clear_session"] == ["run-281"]

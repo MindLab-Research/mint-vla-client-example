@@ -27,7 +27,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -328,7 +328,6 @@ async def _best_effort_delete_training_session(
     model_id: str,
     *,
     reason: str,
-    allow_actor_shutdown: bool,
 ) -> bool:
     if training_engine is None or training_manager is None:
         return False
@@ -356,68 +355,25 @@ async def _best_effort_delete_training_session(
         return False
 
     session = training_manager.get_session(model_id)
-    restored = False
     if session is None:
         restored_session = _restore_training_session(model_id)
         session = await restored_session if inspect.isawaitable(restored_session) else restored_session
-        restored = session is not None
 
-    shutdown_attempted = False
+    deleted = False
     if session is not None:
-        if allow_actor_shutdown:
-            try:
-                shutdown_attempted = True
-                await training_engine.shutdown_session(session)
-            except Exception as e:
-                logger.warning(
-                    "[%s] best-effort stale training cleanup shutdown failed (%s): %s: %s",
-                    model_id,
-                    reason,
-                    type(e).__name__,
-                    e,
-                )
-        else:
+        try:
+            await training_engine.delete_session(session)
+            deleted = True
+        except Exception as e:
             logger.warning(
-                "[%s] skipping actor shutdown during stale training cleanup (%s); "
-                "restored=%s allow_actor_shutdown=%s",
+                "[%s] best-effort stale training cleanup delete failed (%s): %s: %s",
                 model_id,
                 reason,
-                restored,
-                allow_actor_shutdown,
+                type(e).__name__,
+                e,
             )
-            worker = getattr(training_engine, "_workers", {}).get(model_id)
-            delete_session = getattr(worker, "delete_session", None) if worker is not None else None
-            deleted_dense_state = False
-            if delete_session is not None:
-                try:
-                    import ray
-
-                    await asyncio.to_thread(ray.get, delete_session.remote(model_id), timeout=30)
-                    deleted_dense_state = True
-                except Exception as e:
-                    logger.warning(
-                        "[%s] best-effort stale training cleanup remote delete failed (%s): %s: %s",
-                        model_id,
-                        reason,
-                        type(e).__name__,
-                        e,
-                    )
-            if not deleted_dense_state:
-                try:
-                    from ..backend.dense_session_state import delete_dense_session_state
-
-                    delete_dense_session_state(model_id)
-                except Exception as e:
-                    logger.warning(
-                        "[%s] best-effort stale training cleanup storage delete failed (%s): %s: %s",
-                        model_id,
-                        reason,
-                        type(e).__name__,
-                        e,
-                    )
-            getattr(training_engine, "_resource_pool_actor_names", {}).pop(model_id, None)
-            getattr(training_engine, "_workers", {}).pop(model_id, None)
-            session.is_active = False
+    if not deleted:
+        return False
 
     try:
         training_manager.delete_session(model_id)
@@ -444,7 +400,7 @@ async def _best_effort_delete_training_session(
     except Exception:
         pass
 
-    return session is not None or shutdown_attempted
+    return deleted
 
 
 async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = None) -> list[str]:
@@ -491,22 +447,19 @@ async def cleanup_stale_training_sessions_once(*, stale_after_s: float | None = 
         if not session_heartbeat_store.is_stale(session_id, float(stale_after_s)):
             continue
         try:
-            allow_actor_shutdown = bool(actor_name) and actor_refcounts.get(actor_name, 0) <= 1
             deleted = await _best_effort_delete_training_session(
                 model_id,
                 reason=f"stale heartbeat (> {float(stale_after_s):.1f}s)",
-                allow_actor_shutdown=allow_actor_shutdown,
             )
             if not deleted:
                 continue
             cleaned.append(model_id)
             logger.warning(
                 "[%s] auto-terminated stale training session: session_id=%s stale_after_s=%.1f "
-                "allow_actor_shutdown=%s actor_name=%s actor_refcount=%s",
+                "actor_name=%s actor_refcount=%s",
                 model_id,
                 session_id,
                 float(stale_after_s),
-                allow_actor_shutdown,
                 actor_name or "<unknown>",
                 actor_refcounts.get(actor_name, 0) if actor_name else 0,
             )
@@ -1005,7 +958,7 @@ async def _do_create_model(
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.shutdown_session(existing)
+            await training_engine.delete_session(existing)
             training_manager.delete_session(model_id)
 
         # Create session metadata first
@@ -1374,7 +1327,7 @@ async def _do_create_model_from_state(
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.shutdown_session(existing)
+            await training_engine.delete_session(existing)
             training_manager.delete_session(model_id)
 
         # Create session metadata
@@ -1485,7 +1438,7 @@ async def _do_create_model_from_state(
             try:
                 session = training_manager.get_session(model_id)
                 if session:
-                    await training_engine.shutdown_session(session)
+                    await training_engine.delete_session(session)
             except Exception:
                 pass  # Ignore cleanup errors
             training_manager.delete_session(model_id)
@@ -2756,7 +2709,7 @@ async def _do_save_weights_for_sampler(
                 "owner_id": user_id,
                 "model_id": session.model_id,
                 "model_name": session.base_model,
-                "created_at": datetime.utcnow().isoformat() + "Z",
+                "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "step": session.current_step,
                 "checkpoint_type": "sampler",
                 "optimizer_present": False,
@@ -3217,7 +3170,7 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
 
         session = training_manager.get_session(model_id)
         if session is not None:
-            await training_engine.shutdown_session(session)
+            await training_engine.delete_session(session)
             training_manager.delete_session(model_id)
 
         try:
