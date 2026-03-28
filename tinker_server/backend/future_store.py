@@ -104,21 +104,40 @@ def _sync_training_session_step(meta: dict[str, Any] | None, result: Any) -> Any
         return result
 
     try:
-        from .training_session_store import (
-            bump_training_session_step_best_effort,
-            set_training_session_step_best_effort,
-        )
+        from . import training_session_store
 
         step = _extract_training_step(result)
+        persisted_step: int | None = None
         if step is None:
-            bump_training_session_step_best_effort(str(model_id))
-            return result
+            bump_step = getattr(training_session_store, "bump_training_session_step", None)
+            if callable(bump_step):
+                try:
+                    persisted_step = int(bump_step(str(model_id)))
+                except Exception:
+                    persisted_step = None
+            if persisted_step is None:
+                bump_best_effort = getattr(training_session_store, "bump_training_session_step_best_effort", None)
+                if callable(bump_best_effort):
+                    bump_best_effort(str(model_id))
+        else:
+            set_step = getattr(training_session_store, "set_training_session_step", None)
+            if callable(set_step):
+                try:
+                    persisted_step = int(set_step(str(model_id), int(step)))
+                except Exception:
+                    persisted_step = None
+            if persisted_step is None:
+                set_best_effort = getattr(training_session_store, "set_training_session_step_best_effort", None)
+                if callable(set_best_effort):
+                    set_best_effort(str(model_id), int(step))
+            if persisted_step is None:
+                persisted_step = int(step)
 
-        set_training_session_step_best_effort(str(model_id), int(step))
         if isinstance(result, dict):
             metrics = result.get("metrics")
             if isinstance(metrics, dict):
-                metrics["step"] = int(step)
+                if persisted_step is not None:
+                    metrics["step"] = int(persisted_step)
         return result
     except Exception:
         return result
@@ -675,9 +694,14 @@ def _get_or_create_ray_actor():
     )
 
     try:
-        return _RayFutureStoreActor.options(
+        created = _RayFutureStoreActor.options(
             **options
         ).remote(ttl_s, queue_ttl_s, done_ttl_s, tombstone_ttl_s)
+        try:
+            ray.get(created.stats.remote())
+            return created
+        except Exception:
+            return ray.get_actor(actor_name, namespace=namespace)
     except Exception:
         # Race: another process may have created the actor between get_actor and create.
         return ray.get_actor(actor_name, namespace=namespace)

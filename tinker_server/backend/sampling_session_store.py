@@ -78,11 +78,21 @@ def _get_or_create_actor():
 
         def upsert(self, session_id: str, info: dict[str, Any]) -> None:
             current = dict(self._sessions.get(session_id, {}))
-            current.update(info)
+            incoming = dict(info)
+            incoming_version = max(1, int(incoming.get("metadata_version") or 1))
+            current_version = max(1, int(current.get("metadata_version") or 1))
+            if incoming_version < current_version:
+                # Ignore stale metadata writes but keep monotonic last_activity.
+                incoming_last_activity = float(incoming.get("last_activity", 0.0) or 0.0)
+                current["last_activity"] = max(float(current.get("last_activity", 0.0) or 0.0), incoming_last_activity)
+                self._sessions[session_id] = current
+                return
+            current.update(incoming)
             current.setdefault("session_id", session_id)
             current.setdefault("last_activity", time.time())
             current.setdefault("lora_loaded", False)
             current.setdefault("uses_base_model", False)
+            current["metadata_version"] = incoming_version
             self._sessions[session_id] = current
 
         def get(self, session_id: str) -> dict[str, Any] | None:
@@ -120,7 +130,12 @@ def _get_or_create_actor():
     )
 
     try:
-        _ACTOR_HANDLE = _SamplingSessionStoreActor.options(**options).remote()
+        created = _SamplingSessionStoreActor.options(**options).remote()
+        try:
+            ray.get(created.list.remote())
+            _ACTOR_HANDLE = created
+        except Exception:
+            _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
         return _ACTOR_HANDLE
     except Exception:
         _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
@@ -190,6 +205,7 @@ def upsert_sampling_session(info: dict[str, Any]) -> None:
         logger.warning("Sampling session store write skipped: missing session_id")
         return
     payload.setdefault("last_activity", time.time())
+    payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
     try:
         actor = _get_or_create_actor()
         actor.upsert.remote(session_id, payload)

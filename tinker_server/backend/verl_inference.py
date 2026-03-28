@@ -5,6 +5,7 @@ Uses verl's Ray-based vLLM infrastructure for scalable inference.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -1060,6 +1061,16 @@ def _create_extended_server_class(
                 lora_int_id=lora_int_id,
                 lora_path=lora_path,
             )
+
+            deadline = time.time() + float(os.environ.get("MINT_VLLM_ENGINE_READY_WAIT_S", "30"))
+            engine_ready = False
+            while time.time() < deadline:
+                if await self.is_engine_ready():
+                    engine_ready = True
+                    break
+                await asyncio.sleep(0.1)
+            if not engine_ready:
+                raise RuntimeError("vLLM engine not ready before add_lora_from_path")
 
             await self._maybe_ensure_pack_moe_patched_for_adapter_dir(lora_path)
             await self.engine.add_lora(lora_request)

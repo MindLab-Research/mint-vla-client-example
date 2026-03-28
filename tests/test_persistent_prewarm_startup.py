@@ -78,6 +78,11 @@ class _StubFutureStore:
         return None
 
 
+class _StubCapacityManager:
+    def ensure_ready(self) -> None:
+        return None
+
+
 class _StubSessionManager:
     def __init__(self, **_kwargs):
         self.multi_model_manager = None
@@ -115,6 +120,9 @@ class _StubApiWorkQueue:
     def __init__(self):
         self.started_workers = 0
 
+    def ensure_ready(self) -> None:
+        return None
+
     def set_executor(self, _op: str, _executor) -> None:
         return None
 
@@ -129,6 +137,25 @@ async def _noop_async(*_args, **_kwargs) -> None:
     return None
 
 
+class _StubStartupLease:
+    def __init__(self, *, is_owner: bool, local_only: bool = False):
+        self.role = "test-startup-owner"
+        self.owner_id = "owner-1"
+        self.ttl_s = 60.0
+        self.is_owner = bool(is_owner)
+        self.local_only = bool(local_only)
+        self.released = False
+        self.heartbeat_started = False
+
+    async def heartbeat_loop(self) -> None:
+        self.heartbeat_started = True
+        await asyncio.Future()
+
+    async def release(self) -> bool:
+        self.released = True
+        return True
+
+
 def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
     monkeypatch.setattr(app_module, "_cleanup_stale_actors", _noop_async)
     monkeypatch.setattr(app_module, "_restore_sampling_sessions", _noop_async)
@@ -138,6 +165,7 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
 
     api_work_queue_module = importlib.import_module("tinker_server.backend.api_work_queue")
     future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
     gateway_session_store_module = importlib.import_module("tinker_server.backend.gateway_session_store")
     sampling_session_store_module = importlib.import_module("tinker_server.backend.sampling_session_store")
     session_index_store_module = importlib.import_module("tinker_server.backend.session_index_store")
@@ -152,6 +180,7 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
     monkeypatch.setitem(sys.modules, "tinker_server.backend.verl_training", verl_training_module)
 
     monkeypatch.setattr(api_work_queue_module, "api_work_queue", queue)
+    monkeypatch.setattr(capacity_manager_module, "capacity_manager", _StubCapacityManager())
     monkeypatch.setattr(future_store_module, "future_store", _StubFutureStore())
     monkeypatch.setattr(gateway_session_store_module, "ensure_ready", lambda: None)
     monkeypatch.setattr(sampling_session_store_module, "ensure_ready", lambda: None)
@@ -173,11 +202,19 @@ def _install_lifespan_stubs(monkeypatch, queue: _StubApiWorkQueue) -> None:
 def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
     queue = _StubApiWorkQueue()
     _install_lifespan_stubs(monkeypatch, queue)
+    lease = _StubStartupLease(is_owner=True)
 
     async def _fail_prewarm(*_args, **_kwargs) -> None:
         raise RuntimeError("prewarm failed: pinned worker full")
 
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
     monkeypatch.setattr(app_module, "_prewarm_persistent_models", _fail_prewarm)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
 
     async def _run() -> None:
         with pytest.raises(RuntimeError, match="prewarm failed: pinned worker full"):
@@ -186,6 +223,42 @@ def test_lifespan_waits_for_prewarm_and_fails_startup(monkeypatch) -> None:
 
     asyncio.run(_run())
     assert queue.started_workers == 0
+    assert lease.released is True
+
+
+def test_lifespan_follower_skips_leader_only_startup(monkeypatch) -> None:
+    queue = _StubApiWorkQueue()
+    _install_lifespan_stubs(monkeypatch, queue)
+
+    calls: list[str] = []
+    lease = _StubStartupLease(is_owner=False)
+
+    async def _count_cleanup(*_args, **_kwargs) -> None:
+        calls.append("cleanup")
+
+    async def _count_prewarm(*_args, **_kwargs) -> None:
+        calls.append("prewarm")
+
+    async def _acquire_startup_lease(*_args, **_kwargs):
+        return lease
+
+    monkeypatch.setattr(app_module, "_cleanup_stale_actors", _count_cleanup)
+    monkeypatch.setattr(app_module, "_prewarm_persistent_models", _count_prewarm)
+    monkeypatch.setattr(
+        "tinker_server.backend.startup_lease.acquire_startup_lease",
+        _acquire_startup_lease,
+    )
+
+    async def _run() -> None:
+        async with app_module.lifespan(app_module.app):
+            return None
+
+    asyncio.run(_run())
+
+    assert calls == []
+    assert queue.started_workers == 0
+    assert lease.heartbeat_started is False
+    assert lease.released is True
 
 
 @pytest.mark.anyio

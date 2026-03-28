@@ -58,6 +58,16 @@ def _install_namespace_module(monkeypatch, module_name: str, namespace: str):
     return module
 
 
+def _install_resource_pool_module(monkeypatch, *, pool, actor_types=None, stale_error=RuntimeError):
+    module_name = "tinker_server.backend.resource_pool"
+    module = types.ModuleType(module_name)
+    module.ActorType = actor_types or SimpleNamespace(VLLM="vllm", MEGATRON="megatron", DENSE="dense")
+    module.ResourcePoolStaleError = stale_error
+    module.get_resource_pool = lambda: pool
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return module
+
+
 class _GatewayResponse:
     def __init__(self, payload: dict, *, status_code: int = 200, text: str = ""):
         self._payload = dict(payload)
@@ -1274,11 +1284,12 @@ def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(mo
 
     _install_minimal_ray_module(monkeypatch)
     _install_namespace_module(monkeypatch, "tinker_server.backend.multi_lora_engine", "ns-vllm")
-    import tinker_server.backend.resource_pool as rp
-
-    monkeypatch.setattr(rp, "ActorType", SimpleNamespace(VLLM="vllm"))
-    monkeypatch.setattr(rp, "ResourcePoolStaleError", RuntimeError)
-    monkeypatch.setattr(rp, "get_resource_pool", lambda: pool)
+    _install_resource_pool_module(
+        monkeypatch,
+        pool=pool,
+        actor_types=SimpleNamespace(VLLM="vllm"),
+        stale_error=RuntimeError,
+    )
     monkeypatch.setattr(service_route, "async_lookup_actor_handle", _async_lookup_actor_handle)
     monkeypatch.setattr(service_route, "async_kill_named_actor", _async_kill_named_actor)
     monkeypatch.setattr(service_route, "_remove_actor_pg", lambda actor_name: removed_pgs.append(actor_name))
@@ -1297,6 +1308,89 @@ def test_issue_360_kill_exact_vllm_actor_passes_resolved_handle_to_async_kill(mo
     ]
     assert unregister_calls == ["vllm-a"]
     assert removed_pgs == ["vllm-a"]
+
+
+def test_issue_364_kill_busy_vllm_actor_rejected(monkeypatch):
+    busy_entry = SimpleNamespace(
+        actor_name="tinker_vllm_qwen3-0.6b",
+        actor_type="vllm",
+        namespace="ns-vllm",
+        base_model="Qwen/Qwen3-0.6B",
+        current_session=None,
+        inflight_count=1,
+        creating=False,
+        protected=False,
+    )
+    pool = SimpleNamespace(iter_entries=lambda: [busy_entry])
+    kill_calls: list[str | None] = []
+
+    _install_minimal_ray_module(monkeypatch)
+
+    monkeypatch.setattr(service_route, "_require_admin", lambda _request: None)
+    _install_resource_pool_module(
+        monkeypatch,
+        pool=pool,
+        actor_types=SimpleNamespace(VLLM="vllm", MEGATRON="megatron", DENSE="dense"),
+    )
+    monkeypatch.setattr(
+        sys.modules.setdefault("tinker_server.backend.multi_lora_engine", types.ModuleType("tinker_server.backend.multi_lora_engine")),
+        "kill_persistent_vllm_actor",
+        lambda model_name=None: kill_calls.append(model_name) or True,
+        raising=False,
+    )
+
+    with pytest.raises(service_route.HTTPException, match="Refusing to kill busy actor"):
+        anyio.run(
+            service_route.kill_actors,
+            _request_stub("admin"),
+            service_route.KillActorsRequest(actor_type="vllm", model_name="Qwen/Qwen3-0.6B"),
+        )
+
+    assert kill_calls == []
+
+
+def test_issue_364_kill_busy_vllm_actor_force_override(monkeypatch):
+    busy_entry = SimpleNamespace(
+        actor_name="tinker_vllm_qwen3-0.6b",
+        actor_type="vllm",
+        namespace="ns-vllm",
+        base_model="Qwen/Qwen3-0.6B",
+        current_session=None,
+        inflight_count=2,
+        creating=False,
+        protected=False,
+    )
+    pool = SimpleNamespace(iter_entries=lambda: [busy_entry])
+    kill_calls: list[str | None] = []
+
+    _install_minimal_ray_module(monkeypatch)
+
+    monkeypatch.setattr(service_route, "_require_admin", lambda _request: None)
+    _install_resource_pool_module(
+        monkeypatch,
+        pool=pool,
+        actor_types=SimpleNamespace(VLLM="vllm", MEGATRON="megatron", DENSE="dense"),
+    )
+    monkeypatch.setattr(
+        sys.modules.setdefault("tinker_server.backend.multi_lora_engine", types.ModuleType("tinker_server.backend.multi_lora_engine")),
+        "kill_persistent_vllm_actor",
+        lambda model_name=None: kill_calls.append(model_name) or True,
+        raising=False,
+    )
+
+    result = anyio.run(
+        service_route.kill_actors,
+        _request_stub("admin"),
+        service_route.KillActorsRequest(
+            actor_type="vllm",
+            model_name="Qwen/Qwen3-0.6B",
+            force=True,
+            reason="test-force",
+        ),
+    )
+
+    assert result == {"killed": 1, "killed_by_type": {"vllm": 1, "megatron": 0, "dense": 0}}
+    assert kill_calls == ["Qwen/Qwen3-0.6B"]
 
 
 class _AwaitableObjectRef:

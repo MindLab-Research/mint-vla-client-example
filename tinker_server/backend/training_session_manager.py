@@ -47,6 +47,7 @@ class TrainingSession:
     last_activity: float = field(default_factory=time.time)
     inflight_ops: int = 0  # Prevent cleanup while requests are queued or running
     backend: str = "peft"  # "peft" for dense models, "megatron" for MoE
+    metadata_version: int = 1  # Monotonic metadata version for cache coherence
 
     # Per-session inference engine for isolated concurrent access
     # Lazily initialized on first save_weights_for_sampler call
@@ -70,6 +71,23 @@ class TrainingSession:
             "learning_rate": self.learning_rate,
             "backend": self.backend,
         }
+
+
+@dataclass(frozen=True)
+class TrainingSessionSnapshot:
+    """Request-scope immutable view of training metadata."""
+
+    model_id: str
+    session_id: str
+    model_seq_id: int
+    base_model: str
+    backend: str
+    current_step: int
+    lora_config: dict[str, Any] | None
+    rollout_correction_config: dict[str, Any] | None
+    user_metadata: dict[str, Any]
+    learning_rate: float
+    metadata_version: int
 
 
 class TrainingSessionManager:
@@ -100,6 +118,7 @@ class TrainingSessionManager:
         user_metadata: dict | None = None,
         user_id: str | None = None,
         learning_rate: float = 1e-4,
+        metadata_version: int | None = None,
     ) -> TrainingSession:
         """Create a new training session.
 
@@ -132,6 +151,7 @@ class TrainingSessionManager:
             rollout_correction_config=rollout_correction_config,
             user_metadata=user_metadata or {},
             learning_rate=learning_rate,
+            metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
         )
 
         self._sessions[model_id] = session
@@ -140,6 +160,110 @@ class TrainingSessionManager:
             f"(session={session_id}, seq={model_seq_id}, base={base_model})"
         )
 
+        return session
+
+    def get_training_session_snapshot(self, model_id: str) -> TrainingSessionSnapshot | None:
+        session = self._sessions.get(model_id)
+        if session is None:
+            return None
+        return TrainingSessionSnapshot(
+            model_id=session.model_id,
+            session_id=session.session_id,
+            model_seq_id=int(session.model_seq_id),
+            base_model=session.base_model,
+            backend=session.backend,
+            current_step=int(session.current_step),
+            lora_config=session.lora_config.model_dump() if session.lora_config else None,
+            rollout_correction_config=session.rollout_correction_config,
+            user_metadata=dict(session.user_metadata or {}),
+            learning_rate=float(session.learning_rate),
+            metadata_version=max(1, int(session.metadata_version)),
+        )
+
+    def get_session_metadata_version(self, model_id: str) -> int | None:
+        session = self._sessions.get(model_id)
+        if session is None:
+            return None
+        return max(1, int(session.metadata_version))
+
+    def restore_training_session_info(self, info: dict[str, Any]) -> TrainingSession | None:
+        model_id = str(info.get("model_id") or "")
+        session_id = str(info.get("session_id") or "")
+        base_model = str(info.get("base_model") or "")
+        if not model_id or not session_id or not base_model:
+            return None
+
+        incoming_version = max(1, int(info.get("metadata_version") or 1))
+        session = self._sessions.get(model_id)
+
+        lora_cfg = None
+        if info.get("lora_config"):
+            try:
+                from ..models.types import LoRAConfig
+
+                lora_cfg = LoRAConfig(**info["lora_config"])
+            except Exception:
+                lora_cfg = None
+
+        if session is None:
+            session = self.create_session(
+                model_id=model_id,
+                session_id=session_id,
+                model_seq_id=int(info.get("model_seq_id", 0)),
+                base_model=base_model,
+                lora_config=lora_cfg,
+                rollout_correction_config=info.get("rollout_correction_config"),
+                user_metadata=info.get("user_metadata") or {},
+                user_id=info.get("user_id"),
+                learning_rate=float(info.get("learning_rate", 1e-4)),
+                metadata_version=incoming_version,
+            )
+            session.backend = str(info.get("backend", session.backend))
+            try:
+                session.current_step = int(info.get("current_step", session.current_step))
+            except Exception:
+                pass
+        elif incoming_version <= max(1, int(session.metadata_version)):
+            # Allow monotonic activity/step updates without overwriting newer metadata.
+            try:
+                session.current_step = max(session.current_step, int(info.get("current_step", session.current_step)))
+            except Exception:
+                pass
+            try:
+                raw_last_activity = info.get("last_activity")
+                if raw_last_activity is not None:
+                    session.last_activity = max(session.last_activity, float(raw_last_activity))
+            except Exception:
+                pass
+            return session
+        else:
+            session.session_id = session_id
+            session.model_seq_id = int(info.get("model_seq_id", session.model_seq_id))
+            session.base_model = base_model
+            session.lora_config = lora_cfg
+            session.rollout_correction_config = info.get("rollout_correction_config")
+            session.user_metadata = info.get("user_metadata") or {}
+            session.user_id = info.get("user_id")
+            try:
+                session.learning_rate = float(info.get("learning_rate", session.learning_rate))
+            except Exception:
+                pass
+            session.backend = str(info.get("backend", session.backend))
+            try:
+                session.current_step = max(session.current_step, int(info.get("current_step", session.current_step)))
+            except Exception:
+                pass
+            session.metadata_version = incoming_version
+
+        try:
+            raw_last_activity = info.get("last_activity")
+            if raw_last_activity is not None:
+                session.last_activity = float(raw_last_activity)
+        except Exception:
+            pass
+        created_at = info.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            session.created_at = created_at
         return session
 
     def get_session(self, model_id: str) -> TrainingSession | None:
@@ -238,6 +362,22 @@ class TrainingSessionManager:
 
     async def _cleanup_inactive(self) -> None:
         """Cleanup training sessions inactive for longer than timeout."""
+        for model_id, session in list(self._sessions.items()):
+            try:
+                from .training_session_store import async_get_training_session_info
+
+                detached = await async_get_training_session_info(model_id)
+            except Exception:
+                detached = None
+            if isinstance(detached, dict):
+                try:
+                    session.last_activity = max(
+                        float(session.last_activity),
+                        float(detached.get("last_activity", session.last_activity)),
+                    )
+                except Exception:
+                    pass
+
         now = time.time()
         inactive = [
             model_id

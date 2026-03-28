@@ -853,6 +853,131 @@ class KillActorsRequest(BaseModel):
     actor_type: str  # "vllm" | "megatron" | "dense" | "all"
     model_name: str | None = None  # optional per-type model filter
     actor_name: str | None = None  # optional exact actor target
+    force: bool = False  # allow killing actors with in-flight work
+    reason: str | None = None  # optional operator-provided audit reason
+
+
+def _entry_actor_type_name(entry: object) -> str:
+    raw = getattr(entry, "actor_type", None)
+    value = getattr(raw, "value", raw)
+    return str(value or "").strip().lower()
+
+
+def _entry_matches_kill_request(
+    entry: object,
+    *,
+    actor_type: str,
+    model_name: str | None,
+    actor_name: str | None,
+) -> bool:
+    entry_name = str(getattr(entry, "actor_name", "") or "")
+    if actor_name is not None and entry_name != actor_name:
+        return False
+
+    entry_type = _entry_actor_type_name(entry)
+    if actor_type != "all" and entry_type != actor_type:
+        return False
+
+    if model_name is not None and str(getattr(entry, "base_model", "") or "") != model_name:
+        return False
+
+    return True
+
+
+def _collect_kill_target_entries(
+    *,
+    actor_type: str,
+    model_name: str | None,
+    actor_name: str | None,
+) -> list[object]:
+    from ..backend.resource_pool import get_resource_pool
+
+    pool = get_resource_pool()
+    return [
+        entry
+        for entry in pool.iter_entries()
+        if _entry_matches_kill_request(
+            entry,
+            actor_type=actor_type,
+            model_name=model_name,
+            actor_name=actor_name,
+        )
+    ]
+
+
+def _kill_target_snapshot(entries: list[object]) -> list[dict[str, object]]:
+    return [
+        {
+            "actor_name": str(getattr(entry, "actor_name", "") or ""),
+            "actor_type": _entry_actor_type_name(entry),
+            "base_model": str(getattr(entry, "base_model", "") or ""),
+            "current_session": getattr(entry, "current_session", None),
+            "inflight_count": int(getattr(entry, "inflight_count", 0) or 0),
+            "creating": bool(getattr(entry, "creating", False)),
+            "protected": bool(getattr(entry, "protected", False)),
+        }
+        for entry in entries
+    ]
+
+
+def _request_audit_fields(request: Request) -> dict[str, object]:
+    user_data = _get_user_data(request)
+    client = getattr(request, "client", None)
+    return {
+        "client_host": getattr(client, "host", None),
+        "x_forwarded_for": request.headers.get("x-forwarded-for"),
+        "user_agent": request.headers.get("user-agent"),
+        "origin": request.headers.get("origin"),
+        "referer": request.headers.get("referer"),
+        "user_id": user_data.get("user_id") if isinstance(user_data, dict) else None,
+        "is_admin": bool(is_admin_user_data(user_data)),
+    }
+
+
+def _log_kill_request(
+    request: Request,
+    body: KillActorsRequest,
+    *,
+    stage: str,
+    targets: list[dict[str, object]],
+    detail: str | None = None,
+    result: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "stage": stage,
+        "actor_type": body.actor_type,
+        "model_name": body.model_name,
+        "actor_name": body.actor_name,
+        "force": body.force,
+        "reason": body.reason,
+        "targets": targets,
+    }
+    payload.update(_request_audit_fields(request))
+    if detail is not None:
+        payload["detail"] = detail
+    if result is not None:
+        payload["result"] = result
+    logger.info("[actors.kill] %s", payload)
+
+
+def _raise_if_busy_kill_targets(
+    *,
+    request: Request,
+    body: KillActorsRequest,
+    targets: list[dict[str, object]],
+) -> None:
+    if body.force:
+        return
+    busy = [target for target in targets if int(target.get("inflight_count", 0) or 0) > 0]
+    if not busy:
+        return
+    actor_list = ", ".join(str(target.get("actor_name") or "<unknown>") for target in busy)
+    detail = (
+        f"Refusing to kill busy actor(s): {actor_list}. "
+        "Pass force=true to override."
+    )
+    _log_kill_request(request, body, stage="blocked_busy", targets=targets, detail=detail)
+    raise HTTPException(status_code=409, detail=detail)
 
 
 def _remove_actor_pg(actor_name: str) -> None:
@@ -1002,6 +1127,16 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
     model_name = body.model_name
     actor_name = body.actor_name.strip() if body.actor_name else None
 
+    targets = _kill_target_snapshot(
+        _collect_kill_target_entries(
+            actor_type=t,
+            model_name=model_name,
+            actor_name=actor_name,
+        )
+    )
+    _log_kill_request(request, body, stage="received", targets=targets)
+    _raise_if_busy_kill_targets(request=request, body=body, targets=targets)
+
     killed_by_type: dict[str, int] = {"vllm": 0, "megatron": 0, "dense": 0}
 
     if actor_name:
@@ -1020,10 +1155,12 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
             killed_by_type["dense"] = await _kill_exact_dense_actor(actor_name=actor_name)
         else:
             raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
-        return {
+        result = {
             "killed": int(sum(killed_by_type.values())),
             "killed_by_type": killed_by_type,
         }
+        _log_kill_request(request, body, stage="completed", targets=targets, result=result)
+        return result
 
     if t in ("vllm", "all"):
         from ..backend.multi_lora_engine import kill_persistent_vllm_actor
@@ -1051,7 +1188,9 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
     if t not in ("vllm", "megatron", "dense", "all"):
         raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
 
-    return {
+    result = {
         "killed": int(sum(killed_by_type.values())),
         "killed_by_type": killed_by_type,
     }
+    _log_kill_request(request, body, stage="completed", targets=targets, result=result)
+    return result

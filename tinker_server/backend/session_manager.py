@@ -43,7 +43,23 @@ class SessionInfo:
     adapter_path: str | None = None  # Optional (ephemeral) adapter directory to cleanup
     lora_loaded: bool = True  # For multi-LoRA sessions: whether LoRA is loaded into vLLM
     lora_int_id: int | None = None  # Persisted multi-LoRA id for restart recovery
+    metadata_version: int = 1  # Monotonic metadata version for worker-local cache coherence
     inflight_requests: int = 0  # Prevent cleanup while requests are running
+
+
+@dataclass(frozen=True)
+class SamplingSessionSnapshot:
+    """Request-scope immutable view of sampling metadata."""
+
+    session_id: str
+    uses_multi_lora: bool
+    uses_base_model: bool
+    base_model: str | None
+    lora_rank: int
+    adapter_path: str | None
+    lora_loaded: bool
+    lora_int_id: int | None
+    metadata_version: int
 
 
 class SessionManager:
@@ -93,6 +109,7 @@ class SessionManager:
                     "lora_int_id": info.lora_int_id,
                     "uses_base_model": bool(info.uses_base_model),
                     "last_activity": float(info.last_activity),
+                    "metadata_version": int(info.metadata_version),
                 }
             )
         except Exception as e:
@@ -118,6 +135,24 @@ class SessionManager:
 
     async def _cleanup_inactive(self) -> None:
         """Cleanup sessions inactive for longer than timeout."""
+        now = time.time()
+        for sid, info in list(self._sessions.items()):
+            if not info.uses_base_model and (not info.is_shared or info.uses_multi_lora):
+                try:
+                    from .sampling_session_store import async_get_sampling_session_info
+
+                    detached = await async_get_sampling_session_info(sid)
+                except Exception:
+                    detached = None
+                if isinstance(detached, dict):
+                    try:
+                        info.last_activity = max(
+                            float(info.last_activity),
+                            float(detached.get("last_activity", info.last_activity)),
+                        )
+                    except Exception:
+                        pass
+
         now = time.time()
         inactive = [
             sid
@@ -355,6 +390,45 @@ class SessionManager:
         self._touch_info(session_id, info)
         return info.engine
 
+    def get_sampling_session_snapshot(self, session_id: str) -> SamplingSessionSnapshot | None:
+        """Build a request-scope immutable snapshot for sampling session metadata."""
+        info = self._sessions.get(session_id)
+        if info is None:
+            return None
+        self._touch_info(session_id, info)
+        return SamplingSessionSnapshot(
+            session_id=session_id,
+            uses_multi_lora=bool(info.uses_multi_lora),
+            uses_base_model=bool(info.uses_base_model),
+            base_model=info.base_model,
+            lora_rank=int(info.lora_rank),
+            adapter_path=info.adapter_path,
+            lora_loaded=bool(info.lora_loaded),
+            lora_int_id=None if info.lora_int_id is None else int(info.lora_int_id),
+            metadata_version=max(1, int(info.metadata_version)),
+        )
+
+    def _cleanup_sampler_indices(self, sampler_id: str) -> None:
+        try:
+            from .session_index_store import (
+                delete_sampler_index,
+                get_sampler_index,
+                remove_sampler_from_session,
+            )
+
+            sampler_info = get_sampler_index(sampler_id)
+            parent_session_id = None
+            if isinstance(sampler_info, dict):
+                raw_session_id = sampler_info.get("session_id")
+                if isinstance(raw_session_id, str) and raw_session_id:
+                    parent_session_id = raw_session_id
+
+            delete_sampler_index(sampler_id)
+            if parent_session_id is not None:
+                remove_sampler_from_session(parent_session_id, sampler_id)
+        except Exception as e:
+            logger.debug("Failed to cleanup sampler index %s: %s", sampler_id, e)
+
     async def end_session(self, session_id: str) -> bool:
         """End a session and shutdown its engine.
 
@@ -378,6 +452,8 @@ class SessionManager:
             logger.debug("Failed to delete sampling session %s from store: %s", session_id, e)
 
         if info.uses_multi_lora:
+            self._cleanup_sampler_indices(session_id)
+
             # Best-effort: remove LoRA from vLLM and delete ephemeral adapter dir.
             manager = self.get_multi_model_manager()
             if manager is not None and info.base_model:
@@ -557,6 +633,7 @@ class SessionManager:
         lora_loaded: bool = True,
         lora_int_id: int | None = None,
         last_activity: float | None = None,
+        metadata_version: int | None = None,
         persist: bool = True,
     ) -> None:
         """Register a sampling session that uses the shared multi-LoRA engine.
@@ -586,6 +663,7 @@ class SessionManager:
             adapter_path=adapter_path,
             lora_loaded=bool(lora_loaded),
             lora_int_id=None if lora_int_id is None else int(lora_int_id),
+            metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
         )
         if persist:
             self._persist_sampling_session_info(session_id, self._sessions[session_id])
@@ -614,6 +692,13 @@ class SessionManager:
         self._touch_info(session_id, info)
         return None if info.lora_int_id is None else int(info.lora_int_id)
 
+    def get_session_metadata_version(self, session_id: str) -> int | None:
+        info = self._sessions.get(session_id)
+        if info is None:
+            return None
+        self._touch_info(session_id, info)
+        return max(1, int(info.metadata_version))
+
     def is_session_lora_loaded(self, session_id: str) -> bool:
         info = self._sessions.get(session_id)
         if info is None:
@@ -632,9 +717,14 @@ class SessionManager:
         if info is None:
             return
         self._touch_info(session_id, info)
-        info.lora_loaded = bool(loaded)
+        new_loaded = bool(loaded)
+        changed = bool(info.lora_loaded) != new_loaded
+        info.lora_loaded = new_loaded
         if lora_int_id is not None:
+            changed = changed or (info.lora_int_id != int(lora_int_id))
             info.lora_int_id = int(lora_int_id)
+        if changed:
+            info.metadata_version = max(1, int(info.metadata_version) + 1)
         self._persist_sampling_session_info(session_id, info)
 
     def mark_model_lora_sessions_unloaded(self, base_model: str) -> int:
@@ -687,7 +777,13 @@ class SessionManager:
         info = self._sessions.get(session_id)
         return info is not None and info.uses_base_model
 
-    def register_base_model_session(self, session_id: str, base_model: str) -> None:
+    def register_base_model_session(
+        self,
+        session_id: str,
+        base_model: str,
+        *,
+        metadata_version: int | None = None,
+    ) -> None:
         """Register a sampling session that uses base model on multi-LoRA engine.
 
         The session will use the shared multi-LoRA engine without any LoRA adapter.
@@ -711,6 +807,7 @@ class SessionManager:
             uses_base_model=True,
             base_model=base_model,
             lora_loaded=False,
+            metadata_version=max(1, int(metadata_version) if metadata_version is not None else 1),
         )
         self._persist_sampling_session_info(session_id, self._sessions[session_id])
         logger.info(f"Registered base model session {session_id} (model={base_model})")
@@ -721,7 +818,32 @@ class SessionManager:
         base_model = str(info.get("base_model") or "")
         if not session_id or not base_model:
             return False
-        if session_id in self._sessions:
+        incoming_version = max(1, int(info.get("metadata_version") or 1))
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            if incoming_version <= max(1, int(existing.metadata_version)):
+                try:
+                    existing.last_activity = max(
+                        float(existing.last_activity),
+                        float(info.get("last_activity", existing.last_activity)),
+                    )
+                except Exception:
+                    pass
+                return True
+            existing.uses_base_model = bool(info.get("uses_base_model"))
+            existing.base_model = base_model
+            existing.last_activity = float(info.get("last_activity", existing.last_activity))
+            if existing.uses_base_model:
+                existing.lora_rank = 0
+                existing.adapter_path = None
+                existing.lora_loaded = False
+                existing.lora_int_id = None
+            else:
+                existing.lora_rank = int(info.get("lora_rank") or 0)
+                existing.adapter_path = info.get("adapter_path")
+                existing.lora_loaded = bool(info.get("lora_loaded"))
+                existing.lora_int_id = info.get("lora_int_id")
+            existing.metadata_version = incoming_version
             return True
 
         uses_base_model = bool(info.get("uses_base_model"))
@@ -736,6 +858,7 @@ class SessionManager:
                 uses_base_model=True,
                 base_model=base_model,
                 lora_loaded=False,
+                metadata_version=incoming_version,
             )
             return True
 
@@ -747,6 +870,7 @@ class SessionManager:
             lora_loaded=bool(info.get("lora_loaded")),
             lora_int_id=info.get("lora_int_id"),
             last_activity=last_activity,
+            metadata_version=incoming_version,
             persist=False,
         )
         return True

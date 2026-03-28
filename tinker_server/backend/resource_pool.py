@@ -1,155 +1,107 @@
-"""Unified Resource Pool with LRU eviction across all actor types.
+"""Unified ResourcePool with detached control-plane state.
 
-All GPU-using actors (MoE training, dense training, vLLM inference) share
-a single resource pool. When GPUs are needed, the least recently used
-idle actors are evicted regardless of type.
+All GPU-using actors share one admission and eviction control plane. In
+multi-worker API deployments the authoritative state lives in a detached Ray
+actor so inventory, pending GPU reservations, LRU, inflight counts, protection
+flags, and session bindings stay consistent across workers.
+
+Process-local state is limited to actor-handle caching. When Ray is not
+initialized, the module falls back to an in-process state object so unit tests
+can still use the same API.
 """
 
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import ray
 
-from ..config import config as server_config
+from ..config import config as server_config, otel_env_vars
 from . import ray_kill
 
 logger = logging.getLogger(__name__)
+ActorHandle = Any
 
 
 class ResourcePoolStaleError(RuntimeError):
-    """ResourcePool inventory/state disagrees with Ray named-actor registry.
-
-    This indicates startup reconciliation (or an in-flight code change) failed to
-    register/unregister actors deterministically. Callers should surface this
-    rather than silently falling back to alternate registries.
-    """
+    """ResourcePool inventory/state disagrees with Ray named-actor registry."""
 
 
 class ActorType(Enum):
-    MEGATRON = "megatron"  # MoE training (8 GPUs)
-    DENSE = "dense"        # Dense training (1 GPU)
-    VLLM = "vllm"          # Inference (1-4 GPUs)
+    MEGATRON = "megatron"
+    DENSE = "dense"
+    VLLM = "vllm"
 
 
 @dataclass
 class ActorEntry:
-    """Entry in the unified resource pool."""
-
     actor_name: str
     actor_type: ActorType
     num_gpus: int
-    actor_handle: ray.actor.ActorHandle | None = None
+    actor_handle: ActorHandle | None = None
     namespace: str = "tinker"
-    # For training actors: model path; for vLLM: model path
     base_model: str = ""
-    # Session tracking (training actors only)
     current_session: str | None = None
-    # Node tracking for scheduling
     node_id: str | None = None
-    # LRU tracking
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
-    # Count of in-flight work on this actor. While >0, the actor is considered non-idle and
-    # must not be evicted, even if last_accessed is stale (some long-running Ray calls do not
-    # touch ResourcePool unless explicitly wrapped).
     inflight_count: int = 0
-    # Protection flag: actor being created/initialized is not evictable
-    # Set to False after initialization completes
     creating: bool = True
-    # If True, actor is never evicted by ResourcePool LRU.
     protected: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def touch(self):
-        """Update last_accessed timestamp."""
+    def touch(self) -> None:
         self.last_accessed = time.time()
 
-    def mark_ready(self):
-        """Mark actor as ready (no longer creating)."""
+    def mark_ready(self) -> None:
         self.creating = False
         self.touch()
 
     def is_idle(self, session_idle_timeout: float = 300) -> bool:
-        """Check if actor can be evicted.
-
-        An actor is idle if ALL of the following:
-        1. It's not currently being created/initialized
-        2. AND one of:
-           a. It has no current_session (training actors only)
-           b. It hasn't been accessed in session_idle_timeout seconds
-
-        Note: Tinker clients don't explicitly end sessions - they just stop
-        sending requests. We use time-based idle detection to handle this.
-        """
-        # Actors being created are NEVER idle
         if self.creating:
             return False
         if self.inflight_count > 0:
             return False
         if self.actor_type == ActorType.VLLM:
-            # vLLM uses same idle timeout as other actors to prevent eviction during active use
             return self.idle_time() > session_idle_timeout
         if self.current_session is None:
-            return True  # No session loaded
-        # Time-based idle detection for sessions
+            return True
         return self.idle_time() > session_idle_timeout
 
     def age(self) -> float:
-        """Seconds since actor was created."""
         return time.time() - self.created_at
 
     def idle_time(self) -> float:
-        """Seconds since last access."""
         return time.time() - self.last_accessed
 
 
-class ResourcePool:
-    """Unified pool managing all GPU-using actors with LRU eviction.
+class _ResourcePoolState:
+    """Authoritative ResourcePool state machine.
 
-    Thread-safe singleton that tracks:
-    - MegatronWorkerGroup actors (MoE training)
-    - TrainingWorker actors (dense training)
-    - vLLM inference actors
-
-    When GPUs are needed, evicts LRU idle actors regardless of type.
+    This object stores only serializable control-plane metadata. Actor handles
+    intentionally stay worker-local.
     """
 
-    _instance: "ResourcePool | None" = None
-    _lock = threading.Lock()
-
-    def __new__(cls):
-        """Singleton pattern."""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(self):
-        if self._initialized:
-            return
-        self._entries: dict[str, ActorEntry] = {}  # key: actor_name
-        self._pool_lock = threading.Lock()
-        # Pending GPU reservations - GPUs reserved but not yet allocated to actors
-        # This prevents race conditions where multiple concurrent requests
-        # both think they have enough GPUs available
-        self._pending_gpus: int = 0
-        self.MIN_ACTOR_AGE = int(server_config.resource_pool_min_actor_age_s)
-        self.SESSION_IDLE_TIMEOUT = int(server_config.resource_pool_session_idle_timeout_s)
-        logger.info(f"[ResourcePool] Initialized with MIN_ACTOR_AGE={self.MIN_ACTOR_AGE}, SESSION_IDLE_TIMEOUT={self.SESSION_IDLE_TIMEOUT}")
-        self._initialized = True
+    def __init__(self, *, min_actor_age: int, session_idle_timeout: int) -> None:
+        self.entries: dict[str, ActorEntry] = {}
+        self.pending_gpus: int = 0
+        self.min_actor_age = int(min_actor_age)
+        self.session_idle_timeout = int(session_idle_timeout)
 
     def register(
         self,
+        *,
         actor_name: str,
         actor_type: ActorType,
         num_gpus: int,
-        actor_handle: ray.actor.ActorHandle | None = None,
         namespace: str = "tinker",
         base_model: str = "",
         session_id: str | None = None,
@@ -157,183 +109,113 @@ class ResourcePool:
         protected: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> ActorEntry:
-        """Register an actor with the pool.
-
-        Args:
-            actor_name: Unique name of the Ray actor.
-            actor_type: Type of actor (MEGATRON, DENSE, VLLM).
-            num_gpus: Number of GPUs used by this actor.
-            actor_handle: Ray actor handle (optional, can be looked up later).
-            namespace: Ray namespace.
-            base_model: Model path being used.
-            session_id: Active session ID (for training actors).
-            node_id: Ray node ID where actor is running.
-
-        Returns:
-            The registered ActorEntry.
-        """
-        with self._pool_lock:
-            if actor_name in self._entries:
-                # Update existing entry
-                entry = self._entries[actor_name]
-                entry.touch()
-                if session_id:
-                    entry.current_session = session_id
-                if actor_handle:
-                    entry.actor_handle = actor_handle
-                if node_id:
-                    entry.node_id = node_id
-                if protected:
-                    entry.protected = True
-                if metadata:
-                    entry.metadata.update(dict(metadata))
-                logger.info(f"[ResourcePool] Updated existing entry: {actor_name}")
-            else:
-                entry = ActorEntry(
-                    actor_name=actor_name,
-                    actor_type=actor_type,
-                    num_gpus=num_gpus,
-                    actor_handle=actor_handle,
-                    namespace=namespace,
-                    base_model=base_model,
-                    current_session=session_id,
-                    node_id=node_id,
-                    protected=protected,
-                    metadata=dict(metadata) if metadata else {},
-                )
-                self._entries[actor_name] = entry
-                logger.info(
-                    f"[ResourcePool] Registered {actor_type.value} actor: {actor_name} "
-                    f"({num_gpus} GPUs, model={base_model}, node={node_id[:8] if node_id else 'unknown'})"
-                )
+        entry = self.entries.get(actor_name)
+        if entry is None:
+            entry = ActorEntry(
+                actor_name=actor_name,
+                actor_type=actor_type,
+                num_gpus=int(num_gpus),
+                namespace=namespace,
+                base_model=base_model,
+                current_session=session_id,
+                node_id=node_id,
+                protected=bool(protected),
+                metadata=dict(metadata or {}),
+            )
+            self.entries[actor_name] = entry
+            logger.info(
+                "[ResourcePool] Registered %s actor=%s num_gpus=%s base_model=%s node_id=%s",
+                actor_type.value,
+                actor_name,
+                num_gpus,
+                base_model,
+                node_id,
+            )
             return entry
+
+        entry.touch()
+        entry.actor_type = actor_type
+        entry.num_gpus = int(num_gpus)
+        entry.namespace = namespace
+        entry.base_model = base_model
+        if session_id is not None:
+            entry.current_session = session_id
+        if node_id is not None:
+            entry.node_id = node_id
+        if protected:
+            entry.protected = True
+        if metadata:
+            entry.metadata.update(dict(metadata))
+        return entry
 
     def unregister(self, actor_name: str) -> bool:
-        """Remove an actor from the pool.
+        removed = self.entries.pop(actor_name, None) is not None
+        if removed:
+            logger.info("[ResourcePool] Unregistered actor=%s", actor_name)
+        return removed
 
-        Returns:
-            True if actor was found and removed.
-        """
-        with self._pool_lock:
-            if actor_name in self._entries:
-                del self._entries[actor_name]
-                logger.info(f"[ResourcePool] Unregistered actor: {actor_name}")
-                return True
+    def get(self, actor_name: str, *, touch: bool) -> ActorEntry | None:
+        entry = self.entries.get(actor_name)
+        if entry is not None and touch:
+            entry.touch()
+        return entry
+
+    def set_session(self, actor_name: str, session_id: str | None) -> bool:
+        entry = self.entries.get(actor_name)
+        if entry is None:
             return False
-
-    def get(self, actor_name: str) -> ActorEntry | None:
-        """Get an actor entry and update its LRU timestamp."""
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            if entry:
-                entry.touch()
-            return entry
-
-    def set_session(self, actor_name: str, session_id: str | None):
-        """Update the active session for a training actor."""
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            if entry:
-                entry.current_session = session_id
+        entry.current_session = session_id
+        if session_id is not None:
+            entry.touch()
+        return True
 
     def set_protected(self, actor_name: str, protected: bool = True) -> bool:
-        """Set (or clear) eviction protection for an actor."""
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            if entry is None:
-                return False
-            entry.protected = protected
-            return True
+        entry = self.entries.get(actor_name)
+        if entry is None:
+            return False
+        entry.protected = bool(protected)
+        return True
 
     def is_protected(self, actor_name: str) -> bool:
-        """Return True if actor is marked protected in the pool."""
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            return bool(entry and entry.protected)
+        entry = self.entries.get(actor_name)
+        return bool(entry and entry.protected)
 
     def touch(self, actor_name: str) -> bool:
-        """Update last_accessed timestamp to mark actor as recently used.
-
-        Called during training operations to prevent eviction of active actors.
-        Without this, actors are evicted based on creation time rather than
-        actual usage, causing unexpected termination of active training.
-
-        Returns:
-            True if actor was found and touched.
-        """
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            if entry:
-                entry.touch()
-                return True
+        entry = self.entries.get(actor_name)
+        if entry is None:
             return False
+        entry.touch()
+        return True
 
-    def mark_inflight(self, actor_name: str, delta: int) -> None:
-        if delta == 0:
-            return
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            if entry is None:
-                return
-            entry.inflight_count = max(0, int(entry.inflight_count) + int(delta))
-            if delta > 0:
-                entry.touch()
+    def mark_inflight(self, actor_name: str, delta: int) -> bool:
+        entry = self.entries.get(actor_name)
+        if entry is None:
+            return False
+        if int(delta) == 0:
+            return True
+        entry.inflight_count = max(0, int(entry.inflight_count) + int(delta))
+        if int(delta) > 0:
+            entry.touch()
+        return True
 
-    def mark_ready(self, actor_name: str):
-        """Mark an actor as ready (no longer creating).
-
-        Call this after actor initialization completes to allow LRU eviction.
-        """
-        with self._pool_lock:
-            entry = self._entries.get(actor_name)
-            if entry:
-                entry.mark_ready()
-                logger.info(f"[ResourcePool] Actor {actor_name} marked ready")
+    def mark_ready(self, actor_name: str) -> bool:
+        entry = self.entries.get(actor_name)
+        if entry is None:
+            return False
+        entry.mark_ready()
+        return True
 
     def reserve_gpus(self, num_gpus: int) -> bool:
-        """Reserve GPUs before actor creation.
+        self.pending_gpus += max(0, int(num_gpus))
+        return True
 
-        This prevents race conditions where multiple concurrent requests
-        both pass availability checks before either creates an actor.
+    def release_pending_gpus(self, num_gpus: int) -> int:
+        self.pending_gpus = max(0, self.pending_gpus - max(0, int(num_gpus)))
+        return self.pending_gpus
 
-        Args:
-            num_gpus: Number of GPUs to reserve.
-
-        Returns:
-            True if reservation was made (caller should release after actor creation).
-        """
-        with self._pool_lock:
-            self._pending_gpus += num_gpus
-            logger.info(f"[ResourcePool] Reserved {num_gpus} GPUs (pending total: {self._pending_gpus})")
-            return True
-
-    def release_pending_gpus(self, num_gpus: int):
-        """Release pending GPU reservation.
-
-        Call this after actor creation completes (success or failure).
-        On success, the GPUs are now tracked by the registered actor.
-        On failure, the reservation is simply released.
-
-        Args:
-            num_gpus: Number of GPUs to release from pending.
-        """
-        with self._pool_lock:
-            self._pending_gpus = max(0, self._pending_gpus - num_gpus)
-            logger.info(f"[ResourcePool] Released {num_gpus} pending GPUs (pending total: {self._pending_gpus})")
-
-    def get_effective_available_gpus(self) -> int:
-        """Get available GPUs minus pending reservations.
-
-        This is the correct number to check when deciding if there are
-        enough GPUs for a new actor.
-
-        Returns:
-            Number of GPUs available for allocation.
-        """
-        ray_available = int(ray.available_resources().get("GPU", 0))
-        with self._pool_lock:
-            effective = ray_available - self._pending_gpus
-        return max(0, effective)
+    def get_effective_available_gpus(self, *, ray_available: int | None = None) -> int:
+        available = int(ray_available) if ray_available is not None else int(ray.available_resources().get("GPU", 0))
+        return max(0, available - int(self.pending_gpus))
 
     def _get_evictable_actors_lru(
         self,
@@ -341,54 +223,33 @@ class ResourcePool:
         allow_evict_protected: bool,
         exclude_actor_types: tuple[ActorType, ...] = (),
     ) -> list[ActorEntry]:
-        """Get evictable actors sorted by last access time (LRU first).
-
-        Must be called with lock held.
-
-        An actor is evictable if:
-        1. It is idle (no active session OR session inactive > SESSION_IDLE_TIMEOUT)
-        2. It has been idle longer than MIN_ACTOR_AGE
-
-        Note: We use idle_time() (time since last access) rather than age()
-        (time since creation) to protect recently-active actors from eviction.
-        """
         evictable = [
-            e for e in self._entries.values()
-            if (
-                e.actor_type not in exclude_actor_types
-                and
-                (allow_evict_protected or not e.protected)
-                and e.is_idle(self.SESSION_IDLE_TIMEOUT)
-                and e.idle_time() > self.MIN_ACTOR_AGE
-            )
+            entry
+            for entry in self.entries.values()
+            if entry.actor_type not in exclude_actor_types
+            if allow_evict_protected or not entry.protected
+            if entry.is_idle(self.session_idle_timeout)
+            if entry.idle_time() > self.min_actor_age
         ]
-        # Prefer evicting unprotected actors first, even if a protected actor is older.
-        return sorted(evictable, key=lambda e: (e.protected, e.last_accessed))
+        return sorted(evictable, key=lambda entry: (entry.protected, entry.last_accessed))
 
     def _kill_actor(self, entry: ActorEntry) -> bool:
-        """Kill a Ray actor.
-
-        Returns:
-            True if actor was killed successfully.
-        """
         try:
-            # Get actor handle if we don't have it
-            actor = entry.actor_handle
-            if actor is None:
-                try:
-                    actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
-                except ValueError:
-                    logger.warning(f"[ResourcePool] Actor not found: {entry.actor_name}")
-                    return False
+            actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
+        except ValueError:
+            logger.warning("[ResourcePool] Actor not found during eviction: %s", entry.actor_name)
+            return False
+        except Exception as e:
+            logger.warning("[ResourcePool] Actor lookup failed during eviction actor=%s err=%s", entry.actor_name, e)
+            return False
 
-            # Try graceful shutdown first
+        try:
             try:
-                if hasattr(actor, 'shutdown'):
+                if hasattr(actor, "shutdown"):
                     ray.get(actor.shutdown.remote(), timeout=10)
             except Exception:
                 pass
 
-            # Force kill
             ray_kill.kill(
                 actor,
                 reason="resource_pool_evict",
@@ -401,14 +262,13 @@ class ResourcePool:
                 creating=entry.creating,
                 idle_time=f"{entry.idle_time():.1f}",
                 age=f"{entry.age():.1f}",
-                min_actor_age=self.MIN_ACTOR_AGE,
-                session_idle_timeout=self.SESSION_IDLE_TIMEOUT,
+                min_actor_age=self.min_actor_age,
+                session_idle_timeout=self.session_idle_timeout,
             )
-            logger.info(f"[ResourcePool] Killed actor: {entry.actor_name}")
+            logger.info("[ResourcePool] Evicted actor=%s", entry.actor_name)
             return True
-
         except Exception as e:
-            logger.warning(f"[ResourcePool] Error killing actor {entry.actor_name}: {e}")
+            logger.warning("[ResourcePool] Error killing actor %s: %s", entry.actor_name, e)
             return False
 
     def evict_for_gpus(
@@ -418,36 +278,555 @@ class ResourcePool:
         allow_evict_protected: bool,
         exclude_actor_types: tuple[ActorType, ...] = (),
     ) -> int:
-        """Evict LRU idle actors to free GPUs.
-
-        Args:
-            needed_gpus: Number of GPUs to free.
-
-        Returns:
-            Number of GPUs freed.
-        """
         freed_gpus = 0
+        victims = self._get_evictable_actors_lru(
+            allow_evict_protected=allow_evict_protected,
+            exclude_actor_types=exclude_actor_types,
+        )
+        for entry in victims:
+            if freed_gpus >= int(needed_gpus):
+                break
+            if self._kill_actor(entry):
+                freed_gpus += int(entry.num_gpus)
+                self.entries.pop(entry.actor_name, None)
+        return freed_gpus
 
-        with self._pool_lock:
+    def ensure_gpus_available(
+        self,
+        needed_gpus: int,
+        timeout: float = 600.0,
+        *,
+        allow_evict_protected: bool = False,
+        exclude_actor_types: tuple[ActorType, ...] = (),
+    ) -> bool:
+        import time as time_module
+
+        start_time = time_module.time()
+        poll_interval = 5.0
+        iteration = 0
+
+        while True:
+            iteration += 1
+            available = self.get_effective_available_gpus()
+            if available >= int(needed_gpus):
+                return True
+
+            need_to_free = int(needed_gpus) - int(available)
             evictable = self._get_evictable_actors_lru(
                 allow_evict_protected=allow_evict_protected,
                 exclude_actor_types=exclude_actor_types,
             )
+            logger.info(
+                "[ResourcePool] ensure_gpus_available iter=%s need=%s available=%s pending=%s "
+                "need_to_free=%s evictable=%s allow_evict_protected=%s exclude_actor_types=%s",
+                iteration,
+                needed_gpus,
+                available,
+                self.pending_gpus,
+                need_to_free,
+                len(evictable),
+                allow_evict_protected,
+                [actor_type.value for actor_type in exclude_actor_types],
+            )
 
-            for entry in evictable:
-                if freed_gpus >= needed_gpus:
-                    break
+            freed = self.evict_for_gpus(
+                need_to_free,
+                allow_evict_protected=allow_evict_protected,
+                exclude_actor_types=exclude_actor_types,
+            )
+            if freed > 0:
+                time_module.sleep(2.0)
+                if self.get_effective_available_gpus() >= int(needed_gpus):
+                    return True
 
-                logger.info(
-                    f"[ResourcePool] Evicting {entry.actor_type.value} actor: {entry.actor_name} "
-                    f"(idle {entry.idle_time():.1f}s, frees {entry.num_gpus} GPUs)"
+            elapsed = time_module.time() - start_time
+            if elapsed >= float(timeout):
+                raise ValueError(
+                    f"Insufficient GPUs: need {needed_gpus}, available {self.get_effective_available_gpus()} "
+                    f"after eviction. Freed {freed} GPUs but resources did not become available within "
+                    f"{timeout}s timeout. Other actors may be in use. Check cluster status with 'ray status'."
                 )
+            time_module.sleep(min(poll_interval, float(timeout) - elapsed))
 
-                if self._kill_actor(entry):
-                    freed_gpus += entry.num_gpus
-                    del self._entries[entry.actor_name]
+    def iter_entries(self) -> list[ActorEntry]:
+        return list(self.entries.values())
 
-        return freed_gpus
+    def prune_stale(self) -> int:
+        stale: list[str] = []
+        for name, entry in self.entries.items():
+            try:
+                ray.get_actor(entry.actor_name, namespace=entry.namespace)
+            except ValueError:
+                stale.append(name)
+            except Exception as e:
+                logger.warning("[ResourcePool] Error checking actor %s: %s", name, e)
+        for name in stale:
+            self.entries.pop(name, None)
+        return len(stale)
+
+    def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
+        cleared = 0
+        for entry in self.entries.values():
+            if actor_type is not None and entry.actor_type != actor_type:
+                continue
+            if entry.current_session != session_id:
+                continue
+            entry.current_session = None
+            entry.touch()
+            cleared += 1
+        if cleared:
+            logger.info(
+                "[ResourcePool] Cleared current_session=%s actor_type=%s count=%s",
+                session_id,
+                actor_type.value if actor_type is not None else "any",
+                cleared,
+            )
+        return cleared
+
+    def total_gpus_used(self) -> int:
+        return sum(int(entry.num_gpus) for entry in self.entries.values())
+
+    def clear(self, *, kill_actors: bool = True) -> int:
+        count = len(self.entries)
+        if kill_actors:
+            for entry in list(self.entries.values()):
+                self._kill_actor(entry)
+        self.entries.clear()
+        self.pending_gpus = 0
+        return count
+
+
+def _entry_to_record(entry: ActorEntry) -> dict[str, Any]:
+    return {
+        "actor_name": entry.actor_name,
+        "actor_type": entry.actor_type.value,
+        "num_gpus": int(entry.num_gpus),
+        "namespace": entry.namespace,
+        "base_model": entry.base_model,
+        "current_session": entry.current_session,
+        "node_id": entry.node_id,
+        "created_at": float(entry.created_at),
+        "last_accessed": float(entry.last_accessed),
+        "inflight_count": int(entry.inflight_count),
+        "creating": bool(entry.creating),
+        "protected": bool(entry.protected),
+        "metadata": dict(entry.metadata or {}),
+    }
+
+
+def _record_to_entry(record: dict[str, Any], *, actor_handle: ActorHandle | None = None) -> ActorEntry:
+    return ActorEntry(
+        actor_name=str(record.get("actor_name") or ""),
+        actor_type=ActorType(str(record.get("actor_type") or ActorType.DENSE.value)),
+        num_gpus=int(record.get("num_gpus") or 0),
+        actor_handle=actor_handle,
+        namespace=str(record.get("namespace") or "tinker"),
+        base_model=str(record.get("base_model") or ""),
+        current_session=record.get("current_session"),
+        node_id=record.get("node_id"),
+        created_at=float(record.get("created_at") or time.time()),
+        last_accessed=float(record.get("last_accessed") or time.time()),
+        inflight_count=int(record.get("inflight_count") or 0),
+        creating=bool(record.get("creating", True)),
+        protected=bool(record.get("protected", False)),
+        metadata=dict(record.get("metadata") or {}),
+    )
+
+
+def _backend_for_entry(entry: ActorEntry) -> str:
+    if entry.actor_type == ActorType.DENSE:
+        return "peft"
+    if entry.actor_type == ActorType.MEGATRON:
+        return "megatron"
+    return "vllm"
+
+
+def _role_for_entry(entry: ActorEntry) -> str:
+    return "inference" if entry.actor_type == ActorType.VLLM else "trainer"
+
+
+def _exclude_actor_types(values: tuple[ActorType, ...]) -> list[str]:
+    return [value.value if isinstance(value, ActorType) else str(value) for value in values]
+
+
+def _restore_actor_types(values: list[str] | tuple[str, ...] | None) -> tuple[ActorType, ...]:
+    if not values:
+        return ()
+    return tuple(ActorType(str(value)) for value in values)
+
+
+def _ray_namespace() -> str:
+    env_ns = os.environ.get("TINKER_RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE")
+    if env_ns:
+        return env_ns
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return RAY_NAMESPACE
+    except Exception:
+        return "tinker"
+
+
+def _actor_name() -> str:
+    return os.environ.get("MINT_RESOURCE_POOL_ACTOR_NAME", "tinker_resource_pool")
+
+
+def _detached_enabled() -> bool:
+    if os.environ.get("MINT_RESOURCE_POOL_LOCAL_ONLY", "0") == "1":
+        return False
+    try:
+        return bool(ray.is_initialized())
+    except Exception:
+        return False
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    if hasattr(ref, "__await__"):
+        return await cast(Any, ref)
+
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, asyncio.Future):
+            return await fut
+        if isinstance(fut, concurrent.futures.Future):
+            return await asyncio.wrap_future(fut)
+        if hasattr(fut, "__await__"):
+            return await cast(Any, fut)
+
+    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
+
+
+_RESOURCE_POOL_ACTOR_HANDLE = None
+
+
+def _get_or_create_actor_sync() -> Any:
+    global _RESOURCE_POOL_ACTOR_HANDLE
+
+    if not _detached_enabled():
+        raise RuntimeError("Ray not initialized")
+
+    name = _actor_name()
+    namespace = _ray_namespace()
+    try:
+        _RESOURCE_POOL_ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _RESOURCE_POOL_ACTOR_HANDLE
+    except ValueError:
+        pass
+
+    min_actor_age = int(server_config.resource_pool_min_actor_age_s)
+    session_idle_timeout = int(server_config.resource_pool_session_idle_timeout_s)
+
+    @ray.remote(num_cpus=0)
+    class _ResourcePoolActor:
+        def __init__(self, *, min_actor_age: int, session_idle_timeout: int) -> None:
+            from ..logging_context import init_actor_observability
+
+            init_actor_observability()
+            self._state = _ResourcePoolState(
+                min_actor_age=min_actor_age,
+                session_idle_timeout=session_idle_timeout,
+            )
+
+        def register(self, info: dict[str, Any]) -> dict[str, Any]:
+            entry = self._state.register(
+                actor_name=str(info.get("actor_name") or ""),
+                actor_type=ActorType(str(info.get("actor_type") or ActorType.DENSE.value)),
+                num_gpus=int(info.get("num_gpus") or 0),
+                namespace=str(info.get("namespace") or "tinker"),
+                base_model=str(info.get("base_model") or ""),
+                session_id=info.get("session_id"),
+                node_id=info.get("node_id"),
+                protected=bool(info.get("protected", False)),
+                metadata=dict(info.get("metadata") or {}),
+            )
+            return _entry_to_record(entry)
+
+        def unregister(self, actor_name: str) -> bool:
+            return self._state.unregister(actor_name)
+
+        def get(self, actor_name: str, touch: bool = True) -> dict[str, Any] | None:
+            entry = self._state.get(actor_name, touch=bool(touch))
+            return None if entry is None else _entry_to_record(entry)
+
+        def set_session(self, actor_name: str, session_id: str | None) -> bool:
+            return self._state.set_session(actor_name, session_id)
+
+        def set_protected(self, actor_name: str, protected: bool = True) -> bool:
+            return self._state.set_protected(actor_name, protected)
+
+        def is_protected(self, actor_name: str) -> bool:
+            return self._state.is_protected(actor_name)
+
+        def touch(self, actor_name: str) -> bool:
+            return self._state.touch(actor_name)
+
+        def mark_inflight(self, actor_name: str, delta: int) -> bool:
+            return self._state.mark_inflight(actor_name, delta)
+
+        def mark_ready(self, actor_name: str) -> bool:
+            return self._state.mark_ready(actor_name)
+
+        def reserve_gpus(self, num_gpus: int) -> bool:
+            return self._state.reserve_gpus(num_gpus)
+
+        def release_pending_gpus(self, num_gpus: int) -> int:
+            return self._state.release_pending_gpus(num_gpus)
+
+        def get_effective_available_gpus(self) -> int:
+            return self._state.get_effective_available_gpus()
+
+        def ensure_gpus_available(
+            self,
+            needed_gpus: int,
+            timeout: float = 600.0,
+            allow_evict_protected: bool = False,
+            exclude_actor_types: list[str] | None = None,
+        ) -> bool:
+            return self._state.ensure_gpus_available(
+                needed_gpus,
+                timeout=timeout,
+                allow_evict_protected=allow_evict_protected,
+                exclude_actor_types=_restore_actor_types(exclude_actor_types),
+            )
+
+        def list_entries(self, prune_stale: bool = False) -> list[dict[str, Any]]:
+            if prune_stale:
+                try:
+                    self._state.prune_stale()
+                except Exception as e:
+                    logger.warning("[ResourcePool] prune_stale failed: %s", e)
+            return [_entry_to_record(entry) for entry in self._state.iter_entries()]
+
+        def clear_session(self, session_id: str, actor_type: str | None = None) -> int:
+            parsed_actor_type = None if actor_type is None else ActorType(str(actor_type))
+            return self._state.clear_session(session_id, actor_type=parsed_actor_type)
+
+        def total_gpus_used(self) -> int:
+            return self._state.total_gpus_used()
+
+        def clear(self, kill_actors: bool = True) -> int:
+            return self._state.clear(kill_actors=kill_actors)
+
+    options: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "lifetime": "detached",
+    }
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            options["resources"] = {"node:__internal_head__": 0.001}
+    except Exception:
+        pass
+
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=otel_env_vars(),
+    )
+
+    try:
+        _RESOURCE_POOL_ACTOR_HANDLE = _ResourcePoolActor.options(**options).remote(
+            min_actor_age=min_actor_age,
+            session_idle_timeout=session_idle_timeout,
+        )
+        return _RESOURCE_POOL_ACTOR_HANDLE
+    except Exception:
+        _RESOURCE_POOL_ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _RESOURCE_POOL_ACTOR_HANDLE
+
+
+def _call_actor_sync(method_name: str, *args, retry_on_actor_restart: bool = False, **kwargs) -> Any:
+    global _RESOURCE_POOL_ACTOR_HANDLE
+
+    actor = _get_or_create_actor_sync()
+    remote_method = getattr(actor, method_name)
+    try:
+        return ray.get(remote_method.remote(*args, **kwargs))
+    except Exception:
+        if not retry_on_actor_restart:
+            raise
+        _RESOURCE_POOL_ACTOR_HANDLE = None
+        actor = _get_or_create_actor_sync()
+        remote_method = getattr(actor, method_name)
+        return ray.get(remote_method.remote(*args, **kwargs))
+
+
+class ResourcePool:
+    """Unified pool managing all GPU-using actors with detached control plane."""
+
+    _instance: "ResourcePool | None" = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self) -> None:
+        if self._initialized:
+            return
+        min_actor_age = int(server_config.resource_pool_min_actor_age_s)
+        session_idle_timeout = int(server_config.resource_pool_session_idle_timeout_s)
+        self.MIN_ACTOR_AGE = min_actor_age
+        self.SESSION_IDLE_TIMEOUT = session_idle_timeout
+        self._local_state = _ResourcePoolState(
+            min_actor_age=min_actor_age,
+            session_idle_timeout=session_idle_timeout,
+        )
+        self._local_lock = threading.Lock()
+        self._handle_cache: dict[str, ActorHandle] = {}
+        self._initialized = True
+        logger.info(
+            "[ResourcePool] Initialized MIN_ACTOR_AGE=%s SESSION_IDLE_TIMEOUT=%s detached=%s",
+            self.MIN_ACTOR_AGE,
+            self.SESSION_IDLE_TIMEOUT,
+            _detached_enabled(),
+        )
+
+    def _use_detached(self) -> bool:
+        return _detached_enabled()
+
+    def _clear_cached_handle(self, actor_name: str) -> None:
+        with self._local_lock:
+            self._handle_cache.pop(actor_name, None)
+
+    def _remember_handle(self, actor_name: str, actor_handle: ActorHandle | None) -> None:
+        if actor_handle is None:
+            return
+        with self._local_lock:
+            self._handle_cache[actor_name] = actor_handle
+
+    def _lookup_handle(self, actor_name: str, namespace: str) -> ActorHandle | None:
+        with self._local_lock:
+            actor = self._handle_cache.get(actor_name)
+        if actor is not None:
+            return actor
+        if not self._use_detached():
+            return None
+        try:
+            actor = ray.get_actor(actor_name, namespace=namespace)
+        except Exception:
+            return None
+        self._remember_handle(actor_name, actor)
+        return actor
+
+    def _local(self, fn, *args, **kwargs):
+        with self._local_lock:
+            return fn(*args, **kwargs)
+
+    def register(
+        self,
+        actor_name: str,
+        actor_type: ActorType,
+        num_gpus: int,
+        actor_handle: ActorHandle | None = None,
+        namespace: str = "tinker",
+        base_model: str = "",
+        session_id: str | None = None,
+        node_id: str | None = None,
+        protected: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> ActorEntry:
+        self._remember_handle(actor_name, actor_handle)
+        if not self._use_detached():
+            return self._local(
+                self._local_state.register,
+                actor_name=actor_name,
+                actor_type=actor_type,
+                num_gpus=num_gpus,
+                namespace=namespace,
+                base_model=base_model,
+                session_id=session_id,
+                node_id=node_id,
+                protected=protected,
+                metadata=metadata,
+            )
+        record = _call_actor_sync(
+            "register",
+            {
+                "actor_name": actor_name,
+                "actor_type": actor_type.value,
+                "num_gpus": int(num_gpus),
+                "namespace": namespace,
+                "base_model": base_model,
+                "session_id": session_id,
+                "node_id": node_id,
+                "protected": bool(protected),
+                "metadata": dict(metadata or {}),
+            },
+        )
+        return _record_to_entry(record, actor_handle=self._lookup_handle(actor_name, namespace))
+
+    def unregister(self, actor_name: str) -> bool:
+        self._clear_cached_handle(actor_name)
+        if not self._use_detached():
+            return bool(self._local(self._local_state.unregister, actor_name))
+        return bool(_call_actor_sync("unregister", actor_name))
+
+    def get(self, actor_name: str) -> ActorEntry | None:
+        if not self._use_detached():
+            return self._local(self._local_state.get, actor_name, touch=True)
+        record = _call_actor_sync("get", actor_name, True, retry_on_actor_restart=True)
+        if not isinstance(record, dict):
+            return None
+        return _record_to_entry(
+            record,
+            actor_handle=self._lookup_handle(actor_name, str(record.get("namespace") or "tinker")),
+        )
+
+    def set_session(self, actor_name: str, session_id: str | None) -> None:
+        if not self._use_detached():
+            self._local(self._local_state.set_session, actor_name, session_id)
+            return
+        _call_actor_sync("set_session", actor_name, session_id)
+
+    def set_protected(self, actor_name: str, protected: bool = True) -> bool:
+        if not self._use_detached():
+            return bool(self._local(self._local_state.set_protected, actor_name, protected))
+        return bool(_call_actor_sync("set_protected", actor_name, protected))
+
+    def is_protected(self, actor_name: str) -> bool:
+        if not self._use_detached():
+            return bool(self._local(self._local_state.is_protected, actor_name))
+        return bool(_call_actor_sync("is_protected", actor_name, retry_on_actor_restart=True))
+
+    def touch(self, actor_name: str) -> bool:
+        if not self._use_detached():
+            return bool(self._local(self._local_state.touch, actor_name))
+        return bool(_call_actor_sync("touch", actor_name))
+
+    def mark_inflight(self, actor_name: str, delta: int) -> None:
+        if not self._use_detached():
+            self._local(self._local_state.mark_inflight, actor_name, delta)
+            return
+        _call_actor_sync("mark_inflight", actor_name, int(delta))
+
+    def mark_ready(self, actor_name: str) -> None:
+        if not self._use_detached():
+            self._local(self._local_state.mark_ready, actor_name)
+            return
+        _call_actor_sync("mark_ready", actor_name)
+
+    def reserve_gpus(self, num_gpus: int) -> bool:
+        if not self._use_detached():
+            return bool(self._local(self._local_state.reserve_gpus, num_gpus))
+        return bool(_call_actor_sync("reserve_gpus", int(num_gpus)))
+
+    def release_pending_gpus(self, num_gpus: int) -> None:
+        if not self._use_detached():
+            self._local(self._local_state.release_pending_gpus, num_gpus)
+            return
+        _call_actor_sync("release_pending_gpus", int(num_gpus))
+
+    def get_effective_available_gpus(self) -> int:
+        if not self._use_detached():
+            return int(self._local(self._local_state.get_effective_available_gpus))
+        return int(_call_actor_sync("get_effective_available_gpus", retry_on_actor_restart=True))
 
     def ensure_gpus_available(
         self,
@@ -457,295 +836,141 @@ class ResourcePool:
         allow_evict_protected: bool = False,
         exclude_actor_types: tuple[ActorType, ...] = (),
     ) -> bool:
-        """Ensure at least needed_gpus are available, evicting and waiting if necessary.
-
-        Uses get_effective_available_gpus() which accounts for pending reservations
-        from other concurrent requests that haven't yet created their actors.
-
-        Args:
-            needed_gpus: Number of GPUs needed.
-            timeout: Maximum time to wait for resources (seconds). Default 10 minutes.
-            allow_evict_protected: If True, allow eviction of *idle* protected actors as a last
-                resort. Unprotected actors are always evicted first.
-
-        Returns:
-            True if enough GPUs are available.
-
-        Raises:
-            ValueError: If unable to free enough GPUs within timeout.
-        """
-        import time as time_module
-
-        start_time = time_module.time()
-        poll_interval = 5  # seconds between checks
-        iteration = 0
-
-        logger.info(f"[ResourcePool] ensure_gpus_available: need {needed_gpus} GPUs, timeout={timeout}s")
-
-        while True:
-            iteration += 1
-            # Use effective available GPUs (accounts for pending reservations)
-            available = self.get_effective_available_gpus()
-
-            if available >= needed_gpus:
-                logger.info(f"[ResourcePool] Sufficient GPUs: {available} >= {needed_gpus}")
-                return True
-
-            need_to_free = needed_gpus - available
-
-            # Log actor states for debugging
-            evictable_list = self._get_evictable_actors_lru(
-                allow_evict_protected=allow_evict_protected,
-                exclude_actor_types=exclude_actor_types,
+        if not self._use_detached():
+            return bool(
+                self._local(
+                    self._local_state.ensure_gpus_available,
+                    int(needed_gpus),
+                    timeout=float(timeout),
+                    allow_evict_protected=allow_evict_protected,
+                    exclude_actor_types=exclude_actor_types,
+                )
             )
-            with self._pool_lock:
-                all_actors = [
-                    (
-                        e.actor_name,
-                        e.actor_type.value,
-                        e.protected,
-                        e.is_idle(self.SESSION_IDLE_TIMEOUT),
-                        e.idle_time(),
-                        e.creating,
-                        e.inflight_count,
-                    )
-                    for e in self._entries.values()
-                ]
-                pending = self._pending_gpus
-            logger.info(
-                f"[ResourcePool] Iteration {iteration}: need {needed_gpus} GPUs, available {available}, "
-                f"pending {pending}, need_to_free {need_to_free}, evictable={len(evictable_list)}, "
-                f"allow_evict_protected={allow_evict_protected}, "
-                f"exclude_actor_types={[t.value for t in exclude_actor_types]}, all_actors={all_actors}"
+        return bool(
+            _call_actor_sync(
+                "ensure_gpus_available",
+                int(needed_gpus),
+                float(timeout),
+                bool(allow_evict_protected),
+                _exclude_actor_types(exclude_actor_types),
             )
-
-            if evictable_list:
-                logger.info(
-                    f"[ResourcePool] Evicting {len(evictable_list)} actors: "
-                    f"{[(e.actor_name, e.num_gpus) for e in evictable_list]}"
-                )
-
-            freed = self.evict_for_gpus(
-                need_to_free,
-                allow_evict_protected=allow_evict_protected,
-                exclude_actor_types=exclude_actor_types,
-            )
-
-            if freed > 0:
-                # Wait for Ray to reclaim resources
-                time_module.sleep(2)
-                available = self.get_effective_available_gpus()
-
-                if available >= needed_gpus:
-                    logger.info(f"[ResourcePool] After eviction: {available} GPUs available")
-                    return True
-
-            # Check timeout
-            elapsed = time_module.time() - start_time
-            if elapsed >= timeout:
-                logger.error(
-                    f"[ResourcePool] TIMEOUT: need {needed_gpus} GPUs, available {available}, "
-                    f"elapsed {elapsed:.1f}s >= timeout {timeout}s"
-                )
-                raise ValueError(
-                    f"Insufficient GPUs: need {needed_gpus}, available {available} after eviction. "
-                    f"Freed {freed} GPUs but resources did not become available within {timeout}s timeout. "
-                    f"Other actors may be in use. Check cluster status with 'ray status'."
-                )
-
-            # Wait before retrying - resources may become available when other actors finish
-            remaining = timeout - elapsed
-            wait_time = min(poll_interval, remaining)
-            if iteration % 10 == 0:  # Log every 10 iterations (~50s)
-                logger.info(
-                    f"[ResourcePool] Waiting for resources... "
-                    f"(iteration={iteration}, available={available}, needed={needed_gpus}, "
-                    f"elapsed={elapsed:.1f}s, timeout={timeout}s)"
-                )
-            time_module.sleep(wait_time)
+        )
 
     def list_actors(self) -> list[dict]:
-        """List all tracked actors (validates liveness)."""
-        with self._pool_lock:
-            # Validate actors still exist in Ray, remove stale entries
-            # Only check if Ray is initialized
-            stale = []
-            if ray.is_initialized():
-                for name, e in self._entries.items():
-                    try:
-                        ray.get_actor(e.actor_name, namespace=e.namespace)
-                    except ValueError as ex:
-                        logger.warning(f"[ResourcePool] Actor {name} not found in Ray: {ex}")
-                        stale.append(name)
-                    except Exception as ex:
-                        logger.warning(f"[ResourcePool] Error checking actor {name}: {ex}")
-                for name in stale:
-                    logger.info(f"[ResourcePool] Removing stale actor: {name}")
-                    del self._entries[name]
-
-            def _backend(e: ActorEntry) -> str:
-                if e.actor_type == ActorType.DENSE:
-                    return "peft"
-                if e.actor_type == ActorType.MEGATRON:
-                    return "megatron"
-                return "vllm"
-
-            def _role(e: ActorEntry) -> str:
-                if e.actor_type == ActorType.VLLM:
-                    return "inference"
-                return "trainer"
-
-            return [
-                {
-                    "actor_name": e.actor_name,
-                    "actor_type": e.actor_type.value,
-                    "backend": _backend(e),
-                    "role": _role(e),
-                    "num_gpus": e.num_gpus,
-                    "base_model": e.base_model,
-                    "current_session": e.current_session,
-                    "node_id": e.node_id,
-                    "creating": e.creating,
-                    "protected": e.protected,
-                    "metadata": e.metadata,
-                    "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
-                    "idle_time": e.idle_time(),
-                    "age": e.age(),
-                }
-                for e in self._entries.values()
-            ]
+        entries = self.iter_entries(prune_stale=True)
+        return [
+            {
+                "actor_name": entry.actor_name,
+                "actor_type": entry.actor_type.value,
+                "backend": _backend_for_entry(entry),
+                "role": _role_for_entry(entry),
+                "num_gpus": entry.num_gpus,
+                "base_model": entry.base_model,
+                "current_session": entry.current_session,
+                "node_id": entry.node_id,
+                "creating": entry.creating,
+                "protected": entry.protected,
+                "metadata": dict(entry.metadata or {}),
+                "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
+                "idle_time": entry.idle_time(),
+                "age": entry.age(),
+            }
+            for entry in entries
+        ]
 
     def rss_snapshot(self, *, timeout_s: float = 10.0) -> list[dict]:
-        """Best-effort RSS snapshot for all tracked actors.
-
-        Requires each actor to implement a `get_rss_bytes()` method.
-        """
-        import ray
-
-        with self._pool_lock:
-            entries = list(self._entries.values())
-
         out: list[dict] = []
-        for e in entries:
+        for entry in self.iter_entries():
             rec = {
-                "actor_name": e.actor_name,
-                "actor_type": e.actor_type.value,
-                "num_gpus": e.num_gpus,
-                "base_model": e.base_model,
-                "current_session": e.current_session,
-                "node_id": e.node_id,
-                "idle": e.is_idle(self.SESSION_IDLE_TIMEOUT),
-                "idle_time": e.idle_time(),
-                "age": e.age(),
+                "actor_name": entry.actor_name,
+                "actor_type": entry.actor_type.value,
+                "num_gpus": entry.num_gpus,
+                "base_model": entry.base_model,
+                "current_session": entry.current_session,
+                "node_id": entry.node_id,
+                "idle": entry.is_idle(self.SESSION_IDLE_TIMEOUT),
+                "idle_time": entry.idle_time(),
+                "age": entry.age(),
             }
+            handle = entry.actor_handle or self._lookup_handle(entry.actor_name, entry.namespace)
+            if handle is None:
+                rec["error"] = "missing actor_handle"
+                out.append(rec)
+                continue
             try:
-                h = e.actor_handle
-                if h is None:
-                    raise RuntimeError("missing actor_handle")
-                rss = ray.get(h.get_rss_bytes.remote(), timeout=float(timeout_s))
-                rec["rss_bytes"] = int(rss)
+                rss = ray.get(handle.get_rss_bytes.remote(), timeout=float(timeout_s))
+                rec["rss_bytes"] = int(cast(Any, rss))
             except Exception as ex:
                 rec["error"] = f"{type(ex).__name__}: {ex}"
             out.append(rec)
-
         return out
 
-    def iter_entries(self) -> list[ActorEntry]:
-        """Return list of ActorEntry objects (for internal use).
+    def iter_entries(self, *, prune_stale: bool = False) -> list[ActorEntry]:
+        if not self._use_detached():
+            if prune_stale and ray.is_initialized():
+                self._local(self._local_state.prune_stale)
+            with self._local_lock:
+                return list(self._local_state.iter_entries())
 
-        Unlike list_actors() which returns dicts, this returns the actual
-        ActorEntry objects for operations that need the full object.
-        """
-        with self._pool_lock:
-            return list(self._entries.values())
+        records = _call_actor_sync("list_entries", bool(prune_stale), retry_on_actor_restart=True)
+        out: list[ActorEntry] = []
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            namespace = str(record.get("namespace") or "tinker")
+            out.append(
+                _record_to_entry(
+                    record,
+                    actor_handle=self._lookup_handle(str(record.get("actor_name") or ""), namespace),
+                )
+            )
+        return out
 
     def clear_session(self, session_id: str, *, actor_type: ActorType | None = None) -> int:
-        """Clear current_session pointers for entries matching session_id.
-
-        Returns:
-            Number of entries updated.
-        """
-        cleared = 0
-        with self._pool_lock:
-            for e in self._entries.values():
-                if actor_type is not None and e.actor_type != actor_type:
-                    continue
-                if e.current_session != session_id:
-                    continue
-                e.current_session = None
-                e.touch()
-                cleared += 1
-        if cleared:
-            logger.info(
-                f"[ResourcePool] Cleared current_session={session_id} for {cleared} actor(s) "
-                f"(actor_type={actor_type.value if actor_type else 'any'})"
-            )
-        return cleared
+        if not self._use_detached():
+            return int(self._local(self._local_state.clear_session, session_id, actor_type=actor_type))
+        arg = None if actor_type is None else actor_type.value
+        return int(_call_actor_sync("clear_session", session_id, arg))
 
     def total_gpus_used(self) -> int:
-        """Total GPUs used by all tracked actors."""
-        with self._pool_lock:
-            return sum(e.num_gpus for e in self._entries.values())
+        if not self._use_detached():
+            return int(self._local(self._local_state.total_gpus_used))
+        return int(_call_actor_sync("total_gpus_used", retry_on_actor_restart=True))
 
     def gpus_used_by_node(self) -> dict[str, int]:
-        """Get GPU usage per node from tracked actors.
+        usage: dict[str, int] = {}
+        for entry in self.iter_entries():
+            node_id = entry.node_id
+            if not node_id and entry.actor_handle is not None:
+                node_id = self._get_actor_node_id(entry.actor_handle)
+            if not node_id:
+                continue
+            usage[node_id] = usage.get(node_id, 0) + int(entry.num_gpus)
+        return usage
 
-        For actors without node_id, tries to look it up via Ray state API.
-
-        Returns:
-            Dict mapping node_id -> number of GPUs used by actors on that node.
-            Actors with unknown node_id are excluded.
-        """
-        with self._pool_lock:
-            usage: dict[str, int] = {}
-            for e in self._entries.values():
-                node_id = e.node_id
-                # Try to look up node_id if missing
-                if not node_id and e.actor_handle:
-                    node_id = self._get_actor_node_id(e.actor_handle)
-                    if node_id:
-                        e.node_id = node_id  # Cache it for future calls
-                        logger.debug(f"[ResourcePool] Resolved node_id for {e.actor_name}: {node_id[:8]}")
-                if node_id:
-                    usage[node_id] = usage.get(node_id, 0) + e.num_gpus
-            return usage
-
-    def _get_actor_node_id(self, actor_handle: ray.actor.ActorHandle) -> str | None:
-        """Get node_id where an actor is running via Ray state API."""
+    def _get_actor_node_id(self, actor_handle: ActorHandle) -> str | None:
         try:
             actor_id = actor_handle._actor_id
-            # Convert ActorID to hex string for the state API
             actor_id_hex = actor_id.hex()
             from ray._private.state import actors as state_actors
+
             actor_info = state_actors(actor_id_hex)
             if actor_info:
-                # NodeID is nested under Address
                 address = actor_info.get("Address", {})
                 return address.get("NodeID")
         except Exception as e:
-            logger.debug(f"[ResourcePool] Could not get node_id: {e}")
+            logger.debug("[ResourcePool] Could not get node_id: %s", e)
         return None
 
     def clear(self, kill_actors: bool = True) -> int:
-        """Remove all actors from the pool.
-
-        Args:
-            kill_actors: If True, also kill the Ray actors.
-
-        Returns:
-            Number of actors removed.
-        """
-        with self._pool_lock:
-            count = len(self._entries)
-            if kill_actors:
-                for entry in list(self._entries.values()):
-                    self._kill_actor(entry)
-            self._entries.clear()
-            logger.info(f"[ResourcePool] Cleared {count} actors")
-            return count
+        with self._local_lock:
+            self._handle_cache.clear()
+        if not self._use_detached():
+            return int(self._local(self._local_state.clear, kill_actors=kill_actors))
+        return int(_call_actor_sync("clear", bool(kill_actors)))
 
 
 # Global singleton accessor
+
 def get_resource_pool() -> ResourcePool:
-    """Get the global ResourcePool instance."""
     return ResourcePool()

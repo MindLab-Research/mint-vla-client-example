@@ -14,6 +14,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import ray
+
 torch = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
@@ -47,6 +48,7 @@ from tinker_server.ray_utils import init_ray
 # =====================================================================
 # Session State Manager - Per-iteration state persistence for stateless trainers
 # =====================================================================
+
 
 def _get_torch():
     global torch
@@ -83,6 +85,7 @@ class SessionStateManager:
             base_path: Root directory for all session checkpoints.
         """
         import os
+
         self.base_path = os.path.abspath(base_path or get_dense_session_state_root())
         os.makedirs(self.base_path, exist_ok=True)
         logger.info(f"[SessionStateManager] Initialized with base_path={self.base_path}")
@@ -90,11 +93,13 @@ class SessionStateManager:
     def get_session_path(self, session_id: str) -> str:
         """Get checkpoint directory path for a session."""
         import os
+
         return os.path.join(self.base_path, f"{session_id}_checkpoint")
 
     def session_exists(self, session_id: str) -> bool:
         """Check if a session has saved state."""
         import os
+
         maybe_migrate_legacy_dense_session_state(session_id, root=self.base_path)
         session_path = self.get_session_path(session_id)
         adapter_path = os.path.join(session_path, "adapter_model.safetensors")
@@ -151,7 +156,9 @@ class SessionStateManager:
                     grads[name] = param.grad.cpu().clone()
             if grads:
                 torch.save(grads, os.path.join(session_path, "gradients.pt"))
-                logger.debug(f"[SessionStateManager] Saved {len(grads)} gradient tensors for {session_id}")
+                logger.debug(
+                    f"[SessionStateManager] Saved {len(grads)} gradient tensors for {session_id}"
+                )
             else:
                 # Remove old gradients file if no gradients to save
                 grads_path = os.path.join(session_path, "gradients.pt")
@@ -163,7 +170,9 @@ class SessionStateManager:
         with open(os.path.join(session_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-        logger.debug(f"[SessionStateManager] Saved state for {session_id} (step={step})")
+        logger.debug(
+            f"[SessionStateManager] Saved state for {session_id} (step={step})"
+        )
         return os.path.abspath(session_path)
 
     def load_state(
@@ -229,10 +238,16 @@ class SessionStateManager:
                             param.grad.copy_(grads[name])
                         grad_count += 1
                 has_gradients = grad_count > 0
-                logger.debug(f"[SessionStateManager] Restored {grad_count} gradient tensors for {session_id}")
+                logger.debug(
+                    f"[SessionStateManager] Restored {grad_count} gradient tensors for {session_id}"
+                )
 
         # 4. Load metadata
-        meta = {"current_step": 0, "learning_rate": optimizer.param_groups[0]["lr"], "has_gradients": has_gradients}
+        meta = {
+            "current_step": 0,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "has_gradients": has_gradients,
+        }
         meta_path = os.path.join(session_path, "training_meta.json")
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
@@ -240,7 +255,9 @@ class SessionStateManager:
                 meta.update(loaded_meta)
                 meta["has_gradients"] = has_gradients
 
-        logger.debug(f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)}, has_gradients={has_gradients})")
+        logger.debug(
+            f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)}, has_gradients={has_gradients})"
+        )
         return meta
 
     def delete_session(self, session_id: str) -> bool:
@@ -302,7 +319,9 @@ class TrainingWorker:
                 name="TrainingWorker-IdleWatchdog",
             )
             self._watchdog_thread.start()
-            logger.info(f"[TrainingWorker] Idle watchdog started (timeout={idle_timeout}s)")
+            logger.info(
+                f"[TrainingWorker] Idle watchdog started (timeout={idle_timeout}s)"
+            )
 
         logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
 
@@ -330,21 +349,28 @@ class TrainingWorker:
         # Enable gradient checkpointing for large dense models (trades compute for memory)
         # Must be done before PEFT wrapping to properly set up the model
         from .model_registry import get_model_config
+
         force_grad_ckpt = bool(server_config.training_force_grad_checkpointing)
         try:
-            use_grad_ckpt = get_model_config(base_model).gradient_checkpointing or force_grad_ckpt
+            use_grad_ckpt = (
+                get_model_config(base_model).gradient_checkpointing or force_grad_ckpt
+            )
         except ValueError:
             use_grad_ckpt = force_grad_ckpt
 
         # Disable KV cache for training to reduce memory
-        if hasattr(self.model, "config") and getattr(self.model.config, "use_cache", None):
+        if hasattr(self.model, "config") and getattr(
+            self.model.config, "use_cache", None
+        ):
             self.model.config.use_cache = False
 
         if use_grad_ckpt:
             self.model.gradient_checkpointing_enable()
             if hasattr(self.model, "enable_input_require_grads"):
                 self.model.enable_input_require_grads()
-            logger.info(f"[TrainingWorker] Gradient checkpointing enabled for {base_model}")
+            logger.info(
+                f"[TrainingWorker] Gradient checkpointing enabled for {base_model}"
+            )
 
         # Apply LoRA
         # Per Tinker docs: "LoRA performs better when applied to all weight matrices,
@@ -355,7 +381,15 @@ class TrainingWorker:
             task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_rank,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
             lora_dropout=0.0,
             bias="none",
         )
@@ -407,27 +441,59 @@ class TrainingWorker:
         Args:
             session_id: Session ID to load state for.
         """
-        print(f"[DEBUG] _ensure_session_loaded: current={self._current_session_id}, target={session_id}", flush=True)
+        print(
+            f"[DEBUG] _ensure_session_loaded: current={self._current_session_id}, target={session_id}",
+            flush=True,
+        )
 
         if self._current_session_id == session_id:
             # Already loaded
-            print(f"[DEBUG] Session {session_id} already loaded, no switch needed", flush=True)
+            print(
+                f"[DEBUG] Session {session_id} already loaded, no switch needed",
+                flush=True,
+            )
             return
 
         # Save outgoing session's state INCLUDING gradients
         # This is critical for gradient accumulation across session switches
         if self._current_session_id is not None:
             # Check current gradient state before saving
-            grad_count = sum(1 for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None)
-            grad_norm = sum((p.grad.norm().item() ** 2) for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None) ** 0.5
-            print(f"[DEBUG] Saving session {self._current_session_id}: {grad_count} grads, norm={grad_norm:.4f}", flush=True)
-
-            lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
-            self._state_manager.save_state(
-                self._current_session_id, self.model, self.optimizer,
-                self._step_count, lr, self.device, save_gradients=True
+            grad_count = sum(
+                1
+                for _, p in self.model.named_parameters()
+                if p.requires_grad and p.grad is not None
             )
-            print(f"[DEBUG] Saved outgoing session {self._current_session_id} before switch", flush=True)
+            grad_norm = (
+                sum(
+                    (p.grad.norm().item() ** 2)
+                    for _, p in self.model.named_parameters()
+                    if p.requires_grad and p.grad is not None
+                )
+                ** 0.5
+            )
+            print(
+                f"[DEBUG] Saving session {self._current_session_id}: {grad_count} grads, norm={grad_norm:.4f}",
+                flush=True,
+            )
+
+            lr = (
+                self.optimizer.param_groups[0]["lr"]
+                if self.optimizer.param_groups
+                else 1e-4
+            )
+            self._state_manager.save_state(
+                self._current_session_id,
+                self.model,
+                self.optimizer,
+                self._step_count,
+                lr,
+                self.device,
+                save_gradients=True,
+            )
+            print(
+                f"[DEBUG] Saved outgoing session {self._current_session_id} before switch",
+                flush=True,
+            )
 
         # Load new session's state
         if self._state_manager.session_exists(session_id):
@@ -440,15 +506,32 @@ class TrainingWorker:
                 for pg in self.optimizer.param_groups:
                     pg["lr"] = meta["learning_rate"]
             # Check actual gradient state after loading
-            grad_count = sum(1 for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None)
-            grad_norm = sum((p.grad.norm().item() ** 2) for _, p in self.model.named_parameters() if p.requires_grad and p.grad is not None) ** 0.5
-            print(f"[DEBUG] Loaded session {session_id}: step={self._step_count}, actual_grads={grad_count}, norm={grad_norm:.4f}", flush=True)
+            grad_count = sum(
+                1
+                for _, p in self.model.named_parameters()
+                if p.requires_grad and p.grad is not None
+            )
+            grad_norm = (
+                sum(
+                    (p.grad.norm().item() ** 2)
+                    for _, p in self.model.named_parameters()
+                    if p.requires_grad and p.grad is not None
+                )
+                ** 0.5
+            )
+            print(
+                f"[DEBUG] Loaded session {session_id}: step={self._step_count}, actual_grads={grad_count}, norm={grad_norm:.4f}",
+                flush=True,
+            )
         else:
             # New session: reinitialize weights and zero gradients
             self.reinit_lora_weights()
             self.optimizer.zero_grad()
             self._step_count = 0
-            print(f"[DEBUG] New session {session_id}, initialized fresh weights", flush=True)
+            print(
+                f"[DEBUG] New session {session_id}, initialized fresh weights",
+                flush=True,
+            )
 
         self._current_session_id = session_id
 
@@ -461,12 +544,23 @@ class TrainingWorker:
         Args:
             session_id: Session ID to save state for.
         """
-        lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 1e-4
-        self._state_manager.save_state(
-            session_id, self.model, self.optimizer, self._step_count, lr, self.device,
-            save_gradients=False  # Gradients already applied and zeroed
+        lr = (
+            self.optimizer.param_groups[0]["lr"]
+            if self.optimizer.param_groups
+            else 1e-4
         )
-        logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
+        self._state_manager.save_state(
+            session_id,
+            self.model,
+            self.optimizer,
+            self._step_count,
+            lr,
+            self.device,
+            save_gradients=False,  # Gradients already applied and zeroed
+        )
+        logger.debug(
+            f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})"
+        )
 
     def delete_session(
         self,
@@ -521,7 +615,9 @@ class TrainingWorker:
         self._touch()
         return {
             "idle_timeout": self._idle_timeout,
-            "time_until_timeout": max(0, self._idle_timeout - (time.time() - self._last_activity)),
+            "time_until_timeout": max(
+                0, self._idle_timeout - (time.time() - self._last_activity)
+            ),
         }
 
     def _bind_traceparent(self, traceparent: str | None) -> None:
@@ -622,16 +718,24 @@ class TrainingWorker:
                         input_ids.extend(chunk["tokens"])
 
                 if not input_ids:
-                    logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                    logger.warning(
+                        "[TrainingWorker] No tokens in model_input chunks, skipping item"
+                    )
                     continue
             else:
-                logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
+                logger.warning(
+                    "[TrainingWorker] No chunks in model_input, skipping item"
+                )
                 continue
 
             # Extract target tokens and weights/mask
             # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
             target_data = loss_fn_inputs.get("target_tokens", {})
-            weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
+            weights_data = (
+                loss_fn_inputs.get("weights")
+                or loss_fn_inputs.get("loss_mask")
+                or loss_fn_inputs.get("mask", {})
+            )
 
             target_tokens = target_data.get("data", [])
             weights = weights_data.get("data", []) if weights_data else []
@@ -661,8 +765,12 @@ class TrainingWorker:
                 continue
 
             # Convert to tensors
-            input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
-            target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
+            input_ids_t = torch.tensor(
+                [input_ids], dtype=torch.long, device=self.device
+            )
+            target_ids_t = torch.tensor(
+                [target_tokens], dtype=torch.long, device=self.device
+            )
             weights_t = torch.tensor([weights], dtype=torch.float32, device=self.device)
 
             # Forward pass - get logits
@@ -676,7 +784,9 @@ class TrainingWorker:
             has_nan = torch.isnan(logits_for_debug).any().item()
             has_inf = torch.isinf(logits_for_debug).any().item()
             # Get logits at target positions
-            target_logits = logits_for_debug[torch.arange(len(target_tokens)), target_ids_t.squeeze(0)]
+            target_logits = logits_for_debug[
+                torch.arange(len(target_tokens)), target_ids_t.squeeze(0)
+            ]
             target_max = target_logits.max().item()
             target_min = target_logits.min().item()
             # Store debug info for return
@@ -700,7 +810,9 @@ class TrainingWorker:
             weights_flat = weights_t.squeeze(0)  # [seq_len]
 
             # Target logprobs are needed for all supported loss_fns.
-            log_probs = torch.nn.functional.log_softmax(logits_flat, dim=-1)  # [seq_len, vocab]
+            log_probs = torch.nn.functional.log_softmax(
+                logits_flat, dim=-1
+            )  # [seq_len, vocab]
             target_logprobs = torch.gather(
                 log_probs, dim=-1, index=targets_flat.unsqueeze(-1)
             ).squeeze(-1)  # [seq_len]
@@ -714,10 +826,16 @@ class TrainingWorker:
 
                 item_loss = loss.item()
                 logprobs_list = target_logprobs.detach().tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                })
+                loss_fn_outputs.append(
+                    {
+                        "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
+                        "logprobs": {
+                            "data": logprobs_list,
+                            "shape": [len(logprobs_list)],
+                            "dtype": "float32",
+                        },
+                    }
+                )
 
             elif loss_fn in ("importance_sampling", "ppo"):
                 # RL losses require old logprobs and advantages.
@@ -733,8 +851,12 @@ class TrainingWorker:
                     )
                     continue
 
-                old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=self.device)
-                advantages_t = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+                old_logprobs_t = torch.tensor(
+                    old_logprobs, dtype=torch.float32, device=self.device
+                )
+                advantages_t = torch.tensor(
+                    advantages, dtype=torch.float32, device=self.device
+                )
 
                 new_logprobs = target_logprobs
 
@@ -765,7 +887,9 @@ class TrainingWorker:
                     loss = (torch.maximum(pg_loss1, pg_loss2) * weights_flat).sum()
 
                     # Track clip fraction (fraction of masked tokens that were clipped).
-                    clipped = ((ratio < clip_low) | (ratio > clip_high)).float() * weights_flat
+                    clipped = (
+                        (ratio < clip_low) | (ratio > clip_high)
+                    ).float() * weights_flat
                     denom = max(token_count, 1.0)
                     clipfrac = clipped.sum() / denom
                     total_clipfrac += clipfrac.item()
@@ -780,10 +904,16 @@ class TrainingWorker:
                 num_rl_samples += 1
 
                 rl_logprobs_list = new_logprobs.detach().tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": rl_logprobs_list, "shape": [len(rl_logprobs_list)], "dtype": "float32"},
-                })
+                loss_fn_outputs.append(
+                    {
+                        "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
+                        "logprobs": {
+                            "data": rl_logprobs_list,
+                            "shape": [len(rl_logprobs_list)],
+                            "dtype": "float32",
+                        },
+                    }
+                )
 
             else:
                 raise ValueError(f"Unknown loss_fn: {loss_fn}")
@@ -871,26 +1001,39 @@ class TrainingWorker:
                         # Flatten all chunks into a single token list (like ModelInput.to_token_ids())
                         input_ids = []
                         for chunk in chunks:
-                            if chunk.get("type") == "encoded_text" and "tokens" in chunk:
+                            if (
+                                chunk.get("type") == "encoded_text"
+                                and "tokens" in chunk
+                            ):
                                 input_ids.extend(chunk["tokens"])
 
                         if not input_ids:
-                            logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                            logger.warning(
+                                "[TrainingWorker] No tokens in model_input chunks, skipping item"
+                            )
                             continue
                     else:
-                        logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
+                        logger.warning(
+                            "[TrainingWorker] No chunks in model_input, skipping item"
+                        )
                         continue
 
                     # Extract target tokens and weights/mask
                     # Accept "weights", "mask", or "loss_mask" field names (tinker API uses "loss_mask")
                     target_data = loss_fn_inputs.get("target_tokens", {})
-                    weights_data = loss_fn_inputs.get("weights") or loss_fn_inputs.get("loss_mask") or loss_fn_inputs.get("mask", {})
+                    weights_data = (
+                        loss_fn_inputs.get("weights")
+                        or loss_fn_inputs.get("loss_mask")
+                        or loss_fn_inputs.get("mask", {})
+                    )
 
                     target_tokens = target_data.get("data", [])
                     weights = weights_data.get("data", []) if weights_data else []
 
                     if not target_tokens:
-                        logger.warning("[TrainingWorker] Missing target_tokens, skipping item")
+                        logger.warning(
+                            "[TrainingWorker] Missing target_tokens, skipping item"
+                        )
                         continue
 
                     # For forward-only, weights are optional - default to all 1s
@@ -898,16 +1041,24 @@ class TrainingWorker:
                         weights = [1.0] * len(target_tokens)
 
                     # Convert to tensors
-                    input_ids_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
-                    target_ids_t = torch.tensor([target_tokens], dtype=torch.long, device=self.device)
-                    weights_t = torch.tensor([weights], dtype=torch.float32, device=self.device)
+                    input_ids_t = torch.tensor(
+                        [input_ids], dtype=torch.long, device=self.device
+                    )
+                    target_ids_t = torch.tensor(
+                        [target_tokens], dtype=torch.long, device=self.device
+                    )
+                    weights_t = torch.tensor(
+                        [weights], dtype=torch.float32, device=self.device
+                    )
 
                     # Forward pass - get logits
                     outputs = self.model(input_ids=input_ids_t)
                     logits = outputs.logits  # [1, seq_len, vocab_size]
 
                     # Compute log probabilities
-                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [1, seq_len, vocab]
+                    log_probs = torch.nn.functional.log_softmax(
+                        logits, dim=-1
+                    )  # [1, seq_len, vocab]
 
                     # Gather logprobs at target token indices
                     target_logprobs = torch.gather(
@@ -935,10 +1086,20 @@ class TrainingWorker:
                     total_tokens += num_weighted.item()
 
                     logprobs_list = target_logprobs.tolist()
-                    loss_fn_outputs.append({
-                        "loss": {"data": [item_loss], "shape": [1], "dtype": "float32"},
-                        "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                    })
+                    loss_fn_outputs.append(
+                        {
+                            "loss": {
+                                "data": [item_loss],
+                                "shape": [1],
+                                "dtype": "float32",
+                            },
+                            "logprobs": {
+                                "data": logprobs_list,
+                                "shape": [len(logprobs_list)],
+                                "dtype": "float32",
+                            },
+                        }
+                    )
         finally:
             if prev_training:
                 self.model.train()
@@ -947,7 +1108,9 @@ class TrainingWorker:
 
         avg_loss = total_loss / max(total_tokens, 1)
 
-        logger.info(f"[TrainingWorker] forward: loss={avg_loss:.4f}, tokens={total_tokens:.0f}")
+        logger.info(
+            f"[TrainingWorker] forward: loss={avg_loss:.4f}, tokens={total_tokens:.0f}"
+        )
 
         return {
             "loss_fn_output_type": "sft_loss",
@@ -987,8 +1150,14 @@ class TrainingWorker:
         )
 
         block_size = int(os.environ.get("MINT_REVERSE_KL_VOCAB_BLOCK", "4096"))
-        student_batches = [parse_reverse_kl_item(item, input_key="student_input") for item in data_items]
-        reference_batches = [parse_reverse_kl_item(item, input_key="reference_input") for item in data_items]
+        student_batches = [
+            parse_reverse_kl_item(item, input_key="student_input")
+            for item in data_items
+        ]
+        reference_batches = [
+            parse_reverse_kl_item(item, input_key="reference_input")
+            for item in data_items
+        ]
 
         teacher_log_probs_cpu: list[torch.Tensor] = []
         prev_training = self.model.training
@@ -1009,7 +1178,8 @@ class TrainingWorker:
                             )
                             logits = self.model(input_ids=input_ids_t).logits.squeeze(0)
                             completion_logits = logits[
-                                completion_start: completion_start + len(batch.completion_tokens)
+                                completion_start : completion_start
+                                + len(batch.completion_tokens)
                             ]
                             teacher_log_probs_cpu.append(
                                 compute_teacher_log_probs_cpu(
@@ -1025,15 +1195,19 @@ class TrainingWorker:
             outputs = []
             total_loss = 0.0
             total_tokens = 0.0
-            for batch, teacher_log_probs in zip(student_batches, teacher_log_probs_cpu, strict=True):
+            for batch, teacher_log_probs in zip(
+                student_batches, teacher_log_probs_cpu, strict=True
+            ):
                 scoring_input, completion_start = build_scoring_sequence(
                     batch.prefix_tokens,
                     batch.completion_tokens,
                 )
-                input_ids_t = torch.tensor([scoring_input], dtype=torch.long, device=self.device)
+                input_ids_t = torch.tensor(
+                    [scoring_input], dtype=torch.long, device=self.device
+                )
                 logits = self.model(input_ids=input_ids_t).logits.squeeze(0)
                 completion_logits = logits[
-                    completion_start: completion_start + len(batch.completion_tokens)
+                    completion_start : completion_start + len(batch.completion_tokens)
                 ]
                 token_kl = reverse_kl_from_teacher_log_probs(
                     completion_logits,
@@ -1041,7 +1215,9 @@ class TrainingWorker:
                     temperature=temperature,
                     block_size=block_size,
                 )
-                weights_t = torch.tensor(batch.weights, dtype=torch.float32, device=self.device)
+                weights_t = torch.tensor(
+                    batch.weights, dtype=torch.float32, device=self.device
+                )
                 loss = (token_kl * weights_t).sum()
                 loss.backward()
                 outputs.append(
@@ -1131,14 +1307,18 @@ class TrainingWorker:
         if session_id:
             self._save_session_state(session_id)
 
-        logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
+        logger.info(
+            f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}"
+        )
 
         return {
             "metrics": {"grad_norm:last": float(grad_norm)},
             "type": "optim_step",
         }
 
-    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
+    def get_lora_state_dict(
+        self, use_per_expert_lora: bool = False
+    ) -> dict[str, torch.Tensor]:
         """Extract LoRA adapter weights as state dict.
 
         Args:
@@ -1264,10 +1444,20 @@ class TrainingWorker:
         }
         with open(os.path.join(save_path, "training_meta.json"), "w") as f:
             # Don't write state_dict/peft_config to file (already saved separately)
-            json.dump({k: v for k, v in meta.items() if k not in ("state_dict", "peft_config")}, f, indent=2)
+            json.dump(
+                {
+                    k: v
+                    for k, v in meta.items()
+                    if k not in ("state_dict", "peft_config")
+                },
+                f,
+                indent=2,
+            )
 
         abs_path = os.path.abspath(save_path)
-        logger.info(f"[TrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
+        logger.info(
+            f"[TrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})"
+        )
         return meta
 
     def load_checkpoint(
@@ -1315,6 +1505,7 @@ class TrainingWorker:
         state_dict = load_file(adapter_path, device=str(self.device))
         # Load into PEFT model
         from peft.utils.save_and_load import set_peft_model_state_dict
+
         set_peft_model_state_dict(self.model, state_dict)
         logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
 
@@ -1338,7 +1529,9 @@ class TrainingWorker:
             meta_step = meta["current_step"]
             if isinstance(meta_step, int) and not isinstance(meta_step, bool):
                 self._step_count = meta_step
-                logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+                logger.info(
+                    f"[TrainingWorker] Loaded metadata: step={self._step_count}"
+                )
             else:
                 logger.warning(
                     "[TrainingWorker] Invalid current_step type=%s value=%r in %s; "
@@ -1361,8 +1554,12 @@ class TrainingWorker:
             checkpoint_lr = None
 
         if load_optimizer:
-            self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-            logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
+            self.optimizer.load_state_dict(
+                torch.load(optimizer_path, map_location=self.device)
+            )
+            logger.info(
+                f"[TrainingWorker] Loaded optimizer state from {optimizer_path}"
+            )
         else:
             # Non-resume loads must drop any session-local momentum/gradients that
             # _ensure_session_loaded() may have materialized from a previous session incarnation.
@@ -1373,7 +1570,6 @@ class TrainingWorker:
             )
 
         return meta
-
 
     # =====================================================================
     # Phase 8: Session Management Methods (backported from MegatronRankWorker)
@@ -1410,8 +1606,14 @@ class TrainingWorker:
         state_dict = load_file(adapter_path, device=str(self.device))
 
         # Phase 7: Apply padding if actual_rank < trainer_rank
-        if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-            logger.info(f"[TrainingWorker] Padding adapter from rank {actual_rank} to {trainer_rank}")
+        if (
+            actual_rank is not None
+            and trainer_rank is not None
+            and actual_rank < trainer_rank
+        ):
+            logger.info(
+                f"[TrainingWorker] Padding adapter from rank {actual_rank} to {trainer_rank}"
+            )
             state_dict = pad_lora_state_dict(state_dict, actual_rank, trainer_rank)
 
         # Load into PEFT model
@@ -1453,8 +1655,14 @@ class TrainingWorker:
         state_dict = get_peft_model_state_dict(self.model)
 
         # Phase 7: Apply truncation if actual_rank < trainer_rank
-        if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-            logger.info(f"[TrainingWorker] Truncating adapter from rank {trainer_rank} to {actual_rank}")
+        if (
+            actual_rank is not None
+            and trainer_rank is not None
+            and actual_rank < trainer_rank
+        ):
+            logger.info(
+                f"[TrainingWorker] Truncating adapter from rank {trainer_rank} to {actual_rank}"
+            )
             state_dict = truncate_lora_state_dict(state_dict, trainer_rank, actual_rank)
 
         # Save to safetensors format
@@ -1521,13 +1729,13 @@ class TrainingWorker:
         # Find and reinitialize all LoRA parameters
         for name, param in self.model.named_parameters():
             name_lower = name.lower()
-            if 'lora' not in name_lower:
+            if "lora" not in name_lower:
                 continue
             if not param.requires_grad:
                 continue
 
-            is_lora_a = 'lora_a' in name_lower
-            is_lora_b = 'lora_b' in name_lower
+            is_lora_a = "lora_a" in name_lower
+            is_lora_b = "lora_b" in name_lower
 
             if is_lora_a:
                 init.xavier_uniform_(param.data)
@@ -1549,7 +1757,9 @@ class TrainingWorker:
         # Reset optimizer state (momentum/variance)
         opt_state_reset = len(self.optimizer.state)
         self.optimizer.state.clear()
-        logger.info(f"[TrainingWorker] Reset optimizer state ({opt_state_reset} entries)")
+        logger.info(
+            f"[TrainingWorker] Reset optimizer state ({opt_state_reset} entries)"
+        )
 
         # Reset step count
         self._step_count = 0
@@ -1588,7 +1798,11 @@ class TrainingWorker:
             Dict with session and worker info.
         """
         # Get current learning rate
-        lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else None
+        lr = (
+            self.optimizer.param_groups[0]["lr"]
+            if self.optimizer.param_groups
+            else None
+        )
 
         # Get model info
         peft_config = self.model.peft_config.get("default")
@@ -1627,7 +1841,9 @@ class TrainingWorker:
         """
         import os
 
-        logger.info(f"[TrainingWorker] Swapping session: {old_session_id} -> {new_session_id}")
+        logger.info(
+            f"[TrainingWorker] Swapping session: {old_session_id} -> {new_session_id}"
+        )
 
         # Get trainer rank from current model
         peft_config = self.model.peft_config.get("default")
@@ -1735,20 +1951,26 @@ class VerlTrainingEngine:
     def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
         return self._resource_pool_actor_names.get(session.model_id)
 
-    def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
+    def _raise_if_session_poisoned(
+        self, session: "TrainingSession", *, op: str
+    ) -> None:
         if op == "load_weights":
             return
         error = self._poisoned_sessions.get(session.model_id)
         if error is not None:
             raise RuntimeError(error)
 
-    def _note_successful_worker_call(self, session: "TrainingSession", *, op: str) -> None:
+    def _note_successful_worker_call(
+        self, session: "TrainingSession", *, op: str
+    ) -> None:
         actor_name = self._actor_name_for_session(session)
         if not actor_name:
             return
         self._actor_loaded_sessions[actor_name] = session.model_id
         if op in {"forward_backward", "optim_step", "train_step"}:
-            self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+            self._actor_volatile_sessions.setdefault(actor_name, set()).add(
+                session.model_id
+            )
         if op == "save_weights":
             if session.backend == "megatron":
                 return
@@ -1778,7 +2000,10 @@ class VerlTrainingEngine:
     ) -> str | None:
         if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
             return None
-        from .megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
+        from .megatron_distributed import (
+            MegatronSessionStateManager,
+            _make_megatron_actor_name,
+        )
 
         session_manager = MegatronSessionStateManager()
         actor_name = self._actor_name_for_session(session)
@@ -1789,7 +2014,11 @@ class VerlTrainingEngine:
             )
         dirty_sessions = session_manager.list_actor_only_state_sessions(actor_name)
         if op == "load_weights":
-            dirty_siblings = [session_id for session_id in dirty_sessions if session_id != session.model_id]
+            dirty_siblings = [
+                session_id
+                for session_id in dirty_sessions
+                if session_id != session.model_id
+            ]
             if dirty_siblings:
                 joined = ", ".join(dirty_siblings)
                 return (
@@ -1837,7 +2066,9 @@ class VerlTrainingEngine:
         lost_session_ids = []
         sibling_model_ids: list[str] = []
         if actor_name is not None:
-            lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
+            lost_session_ids = sorted(
+                self._actor_volatile_sessions.get(actor_name, set())
+            )
             sibling_model_ids = [
                 model_id
                 for model_id, existing_actor_name in self._resource_pool_actor_names.items()
@@ -1896,7 +2127,9 @@ class VerlTrainingEngine:
             raise RuntimeError(lost_state_error) from cause
         return worker
 
-    def _resolve_session_base_model(self, session: "TrainingSession") -> tuple[str | None, str | None]:
+    def _resolve_session_base_model(
+        self, session: "TrainingSession"
+    ) -> tuple[str | None, str | None]:
         """Resolve session base model to a local path (same policy as create_training_session)."""
         requested_model = session.base_model or self.default_base_model
         if requested_model and not requested_model.startswith("/"):
@@ -1906,7 +2139,9 @@ class VerlTrainingEngine:
             return self.default_base_model, requested_model
         return requested_model, requested_model
 
-    def _resolve_megatron_base_model(self, session: "TrainingSession") -> tuple[str, str]:
+    def _resolve_megatron_base_model(
+        self, session: "TrainingSession"
+    ) -> tuple[str, str]:
         requested_model = session.base_model or self.default_base_model
         if not requested_model:
             raise RuntimeError(f"[{session.model_id}] missing Megatron base model")
@@ -1958,8 +2193,12 @@ class VerlTrainingEngine:
         from .resource_pool import ActorType, get_resource_pool
 
         base_model, requested_model = self._resolve_megatron_base_model(session)
-        actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
-        lora_rank = session.lora_config.rank if session.lora_config else self.default_lora_rank
+        actor_name = _make_megatron_actor_name(
+            base_model or requested_model or session.base_model or ""
+        )
+        lora_rank = (
+            session.lora_config.rank if session.lora_config else self.default_lora_rank
+        )
         distributed_config = self._build_megatron_distributed_config(
             requested_model=requested_model,
             base_model=base_model,
@@ -1980,7 +2219,9 @@ class VerlTrainingEngine:
                     namespace=PERSISTENT_NAMESPACE,
                 )
             except ValueError as e:
-                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+                raise RuntimeError(
+                    f"[{session.model_id}] missing worker for backend=megatron"
+                ) from e
         ready_timeout_s = (
             float(server_config.training_actor_ready_timeout_s)
             if server_config.training_actor_ready_timeout_s is not None
@@ -1995,7 +2236,9 @@ class VerlTrainingEngine:
             )
         except Exception as e:
             if self._is_dead_actor_error(e):
-                raise RuntimeError(f"[{session.model_id}] missing worker for backend=megatron") from e
+                raise RuntimeError(
+                    f"[{session.model_id}] missing worker for backend=megatron"
+                ) from e
             raise
         get_resource_pool().register(
             actor_name=actor_name,
@@ -2056,7 +2299,9 @@ class VerlTrainingEngine:
         for exc in cls._walk_exception_chain(error):
             if isinstance(exc, dead_types):
                 return True
-        text = " | ".join(f"{type(exc).__name__}: {exc}" for exc in cls._walk_exception_chain(error))
+        text = " | ".join(
+            f"{type(exc).__name__}: {exc}" for exc in cls._walk_exception_chain(error)
+        )
         text = text.lower()
         return (
             "actordiederror" in text
@@ -2078,7 +2323,11 @@ class VerlTrainingEngine:
             except Exception:
                 actor_id_hex = None
         try:
-            info = ray._private.state.actors(actor_id=actor_id_hex) if actor_id_hex else None
+            info = (
+                ray._private.state.actors(actor_id=actor_id_hex)
+                if actor_id_hex
+                else None
+            )
         except Exception:
             return None
         if isinstance(info, dict):
@@ -2111,7 +2360,9 @@ class VerlTrainingEngine:
         except Exception:
             return "UNKNOWN"
 
-    def _serialized_batch_stats(self, data_items: list[dict[str, Any]]) -> dict[str, int]:
+    def _serialized_batch_stats(
+        self, data_items: list[dict[str, Any]]
+    ) -> dict[str, int]:
         total_tokens = 0
         max_seq_len = 0
         for item in data_items:
@@ -2187,7 +2438,9 @@ class VerlTrainingEngine:
         base_model, requested_model = self._resolve_megatron_base_model(session)
         actor_name = self._resource_pool_actor_names.get(session.model_id)
         if actor_name is None:
-            actor_name = _make_megatron_actor_name(base_model or requested_model or session.base_model or "")
+            actor_name = _make_megatron_actor_name(
+                base_model or requested_model or session.base_model or ""
+            )
         lock = await self._get_actor_recycle_lock(actor_name)
         async with lock:
             existing = self._workers.get(session.model_id)
@@ -2215,7 +2468,9 @@ class VerlTrainingEngine:
                     )
             if existing is not None and not cause_is_cuda_poison:
                 try:
-                    await asyncio.to_thread(ray.get, existing.get_diagnostics.remote(), timeout=10)
+                    await asyncio.to_thread(
+                        ray.get, existing.get_diagnostics.remote(), timeout=10
+                    )
                     logger.warning(
                         "[%s] megatron_recycle skipped op=%s actor=%s reason=%s current worker already healthy",
                         session.model_id,
@@ -2265,7 +2520,10 @@ class VerlTrainingEngine:
                 len(sibling_model_ids),
             )
             try:
-                await asyncio.to_thread(kill_megatron_actor, base_model or requested_model or session.base_model)
+                await asyncio.to_thread(
+                    kill_megatron_actor,
+                    base_model or requested_model or session.base_model,
+                )
             except Exception as kill_error:
                 logger.warning(
                     "[%s] megatron_recycle kill_failed actor=%s error_type=%s error=%s",
@@ -2281,7 +2539,9 @@ class VerlTrainingEngine:
             await self.create_training_session(session)
             worker = self._workers.get(session.model_id)
             if worker is None:
-                raise RuntimeError(f"[{session.model_id}] megatron_recycle failed to bind recreated worker")
+                raise RuntimeError(
+                    f"[{session.model_id}] megatron_recycle failed to bind recreated worker"
+                )
             for model_id in sibling_model_ids:
                 self._workers[model_id] = worker
             logger.warning(
@@ -2305,14 +2565,18 @@ class VerlTrainingEngine:
         model_id = session.model_id
         actor_name = self._resource_pool_actor_names.get(model_id)
         if actor_name is None:
-            return await self._recover_dense_worker(session, reason=f"{op}:{type(cause).__name__}:no_actor_name")
+            return await self._recover_dense_worker(
+                session, reason=f"{op}:{type(cause).__name__}:no_actor_name"
+            )
 
         lock = await self._get_actor_recycle_lock(actor_name)
         async with lock:
             existing = self._workers.get(model_id)
             if existing is not None:
                 try:
-                    await asyncio.to_thread(ray.get, existing.heartbeat.remote(), timeout=5)
+                    await asyncio.to_thread(
+                        ray.get, existing.heartbeat.remote(), timeout=5
+                    )
                     logger.warning(
                         "[%s] dense_recycle skipped op=%s actor=%s reason=%s current worker already healthy",
                         model_id,
@@ -2371,7 +2635,9 @@ class VerlTrainingEngine:
                     type(kill_error).__name__,
                     kill_error,
                 )
-            worker = await self._recover_dense_worker(session, reason=f"{op}:{type(cause).__name__}")
+            worker = await self._recover_dense_worker(
+                session, reason=f"{op}:{type(cause).__name__}"
+            )
             logger.warning(
                 "[%s] dense_recycle done op=%s actor=%s",
                 model_id,
@@ -2393,7 +2659,9 @@ class VerlTrainingEngine:
     ):
         self._raise_if_session_poisoned(session, op=op)
         try:
-            worker = await self._get_live_worker(session, op=op, allow_recover=allow_recover)
+            worker = await self._get_live_worker(
+                session, op=op, allow_recover=allow_recover
+            )
         except RuntimeError as e:
             if "missing worker" not in str(e):
                 raise
@@ -2462,7 +2730,9 @@ class VerlTrainingEngine:
                     batch_stats=batch_stats,
                 )
 
-    async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
+    async def _recover_dense_worker(
+        self, session: "TrainingSession", *, reason: str
+    ) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
         from .dense_trainer import get_or_create_dense_trainer
 
@@ -2510,8 +2780,12 @@ class VerlTrainingEngine:
                     allow_create=False,
                 )
             if session.backend == "peft" and allow_recover:
-                return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
-            raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
+                return await self._recover_dense_worker(
+                    session, reason=f"{op}:missing_worker"
+                )
+            raise RuntimeError(
+                f"[{model_id}] missing worker for backend={session.backend}"
+            )
 
         # Megatron workers are managed by a persistent group; keep existing behavior.
         if session.backend != "peft":
@@ -2686,8 +2960,12 @@ class VerlTrainingEngine:
                 if timeout_s is not None and timeout_s > 0:
                     remaining = timeout_s - (time.time() - start)
                     if remaining <= 0:
-                        logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
-                        raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
+                        logger.warning(
+                            f"[{session.model_id}] Ray call timed out after {timeout_s}s"
+                        )
+                        raise asyncio.TimeoutError(
+                            f"Ray call timed out after {timeout_s}s"
+                        )
                     wait_s = min(wait_s, remaining)
 
                 try:
@@ -2780,7 +3058,9 @@ class VerlTrainingEngine:
                     )
                 # Fall back to default only for dense models on the same architecture.
                 base_model = self.default_base_model
-                logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
+                logger.info(
+                    f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})"
+                )
         else:
             base_model = requested_model
 
@@ -2791,6 +3071,7 @@ class VerlTrainingEngine:
 
         if use_megatron:
             import asyncio
+
             distributed_config = self._build_megatron_distributed_config(
                 requested_model=requested_model,
                 base_model=base_model,
@@ -2831,7 +3112,9 @@ class VerlTrainingEngine:
                 # Best-effort: kill the persistent Megatron actor to unblock retries.
                 from .megatron_distributed import _make_megatron_actor_name
 
-                actor_name = _make_megatron_actor_name(base_model or requested_model or "")
+                actor_name = _make_megatron_actor_name(
+                    base_model or requested_model or ""
+                )
                 try:
                     actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
                     ray_kill.kill(
@@ -2853,7 +3136,9 @@ class VerlTrainingEngine:
             session.backend = "megatron"
             from .megatron_distributed import _make_megatron_actor_name
 
-            self._resource_pool_actor_names[model_id] = _make_megatron_actor_name(base_model or "")
+            self._resource_pool_actor_names[model_id] = _make_megatron_actor_name(
+                base_model or ""
+            )
             self._touch_actor(session)
             # Note: reinit_lora_weights is now called inside get_or_create_megatron_worker_group
             # with session_id for proper session state management (Issue #44)
@@ -2864,7 +3149,10 @@ class VerlTrainingEngine:
 
             import asyncio
             from .dense_trainer import get_or_create_dense_trainer
-            dense_get_timeout_s = float(server_config.training_dense_get_or_create_timeout_s)
+
+            dense_get_timeout_s = float(
+                server_config.training_dense_get_or_create_timeout_s
+            )
             print(
                 f"[DEBUG {model_id}] dense get_or_create start: timeout_s={dense_get_timeout_s}",
                 flush=True,
@@ -2892,9 +3180,13 @@ class VerlTrainingEngine:
             # Reinitialize LoRA weights for fresh session (statelessness)
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
-            logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
+            logger.info(
+                f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})..."
+            )
             reinit_timeout_s = float(server_config.training_reinit_lora_timeout_s)
-            effective_reinit_timeout_s = reinit_timeout_s if reinit_timeout_s > 0 else None
+            effective_reinit_timeout_s = (
+                reinit_timeout_s if reinit_timeout_s > 0 else None
+            )
             print(
                 f"[DEBUG {model_id}] dense reinit_lora_weights start: timeout_s={effective_reinit_timeout_s}",
                 flush=True,
@@ -2902,7 +3194,9 @@ class VerlTrainingEngine:
             traceparent = get_current_traceparent()
             try:
                 result = await self._await_with_keepalive(
-                    worker.reinit_lora_weights.remote(session.learning_rate, traceparent=traceparent),
+                    worker.reinit_lora_weights.remote(
+                        session.learning_rate, traceparent=traceparent
+                    ),
                     session,
                     interval_s=30.0,
                     timeout_s=effective_reinit_timeout_s,
@@ -2921,10 +3215,14 @@ class VerlTrainingEngine:
                 f"[DEBUG {model_id}] dense reinit_lora_weights done",
                 flush=True,
             )
-            logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
+            logger.info(
+                f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}"
+            )
 
             session.backend = "peft"
-            logger.info(f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})")
+            logger.info(
+                f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})"
+            )
 
         # Wait for actor to be ready (model loaded)
         # Use await instead of ray.get() to not block the event loop
@@ -2997,7 +3295,9 @@ class VerlTrainingEngine:
         loss_fn_config = dict(request.forward_backward_input.loss_fn_config or {})
         session_rollout_corr = getattr(session, "rollout_correction_config", None)
         rollout_correction_config = None
-        if loss_fn in ("ppo", "importance_sampling") and isinstance(session_rollout_corr, dict):
+        if loss_fn in ("ppo", "importance_sampling") and isinstance(
+            session_rollout_corr, dict
+        ):
             if session.backend != "megatron":
                 raise ValueError(
                     "session-level rollout_correction_config is only supported on Megatron backend "
@@ -3012,9 +3312,15 @@ class VerlTrainingEngine:
             )
 
         lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        )
+        train_mlp = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        )
+        train_unembed = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        )
         traceparent = get_current_traceparent()
 
         def _submit(worker):
@@ -3076,7 +3382,9 @@ class VerlTrainingEngine:
             full_weights = [0.0] * completion_start + [float(x) for x in batch.weights]
             reference_items.append(
                 {
-                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": scoring_input}]},
+                    "model_input": {
+                        "chunks": [{"type": "encoded_text", "tokens": scoring_input}]
+                    },
                     "loss_fn_inputs": {
                         "target_tokens": {
                             "data": full_targets,
@@ -3092,19 +3400,27 @@ class VerlTrainingEngine:
                 }
             )
         lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        )
+        train_mlp = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        )
+        train_unembed = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        )
         traceparent = get_current_traceparent()
 
         if session.backend == "megatron":
             import hashlib
 
-
             ref_session_id = f"mintx_ref_{hashlib.md5(request.reference_model_path.encode('utf-8')).hexdigest()[:16]}"
             reference_actual_rank = None
             try:
-                with open(os.path.join(request.reference_model_path, "adapter_config.json"), encoding="utf-8") as f:
+                with open(
+                    os.path.join(request.reference_model_path, "adapter_config.json"),
+                    encoding="utf-8",
+                ) as f:
                     ref_cfg = json.load(f)
                 if isinstance(ref_cfg.get("r"), int):
                     reference_actual_rank = int(ref_cfg["r"])
@@ -3126,8 +3442,12 @@ class VerlTrainingEngine:
                         actual_rank=reference_actual_rank,
                     ),
                 )
-                logger.info(f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}")
-                logger.info(f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}")
+                logger.info(
+                    f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}"
+                )
+                logger.info(
+                    f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}"
+                )
                 reference_chunks = await asyncio.to_thread(
                     ray.get,
                     worker.forward_reference_full_log_probs.remote(
@@ -3156,12 +3476,16 @@ class VerlTrainingEngine:
                     train_unembed=train_unembed,
                     reference_full_log_prob_chunks=reference_chunks,
                 )
-                result = await self._await_with_keepalive(pending, session, interval_s=30.0)
+                result = await self._await_with_keepalive(
+                    pending, session, interval_s=30.0
+                )
             finally:
                 try:
                     await asyncio.to_thread(
                         ray.get,
-                        worker.delete_session.remote(ref_session_id, traceparent=traceparent),
+                        worker.delete_session.remote(
+                            ref_session_id, traceparent=traceparent
+                        ),
                     )
                 except Exception:
                     logger.warning(
@@ -3202,9 +3526,15 @@ class VerlTrainingEngine:
         batch_stats = self._serialized_batch_stats(data_items)
 
         lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        )
+        train_mlp = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        )
+        train_unembed = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        )
         traceparent = get_current_traceparent()
 
         def _submit(worker):
@@ -3217,7 +3547,9 @@ class VerlTrainingEngine:
                     train_mlp=train_mlp,
                     train_unembed=train_unembed,
                 )
-            return worker.forward.remote(data_items, session.model_id, traceparent=traceparent)
+            return worker.forward.remote(
+                data_items, session.model_id, traceparent=traceparent
+            )
 
         result = await self._run_worker_call_with_actor_recycle(
             session,
@@ -3243,7 +3575,11 @@ class VerlTrainingEngine:
             Dict with tokenizer configuration.
         """
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="get_tokenizer_info")
+        worker = await self._get_live_worker(
+            session,
+            op="get_tokenizer_info",
+            allow_recover=(session.backend == "peft"),
+        )
 
         result = await worker.get_tokenizer_info.remote()
 
@@ -3270,9 +3606,15 @@ class VerlTrainingEngine:
             session.learning_rate = lr
 
         lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        )
+        train_mlp = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        )
+        train_unembed = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        )
         traceparent = get_current_traceparent()
 
         def _submit(worker):
@@ -3285,7 +3627,9 @@ class VerlTrainingEngine:
                     train_mlp=train_mlp,
                     train_unembed=train_unembed,
                 )
-            return worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
+            return worker.optim_step.remote(
+                lr, session.model_id, traceparent=traceparent
+            )
 
         result = await self._run_worker_call_with_actor_recycle(
             session,
@@ -3332,7 +3676,9 @@ class VerlTrainingEngine:
         loss_fn_config = dict(request.forward_backward_input.loss_fn_config or {})
         session_rollout_corr = getattr(session, "rollout_correction_config", None)
         rollout_correction_config = None
-        if loss_fn in ("ppo", "importance_sampling") and isinstance(session_rollout_corr, dict):
+        if loss_fn in ("ppo", "importance_sampling") and isinstance(
+            session_rollout_corr, dict
+        ):
             if session.backend != "megatron":
                 raise ValueError(
                     "session-level rollout_correction_config is only supported on Megatron backend "
@@ -3345,13 +3691,23 @@ class VerlTrainingEngine:
                 loss_fn,
                 rollout_correction_config,
             )
-        lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
+        lr = (
+            request.adam_params.learning_rate
+            if request.adam_params
+            else session.learning_rate
+        )
         session.learning_rate = lr
 
         lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        )
+        train_mlp = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        )
+        train_unembed = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        )
         traceparent = get_current_traceparent()
 
         # Only MoE models use the combined MegatronWorkerGroup.train_step path.
@@ -3364,6 +3720,7 @@ class VerlTrainingEngine:
         use_train_step = session.backend == "megatron" and is_moe
 
         if use_train_step:
+
             def _submit_train(worker):
                 return worker.train_step.remote(
                     data_items,
@@ -3386,6 +3743,7 @@ class VerlTrainingEngine:
                 interval_s=30.0,
             )
         else:
+
             def _submit_fb(worker):
                 if session.backend == "megatron":
                     return worker.forward_backward.remote(
@@ -3425,7 +3783,9 @@ class VerlTrainingEngine:
                         train_mlp=train_mlp,
                         train_unembed=train_unembed,
                     )
-                return worker.optim_step.remote(lr, session.model_id, traceparent=traceparent)
+                return worker.optim_step.remote(
+                    lr, session.model_id, traceparent=traceparent
+                )
 
             opt_result = await self._run_worker_call_with_actor_recycle(
                 session,
@@ -3479,7 +3839,9 @@ class VerlTrainingEngine:
         try:
             worker = await self._get_live_worker(session, op="reset_expert_bias")
         except Exception as e:
-            logger.warning(f"[{model_id}] reset_expert_bias: No live worker ({type(e).__name__}: {e})")
+            logger.warning(
+                f"[{model_id}] reset_expert_bias: No live worker ({type(e).__name__}: {e})"
+            )
             return {"modules_reset": 0}
 
         # Mark actor as recently used
@@ -3494,7 +3856,9 @@ class VerlTrainingEngine:
             result = await loop.run_in_executor(None, ray.get, result_ref)
             # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
             modules_reset = result.get("reset_count", result.get("modules_reset", 0))
-            logger.info(f"[{model_id}] reset_expert_bias: reset {modules_reset} modules")
+            logger.info(
+                f"[{model_id}] reset_expert_bias: reset {modules_reset} modules"
+            )
             return {"modules_reset": modules_reset}
         except Exception as e:
             logger.exception(f"[{model_id}] reset_expert_bias failed: {e}")
@@ -3542,7 +3906,11 @@ class VerlTrainingEngine:
         import os
 
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="save_dense_lora_weights_for_sampler")
+        worker = await self._get_live_worker(
+            session,
+            op="save_dense_lora_weights_for_sampler",
+            allow_recover=(session.backend == "peft"),
+        )
         abs_path = os.path.abspath(save_path)
 
         try:
@@ -3560,7 +3928,9 @@ class VerlTrainingEngine:
             default_timeout_s = 600
         else:
             default_timeout_s = 300
-        timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
+        timeout_s = int(
+            os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s))
+        )
 
         traceparent = get_current_traceparent()
         ref = worker.save_lora_weights.remote(
@@ -3605,13 +3975,22 @@ class VerlTrainingEngine:
             default_timeout_s = 600
         else:
             default_timeout_s = 300
-        timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
+        timeout_s = int(
+            os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s))
+        )
 
         lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        )
+        train_mlp = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        )
+        train_unembed = (
+            True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        )
         traceparent = get_current_traceparent()
+
         def _submit(worker):
             return worker.save_lora_weights.remote(
                 abs_path,
@@ -3683,16 +4062,30 @@ class VerlTrainingEngine:
             default_timeout_s = 600
         else:
             default_timeout_s = 300
-        timeout_s = int(os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+        timeout_s = int(
+            os.environ.get("MINT_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s))
+        )
 
         traceparent = get_current_traceparent()
 
         def _submit(worker):
             if session.backend == "megatron":
                 lora_cfg = getattr(session, "lora_config", None)
-                train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-                train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-                train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+                train_attn = (
+                    True
+                    if lora_cfg is None
+                    else bool(getattr(lora_cfg, "train_attn", True))
+                )
+                train_mlp = (
+                    True
+                    if lora_cfg is None
+                    else bool(getattr(lora_cfg, "train_mlp", True))
+                )
+                train_unembed = (
+                    True
+                    if lora_cfg is None
+                    else bool(getattr(lora_cfg, "train_unembed", True))
+                )
                 return worker.save_checkpoint.remote(
                     abs_path,
                     use_per_expert_lora=use_per_expert_lora,
@@ -3717,7 +4110,9 @@ class VerlTrainingEngine:
         )
 
         # Update session state
-        strict_meta = bool(session.backend == "megatron" and self._strict_megatron_save_meta_enabled())
+        strict_meta = bool(
+            session.backend == "megatron" and self._strict_megatron_save_meta_enabled()
+        )
         self._update_session_step_monotonic(
             session,
             meta,
@@ -3777,10 +4172,14 @@ class VerlTrainingEngine:
                     if not self._is_dead_actor_error(e) or ready_attempts >= 1:
                         raise
                     ready_attempts += 1
-                    worker = await self._recycle_worker_after_failure(session, op="load_weights", cause=e)
+                    worker = await self._recycle_worker_after_failure(
+                        session, op="load_weights", cause=e
+                    )
 
         default_timeout_s = 1800.0 if session.backend == "megatron" else 120.0
-        load_timeout_s = float(os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
+        load_timeout_s = float(
+            os.environ.get("MINT_LOAD_CHECKPOINT_TIMEOUT_S", str(default_timeout_s))
+        )
 
         # Remote call to load checkpoint while keeping the pooled actor marked active.
         traceparent = get_current_traceparent()
@@ -3790,9 +4189,20 @@ class VerlTrainingEngine:
         }
         if session.backend == "megatron":
             lora_cfg = getattr(session, "lora_config", None)
-            kwargs["train_attn"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-            kwargs["train_mlp"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-            kwargs["train_unembed"] = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+            kwargs["train_attn"] = (
+                True
+                if lora_cfg is None
+                else bool(getattr(lora_cfg, "train_attn", True))
+            )
+            kwargs["train_mlp"] = (
+                True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+            )
+            kwargs["train_unembed"] = (
+                True
+                if lora_cfg is None
+                else bool(getattr(lora_cfg, "train_unembed", True))
+            )
+
         def _submit(worker):
             return worker.load_checkpoint.remote(load_path, load_optimizer, **kwargs)
 
@@ -3808,7 +4218,9 @@ class VerlTrainingEngine:
         if session.backend == "megatron":
             actor_name = self._actor_name_for_session(session)
             if actor_name:
-                self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+                self._actor_volatile_sessions.setdefault(actor_name, set()).add(
+                    session.model_id
+                )
 
         # Update session state from loaded metadata without polluting existing
         # client-side state when old/corrupt checkpoints omit metadata.

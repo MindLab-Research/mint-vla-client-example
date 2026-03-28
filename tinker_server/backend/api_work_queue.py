@@ -1078,9 +1078,14 @@ def _create_ray_actor():
     if resources is not None:
         options["resources"] = resources
 
-    return _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
+    created = _RayApiWorkQueueActor.options(  # type: ignore[attr-defined]
         **options
     ).remote()
+    try:
+        ray.get(created.stats.remote(), timeout=1.0)
+        return created
+    except Exception:
+        return ray.get_actor(actor_name, namespace=_ray_namespace())
 
 
 def _get_or_create_ray_actor():

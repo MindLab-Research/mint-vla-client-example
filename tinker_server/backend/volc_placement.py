@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from functools import lru_cache
 import os
 import re
 import subprocess
@@ -23,6 +24,29 @@ class VolcGpuNode:
     volc_job_id: str | None
     volc_resource_queue_id: str | None
 
+
+
+
+@lru_cache(maxsize=1)
+def _available_resources_per_node_remote():
+    @ray.remote(num_cpus=0)
+    def _task():
+        from ray._private import state as ray_state
+
+        return ray_state.available_resources_per_node()
+
+    return _task
+
+
+def _available_resources_per_node_safe() -> dict[str, dict[str, float]]:
+    from ray._private import state as ray_state
+
+    try:
+        return ray_state.available_resources_per_node()
+    except Exception as e:
+        if "Ray has not been started yet" not in str(e):
+            raise
+        return ray.get(_available_resources_per_node_remote().remote())
 
 def parse_csv(value: str | None) -> list[str]:
     if value is None:
@@ -78,7 +102,7 @@ def _list_volc_gpu_nodes(*, resource_queue_id: str) -> list[VolcGpuNode]:
 
     # Volcano CLI can return non-zero for very large limits; keep this bounded.
     job_to_queue = _volc_job_id_to_resource_queue_id(limit=200)
-    avail = ray_state.available_resources_per_node()
+    avail = _available_resources_per_node_safe()
 
     nodes: list[VolcGpuNode] = []
     for n in ray.nodes():
@@ -130,7 +154,7 @@ def _list_alive_gpu_nodes() -> list[VolcGpuNode]:
 
     from ray._private import state as ray_state
 
-    avail = ray_state.available_resources_per_node()
+    avail = _available_resources_per_node_safe()
     nodes: list[VolcGpuNode] = []
     for n in ray.nodes():
         if not n.get("Alive"):
@@ -435,7 +459,7 @@ def select_free_nodes_from_allowed_ips(
 
     from ray._private import state as ray_state
 
-    avail = ray_state.available_resources_per_node()
+    avail = _available_resources_per_node_safe()
     nodes: list[VolcGpuNode] = []
     for n in ray.nodes():
         if not n.get("Alive"):

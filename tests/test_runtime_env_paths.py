@@ -10,6 +10,7 @@ import tomllib
 import subprocess
 import sys
 
+import tinker_server.config as server_config
 from tinker_server.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
@@ -252,6 +253,22 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
     assert list(layout.host_pythonpath_entries) == [
         str(env_root / "src" / "HostOnlySource"),
     ]
+
+
+def test_preferred_vllm_python_executable_prefers_explicit_env(monkeypatch, tmp_path):
+    repo_root = tmp_path / "local-tinker"
+    worker_wrapper = repo_root / "scripts" / "vllm_worker_python.py"
+    worker_wrapper.parent.mkdir(parents=True, exist_ok=True)
+    worker_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    explicit = tmp_path / "shared" / "scripts" / "vllm_worker_python.py"
+    explicit.parent.mkdir(parents=True, exist_ok=True)
+    explicit.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(server_config, "PFS_TINKER_PATH", str(repo_root))
+    monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(explicit))
+
+    assert server_config.preferred_vllm_python_executable() == str(explicit)
 
 
 def test_validate_runtime_env_layout_requires_base_python_when_host_python_required(tmp_path):

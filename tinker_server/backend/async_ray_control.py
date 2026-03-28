@@ -185,7 +185,7 @@ async def async_placement_group_table(*, timeout_s: float = 5.0) -> dict[str, An
     return out
 
 
-async def async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 5.0):
+async def async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 15.0):
     _ensure_ray_initialized()
     ref = _lookup_actor_handle_remote().remote(str(actor_name), str(namespace))
     return await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))

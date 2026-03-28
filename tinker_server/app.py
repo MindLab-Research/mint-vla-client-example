@@ -47,6 +47,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+_STARTUP_LEASE_ROLE = os.environ.get("MINT_STARTUP_LEASE_ROLE", "mint_api_startup_owner")
 
 
 def _http_route_label(request: Request) -> str:
@@ -343,6 +344,58 @@ async def _cleanup_stale_actors() -> None:
             error=f"{type(e).__name__}: {e}",
         )
         logger.error(f"Actor cleanup failed; healthz will be degraded: {type(e).__name__}: {e}")
+
+
+async def _cancel_task(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _shutdown_local_inference_runtime(inference_manager: SessionManager) -> None:
+    await _cancel_task(getattr(inference_manager, "_cleanup_task", None))
+    if hasattr(inference_manager, "_cleanup_task"):
+        inference_manager._cleanup_task = None
+
+    sessions = dict(getattr(inference_manager, "_sessions", {}))
+    getattr(inference_manager, "_sessions", {}).clear()
+    for session_id, info in sessions.items():
+        engine = getattr(info, "engine", None)
+        if engine is None or bool(getattr(info, "is_shared", False)):
+            continue
+        try:
+            await engine.shutdown()
+            logger.info("Locally shutdown inference engine for session %s", session_id)
+        except Exception as e:
+            logger.warning("Local inference runtime shutdown failed session=%s: %s", session_id, e)
+
+    shared_engine = getattr(inference_manager, "_shared_engine", None)
+    if shared_engine is not None:
+        try:
+            await shared_engine.shutdown()
+            logger.info("Locally shutdown shared inference engine")
+        except Exception as e:
+            logger.warning("Local shared inference engine shutdown failed: %s", e)
+        inference_manager._shared_engine = None
+
+
+async def _shutdown_local_training_runtime(train_manager) -> None:
+    await _cancel_task(getattr(train_manager, "_cleanup_task", None))
+    if hasattr(train_manager, "_cleanup_task"):
+        train_manager._cleanup_task = None
+
+    sessions = dict(getattr(train_manager, "_sessions", {}))
+    getattr(train_manager, "_sessions", {}).clear()
+    for model_id, session in sessions.items():
+        inference_engine = getattr(session, "inference_engine", None)
+        if inference_engine is None:
+            continue
+        try:
+            await inference_engine.shutdown()
+            logger.info("Locally shutdown training-side inference engine for model %s", model_id)
+        except Exception as e:
+            logger.warning("Local training runtime shutdown failed model=%s: %s", model_id, e)
 
 async def _prewarm_persistent_models(
     train_engine: VerlTrainingEngine,
@@ -749,6 +802,7 @@ async def lifespan(app: FastAPI):
     from .backend.gateway_session_store import ensure_ready as ensure_gateway_session_store_ready
     from .backend.sampling_session_store import ensure_ready as ensure_sampling_session_store_ready
     from .backend.session_index_store import ensure_ready as ensure_session_index_store_ready
+    from .backend.startup_lease import acquire_startup_lease
     from .backend.training_session_store import ensure_ready as ensure_training_session_store_ready
     from .checkpoints import (
         get_checkpoint_mirror_poll_s,
@@ -794,549 +848,585 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("dense session-state startup cleanup failed")
 
-    # ==========================================================================
-    # Cleanup: Kill stale actors from previous server runs
-    # ==========================================================================
-    await _cleanup_stale_actors()
-
-    # ==========================================================================
-    # Inference: Initialize SessionManager
-    # ==========================================================================
-    logger.info("Initializing inference session manager")
-
-    inference_manager = SessionManager(
-        tensor_parallel_size=config.tensor_parallel_size,
-        data_parallel_size=config.data_parallel_size,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        max_model_len=config.max_model_len,
-        inactivity_timeout=config.session_inactivity_timeout_s
-        if config.session_inactivity_timeout_s is not None
-        else DEFAULT_INACTIVITY_TIMEOUT,
+    startup_lease = await acquire_startup_lease(_STARTUP_LEASE_ROLE)
+    startup_owner = bool(startup_lease.is_owner)
+    startup_lease_task: asyncio.Task | None = None
+    if startup_owner and not startup_lease.local_only:
+        startup_lease_task = asyncio.create_task(startup_lease.heartbeat_loop())
+    logger.info(
+        "startup lease role=%s is_owner=%s local_only=%s owner_id=%s",
+        _STARTUP_LEASE_ROLE,
+        startup_owner,
+        startup_lease.local_only,
+        startup_lease.owner_id,
     )
 
-    # Make session manager available to routes
-    service.session_manager = inference_manager
-    sampling.session_manager = inference_manager
+    inference_manager = None
+    train_manager = None
+    multi_model_manager = None
+    future_reaper_task = None
+    stale_training_heartbeat_task = None
+    checkpoint_reaper_task = None
+    checkpoint_mirror_task = None
 
-    # Start background cleanup task
-    await inference_manager.start_cleanup_task()
-    await _restore_sampling_sessions(inference_manager)
+    try:
+        # ==========================================================================
+        # Cleanup: Kill stale actors from previous server runs
+        # ==========================================================================
+        if startup_owner:
+            await _cleanup_stale_actors()
+        else:
+            logger.info("Skipping stale-actor cleanup on follower worker")
 
-    logger.info("Inference session manager initialized")
+        # ==========================================================================
+        # Inference: Initialize SessionManager
+        # ==========================================================================
+        logger.info("Initializing inference session manager")
 
-    # ==========================================================================
-    # Multi-Model Inference: Initialize manager for dynamic engine creation
-    # ==========================================================================
-    multi_model_manager: MultiModelInferenceManager | None = None
-
-    if config.enable_multi_lora:
-        from .backend.multi_lora_engine import MultiModelInferenceManager
-
-        logger.info(
-            f"Initializing Multi-Model Inference Manager: max_loras={config.max_loras}, "
-            f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
-        )
-
-        # Create manager - engines are created lazily per model
-        multi_model_manager = MultiModelInferenceManager(
+        inference_manager = SessionManager(
+            tensor_parallel_size=config.tensor_parallel_size,
+            data_parallel_size=config.data_parallel_size,
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_model_len=config.max_model_len,
-            max_loras=config.max_loras,
-            max_cpu_loras=config.max_cpu_loras,
-            max_lora_rank=config.max_lora_rank,
+            inactivity_timeout=config.session_inactivity_timeout_s
+            if config.session_inactivity_timeout_s is not None
+            else DEFAULT_INACTIVITY_TIMEOUT,
         )
 
-        # Register with session manager
-        inference_manager.set_multi_model_manager(multi_model_manager)
-        logger.info("Multi-model inference manager initialized (engines created on-demand)")
-    else:
-        logger.info("Multi-LoRA disabled, using per-session engines")
+        # Make session manager available to routes
+        service.session_manager = inference_manager
+        sampling.session_manager = inference_manager
 
-    # ==========================================================================
-    # Training: Initialize TrainingSessionManager and VerlTrainingEngine
-    # ==========================================================================
-    logger.info("Initializing training components")
+        # Start background cleanup task
+        if startup_owner:
+            await inference_manager.start_cleanup_task()
+        await _restore_sampling_sessions(inference_manager)
 
-    from .backend.training_session_manager import TrainingSessionManager
-    from .backend.verl_training import VerlTrainingEngine
+        logger.info("Inference session manager initialized")
 
-    train_manager = TrainingSessionManager(
-        inactivity_timeout=config.training_inactivity_timeout_s,
-    )
-    train_engine = VerlTrainingEngine()
-    await train_engine.initialize()
+        # ==========================================================================
+        # Multi-Model Inference: Initialize manager for dynamic engine creation
+        # ==========================================================================
+        multi_model_manager: MultiModelInferenceManager | None = None
 
-    # Make training components available to routes
-    training.training_manager = train_manager
-    training.training_engine = train_engine
-    training.inference_manager = inference_manager  # For ephemeral save flow
-    mint.training_manager = train_manager
-    mint.training_engine = train_engine
+        if config.enable_multi_lora:
+            from .backend.multi_lora_engine import MultiModelInferenceManager
 
-    # Weights router also needs training components and inference manager
-    weights.training_manager = train_manager
-    weights.training_engine = train_engine
-    weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
-
-    # Start background cleanup task for idle training sessions
-    await train_manager.start_cleanup_task(train_engine)
-
-    logger.info("Training components initialized")
-
-    # ==========================================================================
-    # Persistent actors: pre-create and protect at startup
-    # ==========================================================================
-    await _prewarm_persistent_models(train_engine, multi_model_manager)
-
-    # ==========================================================================
-    # OpenAI compat: preload tokenizers so request paths stay non-blocking
-    # ==========================================================================
-    try:
-        preload_failures = openai_compat.preload_supported_tokenizers()
-        if preload_failures:
-            logger.warning(
-                "OpenAI-compatible tokenizer preload incomplete: %s",
-                preload_failures,
+            logger.info(
+                f"Initializing Multi-Model Inference Manager: max_loras={config.max_loras}, "
+                f"max_cpu_loras={config.max_cpu_loras}, max_lora_rank={config.max_lora_rank}"
             )
+
+            # Create manager - engines are created lazily per model
+            multi_model_manager = MultiModelInferenceManager(
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                max_model_len=config.max_model_len,
+                max_loras=config.max_loras,
+                max_cpu_loras=config.max_cpu_loras,
+                max_lora_rank=config.max_lora_rank,
+            )
+
+            # Register with session manager
+            inference_manager.set_multi_model_manager(multi_model_manager)
+            logger.info("Multi-model inference manager initialized (engines created on-demand)")
         else:
-            logger.info("OpenAI-compatible tokenizers preloaded")
-    except Exception as e:
-        logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+            logger.info("Multi-LoRA disabled, using per-session engines")
 
-    # ==========================================================================
-    # Issue #84: Admission control + API work queue workers + future reaper
-    # ==========================================================================
-    from .backend.api_work_queue import api_work_queue
-    from .backend.capacity_manager import capacity_manager
-    from .models.types import (
-        ComputeLogprobsRequest,
-        CreateModelFromStateRequest,
-        CreateModelRequest,
-        ForwardRequest,
-        ForwardBackwardRequest,
-        LoadStateRequest,
-        OptimStepRequest,
-        ResetExpertBiasRequest,
-        SampleRequest,
-        SaveStateRequest,
-        SaveWeightsForSamplerRequest,
-        TrainStepRequest,
-    )
-    from .models.mint_types import (
-        ForwardBackwardReverseKLRequest,
-        InterpolateCheckpointsRequest,
-    )
+        # ==========================================================================
+        # Training: Initialize TrainingSessionManager and VerlTrainingEngine
+        # ==========================================================================
+        logger.info("Initializing training components")
 
-    capacity_manager.ensure_ready()
-    api_work_queue.ensure_ready()
+        from .backend.training_session_manager import TrainingSessionManager
+        from .backend.verl_training import VerlTrainingEngine
 
-    async def _exec_sampling_asample(item):
-        async def _run():
-            logger.info(
-                "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
-                str(item.request_id),
-            )
-            req = SampleRequest.model_validate_json(item.request_json)
-            logger.info(
-                "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
-                str(item.request_id),
-            )
-            await sampling._do_sample(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
-            )
+        train_manager = TrainingSessionManager(
+            inactivity_timeout=config.training_inactivity_timeout_s,
+        )
+        train_engine = VerlTrainingEngine()
+        await train_engine.initialize()
 
-        await run_async_with_otel_span(
-            "queue.stage.sampling.asample",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.sampling.asample"},
+        # Make training components available to routes
+        training.training_manager = train_manager
+        training.training_engine = train_engine
+        training.inference_manager = inference_manager  # For ephemeral save flow
+        mint.training_manager = train_manager
+        mint.training_engine = train_engine
+
+        # Weights router also needs training components and inference manager
+        weights.training_manager = train_manager
+        weights.training_engine = train_engine
+        weights.inference_manager = inference_manager  # For multi-LoRA sampling registration
+
+        # Start background cleanup task for idle training sessions
+        if startup_owner:
+            await train_manager.start_cleanup_task(train_engine)
+
+        logger.info("Training components initialized")
+
+        # ==========================================================================
+        # Persistent actors: pre-create and protect at startup
+        # ==========================================================================
+        if startup_owner:
+            await _prewarm_persistent_models(train_engine, multi_model_manager)
+        else:
+            logger.info("Skipping persistent prewarm on follower worker")
+
+        # ==========================================================================
+        # OpenAI compat: preload tokenizers so request paths stay non-blocking
+        # ==========================================================================
+        try:
+            preload_failures = openai_compat.preload_supported_tokenizers()
+            if preload_failures:
+                logger.warning(
+                    "OpenAI-compatible tokenizer preload incomplete: %s",
+                    preload_failures,
+                )
+            else:
+                logger.info("OpenAI-compatible tokenizers preloaded")
+        except Exception as e:
+            logger.exception("OpenAI-compatible tokenizer preload failed: %s", e)
+
+        # ==========================================================================
+        # Issue #84: Admission control + API work queue workers + future reaper
+        # ==========================================================================
+        from .backend.api_work_queue import api_work_queue
+        from .backend.capacity_manager import capacity_manager
+        from .models.types import (
+            ComputeLogprobsRequest,
+            CreateModelFromStateRequest,
+            CreateModelRequest,
+            ForwardRequest,
+            ForwardBackwardRequest,
+            LoadStateRequest,
+            OptimStepRequest,
+            ResetExpertBiasRequest,
+            SampleRequest,
+            SaveStateRequest,
+            SaveWeightsForSamplerRequest,
+            TrainStepRequest,
+        )
+        from .models.mint_types import (
+            ForwardBackwardReverseKLRequest,
+            InterpolateCheckpointsRequest,
         )
 
-    async def _exec_sampling_compute_logprobs(item):
-        async def _run():
-            req = ComputeLogprobsRequest.model_validate_json(item.request_json)
-            await sampling._do_compute_logprobs(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
-            )
+        capacity_manager.ensure_ready()
+        api_work_queue.ensure_ready()
 
-        await run_async_with_otel_span(
-            "queue.stage.sampling.compute_logprobs",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.sampling.compute_logprobs"},
-        )
+        async def _exec_sampling_asample(item):
+            async def _run():
+                logger.info(
+                    "[api_work_queue] sampling.asample request_id=%s stage=before_model_validate",
+                    str(item.request_id),
+                )
+                req = SampleRequest.model_validate_json(item.request_json)
+                logger.info(
+                    "[api_work_queue] sampling.asample request_id=%s stage=after_model_validate",
+                    str(item.request_id),
+                )
+                await sampling._do_sample(
+                    item.request_id,
+                    req,
+                    item.user_id,
+                    (item.extra or {}).get("gateway_auth"),
+                )
 
-    async def _exec_training_create_model(item):
-        async def _run():
-            req = CreateModelRequest.model_validate_json(item.request_json)
-            await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.create_model",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.create_model"},
-        )
-
-    async def _exec_training_create_model_from_state(item):
-        async def _run():
-            req = CreateModelFromStateRequest.model_validate_json(item.request_json)
-            await training._do_create_model_from_state(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.create_model_from_state",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.create_model_from_state"},
-        )
-
-    async def _exec_training_train_step(item):
-        async def _run():
-            req = TrainStepRequest.model_validate_json(item.request_json)
-            await training._do_train_step(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
+            await run_async_with_otel_span(
+                "queue.stage.sampling.asample",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.sampling.asample"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.training.train_step",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.train_step"},
-        )
+        async def _exec_sampling_compute_logprobs(item):
+            async def _run():
+                req = ComputeLogprobsRequest.model_validate_json(item.request_json)
+                await sampling._do_compute_logprobs(
+                    item.request_id,
+                    req,
+                    item.user_id,
+                    (item.extra or {}).get("gateway_auth"),
+                )
 
-    async def _exec_training_forward(item):
-        async def _run():
-            req = ForwardRequest.model_validate_json(item.request_json)
-            await training._do_forward(
-                item.request_id,
-                req,
-                (item.extra or {}).get("gateway_auth"),
+            await run_async_with_otel_span(
+                "queue.stage.sampling.compute_logprobs",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.sampling.compute_logprobs"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.training.forward",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.forward"},
-        )
+        async def _exec_training_create_model(item):
+            async def _run():
+                req = CreateModelRequest.model_validate_json(item.request_json)
+                await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
 
-    async def _exec_training_forward_backward(item):
-        async def _run():
-            req = ForwardBackwardRequest.model_validate_json(item.request_json)
-            await training._do_forward_backward(
-                item.request_id,
-                req,
-                item.user_id,
-                (item.extra or {}).get("gateway_auth"),
+            await run_async_with_otel_span(
+                "queue.stage.training.create_model",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.create_model"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.training.forward_backward",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.forward_backward"},
-        )
+        async def _exec_training_create_model_from_state(item):
+            async def _run():
+                req = CreateModelFromStateRequest.model_validate_json(item.request_json)
+                await training._do_create_model_from_state(item.request_id, req, item.user_id)
 
-    async def _exec_training_save_weights_for_sampler(item):
-        async def _run():
-            req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
-            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            is_admin = bool((item.extra or {}).get("is_admin"))
-            await training._do_save_weights_for_sampler(
-                item.request_id,
-                req,
-                item.user_id,
-                prefer_tinker,
-                is_admin,
+            await run_async_with_otel_span(
+                "queue.stage.training.create_model_from_state",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.create_model_from_state"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.training.save_weights_for_sampler",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.save_weights_for_sampler"},
-        )
+        async def _exec_training_train_step(item):
+            async def _run():
+                req = TrainStepRequest.model_validate_json(item.request_json)
+                await training._do_train_step(
+                    item.request_id,
+                    req,
+                    item.user_id,
+                    (item.extra or {}).get("gateway_auth"),
+                )
 
-    async def _exec_training_optim_step(item):
-        async def _run():
-            req = OptimStepRequest.model_validate_json(item.request_json)
-            await training._do_optim_step(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.optim_step",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.optim_step"},
-        )
-
-    async def _exec_training_reset_expert_bias(item):
-        async def _run():
-            req = ResetExpertBiasRequest.model_validate_json(item.request_json)
-            await training._do_reset_expert_bias(item.request_id, req)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.reset_expert_bias",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.reset_expert_bias"},
-        )
-
-    async def _exec_training_delete_model(item):
-        async def _run():
-            payload = json.loads(item.request_json.decode("utf-8"))
-            model_id = payload.get("model_id")
-            if not isinstance(model_id, str) or not model_id:
-                raise ValueError("training.delete_model missing model_id")
-            await training._do_delete_model(item.request_id, model_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.training.delete_model",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.training.delete_model"},
-        )
-
-    async def _exec_weights_save_weights(item):
-        async def _run():
-            req = SaveStateRequest.model_validate_json(item.request_json)
-            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
-            # This must produce a training checkpoint (weights + optimizer state).
-            await weights._do_save_state(
-                item.request_id,
-                req,
-                user_id=item.user_id,
-                webhook_url=item.webhook_url,
-                prefer_tinker=prefer_tinker,
+            await run_async_with_otel_span(
+                "queue.stage.training.train_step",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.train_step"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.weights.save_weights",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.weights.save_weights"},
-        )
+        async def _exec_training_forward(item):
+            async def _run():
+                req = ForwardRequest.model_validate_json(item.request_json)
+                await training._do_forward(
+                    item.request_id,
+                    req,
+                    (item.extra or {}).get("gateway_auth"),
+                )
 
-    async def _exec_weights_save_state(item):
-        async def _run():
-            req = SaveStateRequest.model_validate_json(item.request_json)
-            prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            await weights._do_save_state(
-                item.request_id,
-                req,
-                user_id=item.user_id,
-                webhook_url=item.webhook_url,
-                prefer_tinker=prefer_tinker,
+            await run_async_with_otel_span(
+                "queue.stage.training.forward",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.forward"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.weights.save_state",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.weights.save_state"},
-        )
+        async def _exec_training_forward_backward(item):
+            async def _run():
+                req = ForwardBackwardRequest.model_validate_json(item.request_json)
+                await training._do_forward_backward(
+                    item.request_id,
+                    req,
+                    item.user_id,
+                    (item.extra or {}).get("gateway_auth"),
+                )
 
-    async def _exec_weights_load_state(item):
-        async def _run():
-            req = LoadStateRequest.model_validate_json(item.request_json)
-            await weights._do_load_state(item.request_id, req, item.user_id)
-
-        await run_async_with_otel_span(
-            "queue.stage.weights.load_state",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.weights.load_state"},
-        )
-
-    async def _exec_internal_noop(item):
-        async def _run():
-            from .backend.future_store import future_store
-
-            future_store.resolve(
-                str(item.request_id),
-                {"ok": True, "op": "internal.noop", "ts": time.time()},
+            await run_async_with_otel_span(
+                "queue.stage.training.forward_backward",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.forward_backward"},
             )
 
-        await run_async_with_otel_span(
-            "queue.stage.internal.noop",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.internal.noop"},
-        )
+        async def _exec_training_save_weights_for_sampler(item):
+            async def _run():
+                req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
+                prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+                is_admin = bool((item.extra or {}).get("is_admin"))
+                await training._do_save_weights_for_sampler(
+                    item.request_id,
+                    req,
+                    item.user_id,
+                    prefer_tinker,
+                    is_admin,
+                )
 
-    async def _exec_mint_interpolate_checkpoints(item):
-        async def _run():
-            req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
-            await mint._do_interpolate_checkpoints(item.request_id, req, item.user_id)
+            await run_async_with_otel_span(
+                "queue.stage.training.save_weights_for_sampler",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.save_weights_for_sampler"},
+            )
 
-        await run_async_with_otel_span(
-            "queue.stage.mint.interpolate_checkpoints",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.mint.interpolate_checkpoints"},
-        )
+        async def _exec_training_optim_step(item):
+            async def _run():
+                req = OptimStepRequest.model_validate_json(item.request_json)
+                await training._do_optim_step(item.request_id, req, item.user_id)
 
-    async def _exec_mint_forward_backward_reverse_kl(item):
-        async def _run():
-            req = ForwardBackwardReverseKLRequest.model_validate_json(item.request_json)
-            await mint._do_forward_backward_reverse_kl(item.request_id, req, item.user_id)
+            await run_async_with_otel_span(
+                "queue.stage.training.optim_step",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.optim_step"},
+            )
 
-        await run_async_with_otel_span(
-            "queue.stage.mint.forward_backward_reverse_kl",
-            _run,
-            component="api_work_queue",
-            op=str(item.op),
-            request_id=str(item.request_id),
-            attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
-        )
+        async def _exec_training_reset_expert_bias(item):
+            async def _run():
+                req = ResetExpertBiasRequest.model_validate_json(item.request_json)
+                await training._do_reset_expert_bias(item.request_id, req)
 
-    api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
-    api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
-    api_work_queue.set_executor("training.create_model", _exec_training_create_model)
-    api_work_queue.set_executor("training.create_model_from_state", _exec_training_create_model_from_state)
-    api_work_queue.set_executor("training.train_step", _exec_training_train_step)
-    api_work_queue.set_executor("training.forward", _exec_training_forward)
-    api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
-    api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
-    api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
-    api_work_queue.set_executor("training.reset_expert_bias", _exec_training_reset_expert_bias)
-    api_work_queue.set_executor("training.delete_model", _exec_training_delete_model)
-    api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
-    api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
-    api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
-    api_work_queue.set_executor("internal.noop", _exec_internal_noop)
-    api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
-    api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
+            await run_async_with_otel_span(
+                "queue.stage.training.reset_expert_bias",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.reset_expert_bias"},
+            )
 
-    await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+        async def _exec_training_delete_model(item):
+            async def _run():
+                payload = json.loads(item.request_json.decode("utf-8"))
+                model_id = payload.get("model_id")
+                if not isinstance(model_id, str) or not model_id:
+                    raise ValueError("training.delete_model missing model_id")
+                await training._do_delete_model(item.request_id, model_id)
 
-    async def _future_reaper_loop() -> None:
-        while True:
-            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
-            try:
-                reaped = future_store.reap()
-                for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
-                    capacity_manager.release_all(str(rid))
-            except Exception:
-                pass
+            await run_async_with_otel_span(
+                "queue.stage.training.delete_model",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.training.delete_model"},
+            )
 
-    future_reaper_task = asyncio.create_task(_future_reaper_loop())
+        async def _exec_weights_save_weights(item):
+            async def _run():
+                req = SaveStateRequest.model_validate_json(item.request_json)
+                prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+                # Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
+                # This must produce a training checkpoint (weights + optimizer state).
+                await weights._do_save_state(
+                    item.request_id,
+                    req,
+                    user_id=item.user_id,
+                    webhook_url=item.webhook_url,
+                    prefer_tinker=prefer_tinker,
+                )
 
-    async def _stale_training_heartbeat_loop() -> None:
-        while True:
-            await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
-            try:
-                cleaned = await training.cleanup_stale_training_sessions_once()
-                if cleaned:
-                    logger.warning(
-                        "auto-terminated %d stale training session(s): %s",
-                        len(cleaned),
-                        cleaned,
-                    )
-            except Exception:
-                logger.exception("stale training heartbeat cleanup failed")
+            await run_async_with_otel_span(
+                "queue.stage.weights.save_weights",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.weights.save_weights"},
+            )
 
-    stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop())
+        async def _exec_weights_save_state(item):
+            async def _run():
+                req = SaveStateRequest.model_validate_json(item.request_json)
+                prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
+                await weights._do_save_state(
+                    item.request_id,
+                    req,
+                    user_id=item.user_id,
+                    webhook_url=item.webhook_url,
+                    prefer_tinker=prefer_tinker,
+                )
 
-    async def _checkpoint_reaper_loop() -> None:
-        while True:
-            await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
-            try:
-                reaped = await asyncio.to_thread(reap_runtime_checkpoints)
-                total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
-                if total:
-                    logger.info(
-                        "checkpoint reaper removed ephemeral=%s persistent_cache=%s persistent=%s",
-                        len(reaped["ephemeral"]),
-                        len(reaped["persistent_cache"]),
-                        len(reaped["persistent"]),
-                    )
-            except Exception:
-                logger.exception("checkpoint reaper failed")
+            await run_async_with_otel_span(
+                "queue.stage.weights.save_state",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.weights.save_state"},
+            )
 
-    checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop())
+        async def _exec_weights_load_state(item):
+            async def _run():
+                req = LoadStateRequest.model_validate_json(item.request_json)
+                await weights._do_load_state(item.request_id, req, item.user_id)
 
-    async def _checkpoint_mirror_loop() -> None:
-        while True:
-            try:
-                mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
-                if mirrored["mirrored"] or mirrored["failed"]:
-                    logger.info(
-                        "checkpoint mirror processed mirrored=%s failed=%s",
-                        len(mirrored["mirrored"]),
-                        len(mirrored["failed"]),
-                    )
-            except Exception:
-                logger.exception("checkpoint mirror loop failed")
-            await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+            await run_async_with_otel_span(
+                "queue.stage.weights.load_state",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.weights.load_state"},
+            )
 
-    checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop())
+        async def _exec_internal_noop(item):
+            async def _run():
+                from .backend.future_store import future_store
+
+                future_store.resolve(
+                    str(item.request_id),
+                    {"ok": True, "op": "internal.noop", "ts": time.time()},
+                )
+
+            await run_async_with_otel_span(
+                "queue.stage.internal.noop",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.internal.noop"},
+            )
+
+        async def _exec_mint_interpolate_checkpoints(item):
+            async def _run():
+                req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
+                await mint._do_interpolate_checkpoints(item.request_id, req, item.user_id)
+
+            await run_async_with_otel_span(
+                "queue.stage.mint.interpolate_checkpoints",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.mint.interpolate_checkpoints"},
+            )
+
+        async def _exec_mint_forward_backward_reverse_kl(item):
+            async def _run():
+                req = ForwardBackwardReverseKLRequest.model_validate_json(item.request_json)
+                await mint._do_forward_backward_reverse_kl(item.request_id, req, item.user_id)
+
+            await run_async_with_otel_span(
+                "queue.stage.mint.forward_backward_reverse_kl",
+                _run,
+                component="api_work_queue",
+                op=str(item.op),
+                request_id=str(item.request_id),
+                attributes={"queue.stage": "queue.stage.mint.forward_backward_reverse_kl"},
+            )
+
+        api_work_queue.set_executor("sampling.asample", _exec_sampling_asample)
+        api_work_queue.set_executor("sampling.compute_logprobs", _exec_sampling_compute_logprobs)
+        api_work_queue.set_executor("training.create_model", _exec_training_create_model)
+        api_work_queue.set_executor("training.create_model_from_state", _exec_training_create_model_from_state)
+        api_work_queue.set_executor("training.train_step", _exec_training_train_step)
+        api_work_queue.set_executor("training.forward", _exec_training_forward)
+        api_work_queue.set_executor("training.forward_backward", _exec_training_forward_backward)
+        api_work_queue.set_executor("training.save_weights_for_sampler", _exec_training_save_weights_for_sampler)
+        api_work_queue.set_executor("training.optim_step", _exec_training_optim_step)
+        api_work_queue.set_executor("training.reset_expert_bias", _exec_training_reset_expert_bias)
+        api_work_queue.set_executor("training.delete_model", _exec_training_delete_model)
+        api_work_queue.set_executor("weights.save_weights", _exec_weights_save_weights)
+        api_work_queue.set_executor("weights.save_state", _exec_weights_save_state)
+        api_work_queue.set_executor("weights.load_state", _exec_weights_load_state)
+        api_work_queue.set_executor("internal.noop", _exec_internal_noop)
+        api_work_queue.set_executor("mint.interpolate_checkpoints", _exec_mint_interpolate_checkpoints)
+        api_work_queue.set_executor("mint.forward_backward_reverse_kl", _exec_mint_forward_backward_reverse_kl)
+
+        if startup_owner:
+            await api_work_queue.start_workers(num_workers=int(config.api_work_queue_num_workers))
+
+        async def _future_reaper_loop() -> None:
+            while True:
+                await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+                try:
+                    reaped = future_store.reap()
+                    for rid in list(reaped.get("expired", [])) + list(reaped.get("timed_out", [])):
+                        capacity_manager.release_all(str(rid))
+                except Exception:
+                    pass
+
+        future_reaper_task = asyncio.create_task(_future_reaper_loop()) if startup_owner else None
+
+        async def _stale_training_heartbeat_loop() -> None:
+            while True:
+                await asyncio.sleep(float(config.api_work_queue_reap_interval_s))
+                try:
+                    cleaned = await training.cleanup_stale_training_sessions_once()
+                    if cleaned:
+                        logger.warning(
+                            "auto-terminated %d stale training session(s): %s",
+                            len(cleaned),
+                            cleaned,
+                        )
+                except Exception:
+                    logger.exception("stale training heartbeat cleanup failed")
+
+        stale_training_heartbeat_task = asyncio.create_task(_stale_training_heartbeat_loop()) if startup_owner else None
+
+        async def _checkpoint_reaper_loop() -> None:
+            while True:
+                await asyncio.sleep(float(get_checkpoint_reap_interval_s()))
+                try:
+                    reaped = await asyncio.to_thread(reap_runtime_checkpoints)
+                    total = len(reaped["ephemeral"]) + len(reaped["persistent_cache"]) + len(reaped["persistent"])
+                    if total:
+                        logger.info(
+                            "checkpoint reaper removed ephemeral=%s persistent_cache=%s persistent=%s",
+                            len(reaped["ephemeral"]),
+                            len(reaped["persistent_cache"]),
+                            len(reaped["persistent"]),
+                        )
+                except Exception:
+                    logger.exception("checkpoint reaper failed")
+
+        checkpoint_reaper_task = asyncio.create_task(_checkpoint_reaper_loop()) if startup_owner else None
+
+        async def _checkpoint_mirror_loop() -> None:
+            while True:
+                try:
+                    mirrored = await asyncio.to_thread(process_pending_checkpoint_mirrors)
+                    if mirrored["mirrored"] or mirrored["failed"]:
+                        logger.info(
+                            "checkpoint mirror processed mirrored=%s failed=%s",
+                            len(mirrored["mirrored"]),
+                            len(mirrored["failed"]),
+                        )
+                except Exception:
+                    logger.exception("checkpoint mirror loop failed")
+                await asyncio.sleep(float(get_checkpoint_mirror_poll_s()))
+
+        checkpoint_mirror_task = asyncio.create_task(_checkpoint_mirror_loop()) if startup_owner else None
+
+    except Exception:
+        await _cancel_task(startup_lease_task)
+        await startup_lease.release()
+        if train_manager is not None:
+            await _shutdown_local_training_runtime(train_manager)
+        if inference_manager is not None:
+            await _shutdown_local_inference_runtime(inference_manager)
+        if multi_model_manager is not None:
+            await multi_model_manager.shutdown_all()
+        raise
 
     yield
 
     # ==========================================================================
     # Shutdown
     # ==========================================================================
-    future_reaper_task.cancel()
-    stale_training_heartbeat_task.cancel()
-    checkpoint_reaper_task.cancel()
-    checkpoint_mirror_task.cancel()
-    await asyncio.gather(
-        future_reaper_task,
-        stale_training_heartbeat_task,
-        checkpoint_reaper_task,
-        checkpoint_mirror_task,
-        return_exceptions=True,
-    )
-    await api_work_queue.shutdown()
-    logger.info("Shutting down all sessions")
+    await _cancel_task(future_reaper_task)
+    await _cancel_task(stale_training_heartbeat_task)
+    await _cancel_task(checkpoint_reaper_task)
+    await _cancel_task(checkpoint_mirror_task)
+    await _cancel_task(startup_lease_task)
+    if startup_owner:
+        await api_work_queue.shutdown()
+    await startup_lease.release()
+    logger.info("Shutting down local runtime state")
 
-    # Shutdown training sessions
-    await train_manager.shutdown_all(train_engine)
-
-    # Shutdown inference sessions
-    await inference_manager.shutdown_all()
+    # Do not let an arbitrary API worker exit delete shared metadata or global actors.
+    await _shutdown_local_training_runtime(train_manager)
+    await _shutdown_local_inference_runtime(inference_manager)
 
     # Shutdown multi-model inference manager
     if multi_model_manager is not None:
@@ -1626,6 +1716,7 @@ async def api_key_auth_middleware(request: Request, call_next):
         )
         request.state.trace_id = final_trace_id
         response.headers["X-Trace-Id"] = final_trace_id
+        response.headers["X-MinT-Server-Pid"] = str(os.getpid())
         apikey_id = get_request_apikey_id(request)
         if apikey_id:
             response.headers["X-MinT-Apikey-Id"] = apikey_id
