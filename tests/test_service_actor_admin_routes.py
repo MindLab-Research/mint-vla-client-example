@@ -36,6 +36,12 @@ class _FakePool:
     def iter_entries(self) -> list[object]:
         return list(self._entries)
 
+    def get(self, actor_name: str):
+        for entry in self._entries:
+            if getattr(entry, "actor_name", None) == actor_name:
+                return entry
+        return None
+
     def unregister(self, actor_name: str) -> None:
         self.unregister_calls.append(actor_name)
 
@@ -103,3 +109,77 @@ def test_kill_dense_actors_returns_503_without_unregistering_when_ray_init_fails
     assert resp.status_code == 503, resp.text
     assert "RAY_ADDRESS must be set" in resp.text
     assert pool.unregister_calls == []
+
+
+def test_kill_exact_dense_actor_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
+    from tinker_server.routes import service as service_routes
+    from tinker_server.backend.resource_pool import ActorType
+
+    _install_ray_stub(monkeypatch)
+    remove_pg_calls: list[str] = []
+
+    async def _lookup(*_args, **_kwargs):
+        return object()
+
+    async def _raise_kill(*_args, **_kwargs):
+        raise RuntimeError("kill failed")
+
+    pool = _FakePool(
+        actors=[],
+        entries=[
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-a",
+                namespace="ns",
+                base_model="Qwen/Qwen3-0.6B",
+                actor_handle=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(service_routes, "async_lookup_actor_handle", _lookup)
+    monkeypatch.setattr(service_routes, "async_kill_named_actor", _raise_kill)
+    monkeypatch.setattr(service_routes, "_remove_actor_pg", lambda actor_name: remove_pg_calls.append(actor_name))
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense", "actor_name": "dense-a"})
+
+    assert resp.status_code == 503, resp.text
+    assert "kill failed" in resp.text
+    assert pool.unregister_calls == []
+    assert remove_pg_calls == []
+
+
+def test_kill_dense_actors_returns_503_without_unregistering_when_kill_fails(monkeypatch) -> None:
+    from tinker_server.routes import service as service_routes
+    from tinker_server.backend.resource_pool import ActorType
+    import tinker_server.ray_utils as ray_utils
+
+    _install_ray_stub(monkeypatch)
+    remove_pg_calls: list[str] = []
+
+    async def _raise_kill(*_args, **_kwargs):
+        raise RuntimeError("kill failed")
+
+    pool = _FakePool(
+        actors=[],
+        entries=[
+            SimpleNamespace(
+                actor_type=ActorType.DENSE,
+                actor_name="dense-a",
+                namespace="ns",
+                base_model="Qwen/Qwen3-0.6B",
+                actor_handle=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(service_routes, "async_kill_named_actor", _raise_kill)
+    monkeypatch.setattr(service_routes, "_remove_actor_pg", lambda actor_name: remove_pg_calls.append(actor_name))
+    monkeypatch.setattr(ray_utils, "init_ray", lambda *_args, **_kwargs: None)
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.post("/api/v1/actors/kill", json={"actor_type": "dense"})
+
+    assert resp.status_code == 503, resp.text
+    assert "kill failed" in resp.text
+    assert pool.unregister_calls == []
+    assert remove_pg_calls == []

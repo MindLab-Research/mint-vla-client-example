@@ -1030,20 +1030,23 @@ async def _kill_exact_dense_actor(*, actor_name: str) -> int:
         return 0
 
     try:
-        try:
-            await async_lookup_actor_handle(entry.actor_name, entry.namespace)
-            await async_kill_named_actor(
-                entry.actor_name,
-                entry.namespace,
-                actor_handle=entry.actor_handle if entry.actor_handle is not None else None,
-                base_model=entry.base_model,
-                reason="dense_kill_by_actor_name",
-            )
-        except Exception:
-            pass
-    finally:
+        actor = await async_lookup_actor_handle(entry.actor_name, entry.namespace)
+    except Exception as exc:
+        if not is_actor_lookup_not_found(exc):
+            raise
         pool.unregister(entry.actor_name)
         _remove_actor_pg(entry.actor_name)
+        return 0
+
+    await async_kill_named_actor(
+        entry.actor_name,
+        entry.namespace,
+        actor_handle=entry.actor_handle if entry.actor_handle is not None else actor,
+        base_model=entry.base_model,
+        reason="dense_kill_by_actor_name",
+    )
+    pool.unregister(entry.actor_name)
+    _remove_actor_pg(entry.actor_name)
     return 1
 
 
@@ -1066,16 +1069,13 @@ async def _kill_dense_actors(base_model: str | None) -> int:
         init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
     for e in targets:
-        try:
-            await async_kill_named_actor(
-                e.actor_name,
-                e.namespace,
-                actor_handle=e.actor_handle if e.actor_handle is not None else None,
-                base_model=e.base_model,
-                reason="dense_kill_by_api",
-            )
-        except Exception:
-            pass
+        await async_kill_named_actor(
+            e.actor_name,
+            e.namespace,
+            actor_handle=e.actor_handle if e.actor_handle is not None else None,
+            base_model=e.base_model,
+            reason="dense_kill_by_api",
+        )
         pool.unregister(e.actor_name)
         _remove_actor_pg(e.actor_name)
         killed += 1
@@ -1106,7 +1106,10 @@ async def kill_actors(request: Request, body: KillActorsRequest) -> dict:
         elif t == "megatron":
             killed_by_type["megatron"] = await _kill_exact_megatron_actor(actor_name=actor_name)
         elif t == "dense":
-            killed_by_type["dense"] = await _kill_exact_dense_actor(actor_name=actor_name)
+            try:
+                killed_by_type["dense"] = await _kill_exact_dense_actor(actor_name=actor_name)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Ray unavailable for dense actor kill: {e}") from e
         else:
             raise HTTPException(status_code=422, detail="actor_type must be one of: vllm, megatron, dense, all")
         return {
