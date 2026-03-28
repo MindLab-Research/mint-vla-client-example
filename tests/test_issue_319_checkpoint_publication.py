@@ -31,7 +31,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
     async def _fake_save_weights_for_sampler(**_kwargs):
         return str(ckpt_dir)
 
-    def _fail(request_id: str, error: str) -> None:
+    async def _async_fail(request_id: str, error: str) -> None:
         failed["request_id"] = request_id
         failed["error"] = error
 
@@ -45,7 +45,8 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
                 current_step=5,
                 backend="dense",
                 lora_config=SimpleNamespace(rank=8, train_mlp=False),
-            )
+            ),
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(
@@ -53,7 +54,11 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
         "training_engine",
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
-    monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+    )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-bad")
     await tr._do_save_weights_for_sampler(
@@ -83,7 +88,7 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     async def _fake_save_weights_for_sampler(**_kwargs):
         return str(ckpt_dir)
 
-    def _fail(request_id: str, error: str) -> None:
+    async def _async_fail(request_id: str, error: str) -> None:
         failed["request_id"] = request_id
         failed["error"] = error
 
@@ -97,7 +102,8 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
                 current_step=5,
                 backend="dense",
                 lora_config=SimpleNamespace(rank=8, train_mlp=False),
-            )
+            ),
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(
@@ -105,7 +111,11 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
         "training_engine",
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
-    monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        SimpleNamespace(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+    )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
     await tr._do_save_weights_for_sampler(
@@ -133,7 +143,7 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
     async def _fake_save_weights(_session, _save_path):
         return str(ckpt_dir)
 
-    def _fail(request_id: str, error: str) -> None:
+    async def _async_fail(request_id: str, error: str) -> None:
         failed["request_id"] = request_id
         failed["error"] = error
 
@@ -145,11 +155,17 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
                 model_id="run-319",
                 base_model="Qwen/Qwen3-0.6B",
                 current_step=7,
-            )
+                backend="dense",
+            ),
+            mark_inflight=lambda *_args, **_kwargs: None,
         ),
     )
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
-    monkeypatch.setattr(wt, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(
+        wt,
+        "future_store",
+        SimpleNamespace(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+    )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveStateRequest(model_id="run-319", path="training-bad")
     await wt._do_save_state(
