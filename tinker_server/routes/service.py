@@ -938,13 +938,9 @@ class KillActorsRequest(BaseModel):
 
 
 def _remove_actor_pg(actor_name: str) -> None:
-    try:
-        import ray
+    from ..backend.ray_placement_groups import remove_named_placement_group
 
-        pg = ray.util.get_placement_group(f"{actor_name}_pg")
-        ray.util.remove_placement_group(pg)
-    except Exception:
-        pass
+    remove_named_placement_group(f"{actor_name}_pg")
 
 
 async def _kill_exact_vllm_actor(*, actor_name: str) -> int:
