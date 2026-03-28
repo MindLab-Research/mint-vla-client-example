@@ -464,6 +464,23 @@ class TrainingWorker:
         )
         logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
 
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        traceparent: str | None = None,
+    ) -> dict:
+        """Delete cached state for a specific session without killing the actor."""
+        _ = traceparent
+        self._touch()
+        deleted = self._state_manager.delete_session(session_id)
+        if self._current_session_id == session_id:
+            self._current_session_id = None
+            self.optimizer.zero_grad(set_to_none=True)
+            self._step_count = 0
+        logger.info(f"[TrainingWorker] Deleted session cache for {session_id} (deleted={deleted})")
+        return {"status": "ok", "session_id": session_id, "deleted": bool(deleted)}
+
     def _idle_watchdog(self) -> None:
         """Background thread that monitors for idle timeout.
 
@@ -3780,21 +3797,19 @@ class VerlTrainingEngine:
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
 
-    async def shutdown_session(self, session: TrainingSession) -> None:
-        """Kill Ray actor to release GPU.
-
-        Args:
-            session: TrainingSession to shutdown.
-        """
+    def _build_session_unbind_plan(self, session: "TrainingSession") -> dict[str, Any]:
         model_id = session.model_id
-
         actor_name = self._resource_pool_actor_names.get(model_id)
         worker = self._workers.get(model_id)
 
         actor_protected = False
         other_users: list[str] = []
         if actor_name:
-            other_users = [mid for mid, an in self._resource_pool_actor_names.items() if an == actor_name and mid != model_id]
+            other_users = [
+                mid
+                for mid, existing_actor_name in self._resource_pool_actor_names.items()
+                if existing_actor_name == actor_name and mid != model_id
+            ]
         should_kill_actor = not other_users
         replacement_session = other_users[0] if other_users else None
         if actor_name:
@@ -3806,6 +3821,66 @@ class VerlTrainingEngine:
                     should_kill_actor = False
             except Exception:
                 pass
+
+        return {
+            "actor_name": actor_name,
+            "worker": worker,
+            "actor_protected": actor_protected,
+            "other_users": other_users,
+            "should_kill_actor": should_kill_actor,
+            "replacement_session": replacement_session,
+        }
+
+    async def _delete_actor_local_session_state(
+        self,
+        session: "TrainingSession",
+        *,
+        worker: ray.actor.ActorHandle | None = None,
+    ) -> None:
+        model_id = session.model_id
+        traceparent = get_current_traceparent()
+        worker = worker or self._workers.get(model_id)
+        delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+
+        if delete_session is not None:
+            try:
+                try:
+                    pending = delete_session.remote(model_id, traceparent=traceparent)
+                except TypeError:
+                    pending = delete_session.remote(model_id)
+                await asyncio.to_thread(ray.get, pending)
+                logger.info(f"[{model_id}] delete_session: actor-local session state deleted")
+                return
+            except Exception:
+                logger.exception(f"[{model_id}] delete_session: actor-local session cleanup failed")
+                raise
+
+        if session.backend == "megatron":
+            from .megatron_distributed import MegatronSessionStateManager
+
+            deleted = MegatronSessionStateManager().delete_session(model_id)
+        else:
+            deleted = SessionStateManager().delete_session(model_id)
+        logger.info(f"[{model_id}] delete_session: local session checkpoint deleted={deleted}")
+
+    async def unbind_session(self, session: TrainingSession) -> None:
+        """Unbind a model_id from the live engine and release its actor if possible."""
+        await self._unbind_session(session)
+
+    async def _unbind_session(
+        self,
+        session: TrainingSession,
+        *,
+        plan: dict[str, Any] | None = None,
+    ) -> None:
+        model_id = session.model_id
+        plan = plan or self._build_session_unbind_plan(session)
+        actor_name = plan["actor_name"]
+        worker = plan["worker"]
+        actor_protected = bool(plan["actor_protected"])
+        other_users = list(plan["other_users"])
+        should_kill_actor = bool(plan["should_kill_actor"])
+        replacement_session = plan["replacement_session"]
 
         self._resource_pool_actor_names.pop(model_id, None)
         self._workers.pop(model_id, None)
@@ -3849,7 +3924,7 @@ class VerlTrainingEngine:
                 try:
                     ray_kill.kill(
                         worker,
-                        reason="shutdown_session",
+                        reason="unbind_session",
                         actor_name=actor_name,
                         namespace=RAY_NAMESPACE,
                         no_restart=True,
@@ -3865,7 +3940,7 @@ class VerlTrainingEngine:
                     actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
                     ray_kill.kill(
                         actor,
-                        reason="shutdown_session_race_no_worker",
+                        reason="unbind_session_race_no_worker",
                         actor_name=actor_name,
                         namespace=RAY_NAMESPACE,
                         no_restart=True,
@@ -3875,15 +3950,25 @@ class VerlTrainingEngine:
                     pass
         else:
             if actor_protected:
-                logger.info(f"[{model_id}] shutdown_session: session deleted; keeping protected actor {actor_name}")
+                logger.info(f"[{model_id}] unbind_session: session released; keeping protected actor {actor_name}")
             else:
                 logger.info(
-                    f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
+                    f"[{model_id}] unbind_session: session released; keeping shared actor {actor_name} "
                     f"(still referenced by {len(other_users)} other model_id(s))"
                 )
 
         session.is_active = False
-        logger.info(f"[{model_id}] TrainingWorker shutdown")
+        logger.info(f"[{model_id}] TrainingWorker unbound")
+
+    async def shutdown_session(self, session: TrainingSession) -> None:
+        """Backward-compatible alias for unbind_session()."""
+        await self.unbind_session(session)
+
+    async def delete_session(self, session: TrainingSession) -> None:
+        """Delete actor-local and persisted state, then unbind the session."""
+        plan = self._build_session_unbind_plan(session)
+        await self._delete_actor_local_session_state(session, worker=plan["worker"])
+        await self._unbind_session(session, plan=plan)
 
 
 # Global engine instance (initialized in app lifespan)
