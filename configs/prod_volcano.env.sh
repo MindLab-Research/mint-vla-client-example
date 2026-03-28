@@ -11,8 +11,8 @@ export TINKER_PORT=18000
 export TINKER_CHECKPOINT_DIR=/tos-mindverse/tinker_checkpoints
 export TINKER_USAGE_LOG_DIR=/vePFS-Mindverse/share/mint-prod-data/billing
 
-export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
-export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
+export MINT_SUPPORTED_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
+export MINT_PERSISTENT_MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507,Qwen/Qwen3-235B-A22B-Instruct-2507"
 export MINT_PERSISTENT_PREWARM_INFERENCE=1
 export MINT_PERSISTENT_PREWARM_TRAINING=1
 export MINT_PERSISTENT_TRAIN_LORA_RANK=64
@@ -26,10 +26,10 @@ export MINT_SCHEDULER_ENABLE=1
 # Current worker topology after 2026-03-12 rebuild:
 # worker1=192.168.37.159 worker2=192.168.37.160 worker3=192.168.37.161 worker4=192.168.37.162
 # worker5=192.168.37.163 worker6=192.168.37.156 worker7=192.168.37.157 worker8=192.168.37.158
-export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.37.159","Qwen/Qwen3-4B-Instruct-2507":"192.168.37.159","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.160"}'
-export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"]}'
-export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"]}'
-export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
+export MINT_VLLM_PINNED_NODE_IP_JSON='{"Qwen/Qwen3-0.6B":"192.168.37.159","Qwen/Qwen3-4B-Instruct-2507":"192.168.37.159","Qwen/Qwen3-4B-Thinking-2507":"192.168.37.159","Qwen/Qwen3-30B-A3B-Instruct-2507":"192.168.37.160"}'
+export MINT_DENSE_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.37.159"]}'
+export MINT_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"]}'
+export MINT_VLLM_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-0.6B":["192.168.37.159"],"Qwen/Qwen3-4B-Instruct-2507":["192.168.37.159"],"Qwen/Qwen3-4B-Thinking-2507":["192.168.37.159"],"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.161","192.168.37.162"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.161","192.168.37.162"]}'
 export MINT_MEGATRON_MODEL_NODE_IPS_JSON='{"Qwen/Qwen3-30B-A3B-Instruct-2507":["192.168.37.160"],"Qwen/Qwen3-235B-A22B-Instruct-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"],"Qwen/Qwen3-235B-A22B-Thinking-2507":["192.168.37.163","192.168.37.156","192.168.37.157","192.168.37.158"]}'
 
 export MINT_MODEL_CONFIG_OVERRIDES_JSON=''
@@ -46,7 +46,8 @@ export MINT_LOG_FILE=/tmp/tinker_server_auth.log
 export MINT_LOG_MAX_BYTES=10485760
 export MINT_LOG_BACKUP_COUNT=5
 export OTEL_SERVICE_NAME=mint
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://apmplus-cn-beijing.ivolces.com:4317
+# export OTEL_EXPORTER_OTLP_ENDPOINT=http://apmplus-cn-beijing.ivolces.com:4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://192.168.4.70:4317
 export OTEL_EXPORTER_OTLP_HEADERS=
 export OTEL_METRIC_EXPORT_INTERVAL_MS=10000
 export OTEL_LOG_LEVEL=DEBUG

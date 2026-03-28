@@ -1,33 +1,17 @@
-"""Dense DPO Test: Preference Optimization.
+"""Dense DPO test via the SDK custom-loss path."""
 
-Tests Direct Preference Optimization on constructed preference pairs.
-
-Pass criteria: DPO loss computes correctly, chosen logprobs > rejected logprobs.
-
-This test collects training curves and saves plots for visual inspection.
-
-NOTE: Requires server-side loss_fn="dpo" support.
-"""
+from __future__ import annotations
 
 import numpy as np
 import pytest
+import tinker
+import torch
+import torch.nn.functional as F
 
-from .conftest import (
-    DENSE_MODEL,
-    create_session,
-    forward_backward,
-    optim_step,
-    save_weights,
-    sample,
-)
-from .utils import (
-    save_training_curve,
-    detect_anomalies,
-    print_test_summary,
-)
+from .conftest import API_KEY, BASE_URL, DENSE_MODEL
+from .utils import detect_anomalies, print_test_summary, save_training_curve
 
 
-# DPO preference pairs: chosen = concise, rejected = verbose
 DPO_PAIRS = [
     {
         "prompt": "Explain what Python is in one sentence.",
@@ -57,181 +41,181 @@ DPO_PAIRS = [
 ]
 
 
-def get_ref_logprobs(tokenizer, model_id: str, tokens: list) -> list:
-    """Get reference logprobs from base model."""
-    # Use sampling with temperature=0 to get deterministic logprobs
-    result = sample(
-        model_id,
-        tokens[:-1],  # Input tokens
-        max_tokens=1,
-        temperature=0.0,
-        include_prompt_logprobs=True
-    )
-
-    if "error" in result:
-        return [0.0] * len(tokens)
-
-    # Extract prompt logprobs - at root level of response, not inside samples
-    prompt_logprobs = result.get("prompt_logprobs", [])
-    if prompt_logprobs:
-        # Pad to match sequence length
-        while len(prompt_logprobs) < len(tokens):
-            prompt_logprobs.append(0.0)
-        return prompt_logprobs[:len(tokens)]
-
-    return [0.0] * len(tokens)
+def _tensor(values: list[int] | list[float], dtype: str) -> tinker.types.TensorData:
+    return tinker.types.TensorData(data=list(values), shape=[len(values)], dtype=dtype)
 
 
-def prepare_dpo_data(tokenizer, model_id: str) -> tuple[list, dict]:
-    """Prepare DPO training data with reference logprobs."""
-    api_data = []
+def _sdk_api_key(api_key: str) -> str:
+    return api_key if api_key.startswith("tml-") else f"tml-{api_key}"
+
+
+def _prepare_dpo_data(tokenizer) -> tuple[list[tinker.types.Datum], list[tinker.types.ModelInput], dict]:
+    data: list[tinker.types.Datum] = []
+    full_sequences: list[tinker.types.ModelInput] = []
     metadata = {"pairs": []}
-
-    # First, save weights to enable sampling
-    save_weights(model_id, name="ref")
 
     for pair in DPO_PAIRS:
         prompt_text = f"Q: {pair['prompt']}\nA:"
         prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
-
-        # Encode chosen and rejected
         chosen_tokens = tokenizer.encode(f" {pair['chosen']}", add_special_tokens=False)
         rejected_tokens = tokenizer.encode(f" {pair['rejected']}", add_special_tokens=False)
 
-        # Build full sequences
         chosen_full = prompt_tokens + chosen_tokens
         rejected_full = prompt_tokens + rejected_tokens
+        chosen_weights = [0.0] * len(prompt_tokens) + [1.0] * len(chosen_tokens)
+        rejected_weights = [0.0] * len(prompt_tokens) + [1.0] * len(rejected_tokens)
 
-        # Get reference logprobs (from current model as reference)
-        chosen_ref_logprobs = get_ref_logprobs(tokenizer, model_id, chosen_full)
-        rejected_ref_logprobs = get_ref_logprobs(tokenizer, model_id, rejected_full)
+        data.append(
+            tinker.types.Datum(
+                model_input=tinker.types.ModelInput.from_ints(chosen_full[:-1]),
+                loss_fn_inputs={
+                    "target_tokens": _tensor(chosen_full[1:], "int64"),
+                    "weights": _tensor(chosen_weights[1:], "float32"),
+                },
+            )
+        )
+        data.append(
+            tinker.types.Datum(
+                model_input=tinker.types.ModelInput.from_ints(rejected_full[:-1]),
+                loss_fn_inputs={
+                    "target_tokens": _tensor(rejected_full[1:], "int64"),
+                    "weights": _tensor(rejected_weights[1:], "float32"),
+                },
+            )
+        )
+        full_sequences.append(tinker.types.ModelInput.from_ints(chosen_full))
+        full_sequences.append(tinker.types.ModelInput.from_ints(rejected_full))
+        metadata["pairs"].append(
+            {
+                "prompt": pair["prompt"],
+                "chosen_len": len(chosen_tokens),
+                "rejected_len": len(rejected_tokens),
+            }
+        )
 
-        # Loss mask: only on response tokens
-        chosen_mask = [0.0] * len(prompt_tokens) + [1.0] * len(chosen_tokens)
-        rejected_mask = [0.0] * len(prompt_tokens) + [1.0] * len(rejected_tokens)
-
-        # Chosen datum
-        api_data.append({
-            "model_input": {"chunks": [{"tokens": chosen_full[:-1], "type": "encoded_text"}]},
-            "loss_fn_inputs": {
-                "target_tokens": {"data": chosen_full[1:], "shape": [len(chosen_full) - 1], "dtype": "int64"},
-                "loss_mask": {"data": chosen_mask[1:], "shape": [len(chosen_mask) - 1], "dtype": "float32"},
-                "ref_logprobs": {"data": chosen_ref_logprobs[1:], "shape": [len(chosen_ref_logprobs) - 1], "dtype": "float32"},
-                "is_chosen": True,
-            },
-        })
-
-        # Rejected datum
-        api_data.append({
-            "model_input": {"chunks": [{"tokens": rejected_full[:-1], "type": "encoded_text"}]},
-            "loss_fn_inputs": {
-                "target_tokens": {"data": rejected_full[1:], "shape": [len(rejected_full) - 1], "dtype": "int64"},
-                "loss_mask": {"data": rejected_mask[1:], "shape": [len(rejected_mask) - 1], "dtype": "float32"},
-                "ref_logprobs": {"data": rejected_ref_logprobs[1:], "shape": [len(rejected_ref_logprobs) - 1], "dtype": "float32"},
-                "is_chosen": False,
-            },
-        })
-
-        metadata["pairs"].append({
-            "prompt": pair["prompt"],
-            "chosen_len": len(chosen_tokens),
-            "rejected_len": len(rejected_tokens),
-        })
-
-    return api_data, metadata
+    return data, full_sequences, metadata
 
 
-def compute_dpo_metrics(result: dict) -> dict:
-    """Extract DPO metrics from forward_backward result."""
-    metrics = result.get("metrics", {})
-
-    # Get logprobs for chosen and rejected
-    loss_outputs = result.get("loss_fn_outputs", [])
-
-    chosen_logprobs = []
-    rejected_logprobs = []
-
-    for i, output in enumerate(loss_outputs):
-        logprobs = output.get("logprobs", [])
-        if logprobs:
-            avg_logprob = np.mean(logprobs)
-            if i % 2 == 0:  # Even indices are chosen
-                chosen_logprobs.append(avg_logprob)
-            else:  # Odd indices are rejected
-                rejected_logprobs.append(avg_logprob)
-
-    chosen_avg = np.mean(chosen_logprobs) if chosen_logprobs else 0.0
-    rejected_avg = np.mean(rejected_logprobs) if rejected_logprobs else 0.0
-    margin = chosen_avg - rejected_avg
-
-    return {
-        "loss": metrics.get("loss:mean", 0),
-        "chosen_logprob": chosen_avg,
-        "rejected_logprob": rejected_avg,
-        "margin": margin,
+def _compute_dpo_loss(
+    *,
+    chosen_logprobs: list[torch.Tensor],
+    rejected_logprobs: list[torch.Tensor],
+    chosen_ref_logprobs: list[torch.Tensor],
+    rejected_ref_logprobs: list[torch.Tensor],
+    dpo_beta: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    chosen_log_ratio = torch.stack(
+        [lp - rlp for lp, rlp in zip(chosen_logprobs, chosen_ref_logprobs, strict=True)]
+    )
+    rejected_log_ratio = torch.stack(
+        [lp - rlp for lp, rlp in zip(rejected_logprobs, rejected_ref_logprobs, strict=True)]
+    )
+    losses = -F.logsigmoid(dpo_beta * (chosen_log_ratio - rejected_log_ratio))
+    loss = losses.mean()
+    chosen_rewards = dpo_beta * chosen_log_ratio
+    rejected_rewards = dpo_beta * rejected_log_ratio
+    metrics = {
+        "dpo_loss": float(loss.item()),
+        "accuracy": float((chosen_log_ratio > rejected_log_ratio).float().mean().item()),
+        "margin": float((chosen_rewards - rejected_rewards).mean().item()),
+        "chosen_reward": float(chosen_rewards.mean().item()),
+        "rejected_reward": float(rejected_rewards.mean().item()),
     }
+    return loss, metrics
 
 
 class TestDenseDPO:
-    """Dense model DPO training tests."""
-
     def test_dpo_training(self, tokenizer):
-        """Test DPO training on preference pairs.
-
-        Expected: Chosen responses get higher logprobs than rejected.
-        Saves training curve for visual inspection.
-        """
         num_iterations = 8
-        lr = 1e-5  # Lower LR for DPO
+        lr = 1e-5
         dpo_beta = 0.1
 
-        # Create session
-        session_id, model_id = create_session(DENSE_MODEL, lora_rank=32, lr=lr)
+        service_client = tinker.ServiceClient(base_url=BASE_URL, api_key=_sdk_api_key(API_KEY))
+        training_client = service_client.create_lora_training_client(
+            base_model=DENSE_MODEL,
+            rank=32,
+        )
+        reference_client = training_client.save_weights_and_get_sampling_client("reference")
 
-        # Prepare data
-        api_data, data_metadata = prepare_dpo_data(tokenizer, model_id)
+        data, full_sequences, _ = _prepare_dpo_data(tokenizer)
+        chosen_data = [datum for idx, datum in enumerate(data) if idx % 2 == 0]
+        rejected_data = [datum for idx, datum in enumerate(data) if idx % 2 == 1]
+        all_ref_logprob_seqs = [
+            torch.tensor(reference_client.compute_logprobs(seq).result()[1:])
+            for seq in full_sequences
+        ]
+        chosen_ref_logprob_seqs = [all_ref_logprob_seqs[idx] for idx in range(0, len(data), 2)]
+        rejected_ref_logprob_seqs = [all_ref_logprob_seqs[idx] for idx in range(1, len(data), 2)]
 
-        # Training loop - collect all metrics
+        def dpo_loss_fn(
+            batch: list[tinker.types.Datum], logprobs_list: list[torch.Tensor]
+        ) -> tuple[torch.Tensor, dict[str, float]]:
+            chosen_logprob_seqs = [logprobs_list[idx] for idx in range(0, len(batch), 2)]
+            rejected_logprob_seqs = [logprobs_list[idx] for idx in range(1, len(batch), 2)]
+            chosen_logprobs: list[torch.Tensor] = []
+            rejected_logprobs: list[torch.Tensor] = []
+            chosen_ref_logprobs: list[torch.Tensor] = []
+            rejected_ref_logprobs: list[torch.Tensor] = []
+
+            for idx in range(len(chosen_data)):
+                chosen_weights = torch.tensor(chosen_data[idx].loss_fn_inputs["weights"].data)
+                chosen_logprobs.append(torch.dot(chosen_logprob_seqs[idx].float(), chosen_weights.float()))
+                chosen_ref_logprobs.append(
+                    torch.dot(chosen_ref_logprob_seqs[idx].float(), chosen_weights.float())
+                )
+
+                rejected_weights = torch.tensor(rejected_data[idx].loss_fn_inputs["weights"].data)
+                rejected_logprobs.append(torch.dot(rejected_logprob_seqs[idx].float(), rejected_weights.float()))
+                rejected_ref_logprobs.append(
+                    torch.dot(rejected_ref_logprob_seqs[idx].float(), rejected_weights.float())
+                )
+
+            return _compute_dpo_loss(
+                chosen_logprobs=chosen_logprobs,
+                rejected_logprobs=rejected_logprobs,
+                chosen_ref_logprobs=chosen_ref_logprobs,
+                rejected_ref_logprobs=rejected_ref_logprobs,
+                dpo_beta=dpo_beta,
+            )
+
         metrics = {
             "losses": [],
-            "chosen_logprobs": [],
-            "rejected_logprobs": [],
+            "chosen_rewards": [],
+            "rejected_rewards": [],
             "margins": [],
         }
 
         import time
+
         for i in range(num_iterations):
             t0 = time.time()
-
-            # Forward-backward with DPO loss
-            result = forward_backward(
-                model_id,
-                api_data,
-                loss_fn="dpo",
-                loss_fn_config={"beta": dpo_beta}
-            )
-
-            # Collect metrics
-            dpo_metrics = compute_dpo_metrics(result)
-            metrics["losses"].append(dpo_metrics["loss"])
-            metrics["chosen_logprobs"].append(dpo_metrics["chosen_logprob"])
-            metrics["rejected_logprobs"].append(dpo_metrics["rejected_logprob"])
+            backward_result = training_client.forward_backward_custom(data, dpo_loss_fn).result()
+            dpo_metrics = backward_result.metrics
+            metrics["losses"].append(dpo_metrics["dpo_loss"])
+            metrics["chosen_rewards"].append(dpo_metrics["chosen_reward"])
+            metrics["rejected_rewards"].append(dpo_metrics["rejected_reward"])
             metrics["margins"].append(dpo_metrics["margin"])
 
-            # Optim step
-            optim_result = optim_step(model_id, lr=lr)
-            grad_norm = optim_result.get("metrics", {}).get("grad_norm", 0)
-
+            optim_result = training_client.optim_step(
+                tinker.AdamParams(
+                    learning_rate=lr,
+                    beta1=0.9,
+                    beta2=0.95,
+                    eps=1e-12,
+                )
+            ).result()
+            grad_norm = optim_result.metrics.get("grad_norm:last") or optim_result.metrics.get("grad_norm") or 0.0
             iteration_time = time.time() - t0
-            print(f"Iteration {i+1}: loss={dpo_metrics['loss']:.4f}, "
-                  f"chosen={dpo_metrics['chosen_logprob']:.3f}, "
-                  f"rejected={dpo_metrics['rejected_logprob']:.3f}, "
-                  f"margin={dpo_metrics['margin']:.3f}, "
-                  f"grad_norm={grad_norm:.6f}, "
-                  f"time={iteration_time:.2f}s")
+            print(
+                f"Iteration {i+1}: loss={dpo_metrics['dpo_loss']:.4f}, "
+                f"chosen={dpo_metrics['chosen_reward']:.3f}, "
+                f"rejected={dpo_metrics['rejected_reward']:.3f}, "
+                f"margin={dpo_metrics['margin']:.3f}, "
+                f"grad_norm={grad_norm:.6f}, "
+                f"time={iteration_time:.2f}s"
+            )
 
-        # Save training curves
-        data_path, plot_path = save_training_curve(
+        _, plot_path = save_training_curve(
             metrics,
             "dense_dpo_preference",
             metadata={
@@ -241,23 +225,19 @@ class TestDenseDPO:
                 "num_iterations": num_iterations,
                 "num_pairs": len(DPO_PAIRS),
             },
-            plot_title="Dense DPO: Training Curves"
+            plot_title="Dense DPO: Training Curves",
         )
 
-        # Detect anomalies
         anomalies = detect_anomalies(metrics["losses"], "loss")
-
-        # Check margin trend
         if len(metrics["margins"]) >= 2:
             margin_improvement = metrics["margins"][-1] - metrics["margins"][0]
             if margin_improvement < 0:
-                anomalies.append(f"Margin decreased: {metrics['margins'][0]:.3f} -> {metrics['margins'][-1]:.3f}")
-
-        # Check final margin is positive
+                anomalies.append(
+                    f"Margin decreased: {metrics['margins'][0]:.3f} -> {metrics['margins'][-1]:.3f}"
+                )
         if metrics["margins"] and metrics["margins"][-1] < 0:
             anomalies.append(f"Final margin negative: {metrics['margins'][-1]:.3f} (chosen < rejected)")
 
-        # Print summary
         print_test_summary(
             "Dense DPO (Preference)",
             metrics,
@@ -268,25 +248,14 @@ class TestDenseDPO:
                 "Initial margin": f"{metrics['margins'][0]:.3f}" if metrics["margins"] else "N/A",
                 "Final margin": f"{metrics['margins'][-1]:.3f}" if metrics["margins"] else "N/A",
                 "Num pairs": len(DPO_PAIRS),
-            }
+            },
         )
 
-        # Programmatic checks
         assert len(metrics["losses"]) > 0, "No training iterations completed"
-
-        # DPO loss should be computable
         for loss in metrics["losses"]:
             assert not np.isnan(loss) and not np.isinf(loss), f"Invalid DPO loss: {loss}"
-
-        # Margin should improve or stay reasonable
-        if len(metrics["margins"]) >= 2:
-            final_margin = metrics["margins"][-1]
-            if final_margin < -1.0:
-                pytest.fail(
-                    f"Margin too negative: {final_margin:.3f} (model prefers rejected)\n"
-                    f"Inspect training curve: {plot_path}"
-                )
-
-        # Warn if anomalies but passed
-        if anomalies:
-            pytest.warns(UserWarning, match="Anomalies detected")
+        if len(metrics["margins"]) >= 2 and metrics["margins"][-1] < -1.0:
+            pytest.fail(
+                f"Margin too negative: {metrics['margins'][-1]:.3f} (model prefers rejected)\n"
+                f"Inspect training curve: {plot_path}"
+            )

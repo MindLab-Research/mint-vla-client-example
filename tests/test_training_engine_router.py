@@ -20,6 +20,10 @@ class _RecordingEngine:
         self.calls.append(("forward_backward", session.base_model))
         return {"engine": self.label, "request": request}
 
+    async def forward_backward_reverse_kl(self, session, request):
+        self.calls.append(("forward_backward_reverse_kl", session.base_model))
+        return {"engine": self.label, "request": request}
+
     def _resolve_hf_model_path(self, model_name: str):
         self.calls.append(("resolve", model_name))
         return f"/models/{model_name}"
@@ -85,3 +89,16 @@ def test_training_engine_router_forwards_hf_path_resolution_to_text_engine() -> 
 
     assert resolved == "/models/Qwen/Qwen3-0.6B"
     assert text_engine.calls == [("resolve", "Qwen/Qwen3-0.6B")]
+
+
+def test_training_engine_router_keeps_reverse_kl_on_text_engine() -> None:
+    text_engine = _RecordingEngine("text")
+    openpi_fast_engine = _RecordingEngine("openpi-fast")
+    router = TrainingEngineRouter(text_engine=text_engine, openpi_fast_engine=openpi_fast_engine)
+    session = SimpleNamespace(base_model="Qwen/Qwen3-0.6B")
+
+    result = asyncio.run(router.forward_backward_reverse_kl(session, request={"batch": 3}))
+
+    assert result == {"engine": "text", "request": {"batch": 3}}
+    assert text_engine.calls == [("forward_backward_reverse_kl", "Qwen/Qwen3-0.6B")]
+    assert openpi_fast_engine.calls == []

@@ -63,6 +63,9 @@ class TrainingEngineRouter:
     async def forward(self, session: Any, request: Any) -> Any:
         return await self._engine_for_session(session).forward(session, request)
 
+    async def forward_backward_reverse_kl(self, session: Any, request: Any) -> Any:
+        return await self._text_engine.forward_backward_reverse_kl(session, request)
+
     async def get_tokenizer_info(self, session: Any) -> Any:
         return await self._engine_for_session(session).get_tokenizer_info(session)
 

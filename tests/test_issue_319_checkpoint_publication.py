@@ -13,6 +13,23 @@ def _touch(path: Path, data: bytes = b"") -> None:
     path.write_bytes(data)
 
 
+class _StubTrainingManager:
+    def __init__(self, session: SimpleNamespace) -> None:
+        self._session = session
+
+    def get_session(self, _model_id: str) -> SimpleNamespace:
+        return self._session
+
+    def mark_inflight(self, _model_id: str, _delta: int) -> None:
+        return None
+
+
+class _StubFutureStore:
+    def __init__(self, *, resolve=None, async_fail=None) -> None:
+        self.resolve = resolve or (lambda *_args, **_kwargs: None)
+        self.async_fail = async_fail or (lambda *_args, **_kwargs: None)
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -35,11 +52,14 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
         failed["request_id"] = request_id
         failed["error"] = error
 
+    async def _async_fail(request_id: str, error: str) -> None:
+        _fail(request_id, error)
+
     monkeypatch.setattr(
         tr,
         "training_manager",
-        SimpleNamespace(
-            get_session=lambda _model_id: SimpleNamespace(
+        _StubTrainingManager(
+            SimpleNamespace(
                 model_id="run-319",
                 base_model="Qwen/Qwen3-0.6B",
                 current_step=5,
@@ -53,7 +73,11 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
         "training_engine",
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
-    monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+    )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-bad")
     await tr._do_save_weights_for_sampler(
@@ -87,11 +111,14 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
         failed["request_id"] = request_id
         failed["error"] = error
 
+    async def _async_fail(request_id: str, error: str) -> None:
+        _fail(request_id, error)
+
     monkeypatch.setattr(
         tr,
         "training_manager",
-        SimpleNamespace(
-            get_session=lambda _model_id: SimpleNamespace(
+        _StubTrainingManager(
+            SimpleNamespace(
                 model_id="run-319",
                 base_model="Qwen/Qwen3-0.6B",
                 current_step=5,
@@ -105,7 +132,11 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
         "training_engine",
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
-    monkeypatch.setattr(tr, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(
+        tr,
+        "future_store",
+        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+    )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
     await tr._do_save_weights_for_sampler(
@@ -137,19 +168,27 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
         failed["request_id"] = request_id
         failed["error"] = error
 
+    async def _async_fail(request_id: str, error: str) -> None:
+        _fail(request_id, error)
+
     monkeypatch.setattr(
         wt,
         "training_manager",
-        SimpleNamespace(
-            get_session=lambda _model_id: SimpleNamespace(
+        _StubTrainingManager(
+            SimpleNamespace(
                 model_id="run-319",
                 base_model="Qwen/Qwen3-0.6B",
                 current_step=7,
+                backend="dense",
             )
         ),
     )
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
-    monkeypatch.setattr(wt, "future_store", SimpleNamespace(resolve=lambda *_args, **_kwargs: None, fail=_fail))
+    monkeypatch.setattr(
+        wt,
+        "future_store",
+        _StubFutureStore(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+    )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     request = SaveStateRequest(model_id="run-319", path="training-bad")
     await wt._do_save_state(
@@ -186,11 +225,14 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
         resolved["request_id"] = request_id
         resolved["payload"] = payload
 
+    async def _async_fail(*_args, **_kwargs) -> None:
+        raise AssertionError("unexpected async_fail")
+
     monkeypatch.setattr(
         wt,
         "training_manager",
-        SimpleNamespace(
-            get_session=lambda _model_id: SimpleNamespace(
+        _StubTrainingManager(
+            SimpleNamespace(
                 model_id="run-319-openpi",
                 base_model="openpi/pi0-fast-libero-low-mem-finetune",
                 current_step=7,
@@ -199,7 +241,11 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
         ),
     )
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
-    monkeypatch.setattr(wt, "future_store", SimpleNamespace(resolve=_resolve, fail=lambda *_args: None))
+    monkeypatch.setattr(
+        wt,
+        "future_store",
+        _StubFutureStore(resolve=_resolve, async_fail=_async_fail),
+    )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(wt, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None)
     request = SaveStateRequest(model_id="run-319-openpi", path="training-openpi")

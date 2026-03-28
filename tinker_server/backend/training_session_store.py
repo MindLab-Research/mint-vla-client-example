@@ -8,14 +8,35 @@ This supports recovery after API server restarts:
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import os
+import time
 from typing import Any
 
 from ..config import otel_env_vars
 
 
 logger = logging.getLogger(__name__)
+_ACTOR_HANDLE = None
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    if hasattr(ref, "__await__"):
+        return await ref
+
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, asyncio.Future):
+            return await fut
+        if isinstance(fut, concurrent.futures.Future):
+            return await asyncio.wrap_future(fut)
+        if hasattr(fut, "__await__"):
+            return await fut
+
+    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 def _ray_namespace() -> str:
@@ -37,10 +58,12 @@ def _actor_name() -> str:
 def _get_or_create_actor():
     import ray
 
+    global _ACTOR_HANDLE
     name = _actor_name()
     namespace = _ray_namespace()
     try:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
     except ValueError:
         pass
 
@@ -71,6 +94,20 @@ def _get_or_create_actor():
             s["current_step"] = int(s.get("current_step", 0)) + 1
             return int(s["current_step"])
 
+        def set_step(self, model_id: str, step: int) -> int:
+            s = self._sessions.get(model_id)
+            if s is None:
+                return int(step)
+            s["current_step"] = max(int(s.get("current_step", 0)), int(step))
+            return int(s["current_step"])
+
+        def set_last_activity(self, model_id: str, last_activity: float) -> float | None:
+            s = self._sessions.get(model_id)
+            if s is None:
+                return None
+            s["last_activity"] = float(last_activity)
+            return float(s["last_activity"])
+
         def list(self) -> list[dict[str, Any]]:
             return list(self._sessions.values())
 
@@ -79,21 +116,87 @@ def _get_or_create_actor():
         "namespace": namespace,
         "lifetime": "detached",
     }
+    try:
+        if "node:__internal_head__" in ray.cluster_resources():
+            options["resources"] = {"node:__internal_head__": 0.001}
+    except Exception:
+        pass
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
-    options["runtime_env"] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=PFS_PYTHONPATH,
-            extra=actor_otel_env,
-        )
-    }
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=actor_otel_env,
+    )
 
     try:
-        return _TrainingSessionStoreActor.options(
+        _ACTOR_HANDLE = _TrainingSessionStoreActor.options(
             **options
         ).remote()
+        return _ACTOR_HANDLE
     except Exception:
-        return ray.get_actor(name, namespace=namespace)
+        _ACTOR_HANDLE = ray.get_actor(name, namespace=namespace)
+        return _ACTOR_HANDLE
+
+
+def _get_cached_actor_for_async_request_path():
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    if _ACTOR_HANDLE is None:
+        raise RuntimeError("Training session store actor is not ready on this API server")
+    return _ACTOR_HANDLE
+
+
+async def _reacquire_actor_for_async_request_path():
+    import ray
+
+    global _ACTOR_HANDLE
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+
+    try:
+        _ACTOR_HANDLE = await asyncio.to_thread(
+            ray.get_actor,
+            _actor_name(),
+            namespace=_ray_namespace(),
+        )
+    except ValueError as e:
+        _ACTOR_HANDLE = None
+        raise RuntimeError("Training session store actor is not ready on this API server") from e
+    return _ACTOR_HANDLE
+
+
+async def _get_actor_for_async_request_path():
+    if _ACTOR_HANDLE is not None:
+        return _ACTOR_HANDLE
+    return await _reacquire_actor_for_async_request_path()
+
+
+async def _call_actor_for_async_request_path(remote_call):
+    import ray
+
+    global _ACTOR_HANDLE
+
+    actor = await _get_actor_for_async_request_path()
+    try:
+        return await _await_ray_ref(remote_call(actor))
+    except (ray.exceptions.ActorDiedError, ray.exceptions.RayActorError):
+        _ACTOR_HANDLE = None
+        actor = await _reacquire_actor_for_async_request_path()
+        return await _await_ray_ref(remote_call(actor))
+
+
+def ensure_ready() -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    out = ray.get(actor.list.remote())
+    if not isinstance(out, list):
+        raise TypeError(f"Training session store returned non-list: {type(out)}")
 
 
 def upsert_training_session(info: dict[str, Any]) -> None:
@@ -104,6 +207,7 @@ def upsert_training_session(info: dict[str, Any]) -> None:
         return
     payload = dict(info)
     payload.setdefault("current_step", 0)
+    payload.setdefault("last_activity", time.time())
     try:
         actor = _get_or_create_actor()
         actor.upsert.remote(str(payload.get("model_id", "")), payload)
@@ -124,6 +228,18 @@ def delete_training_session(model_id: str) -> None:
         logger.warning("Training session store write failed: delete: %s", e)
 
 
+def set_training_session_last_activity(model_id: str, last_activity: float) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        return
+    try:
+        actor = _get_or_create_actor()
+        actor.set_last_activity.remote(model_id, float(last_activity))
+    except Exception as e:
+        logger.debug("Training session store write failed: last_activity: %s", e)
+
+
 def get_training_session_info(model_id: str) -> dict[str, Any] | None:
     import ray
 
@@ -133,6 +249,53 @@ def get_training_session_info(model_id: str) -> dict[str, Any] | None:
     return ray.get(actor.get.remote(model_id))
 
 
+def bump_training_session_step(model_id: str) -> int:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return int(ray.get(actor.bump_step.remote(model_id)))
+
+
+def set_training_session_step(model_id: str, step: int) -> int:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    return int(ray.get(actor.set_step.remote(model_id, int(step))))
+
+
+async def async_get_training_session_info(model_id: str) -> dict[str, Any] | None:
+    out = await _call_actor_for_async_request_path(
+        lambda actor: actor.get.remote(model_id)
+    )
+    if out is None:
+        return None
+    if not isinstance(out, dict):
+        raise TypeError(f"Training session store returned non-dict: {type(out)}")
+    return out
+
+
+def set_training_session_step_best_effort(model_id: str, step: int) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    actor.set_step.remote(model_id, int(step))
+
+
+def bump_training_session_step_best_effort(model_id: str) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Ray not initialized")
+    actor = _get_or_create_actor()
+    actor.bump_step.remote(model_id)
+
+
 def list_training_sessions() -> list[dict[str, Any]]:
     import ray
 
@@ -140,3 +303,12 @@ def list_training_sessions() -> list[dict[str, Any]]:
         raise RuntimeError("Ray not initialized")
     actor = _get_or_create_actor()
     return ray.get(actor.list.remote())
+
+
+async def async_list_training_sessions() -> list[dict[str, Any]]:
+    out = await _call_actor_for_async_request_path(
+        lambda actor: actor.list.remote()
+    )
+    if not isinstance(out, list):
+        raise TypeError(f"Training session store returned non-list: {type(out)}")
+    return [dict(item) for item in out if isinstance(item, dict)]

@@ -12,16 +12,17 @@ from tinker_server.routes import futures as futures_route
 def _reset_retrieve_future_caches(monkeypatch):
     monkeypatch.setattr(futures_route, "_RECENT", futures_route.OrderedDict())
     monkeypatch.setattr(futures_route, "_PENDING_HINTS", futures_route.OrderedDict())
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "0")
 
 
 class _StubFutureStore:
     def __init__(self, meta: dict):
         self._meta = dict(meta)
 
-    def get_status(self, request_id: str) -> FutureStatus:
+    async def async_get_status(self, request_id: str) -> FutureStatus:
         return FutureStatus.PENDING
 
-    def get_meta(self, request_id: str):
+    async def async_get_meta(self, request_id: str):
         return dict(self._meta)
 
 
@@ -183,7 +184,10 @@ def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
         )
 
     monkeypatch.setattr(gateway, "forward_json", _forward_json)
-    monkeypatch.setattr(gateway, "maybe_register_sampling_session_from_retrieve_future", lambda **kwargs: None)
+    async def _register_sampling_session(**kwargs):
+        return None
+
+    monkeypatch.setattr(gateway, "async_maybe_register_sampling_session_from_retrieve_future", _register_sampling_session)
 
     body = FutureRetrieveRequest(request_id="gw:upstream-a:encoded-xyz")
     response = _response_stub()
@@ -212,7 +216,10 @@ def test_issue_182_gateway_request_id_overrides_upstream_200(monkeypatch):
         )
 
     monkeypatch.setattr(gateway, "forward_json", _forward_json)
-    monkeypatch.setattr(gateway, "maybe_register_sampling_session_from_retrieve_future", lambda **kwargs: None)
+    async def _register_sampling_session(**kwargs):
+        return None
+
+    monkeypatch.setattr(gateway, "async_maybe_register_sampling_session_from_retrieve_future", _register_sampling_session)
 
     body = FutureRetrieveRequest(request_id="gw:upstream-a:encoded-xyz")
     response = _response_stub()
@@ -246,6 +253,78 @@ def test_issue_182_scheduler_enabled_omits_queue_fields(monkeypatch):
     assert response.headers.get("X-Queue-Depth") is None
     assert response.headers.get("X-Queue-Position") is None
     assert response.headers.get("X-Queue-ETA-S") is None
+
+
+def test_issue_182_scheduler_default_enabled_omits_queue_fields(monkeypatch):
+    meta = {"queue_state": "queued", "stage": "queued", "op": "training.forward_backward"}
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueue(depth=7, position=3, ema_exec_s=4.0))
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+    monkeypatch.delenv("MINT_SCHEDULER_ENABLE", raising=False)
+
+    body = FutureRetrieveRequest(request_id="rid_sched_default")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("queue_state_reason") == "scheduler_enabled"
+    assert payload.get("queue_depth") is None
+    assert payload.get("queue_position") is None
+    assert payload.get("estimated_wait_s") is None
+    assert response.headers.get("X-Queue-Depth") is None
+    assert response.headers.get("X-Queue-Position") is None
+    assert response.headers.get("X-Queue-ETA-S") is None
+
+
+def test_issue_182_scheduler_enabled_pending_payload_ignores_queue_lookup_outage(monkeypatch):
+    meta = {"queue_state": "queued", "stage": "queued", "op": "training.forward_backward"}
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueueUnavailable())
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+
+    body = FutureRetrieveRequest(request_id="rid_sched_unavailable")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("queue_state_reason") == "scheduler_enabled"
+    assert payload.get("queue_depth") is None
+    assert payload.get("queue_position") is None
+    assert payload.get("estimated_wait_s") is None
+
+
+def test_issue_182_scheduler_enabled_on_pending_payload_ignores_queue_lookup_outage(monkeypatch):
+    meta = {"queue_state": "queued", "stage": "queued", "op": "training.forward_backward"}
+    monkeypatch.setattr(futures_route, "future_store", _StubFutureStore(meta))
+    import tinker_server.backend.api_work_queue as wq
+
+    monkeypatch.setattr(wq, "api_work_queue", _StubApiWorkQueueUnavailable())
+    import tinker_server.config as config_module
+
+    monkeypatch.setattr(config_module.config, "api_work_queue_num_workers", 2, raising=False)
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "on")
+
+    body = FutureRetrieveRequest(request_id="rid_sched_on")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload.get("status") == "queued"
+    assert payload.get("queue_state_reason") == "scheduler_enabled"
+    assert payload.get("queue_depth") is None
+    assert payload.get("queue_position") is None
+    assert payload.get("estimated_wait_s") is None
 
 
 def test_issue_182_non_sampling_status_is_generic(monkeypatch):

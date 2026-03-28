@@ -56,6 +56,13 @@ def poll_future(request_id: str, timeout: int = 300, request_timeout: int = 120)
     raise TimeoutError(f"Operation request_id={request_id} did not complete within {timeout}s")
 
 
+def _raise_if_future_failed(result: dict, *, op: str) -> dict:
+    """Fail closed when an async API future resolves to an error payload."""
+    if "error" in result:
+        raise RuntimeError(f"{op} failed: {result['error']}")
+    return result
+
+
 def create_session(base_model: str, lora_rank: int = 32, lr: float = 1e-4) -> tuple[str, str]:
     """Create training session. Returns (session_id, model_id)."""
     session_id = f"merge_gate_{uuid.uuid4().hex[:8]}"
@@ -69,9 +76,10 @@ def create_session(base_model: str, lora_rank: int = 32, lr: float = 1e-4) -> tu
     }
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=300)
     resp.raise_for_status()
-    result = poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
-    if "error" in result:
-        raise RuntimeError(f"Session creation failed: {result['error']}")
+    result = _raise_if_future_failed(
+        poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S),
+        op="create_session",
+    )
     return session_id, result.get("model_id")
 
 
@@ -88,7 +96,10 @@ def forward_backward(model_id: str, data: list, loss_fn: str = "cross_entropy",
 
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
+    return _raise_if_future_failed(
+        poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S),
+        op="forward_backward",
+    )
 
 
 def optim_step(model_id: str, lr: float = 1e-4) -> dict:
@@ -102,7 +113,10 @@ def optim_step(model_id: str, lr: float = 1e-4) -> dict:
     resp.raise_for_status()
     # Under concurrent load, optim_step can queue behind other long-running GPU work.
     # Use the suite-wide poll timeout rather than failing fast at 60s.
-    return poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
+    return _raise_if_future_failed(
+        poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S),
+        op="optim_step",
+    )
 
 
 def train_step(model_id: str, data: list, lr: float = 1e-4, loss_fn: str = "cross_entropy") -> dict:
@@ -115,7 +129,10 @@ def train_step(model_id: str, data: list, lr: float = 1e-4, loss_fn: str = "cros
     }
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S)
+    return _raise_if_future_failed(
+        poll_future(resp.json().get("request_id"), timeout=DEFAULT_POLL_TIMEOUT_S),
+        op="train_step",
+    )
 
 
 def save_weights(model_id: str, name: str = "test") -> dict:
@@ -129,11 +146,36 @@ def save_weights(model_id: str, name: str = "test") -> dict:
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
     # MoE models need longer timeout for vLLM engine + CUDA graph capture
-    return poll_future(
-        resp.json().get("request_id"),
-        timeout=DEFAULT_POLL_TIMEOUT_S,
-        request_timeout=180,
+    return _raise_if_future_failed(
+        poll_future(
+            resp.json().get("request_id"),
+            timeout=DEFAULT_POLL_TIMEOUT_S,
+            request_timeout=180,
+        ),
+        op="save_weights",
     )
+
+
+def save_weights_for_sampler(model_id: str, ttl_seconds: int | None = None) -> str:
+    """Create an ephemeral sampling session from the current training weights."""
+    url = f"{BASE_URL}/api/v1/save_weights_for_sampler"
+    payload: dict = {"model_id": model_id}
+    if ttl_seconds is not None:
+        payload["ttl_seconds"] = ttl_seconds
+    resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+    resp.raise_for_status()
+    result = _raise_if_future_failed(
+        poll_future(
+            resp.json().get("request_id"),
+            timeout=DEFAULT_POLL_TIMEOUT_S,
+            request_timeout=180,
+        ),
+        op="save_weights_for_sampler",
+    )
+    sampling_session_id = result.get("sampling_session_id")
+    if not isinstance(sampling_session_id, str) or not sampling_session_id:
+        raise RuntimeError(f"save_weights_for_sampler returned invalid sampling_session_id: {result!r}")
+    return sampling_session_id
 
 
 def sample(model_id: str, prompt_tokens: list, max_tokens: int = 20,
@@ -298,7 +340,10 @@ def save_state(model_id: str, name: str = "checkpoint") -> dict:
     payload = {"model_id": model_id, "path": name}
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=300)
+    return _raise_if_future_failed(
+        poll_future(resp.json().get("request_id"), timeout=300),
+        op="save_state",
+    )
 
 
 def load_state(model_id: str, path: str, load_optimizer: bool = True) -> dict:
@@ -307,4 +352,7 @@ def load_state(model_id: str, path: str, load_optimizer: bool = True) -> dict:
     payload = {"model_id": model_id, "path": path, "optimizer": load_optimizer}
     resp = requests.post(url, json=payload, headers=get_headers(), timeout=120)
     resp.raise_for_status()
-    return poll_future(resp.json().get("request_id"), timeout=120)
+    return _raise_if_future_failed(
+        poll_future(resp.json().get("request_id"), timeout=120),
+        op="load_state",
+    )

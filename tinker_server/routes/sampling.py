@@ -21,7 +21,13 @@ from fastapi import APIRouter, HTTPException, Request
 from ..config import config as server_config
 from ..backend.future_store import FutureStatus, FutureStoreUnavailableError, future_store
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import classify_failure_reason, run_async_with_otel_span, set_request_id
+from ..logging_context import (
+    classify_failure_reason,
+    get_otel_tracer,
+    record_sampling_admission_metric,
+    run_async_with_otel_span,
+    set_request_id,
+)
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     ComputeLogprobsRequest,
@@ -63,6 +69,41 @@ _coalesced_abort_aliases: dict[str, str] = {}
 _lora_load_locks_guard = asyncio.Lock()
 _lora_load_locks: dict[str, asyncio.Lock] = {}
 
+_ASAMPLE_ROUTE = "/api/v1/asample"
+_COMPUTE_LOGPROBS_ROUTE = "/api/v1/compute_logprobs"
+_SAMPLE_ONCE_ROUTE = "sample_once"
+
+
+async def _normalize_sampling_request_session(
+    request: SampleRequest,
+    http_request: Request,
+) -> tuple[SampleRequest, str]:
+    if not request.needs_session_creation():
+        return request, request.get_session_id()
+
+    from .service import ensure_sampling_session
+
+    model_ref = request.model_path or request.base_model
+    if not isinstance(model_ref, str) or not model_ref:
+        raise HTTPException(
+            status_code=422,
+            detail="Exactly one selector must be provided: sampling_session_id/model_id, base_model, or model_path",
+        )
+
+    session_id, _base_model = await ensure_sampling_session(
+        model_path=model_ref,
+        http_request=http_request,
+    )
+    normalized = request.model_copy(
+        update={
+            "sampling_session_id": session_id,
+            "model_id": None,
+            "base_model": None,
+            "model_path": None,
+        }
+    )
+    return normalized, session_id
+
 
 async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
     async with _lora_load_locks_guard:
@@ -73,6 +114,16 @@ async def _get_lora_load_lock(session_id: str) -> asyncio.Lock:
         return lock
 
 
+async def _drop_lora_load_lock(session_id: str) -> None:
+    async with _lora_load_locks_guard:
+        _lora_load_locks.pop(session_id, None)
+
+
+async def _lora_load_lock_count() -> int:
+    async with _lora_load_locks_guard:
+        return len(_lora_load_locks)
+
+
 def _resolve_billing_model(session_id: str) -> str:
     if session_manager is None:
         return session_id
@@ -81,6 +132,47 @@ def _resolve_billing_model(session_id: str) -> str:
 
 def _build_sampling_usage_label(*, model: str, route: str, dimension: str) -> str:
     return f"model={model},route={route},dimension={dimension}"
+
+
+async def _enqueue_sampling_request_with_trace(
+    *,
+    route_start_s: float,
+    request_id: str,
+    op: str,
+    enqueue_coro,
+    session_id: str | None = None,
+    base_model: str | None = None,
+) -> None:
+    tracer = get_otel_tracer()
+    future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
+    if tracer is None:
+        await enqueue_coro
+        return
+
+    with tracer.start_as_current_span(f"{op}.enqueue") as span:
+        span.set_attribute("component", "routes.sampling")
+        span.set_attribute("op", str(op))
+        span.set_attribute("request_id", str(request_id))
+        if session_id:
+            span.set_attribute("sampling_session_id", str(session_id))
+        if base_model:
+            span.set_attribute("base_model", str(base_model))
+        span.add_event(
+            "future_store_ready",
+            {
+                "elapsed_ms": round(future_ready_elapsed_ms, 3),
+                "route_elapsed_ms": round(future_ready_elapsed_ms, 3),
+            },
+        )
+        enqueue_start_s = time.perf_counter()
+        await enqueue_coro
+        span.add_event(
+            "enqueue_done",
+            {
+                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
+                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+            },
+        )
 
 
 async def _ensure_session_lora_loaded(engine, session_id: str) -> None:
@@ -162,7 +254,7 @@ async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable)
                 logger.info(f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}")
                 return await task
             try:
-                status = future_store.get_status(request_id)
+                status = await future_store.async_get_status(request_id)
             except KeyError:
                 status = FutureStatus.PENDING
             now = time.monotonic()
@@ -507,25 +599,27 @@ async def asample(
     The request is processed in the background. Use /retrieve_future
     with the returned request_id to get results.
     """
+    route_start_s = time.perf_counter()
     # Gateway forwarding: if this sampling_session_id was created upstream, proxy the
     # request and return a gateway-encoded request_id so /retrieve_future can route it.
     from ..gateway import (
+        async_remote_sampling_session,
         encode_request_id,
         forward_json,
-        remote_sampling_session,
         upstream_for_alias,
     )
 
-    session_id = request.get_session_id()
-    if server_config.sampling_require_seq_id and request.seq_id is None:
+    uses_existing_session_selector = request.has_session_selector()
+    if server_config.sampling_require_seq_id and uses_existing_session_selector and request.seq_id is None:
         raise HTTPException(
             status_code=422,
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
+    request, session_id = await _normalize_sampling_request_session(request, http_request)
     is_local = False
     if session_manager is not None:
         is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
-    remote = None if is_local else remote_sampling_session(session_id)
+    remote = None if is_local else await async_remote_sampling_session(session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -589,9 +683,14 @@ async def asample(
 
     global _inflight_sample_tasks
     if _should_backpressure(http_request):
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="server_overloaded",
+        )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
     user_id = _get_user_id(http_request)
-    from ..backend.api_work_queue import ApiWorkQueueThrottleError, api_work_queue
+    from ..backend.api_work_queue import ApiWorkQueueThrottleError, _unwrap_queue_throttle_error, api_work_queue
     from ..backend.capacity_manager import capacity_manager
     from ..backend.result_size_estimator import estimate_sampling_result_bytes
 
@@ -615,7 +714,7 @@ async def asample(
     if request.seq_id is not None:
         for attempt in range(2):
             try:
-                ensure = future_store.ensure_pending(
+                ensure = await future_store.async_ensure_pending(
                     request_id=request_id,
                     meta={"payload_hash": payload_hash},
                 )
@@ -637,7 +736,7 @@ async def asample(
                     detail="Duplicate seq_id with different request payload",
                 )
             try:
-                future_store.get_status(request_id)
+                await future_store.async_get_status(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
             except KeyError:
@@ -649,7 +748,7 @@ async def asample(
                 )
             return UntypedAPIFuture(request_id=request_id)
 
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_sampling_result_bytes(request),
@@ -657,9 +756,14 @@ async def asample(
     if not bool(reserve.get("ok")):
         if created_pending:
             try:
-                future_store.forget(request_id)
+                await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="capacity_rejected",
+        )
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -668,9 +772,9 @@ async def asample(
     created = False
     try:
         if not created_pending:
-            future_store.create_with_id(request_id)
+            await future_store.async_create_with_id(request_id)
             created = True
-        future_store.mark_queued(
+        await future_store.async_mark_queued(
             request_id,
             meta={
                 "op": "sampling.asample",
@@ -679,37 +783,77 @@ async def asample(
                 "stage": "queued",
             },
         )
-        await api_work_queue.enqueue(
+        get_session_base_model = getattr(session_manager, "get_session_base_model", None)
+        base_model = get_session_base_model(session_id) if callable(get_session_base_model) else None
+        await _enqueue_sampling_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="sampling.asample",
-            request_json=request_json,
-            user_id=user_id,
-            apikey_id=apikey_id,
-            throttle_principal=throttle_principal,
-            webhook_url=None,
-            extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            session_id=session_id,
+            base_model=base_model,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="sampling.asample",
+                request_json=request_json,
+                user_id=user_id,
+                apikey_id=apikey_id,
+                throttle_principal=throttle_principal,
+                webhook_url=None,
+                extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            ),
         )
     except ApiWorkQueueThrottleError as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
-                future_store.forget(request_id)
+                await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         elif created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason="queue_throttled",
+            scope=detail.get("scope") if isinstance(detail, dict) else None,
+        )
         raise HTTPException(status_code=429, detail=e.detail) from e
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        throttle_error = _unwrap_queue_throttle_error(e)
+        if throttle_error is not None:
+            await capacity_manager.async_release_all(request_id)
+            if created_pending:
+                try:
+                    await future_store.async_forget(request_id)
+                except FutureStoreUnavailableError:
+                    raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
+            elif created:
+                await future_store.async_cleanup(request_id)
+            detail = throttle_error.detail if isinstance(throttle_error.detail, dict) else {}
+            record_sampling_admission_metric(
+                route=_ASAMPLE_ROUTE,
+                decision="rejected",
+                reason="queue_throttled",
+                scope=detail.get("scope") if isinstance(detail, dict) else None,
+            )
+            raise HTTPException(status_code=429, detail=throttle_error.detail) from e
+        await capacity_manager.async_release_all(request_id)
         if created_pending:
             try:
-                future_store.forget(request_id)
+                await future_store.async_forget(request_id)
             except FutureStoreUnavailableError:
                 raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
         elif created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
+    record_sampling_admission_metric(
+        route=_ASAMPLE_ROUTE,
+        decision="accepted",
+        reason="queued",
+        scope=throttle_scope,
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -726,15 +870,20 @@ async def sample_once(
     user_id: str | None,
 ) -> SampledSequence:
     """Synchronously execute one sampling request using the multi-LoRA path."""
-    from ..gateway import forward_json, remote_sampling_session, upstream_for_alias
+    from ..gateway import async_remote_sampling_session, forward_json, upstream_for_alias
 
     if _should_backpressure(http_request):
+        record_sampling_admission_metric(
+            route=_SAMPLE_ONCE_ROUTE,
+            decision="rejected",
+            reason="server_overloaded",
+        )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
 
     is_local = False
     if session_manager is not None:
         is_local = session_manager.is_multi_lora_session(session_id) or (session_manager.get_engine(session_id) is not None)
-    remote = None if is_local else remote_sampling_session(session_id)
+    remote = None if is_local else await async_remote_sampling_session(session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1295,7 +1444,7 @@ async def _do_sample(
 
         except asyncio.CancelledError:
             await _abort_engine_request(engine, request_id)
-            future_store.fail(request_id, "sampling task cancelled")
+            await future_store.async_fail(request_id, "sampling task cancelled")
             logger.warning(
                 "[sampling.asample] canceled request_id=%s session_id=%s next_action=%s",
                 str(request_id),
@@ -1313,7 +1462,7 @@ async def _do_sample(
                 type(e).__name__,
                 "check_sampling_session_and_vllm_actor",
             )
-            future_store.fail(request_id, str(e))
+            await future_store.async_fail(request_id, str(e))
     finally:
         if resource_pool is not None and resource_pool_actor_name is not None:
             resource_pool.mark_inflight(resource_pool_actor_name, -1)
@@ -1333,10 +1482,11 @@ async def compute_logprobs(
     - logprobs[0] is None (first token has no conditioning context)
     - logprobs[i] = log P(token[i] | token[0:i]) for i >= 1
     """
+    route_start_s = time.perf_counter()
     from ..gateway import (
+        async_remote_sampling_session,
         encode_request_id,
         forward_json,
-        remote_sampling_session,
         upstream_for_alias,
     )
 
@@ -1345,7 +1495,7 @@ async def compute_logprobs(
         is_local = session_manager.is_multi_lora_session(request.sampling_session_id) or (
             session_manager.get_engine(request.sampling_session_id) is not None
         )
-    remote = None if is_local else remote_sampling_session(request.sampling_session_id)
+    remote = None if is_local else await async_remote_sampling_session(request.sampling_session_id)
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1412,12 +1562,17 @@ async def compute_logprobs(
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
     billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    reserve = capacity_manager.try_reserve(
+    reserve = await capacity_manager.async_try_reserve(
         request_id,
         queue_bytes=len(request_json),
         object_store_bytes=estimate_compute_logprobs_result_bytes(request),
     )
     if not bool(reserve.get("ok")):
+        record_sampling_admission_metric(
+            route=_COMPUTE_LOGPROBS_ROUTE,
+            decision="rejected",
+            reason="capacity_rejected",
+        )
         raise HTTPException(
             status_code=429,
             detail={"code": "tinker_overloaded", **{k: v for k, v in reserve.items() if k != "ok"}},
@@ -1425,23 +1580,41 @@ async def compute_logprobs(
 
     created = False
     try:
-        future_store.create_with_id(request_id)
+        await future_store.async_create_with_id(request_id)
         created = True
-        future_store.mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
-        await api_work_queue.enqueue(
+        await future_store.async_mark_queued(request_id, meta={"op": "sampling.compute_logprobs"})
+        get_session_base_model = getattr(session_manager, "get_session_base_model", None)
+        base_model = (
+            get_session_base_model(request.sampling_session_id)
+            if callable(get_session_base_model)
+            else None
+        )
+        await _enqueue_sampling_request_with_trace(
+            route_start_s=route_start_s,
             request_id=request_id,
             op="sampling.compute_logprobs",
-            request_json=request_json,
-            user_id=user_id,
-            webhook_url=None,
-            extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            session_id=request.sampling_session_id,
+            base_model=base_model,
+            enqueue_coro=api_work_queue.enqueue(
+                request_id=request_id,
+                op="sampling.compute_logprobs",
+                request_json=request_json,
+                user_id=user_id,
+                webhook_url=None,
+                extra={"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            ),
         )
     except Exception as e:
-        capacity_manager.release_all(request_id)
+        await capacity_manager.async_release_all(request_id)
         if created:
-            future_store.cleanup(request_id)
+            await future_store.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
 
+    record_sampling_admission_metric(
+        route=_COMPUTE_LOGPROBS_ROUTE,
+        decision="accepted",
+        reason="queued",
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 
@@ -1461,46 +1634,55 @@ async def _do_compute_logprobs(
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
         session_manager.mark_session_inflight(session_id, +1)
+        base_model = session_manager.get_session_base_model(session_id)
 
-        # Check if session uses multi-LoRA mode (includes base model sessions)
-        is_multi_lora = session_manager.is_multi_lora_session(session_id)
-        if is_multi_lora:
-            base_model = session_manager.get_session_base_model(session_id)
-            if not base_model:
-                raise RuntimeError(f"Session {session_id!r} missing base_model")
-            from ..backend.model_registry import get_model_config
+        async def _compute_logprobs_action():
+            # Check if session uses multi-LoRA mode (includes base model sessions)
+            is_multi_lora = session_manager.is_multi_lora_session(session_id)
+            if is_multi_lora:
+                if not base_model:
+                    raise RuntimeError(f"Session {session_id!r} missing base_model")
+                from ..backend.model_registry import get_model_config
 
-            max_model_len = int(get_model_config(base_model).max_model_len)
-            total_len = len(token_ids) + 1
-            if total_len > max_model_len:
-                raise ValueError(
-                    f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
-                    f"for model {base_model}"
+                max_model_len = int(get_model_config(base_model).max_model_len)
+                total_len = len(token_ids) + 1
+                if total_len > max_model_len:
+                    raise ValueError(
+                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
+                        f"for model {base_model}"
+                    )
+
+            if is_multi_lora:
+                multi_lora_engine = await session_manager.get_engine_for_session(session_id)
+                if multi_lora_engine is None:
+                    raise RuntimeError(f"No engine found for session {session_id}")
+                await _ensure_session_lora_loaded(multi_lora_engine, session_id)
+                return await multi_lora_engine.compute_logprobs(
+                    sampling_session_id=session_id,
+                    prompt_ids=token_ids,
+                    request_id=request_id,
                 )
 
-        if is_multi_lora:
-            # Multi-LoRA mode: handles both LoRA and base model sessions
-            # Get engine for this session's model (dynamically creates if needed)
-            multi_lora_engine = await session_manager.get_engine_for_session(session_id)
-            if multi_lora_engine is None:
-                raise RuntimeError(f"No engine found for session {session_id}")
-            await _ensure_session_lora_loaded(multi_lora_engine, session_id)
-
-            logprobs = await multi_lora_engine.compute_logprobs(
-                sampling_session_id=session_id,
-                prompt_ids=token_ids,
-                request_id=request_id,
-            )
-        else:
-            # Legacy mode: per-session engine
             engine = session_manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
-
-            logprobs = await engine.compute_logprobs(
+            return await engine.compute_logprobs(
                 prompt_ids=token_ids,
                 request_id=request_id,
             )
+
+        logprobs = await run_async_with_otel_span(
+            "sampling.compute_logprobs.execute",
+            _compute_logprobs_action,
+            component="routes.sampling",
+            op="sampling.compute_logprobs",
+            request_id=str(request_id),
+            attributes={
+                "sampling_session_id": str(session_id),
+                "base_model": str(base_model) if base_model else None,
+                "prompt_tokens": int(len(token_ids)),
+            },
+        )
 
         logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
         response = ComputeLogprobsResponse(logprobs=logprobs)
@@ -1536,7 +1718,7 @@ async def _do_compute_logprobs(
             type(e).__name__,
             "check_sampling_session_and_token_length",
         )
-        future_store.fail(request_id, str(e))
+        await future_store.async_fail(request_id, str(e))
     finally:
         if session_manager is not None and session_id is not None:
             session_manager.mark_session_inflight(session_id, -1)

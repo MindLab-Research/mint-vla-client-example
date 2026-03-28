@@ -11,20 +11,27 @@ import tinker_server.logging_context as logging_context
 def test_issue_304_bind_request_trace_context_restores_previous_values():
     prev_request_id = logging_context.get_request_id()
     prev_trace_id = logging_context.get_trace_id()
+    prev_identity = logging_context.get_request_identity_context()
     try:
         logging_context.set_request_id("req-old")
         logging_context.set_trace_id("a" * 32)
         with logging_context.bind_request_trace_context(
             request_id="req-new",
             trace_id="b" * 32,
+            apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            gateway_request_id="gw-123",
         ):
             assert logging_context.get_request_id() == "req-new"
             assert logging_context.get_trace_id() == "b" * 32
+            assert logging_context.get_request_identity_context()["apikey_id"] == "bbbbbbbbbbbbbbbbbbbbbbbb"
+            assert logging_context.get_request_identity_context()["gateway_request_id"] == "gw-123"
         assert logging_context.get_request_id() == "req-old"
         assert logging_context.get_trace_id() == "a" * 32
+        assert logging_context.get_request_identity_context() == prev_identity
     finally:
         logging_context.set_request_id(prev_request_id)
         logging_context.set_trace_id(prev_trace_id)
+        logging_context.request_identity_var.set(prev_identity or None)
 
 
 def test_issue_304_log_with_bound_context_does_not_leak_context():

@@ -8,6 +8,7 @@ Shared loss functions and Tinker Datum conversion utilities live in megatron_tra
 
 from __future__ import annotations  # Allow forward references in type hints
 
+import copy
 import os
 import json
 import math
@@ -25,6 +26,13 @@ import ray
 # NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
 # to ensure CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
 # (tensordict imports torch internally)
+
+# Fresh Ray worker processes can inherit cluster-level NVTE_* defaults that
+# conflict with Megatron's chosen attention backend during model construction.
+# Unset them on module import so Megatron can choose the backend cleanly.
+os.environ.pop("NVTE_FUSED_ATTN", None)
+os.environ.pop("NVTE_UNFUSED_ATTN", None)
+os.environ.pop("NVTE_FLASH_ATTN", None)
 
 from . import ray_kill
 from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
@@ -106,6 +114,7 @@ def _collect_python_thread_stacks(*, limit: int = 64) -> str:
     return "".join(lines)
 
 
+
 def _model_key_from_base_model(base_model: str) -> str:
     import re
 
@@ -164,6 +173,19 @@ def _make_megatron_actor_name(base_model: str) -> str:
         model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
 
     return f"megatron_{model_name}"
+
+
+
+def _sanitize_pg_component(value: str | None) -> str:
+    import re
+
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or "default"
+
+
+def _make_megatron_pg_name(actor_name: str, namespace: str | None) -> str:
+    return f"{actor_name}_{_sanitize_pg_component(namespace)}_pg"
 
 
 @dataclass
@@ -287,6 +309,7 @@ class MegatronRankWorker:
         # Values: list[torch.Tensor] (valid gradients) or _GRADIENTS_CONSUMED (consumed by optim_step)
         self._session_gradients: dict[str, list[torch.Tensor] | object] = {}
         self._session_optimizer_states: dict[str, dict] = {}  # Per-session optimizer state (CPU)
+        self._session_lr_scheduler_states: dict[str, dict] = {}  # Per-session scheduler state (CPU)
         self._sticky_train_mode_enabled = _env_flag("MINT_MEGATRON_STICKY_TRAIN_MODE", default=False)
         self._sticky_train_mode_idle_timeout_s = _env_float("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S", default=15.0)
         self._sticky_train_mode_close_on_optim = _env_flag("MINT_MEGATRON_STICKY_CLOSE_ON_OPTIM", default=True)
@@ -585,6 +608,33 @@ class MegatronRankWorker:
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
 
+    def get_cuda_memory_stats(self) -> dict[str, object]:
+        try:
+            import torch
+        except Exception as e:
+            return {
+                "current_session_id": self._current_session_id,
+                "cuda_available": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        if not torch.cuda.is_available():
+            return {
+                "current_session_id": self._current_session_id,
+                "cuda_available": False,
+            }
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "current_session_id": self._current_session_id,
+            "cuda_available": True,
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+        }
+
     def _bind_traceparent(self, traceparent: str | None) -> None:
         if isinstance(traceparent, str) and traceparent:
             restore_trace_id_from_traceparent(traceparent)
@@ -765,6 +815,17 @@ class MegatronRankWorker:
         import torch
         from megatron.core.optimizer import ChainedOptimizer
 
+        def clone_to_cpu(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, dict):
+                return {k: clone_to_cpu(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [clone_to_cpu(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(clone_to_cpu(v) for v in value)
+            return copy.deepcopy(value)
+
         state_dict = {}
         optimizer = self.engine.optimizer
 
@@ -777,22 +838,34 @@ class MegatronRankWorker:
             return [opt]
 
         for i, _opt in enumerate(iter_optimizers(optimizer)):
-            if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
-                inner_opt = _opt.optimizer
-                # Deep copy state to CPU
-                opt_state = {}
-                for param, state in inner_opt.state.items():
-                    opt_state[id(param)] = {
-                        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-                        for k, v in state.items()
-                    }
-                state_dict[f"optimizer_{i}"] = {
-                    "state": opt_state,
-                    "param_groups": [
-                        {k: v for k, v in pg.items() if k != 'params'}
-                        for pg in inner_opt.param_groups
-                    ]
-                }
+            entry = {}
+            if hasattr(_opt, "state_dict"):
+                try:
+                    entry["wrapper_state_dict"] = clone_to_cpu(_opt.state_dict())
+                except Exception as e:
+                    logger.warning(
+                        "[Rank %s] Failed to capture wrapper optimizer state for opt[%s]: %s: %s",
+                        self.rank,
+                        i,
+                        type(e).__name__,
+                        e,
+                    )
+
+            inner_opt = getattr(_opt, "optimizer", None)
+            if inner_opt is not None and hasattr(inner_opt, "state_dict"):
+                try:
+                    entry["inner_state_dict"] = clone_to_cpu(inner_opt.state_dict())
+                except Exception as e:
+                    logger.warning(
+                        "[Rank %s] Failed to capture inner optimizer state for opt[%s]: %s: %s",
+                        self.rank,
+                        i,
+                        type(e).__name__,
+                        e,
+                    )
+
+            if entry:
+                state_dict[f"optimizer_{i}"] = entry
 
         logger.debug(f"[Rank {self.rank}] Captured optimizer state for {len(state_dict)} optimizers")
         return state_dict
@@ -814,63 +887,90 @@ class MegatronRankWorker:
         if optimizer is None:
             return
 
+        def clear_inner_state(inner_opt) -> None:
+            state = inner_opt.state
+            if hasattr(state, '_inner_dicts'):
+                for inner_dict in state._inner_dicts:
+                    inner_dict.clear()
+            elif hasattr(state, 'clear'):
+                state.clear()
+            else:
+                keys = list(state.keys()) if hasattr(state, 'keys') else []
+                for key in keys:
+                    del state[key]
+
         def iter_optimizers(opt):
             if isinstance(opt, ChainedOptimizer):
                 return opt.chained_optimizers
             return [opt]
 
         for i, _opt in enumerate(iter_optimizers(optimizer)):
-            if hasattr(_opt, 'optimizer') and _opt.optimizer is not None:
-                inner_opt = _opt.optimizer
+            inner_opt = getattr(_opt, "optimizer", None)
+            if inner_opt is not None:
+                # Always clear existing inner state first to prevent contamination.
+                clear_inner_state(inner_opt)
 
-                # CRITICAL: Always clear existing state first to prevent session contamination
-                # Without this, optimizer momentum from previous session persists
-                state = inner_opt.state
-                if hasattr(state, '_inner_dicts'):
-                    # ProxyDict from ChainedOptimizer
-                    for inner_dict in state._inner_dicts:
-                        inner_dict.clear()
-                elif hasattr(state, 'clear'):
-                    # Regular dict
-                    state.clear()
-                else:
-                    # Unknown type - try to clear via iteration
-                    keys = list(state.keys()) if hasattr(state, 'keys') else []
-                    for key in keys:
-                        del state[key]
-                
-                # If no state to restore, we're done (state is now clean)
-                key = f"optimizer_{i}"
-                if not state_dict or key not in state_dict:
+            key = f"optimizer_{i}"
+            if not state_dict or key not in state_dict:
+                continue
+
+            saved_entry = state_dict[key]
+
+            wrapper_state_dict = saved_entry.get("wrapper_state_dict")
+            if wrapper_state_dict is not None and hasattr(_opt, "load_state_dict"):
+                try:
+                    _opt.load_state_dict(copy.deepcopy(wrapper_state_dict))
+                except Exception as e:
+                    logger.warning(
+                        "[Rank %s] Failed to restore wrapper optimizer state for opt[%s]: %s: %s",
+                        self.rank,
+                        i,
+                        type(e).__name__,
+                        e,
+                    )
+
+            inner_state_dict = saved_entry.get("inner_state_dict")
+            if inner_opt is not None and inner_state_dict is not None:
+                try:
+                    inner_opt.load_state_dict(copy.deepcopy(inner_state_dict))
                     continue
+                except Exception as e:
+                    logger.warning(
+                        "[Rank %s] Failed to restore inner optimizer state_dict for opt[%s]; "
+                        "falling back to legacy param-order restore: %s: %s",
+                        self.rank,
+                        i,
+                        type(e).__name__,
+                        e,
+                    )
 
-                saved_state = state_dict[key]["state"]
-                saved_param_ids = list(saved_state.keys())
+            # Backward-compatibility path for legacy in-memory snapshots.
+            if inner_opt is None or "state" not in saved_entry:
+                continue
 
-                # Get all params from param_groups (not from state.keys() which could be empty)
-                all_params = []
-                for pg in inner_opt.param_groups:
-                    all_params.extend(pg['params'])
+            saved_state = saved_entry["state"]
+            saved_param_ids = list(saved_state.keys())
 
-                # Restore state by position mapping
-                for j, param in enumerate(all_params):
-                    if j < len(saved_param_ids):
-                        saved_id = saved_param_ids[j]
-                        if saved_id in saved_state:
-                            # Initialize state dict for this param
-                            inner_opt.state[param] = {}
-                            for k, v in saved_state[saved_id].items():
-                                if isinstance(v, torch.Tensor):
-                                    inner_opt.state[param][k] = v.cuda()
-                                else:
-                                    inner_opt.state[param][k] = v
+            all_params = []
+            for pg in inner_opt.param_groups:
+                all_params.extend(pg['params'])
 
-                # Restore param group settings (like lr)
-                saved_groups = state_dict[key].get("param_groups", [])
-                for j, pg in enumerate(inner_opt.param_groups):
-                    if j < len(saved_groups):
-                        for k, v in saved_groups[j].items():
-                            pg[k] = v
+            for j, param in enumerate(all_params):
+                if j < len(saved_param_ids):
+                    saved_id = saved_param_ids[j]
+                    if saved_id in saved_state:
+                        inner_opt.state[param] = {}
+                        for k, v in saved_state[saved_id].items():
+                            if isinstance(v, torch.Tensor):
+                                inner_opt.state[param][k] = v.cuda()
+                            else:
+                                inner_opt.state[param][k] = v
+
+            saved_groups = saved_entry.get("param_groups", [])
+            for j, pg in enumerate(inner_opt.param_groups):
+                if j < len(saved_groups):
+                    for k, v in saved_groups[j].items():
+                        pg[k] = v
 
         logger.debug(f"[Rank {self.rank}] Restored optimizer state (cleared first)")
 
@@ -959,6 +1059,30 @@ class MegatronRankWorker:
         except Exception as e:
             logger.warning(f"[Rank {self.rank}] Failed to reset lr_scheduler: {e}")
 
+    def _capture_lr_scheduler_state(self) -> dict:
+        """Capture lr_scheduler state to CPU-friendly Python objects."""
+        lr_scheduler = getattr(self.engine, "lr_scheduler", None)
+        if lr_scheduler is None or not hasattr(lr_scheduler, "state_dict"):
+            return {}
+
+        try:
+            return copy.deepcopy(lr_scheduler.state_dict())
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Failed to capture lr_scheduler state: {e}")
+            return {}
+
+    def _restore_lr_scheduler_state(self, state_dict: dict) -> None:
+        """Restore lr_scheduler state for an existing session."""
+        lr_scheduler = getattr(self.engine, "lr_scheduler", None)
+        if lr_scheduler is None or not hasattr(lr_scheduler, "load_state_dict"):
+            return
+
+        try:
+            lr_scheduler.load_state_dict(copy.deepcopy(state_dict))
+            logger.debug(f"[Rank {self.rank}] Restored lr_scheduler state")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Failed to restore lr_scheduler state: {e}")
+
     def _rebuild_optimizer_and_scheduler(self) -> None:
         """Rebuild optimizer and LR scheduler to ensure a clean state."""
         try:
@@ -1040,6 +1164,12 @@ class MegatronRankWorker:
                     f"[Rank {self.rank}] Saved optimizer state for session {self._current_session_id}: "
                     f"{len(opt_state)} optimizers"
                 )
+                lr_scheduler_state = self._capture_lr_scheduler_state()
+                self._session_lr_scheduler_states[self._current_session_id] = lr_scheduler_state
+                logger.debug(
+                    f"[Rank {self.rank}] Saved lr_scheduler state for session {self._current_session_id}: "
+                    f"{bool(lr_scheduler_state)}"
+                )
 
             # Restore incoming session's gradients (or zero for new session)
             # _GRADIENTS_CONSUMED means gradients were consumed by optim_step - zero them
@@ -1062,6 +1192,7 @@ class MegatronRankWorker:
                 self._restore_optimizer_state(self._session_optimizer_states[new_session_id])
                 print(f"[Rank {self.rank}] RESTORED optimizer state for session {new_session_id}", flush=True)
                 logger.debug(f"[Rank {self.rank}] Restored optimizer state for session {new_session_id}")
+                self._restore_lr_scheduler_state(self._session_lr_scheduler_states.get(new_session_id, {}))
             else:
                 # New session - reset optimizer state (clear momentum/variance)
                 self._reset_optimizer_state()
@@ -1081,7 +1212,19 @@ class MegatronRankWorker:
             del self._session_gradients[session_id]
         if session_id in self._session_optimizer_states:
             del self._session_optimizer_states[session_id]
+        if session_id in self._session_lr_scheduler_states:
+            del self._session_lr_scheduler_states[session_id]
         logger.debug(f"[Rank {self.rank}] Cleared state for session {session_id}")
+
+    def has_session_state_cached(self, session_id: str) -> bool:
+        """Whether this live worker still has the session's actor-only state in memory."""
+        if self._current_session_id == session_id:
+            return True
+        return (
+            session_id in self._session_gradients
+            and session_id in self._session_optimizer_states
+            and session_id in self._session_lr_scheduler_states
+        )
 
     def mark_session_loaded(self, session_id: str) -> None:
         """Record that a checkpoint-loaded session is now active on this rank."""
@@ -1177,6 +1320,21 @@ class MegatronRankWorker:
 
     def _initialize_megatron(self):
         """Initialize Megatron model parallel and engine."""
+        # Fresh Ray worker processes can inherit cluster-level NVTE_* defaults
+        # that conflict with Megatron's chosen attention backend. Unset them
+        # inside the worker process before any Megatron/TE model construction
+        # and let Megatron decide the backend-specific expectation itself.
+        os.environ.pop("NVTE_FUSED_ATTN", None)
+        os.environ.pop("NVTE_UNFUSED_ATTN", None)
+        os.environ.pop("NVTE_FLASH_ATTN", None)
+        print(
+            f"[Rank {self.rank}] NVTE env normalized pre-import: "
+            f"FUSED={os.environ.get('NVTE_FUSED_ATTN')!r} "
+            f"UNFUSED={os.environ.get('NVTE_UNFUSED_ATTN')!r} "
+            f"FLASH={os.environ.get('NVTE_FLASH_ATTN')!r}",
+            flush=True,
+        )
+
         # CRITICAL: Enable determinism FIRST, before ANY Megatron/TE imports
         # This must happen before FlashAttention code is loaded to take effect
         # Without this, consecutive forward passes differ by ~0.46 nats
@@ -1345,11 +1503,19 @@ class MegatronRankWorker:
             grad_accum_fusion_available = True
         except Exception:
             grad_accum_fusion_available = False
-        override_tf_config["gradient_accumulation_fusion"] = grad_accum_fusion_available
-        if not grad_accum_fusion_available:
+        # LoRA adapters do not reliably carry main_grad buffers across the current
+        # Megatron-Bridge path on the recovered 30B workers. When fused weight-grad
+        # accumulation is enabled, Megatron writes directly into weight.main_grad
+        # and crashes with AttributeError if that buffer is absent. For LoRA
+        # training, use the unfused fallback path instead.
+        if self.lora_rank > 0:
+            override_tf_config["gradient_accumulation_fusion"] = False
+        else:
+            override_tf_config["gradient_accumulation_fusion"] = grad_accum_fusion_available
+        if not override_tf_config["gradient_accumulation_fusion"]:
             logger.info(
-                f"[Rank {self.rank}] fused_weight_gradient_mlp_cuda not found; "
-                "gradient_accumulation_fusion=False"
+                f"[Rank {self.rank}] gradient_accumulation_fusion=False "
+                f"(available={grad_accum_fusion_available}, lora_rank={self.lora_rank})"
             )
         override_tf_config["persist_layer_norm"] = True
         override_tf_config["bias_activation_fusion"] = True
@@ -1519,6 +1685,15 @@ class MegatronRankWorker:
             optimizer_config=optimizer_config,
             checkpoint_config=checkpoint_config,
         )
+
+        print(
+            f"[Rank {self.rank}] NVTE env before engine.initialize: "
+            f"FUSED={os.environ.get('NVTE_FUSED_ATTN')!r} "
+            f"UNFUSED={os.environ.get('NVTE_UNFUSED_ATTN')!r} "
+            f"FLASH={os.environ.get('NVTE_FLASH_ATTN')!r}",
+            flush=True,
+        )
+
         self.engine.initialize()
         logger.info(f"[Rank {self.rank}] MegatronEngineWithLMHead initialized")
 
@@ -1662,6 +1837,39 @@ class MegatronRankWorker:
 
         return {"reset_count": reset_count} if self.rank == 0 else {}
 
+    def _capture_expert_bias_state(self) -> dict[str, "torch.Tensor"]:
+        """Capture per-module expert_bias buffers onto CPU for session restore."""
+        import torch
+
+        state: dict[str, torch.Tensor] = {}
+        for model_chunk in self.engine.module:
+            for name, module in model_chunk.named_modules():
+                if hasattr(module, "expert_bias") and module.expert_bias is not None:
+                    state[name] = module.expert_bias.detach().cpu().clone()
+        return state
+
+    def _restore_expert_bias_state(self, state: dict[str, "torch.Tensor"] | None) -> int:
+        """Restore expert_bias buffers; missing entries are treated as zeros."""
+        restored = 0
+        source = state or {}
+        for model_chunk in self.engine.module:
+            for name, module in model_chunk.named_modules():
+                if hasattr(module, "expert_bias") and module.expert_bias is not None:
+                    incoming = source.get(name)
+                    if incoming is None:
+                        module.expert_bias.zero_()
+                    else:
+                        module.expert_bias.copy_(
+                            incoming.to(
+                                device=module.expert_bias.device,
+                                dtype=module.expert_bias.dtype,
+                            )
+                        )
+                    restored += 1
+                if hasattr(module, "local_tokens_per_expert") and module.local_tokens_per_expert is not None:
+                    module.local_tokens_per_expert.zero_()
+        return restored
+
     def _resolve_reset_bias(self, reset_bias: bool | None, default: bool) -> bool:
         if reset_bias is not None:
             return reset_bias
@@ -1754,8 +1962,8 @@ class MegatronRankWorker:
             self.reset_expert_bias(traceparent=traceparent)
 
         # Session state swap moved inside train_mode() - see below
-
         seq_lengths: list[int] = []
+
         for item_index, item in enumerate(data_items):
             model_input = item.get("model_input", {})
             tokens = flatten_encoded_text_chunks(model_input)
@@ -1815,11 +2023,12 @@ class MegatronRankWorker:
                 extra=f"items={len(data_items)} loss_fn={loss_fn}",
             )
             try:
-                result = self.engine.forward_backward_batch(
-                    data=data,
-                    loss_function=loss_function,
-                    forward_only=False,
-                )
+                with torch.autograd.set_detect_anomaly(True):
+                    result = self.engine.forward_backward_batch(
+                        data=data,
+                        loss_function=loss_function,
+                        forward_only=False,
+                    )
             finally:
                 self._stop_slow_op_watchdog(watchdog)
             forward_backward_batch_ms = (time.perf_counter() - t_fb0) * 1000.0
@@ -1922,6 +2131,7 @@ class MegatronRankWorker:
             clip_frac_sum = 0.0
             ratio_mean_sum = 0.0
             n_ppo_results = 0
+            loss_sum_value = 0.0
             all_log_probs = []
             loss_fn_outputs = []
             per_sample_log_probs = None
@@ -1952,6 +2162,12 @@ class MegatronRankWorker:
                     if hasattr(tokens, "item"):
                         tokens = tokens.item()
                     num_tokens += int(tokens)
+
+                loss_sum_list = metrics.get("loss_sum", [])
+                for raw_loss_sum in loss_sum_list:
+                    if hasattr(raw_loss_sum, "item"):
+                        raw_loss_sum = raw_loss_sum.item()
+                    loss_sum_value += float(raw_loss_sum)
 
                 # Extract per-token log_probs from metrics (list of tensors)
                 log_probs_list = metrics.get("log_probs", [])
@@ -2104,6 +2320,7 @@ class MegatronRankWorker:
             routing_replay_items = int(valid_count) if routing_replay_enabled else 0
             result_dict = {
                 "loss_value": float(loss_value),
+                "loss_sum_value": float(loss_sum_value),
                 "num_tokens": int(num_tokens),
                 "clip_frac_sum": float(clip_frac_sum),
                 "ratio_mean_sum": float(ratio_mean_sum),
@@ -2199,6 +2416,7 @@ class MegatronRankWorker:
         if output_rank:
             valid_count = len(seq_lengths)
             loss_value = 0.0
+            loss_sum_value = 0.0
             num_tokens = 0
             all_log_probs = []
             loss_fn_outputs = []
@@ -2231,6 +2449,13 @@ class MegatronRankWorker:
                     if hasattr(tokens, "item"):
                         tokens = tokens.item()
                     num_tokens += int(tokens)
+
+                # Sum loss_sum from all micro-batches (raw pre-normalization sum)
+                loss_sum_list = metrics.get("loss_sum", [])
+                for raw_loss_sum in loss_sum_list:
+                    if hasattr(raw_loss_sum, "item"):
+                        raw_loss_sum = raw_loss_sum.item()
+                    loss_sum_value += float(raw_loss_sum)
 
                 # Extract per-token log_probs from metrics (list of tensors, one per micro-batch)
                 log_probs_list = metrics.get("log_probs", [])
@@ -2292,12 +2517,361 @@ class MegatronRankWorker:
 
             return {
                 "loss_value": float(loss_value),
+                "loss_sum_value": float(loss_sum_value),
                 "num_tokens": int(num_tokens),
                 "valid_count": int(valid_count),
                 "loss_fn_outputs": loss_fn_outputs,
-                "log_probs": combined_log_probs,  # Combined per-token log_probs tensor (for backward compat)
+                "log_probs": (
+                    {
+                        "data": combined_log_probs.tolist(),
+                        "shape": list(combined_log_probs.shape),
+                        "dtype": str(combined_log_probs.dtype),
+                    }
+                    if combined_log_probs is not None
+                    else None
+                ),
             }
         return {}
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict],
+        reference_checkpoint_path: str,
+        reference_actual_rank: int | None,
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+        reference_full_log_prob_chunks: list | None = None,
+    ) -> dict:
+        """Run reverse-KL distillation loss against a fixed reference adapter checkpoint."""
+        import torch
+        from tinker_server.backend.megatron_training import (
+            create_reverse_kl_loss_fn,
+            create_vocab_parallel_logits_extractor_fn,
+            tinker_to_tensordict,
+        )
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+
+        from .mintx_ops import build_scoring_sequence, vocab_parallel_log_probs_from_logits_no_grad
+
+        self._bind_traceparent(traceparent)
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature!r}")
+
+        output_rank = self._is_output_rank()
+        completion_lengths: list[int] = []
+        completion_weights: list[list[float]] = []
+        student_items: list[dict] = []
+        reference_items: list[dict] = []
+        for item_index, item in enumerate(data_items):
+            student_input = item.get("student_input")
+            reference_input = item.get("reference_input")
+            target_tokens = item.get("target_tokens")
+            weights = item.get("weights")
+            if not isinstance(student_input, dict) or not isinstance(reference_input, dict):
+                raise ValueError(f"Item {item_index}: student_input/reference_input must be dicts")
+            student_tokens = flatten_encoded_text_chunks(student_input)
+            reference_tokens = flatten_encoded_text_chunks(reference_input)
+            if not student_tokens or not reference_tokens:
+                raise ValueError(f"Item {item_index}: student/reference input must contain tokens")
+            if not isinstance(target_tokens, dict) or not isinstance(weights, dict):
+                raise ValueError(f"Item {item_index}: target_tokens and weights must be TensorData-like dicts")
+            completion_tokens = target_tokens.get("data", [])
+            weight_values = weights.get("data", [])
+            if not isinstance(completion_tokens, list) or not completion_tokens:
+                raise ValueError(f"Item {item_index}: target_tokens.data must be non-empty")
+            if not isinstance(weight_values, list) or len(weight_values) != len(completion_tokens):
+                raise ValueError(f"Item {item_index}: weights.data must align with target_tokens.data")
+            completion_lengths.append(len(completion_tokens))
+            completion_weights.append([float(x) for x in weight_values])
+
+            student_full_input, student_completion_start = build_scoring_sequence(
+                [int(x) for x in student_tokens],
+                [int(x) for x in completion_tokens],
+            )
+            reference_full_input, reference_completion_start = build_scoring_sequence(
+                [int(x) for x in reference_tokens],
+                [int(x) for x in completion_tokens],
+            )
+            student_full_targets = student_full_input[1:] + [int(completion_tokens[-1])]
+            reference_full_targets = reference_full_input[1:] + [int(completion_tokens[-1])]
+            student_full_weights = [0.0] * student_completion_start + [float(x) for x in weight_values]
+            reference_full_weights = [0.0] * reference_completion_start + [float(x) for x in weight_values]
+
+            student_items.append(
+                {
+                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": student_full_input}]},
+                    "loss_fn_inputs": {
+                        "target_tokens": {"data": student_full_targets, "shape": [len(student_full_targets)], "dtype": "int64"},
+                        "weights": {"data": student_full_weights, "shape": [len(student_full_weights)], "dtype": "float32"},
+                    },
+                }
+            )
+            reference_items.append(
+                {
+                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": reference_full_input}]},
+                    "loss_fn_inputs": {
+                        "target_tokens": {"data": reference_full_targets, "shape": [len(reference_full_targets)], "dtype": "int64"},
+                        "weights": {"data": reference_full_weights, "shape": [len(reference_full_weights)], "dtype": "float32"},
+                    },
+                }
+            )
+
+        device = torch.cuda.current_device()
+        max_token_len = get_model_config(self.base_model).max_model_len
+        student_data = tinker_to_tensordict(
+            student_items,
+            max_token_len_per_gpu=max_token_len,
+            device=f"cuda:{device}",
+        )
+        student_data.set_non_tensor("temperature", float(temperature))
+        student_data.set_non_tensor("return_vocab_parallel_logits", True)
+        if reference_full_log_prob_chunks is None:
+            reference_data = tinker_to_tensordict(
+                reference_items,
+                max_token_len_per_gpu=max_token_len,
+                device=f"cuda:{device}",
+            )
+            reference_data.set_non_tensor("temperature", float(temperature))
+            reference_data.set_non_tensor("return_vocab_parallel_logits", True)
+
+            current_adapter_state = self._capture_adapter_state_dict()
+            rank_path = _get_rank_checkpoint_path(reference_checkpoint_path)
+            adapter_file = rank_path + "_adapter.pt"
+            if not os.path.isfile(adapter_file):
+                raise FileNotFoundError(f"Reference adapter checkpoint not found: {adapter_file}")
+            checkpoint = torch.load(adapter_file, map_location="cpu")
+            reference_adapter_state = checkpoint.get("adapter_state_dict", {})
+            with self.engine.eval_mode():
+                try:
+                    self._restore_adapter_state_dict(
+                        reference_adapter_state,
+                        actual_rank=reference_actual_rank,
+                        trainer_rank=self.lora_rank,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    )
+                    extractor = create_vocab_parallel_logits_extractor_fn()
+                    with torch.no_grad():
+                        reference_result = self.engine.forward_backward_batch(
+                            data=reference_data,
+                            loss_function=extractor,
+                            forward_only=True,
+                        )
+                    reference_model_output = reference_result.get("model_output", {})
+                    reference_local_logits = reference_model_output.get("vocab_parallel_logits")
+                    if reference_local_logits is None:
+                        raise ValueError("reference forward missing vocab_parallel_logits")
+                    if hasattr(reference_local_logits, "values"):
+                        reference_local_logits = reference_local_logits.values()
+                    reference_log_probs = vocab_parallel_log_probs_from_logits_no_grad(reference_local_logits)
+                finally:
+                    self._restore_adapter_state_dict(
+                        current_adapter_state,
+                        trainer_rank=self.lora_rank,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    )
+
+            reference_loss_mask = reference_data["loss_mask"]
+            if hasattr(reference_loss_mask, "values"):
+                reference_loss_mask = reference_loss_mask.values()
+            selected_reference_log_probs = reference_log_probs[reference_loss_mask != 0].detach()
+            ref_chunks = []
+            offset = 0
+            for completion_len in completion_lengths:
+                ref_chunks.append(
+                    selected_reference_log_probs[offset: offset + completion_len].cpu()
+                )
+                offset += completion_len
+        else:
+            ref_chunks = [
+                chunk.to(dtype=torch.float32, device="cpu")
+                if hasattr(chunk, "to")
+                else torch.tensor(chunk, dtype=torch.float32, device="cpu")
+                for chunk in reference_full_log_prob_chunks
+            ]
+        # Re-materialize the current adapter weights before the student forward.
+        # The 30B SDPO path has repeatedly surfaced zero-storage LoRA tensors in
+        # live runs; capturing and restoring the current adapter state forces the
+        # parameter storage back through a fresh CPU clone before the batch runs.
+        # Keep teacher log-probs outside the TensorDict batch object. The student
+        # forward path only needs input_ids/loss_mask; carrying the teacher tensor
+        # inside the batch adds a large extra tensor field to every microbatch.
+        flat_reference_log_probs = torch.cat(ref_chunks, dim=0)
+        reverse_kl_loss_fn = create_reverse_kl_loss_fn(
+            temperature=temperature,
+            reference_log_probs=flat_reference_log_probs,
+        )
+
+        result = None
+        def _run_reverse_kl_compute():
+            nonlocal result
+            watchdog = self._start_slow_op_watchdog(
+                op="forward_backward_batch_reverse_kl",
+                session_id=session_id,
+                extra=f"items={len(data_items)}",
+            )
+            try:
+                result = self.engine.forward_backward_batch(
+                    data=student_data,
+                    loss_function=reverse_kl_loss_fn,
+                    forward_only=False,
+                )
+            finally:
+                self._stop_slow_op_watchdog(watchdog)
+
+        try:
+            if self._sticky_enabled_for(session_id):
+                sticky = self._ensure_sticky_train_mode(session_id=session_id, reason="forward_backward_reverse_kl")
+                train_mode_reused = bool(sticky.get("reused", False))
+                cached_grads = self._session_gradients.get(session_id)
+                if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED and not train_mode_reused:
+                    self._restore_gradients(cached_grads)
+                try:
+                    _run_reverse_kl_compute()
+                    self._sticky_train_mode_last_used_s = time.perf_counter()
+                except Exception as original_error:
+                    try:
+                        self._release_sticky_train_mode(
+                            reason="forward_backward_reverse_kl_error",
+                            snapshot_gradients=False,
+                        )
+                    except Exception:
+                        pass
+                    raise original_error
+            else:
+                with self.engine.train_mode():
+                    cached_grads = self._session_gradients.get(session_id) if session_id else None
+                    if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
+                        self._restore_gradients(cached_grads)
+                    _run_reverse_kl_compute()
+                    if session_id is not None:
+                        self._session_gradients[session_id] = self._capture_gradients()
+        finally:
+            pass
+        if not output_rank:
+            return {}
+
+        result_metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+        losses = result.get("loss", []) if isinstance(result, dict) else []
+        total_loss = 0.0
+        for loss in losses:
+            if hasattr(loss, "item"):
+                loss = loss.item()
+            total_loss += float(loss)
+
+        num_tokens = 0
+        for value in result_metrics.get("num_tokens", []):
+            if hasattr(value, "item"):
+                value = value.item()
+            num_tokens += int(value)
+
+        kl_tensors = []
+        for value in result_metrics.get("reverse_kl_tokens", []):
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            kl_tensors.append(value)
+        combined_kl = torch.cat(kl_tensors, dim=0) if kl_tensors else None
+
+        outputs = []
+        offset = 0
+        for completion_len, weights in zip(completion_lengths, completion_weights, strict=True):
+            if combined_kl is None:
+                item_loss = total_loss / max(len(completion_lengths), 1)
+            else:
+                sample_kl = combined_kl[offset: offset + completion_len]
+                offset += completion_len
+                weights_t = torch.tensor(weights, dtype=sample_kl.dtype)
+                item_loss = float((sample_kl * weights_t).sum().item())
+            outputs.append(
+                {
+                    "loss": {
+                        "data": [float(item_loss)],
+                        "shape": [1],
+                        "dtype": "float32",
+                    }
+                }
+            )
+
+        avg_loss = total_loss / max(float(num_tokens), 1.0)
+        return {
+            "outputs": outputs,
+            "metrics": {
+                "loss:mean": float(avg_loss),
+                "reverse_kl:mean": float(avg_loss),
+                "num_samples:sum": float(len(outputs)),
+                "num_tokens:sum": float(num_tokens),
+            },
+            "type": "mint_forward_backward_reverse_kl",
+        }
+
+    def forward_reference_full_log_probs(
+        self,
+        data_items: list[dict],
+        temperature: float,
+        traceparent: str | None = None,
+    ) -> dict:
+        """Compute full-vocab teacher log-probs on masked completion tokens only."""
+        import torch
+        from tinker_server.backend.megatron_training import (
+            create_vocab_parallel_logits_extractor_fn,
+            tinker_to_tensordict,
+        )
+
+        from .mintx_ops import vocab_parallel_log_probs_from_logits_no_grad
+
+        self._bind_traceparent(traceparent)
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature!r}")
+        completion_lengths: list[int] = []
+        for item_index, item in enumerate(data_items):
+            weights = item.get("loss_fn_inputs", {}).get("weights", {})
+            weight_values = weights.get("data", []) if isinstance(weights, dict) else []
+            if not isinstance(weight_values, list):
+                raise ValueError(f"Item {item_index}: weights.data must be list")
+            completion_lengths.append(sum(1 for w in weight_values if float(w) != 0.0))
+
+        device = torch.cuda.current_device()
+        max_token_len = get_model_config(self.base_model).max_model_len
+        td = tinker_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
+        td.set_non_tensor("temperature", float(temperature))
+        td.set_non_tensor("return_vocab_parallel_logits", True)
+
+        extractor = create_vocab_parallel_logits_extractor_fn()
+        with self.engine.eval_mode():
+            with torch.no_grad():
+                result = self.engine.forward_backward_batch(
+                    data=td,
+                    loss_function=extractor,
+                    forward_only=True,
+                )
+
+        model_output = result.get("model_output", {})
+        local_logits = model_output.get("vocab_parallel_logits")
+        if local_logits is None:
+            raise ValueError("reference forward missing vocab_parallel_logits")
+        if hasattr(local_logits, "values"):
+            local_logits = local_logits.values()
+        local_log_probs = vocab_parallel_log_probs_from_logits_no_grad(local_logits)
+
+        loss_mask = td["loss_mask"]
+        if hasattr(loss_mask, "values"):
+            loss_mask = loss_mask.values()
+        selected_local = local_log_probs[loss_mask != 0].contiguous()
+
+        local = selected_local.cpu()
+        chunks = []
+        offset = 0
+        for clen in completion_lengths:
+            chunks.append(local[offset:offset + clen].clone().tolist())
+            offset += clen
+        return {"reference_local_log_probs": chunks}
 
     def optim_step(
         self,
@@ -4299,9 +4873,11 @@ class MegatronRankWorker:
         config = {
             "r": effective_rank,
             "lora_alpha": effective_rank * 2,
+            "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
             "base_model_name_or_path": self.base_model,
         }
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -4345,13 +4921,21 @@ class MegatronRankWorker:
         state_dict = self.get_lora_state_dict(use_per_expert_lora=use_per_expert_lora)
 
         os.makedirs(save_path, exist_ok=True)
+        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+
+        # Also persist rank-local adapter shards so Mint reverse-KL can load this
+        # sampler checkpoint back into Megatron without requiring optimizer artifacts.
+        self.save_adapter_state(
+            checkpoint_path=save_path,
+            actual_rank=effective_rank,
+            trainer_rank=self.lora_rank,
+            traceparent=traceparent,
+        )
 
         if self.rank != 0:
             return {}
 
         save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
-
-        effective_rank = actual_rank if actual_rank is not None else self.lora_rank
         try:
             cfg = get_model_config(self.base_model)
             model_is_mla = cfg.is_mla
@@ -4374,9 +4958,11 @@ class MegatronRankWorker:
         config = {
             "r": effective_rank,
             "lora_alpha": effective_rank * 2,
+            "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
             "base_model_name_or_path": self.base_model,
         }
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -4439,9 +5025,84 @@ class MegatronRankWorker:
         }
 
 
+
     # ========================================================================
     # Phase 6: Multi-Session Support Methods
     # ========================================================================
+
+    def _capture_adapter_state_dict(
+        self,
+        *,
+        actual_rank: int | None = None,
+        trainer_rank: int | None = None,
+    ) -> dict:
+        import torch
+
+        from tinker_server.backend.lora_utils import truncate_lora_state_dict
+        from verl.utils.megatron_peft_utils import get_adapter_state_dict
+
+        with self.engine.eval_mode():
+            adapter_state = get_adapter_state_dict(self.engine.module)
+            adapter_state = {
+                key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+                for key, value in adapter_state.items()
+            }
+        if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+            logger.info(
+                f"[Rank {self.rank}] Truncating in-memory adapter from rank {trainer_rank} to {actual_rank}"
+            )
+            adapter_state = truncate_lora_state_dict(adapter_state, trainer_rank, actual_rank)
+        return adapter_state
+
+    def _restore_adapter_state_dict(
+        self,
+        adapter_state: dict,
+        *,
+        actual_rank: int | None = None,
+        trainer_rank: int | None = None,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> None:
+        import torch
+
+        from tinker_server.backend.lora_utils import pad_lora_state_dict
+        from verl.utils.megatron_utils import unwrap_model
+
+        # Phase 7: Apply padding if actual_rank < trainer_rank
+        if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
+            logger.info(
+                f"[Rank {self.rank}] Padding in-memory adapter from rank {actual_rank} to {trainer_rank}"
+            )
+            adapter_state = pad_lora_state_dict(adapter_state, actual_rank, trainer_rank)
+
+        adapter_state = {
+            key: value.detach().cpu().contiguous().clone() if isinstance(value, torch.Tensor) else value
+            for key, value in adapter_state.items()
+        }
+
+        # The caller must hold the desired engine context. Re-entering
+        # eval_mode() here offloads Megatron DDP param storage on exit, which
+        # can leave zero-sized storage just before a caller refreshes optimizer
+        # master params from the restored model weights.
+        model = self.engine.module
+        if isinstance(model, list):
+            model = model[0]
+        unwrapped = unwrap_model(model)
+        if isinstance(unwrapped, list):
+            unwrapped = unwrapped[0]
+
+        _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
+        if unexpected:
+            logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
+
+        train_attn = True if train_attn is None else bool(train_attn)
+        train_mlp = True if train_mlp is None else bool(train_mlp)
+        train_unembed = True if train_unembed is None else bool(train_unembed)
+        self._freeze_non_lora_params(unwrapped)
+        self._zero_disabled_lora_params(
+            unwrapped, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+        )
 
     def load_adapter_state(
         self,
@@ -4451,6 +5112,7 @@ class MegatronRankWorker:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        reload_optimizer_model_params: bool = True,
         traceparent: str | None = None,
     ) -> dict:
         """Load LoRA adapter weights from checkpoint.
@@ -4475,17 +5137,18 @@ class MegatronRankWorker:
 
         import torch
 
-        from tinker_server.backend.lora_utils import pad_lora_state_dict
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
-        from verl.utils.megatron_utils import unwrap_model
 
         self._release_sticky_for_aux_mode_transition(
             reason="load_adapter_state",
             snapshot_gradients=True,
         )
 
-        # Use train_mode context to ensure model is on GPU for loading
-        with self.engine.train_mode():
+        # Loading adapter weights does not require train-mode gradient buffer reset.
+        # Using eval_mode avoids zero_grad_buffer() on context exit, which can trip
+        # illegal-memory-access cleanup when the actor is only being prepared as a
+        # fixed reference model.
+        with self.engine.eval_mode():
             # Get rank-specific checkpoint path
             rank_path = _get_rank_checkpoint_path(checkpoint_path)
             adapter_file = rank_path + "_adapter.pt"
@@ -4495,37 +5158,32 @@ class MegatronRankWorker:
 
             checkpoint = torch.load(adapter_file, map_location="cpu")
             adapter_state = checkpoint.get("adapter_state_dict", {})
-
-            # Phase 7: Apply padding if actual_rank < trainer_rank
-            if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-                logger.info(
-                    f"[Rank {self.rank}] Padding adapter from rank {actual_rank} to {trainer_rank}"
-                )
-                adapter_state = pad_lora_state_dict(adapter_state, actual_rank, trainer_rank)
-
-            # Load into model
-            model = self.engine.module
-            if isinstance(model, list):
-                model = model[0]
-            unwrapped = unwrap_model(model)
-            if isinstance(unwrapped, list):
-                unwrapped = unwrapped[0]
-
-            _, unexpected = unwrapped.load_state_dict(adapter_state, strict=False)
-            if unexpected:
-                logger.warning(f"[Rank {self.rank}] Unexpected keys in checkpoint: {unexpected[:5]}...")
-
-            train_attn = True if train_attn is None else bool(train_attn)
-            train_mlp = True if train_mlp is None else bool(train_mlp)
-            train_unembed = True if train_unembed is None else bool(train_unembed)
-
-            # Keep only LoRA/adapter params trainable; then project disabled targets to zero.
-            self._freeze_non_lora_params(unwrapped)
-            self._zero_disabled_lora_params(
-                unwrapped, train_attn=train_attn, train_mlp=train_mlp, train_unembed=train_unembed
+            expert_bias_state = checkpoint.get("expert_bias_state_dict")
+            self._restore_adapter_state_dict(
+                adapter_state,
+                actual_rank=actual_rank,
+                trainer_rank=trainer_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
+            restored_expert_bias = self._restore_expert_bias_state(expert_bias_state)
 
-        logger.info(f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path}")
+            # Mixed-precision Megatron optimizers keep FP32/master params separate
+            # from the model weights. After loading a different session's LoRA
+            # weights, those master params must be refreshed before the next
+            # optim_step or the old session can overwrite the newly loaded model.
+            optimizer = getattr(self.engine, "optimizer", None)
+            reloaded_master_params = False
+            if reload_optimizer_model_params and optimizer is not None and hasattr(optimizer, "reload_model_params"):
+                optimizer.reload_model_params()
+                reloaded_master_params = True
+
+        logger.info(
+            f"[Rank {self.rank}] Loaded adapter state from {checkpoint_path} "
+            f"(restored_expert_bias={restored_expert_bias}, "
+            f"reloaded_master_params={reloaded_master_params})"
+        )
 
         if self.rank == 0:
             return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
@@ -4558,11 +5216,9 @@ class MegatronRankWorker:
         self._bind_traceparent(traceparent)
         import os
         from pathlib import Path
-
         import torch
 
-        from tinker_server.backend.lora_utils import truncate_lora_state_dict
-        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path, get_adapter_state_dict
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
 
         os.makedirs(checkpoint_path, exist_ok=True)
         self._release_sticky_for_aux_mode_transition(
@@ -4570,26 +5226,29 @@ class MegatronRankWorker:
             snapshot_gradients=True,
         )
 
-        # Use train_mode context to ensure model is on GPU for saving
-        with self.engine.train_mode():
-            # Get adapter state dict
-            adapter_state = get_adapter_state_dict(self.engine.module)
+        adapter_state = self._capture_adapter_state_dict(
+            actual_rank=actual_rank,
+            trainer_rank=trainer_rank,
+        )
 
-            # Phase 7: Apply truncation if actual_rank < trainer_rank
-            if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-                logger.info(
-                    f"[Rank {self.rank}] Truncating adapter from rank {trainer_rank} to {actual_rank}"
-                )
-                adapter_state = truncate_lora_state_dict(adapter_state, trainer_rank, actual_rank)
+        # Get rank-specific path
+        Path(checkpoint_path).mkdir(parents=True, exist_ok=True)
+        rank_path = _get_rank_checkpoint_path(checkpoint_path)
+        adapter_file = rank_path + "_adapter.pt"
 
-            # Get rank-specific path
-            Path(checkpoint_path).mkdir(parents=True, exist_ok=True)
-            rank_path = _get_rank_checkpoint_path(checkpoint_path)
-            adapter_file = rank_path + "_adapter.pt"
+        expert_bias_state = self._capture_expert_bias_state()
+        torch.save(
+            {
+                "adapter_state_dict": adapter_state,
+                "expert_bias_state_dict": expert_bias_state,
+            },
+            adapter_file,
+        )
 
-            torch.save({"adapter_state_dict": adapter_state}, adapter_file)
-
-        logger.info(f"[Rank {self.rank}] Saved adapter state to {checkpoint_path}")
+        logger.info(
+            f"[Rank {self.rank}] Saved adapter state to {checkpoint_path} "
+            f"(expert_bias_buffers={len(expert_bias_state)})"
+        )
 
         if self.rank == 0:
             return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
@@ -4707,6 +5366,9 @@ class MegatronSessionStateManager:
         """Get checkpoint directory path for a session."""
         return os.path.join(self.base_path, f"{session_id}_checkpoint")
 
+    def _actor_only_state_path(self, session_id: str) -> str:
+        return os.path.join(self.get_session_path(session_id), "actor_only_state.json")
+
     def session_exists(self, session_id: str) -> bool:
         """Check if a session has saved state."""
         session_path = self.get_session_path(session_id)
@@ -4718,23 +5380,161 @@ class MegatronSessionStateManager:
 
     def save_metadata(self, session_id: str, step: int, lr: float, actual_rank: int | None = None):
         """Save session metadata (step count, learning rate, actual rank)."""
-        self._session_metadata[session_id] = {
+        meta = {
             "step": step,
             "lr": lr,
             "actual_rank": actual_rank,
         }
+        self._session_metadata[session_id] = meta
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+        metadata_path = os.path.join(session_path, "session_metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+
+    def mark_actor_only_state(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        actor_name: str | None = None,
+    ) -> None:
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+        marker_path = self._actor_only_state_path(session_id)
+        tmp_path = f"{marker_path}.tmp"
+        payload = {
+            "reason": str(reason),
+            "actor_name": None if actor_name is None else str(actor_name),
+            "updated_at": time.time(),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, marker_path)
+
+    def has_actor_only_state(self, session_id: str) -> bool:
+        marker_path = self._actor_only_state_path(session_id)
+        if not os.path.exists(marker_path):
+            return False
+        self._read_actor_only_state(marker_path)
+        return True
+
+    def clear_actor_only_state(self, session_id: str) -> None:
+        marker_path = self._actor_only_state_path(session_id)
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            return
+
+    def _read_actor_only_state(self, marker_path: str) -> dict:
+        try:
+            with open(marker_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read actor_only_state marker {marker_path}: {type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Invalid actor_only_state marker payload type {type(payload).__name__} in {marker_path}"
+            )
+        marker_actor_name = payload.get("actor_name")
+        if not isinstance(marker_actor_name, str) or not marker_actor_name:
+            raise RuntimeError(
+                f"Invalid actor_only_state marker actor_name={marker_actor_name!r} in {marker_path}"
+            )
+        return payload
+
+    def list_actor_only_state_sessions(self, actor_name: str) -> list[str]:
+        import glob
+
+        dirty_sessions: list[str] = []
+        pattern = os.path.join(self.base_path, "*_checkpoint", "actor_only_state.json")
+        for marker_path in glob.glob(pattern):
+            payload = self._read_actor_only_state(marker_path)
+            marker_actor_name = payload["actor_name"]
+            if marker_actor_name != actor_name:
+                continue
+            session_dir = os.path.basename(os.path.dirname(marker_path))
+            if not session_dir.endswith("_checkpoint"):
+                continue
+            dirty_sessions.append(session_dir[: -len("_checkpoint")])
+        return sorted(set(dirty_sessions))
+
+    def prime_session(
+        self,
+        session_id: str,
+        checkpoint_path: str,
+        *,
+        step: int,
+        lr: float,
+        actual_rank: int | None = None,
+    ) -> str:
+        import shutil
+
+        session_path = self.get_session_path(session_id)
+        if not os.path.isdir(checkpoint_path):
+            raise FileNotFoundError(f"checkpoint_path does not exist: {checkpoint_path}")
+        if os.path.realpath(session_path) != os.path.realpath(checkpoint_path):
+            if os.path.lexists(session_path):
+                if os.path.islink(session_path) or os.path.isfile(session_path):
+                    os.unlink(session_path)
+                else:
+                    shutil.rmtree(session_path)
+            os.symlink(checkpoint_path, session_path, target_is_directory=True)
+        self.save_metadata(session_id, step, lr, actual_rank)
+        return session_path
 
     def get_metadata(self, session_id: str) -> dict | None:
         """Get session metadata if exists."""
-        return self._session_metadata.get(session_id)
+        metadata_path = os.path.join(self.get_session_path(session_id), "session_metadata.json")
+        if not os.path.exists(metadata_path):
+            return None
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return None
+        validated = self._validate_metadata(meta, session_id=session_id)
+        if validated is not None:
+            self._session_metadata[session_id] = validated
+        return validated
+
+    def _validate_metadata(self, meta: object, *, session_id: str) -> dict | None:
+        if not isinstance(meta, dict):
+            return None
+        step = meta.get("step")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            return None
+        lr_value = meta.get("lr")
+        if isinstance(lr_value, bool):
+            return None
+        try:
+            lr = float(lr_value)
+        except Exception:
+            return None
+        if not math.isfinite(lr):
+            return None
+        actual_rank = meta.get("actual_rank")
+        if actual_rank is not None:
+            if not isinstance(actual_rank, int) or isinstance(actual_rank, bool) or actual_rank <= 0:
+                return None
+        return {
+            "step": step,
+            "lr": lr,
+            "actual_rank": actual_rank,
+        }
 
     def delete_session(self, session_id: str) -> bool:
         """Delete session checkpoint and metadata."""
         import shutil
         session_path = self.get_session_path(session_id)
         deleted = False
-        if os.path.exists(session_path):
-            shutil.rmtree(session_path)
+        if os.path.lexists(session_path):
+            if os.path.islink(session_path) or os.path.isfile(session_path):
+                os.unlink(session_path)
+            else:
+                shutil.rmtree(session_path)
             deleted = True
         if session_id in self._session_metadata:
             del self._session_metadata[session_id]
@@ -4750,8 +5550,6 @@ class MegatronWorkerGroup:
 
     Creates placement group, spawns workers, routes API calls.
     This is the Tinker API surface for MoE training.
-
-    This is a Ray actor (num_gpus=0) to match MegatronTrainingWorker interface.
     """
 
     def __init__(
@@ -4760,12 +5558,17 @@ class MegatronWorkerGroup:
         lora_rank: int,
         learning_rate: float,
         distributed_config: DistributedConfig | None = None,
+        placement_group_name: str | None = None,
     ):
         init_actor_observability()
         self.base_model = base_model
         self.lora_rank = lora_rank  # This is max_lora_rank for Phase 7
         self.learning_rate = learning_rate
         self.config = distributed_config or DistributedConfig()
+        self.placement_group_name = placement_group_name or _make_megatron_pg_name(
+            _make_megatron_actor_name(base_model),
+            os.environ.get("TINKER_RAY_NAMESPACE"),
+        )
 
         self.workers: list[ray.actor.ActorHandle] = []
         self.placement_group = None
@@ -4787,6 +5590,76 @@ class MegatronWorkerGroup:
         rss_pages = int(parts[1])
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
         return rss_pages * page_size
+
+    def get_cuda_memory_summary(self) -> dict[str, object]:
+        timeout_s = float(os.environ.get("MINT_WORKER_CUDA_SUMMARY_TIMEOUT_S", "2.0"))
+        refs = [w.get_cuda_memory_stats.remote() for w in self.workers]
+        ref_to_rank = {ref: rank for rank, ref in enumerate(refs)}
+        pending = list(refs)
+        stats: list[dict[str, object] | None] = [None] * len(refs)
+
+        while pending:
+            ready, pending = ray.wait(pending, num_returns=1, timeout=timeout_s)
+            if not ready:
+                break
+            ref = ready[0]
+            rank = ref_to_rank[ref]
+            try:
+                stats[rank] = ray.get(ref)
+            except Exception as e:
+                stats[rank] = {
+                    "rank": rank,
+                    "cuda_available": False,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }
+
+        for ref in pending:
+            rank = ref_to_rank[ref]
+            stats[rank] = {
+                "rank": rank,
+                "cuda_available": False,
+                "error_type": "GetTimeoutError",
+                "error": f"get_cuda_memory_stats timed out after {timeout_s:.3f}s for rank {rank}",
+            }
+
+        final_stats: list[dict[str, object]] = []
+        allocated_max = 0
+        reserved_max = 0
+        free_min = None
+        total_bytes = None
+        hottest_rank = None
+        hottest_session = None
+
+        for rank, entry in enumerate(stats):
+            item = dict(entry or {"cuda_available": False})
+            item.setdefault("rank", rank)
+            final_stats.append(item)
+            if not bool(item.get("cuda_available")):
+                continue
+            allocated = int(item.get("allocated_bytes", 0) or 0)
+            reserved = int(item.get("reserved_bytes", 0) or 0)
+            free_bytes = int(item.get("free_bytes", 0) or 0)
+            total = int(item.get("total_bytes", 0) or 0)
+            if allocated >= allocated_max:
+                allocated_max = allocated
+                hottest_rank = rank
+                hottest_session = item.get("current_session_id")
+            reserved_max = max(reserved_max, reserved)
+            free_min = free_bytes if free_min is None else min(free_min, free_bytes)
+            total_bytes = total if total_bytes is None else max(total_bytes, total)
+
+        return {
+            "world_size": len(self.workers),
+            "cuda_available": any(bool(item.get("cuda_available")) for item in final_stats),
+            "allocated_bytes_max": int(allocated_max),
+            "reserved_bytes_max": int(reserved_max),
+            "free_bytes_min": None if free_min is None else int(free_min),
+            "total_bytes": None if total_bytes is None else int(total_bytes),
+            "hottest_rank": hottest_rank,
+            "hottest_session_id": hottest_session,
+            "rank_stats": final_stats,
+        }
 
     def get_master_addr(self) -> str | None:
         return self._master_addr
@@ -4905,7 +5778,7 @@ class MegatronWorkerGroup:
                 logger.info(f"[MegatronWorkerGroup] Model placement preferred nodes={node_ips}")
         # PACK: try to colocate but allow multi-node for large models (K2: 16+ GPUs)
         # STRICT_PACK would require single node, blocking on 8-GPU nodes
-        pg_name = f"{_make_megatron_actor_name(self.base_model)}_pg"
+        pg_name = self.placement_group_name
         try:
             self.placement_group = get_named_placement_group(
                 pg_name,
@@ -4964,9 +5837,13 @@ class MegatronWorkerGroup:
                 # TransformerEngine debug - see why attention backends are disabled
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
-                # Allow TE DotProductAttention backends; Megatron flash attention asserts these are 0.
-                "NVTE_FUSED_ATTN": "0" if is_mla else "1",
-                "NVTE_UNFUSED_ATTN": "0" if is_mla else "1",
+                # GPU worker images can inherit cluster-level NVTE_* defaults.
+                # Fresh 30B Megatron bring-up currently selects flash attention,
+                # which asserts fused/unfused toggles are unset or 0. Override
+                # the inherited defaults explicitly so fresh workers do not see
+                # NVTE_FUSED_ATTN=1 / NVTE_UNFUSED_ATTN=1 from outside this repo.
+                "NVTE_FUSED_ATTN": "0",
+                "NVTE_UNFUSED_ATTN": "0",
                 **otel_env_vars(),
                 },
             ),
@@ -5144,6 +6021,20 @@ class MegatronWorkerGroup:
             raise
         logger.info("[MegatronWorkerGroup] Session state swapped on all workers")
 
+    def _session_state_cached_on_workers(self, session_id: str) -> bool:
+        """Whether every live worker still has actor-only state for this session in memory."""
+        try:
+            states = ray.get([w.has_session_state_cached.remote(session_id) for w in self.workers])
+        except Exception as e:
+            logger.warning(
+                "[MegatronWorkerGroup] Failed to query cached session state for %s: %s: %s",
+                session_id,
+                type(e).__name__,
+                e,
+            )
+            return False
+        return all(bool(state) for state in states)
+
     def _ensure_session_loaded(
         self,
         session_id: str | None,
@@ -5152,6 +6043,7 @@ class MegatronWorkerGroup:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        reload_optimizer_model_params: bool = True,
     ) -> None:
         """Ensure the specified session's state is loaded (LoRA + optimizer + gradients).
 
@@ -5172,11 +6064,6 @@ class MegatronWorkerGroup:
         if session_id is None:
             return
         self._bind_traceparent(traceparent)
-
-        if self._current_session == session_id:
-            # Already loaded
-            logger.debug(f"[MegatronWorkerGroup] Session {session_id} already loaded")
-            return
 
         train_attn = True if train_attn is None else bool(train_attn)
         train_mlp = True if train_mlp is None else bool(train_mlp)
@@ -5203,6 +6090,38 @@ class MegatronWorkerGroup:
             flush=True,
         )
 
+        has_actor_only_state = self._session_manager.has_actor_only_state(session_id)
+        session_exists = self._session_manager.session_exists(session_id)
+        prevalidated_meta = None
+        logger.info(f"[MegatronWorkerGroup] session_exists({session_id}) = {session_exists}")
+        if self._current_session == session_id:
+            if session_exists:
+                meta = self._session_manager.get_metadata(session_id)
+                if not isinstance(meta, dict):
+                    raise RuntimeError(
+                        f"Session cache for {session_id} is missing session_metadata.json; "
+                        "reload from an explicit checkpoint before continuing."
+                    )
+            logger.debug(f"[MegatronWorkerGroup] Session {session_id} already loaded")
+            return
+        if has_actor_only_state:
+            if not self._session_state_cached_on_workers(session_id):
+                raise RuntimeError(
+                    f"Session cache for {session_id} still has actor-only training state; "
+                    "reload it from an explicit checkpoint before continuing."
+                )
+            logger.info(
+                "[MegatronWorkerGroup] Session %s has actor-only marker but state is still cached in-memory on all workers; continuing with live session swap",
+                session_id,
+            )
+        if session_exists:
+            prevalidated_meta = self._session_manager.get_metadata(session_id)
+            if not isinstance(prevalidated_meta, dict):
+                raise RuntimeError(
+                    f"Session cache for {session_id} is missing session_metadata.json; "
+                    "reload from an explicit checkpoint before continuing."
+                )
+
         # Save outgoing session's LoRA weights to disk
         t_save0 = time.perf_counter() if timing else 0.0
         if self._current_session is not None:
@@ -5227,11 +6146,14 @@ class MegatronWorkerGroup:
 
         # Load new session's LoRA weights from disk (or reset for new session)
         t_load0 = time.perf_counter() if timing else 0.0
-        session_exists = self._session_manager.session_exists(session_id)
-        logger.info(f"[MegatronWorkerGroup] session_exists({session_id}) = {session_exists}")
         if session_exists:
             new_path = self._session_manager.get_session_path(session_id)
-            meta = self._session_manager.get_metadata(session_id)
+            meta = prevalidated_meta
+            if not isinstance(meta, dict):
+                raise RuntimeError(
+                    f"Session cache for {session_id} is missing session_metadata.json; "
+                    "reload from an explicit checkpoint before continuing."
+                )
             actual_rank = meta.get("actual_rank") if meta else None
             logger.info(f"[MegatronWorkerGroup] Loading session {session_id} from {new_path}")
             self.load_adapter_state(
@@ -5241,12 +6163,12 @@ class MegatronWorkerGroup:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                reload_optimizer_model_params=reload_optimizer_model_params,
             )
             # Restore metadata
-            if meta:
-                self._step_count = meta.get("step", 0)
-                self.learning_rate = meta.get("lr", self.learning_rate)
-                self._actual_rank = meta.get("actual_rank", self.lora_rank)
+            self._step_count = meta.get("step", 0)
+            self.learning_rate = meta.get("lr", self.learning_rate)
+            self._actual_rank = meta.get("actual_rank", self.lora_rank)
         else:
             # New session: reinitialize LoRA weights
             logger.info(f"[MegatronWorkerGroup] New session {session_id}, reinitializing LoRA")
@@ -5260,13 +6182,15 @@ class MegatronWorkerGroup:
             self._actual_rank = self.lora_rank
         t_load1 = time.perf_counter() if timing else 0.0
 
-        # Reset expert_bias on every session switch to avoid cross-session leakage.
-        # expert_bias is not saved/restored with LoRA checkpoints.
+        # expert_bias is part of the training state for MoE models. Existing
+        # sessions restore it from checkpoint; only brand-new sessions should
+        # be zero-initialized here.
         t_bias0 = time.perf_counter() if timing else 0.0
-        try:
-            self.reset_expert_bias(traceparent=traceparent)
-        except Exception as e:
-            logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for {session_id}: {e}")
+        if not session_exists:
+            try:
+                self.reset_expert_bias(traceparent=traceparent)
+            except Exception as e:
+                logger.warning(f"[MegatronWorkerGroup] Failed to reset expert_bias for new session {session_id}: {e}")
         t_bias1 = time.perf_counter() if timing else 0.0
 
         # DEBUG: Log LoRA norm/checksum after switch
@@ -5294,6 +6218,37 @@ class MegatronWorkerGroup:
                 f"total_s={t1 - t0:.3f} "
                 f"session_exists={session_exists}"
             )
+
+    def _prepare_session_for_explicit_load(
+        self,
+        session_id: str | None,
+        traceparent: str | None = None,
+    ) -> None:
+        """Prepare the actor for an explicit checkpoint load without trusting target cache."""
+        if session_id is None:
+            return
+        self._bind_traceparent(traceparent)
+        if self._current_session == session_id:
+            return
+        if self._current_session is not None:
+            old_path = self._session_manager.get_session_path(self._current_session)
+            logger.info(f"[MegatronWorkerGroup] Saving outgoing session {self._current_session}")
+            self.save_adapter_state(old_path, traceparent=traceparent)
+            self._session_manager.save_metadata(
+                self._current_session,
+                self._step_count,
+                self.learning_rate,
+                self._actual_rank,
+            )
+        ray.get(
+            [
+                w.clear_session_state.remote(session_id, traceparent=traceparent)
+                for w in self.workers
+            ]
+        )
+        self._swap_session_on_workers(session_id)
+        self._current_session = session_id
+        self._session_unknown_due_to_partial_swap = False
 
     def _resolve_required_session_id(self, session_id: str | None, *, op: str) -> str:
         """Resolve session_id with fail-closed behavior for unknown group state."""
@@ -5390,6 +6345,11 @@ class MegatronWorkerGroup:
             t3 = time.perf_counter() if timing else 0.0
         finally:
             self._stop_slow_group_watchdog(watchdog)
+        self._session_manager.mark_actor_only_state(
+            effective_session_id,
+            reason="forward_backward",
+            actor_name=_make_megatron_actor_name(self.base_model),
+        )
         if timing:
             logger.info(
                 f"[MegatronWorkerGroup] forward_backward timing: "
@@ -5409,7 +6369,9 @@ class MegatronWorkerGroup:
         if math.isnan(loss_value) or math.isinf(loss_value):
             raise ValueError(f"non-finite loss_value={loss_value!r}")
 
+        loss_sum = rank0_result.get("loss_sum_value", 0.0)
         metrics = {
+            "loss:sum": float(loss_sum),
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
@@ -5578,6 +6540,7 @@ class MegatronWorkerGroup:
             train_attn=train_attn,
             train_mlp=train_mlp,
             train_unembed=train_unembed,
+            reload_optimizer_model_params=False,
         )
 
         # Send raw data_items to workers (TensorDict created locally on each worker
@@ -5615,31 +6578,143 @@ class MegatronWorkerGroup:
                 raise ValueError(f"loss_fn_outputs[{i}].loss.data[0] non-finite: {v!r}")
         log_probs = rank0_result.get("log_probs")  # Per-token log_probs tensor
 
+        loss_sum = rank0_result.get("loss_sum_value", 0.0)
         metrics = {
+            "loss:sum": float(loss_sum),
             "loss:mean": float(loss_value),
             "num_samples:sum": float(valid_count),
             "num_tokens:sum": float(num_tokens),
         }
 
-        # Convert log_probs tensor to serializable format if present
-        log_probs_data = None
-        if log_probs is not None:
-            import torch
-            if isinstance(log_probs, torch.Tensor):
-                log_probs_data = {
-                    "data": log_probs.tolist(),
-                    "shape": list(log_probs.shape),
-                    "dtype": str(log_probs.dtype),
-                }
-
-        logger.info(f"[MegatronWorkerGroup] forward: loss={loss_value:.4f}, log_probs={'present' if log_probs_data else 'none'}")
+        logger.info(f"[MegatronWorkerGroup] forward: loss={loss_value:.4f}")
 
         return {
             "loss_fn_output_type": "logprob_extractor",
             "loss_fn_outputs": loss_fn_outputs,
             "metrics": metrics,
-            "log_probs": log_probs_data,  # Per-token log probabilities
+            "log_probs": log_probs,
         }
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict],
+        reference_checkpoint_path: str | None,
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+        reference_full_log_prob_chunks: list | None = None,
+    ) -> dict:
+        """Run Mint reverse-KL forward/backward on all workers."""
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="forward_backward_reverse_kl",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+            reload_optimizer_model_params=False,
+        )
+
+        futures = [
+            w.forward_backward_reverse_kl.remote(
+                data_items,
+                reference_checkpoint_path,
+                None,
+                temperature,
+                effective_session_id,
+                traceparent=traceparent,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+                reference_full_log_prob_chunks=(
+                    reference_full_log_prob_chunks[idx]
+                    if isinstance(reference_full_log_prob_chunks, list)
+                    and len(reference_full_log_prob_chunks) == len(self.workers)
+                    else reference_full_log_prob_chunks
+                ),
+            )
+            for idx, w in enumerate(self.workers)
+        ]
+        results = ray.get(futures)
+        rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
+        if not rank0_result:
+            raise ValueError("reverse_kl produced no rank0 result")
+        return rank0_result
+
+    def forward_reference_full_log_probs(
+        self,
+        data_items: list[dict],
+        temperature: float,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> list:
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="forward_reference_full_log_probs",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+            reload_optimizer_model_params=False,
+        )
+        futures = [
+            w.forward_reference_full_log_probs.remote(
+                data_items,
+                temperature,
+                traceparent=traceparent,
+            )
+            for w in self.workers
+        ]
+        results = ray.get(futures)
+        chunks_by_rank = []
+        for idx, result in enumerate(results):
+            chunks = result.get("reference_local_log_probs") if isinstance(result, dict) else None
+            if not isinstance(chunks, list):
+                raise ValueError(f"reference_local_log_probs missing from worker index {idx}")
+            chunks_by_rank.append(chunks)
+        return chunks_by_rank
+
+    def debug_lora_storage(
+        self,
+        session_id: str | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict:
+        self._bind_traceparent(traceparent)
+        effective_session_id = self._resolve_required_session_id(
+            session_id,
+            op="debug_lora_storage",
+        )
+        self._ensure_session_loaded(
+            effective_session_id,
+            traceparent=traceparent,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+        results = ray.get(
+            [w.debug_lora_storage.remote(traceparent=traceparent) for w in self.workers]
+        )
+        return {"results": results}
 
     def optim_step(
         self,
@@ -5672,12 +6747,9 @@ class MegatronWorkerGroup:
             session_id,
             op="optim_step",
         )
-        self._ensure_session_loaded(
+        self._prepare_session_for_explicit_load(
             effective_session_id,
             traceparent=traceparent,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
         )
         t1 = time.perf_counter() if timing else 0.0
 
@@ -5708,6 +6780,11 @@ class MegatronWorkerGroup:
         lr = rank0_result.get("lr", learning_rate)
 
         self._step_count += 1
+        self._session_manager.mark_actor_only_state(
+            effective_session_id,
+            reason="optim_step",
+            actor_name=_make_megatron_actor_name(self.base_model),
+        )
 
         print(
             f"[MegatronWorkerGroup] optim_step: grad_norm={grad_norm:.4f}, "
@@ -6007,21 +7084,35 @@ class MegatronWorkerGroup:
                     "Optimizer restore requested, but optimizer shard(s) not found: "
                     + ", ".join(missing)
                 )
-        self._ensure_session_loaded(
+        self._prepare_session_for_explicit_load(
             effective_session_id,
             traceparent=traceparent,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
         )
 
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: path={load_path}, load_optimizer={load_optimizer}")
         logger.info(f"[MegatronWorkerGroup] load_checkpoint: found {len(adapter_files)} adapter files")
 
+        adapter_config_path = os.path.join(load_path, "adapter_config.json")
+        if not os.path.isfile(adapter_config_path):
+            raise FileNotFoundError(
+                f"Missing adapter_config.json required to recover actual LoRA rank: {adapter_config_path}"
+            )
+        with open(adapter_config_path, "r", encoding="utf-8") as f:
+            adapter_config = json.load(f)
+        if not isinstance(adapter_config, dict):
+            raise RuntimeError(
+                f"Invalid adapter_config.json type {type(adapter_config).__name__} in {adapter_config_path}"
+            )
+        checkpoint_rank = adapter_config.get("r")
+        if not isinstance(checkpoint_rank, int) or isinstance(checkpoint_rank, bool) or checkpoint_rank <= 0:
+            raise RuntimeError(
+                f"Invalid adapter rank in {adapter_config_path}: expected positive int, got {checkpoint_rank!r}"
+            )
+
         # Delegate to load_adapter_state
         result = self.load_adapter_state(
             load_path,
-            actual_rank=self._actual_rank or self.lora_rank,
+            actual_rank=checkpoint_rank,
             traceparent=traceparent,
             train_attn=train_attn,
             train_mlp=train_mlp,
@@ -6093,6 +7184,11 @@ class MegatronWorkerGroup:
             result["optimizer_reset"] = True
         else:
             result["optimizer_reset"] = False
+            self._session_manager.mark_actor_only_state(
+                effective_session_id,
+                reason="load_weights",
+                actor_name=_make_megatron_actor_name(self.base_model),
+            )
 
         self._step_count = checkpoint_step
         self.learning_rate = checkpoint_lr
@@ -6252,6 +7348,7 @@ class MegatronWorkerGroup:
         train_attn: bool | None = None,
         train_mlp: bool | None = None,
         train_unembed: bool | None = None,
+        reload_optimizer_model_params: bool = True,
     ) -> dict:
         """Load LoRA adapter weights from checkpoint on all workers.
 
@@ -6281,6 +7378,7 @@ class MegatronWorkerGroup:
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
+                reload_optimizer_model_params=reload_optimizer_model_params,
                 traceparent=traceparent,
             )
             for w in self.workers
@@ -6424,6 +7522,7 @@ class MegatronWorkerGroup:
         step_count: int,
         learning_rate: float,
         actual_rank: int | None = None,
+        actor_only_state_dirty: bool = False,
     ) -> dict:
         """Record that a checkpoint-loaded session is the current active session."""
         ray.get([w.mark_session_loaded.remote(session_id) for w in self.workers])
@@ -6431,17 +7530,67 @@ class MegatronWorkerGroup:
         self._step_count = int(step_count)
         self.learning_rate = float(learning_rate)
         self._actual_rank = actual_rank if actual_rank is not None else self.lora_rank
+        self.save_adapter_state(self._session_manager.get_session_path(session_id))
         self._session_manager.save_metadata(
             session_id,
             self._step_count,
             self.learning_rate,
             self._actual_rank,
         )
+        if actor_only_state_dirty:
+            self._session_manager.mark_actor_only_state(
+                session_id,
+                reason="load_weights",
+                actor_name=_make_megatron_actor_name(self.base_model),
+            )
+        else:
+            self._session_manager.clear_actor_only_state(session_id)
         logger.info(
             f"[MegatronWorkerGroup] Marked loaded session active: {session_id} "
             f"(step={self._step_count}, actual_rank={self._actual_rank})"
         )
         return {"status": "ok", "session_id": session_id}
+
+    def prime_session_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_path: str,
+        *,
+        step_count: int,
+        learning_rate: float,
+        actual_rank: int | None = None,
+    ) -> dict:
+        session_path = self._session_manager.prime_session(
+            session_id,
+            checkpoint_path,
+            step=int(step_count),
+            lr=float(learning_rate),
+            actual_rank=actual_rank,
+        )
+        logger.info(
+            f"[MegatronWorkerGroup] Primed session {session_id} from {checkpoint_path} "
+            f"into {session_path} (actual_rank={actual_rank})"
+        )
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "session_path": session_path,
+            "actual_rank": actual_rank,
+        }
+
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        traceparent: str | None = None,
+    ) -> dict:
+        self._bind_traceparent(traceparent)
+        ray.get([w.clear_session_state.remote(session_id, traceparent=traceparent) for w in self.workers])
+        deleted = self._session_manager.delete_session(session_id)
+        if self._current_session == session_id:
+            self._current_session = None
+            self._session_unknown_due_to_partial_swap = False
+        return {"status": "ok", "session_id": session_id, "deleted": bool(deleted)}
 
     def get_session_info(self) -> dict:
         """Get current session info.
@@ -6498,6 +7647,7 @@ def get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
+    actor_name_override: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Get existing or create new persistent MegatronWorkerGroup for this model.
 
@@ -6528,7 +7678,7 @@ def get_or_create_megatron_worker_group(
         )
 
     resource_pool = get_resource_pool()
-    actor_name = _make_megatron_actor_name(base_model)
+    actor_name = actor_name_override or _make_megatron_actor_name(base_model)
 
     create_lock = _get_megatron_create_lock(actor_name)
     with create_lock:
@@ -6585,7 +7735,7 @@ def get_or_create_megatron_worker_group(
         # Heal a common invariant violation: a detached Megatron placement group can outlive the
         # named actor (e.g., crash during initialization). The orphan PG reserves GPUs, which can
         # make ensure_gpus_available() block forever even though nothing is actually running.
-        pg_name = f"{actor_name}_pg"
+        pg_name = _make_megatron_pg_name(actor_name, PERSISTENT_NAMESPACE)
         try:
             orphan_pg = get_named_placement_group(pg_name, namespace=PERSISTENT_NAMESPACE)
         except ValueError:
@@ -6651,6 +7801,8 @@ def get_or_create_megatron_worker_group(
             for k in (
                 "MINT_MOE_LORA_SPARSE_EXPERT_EXPORT",
                 "MINT_MOE_LORA_SHARED_EXPERT_EXPORT",
+                "CUDA_LAUNCH_BLOCKING",
+                "TORCH_USE_CUDA_DSA",
             ):
                 v = os.environ.get(k)
                 if v is not None:
@@ -6668,6 +7820,8 @@ def get_or_create_megatron_worker_group(
                 v = os.environ.get(k)
                 if v is not None:
                     runtime_env["env_vars"][k] = v
+            from .volc_placement import list_node_ips_for_resource_queue
+
             explicit_node_ips_csv = os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", "").strip()
             megatron_node_pin_json = os.environ.get("MINT_MEGATRON_MODEL_NODE_IPS_JSON")
             if explicit_node_ips_csv:
@@ -6675,8 +7829,6 @@ def get_or_create_megatron_worker_group(
             elif not megatron_node_pin_json:
                 volc_rq = os.environ.get("MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID", "").strip()
                 if volc_rq:
-                    from .volc_placement import list_node_ips_for_resource_queue
-
                     node_ips = list_node_ips_for_resource_queue(resource_queue_id=volc_rq)
                     if not node_ips:
                         raise RuntimeError(
@@ -6695,16 +7847,45 @@ def get_or_create_megatron_worker_group(
 
             # Create detached Ray actor with per-model name
             try:
-                actor = MegatronWorkerGroup.options(
-                    name=actor_name,
-                    namespace=PERSISTENT_NAMESPACE,
-                    lifetime="detached",
-                    runtime_env=runtime_env,
-                ).remote(
+                actor_options = {
+                    "name": actor_name,
+                    "namespace": PERSISTENT_NAMESPACE,
+                    "lifetime": "detached",
+                    "runtime_env": runtime_env,
+                }
+                preferred_node_ips = _preferred_worker_node_ips_for_model(base_model)
+                if preferred_node_ips:
+                    pinned_node_ip = preferred_node_ips[0]
+                    node_map = {
+                        n.get("NodeManagerAddress"): n.get("NodeID")
+                        for n in ray.nodes()
+                        if n.get("Alive")
+                    }
+                    node_id = node_map.get(pinned_node_ip)
+                    if not node_id:
+                        raise RuntimeError(
+                            f"Requested pinned_node_ip={pinned_node_ip} for actor={actor_name} "
+                            "but no alive Ray node has that IP"
+                        )
+                    actor_options["resources"] = {f"node:{pinned_node_ip}": 0.001}
+                    actor_options["scheduling_strategy"] = (
+                        ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                            node_id,
+                            soft=False,
+                        )
+                    )
+                    logger.info(
+                        "Pinning detached manager actor=%s to node_ip=%s node_id=%s",
+                        actor_name,
+                        pinned_node_ip,
+                        node_id,
+                    )
+                actor = MegatronWorkerGroup.options(**actor_options).remote(
                     base_model=base_model,
                     lora_rank=lora_rank,
                     learning_rate=learning_rate,
                     distributed_config=config,
+                    placement_group_name=pg_name,
                 )
             except Exception as e:
                 msg = str(e)
@@ -6741,6 +7922,7 @@ async def async_get_or_create_megatron_worker_group(
     learning_rate: float,
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
+    actor_name_override: str | None = None,
 ) -> ray.actor.ActorHandle:
     """Async version of get_or_create_megatron_worker_group.
 
@@ -6766,6 +7948,7 @@ async def async_get_or_create_megatron_worker_group(
         learning_rate,
         distributed_config,
         session_id,
+        actor_name_override,
     )
 
 

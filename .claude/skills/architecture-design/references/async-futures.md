@@ -42,13 +42,28 @@ Async endpoints must use the admission layer before creating futures:
 
 On admission failure, the API must return HTTP 429 with a structured overload reason (for example `queue_bytes_budget_exceeded` or `object_store_budget_exceeded`). Overload is explicit; the server must not allow unbounded backlog to grow until OOM.
 
+## Request-path async rules
+
+The request path uses native async Ray integration on hot control-plane operations:
+
+- Routes await Ray refs directly through async helpers instead of calling blocking `ray.get(...)`.
+- Request paths do not call `init_ray()` or attempt reconnection. Startup owns Ray initialization.
+- Startup warms cached detached-actor handles for the request-path stores.
+- If a cached detached-actor handle dies, the async helper may reacquire the actor by name once. This is a stale-handle recovery path, not permission for routes to bootstrap a new Ray client or hide a missing actor.
+
 ## Training queue scheduling (session-aware mode)
 
-By default, the detached API work queue behaves like FIFO. For chunked training bursts, `api_work_queue` also supports a session-aware scheduler path for selected ops:
+The detached API work queue is still FIFO for untagged work. For training-session-bound requests, the training routes now tag scheduler metadata by default (`MINT_SCHEDULER_ENABLE` defaults to `1` unless explicitly disabled). The tagged route set includes:
 
+- `training.create_model`
+- `training.create_model_from_state`
+- `training.forward`
 - `training.forward_backward`
 - `training.optim_step`
 - `training.train_step`
+- `training.reset_expert_bias`
+- `training.save_weights_for_sampler`
+- `training.delete_model`
 
 The training route tags these requests with `extra` metadata:
 
@@ -56,12 +71,14 @@ The training route tags these requests with `extra` metadata:
 - `scheduler_domain` (typically `"{backend}:{base_model}"`)
 - `scheduler_session_key` (uses server-side `model_id`)
 
-When enabled (`MINT_SCHEDULER_ENABLE=1`), tagged requests are grouped into per-domain/per-session subqueues. Scheduling semantics:
+When enabled, tagged requests are grouped into per-domain/per-session subqueues. Scheduling semantics:
 
 - Same session preserves FIFO order.
+- Each scheduler domain is single-flight: only one scheduled request from that domain can be leased to a worker at a time. This is intentional for shared training actors where overlapping requests against the same actor would violate session-state invariants.
 - Across sessions, selection is fairness-based (`MINT_SCHEDULER_FAIRNESS=oldest|rr`) with starvation guard (`MINT_SCHEDULER_STARVATION_S`).
 - Sticky bursts are bounded by `MINT_SCHEDULER_MAX_CONSECUTIVE`.
 - Optional coalescing window (`MINT_SCHEDULER_COALESCE_MS`) briefly waits for another chunk from the previous session before switching.
+- There is no follow-up hold window anymore. A session only keeps the domain lease while its dequeued request is still live; stale consumer generations release those leases during restart reconciliation.
 
 This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for these tagged training ops to reduce cross-session thrash, while preserving per-session ordering and bounded fairness.
 

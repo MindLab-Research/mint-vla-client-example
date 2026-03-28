@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -56,7 +58,8 @@ _SESSION_CACHE_TTL_S = int(
 _session_cache: OrderedDict[tuple[str | None, str], _SessionCacheEntry] = OrderedDict()
 _session_lock = asyncio.Lock()
 _tokenizer_cache: dict[str, Any] = {}
-_tokenizer_lock = asyncio.Lock()
+_tokenizer_locks: dict[str, asyncio.Lock] = {}
+_tokenizer_locks_guard = asyncio.Lock()
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 # Secondary: ```json {...} ``` / ```json [...] ``` code blocks for tool payloads.
 # Handles models whose native chat templates emit JSON code blocks instead of <tool_call> XML.
@@ -107,14 +110,72 @@ def _load_tokenizer_cpu(base_model: str):
     return AutoTokenizer.from_pretrained(base_model, local_files_only=True)
 
 
+def _tokenizer_max_workers() -> int:
+    raw = (
+        os.environ.get("TINKER_OAI_TOKENIZER_MAX_WORKERS")
+        or os.environ.get("MINT_OAI_TOKENIZER_MAX_WORKERS")
+        or "8"
+    )
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 8
+
+
+@lru_cache(maxsize=1)
+def _get_tokenizer_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(
+        max_workers=_tokenizer_max_workers(),
+        thread_name_prefix="mint-oai-tokenizer",
+    )
+
+
+def shutdown_tokenizer_executor() -> None:
+    if _get_tokenizer_executor.cache_info().currsize == 0:
+        return
+    executor = _get_tokenizer_executor()
+    executor.shutdown(wait=False, cancel_futures=True)
+    _get_tokenizer_executor.cache_clear()
+
+
+async def _get_tokenizer_model_lock(base_model: str) -> asyncio.Lock:
+    lock = _tokenizer_locks.get(base_model)
+    if lock is not None:
+        return lock
+    async with _tokenizer_locks_guard:
+        lock = _tokenizer_locks.get(base_model)
+        if lock is None:
+            lock = asyncio.Lock()
+            _tokenizer_locks[base_model] = lock
+        return lock
+
+
+def preload_supported_tokenizers() -> dict[str, str]:
+    failures: dict[str, str] = {}
+    for base_model in _list_supported_models():
+        if base_model in _tokenizer_cache:
+            continue
+        try:
+            _tokenizer_cache[base_model] = _load_tokenizer_cpu(base_model)
+        except Exception as exc:
+            failures[base_model] = f"{type(exc).__name__}: {exc}"
+    return failures
+
+
 async def _get_tokenizer(base_model: str):
     tokenizer = _tokenizer_cache.get(base_model)
     if tokenizer is not None:
         return tokenizer
-    async with _tokenizer_lock:
+    model_lock = await _get_tokenizer_model_lock(base_model)
+    async with model_lock:
         tokenizer = _tokenizer_cache.get(base_model)
         if tokenizer is None:
-            tokenizer = await asyncio.to_thread(_load_tokenizer_cpu, base_model)
+            loop = asyncio.get_running_loop()
+            tokenizer = await loop.run_in_executor(
+                _get_tokenizer_executor(),
+                _load_tokenizer_cpu,
+                base_model,
+            )
             _tokenizer_cache[base_model] = tokenizer
         return tokenizer
 

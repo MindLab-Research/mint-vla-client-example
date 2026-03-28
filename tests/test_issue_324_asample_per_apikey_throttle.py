@@ -16,31 +16,34 @@ class _StubSamplingSessionManager:
     def get_engine(self, _session_id: str):
         return object()
 
+    def get_session_base_model(self, _session_id: str) -> str:
+        return "Qwen/Qwen3-4B-Instruct-2507"
+
 
 class _StubFutureStore:
-    def create_with_id(self, _request_id: str):
+    async def async_create_with_id(self, _request_id: str):
         return None
 
-    def mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
+    async def async_mark_queued(self, _request_id: str, meta: dict | None = None) -> None:
         _ = meta
 
-    def ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
+    async def async_ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
         _ = (request_id, meta)
         return {"created": True, "meta": None}
 
-    def cleanup(self, _request_id: str) -> None:
+    async def async_cleanup(self, _request_id: str) -> None:
         return None
 
-    def forget(self, _request_id: str) -> None:
+    async def async_forget(self, _request_id: str) -> None:
         return None
 
 
 class _StubCapacityManager:
-    def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+    async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
         _ = (request_id, queue_bytes, object_store_bytes)
         return {"ok": True}
 
-    def release_all(self, _request_id: str) -> None:
+    async def async_release_all(self, _request_id: str) -> None:
         return None
 
 
@@ -73,13 +76,20 @@ def _sample_request() -> SampleRequest:
         sampling_params=SamplingParams(max_tokens=4),
     )
 
+
 def test_issue_324_asample_maps_queue_throttle_to_429(monkeypatch):
     stub_q = _StubApiWorkQueue()
     stub_fs = _StubFutureStore()
     stub_cap = _StubCapacityManager()
+    metric_calls: list[dict] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "future_store", stub_fs)
+    monkeypatch.setattr(
+        sampling_route,
+        "record_sampling_admission_metric",
+        lambda **kwargs: metric_calls.append(dict(kwargs)),
+    )
 
     import tinker_server.backend.api_work_queue as awq
     import tinker_server.backend.capacity_manager as cm
@@ -106,6 +116,61 @@ def test_issue_324_asample_maps_queue_throttle_to_429(monkeypatch):
         "pending": 1,
         "message": "Sampling backpressure: principal budget exhausted",
     }
+    assert metric_calls == [
+        {
+            "route": "/api/v1/asample",
+            "decision": "rejected",
+            "reason": "queue_throttled",
+            "scope": "api_key",
+        }
+    ]
+
+
+def test_issue_324_compute_logprobs_records_capacity_rejection_metric(monkeypatch):
+    metric_calls: list[dict] = []
+
+    class _RejectingCapacityManager:
+        async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int) -> dict:
+            _ = (request_id, queue_bytes, object_store_bytes)
+            return {"ok": False, "queue_bytes": 123, "object_store_bytes": 456}
+
+    monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
+    monkeypatch.setattr(
+        sampling_route,
+        "record_sampling_admission_metric",
+        lambda **kwargs: metric_calls.append(dict(kwargs)),
+    )
+
+    import tinker_server.backend.capacity_manager as cm
+    import tinker_server.backend.result_size_estimator as rse
+
+    monkeypatch.setattr(cm, "capacity_manager", _RejectingCapacityManager())
+    monkeypatch.setattr(rse, "estimate_compute_logprobs_result_bytes", lambda _req: 0)
+
+    request = sampling_route.ComputeLogprobsRequest(
+        sampling_session_id="sess",
+        seq_id=1,
+        sequence=ModelInput.from_ints([1, 2, 3]),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        anyio.run(
+            sampling_route.compute_logprobs,
+            request,
+            _dummy_request(
+                user_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+                apikey_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        )
+
+    assert exc.value.status_code == 429
+    assert metric_calls == [
+        {
+            "route": "/api/v1/compute_logprobs",
+            "decision": "rejected",
+            "reason": "capacity_rejected",
+        }
+    ]
 
 
 def test_issue_324_unwrap_queue_throttle_error_from_ray_wrapper():

@@ -233,9 +233,9 @@ async def retrieve_future(
 
         # If this future corresponds to an ephemeral save_weights_for_sampler on an upstream,
         # register the returned sampling_session_id so subsequent /asample routes correctly.
-        from ..gateway import maybe_register_sampling_session_from_retrieve_future
+        from ..gateway import async_maybe_register_sampling_session_from_retrieve_future
 
-        maybe_register_sampling_session_from_retrieve_future(
+        await async_maybe_register_sampling_session_from_retrieve_future(
             upstream_alias=upstream_alias,
             upstream_request_id=upstream_request_id,
             payload=payload,
@@ -279,7 +279,7 @@ async def retrieve_future(
         return payload
 
     try:
-        status = future_store.get_status(body.request_id)
+        status = await future_store.async_get_status(body.request_id)
     except FutureStoreUnavailableError:
         raise HTTPException(status_code=503, detail="Ray unavailable: FutureStore requires Ray")
     except KeyError:
@@ -290,14 +290,14 @@ async def retrieve_future(
             detail = {
                 "error": detail,
                 "request_id": body.request_id,
-                "future_store": future_store.debug_snapshot(),
+                "future_store": await future_store.async_debug_snapshot(),
             }
         raise HTTPException(status_code=404, detail=detail)
 
     if status == FutureStatus.PENDING:
         meta = None
         try:
-            meta = future_store.get_meta(body.request_id)
+            meta = await future_store.async_get_meta(body.request_id)
         except Exception:
             meta = None
         if isinstance(meta, dict):
@@ -356,19 +356,22 @@ async def retrieve_future(
         queue_depth = None
         estimated_wait_s = None
         from ..backend.api_work_queue import ApiWorkQueueUnavailableError, api_work_queue
-        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "0")).strip().lower() in (
+        scheduler_enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
             "1",
             "true",
             "yes",
             "y",
+            "on",
         )
-        try:
-            pos = await api_work_queue.find_position(body.request_id)
-        except ApiWorkQueueUnavailableError as e:
-            raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
-        if not scheduler_enabled and isinstance(pos, dict):
+        pos = None
+        if status_field == "queued" and not scheduler_enabled:
+            try:
+                pos = await api_work_queue.find_position(body.request_id)
+            except ApiWorkQueueUnavailableError as e:
+                raise HTTPException(status_code=503, detail=f"ApiWorkQueue unavailable: {e}") from e
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"ApiWorkQueue position lookup failed: {type(e).__name__}: {e}") from e
+        if isinstance(pos, dict):
             queue_depth = pos.get("depth")
             if status_field == "queued":
                 queue_position = pos.get("position")
@@ -491,12 +494,12 @@ async def retrieve_future(
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             return _apply_cached_response(cached, response)
-        result = future_store.get_result(body.request_id)
+        result = await future_store.async_get_result(body.request_id)
         if result is not None:
             _recent_put(body.request_id, result)
             logger.info("[retrieve_future] request_id=%s status=retrieved served=result", body.request_id)
             return result
-        error = future_store.get_error(body.request_id)
+        error = await future_store.async_get_error(body.request_id)
         if error is not None:
             if _is_privileged(http_request):
                 payload = {"error": error, "category": "system"}
@@ -509,7 +512,7 @@ async def retrieve_future(
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
         _pending_hint_clear(body.request_id)
-        error = future_store.get_error(body.request_id)
+        error = await future_store.async_get_error(body.request_id)
         # Only expose full error details to privileged users
         if _is_privileged(http_request):
             payload = {"error": error, "category": "system"}
@@ -523,18 +526,18 @@ async def retrieve_future(
             import ray
 
             if ray.is_initialized():
-                capacity_manager.release_all(body.request_id)
+                await capacity_manager.async_release_all(body.request_id)
         except Exception:
             pass
         try:
-            future_store.cleanup(body.request_id)
+            await future_store.async_cleanup(body.request_id)
         except Exception:
             pass
         return payload
     else:
         _pending_hint_clear(body.request_id)
         # DONE - return the result
-        result = future_store.get_result(body.request_id)
+        result = await future_store.async_get_result(body.request_id)
         _recent_put(body.request_id, result)
         logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
         try:
@@ -543,11 +546,11 @@ async def retrieve_future(
             import ray
 
             if ray.is_initialized():
-                capacity_manager.release_all(body.request_id)
+                await capacity_manager.async_release_all(body.request_id)
         except Exception:
             pass
         try:
-            future_store.cleanup(body.request_id)
+            await future_store.async_cleanup(body.request_id)
         except Exception:
             pass
         return result

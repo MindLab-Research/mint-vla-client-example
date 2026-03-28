@@ -59,15 +59,22 @@ class _StubFutureStore:
         self.created: list[str] = []
         self.forgotten: list[str] = []
 
-    def ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
+    async def async_ensure_pending(self, request_id: str, meta: dict | None = None) -> dict:
         if request_id in self.pending:
             return {"created": False, "meta": self.pending.get(request_id)}
         self.pending[request_id] = dict(meta) if meta is not None else None
         return {"created": True, "meta": None}
 
-    def create_with_id(self, request_id: str):
+    async def async_create_with_id(self, request_id: str):
         self.created.append(request_id)
         return request_id
+
+    async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+        self.marked.append(request_id)
+        cur = self.pending.get(request_id) or {}
+        if meta is not None:
+            cur.update(dict(meta))
+        self.pending[request_id] = cur
 
     def mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.marked.append(request_id)
@@ -76,15 +83,15 @@ class _StubFutureStore:
             cur.update(dict(meta))
         self.pending[request_id] = cur
 
-    def get_status(self, request_id: str) -> str:
+    async def async_get_status(self, request_id: str) -> str:
         if request_id in self.pending:
             return "PENDING"
         raise KeyError(f"Unknown request_id: {request_id}")
 
-    def cleanup(self, _request_id: str) -> None:
+    async def async_cleanup(self, _request_id: str) -> None:
         return None
 
-    def forget(self, request_id: str) -> None:
+    async def async_forget(self, request_id: str) -> None:
         self.forgotten.append(request_id)
         self.pending.pop(request_id, None)
 
@@ -94,9 +101,12 @@ class _StubCapacityManager:
         self.reserved: list[str] = []
         self.released: list[str] = []
 
-    def try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int):
+    async def async_try_reserve(self, request_id: str, queue_bytes: int, object_store_bytes: int):
         self.reserved.append(request_id)
         return {"ok": True}
+
+    async def async_release_all(self, request_id: str) -> None:
+        self.released.append(request_id)
 
     def release_all(self, request_id: str) -> None:
         self.released.append(request_id)

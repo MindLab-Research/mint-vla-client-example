@@ -181,6 +181,8 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
     for key in (
         "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
         "TINKER_ACTOR_LD_LIBRARY_PATH",
+        "MINT_SFT_DIAG_FAIL",
+        "MINT_REVERSE_KL_DIAG_FAIL",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
@@ -188,6 +190,18 @@ def actor_runtime_env_vars(*, pythonpath: str, extra: dict[str, str] | None = No
     if extra:
         out.update(extra)
     return out
+
+def actor_runtime_env(*, pythonpath: str, extra: dict[str, str] | None = None) -> dict[str, object]:
+    runtime_env: dict[str, object] = {
+        "env_vars": actor_runtime_env_vars(pythonpath=pythonpath, extra=extra)
+    }
+    py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
+    if py_modules_csv:
+        runtime_env["py_modules"] = [x.strip() for x in py_modules_csv.split(",") if x.strip()]
+    working_dir = _env_nonempty(os.environ, "MINT_RAY_WORKING_DIR")
+    if working_dir:
+        runtime_env["working_dir"] = working_dir
+    return runtime_env
 
 
 def preferred_vllm_python_executable() -> str | None:
@@ -321,6 +335,7 @@ class ServerConfig:
     api_work_queue_reap_interval_s: float = 5.0
 
     # Training settings (backend/verl_training.py)
+    training_inactivity_timeout_s: int = 3600
     training_force_grad_checkpointing: bool = True
     training_enable_sdp: bool = True
     training_megatron_create_timeout_s: float = 1800.0
@@ -611,6 +626,11 @@ class ServerConfig:
                 5.0,
             ),
             # Training settings
+            training_inactivity_timeout_s=_pick_int(
+                "MINT_TRAINING_INACTIVITY_TIMEOUT",
+                file_training.inactivity_timeout_s if file_training is not None else None,
+                3600,
+            ),
             training_force_grad_checkpointing=_pick_bool(
                 "TINKER_FORCE_GRAD_CHECKPOINTING",
                 file_training.force_grad_checkpointing if file_training is not None else None,

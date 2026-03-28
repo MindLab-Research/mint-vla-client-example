@@ -261,7 +261,9 @@ def _is_request_validation_error(exc: BaseException) -> bool:
         marker in text
         for marker in (
             "vllm_prompt_logprobs_add_request_failed",
+            "vllm_prompt_topk_add_request_failed",
             "vllm_generate_add_request_failed",
+            "Requested prompt logprobs of",
             "Prompt+max_tokens length",
             "exceeds max_model_len",
             "maximum model length",
@@ -2132,26 +2134,9 @@ class MultiNodeInferenceEngine:
             node_ips: list[str] | None = None
             gpus_per_node = 8
 
-            # Preferred node pinning (e.g., for temporarily placing K2 vLLM workers onto C1 nodes
-            # when C2 is unavailable). If provided, it takes precedence over queue-based selection.
+            # Preferred node pinning takes precedence over queue-based selection.
             preferred_node_ips = _preferred_worker_node_ips_for_model(self.model_name)
-            if preferred_node_ips and distributed_executor_backend != "mp":
-                required_by_node_ip: dict[str, int] = {}
-                for bundle in resources.pg_bundles:
-                    if float(bundle.get("GPU", 0) or 0) <= 0:
-                        continue
-                    for key, value in bundle.items():
-                        if not isinstance(key, str) or not key.startswith("node:"):
-                            continue
-                        if float(value or 0) <= 0:
-                            continue
-                        node_ip = key.split("node:", 1)[1]
-                        required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
-                if required_by_node_ip:
-                    assert_node_ip_capacity(
-                        required_gpus_by_node_ip=required_by_node_ip,
-                        context=f"multinode_vllm_node_pin model={self.model_name}",
-                    )
+            if preferred_node_ips:
                 nodes_needed = (int(worker_gpus) + int(gpus_per_node) - 1) // int(gpus_per_node)
                 if len(preferred_node_ips) < nodes_needed:
                     raise RuntimeError(
@@ -2163,6 +2148,33 @@ class MultiNodeInferenceEngine:
                 logger.info(
                     f"[MultiNodeInferenceEngine] Using pinned node IPs for model={self.model_name} nodes={node_ips}"
                 )
+                if distributed_executor_backend == "mp":
+                    if len(node_ips) != 1:
+                        raise RuntimeError(
+                            f"mp vLLM requires exactly 1 pinned node, got nodes={node_ips} "
+                            f"for model={self.model_name!r}"
+                        )
+                    mp_pinned_node_ip = node_ips[0]
+                    logger.info(
+                        f"[MultiNodeInferenceEngine] mp pin model={self.model_name} node={mp_pinned_node_ip}"
+                    )
+                else:
+                    required_by_node_ip: dict[str, int] = {}
+                    for bundle in resources.pg_bundles:
+                        if float(bundle.get("GPU", 0) or 0) <= 0:
+                            continue
+                        for key, value in bundle.items():
+                            if not isinstance(key, str) or not key.startswith("node:"):
+                                continue
+                            if float(value or 0) <= 0:
+                                continue
+                            node_ip = key.split("node:", 1)[1]
+                            required_by_node_ip[node_ip] = required_by_node_ip.get(node_ip, 0) + 1
+                    if required_by_node_ip:
+                        assert_node_ip_capacity(
+                            required_gpus_by_node_ip=required_by_node_ip,
+                            context=f"multinode_vllm_node_pin model={self.model_name}",
+                        )
             else:
                 k2_models = ("moonshotai/Kimi-K2-Instruct", "unsloth/Kimi-K2-Instruct-0905-BF16")
                 if self.model_name in k2_models:
@@ -3016,7 +3028,9 @@ class MultiNodeInferenceEngine:
             raise RuntimeError(
                 f"multinode_vllm_ray_get_timeout_s={ray_get_timeout_s} request_id={request_id}"
             ) from e
-        except Exception:
+        except Exception as e:
+            if _is_request_validation_error(e):
+                raise
             logger.exception(
                 "multinode_vllm_ray_get_failed compute_topk actor=%s request_id=%s sampling_session_id=%s prompt_len=%s k=%s",
                 self.actor_name,

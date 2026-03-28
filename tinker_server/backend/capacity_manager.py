@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import os
 import time
 from dataclasses import dataclass
@@ -54,6 +56,24 @@ def _object_store_free_bytes() -> int:
         )
     # Ray reports as float; treat as bytes.
     return int(free)
+
+
+async def _await_ray_ref(ref: Any) -> Any:
+    """Await a Ray ObjectRef using native async integration."""
+    if hasattr(ref, "__await__"):
+        return await ref
+
+    to_future = getattr(ref, "future", None)
+    if callable(to_future):
+        fut = to_future()
+        if isinstance(fut, asyncio.Future):
+            return await fut
+        if isinstance(fut, concurrent.futures.Future):
+            return await asyncio.wrap_future(fut)
+        if hasattr(fut, "__await__"):
+            return await fut
+
+    raise TypeError(f"Ray ref is not awaitable: {type(ref)}")
 
 
 def _get_or_create_ray_actor():
@@ -192,13 +212,11 @@ def _get_or_create_ray_actor():
         "get_if_exists": True,
     }
     actor_otel_env = otel_env_vars()
-    from ..config import PFS_PYTHONPATH, actor_runtime_env_vars
-    options["runtime_env"] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=PFS_PYTHONPATH,
-            extra=actor_otel_env,
-        )
-    }
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+    options["runtime_env"] = actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        extra=actor_otel_env,
+    )
     return _RayCapacityManagerActor.options(  # type: ignore[attr-defined]
         **options
     ).remote(queue_bytes_budget=queue_bytes_budget)
@@ -207,6 +225,21 @@ def _get_or_create_ray_actor():
 class CapacityManager:
     def __init__(self) -> None:
         self._ray_actor = None
+
+    def _get_cached_ray_actor_for_async_request_path(self):
+        try:
+            import ray
+        except Exception as e:
+            raise CapacityManagerUnavailableError("Ray import failed") from e
+
+        if not ray.is_initialized():
+            raise CapacityManagerUnavailableError("Ray not initialized")
+
+        if self._ray_actor is None:
+            raise CapacityManagerUnavailableError(
+                "Detached Ray CapacityManager actor is not ready on this API server"
+            )
+        return self._ray_actor
 
     def _get_ray_actor(self):
         try:
@@ -241,6 +274,62 @@ class CapacityManager:
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
+
+    def ensure_ready(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
+        return self.snapshot(timeout_s=timeout_s)
+
+    async def async_try_reserve(
+        self,
+        request_id: str,
+        *,
+        queue_bytes: int,
+        object_store_bytes: int,
+    ) -> dict[str, Any]:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            out = await _await_ray_ref(
+                actor.try_reserve.remote(
+                    request_id,
+                    queue_bytes=int(queue_bytes),
+                    object_store_bytes=int(object_store_bytes),
+                )
+            )
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
+
+        if not isinstance(out, dict):
+            raise TypeError(f"CapacityManager.try_reserve returned non-dict: {type(out)}")
+        return out
+
+    async def async_release_queue(self, request_id: str) -> None:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            await _await_ray_ref(actor.release_queue.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+
+    async def async_release_object_store(self, request_id: str) -> None:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            await _await_ray_ref(actor.release_object_store.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
+
+    async def async_release_all(self, request_id: str) -> None:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            await _await_ray_ref(actor.release_all.remote(request_id))
+        except ray.exceptions.ActorDiedError:
+            self._ray_actor = None
 
     def release_queue(self, request_id: str) -> None:
         actor = self._get_ray_actor()
@@ -289,12 +378,43 @@ class CapacityManager:
             reserves_total=_require_int("reserves_total", d.get("reserves_total")),
         )
 
+    async def async_snapshot(self, *, timeout_s: float = 10.0) -> CapacitySnapshot:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            d = await asyncio.wait_for(_await_ray_ref(actor.snapshot.remote()), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
+        if not isinstance(d, dict):
+            raise TypeError(f"CapacityManager.snapshot returned non-dict: {type(d)}")
+        return CapacitySnapshot(
+            queue_bytes_budget=_require_int("queue_bytes_budget", d.get("queue_bytes_budget")),
+            queue_bytes_reserved=_require_int("queue_bytes_reserved", d.get("queue_bytes_reserved")),
+            object_store_bytes_reserved=_require_int("object_store_bytes_reserved", d.get("object_store_bytes_reserved")),
+            object_store_free_bytes=None if d.get("object_store_free_bytes") is None else int(d["object_store_free_bytes"]),
+            rejects_total=_require_int("rejects_total", d.get("rejects_total")),
+            reserves_total=_require_int("reserves_total", d.get("reserves_total")),
+        )
+
     def rss_bytes(self, *, timeout_s: float = 10.0) -> int:
         actor = self._get_ray_actor()
         import ray
 
         try:
             v = ray.get(actor.get_rss_bytes.remote(), timeout=float(timeout_s))
+        except ray.exceptions.ActorDiedError as e:
+            self._ray_actor = None
+            raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e
+        return int(v)
+
+    async def async_rss_bytes(self, *, timeout_s: float = 10.0) -> int:
+        actor = self._get_cached_ray_actor_for_async_request_path()
+        import ray
+
+        try:
+            v = await asyncio.wait_for(_await_ray_ref(actor.get_rss_bytes.remote()), timeout=float(timeout_s))
         except ray.exceptions.ActorDiedError as e:
             self._ray_actor = None
             raise CapacityManagerUnavailableError("Detached Ray CapacityManager actor died") from e

@@ -9,31 +9,83 @@ Entrypoint: |
   set -euo pipefail
 
   # Note: Ray CLI crashes on startup; start Ray via Python internals.
-  # Note: dashboard is disabled (image missing dashboard deps like aiohttp_cors).
+  # Note: prod keeps dashboard and Ray client disabled on purpose.
   python3 - <<'PY'
+  import os
+  import socket
   import time
 
   import ray
   from ray._private.node import Node
   from ray._private.parameter import RayParams
 
-  ip = ray.util.get_node_ip_address()
-  print(f"Local node IP: {ip}", flush=True)
+  HEAD_IP_PATH = "/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt"
+  CHECK_INTERVAL_S = 10
+  BACKOFF_INITIAL_S = 5
+  BACKOFF_MAX_S = 60
+  BACKOFF_RESET_AFTER_HEALTHY_CHECKS = 6
 
-  ray_params = RayParams(
-      num_cpus=4,
-      num_gpus=0,
-      include_dashboard=False,
-      gcs_server_port=6379,
-  )
-  node = Node(ray_params, head=True, shutdown_at_exit=False, spawn_reaper=False)
 
-  with open("/vePFS-Mindverse/share/code/tinker-server-auth/ray_head_ip.txt", "w") as f:
-      f.write(ip)
+  def _write_head_ip(ip: str) -> None:
+      os.makedirs(os.path.dirname(HEAD_IP_PATH), exist_ok=True)
+      tmp_path = f"{HEAD_IP_PATH}.tmp"
+      with open(tmp_path, "w") as f:
+          f.write(ip)
+      os.replace(tmp_path, HEAD_IP_PATH)
 
-  print(f"MINT Production Ray head IP: {ip}", flush=True)
+
+  def _port_open(host: str, port: int) -> bool:
+      sock = socket.socket()
+      sock.settimeout(2)
+      try:
+          sock.connect((host, port))
+          return True
+      except OSError:
+          return False
+      finally:
+          sock.close()
+
+  restart_delay_s = BACKOFF_INITIAL_S
   while True:
-      time.sleep(3600)
+      ip = ray.util.get_node_ip_address()
+      print(f"Local node IP: {ip}", flush=True)
+
+      ray_params = RayParams(
+          num_cpus=4,
+          num_gpus=0,
+          include_dashboard=False,
+          gcs_server_port=6379,
+      )
+      node = None
+      healthy_checks = 0
+      try:
+          node = Node(ray_params, head=True, shutdown_at_exit=False, spawn_reaper=False)
+          _write_head_ip(ip)
+          print(f"MINT Production Ray head published IP: {ip}", flush=True)
+          while True:
+              if not _port_open("127.0.0.1", 6379):
+                  print("mint-prod head lost gcs_server on 127.0.0.1:6379; restarting ray head", flush=True)
+                  break
+              dead = node.dead_processes()
+              if dead:
+                  print(f"mint-prod head detected dead ray processes: {dead!r}; restarting ray head", flush=True)
+                  break
+              healthy_checks += 1
+              if healthy_checks >= BACKOFF_RESET_AFTER_HEALTHY_CHECKS and restart_delay_s != BACKOFF_INITIAL_S:
+                  print("mint-prod head reset restart backoff to 5s after stable run", flush=True)
+                  restart_delay_s = BACKOFF_INITIAL_S
+              time.sleep(CHECK_INTERVAL_S)
+      except Exception as e:
+          print(f"mint-prod head wrapper caught exception: {type(e).__name__}: {e}", flush=True)
+      finally:
+          if node is not None:
+              try:
+                  node.kill_all_processes(check_alive=False, allow_graceful=False, wait=True)
+              except Exception as e:
+                  print(f"mint-prod head cleanup failed: {type(e).__name__}: {e}", flush=True)
+          print(f"mint-prod head sleeping {restart_delay_s}s before restart", flush=True)
+          time.sleep(restart_delay_s)
+          restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)
   PY
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"

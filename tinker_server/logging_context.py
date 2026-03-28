@@ -40,6 +40,20 @@ except Exception:
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 # Context variable to store current trace_id
 trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("trace_id", default=None)
+request_identity_var: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "request_identity",
+    default=None,
+)
+
+_UNSET = object()
+_REQUEST_IDENTITY_KEYS = (
+    "user_id",
+    "user_role",
+    "account_id",
+    "apikey_id",
+    "gateway_request_id",
+    "gateway_session_id",
+)
 
 _HEX_CHARS = frozenset("0123456789abcdef")
 _OTEL_ENABLED = False
@@ -49,6 +63,8 @@ _STRUCTLOG_WARNED = False
 _HTTP_REQUEST_COUNTER: Any | None = None
 _HTTP_DURATION_HISTOGRAM: Any | None = None
 _HTTP_ERROR_COUNTER: Any | None = None
+_SAMPLING_ADMISSION_COUNTER: Any | None = None
+_FUTURE_STORE_TIMEOUT_COUNTER: Any | None = None
 _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
 _ACTOR_OBS_INITIALIZED = False
@@ -88,6 +104,10 @@ class _ContextEnrichmentFilter(logging.Filter):
             record.request_id = get_request_id() or "-"
         if not hasattr(record, "trace_id"):
             record.trace_id = get_trace_id() or _get_current_otel_trace_id() or "-"
+        identity = get_request_identity_context()
+        for key in _REQUEST_IDENTITY_KEYS:
+            if not hasattr(record, key):
+                record.__dict__[key] = identity.get(key) or "-"
 
         current_hostname = getattr(record, "hostname", None)
         if not isinstance(current_hostname, str) or not current_hostname.strip():
@@ -135,6 +155,13 @@ def set_trace_id(trace_id: str | None) -> None:
 def get_trace_id() -> str | None:
     """Get the trace_id from the current context."""
     return _normalize_trace_id(trace_id_var.get())
+
+
+def get_request_identity_context() -> dict[str, str]:
+    raw = request_identity_var.get()
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, str) and v}
 
 
 def generate_trace_id() -> str:
@@ -331,17 +358,42 @@ def bind_request_trace_context(
     *,
     request_id: str | None = None,
     trace_id: str | None = None,
+    user_id: str | None | object = _UNSET,
+    user_role: str | None | object = _UNSET,
+    account_id: str | None | object = _UNSET,
+    apikey_id: str | None | object = _UNSET,
+    gateway_request_id: str | None | object = _UNSET,
+    gateway_session_id: str | None | object = _UNSET,
 ) -> Iterator[None]:
     """Temporarily bind request/trace IDs and restore previous context on exit."""
     prev_request_id = get_request_id()
     prev_trace_id = get_trace_id()
+    prev_identity = get_request_identity_context()
     set_request_id(_normalize_context_id(request_id))
     set_trace_id(_normalize_context_id(trace_id))
+    next_identity = dict(prev_identity)
+    for key, value in (
+        ("user_id", user_id),
+        ("user_role", user_role),
+        ("account_id", account_id),
+        ("apikey_id", apikey_id),
+        ("gateway_request_id", gateway_request_id),
+        ("gateway_session_id", gateway_session_id),
+    ):
+        if value is _UNSET:
+            continue
+        normalized = _normalize_context_id(None if value is None else str(value))
+        if normalized is None:
+            next_identity.pop(key, None)
+        else:
+            next_identity[key] = normalized
+    request_identity_var.set(next_identity)
     try:
         yield
     finally:
         set_request_id(prev_request_id)
         set_trace_id(prev_trace_id)
+        request_identity_var.set(prev_identity or None)
 
 
 def log_with_bound_context(
@@ -411,6 +463,14 @@ def add_trace_id(logger: Any, method_name: str, event_dict: dict[str, Any]) -> d
     """Structlog processor to add trace_id to all log events."""
     trace_id = get_trace_id() or _get_current_otel_trace_id()
     event_dict["trace_id"] = trace_id if trace_id else "-"
+    return event_dict
+
+
+def add_request_identity_fields(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Structlog processor to add request identity fields to all log events."""
+    identity = get_request_identity_context()
+    for key in _REQUEST_IDENTITY_KEYS:
+        event_dict[key] = identity.get(key) or "-"
     return event_dict
 
 
@@ -491,7 +551,8 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
 def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     """Configure OTLP trace/metric/log export (APMPlus or collector)."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED
-    global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER, _TRACER
+    global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
+    global _SAMPLING_ADMISSION_COUNTER, _FUTURE_STORE_TIMEOUT_COUNTER, _TRACER
 
     if _OTEL_INITIALIZED:
         return
@@ -563,6 +624,16 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             unit="ms",
             description="HTTP request duration in milliseconds",
         )
+        _SAMPLING_ADMISSION_COUNTER = meter.create_counter(
+            "mint_sampling_admission_total",
+            unit="{decision}",
+            description="Sampling admission decisions observed by mint",
+        )
+        _FUTURE_STORE_TIMEOUT_COUNTER = meter.create_counter(
+            "mint_future_store_timeout_events_total",
+            unit="{timeout}",
+            description="FutureStore queue and execution timeout events observed by mint",
+        )
 
         # 3) Logs
         log_exporter = OTLPLogExporter(endpoint=endpoint, headers=headers or None, insecure=insecure)
@@ -619,6 +690,42 @@ def record_http_server_metrics(*, method: str, route: str, status_code: int, dur
         pass
 
 
+def record_sampling_admission_metric(
+    *,
+    route: str,
+    decision: str,
+    reason: str,
+    scope: str | None = None,
+) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {
+        "route": str(route),
+        "decision": str(decision),
+        "reason": str(reason),
+    }
+    if isinstance(scope, str) and scope.strip():
+        attrs["scope"] = scope.strip()
+    try:
+        if _SAMPLING_ADMISSION_COUNTER is not None:
+            _SAMPLING_ADMISSION_COUNTER.add(1, attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_future_store_timeout_metric(*, kind: str, op: str | None = None) -> None:
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {"kind": str(kind)}
+    if isinstance(op, str) and op.strip():
+        attrs["op"] = op.strip()
+    try:
+        if _FUTURE_STORE_TIMEOUT_COUNTER is not None:
+            _FUTURE_STORE_TIMEOUT_COUNTER.add(1, attributes=attrs)
+    except Exception:
+        pass
+
+
 def _configure_stdlib_logging(
     *,
     root_logger: logging.Logger,
@@ -631,7 +738,11 @@ def _configure_stdlib_logging(
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    fmt = "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s trace_id=%(trace_id)s %(message)s"
+    fmt = (
+        "%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s trace_id=%(trace_id)s "
+        "user_id=%(user_id)s user_role=%(user_role)s account_id=%(account_id)s apikey_id=%(apikey_id)s "
+        "gateway_request_id=%(gateway_request_id)s gateway_session_id=%(gateway_session_id)s %(message)s"
+    )
     datefmt = "%Y-%m-%dT%H:%M:%S%z"
 
     context_filter = _ContextEnrichmentFilter()
@@ -687,6 +798,7 @@ def configure_logging() -> None:
         structlog.contextvars.merge_contextvars,
         add_request_id,
         add_trace_id,
+        add_request_identity_fields,
         add_hostname,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,

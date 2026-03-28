@@ -1,22 +1,16 @@
-"""Shared Megatron training utilities and deprecated MegatronTrainingWorker.
+"""Shared Megatron training utilities used by the distributed Megatron backend.
 
 This module provides:
 - Tinker Datum -> verl TensorDict conversion
-- Loss functions (SFT/PPO/logprobs)
-- is_moe_model() routing helper
-
-MegatronTrainingWorker remains for legacy single-process training and is not used by
-VerlTrainingEngine (which uses megatron_distributed.MegatronWorkerGroup).
+- Loss functions (SFT/PPO/logprobs/reverse-KL)
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
-import ray
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -31,31 +25,6 @@ from tinker_server.config import config as server_config
 from tinker_server.model_input_utils import flatten_encoded_text_chunks
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class MegatronTrainingConfig:
-    """Configuration for MegatronTrainingWorker.
-
-    Translates Tinker API parameters to verl/Megatron config.
-    """
-    model_path: str
-    lora_rank: int = 16
-    lora_alpha: int = 32
-    learning_rate: float = 1e-4
-    # Parallelism config - single process for now (TP=1 to avoid distributed)
-    # TODO: Implement proper multi-process parallelism for 8 GPUs
-    tensor_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
-    expert_parallel_size: int = 1
-    context_parallel_size: int = 1
-    # Offloading - enable to fit large models
-    param_offload: bool = True
-    optimizer_offload: bool = True
-    grad_offload: bool = True
-    # Training
-    dtype: str = "bfloat16"
-    seed: int = 42
 
 
 def tinker_to_tensordict(
@@ -340,7 +309,8 @@ def tinker_to_tensordict(
     # Add external labels if present (target_tokens with correct last token)
     # Key MUST NOT be "label" - verl applies torch.roll when key == "label"
     # Using "target" bypasses roll since need_roll=(k == "label") in model_forward.py
-    if has_external_labels and target_tokens_list:
+    disable_external_label = os.environ.get("MINT_DISABLE_EXTERNAL_LABEL", "0") == "1"
+    if has_external_labels and target_tokens_list and not disable_external_label:
         if has_full_external_labels and all(seq is not None for seq in target_tokens_list):
             target_tokens_tensors = [torch.tensor(seq, dtype=torch.long, device=device) for seq in target_tokens_list]
             td["target"] = torch.nested.as_nested_tensor(target_tokens_tensors, layout=torch.jagged)
@@ -354,6 +324,8 @@ def tinker_to_tensordict(
                 "[tinker_to_tensordict] Mixed target_tokens presence in batch; "
                 "skipping external labels to avoid TensorDict shape mismatch."
             )
+    elif has_external_labels and disable_external_label:
+        logger.warning("[tinker_to_tensordict] MINT_DISABLE_EXTERNAL_LABEL=1; forcing original rolled labels")
 
     require_r3 = (server_config.router_replay_mode == "R3")
     if require_r3:
@@ -446,6 +418,14 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
     Returns:
         Loss function compatible with verl's forward_backward_batch.
     """
+    def _flatten_rows(tensor: torch.Tensor) -> torch.Tensor:
+        if getattr(tensor, "is_nested", False):
+            rows = [row for row in tensor.unbind()]
+            if not rows:
+                return torch.empty((0,), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat(rows, dim=0)
+        return tensor
+
     def sft_loss_with_logprobs(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """SFT cross-entropy loss that also returns log_probs for metrics.
 
@@ -457,25 +437,48 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         Returns:
             Tuple of (loss_tensor, metrics_dict_with_logprobs)
         """
-        log_probs = model_output.get("log_probs")
+        packed_present = "packed_log_probs" in model_output
+        log_probs = model_output.get("packed_log_probs")
+        if log_probs is None:
+            log_probs = model_output.get("log_probs")
 
         if log_probs is None:
             raise ValueError("model_output missing required log_probs")
 
-        # Handle NestedTensor format from verl (NO_PADDING mode)
-        if hasattr(log_probs, 'values'):
-            log_probs_flat = log_probs.values()
-        else:
-            log_probs_flat = log_probs
+        # Prefer the packed non-nested tensor emitted by the patched Megatron
+        # forward step. Falling back to nested .values() keeps older paths alive,
+        # but the packed tensor avoids nested autograd edges on the SFT path.
+        log_probs_flat = _flatten_rows(log_probs)
 
         # Get loss_mask to identify which tokens contribute to loss
         loss_mask = data.get("loss_mask")
-        if loss_mask is not None and hasattr(loss_mask, 'values'):
-            loss_mask_flat = loss_mask.values()
-        elif loss_mask is not None:
-            loss_mask_flat = loss_mask
+        if loss_mask is not None:
+            loss_mask_flat = _flatten_rows(loss_mask)
         else:
             raise ValueError("data missing required loss_mask")
+
+        logger.info(
+            "[sft_loss_with_logprobs] packed_present=%s log_probs_type=%s log_probs_flat_type=%s "
+            "loss_mask_type=%s loss_mask_flat_type=%s",
+            packed_present,
+            type(log_probs).__name__,
+            type(log_probs_flat).__name__,
+            type(loss_mask).__name__ if loss_mask is not None else None,
+            type(loss_mask_flat).__name__,
+        )
+        if os.environ.get("MINT_SFT_DIAG_FAIL", "0") == "1":
+            raise RuntimeError(
+                "SFT_DIAG "
+                f"packed_present={packed_present} "
+                f"log_probs_type={type(log_probs).__name__} "
+                f"log_probs_is_nested={getattr(log_probs, 'is_nested', False)} "
+                f"log_probs_flat_type={type(log_probs_flat).__name__} "
+                f"log_probs_flat_is_nested={getattr(log_probs_flat, 'is_nested', False)} "
+                f"loss_mask_type={type(loss_mask).__name__ if loss_mask is not None else None} "
+                f"loss_mask_is_nested={getattr(loss_mask, 'is_nested', False) if loss_mask is not None else None} "
+                f"loss_mask_flat_type={type(loss_mask_flat).__name__} "
+                f"loss_mask_flat_is_nested={getattr(loss_mask_flat, 'is_nested', False)}"
+            )
 
         use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
         if not use_external_label:
@@ -500,16 +503,18 @@ def create_sft_loss_fn(return_logprobs: bool = True) -> Callable:
         else:
             batch_num_tokens_value = float(batch_num_tokens)
 
+        loss_sum = -weighted_log_probs.sum()
         if batch_num_tokens_value > 0:
-            nll = -weighted_log_probs.sum() / batch_num_tokens_value * dp_size
+            nll = loss_sum / batch_num_tokens_value * dp_size
         else:
-            nll = -weighted_log_probs.sum()
+            nll = loss_sum
 
         # Clone log_probs for metrics (detach to avoid affecting gradients)
         log_probs_cpu = log_probs_flat.detach().cpu()
 
         metrics = {
-            "loss": nll.detach(),
+            "loss": nll.detach().item() if hasattr(nll, "item") else float(nll),
+            "loss_sum": loss_sum.detach().item() if hasattr(loss_sum, "item") else float(loss_sum),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, 'item') else int(num_tokens),
         }
 
@@ -537,8 +542,9 @@ def create_ppo_loss_fn(
     import math
     import torch.nn.functional as F
     from verl.trainer.config import RolloutCorrectionConfig
+    from verl.trainer.ppo.core_algos import agg_loss
+    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_rejection_mask
     from verl.workers.config import ActorConfig, PolicyLossConfig
-    from verl.workers.utils.losses import ppo_loss as verl_ppo_loss, _slice_response_from_unpad_output
 
     clip_ratio = float(epsilon)
     clip_ratio_c = 1e6 if math.isinf(clip_ratio) else 3.0
@@ -563,13 +569,136 @@ def create_ppo_loss_fn(
 
     actor_config = ActorConfig(**actor_config_kwargs)
 
+    def _compute_vanilla_pg_losses(
+        *,
+        old_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        rollout_is_weights: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl)
+
+        clip_ratio_low = actor_config.clip_ratio_low if actor_config.clip_ratio_low is not None else actor_config.clip_ratio
+        clip_ratio_high = actor_config.clip_ratio_high if actor_config.clip_ratio_high is not None else actor_config.clip_ratio
+        clip_ratio_c_local = actor_config.get("clip_ratio_c", 3.0)
+
+        pg_losses1 = -advantages * ratio
+        pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+        pg_losses3 = -advantages * clip_ratio_c_local
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        if rollout_is_weights is not None:
+            pg_losses = pg_losses * rollout_is_weights
+        return pg_losses, ratio
+
+    def _compute_bypass_pg_losses(
+        *,
+        rollout_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask_bool: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rollout_corr_config = (
+            actor_config.policy_loss.get("rollout_correction", None) if hasattr(actor_config, "policy_loss") else None
+        )
+        if rollout_corr_config is None:
+            raise ValueError(
+                "rollout_correction config not found in policy_loss. "
+                "When using bypass_mode, the rollout_correction config must be present."
+            )
+
+        with torch.no_grad():
+            rollout_is_weights_proto, modified_response_mask, _ = compute_rollout_correction_and_rejection_mask(
+                old_log_prob=log_prob,
+                rollout_log_prob=rollout_log_prob,
+                response_mask=response_mask_bool,
+                rollout_is=rollout_corr_config.get("rollout_is", None),
+                rollout_is_threshold=rollout_corr_config.get("rollout_is_threshold", 2.0),
+                rollout_rs=rollout_corr_config.get("rollout_rs", None),
+                rollout_rs_threshold=rollout_corr_config.get("rollout_rs_threshold", None),
+                rollout_rs_threshold_lower=rollout_corr_config.get("rollout_rs_threshold_lower", None),
+                rollout_token_veto_threshold=rollout_corr_config.get("rollout_token_veto_threshold", None),
+                rollout_is_batch_normalize=rollout_corr_config.get("rollout_is_batch_normalize", False),
+            )
+
+        effective_mask = modified_response_mask.to(bool)
+        ratio = torch.exp(torch.clamp(log_prob - rollout_log_prob, min=-20.0, max=20.0))
+        loss_type = rollout_corr_config.get("loss_type", "ppo_clip")
+
+        if loss_type == "reinforce":
+            rollout_is_weights = rollout_is_weights_proto.batch["rollout_is_weights"] if rollout_is_weights_proto else None
+            pg_losses = -advantages * log_prob
+            if rollout_is_weights is not None:
+                pg_losses = pg_losses * rollout_is_weights
+            return pg_losses, effective_mask, ratio
+
+        if loss_type == "ppo_clip":
+            pg_losses, _ = _compute_vanilla_pg_losses(
+                old_log_prob=rollout_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                rollout_is_weights=None,
+            )
+            return pg_losses, effective_mask, ratio
+
+        raise ValueError(f"Invalid bypass_mode loss_type: {loss_type!r}")
+
+    def _slice_response_log_probs(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
+        prompt_ids = data["prompts"]
+        response_ids = data["responses"]
+        attention_mask = data["attention_mask"]
+
+        if prompt_ids.is_nested:
+            prompt_lens = prompt_ids.offsets().diff()
+            response_lens = response_ids.offsets().diff()
+            max_response_len = int(response_lens.max().item()) if response_lens.numel() else 0
+        else:
+            assert not attention_mask.is_nested
+            prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+            response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+            max_response_len = int(response_ids.shape[1])
+
+        rows = []
+        if tensor.is_nested:
+            for row_idx, (prompt_len, response_len) in enumerate(zip(prompt_lens, response_lens, strict=True)):
+                prompt_len_i = int(prompt_len.item()) if hasattr(prompt_len, "item") else int(prompt_len)
+                response_len_i = int(response_len.item()) if hasattr(response_len, "item") else int(response_len)
+                start = max(prompt_len_i - 1, 0)
+                end = start + response_len_i
+                row = tensor[row_idx][start:end]
+                pad_size = max_response_len - response_len_i
+                if pad_size > 0:
+                    row = F.pad(row, (0, pad_size))
+                rows.append(row)
+        else:
+            values = tensor
+            sequence_lens = prompt_lens + response_lens
+            sequence_offsets = sequence_lens.cumsum(dim=0)
+            assert sequence_offsets[-1].item() == values.shape[0]
+            for response_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
+                response_len_i = int(response_len.item()) if hasattr(response_len, "item") else int(response_len)
+                seq_offset_i = int(seq_offset.item()) if hasattr(seq_offset, "item") else int(seq_offset)
+                pad_size = max_response_len - response_len_i
+                row = values[seq_offset_i - response_len_i - 1 : seq_offset_i - 1]
+                if pad_size > 0:
+                    row = F.pad(row, (0, pad_size))
+                rows.append(row)
+
+        if not rows:
+            return torch.empty((0, 0), dtype=tensor.dtype, device=tensor.device)
+        return torch.stack(rows, dim=0)
+
     def ppo_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
         """PPO clipped objective loss via verl's implementation.
 
         Returns:
             Tuple of (loss_tensor, metrics_dict)
         """
-        response_log_probs = _slice_response_from_unpad_output(model_output["log_probs"], data)
+        response_log_probs = model_output.get("response_log_probs")
+        if response_log_probs is None:
+            response_log_probs = _slice_response_log_probs(model_output["log_probs"], data)
         target_len = response_log_probs.shape[1] if response_log_probs.dim() > 1 else response_log_probs.numel()
 
         old_log_probs = data["old_log_probs"]
@@ -591,27 +720,45 @@ def create_ppo_loss_fn(
         advantages = _pad_or_trunc(advantages, target_len, pad_value=0.0)
         response_mask = _pad_or_trunc(response_mask, target_len, pad_value=0.0)
 
-        data["old_log_probs"] = old_log_probs
-        data["advantages"] = advantages
-        data["response_mask"] = response_mask
-
-        loss, _ = verl_ppo_loss(actor_config, model_output, data, dp_group=dp_group)
-
         response_mask_bool = response_mask.to(bool)
-        response_mask_float = response_mask_bool.float()
+        loss_mode = actor_config.policy_loss.get("loss_mode", "vanilla") if hasattr(actor_config, "policy_loss") else "vanilla"
+        if loss_mode == "bypass_mode":
+            pg_losses, effective_mask_bool, ratio = _compute_bypass_pg_losses(
+                rollout_log_prob=old_log_probs,
+                log_prob=response_log_probs,
+                advantages=advantages,
+                response_mask_bool=response_mask_bool,
+            )
+        else:
+            rollout_is_weights = data.get("rollout_is_weights", None)
+            pg_losses, ratio = _compute_vanilla_pg_losses(
+                old_log_prob=old_log_probs,
+                log_prob=response_log_probs,
+                advantages=advantages,
+                rollout_is_weights=rollout_is_weights,
+            )
+            effective_mask_bool = response_mask_bool
 
-        log_ratio = response_log_probs - old_log_probs
-        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
-        ratio = torch.exp(log_ratio)
-
-        num_tokens = response_mask_float.sum()
+        effective_mask_float = effective_mask_bool.float()
+        loss = agg_loss(
+            loss_mat=pg_losses,
+            loss_mask=effective_mask_float,
+            loss_agg_mode=actor_config.loss_agg_mode,
+            dp_size=data["dp_size"],
+            batch_num_tokens=data["batch_num_tokens"],
+            global_batch_size=data["global_batch_size"],
+            loss_scale_factor=actor_config.loss_scale_factor,
+        )
+        num_tokens = effective_mask_float.sum()
         denom = num_tokens.clamp(min=1) if hasattr(num_tokens, "clamp") else max(num_tokens, 1)
         clipped = ((ratio < 1 - clip_ratio) | (ratio > 1 + clip_ratio)).float()
-        clip_frac = (clipped * response_mask_float).sum() / denom
-        ratio_mean = (ratio * response_mask_float).sum() / denom
+        clip_frac = (clipped * effective_mask_float).sum() / denom
+        ratio_mean = (ratio * effective_mask_float).sum() / denom
+        loss_sum = (pg_losses * effective_mask_float).sum()
 
         metrics = {
             "loss": loss.detach().item() if hasattr(loss, "item") else float(loss),
+            "loss_sum": loss_sum.detach().item() if hasattr(loss_sum, "item") else float(loss_sum),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
             "clip_frac": clip_frac.detach().item() if hasattr(clip_frac, "item") else float(clip_frac),
             "ratio_mean": ratio_mean.detach().item() if hasattr(ratio_mean, "item") else float(ratio_mean),
@@ -732,7 +879,7 @@ def create_logprob_extractor_fn() -> Callable:
             use_external_label = tu.get_non_tensor_data(data, key="use_external_label", default=False)
             if not use_external_label:
                 loss_mask_float = torch.roll(loss_mask_float, shifts=-1, dims=0)
-            nll = -(log_probs * loss_mask_float).sum()
+            loss_sum = -(log_probs * loss_mask_float).sum()
             num_tokens = loss_mask_float.sum()
             dp_size = tu.get_non_tensor_data(data, key="dp_size", default=1)
             batch_num_tokens = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
@@ -743,14 +890,18 @@ def create_logprob_extractor_fn() -> Callable:
             else:
                 batch_num_tokens_value = float(batch_num_tokens)
             if batch_num_tokens_value > 0:
-                nll = nll / batch_num_tokens_value * dp_size
+                nll = loss_sum / batch_num_tokens_value * dp_size
+            else:
+                nll = loss_sum
         else:
+            loss_sum = -log_probs.sum()
             nll = -log_probs.mean()
             num_tokens = log_probs.numel()
 
         # Return log_probs in metrics
         metrics = {
             "loss": nll.detach().item() if hasattr(nll, 'item') else float(nll),
+            "loss_sum": loss_sum.detach().item() if hasattr(loss_sum, "item") else float(loss_sum),
             "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
             "log_probs": log_probs_cpu,  # Per-token log probabilities tensor
         }
@@ -759,743 +910,148 @@ def create_logprob_extractor_fn() -> Callable:
     return logprob_extractor
 
 
-@ray.remote(num_gpus=1)  # TODO: Implement multi-GPU parallelism
-class MegatronTrainingWorker:
-    """Ray actor for MoE training via verl's Megatron backend.
+def create_vocab_parallel_logits_extractor_fn() -> Callable:
+    """Create a forward-only extractor that preserves vocab-parallel logits."""
 
-    Provides Tinker API compatibility:
-    - forward_backward(data_items, loss_fn) -> {loss_fn_outputs, metrics}
-    - optim_step(learning_rate) -> {metrics}
-    - get_lora_state_dict() -> {name: tensor}
-    """
+    def extractor(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
+        log_probs = model_output.get("log_probs")
+        vocab_parallel_logits = model_output.get("vocab_parallel_logits")
+        if vocab_parallel_logits is None:
+            raise ValueError("model_output missing required vocab_parallel_logits")
 
-    def __init__(
-        self,
-        base_model: str,
-        lora_rank: int,
-        learning_rate: float,
-        config: MegatronTrainingConfig | None = None,
-    ):
-        """Initialize Megatron training worker.
-
-        Currently runs single-GPU without parallelism. Multi-GPU parallelism
-        requires launching distributed processes (torchrun) which is not yet
-        implemented for Ray actors.
-
-        Args:
-            base_model: HuggingFace model path or local path.
-            lora_rank: LoRA adapter rank.
-            learning_rate: Initial learning rate.
-            config: Optional full MegatronTrainingConfig.
-        """
-        from ..logging_context import init_actor_observability
-
-        init_actor_observability()
-        self.base_model = base_model
-        self.lora_rank = lora_rank
-        self.learning_rate = learning_rate
-
-        if config is None:
-            config = MegatronTrainingConfig(
-                model_path=base_model,
-                lora_rank=lora_rank,
-                learning_rate=learning_rate,
-            )
-        self.config = config
-
-        # Will be set during initialization
-        self.engine = None
-        self.bridge = None
-        self._step_count = 0
-
-        # Initialize the Megatron backend
-        self._initialize_megatron()
-
-        logger.info(f"[MegatronTrainingWorker] Ready with model={base_model}, lora_rank={lora_rank}")
-
-    def _initialize_megatron(self):
-        """Initialize verl's MegatronEngine.
-
-        This sets up:
-        1. Distributed process group
-        2. Model parallel groups (TP, PP, EP, CP)
-        3. Model with LoRA via Megatron-Bridge
-        4. Optimizer with offloading
-        """
-        # Import verl components
-        from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
-        from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
-        from verl.trainer.config import CheckpointConfig
-        from verl.utils.fs import copy_to_local
-
-        # Initialize distributed if not already done
-        # For Ray actor running single-process multi-GPU, we set up minimal distributed env
-        if not torch.distributed.is_initialized():
-            # Set required env vars for torch.distributed if not present
-            if "RANK" not in os.environ:
-                os.environ["RANK"] = "0"
-            if "WORLD_SIZE" not in os.environ:
-                os.environ["WORLD_SIZE"] = "1"
-            if "LOCAL_RANK" not in os.environ:
-                os.environ["LOCAL_RANK"] = "0"
-            if "MASTER_ADDR" not in os.environ:
-                os.environ["MASTER_ADDR"] = "localhost"
-            if "MASTER_PORT" not in os.environ:
-                os.environ["MASTER_PORT"] = "29500"
-
-            rank = int(os.environ.get("LOCAL_RANK", 0))
-            torch.distributed.init_process_group(backend="nccl")
-            torch.cuda.set_device(rank)
-
-        # Copy model to local if needed
-        local_path = copy_to_local(self.base_model)
-
-        # Build HFModelConfig
-        from transformers import AutoConfig
-        hf_config = AutoConfig.from_pretrained(local_path, trust_remote_code=True, local_files_only=True)
-
-        model_config = HFModelConfig(
-            path=self.base_model,  # HuggingFace model name for tokenizer
-            local_path=local_path,
-            hf_config=hf_config,
-            architectures=hf_config.architectures,
-            lora_rank=self.config.lora_rank,
-            lora_alpha=self.config.lora_alpha,
-            target_modules="all-linear",
-            trust_remote_code=True,
-        )
-
-        # Build McoreEngineConfig
-        engine_config = McoreEngineConfig(
-            tensor_model_parallel_size=self.config.tensor_parallel_size,
-            pipeline_model_parallel_size=self.config.pipeline_parallel_size,
-            expert_model_parallel_size=self.config.expert_parallel_size,
-            context_parallel_size=self.config.context_parallel_size,
-            param_offload=self.config.param_offload,
-            optimizer_offload=self.config.optimizer_offload,
-            grad_offload=self.config.grad_offload,
-            dtype=self.config.dtype,
-            seed=self.config.seed,
-            use_mbridge=True,
-            use_distributed_optimizer=True,
-        )
-
-        # Build McoreOptimizerConfig
-        # Use constant LR decay style for online learning (no fixed schedule)
-        optimizer_config = McoreOptimizerConfig(
-            lr=self.learning_rate,
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            clip_grad=1.0,
-            lr_decay_steps=100000,  # Large value for online learning
-            lr_decay_style="constant",  # Don't decay learning rate
-            lr_warmup_steps=0,
-        )
-
-        # Build CheckpointConfig (minimal)
-        checkpoint_config = CheckpointConfig()
-
-        # Create and initialize the engine
-        # Use MegatronEngineWithLMHead which implements forward_step for LM training
-        self.engine = MegatronEngineWithLMHead(
-            model_config=model_config,
-            engine_config=engine_config,
-            optimizer_config=optimizer_config,
-            checkpoint_config=checkpoint_config,
-        )
-        self.engine.initialize()
-
-        # Store bridge reference for weight export
-        self.bridge = self.engine.bridge
-
-        logger.info("[MegatronTrainingWorker] MegatronEngineWithLMHead initialized")
-
-    def forward_backward(
-        self,
-        data_items: list[dict],
-        loss_fn: str = "cross_entropy",
-        loss_fn_config: dict | None = None,
-        rollout_correction_config: dict[str, Any] | None = None,
-    ) -> dict:
-        """Forward + backward pass via MegatronEngine.
-
-        Args:
-            data_items: List of Tinker Datum dicts.
-            loss_fn: Loss function type ("cross_entropy", "importance_sampling", "ppo").
-            loss_fn_config: Optional config (e.g., {"epsilon": 0.2} for PPO).
-            rollout_correction_config: Optional verl rollout correction config passed to policy_loss.
-
-        Returns:
-            Dict with loss_fn_outputs and metrics.
-        """
-        loss_fn_config = loss_fn_config or {}
-
-        # Filter valid items and collect sequence lengths.
-        valid_items: list[dict] = []
-        valid_indices: list[int] = []
-        seq_lengths: list[int] = []
-        for item_index, item in enumerate(data_items):
-            model_input = item.get("model_input", {})
-            tokens = flatten_encoded_text_chunks(model_input)
-            if tokens:
-                valid_items.append(item)
-                valid_indices.append(item_index)
-                seq_lengths.append(len(tokens))
+        log_probs_flat = None
+        if log_probs is not None:
+            if getattr(log_probs, "is_nested", False):
+                log_probs_flat = log_probs.values()
             else:
-                logger.warning(f"[MegatronTrainingWorker] Missing tokens in item {item_index}, skipping")
+                log_probs_flat = log_probs
 
-        if not valid_items:
-            empty_outputs = [
-                {
-                    "loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
-                }
-                for _ in data_items
-            ]
-            return {
-                "loss_fn_output_type": f"{loss_fn}_loss",
-                "loss_fn_outputs": empty_outputs,
-                "metrics": {"loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
-            }
-
-        # Create TensorDict directly on device to avoid NestedTensor .to() issues.
-        if torch.cuda.is_available():
-            device = f"cuda:{torch.cuda.current_device()}"
+        if getattr(vocab_parallel_logits, "is_nested", False):
+            local_logits = vocab_parallel_logits.values()
         else:
-            device = "cpu"
-        data = tinker_to_tensordict(valid_items, device=device)
+            local_logits = vocab_parallel_logits
 
-        # Select loss function
-        if loss_fn == "cross_entropy":
-            loss_function = create_sft_loss_fn()
-        elif loss_fn == "ppo":
-            epsilon = loss_fn_config.get("epsilon", 0.2)
-            loss_function = create_ppo_loss_fn(
-                epsilon,
-                rollout_correction_config=rollout_correction_config,
-            )
-        elif loss_fn == "importance_sampling":
-            # Importance sampling is PPO without clipping
-            loss_function = create_ppo_loss_fn(
-                epsilon=float("inf"),
-                rollout_correction_config=rollout_correction_config,
-            )
+        loss_mask = data.get("loss_mask")
+        if loss_mask is not None and getattr(loss_mask, "is_nested", False):
+            loss_mask_flat = loss_mask.values()
+        elif loss_mask is not None:
+            loss_mask_flat = loss_mask
         else:
-            raise ValueError(f"Unknown loss_fn: {loss_fn}")
-
-        # Zero gradients
-        self.engine.optimizer_zero_grad()
-
-        # Forward + backward via engine
-        result = self.engine.forward_backward_batch(
-            data=data,
-            loss_function=loss_function,
-            forward_only=False,
-        )
-
-        # Extract metrics from result (verl returns a single dict).
-        loss_value = 0.0
-        num_tokens = 0
-        clip_frac_sum = 0.0
-        ratio_mean_sum = 0.0
-        n_ppo_results = 0
-        all_log_probs = []
-        loss_fn_outputs = []
-        per_sample_log_probs = None
-        if result and isinstance(result, dict):
-            result_metrics = result.get("metrics", {})
-            losses = result.get("loss", [])
-
-            for loss in losses:
-                if hasattr(loss, "item"):
-                    loss = loss.item()
-                loss_value += float(loss)
-
-            num_tokens_list = result_metrics.get("num_tokens", [])
-            for tokens in num_tokens_list:
-                if hasattr(tokens, "item"):
-                    tokens = tokens.item()
-                num_tokens += int(tokens)
-
-            log_probs_list = result_metrics.get("log_probs", [])
-            for log_probs in log_probs_list:
-                if log_probs is not None:
-                    if hasattr(log_probs, "cpu"):
-                        log_probs = log_probs.cpu()
-                    all_log_probs.append(log_probs)
-
-            clip_frac_list = result_metrics.get("clip_frac", [])
-            for clip_frac in clip_frac_list:
-                if hasattr(clip_frac, "item"):
-                    clip_frac = clip_frac.item()
-                clip_frac_sum += float(clip_frac)
-                n_ppo_results += 1
-
-            ratio_mean_list = result_metrics.get("ratio_mean", [])
-            for ratio_mean in ratio_mean_list:
-                if hasattr(ratio_mean, "item"):
-                    ratio_mean = ratio_mean.item()
-                ratio_mean_sum += float(ratio_mean)
-
-            model_output = result.get("model_output", {})
-            model_log_probs = model_output.get("log_probs")
-            if model_log_probs is not None:
-                if hasattr(model_log_probs, "unbind"):
-                    per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
-                elif seq_lengths and hasattr(model_log_probs, "dim") and model_log_probs.dim() >= 2:
-                    per_sample_log_probs = []
-                    for idx, row in enumerate(model_log_probs):
-                        seq_len = seq_lengths[idx] if idx < len(seq_lengths) else row.shape[0]
-                        per_sample_log_probs.append(row[:seq_len].detach().cpu())
-
-        if per_sample_log_probs:
-            avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
-            for sample_log_probs in per_sample_log_probs:
-                logprobs_list = sample_log_probs.tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                })
-        elif loss_fn == "cross_entropy" and all_log_probs and seq_lengths:
-            combined_log_probs = torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
-            offset = 0
-            avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
-            for seq_len in seq_lengths:
-                sample_log_probs = combined_log_probs[offset:offset + seq_len]
-                offset += seq_len
-                logprobs_list = sample_log_probs.tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": logprobs_list, "shape": [len(logprobs_list)], "dtype": "float32"},
-                })
-
-        valid_count = len(seq_lengths)
-        expected_outputs = valid_count
-        if expected_outputs and len(loss_fn_outputs) < expected_outputs:
-            avg_loss_per_sample = loss_value / max(expected_outputs, 1)
-            for _ in range(expected_outputs - len(loss_fn_outputs)):
-                loss_fn_outputs.append({
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                    "logprobs": {"data": [], "shape": [0], "dtype": "float32"},
-                })
-
-        if valid_indices:
-            avg_loss_per_sample = loss_value / max(valid_count, 1)
-            full_outputs = [
-                {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                 "logprobs": {"data": [], "shape": [0], "dtype": "float32"}}
-                for _ in data_items
-            ]
-            for output, item_index in zip(loss_fn_outputs, valid_indices):
-                full_outputs[item_index] = output
-            loss_fn_outputs = full_outputs
+            raise ValueError("data missing required loss_mask")
 
         metrics = {
-            "loss:mean": float(loss_value),
-            "num_samples:sum": float(valid_count),
-            "num_tokens:sum": float(num_tokens),
+            "loss": 0.0,
+            "num_tokens": int(loss_mask_flat.float().sum().item()),
+            "vocab_parallel_logits": local_logits.detach(),
         }
+        if log_probs_flat is not None:
+            metrics["log_probs"] = log_probs_flat.detach().cpu()
+        return local_logits.new_zeros(()), metrics
 
-        if loss_fn in ("ppo", "importance_sampling") and n_ppo_results > 0:
-            metrics["clipfrac:mean"] = float(clip_frac_sum / n_ppo_results)
-            metrics["ratio:mean"] = float(ratio_mean_sum / n_ppo_results)
+    return extractor
 
-        debug_metric_keys = [
-            "training/rollout_probs_diff_valid",
-            "training/rollout_probs_diff_mean",
-            "training/rollout_probs_diff_max",
-            "training/rollout_probs_diff_std",
-            "training/rollout_actor_probs_pearson_corr",
-        ]
-        for debug_key in debug_metric_keys:
-            values = result_metrics.get(debug_key)
-            if values is None:
-                continue
-            if isinstance(values, list):
-                numeric_values = []
-                for value in values:
-                    if hasattr(value, "item"):
-                        value = value.item()
-                    if isinstance(value, (int, float)):
-                        numeric_values.append(float(value))
-                if numeric_values:
-                    metrics[f"{debug_key}:mean"] = float(sum(numeric_values) / len(numeric_values))
-            else:
-                if hasattr(values, "item"):
-                    values = values.item()
-                if isinstance(values, (int, float)):
-                    metrics[f"{debug_key}:mean"] = float(values)
 
-        logger.info(f"[MegatronTrainingWorker] forward_backward ({loss_fn}): loss={loss_value:.4f}")
+def create_reverse_kl_loss_fn(
+    temperature: float,
+    *,
+    reference_log_probs: torch.Tensor | None = None,
+) -> Callable:
+    """Create reverse-KL loss over vocab-parallel logits against fixed teacher log-probs."""
 
-        return {
-            "loss_fn_output_type": f"{loss_fn}_loss",
-            "loss_fn_outputs": loss_fn_outputs,
-            "metrics": metrics,
-        }
+    import torch.distributed as dist
+    from megatron.core import parallel_state as mpu
+    from .mintx_ops import vocab_parallel_reverse_kl_against_log_q
 
-    def forward(self, data_items: list[dict]) -> dict:
-        """Forward pass only (no backward). Returns per-token logprobs.
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature!r}")
 
-        Args:
-            data_items: List of Tinker Datum dicts.
+    def _flatten_rows(tensor: torch.Tensor) -> torch.Tensor:
+        if getattr(tensor, "is_nested", False):
+            rows = [row for row in tensor.unbind()]
+            if not rows:
+                return torch.empty((0,), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat(rows, dim=0)
+        return tensor
 
-        Returns:
-            Dict with loss_fn_outputs (including per-token logprobs) and metrics.
-        """
-        valid_items: list[dict] = []
-        valid_indices: list[int] = []
-        seq_lengths: list[int] = []
-        for item_index, item in enumerate(data_items):
-            model_input = item.get("model_input", {})
-            tokens = flatten_encoded_text_chunks(model_input)
-            if tokens:
-                valid_items.append(item)
-                valid_indices.append(item_index)
-                seq_lengths.append(len(tokens))
-            else:
-                logger.warning(f"[MegatronTrainingWorker] Missing tokens in item {item_index}, skipping")
-
-        if not valid_items:
-            empty_outputs = [
-                {
-                    "loss": {"data": [0.0], "shape": [1], "dtype": "float32"},
-                    "logprobs": [],
-                }
-                for _ in data_items
-            ]
-            return {
-                "loss_fn_output_type": "logprob_extractor",
-                "loss_fn_outputs": empty_outputs,
-                "metrics": {"loss:mean": 0.0, "num_samples:sum": 0.0, "num_tokens:sum": 0.0},
-                "log_probs": None,
-            }
-
-        if torch.cuda.is_available():
-            device = f"cuda:{torch.cuda.current_device()}"
-        else:
-            device = "cpu"
-        data = tinker_to_tensordict(valid_items, device=device)
-
-        # Use logprob extractor to get per-token log probabilities
-        loss_function = create_logprob_extractor_fn()
-
-        # Forward only via engine
-        with torch.no_grad():
-            result = self.engine.forward_backward_batch(
-                data=data,
-                loss_function=loss_function,
-                forward_only=True,
+    def reverse_kl_loss_fn(model_output: dict, data: TensorDict, dp_group=None) -> tuple:
+        packed_student_logits = model_output.get("packed_vocab_parallel_logits")
+        raw_student_logits = model_output.get("vocab_parallel_logits")
+        if packed_student_logits is None:
+            raise ValueError(
+                "reverse_kl requires packed_vocab_parallel_logits; "
+                f"model_output keys={sorted(model_output.keys())}"
             )
+        student_logits = packed_student_logits
+        student_token_log_probs = model_output.get("log_probs")
+        teacher_log_probs = reference_log_probs if reference_log_probs is not None else data.get("reference_log_probs")
+        loss_mask = data.get("loss_mask")
 
-        # Extract per-token log_probs from result (verl returns a dict).
-        loss_value = 0.0
-        num_tokens = 0
-        all_log_probs = []
-        loss_fn_outputs = []
-        per_sample_log_probs = None
-        combined_log_probs = None
-        result_metrics: dict[str, Any] = {}
-
-        if result and isinstance(result, dict):
-            result_metrics = result.get("metrics", {})
-            losses = result.get("loss", [])
-
-            for loss in losses:
-                if hasattr(loss, "item"):
-                    loss = loss.item()
-                loss_value += float(loss)
-
-            num_tokens_list = result_metrics.get("num_tokens", [])
-            for tokens in num_tokens_list:
-                if hasattr(tokens, "item"):
-                    tokens = tokens.item()
-                num_tokens += int(tokens)
-
-            log_probs_list = result_metrics.get("log_probs", [])
-            for log_probs in log_probs_list:
-                if log_probs is not None:
-                    if hasattr(log_probs, "cpu"):
-                        log_probs = log_probs.cpu()
-                    all_log_probs.append(log_probs)
-
-            model_output = result.get("model_output", {})
-            model_log_probs = model_output.get("log_probs")
-            if model_log_probs is not None:
-                if hasattr(model_log_probs, "unbind"):
-                    per_sample_log_probs = [lp.detach().cpu() for lp in model_log_probs.unbind()]
-                elif seq_lengths and hasattr(model_log_probs, "dim") and model_log_probs.dim() >= 2:
-                    per_sample_log_probs = []
-                    for idx, row in enumerate(model_log_probs):
-                        seq_len = seq_lengths[idx] if idx < len(seq_lengths) else row.shape[0]
-                        per_sample_log_probs.append(row[:seq_len].detach().cpu())
-
-        if per_sample_log_probs:
-            combined_log_probs = (
-                torch.cat(per_sample_log_probs, dim=0)
-                if len(per_sample_log_probs) > 1
-                else per_sample_log_probs[0]
-            )
-            avg_loss_per_sample = loss_value / max(len(per_sample_log_probs), 1)
-            for sample_log_probs in per_sample_log_probs:
-                logprobs_list = sample_log_probs.tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                    "logprobs": logprobs_list,
-                })
-        else:
-            if all_log_probs:
-                combined_log_probs = (
-                    torch.cat(all_log_probs, dim=0) if len(all_log_probs) > 1 else all_log_probs[0]
-                )
-            if combined_log_probs is not None and seq_lengths:
-                offset = 0
-                avg_loss_per_sample = loss_value / max(len(seq_lengths), 1)
-                for seq_len in seq_lengths:
-                    sample_log_probs = combined_log_probs[offset:offset + seq_len]
-                    offset += seq_len
-                    logprobs_list = sample_log_probs.tolist()
-                    loss_fn_outputs.append({
-                        "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                        "logprobs": logprobs_list,
-                    })
-            elif combined_log_probs is not None:
-                logprobs_list = combined_log_probs.tolist()
-                loss_fn_outputs.append({
-                    "loss": {"data": [loss_value], "shape": [1], "dtype": "float32"},
-                    "logprobs": logprobs_list,
-                })
-
-        valid_count = len(seq_lengths)
-        expected_outputs = valid_count
-        if expected_outputs and len(loss_fn_outputs) < expected_outputs:
-            avg_loss_per_sample = loss_value / max(expected_outputs, 1)
-            for _ in range(expected_outputs - len(loss_fn_outputs)):
-                loss_fn_outputs.append({
-                    "loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                    "logprobs": [],
-                })
-
-        if valid_indices:
-            avg_loss_per_sample = loss_value / max(valid_count, 1)
-            full_outputs = [
-                {"loss": {"data": [avg_loss_per_sample], "shape": [1], "dtype": "float32"},
-                 "logprobs": []}
-                for _ in data_items
-            ]
-            for output, item_index in zip(loss_fn_outputs, valid_indices):
-                full_outputs[item_index] = output
-            loss_fn_outputs = full_outputs
-
-        log_probs_data = None
-        if combined_log_probs is not None:
-            log_probs_data = {
-                "data": combined_log_probs.tolist(),
-                "shape": list(combined_log_probs.shape),
-                "dtype": str(combined_log_probs.dtype),
-            }
-
-        metrics = {
-            "loss:mean": float(loss_value),
-            "num_samples:sum": float(valid_count),
-            "num_tokens:sum": float(num_tokens),
-        }
+        if teacher_log_probs is None or loss_mask is None:
+            raise ValueError("reverse_kl requires vocab_parallel_logits, reference_log_probs, and loss_mask")
 
         logger.info(
-            f"[MegatronTrainingWorker] forward: loss={loss_value:.4f}, "
-            f"log_probs={'present' if log_probs_data else 'none'}"
+            "reverse_kl loss inputs packed_logits=%s raw_logits_nested=%s raw_logits_type=%s packed_logits_shape=%s raw_logits_shape=%s",
+            packed_student_logits is not None,
+            getattr(raw_student_logits, "is_nested", False) if raw_student_logits is not None else None,
+            type(raw_student_logits).__name__ if raw_student_logits is not None else None,
+            list(packed_student_logits.shape) if hasattr(packed_student_logits, "shape") else None,
+            list(raw_student_logits.shape) if hasattr(raw_student_logits, "shape") else None,
         )
 
-        return {
-            "loss_fn_output_type": "logprob_extractor",
-            "loss_fn_outputs": loss_fn_outputs,
-            "metrics": metrics,
-            "log_probs": log_probs_data,
-        }
-
-    def optim_step(self, learning_rate: float | None = None) -> dict:
-        """Optimizer step.
-
-        Args:
-            learning_rate: Optional new learning rate.
-
-        Returns:
-            Dict with metrics.
-        """
-        # Update learning rate if provided
-        # Note: verl's optimizer handles LR scheduling differently
-        # For now, we skip dynamic LR updates
-
-        # Optimizer step via engine
-        grad_norm = self.engine.optimizer_step()
-
-        # LR scheduler step
-        current_lr = self.engine.lr_scheduler_step()
-
-        self._step_count += 1
-
-        logger.info(f"[MegatronTrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
-
-        return {
-            "metrics": {
-                "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
-                "step": self._step_count,
-                "lr": float(current_lr[0]) if current_lr else self.learning_rate,
-            },
-            "type": "optim_step",
-        }
-
-    def get_lora_state_dict(self, use_per_expert_lora: bool = False) -> dict[str, torch.Tensor]:
-        """Extract LoRA adapter weights in PEFT format.
-
-        NOTE: This class is DEPRECATED. Use MegatronWorkerGroup from megatron_distributed.py instead.
-        This method uses the legacy single-actor approach and may not work with modern Megatron-Bridge.
-
-        Uses bridge.export_hf_weights() and filters for LoRA parameters.
-        Converts mbridge HuggingFace names to PEFT format for vLLM compatibility.
-
-        mbridge format: layers.0.self_attn.q_proj.lora_A.weight
-        PEFT format:    base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
-
-        Args:
-            use_per_expert_lora: Ignored for legacy actor. Only applies to
-                MegatronWorkerGroup for MoE models.
-
-        Returns:
-            Dict mapping LoRA parameter names (PEFT format) to CPU tensors.
-        """
-        import warnings
-        warnings.warn(
-            "MegatronTrainingWorker is deprecated. Use MegatronWorkerGroup from megatron_distributed.py instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-
-        if self.bridge is None:
-            raise RuntimeError("Bridge not initialized - cannot export weights")
-
-        # Export all weights via bridge - requires export_hf_weights() API
-        # The old export_weights() API merges LoRA into base weights, which is unusable
-        # for multi-LoRA inference. We must have separate lora_A/lora_B matrices.
-        if not hasattr(self.bridge, 'export_hf_weights'):
+        student_logits = _flatten_rows(student_logits)
+        if student_token_log_probs is not None:
+            student_token_log_probs = _flatten_rows(student_token_log_probs)
+        teacher_log_probs = _flatten_rows(teacher_log_probs)
+        loss_mask = _flatten_rows(loss_mask)
+        if os.environ.get("MINT_REVERSE_KL_DIAG_FAIL", "0") == "1":
             raise RuntimeError(
-                "Bridge lacks export_hf_weights() method. "
-                "The old export_weights() API merges LoRA into base weights, "
-                "which cannot be used for vLLM multi-LoRA inference."
+                "REVERSE_KL_DIAG "
+                f"student_logits_type={type(student_logits).__name__} "
+                f"student_logits_is_nested={getattr(student_logits, 'is_nested', False)} "
+                f"student_token_log_probs_type={type(student_token_log_probs).__name__ if student_token_log_probs is not None else None} "
+                f"student_token_log_probs_is_nested={getattr(student_token_log_probs, 'is_nested', False) if student_token_log_probs is not None else None} "
+                f"teacher_log_probs_type={type(teacher_log_probs).__name__} "
+                f"teacher_log_probs_is_nested={getattr(teacher_log_probs, 'is_nested', False)} "
+                f"loss_mask_type={type(loss_mask).__name__} "
+                f"loss_mask_is_nested={getattr(loss_mask, 'is_nested', False)}"
             )
-        full_state_dict = dict(self.bridge.export_hf_weights(self.engine.module))
+        if hasattr(teacher_log_probs, "device") and teacher_log_probs.device != student_logits.device:
+            teacher_log_probs = teacher_log_probs.to(device=student_logits.device, dtype=torch.float32)
 
-        # Filter for LoRA parameters and convert to PEFT format
-        lora_state_dict = {}
-        for name, tensor in full_state_dict.items():
-            if "lora" in name.lower():
-                # Convert mbridge HuggingFace format to PEFT format
-                peft_name = f"base_model.model.model.{name}"
-                # Move to CPU for Ray serialization
-                lora_state_dict[peft_name] = tensor.cpu() if tensor.is_cuda else tensor
+        selected_idx = (loss_mask != 0).nonzero(as_tuple=False).squeeze(-1)
+        student_logits = student_logits.index_select(0, selected_idx)
+        selected_weights = loss_mask.float().index_select(0, selected_idx)
 
-        logger.info(f"[MegatronTrainingWorker] Extracted {len(lora_state_dict)} LoRA parameters (PEFT format)")
-        if lora_state_dict:
-            sample_keys = list(lora_state_dict.keys())[:3]
-            logger.debug(f"[MegatronTrainingWorker] Sample LoRA keys: {sample_keys}")
+        if student_token_log_probs is not None:
+            student_token_log_probs = student_token_log_probs.index_select(0, selected_idx)
 
-        return lora_state_dict
+        if student_logits.shape != teacher_log_probs.shape:
+            raise ValueError(
+                f"student logits shape {tuple(student_logits.shape)} != teacher log-probs shape {tuple(teacher_log_probs.shape)}"
+            )
 
-    def get_lora_config(self) -> dict:
-        """Get LoRA configuration as dictionary.
+        token_kl = vocab_parallel_reverse_kl_against_log_q(student_logits, teacher_log_probs)
+        token_kl = token_kl * (float(temperature) * float(temperature))
+        weighted_kl = token_kl * selected_weights
+        num_tokens = selected_weights.sum()
 
-        Returns:
-            PEFT config dict compatible with vLLM's PEFTHelper.
-        """
-        return {
-            "r": self.config.lora_rank,
-            "lora_alpha": self.config.lora_alpha,
-            "lora_dropout": 0.0,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            "bias": "none",
-            "task_type": "CAUSAL_LM",
-            "peft_type": "LORA",
-            "base_model_name_or_path": self.base_model,
+        dp_size = tu.get_non_tensor_data(data, key="dp_size", default=1)
+        batch_num_tokens = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
+        if batch_num_tokens is None:
+            batch_num_tokens = num_tokens
+        batch_num_tokens_value = batch_num_tokens.item() if hasattr(batch_num_tokens, "item") else float(batch_num_tokens)
+        if batch_num_tokens_value > 0:
+            loss = weighted_kl.sum() / batch_num_tokens_value * dp_size
+        else:
+            loss = weighted_kl.sum()
+
+        metrics = {
+            "loss": loss.detach(),
+            "num_tokens": int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens),
+            "reverse_kl_tokens": token_kl.detach().cpu(),
         }
+        if student_token_log_probs is not None:
+            metrics["log_probs"] = student_token_log_probs.detach().cpu()
+        return loss, metrics
 
-    def get_tokenizer_info(self) -> dict:
-        """Return tokenizer configuration.
-
-        Returns:
-            Dict with tokenizer info.
-        """
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True, local_files_only=True)
-
-        return {
-            "vocab_size": tokenizer.vocab_size,
-            "model_max_length": tokenizer.model_max_length,
-            "pad_token_id": tokenizer.pad_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-            "bos_token_id": tokenizer.bos_token_id,
-        }
-
-
-    def save_checkpoint(self, save_path: str) -> dict:
-        """Save checkpoint: LoRA weights + config + training metadata.
-
-        For distributed Megatron training, optimizer state is sharded across ranks
-        and not saved here. Only rank 0 saves the checkpoint.
-
-        Args:
-            save_path: Directory path to save checkpoint files.
-
-        Returns:
-            Dict with training metadata.
-        """
-        import json
-        import os
-
-        from safetensors.torch import save_file
-
-        os.makedirs(save_path, exist_ok=True)
-
-        # 1. LoRA weights
-        state_dict = self.get_lora_state_dict()
-        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
-
-        # 2. LoRA config
-        config = self.get_lora_config()
-        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-
-        # 3. Training metadata
-        meta = {
-            "current_step": self._step_count,
-            "learning_rate": self.learning_rate,
-        }
-        with open(os.path.join(save_path, "training_meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
-
-        abs_path = os.path.abspath(save_path)
-        logger.info(f"[MegatronTrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
-        return meta
-
-    def shutdown(self) -> None:
-        """Release resources."""
-        logger.info("[MegatronTrainingWorker] Shutting down")
-        # MegatronEngine cleanup handled by garbage collection
-        self.engine = None
-        self.bridge = None
-        torch.cuda.empty_cache()
-
-
-def is_moe_model(model_name: str) -> bool:
-    """Check if a model is an MoE model requiring Megatron training.
-
-    Args:
-        model_name: Model name (e.g., "Qwen/Qwen3-30B-A3B").
-
-    Returns:
-        True if model is MoE and should use MegatronTrainingWorker.
-
-    Raises:
-        ValueError: If model is not in the supported list.
-    """
-    from .model_registry import get_model_config
-    return get_model_config(model_name).is_moe
+    return reverse_kl_loss_fn

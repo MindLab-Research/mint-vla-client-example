@@ -98,6 +98,7 @@ class _FutureStoreSection(BaseModel):
 class _TrainingSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    inactivity_timeout_s: int | None = None
     force_grad_checkpointing: bool | None = None
     enable_sdp: bool | None = None
 

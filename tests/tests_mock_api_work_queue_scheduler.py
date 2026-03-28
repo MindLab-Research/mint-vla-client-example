@@ -1,8 +1,13 @@
 import asyncio
 import importlib
 import importlib.machinery
+import json
 import sys
+import tempfile
 import types
+from pathlib import Path
+
+import tomllib
 
 import pytest
 
@@ -37,6 +42,7 @@ def _install_ray_stub(monkeypatch) -> None:
         raise ValueError("named actor not found")
 
     ray.remote = remote  # type: ignore[attr-defined]
+    ray.get = lambda ref, timeout=None: ref  # type: ignore[attr-defined]
     ray.get_actor = get_actor  # type: ignore[attr-defined]
     ray.cluster_resources = lambda: {}  # type: ignore[attr-defined]
     ray.get_runtime_context = lambda: _Ctx()  # type: ignore[attr-defined]
@@ -44,21 +50,38 @@ def _install_ray_stub(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "ray", ray)
 
 
-def _configure_runtime_env_for_queue_tests(monkeypatch) -> None:
-    import tinker_server.config as config
+def _materialize_runtime_env(root: Path) -> None:
+    from tinker_server.runtime_env import checkout_runtime_env_layout
 
-    monkeypatch.setattr(config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
-    monkeypatch.setattr(config, "PFS_TINKER_PATH", "/repo")
-    monkeypatch.setattr(config, "PFS_HF_MODULES_PATH", "/hf")
-    monkeypatch.setattr(config, "PFS_PYTHONPATH", "/runtime/site-packages:/repo:/hf")
-    monkeypatch.setattr(config, "require_ray_address", lambda: "127.0.0.1:6379")
+    layout = checkout_runtime_env_layout(str(root))
+    runtime = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["tinker"]["runtime_env"]
+    manifest = {
+        "runtime_env": {
+            "site_packages_dir": runtime.get("site_packages_dir", "site-packages"),
+            "source_dir": runtime.get("source_dir", "src"),
+            "host_venv_dir": runtime.get("host_venv_dir", "host-venv"),
+        },
+        "sources": runtime["sources"],
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
+    for entry in layout.pythonpath_entries[1:]:
+        Path(entry).mkdir(parents=True, exist_ok=True)
 
 
 def _load_api_work_queue_module(monkeypatch):
+    runtime_root = Path(tempfile.mkdtemp(prefix="mint-issue360-runtime-env-"))
+    _materialize_runtime_env(runtime_root)
+    monkeypatch.setenv("RAY_ADDRESS", "auto")
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(runtime_root))
+    monkeypatch.setenv("PFS_TINKER_PATH", "/tmp/tinker")
+    monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf-modules")
     _install_ray_stub(monkeypatch)
-    _configure_runtime_env_for_queue_tests(monkeypatch)
+    import tinker_server.config as config_module
     import tinker_server.backend.api_work_queue as api_work_queue
 
+    importlib.reload(config_module)
     return importlib.reload(api_work_queue)
 
 
@@ -72,9 +95,11 @@ def _item(
     scheduler_max_consecutive: int | None = None,
     created_at: float = 0.0,
 ) -> dict:
+    serial_session_key = session_key or legacy_session_id or "unknown"
     extra = {
         "scheduler_enabled": True,
         "scheduler_domain": domain,
+        "execution_serial_key": f"training_session:{serial_session_key}",
     }
     if session_key is not None:
         extra["scheduler_session_key"] = session_key
@@ -105,7 +130,9 @@ async def _enqueue_many(actor, items: list[dict]) -> None:
 async def _dequeue_many(actor, n: int) -> list[dict]:
     out: list[dict] = []
     for _ in range(n):
-        out.append(await actor.dequeue("consumer-job"))
+        item = await actor.dequeue("consumer-job")
+        out.append(item)
+        await actor.finalize_request(item["request_id"])
     return out
 
 
@@ -237,6 +264,50 @@ def test_mock_scheduler_honors_domain_policy_overrides(monkeypatch):
     assert sessions == ["A", "B", "A", "B"]
 
 
+def test_mock_scheduler_does_not_idle_wait_for_missing_followup(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "20")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
+    first = asyncio.run(actor.dequeue("consumer-job"))
+    assert _session_key_from_item(first) == "A"
+    asyncio.run(actor.finalize_request("r1"))
+
+    asyncio.run(_enqueue_many(actor, [_item("r2", domain="d", session_key="B", created_at=2.0)]))
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-job"), timeout=0.05))
+
+    assert _session_key_from_item(second) == "B"
+
+
+def test_issue_194_dequeue_assigns_monotonic_execution_serial_seq(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    asyncio.run(
+        _enqueue_many(
+            actor,
+            [
+                _item("r1", domain="d", session_key="A", created_at=1.0),
+                _item("r2", domain="d", session_key="A", created_at=2.0),
+            ],
+        )
+    )
+    out = asyncio.run(_dequeue_many(actor, 2))
+    seqs = [int((x.get("extra") or {}).get("execution_serial_seq")) for x in out]
+    epochs = [str((x.get("extra") or {}).get("execution_serial_epoch") or "") for x in out]
+
+    assert seqs == [1, 2]
+    assert epochs[0]
+    assert epochs == [epochs[0], epochs[0]]
+
+
 def test_stale_dequeue_returns_stale_consumer_sentinel(monkeypatch):
     monkeypatch.setenv("MINT_API_WORK_QUEUE_DEQUEUE_POLL_S", "0.05")
 
@@ -327,7 +398,7 @@ def test_issue_324_finalize_request_releases_running_slot(monkeypatch):
     dequeued = asyncio.run(actor.dequeue("consumer-job"))
     assert dequeued["request_id"] == "r1"
     assert actor.stats()["by_apikey_id"] == {"bbbbbbbbbbbbbbbbbbbbbbbb": 1}
-    actor.finalize_request("r1")
+    asyncio.run(actor.finalize_request("r1"))
     assert actor.stats()["by_apikey_id"] == {}
 
 
@@ -352,3 +423,107 @@ def test_issue_324_consumer_handoff_releases_leased_slots(monkeypatch):
 
     accepted = asyncio.run(actor.enqueue(dict(item, request_id="r2")))
     assert accepted == {"ok": True}
+
+
+def test_issue_324_scheduler_lease_survives_handoff_until_stale_request_reconciled(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    actor.set_active_job_id("consumer-old")
+    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
+    first = asyncio.run(actor.dequeue("consumer-old"))
+    assert first["request_id"] == "r1"
+
+    asyncio.run(_enqueue_many(actor, [_item("r2", domain="d", session_key="B", created_at=2.0)]))
+    actor.set_active_job_id("consumer-new")
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
+
+    released_ids = actor.release_scheduler_leases_for_consumer("consumer-old")
+    assert released_ids == ["r1"]
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
+
+    assert second["request_id"] == "r2"
+
+
+def test_issue_324_stale_finalize_after_handoff_cannot_restore_followup_bias(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.setenv("MINT_SCHEDULER_FAIRNESS", "oldest")
+    monkeypatch.setenv("MINT_SCHEDULER_MAX_CONSECUTIVE", "8")
+    monkeypatch.setenv("MINT_SCHEDULER_COALESCE_MS", "0")
+
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    actor = api_work_queue._get_or_create_ray_actor()
+
+    actor.set_active_job_id("consumer-old")
+    asyncio.run(_enqueue_many(actor, [_item("r1", domain="d", session_key="A", created_at=1.0)]))
+    first = asyncio.run(actor.dequeue("consumer-old"))
+    assert first["request_id"] == "r1"
+
+    asyncio.run(
+        _enqueue_many(
+            actor,
+            [
+                _item("r2", domain="d", session_key="B", created_at=2.0),
+                _item("r3", domain="d", session_key="A", created_at=3.0),
+            ],
+        )
+    )
+    actor.set_active_job_id("consumer-new")
+    assert actor.release_scheduler_leases_for_consumer("consumer-old") == ["r1"]
+    asyncio.run(actor.finalize_request("r1"))
+
+    second = asyncio.run(asyncio.wait_for(actor.dequeue("consumer-new"), timeout=0.05))
+    assert second["request_id"] == "r2"
+
+
+def test_issue_324_reconcile_stale_running_requests_fails_pending_leased_requests(monkeypatch):
+    api_work_queue = _load_api_work_queue_module(monkeypatch)
+    client = api_work_queue.ApiWorkQueueClient()
+    released: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    class _RemoteMethod:
+        def __init__(self, fn):
+            self._fn = fn
+
+        def remote(self, *args, **kwargs):
+            return self._fn(*args, **kwargs)
+
+    actor = types.SimpleNamespace(
+        release_stale_scheduler_leases=_RemoteMethod(
+            lambda active_consumer_job_id: ["leased-r1"] if active_consumer_job_id == "consumer-new" else []
+        )
+    )
+
+    monkeypatch.setattr(client, "_get_ray_actor", lambda: actor)
+    future_store_module = importlib.import_module("tinker_server.backend.future_store")
+    capacity_manager_module = importlib.import_module("tinker_server.backend.capacity_manager")
+
+    monkeypatch.setattr(
+        future_store_module,
+        "future_store",
+        types.SimpleNamespace(
+            fail_stale_running_requests=lambda active_consumer_job_id, error: [],
+            fail=lambda request_id, error: failed.append((request_id, error)),
+        ),
+    )
+
+    async def _async_release_all(request_id):
+        released.append(request_id)
+
+    monkeypatch.setattr(
+        capacity_manager_module,
+        "capacity_manager",
+        types.SimpleNamespace(async_release_all=_async_release_all),
+    )
+
+    asyncio.run(client._reconcile_stale_running_requests("consumer-new"))
+
+    assert failed == [("leased-r1", "api server restarted while request was dequeued before execution began")]
+    assert released == ["leased-r1"]

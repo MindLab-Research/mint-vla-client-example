@@ -177,6 +177,48 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
     assert list(layout.host_pythonpath_entries) == expected
 
 
+def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
+    from scripts import build_runtime_env as build_runtime_env
+
+    env_root = tmp_path / "runtime"
+    version_file = env_root / "src" / "vllm" / "vllm" / "_version.py"
+    version_file.parent.mkdir(parents=True, exist_ok=True)
+    version_file.write_text(
+        '__version__ = "0.1.dev1+g89a77b108"\n__version_tuple__ = (0, 1, "dev1", "g89a77b108")\n',
+        encoding="utf-8",
+    )
+    pkg_info = env_root / "src" / "vllm" / "vllm.egg-info" / "PKG-INFO"
+    pkg_info.parent.mkdir(parents=True, exist_ok=True)
+    pkg_info.write_text(
+        "Metadata-Version: 2.4\nName: vllm\nVersion: 0.1.dev1+g89a77b108\n",
+        encoding="utf-8",
+    )
+    pyproject = {
+        "tool": {
+            "tinker": {
+                "runtime_env": {
+                    "source_dir": "src",
+                    "sources": [
+                        {
+                            "name": "vllm",
+                            "host_only": True,
+                            "package_name": "vllm",
+                            "version": "0.16.0",
+                        }
+                    ],
+                }
+            }
+        }
+    }
+
+    build_runtime_env._write_host_source_version_files(pyproject, env_root)
+
+    assert '__version__ = "0.16.0"' in version_file.read_text(encoding="utf-8")
+    pkg_info_text = pkg_info.read_text(encoding="utf-8")
+    assert "Name: vllm" in pkg_info_text
+    assert "Version: 0.16.0" in pkg_info_text
+
+
 def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
     env_root = tmp_path / "runtime"
     manifest = {
@@ -543,11 +585,11 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "PFS_TINKER_PATH": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
-            "RAY_ADDRESS": "127.0.0.1:6379",
+            "RAY_ADDRESS": "ray://cfg-test",
             "TINKER_CONFIG_PATH": str(cfg),
         },
     )
     data = json.loads(out.stdout)
+    assert data["RAY_ADDRESS"] == "ray://cfg-test"
     assert data["TINKER_CONFIG_PATH"] == str(cfg)
     assert data["TINKER_RAY_NAMESPACE"] == "cfg_ns"
-    assert data["RAY_ADDRESS"] == "127.0.0.1:6379"
