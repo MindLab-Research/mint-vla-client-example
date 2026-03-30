@@ -577,6 +577,32 @@ class SessionManager:
         info.last_activity = time.time()
         info.lora_loaded = bool(loaded)
 
+    def mark_model_lora_sessions_unloaded(self, base_model: str) -> int:
+        """Invalidate multi-LoRA load state for sessions bound to a base model.
+
+        When the shared vLLM actor is killed or recreated, per-session LoRA load
+        state tracked in the API process is stale. Those sessions must force a
+        fresh add_lora_from_path on the next request instead of silently
+        sampling without their adapter.
+        """
+        count = 0
+        now = time.time()
+        for info in self._sessions.values():
+            if not info.uses_multi_lora:
+                continue
+            if info.uses_base_model:
+                continue
+            if info.base_model != base_model:
+                continue
+            if not info.adapter_path:
+                continue
+            if not info.lora_loaded:
+                continue
+            info.last_activity = now
+            info.lora_loaded = False
+            count += 1
+        return count
+
     def is_multi_lora_session(self, session_id: str) -> bool:
         """Check if a session uses multi-LoRA mode.
 

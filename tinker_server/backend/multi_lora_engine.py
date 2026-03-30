@@ -72,6 +72,40 @@ PERSISTENT_VLLM_ACTOR_NAME = "tinker_vllm_server"
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
 
+def _invalidate_model_session_loras(model_name: str) -> None:
+    """Force multi-LoRA sessions for a model to reload after actor recreate."""
+    try:
+        managers = []
+
+        from .session_manager import session_manager as backend_session_manager
+
+        if backend_session_manager is not None:
+            managers.append(backend_session_manager)
+
+        from ..routes import sampling as sampling_routes
+
+        route_session_manager = getattr(sampling_routes, "session_manager", None)
+        if route_session_manager is not None and route_session_manager not in managers:
+            managers.append(route_session_manager)
+
+        invalidated = 0
+        for manager in managers:
+            invalidated += manager.mark_model_lora_sessions_unloaded(model_name)
+        if invalidated:
+            logger.info(
+                "Invalidated cached LoRA load state for %s session(s) on model=%s after vLLM actor recreate",
+                invalidated,
+                model_name,
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed to invalidate cached LoRA load state for model=%s: %s: %s",
+            model_name,
+            type(e).__name__,
+            e,
+        )
+
+
 def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
     """Get the node_id where an actor is running.
 
@@ -1466,6 +1500,7 @@ class MultiModelInferenceManager:
                                     model_name,
                                 )
                                 self._engines.pop(model_name, None)
+                                _invalidate_model_session_loras(model_name)
                             else:
                                 logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
                                 return engine
@@ -1487,6 +1522,7 @@ class MultiModelInferenceManager:
                             f"Cached vLLM engine for {model_name} hit SystemExit during is_alive check; recreating"
                         )
                         self._engines.pop(model_name, None)
+                        _invalidate_model_session_loras(model_name)
                     except ray.exceptions.GetTimeoutError:
                         # Actor tasks can queue behind long-running generations/logprobs.
                         # A short timeout here is not evidence of death.
@@ -1500,9 +1536,11 @@ class MultiModelInferenceManager:
                             f"Cached vLLM engine for {model_name} has dead actor, recreating"
                         )
                         self._engines.pop(model_name, None)
+                        _invalidate_model_session_loras(model_name)
                 else:
                     # Engine has no actor handle, remove stale entry
                     self._engines.pop(model_name, None)
+                    _invalidate_model_session_loras(model_name)
 
             # Get model config for parallelism settings
             from tinker_server.backend.model_registry import get_model_config
