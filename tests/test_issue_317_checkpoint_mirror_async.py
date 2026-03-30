@@ -292,6 +292,9 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
         resolved["request_id"] = request_id
         resolved["response"] = response
 
+    async def _async_fail(request_id: str, error: str) -> None:
+        raise AssertionError(f"unexpected async_fail({request_id}): {error}")
+
     class _ForbiddenInferenceManager:
         async def get_engine_for_model(self, _base_model):
             raise AssertionError("save_state must not wait for inference registration")
@@ -300,19 +303,20 @@ async def test_issue_317_save_state_does_not_wait_for_sampling_registration(
         wt,
         "training_manager",
         SimpleNamespace(
-                get_session=lambda _model_id: SimpleNamespace(
-                    model_id="run-317",
-                    base_model="Qwen/Qwen3-0.6B",
-                    current_step=11,
-                    backend="dense",
-                )
+            get_session=lambda _model_id: SimpleNamespace(
+                model_id="run-317",
+                base_model="Qwen/Qwen3-0.6B",
+                current_step=11,
+                backend="dense",
             ),
-        )
+            mark_inflight=lambda _model_id, _delta: None,
+        ),
+    )
     monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
     monkeypatch.setattr(
         wt,
         "future_store",
-        SimpleNamespace(resolve=_resolve, fail=lambda *_args, **_kwargs: None),
+        SimpleNamespace(resolve=_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(
@@ -359,6 +363,9 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
         resolved["request_id"] = request_id
         resolved["response"] = response
 
+    async def _async_fail(request_id: str, error: str) -> None:
+        raise AssertionError(f"unexpected async_fail({request_id}): {error}")
+
     monkeypatch.setattr(
         tr,
         "training_manager",
@@ -369,7 +376,8 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
                 current_step=9,
                 backend="dense",
                 lora_config=SimpleNamespace(rank=8, train_mlp=False),
-            )
+            ),
+            mark_inflight=lambda _model_id, _delta: None,
         ),
     )
     monkeypatch.setattr(
@@ -380,7 +388,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
     monkeypatch.setattr(
         tr,
         "future_store",
-        SimpleNamespace(resolve=_resolve, fail=lambda *_args, **_kwargs: None),
+        SimpleNamespace(resolve=_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
     monkeypatch.setattr(

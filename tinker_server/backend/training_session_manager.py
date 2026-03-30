@@ -260,7 +260,7 @@ class TrainingSessionManager:
         """Full cleanup of a single training session.
 
         Mirrors the DELETE /models/{model_id} flow:
-        1. engine.shutdown_session (release GPU actor if applicable)
+        1. engine.delete_session (delete actor-local state, then unbind/kill actor if applicable)
         2. delete_session (remove from in-memory manager)
         3. delete_training_session (remove from detached Ray store)
         4. resource_pool.clear_session (clear stale session pins)
@@ -276,16 +276,14 @@ class TrainingSessionManager:
         if time.time() - session.last_activity <= self._inactivity_timeout:
             return
 
-        # 1. Shutdown training worker (best-effort, unconditional —
-        #    matches DELETE route which calls shutdown_session regardless
-        #    of is_active; shutdown_session is a safe no-op when no
-        #    worker mapping exists for this model_id).
+        # 1. Delete actor-local session state, then unbind the live engine
+        #    session. This mirrors explicit DELETE semantics.
         if self._engine is not None:
             try:
-                await self._engine.shutdown_session(session)
+                await self._engine.delete_session(session)
             except Exception as e:
                 logger.error(
-                    f"Failed to shutdown training session {model_id} "
+                    f"Failed to delete training session {model_id} "
                     f"during idle cleanup: {e}"
                 )
 
@@ -341,10 +339,11 @@ class TrainingSessionManager:
         for model_id in session_ids:
             session = self._sessions.get(model_id)
             if session:
-                # Shutdown training worker
+                # Application shutdown should only release live actors; it
+                # must not delete persisted session state.
                 if session.is_active:
                     try:
-                        await engine.shutdown_session(session)
+                        await engine.unbind_session(session)
                         logger.info(f"Shutdown training session: {model_id}")
                     except Exception as e:
                         logger.error(f"Failed to shutdown session {model_id}: {e}")

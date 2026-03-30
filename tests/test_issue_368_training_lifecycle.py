@@ -61,12 +61,23 @@ class _StubTrainingManager:
 
 class _StubTrainingEngine:
     def __init__(self):
-        self.shutdown_calls = []
+        self.unbind_calls = []
+        self.delete_calls = []
         self._workers = {}
         self._resource_pool_actor_names = {}
 
-    async def shutdown_session(self, session):
-        self.shutdown_calls.append(session.model_id)
+    async def unbind_session(self, session):
+        self.unbind_calls.append(session.model_id)
+        session.is_active = False
+
+    async def delete_session(self, session):
+        self.delete_calls.append(session.model_id)
+        worker = self._workers.get(session.model_id)
+        delete_session = getattr(worker, "delete_session", None) if worker is not None else None
+        if delete_session is not None:
+            delete_session.remote(session.model_id)
+        self._workers.pop(session.model_id, None)
+        self._resource_pool_actor_names.pop(session.model_id, None)
         session.is_active = False
 
 
@@ -158,7 +169,7 @@ async def test_issue_368_cleanup_stale_training_sessions(monkeypatch: pytest.Mon
     cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=123.0)
 
     assert cleaned == ["model-stale"]
-    assert engine.shutdown_calls == ["model-stale"]
+    assert engine.delete_calls == ["model-stale"]
     assert manager.deleted == ["model-stale"]
     assert deleted_model_ids == ["model-stale"]
     assert cleared_model_ids == ["model-stale"]
@@ -200,7 +211,11 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
         lambda model_id: deleted_model_ids.append(model_id),
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
-    monkeypatch.setattr(training_routes, "_restore_training_session", lambda model_id: restored)
+
+    async def _restore_training_session(_model_id: str):
+        return restored
+
+    monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
         lambda: SimpleNamespace(clear_session=lambda model_id: None),
@@ -209,7 +224,7 @@ async def test_issue_368_cleanup_can_restore_session_before_shutdown(monkeypatch
     cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
 
     assert cleaned == ["model-restore"]
-    assert engine.shutdown_calls == ["model-restore"]
+    assert engine.delete_calls == ["model-restore"]
     assert deleted_model_ids == ["model-restore"]
 
 
@@ -253,7 +268,7 @@ async def test_issue_368_cleanup_aborts_if_future_fail_path_errors(monkeypatch: 
     cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
 
     assert cleaned == []
-    assert engine.shutdown_calls == []
+    assert engine.delete_calls == []
     assert manager.deleted == []
     assert deleted_model_ids == []
 
@@ -294,7 +309,11 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
         lambda model_id: deleted_model_ids.append(model_id),
     )
     monkeypatch.setattr(heartbeat_store_module, "session_heartbeat_store", heartbeat_store)
-    monkeypatch.setattr(training_routes, "_restore_training_session", lambda model_id: stale)
+
+    async def _restore_training_session(_model_id: str):
+        return stale
+
+    monkeypatch.setattr(training_routes, "_restore_training_session", _restore_training_session)
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda value, timeout=None: value))
     monkeypatch.setattr(
         "tinker_server.backend.resource_pool.get_resource_pool",
@@ -304,7 +323,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     cleaned = await training_routes.cleanup_stale_training_sessions_once(stale_after_s=60.0)
 
     assert cleaned == ["model-stale"]
-    assert engine.shutdown_calls == []
+    assert engine.delete_calls == ["model-stale"]
     assert shared_worker.delete_calls == ["model-stale"]
     assert deleted_model_ids == ["model-stale"]
     assert stale.model_id not in engine._workers
@@ -313,8 +332,8 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
 
 def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monkeypatch: pytest.MonkeyPatch) -> None:
     actor = _StubTrainingStoreActor()
-    monkeypatch.setattr(training_store_module, "bump_training_session_step", actor._bump_step)
-    monkeypatch.setattr(training_store_module, "set_training_session_step", actor._set_step)
+    monkeypatch.setattr(training_store_module, "bump_training_session_step_best_effort", actor._bump_step)
+    monkeypatch.setattr(training_store_module, "set_training_session_step_best_effort", actor._set_step)
 
     result = future_store_module._sync_training_session_step(
         {"op": "training.optim_step", "model_id": "model-a"},
@@ -323,15 +342,15 @@ def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monk
 
     assert actor.bump_calls == ["model-a"]
     assert actor.set_calls == []
-    assert result["metrics"]["step"] == 7
+    assert "step" not in result["metrics"]
 
 
 def test_issue_368_sync_training_session_step_uses_reported_step_when_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor = _StubTrainingStoreActor()
-    monkeypatch.setattr(training_store_module, "bump_training_session_step", actor._bump_step)
-    monkeypatch.setattr(training_store_module, "set_training_session_step", actor._set_step)
+    monkeypatch.setattr(training_store_module, "bump_training_session_step_best_effort", actor._bump_step)
+    monkeypatch.setattr(training_store_module, "set_training_session_step_best_effort", actor._set_step)
 
     result = future_store_module._sync_training_session_step(
         {"op": "training.train_step", "model_id": "model-b"},

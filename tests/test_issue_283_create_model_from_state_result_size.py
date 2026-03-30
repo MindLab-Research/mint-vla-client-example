@@ -210,7 +210,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
             self.load_calls: list[dict] = []
             self._resource_pool_actor_names = {}
 
-        async def shutdown_session(self, session) -> None:
+        async def unbind_session(self, session) -> None:
             return None
 
         async def create_training_session(self, session) -> None:
