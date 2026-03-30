@@ -528,6 +528,82 @@ async def metrics() -> Response:
                 _append_metric(lines, "mint_work_queue_execution_count", rec.get("count"), labels=labels)
                 _append_metric(lines, "mint_work_queue_execution_max_s", rec.get("max"), labels=labels)
 
+        _append_metric(lines, "tinker_work_queue_scheduler_arbitration_total", wq.get("scheduler_arbitration_total"))
+        arbitration_by_winner = wq.get("scheduler_arbitration_by_winner")
+        if isinstance(arbitration_by_winner, dict):
+            for winner_bucket, total in arbitration_by_winner.items():
+                _append_metric(
+                    lines,
+                    "tinker_work_queue_scheduler_arbitration_total",
+                    total,
+                    labels={"winner_bucket": winner_bucket},
+                )
+        arbitration_by_reason = wq.get("scheduler_arbitration_by_reason")
+        if isinstance(arbitration_by_reason, dict):
+            for decision_reason, total in arbitration_by_reason.items():
+                _append_metric(
+                    lines,
+                    "tinker_work_queue_scheduler_arbitration_total",
+                    total,
+                    labels={"decision_reason": decision_reason},
+                )
+
+        scheduled_dequeue_stats = wq.get("scheduled_dequeue_stats")
+        if isinstance(scheduled_dequeue_stats, list):
+            for rec in scheduled_dequeue_stats:
+                if not isinstance(rec, dict):
+                    continue
+                scheduler_domain = rec.get("scheduler_domain")
+                labels = {
+                    "scheduler_domain": scheduler_domain,
+                    "backend": str(scheduler_domain).split(":", 1)[0] if scheduler_domain else "unknown",
+                    "reason": rec.get("reason") or "unknown",
+                    "op": rec.get("op") or "unknown",
+                    "execution_scope": "local",
+                }
+                _append_metric(lines, "tinker_work_queue_scheduler_domain_dequeue_total", rec.get("total"), labels=labels)
+
+        legacy_dequeue_stats = wq.get("legacy_dequeue_stats")
+        if isinstance(legacy_dequeue_stats, list):
+            for rec in legacy_dequeue_stats:
+                if not isinstance(rec, dict):
+                    continue
+                _append_metric(
+                    lines,
+                    "tinker_work_queue_legacy_dequeue_total",
+                    rec.get("total"),
+                    labels={
+                        "reason": rec.get("reason") or "unknown",
+                        "op": rec.get("op") or "unknown",
+                        "execution_scope": "local",
+                    },
+                )
+
+        scheduler_domains = wq.get("scheduler_domains")
+        if isinstance(scheduler_domains, dict):
+            for scheduler_domain, rec in scheduler_domains.items():
+                if not isinstance(rec, dict):
+                    continue
+                labels = {
+                    "scheduler_domain": scheduler_domain,
+                    "backend": rec.get("backend") or str(scheduler_domain).split(":", 1)[0],
+                    "execution_scope": "local",
+                }
+                _append_metric(lines, "tinker_work_queue_scheduler_domain_pending_requests", rec.get("pending_requests"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_scheduler_domain_oldest_queued_s", rec.get("oldest_queued_s"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_scheduler_domain_active_sessions", rec.get("active_sessions"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_scheduler_domain_inflight_workers", rec.get("inflight_workers"), labels=labels)
+                _append_metric(lines, "tinker_work_queue_scheduler_domain_service_gap_s", rec.get("service_gap_s"), labels=labels)
+                domain_stats = rec.get("stats")
+                if isinstance(domain_stats, dict):
+                    _append_metric(
+                        lines,
+                        "tinker_work_queue_scheduler_domain_dequeue_picks_total",
+                        domain_stats.get("picks"),
+                        labels=labels,
+                    )
+                    _append_metric(lines, "tinker_work_queue_scheduler_domain_starvation_picks_total", domain_stats.get("starvation_picks"), labels=labels)
+
     fs = stats.get("future_store")
     if isinstance(fs, dict):
         # Existing FutureStore counters/settings from /internal/admission_stats.
