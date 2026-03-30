@@ -90,3 +90,7 @@ Storages:
       MountPath: "/vePFS-Mindverse/share"
       SubPath: "share"
       ReadOnly: false
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse"
+      Bucket: "tos-mindverse"
+      Prefix: "/"
