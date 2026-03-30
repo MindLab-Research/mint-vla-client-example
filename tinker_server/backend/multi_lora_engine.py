@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import ray
@@ -1332,12 +1333,9 @@ def _model_to_actor_name(model_name: str) -> str:
 
 
 def _resolve_model_path(model_name: str) -> str:
-    """Resolve model name to full path on PFS.
-
-    Uses cached paths for known models.
-    """
+    """Resolve model name to a concrete local snapshot path on PFS."""
     # Map of model names to local paths
-    MODEL_PATHS = {
+    model_paths = {
         # Dense models
         "Qwen/Qwen2.5-7B-Instruct": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
@@ -1355,12 +1353,22 @@ def _resolve_model_path(model_name: str) -> str:
         "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
     }
 
-    if model_name in MODEL_PATHS:
-        return MODEL_PATHS[model_name]
+    resolved = model_paths.get(model_name)
+    if resolved is None:
+        return model_name
 
-    # Fall back to model name as path
-    return model_name
+    resolved_path = Path(resolved)
+    if resolved_path.exists():
+        return str(resolved_path.resolve())
 
+    snapshots_dir = resolved_path.parent
+    if snapshots_dir.name == "snapshots" and snapshots_dir.exists():
+        snapshot_dirs = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
+        if snapshot_dirs:
+            return str(snapshot_dirs[-1].resolve())
+
+    # Fall back to the configured value so callers still get the original path in logs.
+    return resolved
 
 class MultiModelInferenceManager:
     """Manages multiple vLLM engines, one per base model.
