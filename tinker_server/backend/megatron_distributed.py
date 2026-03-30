@@ -315,6 +315,18 @@ class _HotSessionCacheEntry:
     durable: bool
 
 
+@dataclass
+class _MegatronSessionCacheEntry:
+    session_id: str
+    session_path: str
+    total_bytes: int
+    updated_at: float
+    age_s: float
+    actor_name: str | None
+    cold_safe: bool
+    skip_reason: str | None
+
+
 @ray.remote(num_gpus=1, num_cpus=0)
 class MegatronRankWorker:
     """Single-rank worker for distributed Megatron training.
@@ -5632,6 +5644,9 @@ class MegatronSessionStateManager:
     def _actor_only_snapshot_manifest_path(self, session_id: str) -> str:
         return _actor_only_snapshot_manifest_path(self.get_session_path(session_id))
 
+    def _external_checkpoint_marker_path(self, session_id: str) -> str:
+        return os.path.join(self.base_path, f"{session_id}_external_checkpoint.json")
+
     def session_exists(self, session_id: str) -> bool:
         """Check if a session has saved adapter state."""
         session_path = self.get_session_path(session_id)
@@ -5652,6 +5667,7 @@ class MegatronSessionStateManager:
         metadata_path = os.path.join(session_path, "session_metadata.json")
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
+        self._maybe_recycle_cache()
 
     def mark_actor_only_state(
         self,
@@ -5682,6 +5698,43 @@ class MegatronSessionStateManager:
 
     def clear_actor_only_state(self, session_id: str) -> None:
         marker_path = self._actor_only_state_path(session_id)
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            return
+
+    def mark_external_checkpoint(
+        self,
+        session_id: str,
+        *,
+        checkpoint_path: str,
+        reason: str,
+        actor_name: str | None = None,
+    ) -> dict:
+        session_path = self.get_session_path(session_id)
+        os.makedirs(session_path, exist_ok=True)
+        marker_path = self._external_checkpoint_marker_path(session_id)
+        tmp_path = f"{marker_path}.tmp"
+        payload = {
+            "checkpoint_path": str(checkpoint_path),
+            "reason": str(reason),
+            "actor_name": None if actor_name is None else str(actor_name),
+            "updated_at": time.time(),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, marker_path)
+        self._maybe_recycle_cache()
+        return payload
+
+    def get_external_checkpoint(self, session_id: str) -> dict | None:
+        marker_path = self._external_checkpoint_marker_path(session_id)
+        if not os.path.exists(marker_path):
+            return None
+        return self._read_external_checkpoint(marker_path)
+
+    def clear_external_checkpoint(self, session_id: str) -> None:
+        marker_path = self._external_checkpoint_marker_path(session_id)
         try:
             os.remove(marker_path)
         except FileNotFoundError:
@@ -5727,6 +5780,7 @@ class MegatronSessionStateManager:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         os.replace(tmp_path, manifest_path)
+        self._maybe_recycle_cache()
         return payload
 
     def _read_actor_only_state(self, marker_path: str) -> dict:
@@ -5745,6 +5799,30 @@ class MegatronSessionStateManager:
         if not isinstance(marker_actor_name, str) or not marker_actor_name:
             raise RuntimeError(
                 f"Invalid actor_only_state marker actor_name={marker_actor_name!r} in {marker_path}"
+            )
+        return payload
+
+    def _read_external_checkpoint(self, marker_path: str) -> dict:
+        try:
+            with open(marker_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read external checkpoint marker {marker_path}: {type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Invalid external checkpoint marker payload type {type(payload).__name__} in {marker_path}"
+            )
+        checkpoint_path = payload.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            raise RuntimeError(
+                f"Invalid external checkpoint marker checkpoint_path={checkpoint_path!r} in {marker_path}"
+            )
+        actor_name = payload.get("actor_name")
+        if actor_name is not None and (not isinstance(actor_name, str) or not actor_name):
+            raise RuntimeError(
+                f"Invalid external checkpoint marker actor_name={actor_name!r} in {marker_path}"
             )
         return payload
 
@@ -5855,7 +5933,210 @@ class MegatronSessionStateManager:
                     shutil.rmtree(session_path)
             os.symlink(checkpoint_path, session_path, target_is_directory=True)
         self.save_metadata(session_id, step, lr, actual_rank)
+        self._maybe_recycle_cache()
         return session_path
+
+    def _session_last_updated_at(self, session_path: str) -> float:
+        latest = os.path.getmtime(session_path)
+        if os.path.isdir(session_path) and not os.path.islink(session_path):
+            for root, _dirs, files in os.walk(session_path):
+                for name in files:
+                    try:
+                        latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+                    except FileNotFoundError:
+                        continue
+        return latest
+
+    def _session_total_bytes(self, session_path: str) -> int:
+        if os.path.islink(session_path):
+            try:
+                return int(os.lstat(session_path).st_size)
+            except FileNotFoundError:
+                return 0
+        total = 0
+        for root, _dirs, files in os.walk(session_path):
+            for name in files:
+                try:
+                    total += int(os.path.getsize(os.path.join(root, name)))
+                except FileNotFoundError:
+                    continue
+        return total
+
+    def _iter_cache_entries(self) -> list[_MegatronSessionCacheEntry]:
+        import glob
+
+        entries: list[_MegatronSessionCacheEntry] = []
+        now = time.time()
+        pattern = os.path.join(self.base_path, "*_checkpoint")
+        for session_path in sorted(glob.glob(pattern)):
+            session_dir = os.path.basename(session_path)
+            if not session_dir.endswith("_checkpoint"):
+                continue
+            session_id = session_dir[: -len("_checkpoint")]
+            actor_name = None
+            cold_safe = False
+            skip_reason = None
+            if os.path.islink(session_path):
+                cold_safe = True
+                skip_reason = None
+            else:
+                external_marker = self.get_external_checkpoint(session_id)
+                dirty_marker = self.has_actor_only_state(session_id)
+                persisted = self.get_persisted_actor_only_state(session_id)
+                if dirty_marker:
+                    actor_name = self._read_actor_only_state(self._actor_only_state_path(session_id)).get("actor_name")
+                    skip_reason = "actor_only_state_dirty"
+                elif external_marker is not None:
+                    actor_name = external_marker.get("actor_name")
+                    cold_safe = True
+                else:
+                    skip_reason = "no_external_checkpoint"
+                if actor_name is None and isinstance(persisted, dict):
+                    actor_name = persisted.get("actor_name")
+            updated_at = self._session_last_updated_at(session_path)
+            entries.append(
+                _MegatronSessionCacheEntry(
+                    session_id=session_id,
+                    session_path=session_path,
+                    total_bytes=self._session_total_bytes(session_path),
+                    updated_at=updated_at,
+                    age_s=max(0.0, now - updated_at),
+                    actor_name=actor_name,
+                    cold_safe=cold_safe,
+                    skip_reason=skip_reason,
+                )
+            )
+        return entries
+
+    def get_cache_usage(self, *, actor_name: str | None = None) -> dict:
+        entries = [
+            entry
+            for entry in self._iter_cache_entries()
+            if actor_name is None or entry.actor_name == actor_name
+        ]
+        total_bytes = sum(entry.total_bytes for entry in entries)
+        oldest_age_s = max((entry.age_s for entry in entries), default=0.0)
+        skipped = [entry for entry in entries if not entry.cold_safe]
+        evictable = [entry for entry in entries if entry.cold_safe]
+        return {
+            "base_path": self.base_path,
+            "actor_name": actor_name,
+            "session_count": len(entries),
+            "total_bytes": total_bytes,
+            "oldest_entry_age_s": oldest_age_s,
+            "skipped_not_cold_safe_count": len(skipped),
+            "skipped_not_cold_safe_sessions": [entry.session_id for entry in skipped],
+            "evictable_session_count": len(evictable),
+            "evictable_bytes": sum(entry.total_bytes for entry in evictable),
+        }
+
+    def recycle_cache(
+        self,
+        *,
+        max_total_bytes: int | None = None,
+        max_age_s: float | None = None,
+        max_bytes_per_actor: int | None = None,
+    ) -> dict:
+        max_total_bytes = (
+            max(0, _env_int("MINT_MEGATRON_SESSION_CACHE_MAX_BYTES", 0))
+            if max_total_bytes is None
+            else max(0, int(max_total_bytes))
+        )
+        max_age_s = (
+            max(0.0, _env_float("MINT_MEGATRON_SESSION_CACHE_MAX_AGE_S", 0.0))
+            if max_age_s is None
+            else max(0.0, float(max_age_s))
+        )
+        max_bytes_per_actor = (
+            max(0, _env_int("MINT_MEGATRON_SESSION_CACHE_MAX_BYTES_PER_ACTOR", 0))
+            if max_bytes_per_actor is None
+            else max(0, int(max_bytes_per_actor))
+        )
+
+        before = self.get_cache_usage()
+        evicted: list[dict[str, object]] = []
+
+        def _evict_entry(entry: _MegatronSessionCacheEntry, reason: str) -> None:
+            if not entry.cold_safe:
+                return
+            if self.delete_session(entry.session_id):
+                evicted.append(
+                    {
+                        "session_id": entry.session_id,
+                        "bytes": entry.total_bytes,
+                        "reason": reason,
+                        "actor_name": entry.actor_name,
+                    }
+                )
+
+        entries = self._iter_cache_entries()
+        if max_age_s > 0:
+            for entry in sorted(entries, key=lambda item: item.updated_at):
+                if entry.cold_safe and entry.age_s > max_age_s:
+                    _evict_entry(entry, f"max_age_s>{max_age_s}")
+            entries = self._iter_cache_entries()
+
+        if max_bytes_per_actor > 0:
+            bytes_by_actor: dict[str, int] = {}
+            grouped: dict[str, list[_MegatronSessionCacheEntry]] = {}
+            for entry in entries:
+                if entry.actor_name is None:
+                    continue
+                bytes_by_actor[entry.actor_name] = bytes_by_actor.get(entry.actor_name, 0) + entry.total_bytes
+                grouped.setdefault(entry.actor_name, []).append(entry)
+            for actor_key, actor_entries in grouped.items():
+                current = bytes_by_actor.get(actor_key, 0)
+                for entry in sorted(actor_entries, key=lambda item: item.updated_at):
+                    if current <= max_bytes_per_actor:
+                        break
+                    if not entry.cold_safe:
+                        continue
+                    _evict_entry(entry, f"max_bytes_per_actor>{max_bytes_per_actor}")
+                    current -= entry.total_bytes
+            entries = self._iter_cache_entries()
+
+        if max_total_bytes > 0:
+            current_total = sum(entry.total_bytes for entry in entries)
+            for entry in sorted(entries, key=lambda item: item.updated_at):
+                if current_total <= max_total_bytes:
+                    break
+                if not entry.cold_safe:
+                    continue
+                _evict_entry(entry, f"max_total_bytes>{max_total_bytes}")
+                current_total -= entry.total_bytes
+
+        after = self.get_cache_usage()
+        return {
+            "base_path": self.base_path,
+            "max_total_bytes": max_total_bytes,
+            "max_age_s": max_age_s,
+            "max_bytes_per_actor": max_bytes_per_actor,
+            "evicted_sessions": evicted,
+            "evicted_session_count": len(evicted),
+            "evicted_bytes": sum(int(item["bytes"]) for item in evicted),
+            "before": before,
+            "after": after,
+        }
+
+    def _maybe_recycle_cache(self) -> dict | None:
+        max_total_bytes = max(0, _env_int("MINT_MEGATRON_SESSION_CACHE_MAX_BYTES", 0))
+        max_age_s = max(0.0, _env_float("MINT_MEGATRON_SESSION_CACHE_MAX_AGE_S", 0.0))
+        max_bytes_per_actor = max(0, _env_int("MINT_MEGATRON_SESSION_CACHE_MAX_BYTES_PER_ACTOR", 0))
+        if max_total_bytes <= 0 and max_age_s <= 0 and max_bytes_per_actor <= 0:
+            return None
+        result = self.recycle_cache(
+            max_total_bytes=max_total_bytes,
+            max_age_s=max_age_s,
+            max_bytes_per_actor=max_bytes_per_actor,
+        )
+        if result["evicted_session_count"]:
+            logger.info(
+                "[MegatronSessionStateManager] Recycled %s session(s) from %s (bytes=%s)",
+                result["evicted_session_count"],
+                self.base_path,
+                result["evicted_bytes"],
+            )
+        return result
 
     def get_metadata(self, session_id: str) -> dict | None:
         """Get session metadata if exists."""
@@ -5908,6 +6189,7 @@ class MegatronSessionStateManager:
             else:
                 shutil.rmtree(session_path)
             deleted = True
+        self.clear_external_checkpoint(session_id)
         if session_id in self._session_metadata:
             del self._session_metadata[session_id]
             deleted = True
@@ -7674,6 +7956,18 @@ class MegatronWorkerGroup:
 
         self._step_count = checkpoint_step
         self.learning_rate = checkpoint_lr
+        mark_external_checkpoint = getattr(
+            self._session_manager,
+            "mark_external_checkpoint",
+            None,
+        )
+        if mark_external_checkpoint is not None:
+            mark_external_checkpoint(
+                effective_session_id,
+                checkpoint_path=load_path,
+                reason="load_checkpoint",
+                actor_name=_make_megatron_actor_name(self.base_model),
+            )
 
         return result
 
@@ -7743,6 +8037,18 @@ class MegatronWorkerGroup:
         timeout_s = int(os.environ.get("MINT_MEGATRON_SAVE_CHECKPOINT_TIMEOUT_S", str(default_timeout_s)))
         results = ray.get(futures, timeout=timeout_s)
         result = results[0]  # Only rank 0 returns actual data
+        mark_external_checkpoint = getattr(
+            self._session_manager,
+            "mark_external_checkpoint",
+            None,
+        )
+        if mark_external_checkpoint is not None:
+            mark_external_checkpoint(
+                effective_session_id,
+                checkpoint_path=save_path,
+                reason="save_checkpoint",
+                actor_name=_make_megatron_actor_name(self.base_model),
+            )
         logger.info(f"[MegatronWorkerGroup] save_checkpoint: completed, step={result.get('current_step', 'unknown')}")
         return result
 
@@ -7803,6 +8109,19 @@ class MegatronWorkerGroup:
         logger.info(f"[MegatronWorkerGroup] save_lora_weights: completed, step={result.get('current_step', 'unknown')}")
         return result
 
+    def _get_session_cache_store_diagnostics(self) -> dict:
+        actor_name = _make_megatron_actor_name(self.base_model)
+        get_cache_usage = getattr(self._session_manager, "get_cache_usage", None)
+        if get_cache_usage is None:
+            return {
+                "global": {},
+                "actor": {},
+            }
+        return {
+            "global": get_cache_usage(),
+            "actor": get_cache_usage(actor_name=actor_name),
+        }
+
     def _get_session_cache_diagnostics(self) -> dict:
         hot_infos: list[dict] = []
         if self.workers:
@@ -7860,6 +8179,7 @@ class MegatronWorkerGroup:
             "base_model": self.base_model,
             "lora_rank": self.lora_rank,
             "session_cache": self._get_session_cache_diagnostics(),
+            "session_cache_store": self._get_session_cache_store_diagnostics(),
         }
 
 
@@ -8151,6 +8471,7 @@ class MegatronWorkerGroup:
             "max_lora_rank": self.lora_rank,  # Phase 7: trainer's max rank
             "actual_rank": getattr(self, '_actual_rank', None),  # Phase 7: session's actual rank
             "session_cache": self._get_session_cache_diagnostics(),
+            "session_cache_store": self._get_session_cache_store_diagnostics(),
         }
 
     def get_optimizer_info(self) -> dict:
